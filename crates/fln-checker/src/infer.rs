@@ -22,7 +22,7 @@ use crate::instantiate::{
 use crate::term::{
     TermBudget, TermFault, TermInput, TermLimit, TermOutcome, TermStop,
     abstract_free_telescope_with, copy_compact_subterm_with, copy_subterm_with, inspect_with,
-    substitute_bound_subterms_with,
+    substitute_bound_subterms_with, substitute_free_with,
 };
 use crate::whnf::{
     FreeBinding, ProjectionRule, WhnfBudget, WhnfContext, WhnfFault, WhnfOutcome, WhnfRefusal,
@@ -355,6 +355,13 @@ pub enum InferencePhase {
     ForallBody,
     ForallCodomainSort,
     ForallUniverse,
+    LetTelescope,
+    LetDeclaredType,
+    LetDeclaredTypeSort,
+    LetValue,
+    LetValueComparison,
+    LetBody,
+    LetZeta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +369,7 @@ pub enum InferenceSortSite {
     LambdaBinder { binder: usize },
     ForallBinder { binder: usize },
     ForallCodomain { binders: usize },
+    LetBinder { binder: usize },
 }
 
 impl InferenceSortSite {
@@ -370,19 +378,28 @@ impl InferenceSortSite {
             InferenceSortSite::LambdaBinder { .. } => InferencePhase::BinderSort,
             InferenceSortSite::ForallBinder { .. } => InferencePhase::ForallDomainSort,
             InferenceSortSite::ForallCodomain { .. } => InferencePhase::ForallCodomainSort,
+            InferenceSortSite::LetBinder { .. } => InferencePhase::LetDeclaredTypeSort,
         }
     }
 
     const fn at(self) -> usize {
         match self {
             InferenceSortSite::LambdaBinder { binder }
-            | InferenceSortSite::ForallBinder { binder } => binder,
+            | InferenceSortSite::ForallBinder { binder }
+            | InferenceSortSite::LetBinder { binder } => binder,
             InferenceSortSite::ForallCodomain { binders } => binders,
         }
     }
 
     const fn is_forall(self) -> bool {
-        !matches!(self, InferenceSortSite::LambdaBinder { .. })
+        matches!(
+            self,
+            InferenceSortSite::ForallBinder { .. } | InferenceSortSite::ForallCodomain { .. }
+        )
+    }
+
+    const fn is_let(self) -> bool {
+        matches!(self, InferenceSortSite::LetBinder { .. })
     }
 }
 
@@ -424,6 +441,14 @@ pub enum InferenceStop {
     SortWhnf {
         site: InferenceSortSite,
         stop: Box<WhnfStop>,
+        progress: InferenceProgress,
+    },
+    /// KR-109: the let value / declared type conversion exhausted its budget or
+    /// was cancelled. Separate from [`InferenceStop::DefEq`] because that one is
+    /// keyed by an application argument ordinal, which a let has none of.
+    LetValueDefEq {
+        binder: usize,
+        stop: Box<DefEqStop>,
         progress: InferenceProgress,
     },
 }
@@ -477,6 +502,20 @@ pub enum InferenceRefusal {
         site: InferenceSortSite,
         refusal: WhnfRefusal,
     },
+    /// KR-109: the let value's inferred type is not definitionally equal to the
+    /// declared type. The binder ordinal is retained because a let telescope is
+    /// flattened, so "which let" is not recoverable from the term root.
+    LetValueTypeMismatch {
+        binder: usize,
+        mismatch: DefEqMismatch,
+    },
+    /// KR-109: reduction refused while comparing a let value against its
+    /// declared type. Distinct from the mismatch above: nothing was decided.
+    LetValueConversionRefusal {
+        binder: usize,
+        side: DefEqSide,
+        refusal: WhnfRefusal,
+    },
 }
 
 /// Rule families deliberately outside this child.
@@ -486,7 +525,12 @@ pub enum InferenceDeferred {
         argument: usize,
         need: DefEqDeferred,
     },
-    Let,
+    /// KR-109: the let value / declared type conversion could not be decided
+    /// within the definitional-equality budget. Never a rejection.
+    LetValueConversion {
+        binder: usize,
+        need: DefEqDeferred,
+    },
     NatLiteral,
     StringLiteral,
     Projection,
@@ -522,6 +566,12 @@ pub enum InferenceFault {
     Whnf {
         argument: usize,
         fault: WhnfFault,
+    },
+    /// KR-109: an internal fault raised while comparing a let value against its
+    /// declared type. Keyed by binder ordinal, not by argument ordinal.
+    LetValueDefEq {
+        binder: usize,
+        fault: DefEqFault,
     },
     DefEq {
         argument: usize,
@@ -1424,6 +1474,69 @@ enum TelescopeKind {
     Forall,
 }
 
+/// KR-109: one `let` binder as it appears in the source term.
+///
+/// The source's display name is deliberately NOT retained. A let is transparent
+/// to typing, so the completed type mentions the VALUE and never a binder, and a
+/// field nothing reads is a place for a future reader to assume a guarantee that
+/// is not made.
+struct LetBinderSource {
+    declared_type: TermReference,
+    value: TermReference,
+}
+
+/// KR-109: one `let` binder after its declared type and value have been
+/// materialized under the binders to its left.
+///
+/// `value` is the zeta replacement: the completed body type has this term
+/// substituted for `local_name`, which is what makes a let transparent to
+/// typing rather than abstracted over like a lambda.
+struct LetBinder {
+    local_name: WireName,
+    local_reference: TermReference,
+    declared_type: Arc<WireExpr>,
+    value: Arc<WireExpr>,
+}
+
+/// KR-109: the flattened let telescope.
+///
+/// **This rule deliberately adds NO `InferenceProgress` counters**, unlike
+/// KR-107 and KR-108 which each carry several. `InferenceProgress` is returned
+/// by value through the whole inference path, and eight KR-109 counters took it
+/// from 176 to 240 bytes and overflowed the 64 KiB stack the deep-telescope
+/// cells run on — in a *forall* test this rule does not touch. The KR-109 cells
+/// assert the SEMANTICS instead (the value reaching the type, the internal local
+/// not surviving, each nonanswer in its own class), which is what the rule
+/// actually claims. `crates/fln-checker/tests/size_probe.rs` holds the ceiling
+/// so the next counter fails there rather than in an unrelated rule.
+///
+/// Nested and sequential lets are collected onto the heap exactly as the lambda
+/// and forall telescopes are, because let depth is attacker-controlled and a
+/// recursive host traversal over it is the defect the covenant forbids.
+struct LetState {
+    sources: Vec<LetBinderSource>,
+    body: TermReference,
+    binders: Vec<LetBinder>,
+    next: usize,
+    /// The binder currently being checked.
+    ///
+    /// This lives INSIDE the boxed state rather than in the continuation on
+    /// purpose. Carrying it in the `Continuation` variants grew that enum enough
+    /// to push `fifty_thousand_binder_forall_telescope_fits_a_64k_stack` — a rule
+    /// this slice does not touch — into a stack overflow, because the covenant's
+    /// 64 KiB budget leaves no headroom for a wider frame in the dispatch path.
+    /// Measured: that test passes at HEAD and overflowed with the payload inline.
+    pending: Option<LetPending>,
+}
+
+/// KR-109: the in-flight binder's materialized parts.
+struct LetPending {
+    declared_type: Arc<WireExpr>,
+    value: Arc<WireExpr>,
+    local_name: WireName,
+    local_reference: TermReference,
+}
+
 struct TelescopeState {
     kind: TelescopeKind,
     sources: Vec<TelescopeBinderSource>,
@@ -1445,6 +1558,10 @@ enum Dispatch {
     },
     Forall {
         binders: Vec<TelescopeBinderSource>,
+        body: TermReference,
+    },
+    Let {
+        binders: Vec<LetBinderSource>,
         body: TermReference,
     },
 }
@@ -1469,6 +1586,22 @@ enum Continuation {
     },
     TelescopeBody {
         state: Box<TelescopeState>,
+    },
+    /// KR-109: the declared type of `state.next` is being inferred; its own
+    /// inferred type must reduce to a Sort. The materialized parts ride in
+    /// `state.pending`, so this variant stays one pointer wide.
+    LetDeclaredType {
+        state: Box<LetState>,
+    },
+    /// KR-109: the value of `state.next` is being inferred; its inferred type
+    /// must be definitionally equal to the declared type.
+    LetValue {
+        state: Box<LetState>,
+    },
+    /// KR-109: the let body is being inferred; the result is its type with every
+    /// bound value zeta-substituted back in.
+    LetBody {
+        state: Box<LetState>,
     },
 }
 
@@ -1640,6 +1773,70 @@ fn collect_telescope(
     if binders.len() > MAX_BVAR_INDEX as usize + 1 {
         return Err(LeafHalt::stop(InferenceStop::Materialization {
             phase: kind.telescope_phase(),
+            stop: TermStop::Resource {
+                limit: TermLimit::BoundIndex,
+                allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
+                observed: usize_units(binders.len()),
+                at: cursor.index(),
+                completed_steps: control.progress.steps,
+            },
+            progress: control.progress,
+        }));
+    }
+    Ok((
+        binders,
+        TermReference {
+            source,
+            root: cursor,
+        },
+    ))
+}
+
+/// KR-109: flatten a chain of `let` binders onto the heap.
+///
+/// Mirrors [`collect_telescope`]; kept separate rather than folded into
+/// [`TelescopeKind`] because a let binder carries a third component — the value —
+/// that neither a lambda nor a forall binder has, and a shared shape would have
+/// to carry a dead field for two of the three kinds.
+fn collect_let_telescope(
+    term: &WireExpr,
+    source: ArenaSource,
+    root: ExprId,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(Vec<LetBinderSource>, TermReference), LeafHalt> {
+    let mut cursor = root;
+    let mut binders = Vec::new();
+    loop {
+        let current =
+            term.node(cursor)
+                .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
+                    index: cursor.index(),
+                }))?;
+        let ExprNode::Let {
+            type_, value, body, ..
+        } = current
+        else {
+            break;
+        };
+        control
+            .step(cancelled, InferencePhase::LetTelescope, cursor.index())
+            .map_err(LeafHalt::stop)?;
+        binders.push(LetBinderSource {
+            declared_type: TermReference {
+                source,
+                root: *type_,
+            },
+            value: TermReference {
+                source,
+                root: *value,
+            },
+        });
+        cursor = *body;
+    }
+    if binders.len() > MAX_BVAR_INDEX as usize + 1 {
+        return Err(LeafHalt::stop(InferenceStop::Materialization {
+            phase: InferencePhase::LetTelescope,
             stop: TermStop::Resource {
                 limit: TermLimit::BoundIndex,
                 allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
@@ -1875,7 +2072,11 @@ fn dispatch_reference(
             )?;
             Ok(Dispatch::Forall { binders, body })
         }
-        ExprNode::Let { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Let)),
+        ExprNode::Let { .. } => {
+            let (binders, body) =
+                collect_let_telescope(term, reference.source, root, control, cancelled)?;
+            Ok(Dispatch::Let { binders, body })
+        }
         ExprNode::NatLiteral { .. } => Err(LeafHalt::Deferred(InferenceDeferred::NatLiteral)),
         ExprNode::StringLiteral(_) => Err(LeafHalt::Deferred(InferenceDeferred::StringLiteral)),
         ExprNode::Projection { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Projection)),
@@ -2180,6 +2381,309 @@ impl<'a> InferenceEngine<'a> {
         })
     }
 
+    /// KR-109: materialize the let subterm at `reference` under the locals
+    /// already installed.
+    ///
+    /// A let binder's declared type and value are both open in the binders to
+    /// their left, exactly as a telescope domain is, so the substitution walk is
+    /// the same one — reused rather than re-implemented, since a second copy of
+    /// the loose-bvar accounting is a place for the two to disagree.
+    fn materialize_let_subterm(
+        &mut self,
+        reference: TermReference,
+        binders: &[LetBinder],
+        phase: InferencePhase,
+    ) -> Result<WireExpr, LeafHalt> {
+        let carriers: Vec<TelescopeBinder> = binders
+            .iter()
+            .map(|binder| TelescopeBinder {
+                display_name: binder.local_name.clone(),
+                style: BinderStyle::Default,
+                local_name: binder.local_name.clone(),
+                local_reference: binder.local_reference,
+                domain: Arc::clone(&binder.declared_type),
+            })
+            .collect();
+        self.materialize_telescope_subterm(reference, &carriers, phase)
+    }
+
+    /// KR-109: bind the let local to its DECLARED type.
+    ///
+    /// The local carries the declared type and not the value's inferred type,
+    /// because the two are only definitionally equal and KR-102 must read back
+    /// the type the term declared.
+    fn install_let_binder(&mut self, state: &mut LetState) -> Result<(), LeafHalt> {
+        let pending = state
+            .pending
+            .take()
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        if self
+            .scoped_locals
+            .insert(
+                pending.local_name.clone(),
+                Arc::clone(&pending.declared_type),
+            )
+            .is_some()
+        {
+            return Err(LeafHalt::Fault(InferenceFault::ScopedLocalCollision {
+                name: pending.local_name,
+            }));
+        }
+        state.binders.push(LetBinder {
+            local_name: pending.local_name,
+            local_reference: pending.local_reference,
+            declared_type: pending.declared_type,
+            value: pending.value,
+        });
+        state.next = state.next.saturating_add(1);
+        Ok(())
+    }
+
+    /// KR-109: schedule the next outstanding query for a let telescope.
+    ///
+    /// Per binder this is two queries in order — the declared type, then the
+    /// value — and after the last binder, the body.
+    #[inline(never)]
+    fn schedule_let(&mut self, mut state: Box<LetState>) -> Result<TelescopeSchedule, LeafHalt> {
+        if state.next < state.sources.len() {
+            let source = state
+                .sources
+                .get(state.next)
+                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            let declared_reference = source.declared_type;
+            let value_reference = source.value;
+            self.control
+                .step(
+                    self.cancelled,
+                    InferencePhase::LetDeclaredType,
+                    declared_reference.root.index(),
+                )
+                .map_err(LeafHalt::stop)?;
+            let declared_type = Arc::new(self.materialize_let_subterm(
+                declared_reference,
+                &state.binders,
+                InferencePhase::LetDeclaredType,
+            )?);
+            let value = Arc::new(self.materialize_let_subterm(
+                value_reference,
+                &state.binders,
+                InferencePhase::LetValue,
+            )?);
+            let query = self.store_generated(Arc::clone(&declared_type));
+            let local_name = self.fresh_local_name()?;
+            let local_reference = self.materialize_free_reference(&local_name)?;
+            if state.pending.is_some() {
+                return Err(LeafHalt::Fault(InferenceFault::EmptyWorklist));
+            }
+            state.pending = Some(LetPending {
+                declared_type,
+                value,
+                local_name,
+                local_reference,
+            });
+            return Ok(TelescopeSchedule::Query {
+                continuation: Continuation::LetDeclaredType { state },
+                reference: query,
+            });
+        }
+
+        self.control
+            .step(
+                self.cancelled,
+                InferencePhase::LetBody,
+                state.body.root.index(),
+            )
+            .map_err(LeafHalt::stop)?;
+        let body = Arc::new(self.materialize_let_subterm(
+            state.body,
+            &state.binders,
+            InferencePhase::LetBody,
+        )?);
+        let reference = self.store_generated(body);
+        Ok(TelescopeSchedule::Query {
+            continuation: Continuation::LetBody { state },
+            reference,
+        })
+    }
+
+    /// KR-109: enter a let telescope.
+    ///
+    /// `#[inline(never)]` and split out of `run` deliberately. `run` is ONE
+    /// frame on a 64 KiB budget shared with every rule, and inlining these arms
+    /// grew that frame enough to overflow
+    /// `fifty_thousand_binder_forall_telescope_fits_a_64k_stack` — a forall test
+    /// this slice does not otherwise touch. Measured at HEAD and after.
+    #[inline(never)]
+    fn begin_let(
+        &mut self,
+        binders: Vec<LetBinderSource>,
+        body: TermReference,
+    ) -> Result<TermReference, LeafHalt> {
+        let state = Box::new(LetState {
+            sources: binders,
+            body,
+            binders: Vec::new(),
+            next: 0,
+            pending: None,
+        });
+        let TelescopeSchedule::Query {
+            continuation,
+            reference,
+        } = self.schedule_let(state)?;
+        self.continuations.push(continuation);
+        Ok(reference)
+    }
+
+    /// KR-109: the declared type's own type must reduce to a Sort.
+    ///
+    /// Runs in BOTH modes: the value is substituted into the result, so an
+    /// annotation that is not a type would put an ill-typed term into a type
+    /// even when only inferring.
+    #[inline(never)]
+    fn after_let_declared_type(
+        &mut self,
+        state: Box<LetState>,
+        declared_type_type: &WireExpr,
+    ) -> Result<TermReference, LeafHalt> {
+        self.ensure_sort(
+            InferenceSortSite::LetBinder { binder: state.next },
+            declared_type_type,
+            false,
+        )?;
+        let pending = state
+            .pending
+            .as_ref()
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        let query = self.store_generated(Arc::clone(&pending.value));
+        self.continuations.push(Continuation::LetValue { state });
+        Ok(query)
+    }
+
+    /// KR-109: the value's inferred type must be defeq to the declared type;
+    /// then the binder is installed and the next query scheduled.
+    #[inline(never)]
+    fn after_let_value(
+        &mut self,
+        mut state: Box<LetState>,
+        value_type: &WireExpr,
+    ) -> Result<TermReference, LeafHalt> {
+        let declared = {
+            let pending = state
+                .pending
+                .as_ref()
+                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            Arc::clone(&pending.declared_type)
+        };
+        self.compare_let_value(state.next, value_type, &declared)?;
+        self.install_let_binder(&mut state)?;
+        let TelescopeSchedule::Query {
+            continuation,
+            reference,
+        } = self.schedule_let(state)?;
+        self.continuations.push(continuation);
+        Ok(reference)
+    }
+
+    /// KR-109: the value's inferred type must be definitionally equal to the
+    /// declared type. Every outcome stays in its own class.
+    #[inline(never)]
+    fn compare_let_value(
+        &mut self,
+        binder: usize,
+        actual: &WireExpr,
+        declared: &WireExpr,
+    ) -> Result<(), LeafHalt> {
+        self.control
+            .step(self.cancelled, InferencePhase::LetValueComparison, binder)
+            .map_err(LeafHalt::stop)?;
+        self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
+        match def_eq_with(
+            actual,
+            declared,
+            self.context.reduction(),
+            self.control.budget.defeq,
+            &mut *self.cancelled,
+        ) {
+            DefEqOutcome::Equal(_) => Ok(()),
+            DefEqOutcome::NotEqual { mismatch, .. } => {
+                Err(LeafHalt::Refused(InferenceRefusal::LetValueTypeMismatch {
+                    binder,
+                    mismatch,
+                }))
+            }
+            DefEqOutcome::Deferred { need, .. } => {
+                Err(LeafHalt::Deferred(InferenceDeferred::LetValueConversion {
+                    binder,
+                    need,
+                }))
+            }
+            DefEqOutcome::Refused { side, refusal, .. } => Err(LeafHalt::Refused(
+                InferenceRefusal::LetValueConversionRefusal {
+                    binder,
+                    side,
+                    refusal,
+                },
+            )),
+            DefEqOutcome::Inconclusive(stop) => Err(LeafHalt::stop(InferenceStop::LetValueDefEq {
+                binder,
+                stop: Box::new(stop),
+                progress: self.control.progress,
+            })),
+            DefEqOutcome::InternalFault(fault) => {
+                Err(LeafHalt::Fault(InferenceFault::LetValueDefEq {
+                    binder,
+                    fault,
+                }))
+            }
+        }
+    }
+
+    /// KR-109: complete the let by ZETA-SUBSTITUTING each bound value into the
+    /// body's inferred type, innermost binder first.
+    ///
+    /// This is the whole difference between KR-109 and KR-107: a lambda
+    /// ABSTRACTS its binder into a Pi, while a let is transparent to typing, so
+    /// the value flows into the type and the internal local must not survive.
+    #[inline(never)]
+    fn complete_let(&mut self, state: LetState, body_type: WireExpr) -> Result<WireExpr, LeafHalt> {
+        let mut result = self.cheap_beta_reduce(body_type)?;
+        for binder in state.binders.iter().rev() {
+            self.control
+                .step(self.cancelled, InferencePhase::LetZeta, state.binders.len())
+                .map_err(LeafHalt::stop)?;
+            result = map_materialization(
+                substitute_free_with(
+                    &result,
+                    &binder.local_name,
+                    &binder.value,
+                    self.control.budget.materialization,
+                    &mut *self.cancelled,
+                ),
+                InferencePhase::LetZeta,
+                self.control.progress,
+            )?;
+        }
+        self.remove_let_locals(&state.binders)?;
+        Ok(result)
+    }
+
+    /// KR-109: drop the query-local let bindings.
+    ///
+    /// Separate from [`Self::remove_telescope_locals`] only because the binder
+    /// shapes differ; the law it enforces is the same one — a local that was
+    /// never installed, or was removed twice, is an internal fault rather than a
+    /// silently tolerated state.
+    fn remove_let_locals(&mut self, binders: &[LetBinder]) -> Result<(), LeafHalt> {
+        for binder in binders.iter().rev() {
+            if self.scoped_locals.remove(&binder.local_name).is_none() {
+                return Err(LeafHalt::Fault(InferenceFault::MissingScopedLocal {
+                    name: binder.local_name.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_sort(
         &mut self,
         site: InferenceSortSite,
@@ -2193,6 +2697,7 @@ impl<'a> InferenceEngine<'a> {
         if site.is_forall() {
             self.control.progress.forall_sort_checks =
                 self.control.progress.forall_sort_checks.saturating_add(1);
+        } else if site.is_let() {
         } else {
             self.control.progress.binder_sort_checks =
                 self.control.progress.binder_sort_checks.saturating_add(1);
@@ -2976,6 +3481,9 @@ impl<'a> InferenceEngine<'a> {
                         self.continuations.push(continuation);
                         current = Some(reference);
                     }
+                    Dispatch::Let { binders, body } => {
+                        current = Some(self.begin_let(binders, body)?);
+                    }
                 }
                 continue;
             }
@@ -3064,6 +3572,15 @@ impl<'a> InferenceEngine<'a> {
                         TelescopeKind::Lambda => self.complete_lambda(*state, value)?,
                         TelescopeKind::Forall => self.complete_forall(*state, &value)?,
                     });
+                }
+                Continuation::LetDeclaredType { state } => {
+                    current = Some(self.after_let_declared_type(state, &value)?);
+                }
+                Continuation::LetValue { state } => {
+                    current = Some(self.after_let_value(state, &value)?);
+                }
+                Continuation::LetBody { state } => {
+                    inferred = Some(self.complete_let(*state, value)?);
                 }
             }
         }

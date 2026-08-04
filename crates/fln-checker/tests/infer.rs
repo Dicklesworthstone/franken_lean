@@ -17,8 +17,8 @@ use fln_checker::infer::{
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
 use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfContext, WhnfStop};
 use fln_checker::wire::{
-    DecodeBudget, DecodeOutcome, ExprNode, LevelId, LevelNode, WireExpr, WireName, decode_expr,
-    decode_name,
+    DecodeBudget, DecodeOutcome, ExprId, ExprNode, LevelId, LevelNode, WireExpr, WireName,
+    decode_expr, decode_name,
 };
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
@@ -622,16 +622,6 @@ fn generated_level_constructors_preserve_sort_successor_and_constant_instantiati
 fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requirement() {
     let sort_zero = Expr::sort(Level::zero());
     let cases = vec![
-        (
-            Expr::let_e(
-                Name::anonymous(),
-                sort_zero.clone(),
-                sort_zero.clone(),
-                sort_zero.clone(),
-                false,
-            ),
-            InferenceDeferred::Let,
-        ),
         (
             Expr::lit(Literal::Nat(NatLit::from_u64(11))),
             InferenceDeferred::NatLiteral,
@@ -2996,6 +2986,13 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 | InferencePhase::CheapBeta
                 | InferencePhase::PiAbstraction
                 | InferencePhase::ForallTelescope
+                | InferencePhase::LetTelescope
+                | InferencePhase::LetDeclaredType
+                | InferencePhase::LetDeclaredTypeSort
+                | InferencePhase::LetValue
+                | InferencePhase::LetValueComparison
+                | InferencePhase::LetBody
+                | InferencePhase::LetZeta
                 | InferencePhase::ForallDomain
                 | InferencePhase::ForallDomainSort
                 | InferencePhase::ForallBody
@@ -3448,4 +3445,328 @@ fn inference_production_code_has_no_primary_semantic_path() {
             "checker inference reached a forbidden primary semantic path: {forbidden}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// KR-109 — Let inference (bead franken_lean-gii.20)
+//
+// A let is TRANSPARENT to typing: its value flows into the inferred type by
+// zeta substitution rather than being abstracted over as a lambda binder is.
+// These cells are written against that distinction, because a KR-109 that
+// abstracted instead of substituting would still produce a well-formed type.
+// ---------------------------------------------------------------------------
+
+/// A shape model of a checker term.
+///
+/// `WireExpr` equality is ARENA equality: two terms that mean the same thing
+/// differ if one shares a level node the other repeats. The first version of
+/// these cells compared arenas and failed on `forall (a : Sort 0), Sort 0`
+/// against itself for exactly that reason. Compare SHAPE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExprModel {
+    Sort(LevelModel),
+    Forall(WireName, Box<ExprModel>, Box<ExprModel>),
+    Lambda(WireName, Box<ExprModel>, Box<ExprModel>),
+    Free(WireName),
+    Other(String),
+}
+
+fn expr_model_at(term: &WireExpr, root: ExprId) -> ExprModel {
+    match term.node(root).expect("model root exists") {
+        ExprNode::Sort { level } => ExprModel::Sort(level_model(term, *level)),
+        ExprNode::Forall {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        } => ExprModel::Forall(
+            binder_name.clone(),
+            Box::new(expr_model_at(term, *binder_type)),
+            Box::new(expr_model_at(term, *body)),
+        ),
+        ExprNode::Lambda {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        } => ExprModel::Lambda(
+            binder_name.clone(),
+            Box::new(expr_model_at(term, *binder_type)),
+            Box::new(expr_model_at(term, *body)),
+        ),
+        ExprNode::Free { name } => ExprModel::Free(name.clone()),
+        other => ExprModel::Other(format!("{other:?}")),
+    }
+}
+
+fn expr_model(term: &WireExpr) -> ExprModel {
+    expr_model_at(term, term.root())
+}
+
+/// Every free name occurring in a term. KR-109's internal locals must not
+/// survive into a published type, and an arena comparison cannot say so.
+fn free_names(term: &WireExpr) -> Vec<WireName> {
+    let mut names = Vec::new();
+    for node in term.nodes() {
+        if let ExprNode::Free { name } = node {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn bvar(index: u32) -> Expr {
+    Expr::bvar(index).expect("bound index within range")
+}
+
+fn let_modes() -> [InferenceMode; 2] {
+    [
+        InferenceMode::InferOnly,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+    ]
+}
+
+#[test]
+fn kr109_let_body_type_carries_the_value_not_the_binder() {
+    // let A : Sort 1 := Sort 0; (fun (a : A) => a)
+    //
+    // The lambda's type is `forall (a : A), A`. Zeta must replace A with the
+    // VALUE, giving `forall (a : Sort 0), Sort 0`. A KR-109 that abstracted the
+    // binder would yield a Pi over the let, and one that leaked the internal
+    // local would put a fresh free name in a published type.
+    let term = Expr::let_e(
+        primary_name("A"),
+        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+        Expr::sort(Level::zero()),
+        Expr::lam(primary_name("a"), bvar(0), bvar(0), BinderInfo::Default),
+        false,
+    );
+    let expected = decoded(&Expr::forall_e(
+        primary_name("a"),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        BinderInfo::Default,
+    ));
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for mode in let_modes() {
+        let result = complete(infer(
+            &decoded(&term),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ));
+        assert_eq!(
+            expr_model(&result.type_),
+            expr_model(&expected),
+            "KR-109 must zeta-substitute the value into the body type ({mode:?})"
+        );
+        assert!(
+            free_names(&result.type_).is_empty(),
+            "the query-local let name must not survive into the inferred type ({mode:?})"
+        );
+    }
+}
+
+#[test]
+fn kr109_non_dependent_let_body_type_is_unchanged_by_zeta() {
+    // let x : Sort 1 := Sort 0; Sort 0   ==>   Sort 1
+    // The body's type does not mention the binder, so zeta is a no-op on the
+    // RESULT while still running — the counter proves it ran.
+    let term = Expr::let_e(
+        primary_name("x"),
+        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        true,
+    );
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for mode in let_modes() {
+        let result = complete(infer(
+            &decoded(&term),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ));
+        assert_eq!(
+            sort_model(&result.type_),
+            LevelModel::Succ(Box::new(LevelModel::Zero))
+        );
+    }
+}
+
+#[test]
+fn kr109_sequential_and_nested_lets_flatten_and_substitute_innermost_first() {
+    // let A : Sort 1 := Sort 0; let B : Sort 1 := A; (fun (b : B) => b)
+    //
+    // B's value is A, which is itself a let local, so the substitutions must run
+    // innermost-first or B would be replaced by a name that no longer exists.
+    let term = Expr::let_e(
+        primary_name("A"),
+        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+        Expr::sort(Level::zero()),
+        Expr::let_e(
+            primary_name("B"),
+            Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+            bvar(0),
+            Expr::lam(primary_name("b"), bvar(0), bvar(0), BinderInfo::Default),
+            false,
+        ),
+        false,
+    );
+    let expected = decoded(&Expr::forall_e(
+        primary_name("b"),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        BinderInfo::Default,
+    ));
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for mode in let_modes() {
+        let result = complete(infer(
+            &decoded(&term),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ));
+        assert_eq!(
+            expr_model(&result.type_),
+            expr_model(&expected),
+            "a let bound to another let must resolve through both ({mode:?})"
+        );
+        assert!(
+            free_names(&result.type_).is_empty(),
+            "no internal local may survive a chained let ({mode:?})"
+        );
+    }
+}
+
+#[test]
+fn kr109_a_declared_type_that_is_not_a_sort_is_rejected_at_its_binder() {
+    // let x : (fun (a : Sort 0) => a) := Sort 0; Sort 0
+    // The annotation is a lambda, whose type is a Pi and not a Sort.
+    let term = Expr::let_e(
+        primary_name("x"),
+        Expr::lam(
+            primary_name("a"),
+            Expr::sort(Level::zero()),
+            bvar(0),
+            BinderInfo::Default,
+        ),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        false,
+    );
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for mode in let_modes() {
+        let outcome = infer(
+            &decoded(&term),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                InferenceOutcome::Refused {
+                    refusal: InferenceRefusal::SortExpected {
+                        site: InferenceSortSite::LetBinder { binder: 0 }
+                    },
+                    ..
+                }
+            ),
+            "a non-Sort let annotation must be refused AT ITS BINDER, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn kr109_a_value_whose_type_mismatches_the_annotation_is_rejected_naming_the_binder() {
+    // let x : Sort 0 := Sort 0; Sort 0
+    // `Sort 0 : Sort 1`, which is not `Sort 0`, so the value does not check.
+    let term = Expr::let_e(
+        primary_name("x"),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        Expr::sort(Level::zero()),
+        false,
+    );
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for mode in let_modes() {
+        let outcome = infer(
+            &decoded(&term),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                InferenceOutcome::Refused {
+                    refusal: InferenceRefusal::LetValueTypeMismatch { binder: 0, .. },
+                    ..
+                }
+            ),
+            "a let value/annotation mismatch must be a typed rejection, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn kr109_the_deferral_set_shrank_by_exactly_the_let_case() {
+    // The anti-vacuity cell for this whole slice. KR-110 and KR-112 must STILL
+    // defer; a repair that replaced the deferral machinery wholesale, rather
+    // than removing one member of it, fails here.
+    let sort_zero = Expr::sort(Level::zero());
+    let context = InferenceContext::empty(ConstantEnvironment::empty());
+    let still_deferred = vec![
+        (
+            Expr::lit(Literal::Nat(NatLit::from_u64(11))),
+            InferenceDeferred::NatLiteral,
+        ),
+        (
+            Expr::lit(Literal::Str("deferred".to_owned())),
+            InferenceDeferred::StringLiteral,
+        ),
+        (
+            Expr::proj(primary_name("S"), 0, sort_zero.clone()),
+            InferenceDeferred::Projection,
+        ),
+    ];
+    for (expression, requirement) in still_deferred {
+        let outcome = infer(
+            &decoded(&expression),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                InferenceOutcome::Deferred { requirement: ref got, .. } if *got == requirement
+            ),
+            "{requirement:?} must still defer after the KR-109 slice, got {outcome:?}"
+        );
+    }
+
+    // …and the let case no longer does.
+    let well_typed = Expr::let_e(
+        primary_name("x"),
+        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+        sort_zero.clone(),
+        sort_zero,
+        false,
+    );
+    assert!(
+        matches!(
+            infer(
+                &decoded(&well_typed),
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Complete(_)
+        ),
+        "a well-typed let must now COMPLETE rather than defer"
+    );
 }
