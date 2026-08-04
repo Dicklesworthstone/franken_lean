@@ -16,8 +16,9 @@ use crate::environment::{DeclarationDeltaError, Environment};
 use crate::extensions::ExtensionDescriptor;
 use crate::modules::{ArtifactEvidence, ModuleGraph, ModuleId};
 use crate::provenance::{
-    DeclarationClass, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
-    ModuleProvenanceIndexes, ModuleProvenanceManifest, ModuleProvenanceRoot,
+    CaptureStatus, DeclarationClass, ExtensionEntryId, ModuleContributionRecord,
+    ModuleProvenanceError, ModuleProvenanceIndexes, ModuleProvenanceManifest, ModuleProvenanceRoot,
+    ProvenanceAuthority, ProvenanceCompleteness,
 };
 
 /// Schema for the ephemeral payload envelope.  Bumping it invalidates every prepared
@@ -982,6 +983,52 @@ pub fn prepare_module_apply_candidate(
     )
 }
 
+/// The authority grade of one applied contribution.
+///
+/// A contribution can be applied byte-exactly while its decoder reported a partial
+/// capture or unresolved direct targets. Those successful applications are explicitly
+/// `AppliedIncomplete`: consumers must ask the retained completeness tuple whether a
+/// particular cache or invalidation capability was actually earned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyGrade {
+    Complete {
+        completeness: ProvenanceCompleteness,
+    },
+    AppliedIncomplete {
+        completeness: ProvenanceCompleteness,
+    },
+}
+
+impl ModuleApplyGrade {
+    fn from_completeness(completeness: &ProvenanceCompleteness) -> Self {
+        if completeness.capture() == CaptureStatus::Complete
+            && completeness.missing_dependencies().is_empty()
+        {
+            Self::Complete {
+                completeness: completeness.clone(),
+            }
+        } else {
+            Self::AppliedIncomplete {
+                completeness: completeness.clone(),
+            }
+        }
+    }
+
+    /// The exact canonical completeness tuple, never a lossy boolean summary.
+    pub fn completeness(&self) -> &ProvenanceCompleteness {
+        match self {
+            Self::Complete { completeness } | Self::AppliedIncomplete { completeness } => {
+                completeness
+            }
+        }
+    }
+
+    /// Whether this result earned one specific provenance capability.
+    pub fn grants(&self, authority: ProvenanceAuthority) -> bool {
+        self.completeness().grants(authority)
+    }
+}
+
 /// Immutable evidence for one successful aggregate transition.
 ///
 /// The receipt is created while the plan still holds both exact states, then checked
@@ -994,6 +1041,7 @@ pub struct ModuleApplyReceipt {
     schema: u16,
     module: ModuleId,
     contribution: ModuleContributionRecord,
+    grade: ModuleApplyGrade,
     transaction_id: ModuleApplyTransactionId,
     base_provenance_root: ModuleProvenanceRoot,
     result_provenance_root: ModuleProvenanceRoot,
@@ -1011,6 +1059,11 @@ impl ModuleApplyReceipt {
     /// Canonical contribution record that was committed, including artifact evidence.
     pub fn contribution(&self) -> &ModuleContributionRecord {
         &self.contribution
+    }
+
+    /// The published completeness grade, bound to the canonical contribution record.
+    pub fn grade(&self) -> &ModuleApplyGrade {
+        &self.grade
     }
 
     pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
@@ -1056,6 +1109,12 @@ impl ModuleApplyReceipt {
         })?;
         if actual_contribution != &self.contribution {
             return Err(ModuleApplyReceiptError::Contribution {
+                module: self.module.clone(),
+            });
+        }
+        let actual_grade = ModuleApplyGrade::from_completeness(actual_contribution.completeness());
+        if self.grade != actual_grade {
+            return Err(ModuleApplyReceiptError::Grade {
                 module: self.module.clone(),
             });
         }
@@ -1258,6 +1317,9 @@ pub enum ModuleApplyReceiptError {
     Contribution {
         module: ModuleId,
     },
+    Grade {
+        module: ModuleId,
+    },
     Transaction {
         expected: ModuleApplyTransactionId,
         actual: ModuleApplyTransactionId,
@@ -1291,6 +1353,9 @@ pub fn prepare_module_apply(
                     schema: preflight.schema(),
                     module: preflight.transaction().contribution().module().id.clone(),
                     contribution: preflight.transaction().contribution().clone(),
+                    grade: ModuleApplyGrade::from_completeness(
+                        preflight.transaction().contribution().completeness(),
+                    ),
                     transaction_id: preflight.transaction_id(),
                     base_provenance_root: base.manifest().root(),
                     result_provenance_root: candidate.manifest().root(),
@@ -1625,6 +1690,20 @@ mod tests {
     }
 
     fn record(contributions: Vec<ExtensionContribution>) -> ModuleContributionRecord {
+        record_with_completeness(
+            contributions,
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
+                vec![],
+            ),
+        )
+    }
+
+    fn record_with_completeness(
+        contributions: Vec<ExtensionContribution>,
+        completeness: ProvenanceCompleteness,
+    ) -> ModuleContributionRecord {
         let epoch = epoch();
         ModuleContributionRecord::new(
             ModuleRecord::new(
@@ -1641,11 +1720,7 @@ mod tests {
             vec![name("fixture.decl")],
             vec![name("fixture.extra")],
             contributions,
-            ProvenanceCompleteness::new(
-                CaptureStatus::Complete,
-                PayloadTransparency::Understood,
-                vec![],
-            ),
+            completeness,
         )
     }
 
@@ -2200,6 +2275,28 @@ mod tests {
             ))
         ));
 
+        let mut tampered_grade_plan =
+            match prepare_module_apply(&checked, &base, &declaration_candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                Outcome::Complete(Ok(other)) => {
+                    panic!("expected a prepared application plan, got {other:?}")
+                }
+                other => panic!("expected a complete application plan, got {other:?}"),
+            };
+        tampered_grade_plan.receipt.grade = ModuleApplyGrade::AppliedIncomplete {
+            completeness: ProvenanceCompleteness::new(
+                CaptureStatus::Partial,
+                PayloadTransparency::Understood,
+                vec![],
+            ),
+        };
+        assert!(matches!(
+            tampered_grade_plan.commit(&base),
+            Err(ModuleApplyCommitError::Receipt(
+                ModuleApplyReceiptError::Grade { .. }
+            ))
+        ));
+
         let mut tampered_transaction_plan =
             match prepare_module_apply(&checked, &base, &declaration_candidate) {
                 Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
@@ -2230,6 +2327,16 @@ mod tests {
         assert_eq!(committed.state().graph().len(), 1);
         assert_eq!(committed.receipt().module(), &contribution.module().id);
         assert_eq!(committed.receipt().contribution(), &contribution);
+        assert!(matches!(
+            committed.receipt().grade(),
+            ModuleApplyGrade::Complete { .. }
+        ));
+        assert!(
+            committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::FineInvalidation)
+        );
         assert_eq!(
             committed.receipt().transaction_id(),
             checked.transaction_id()
@@ -2328,5 +2435,75 @@ mod tests {
             Err(ModuleApplyRetryError::PayloadConflict { .. })
         ));
         assert_eq!(base.graph().len(), 0);
+    }
+
+    #[test]
+    fn partial_capture_publishes_as_applied_incomplete_without_cache_authority() {
+        let environment = Environment::new();
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(environment, empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
+            vec![],
+        );
+        let checked = preflight_module_apply(transaction(
+            record_with_completeness(vec![], completeness.clone()),
+            vec![],
+        ))
+        .expect("partial capture still binds every retained payload exactly");
+        let declaration_candidate = base
+            .environment()
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+        let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
+                plan.commit(&base).expect("base remains current")
+            }
+            Outcome::Complete(Ok(ModuleApplyPlan::ExactResultRetry(other))) => {
+                panic!("first partial application unexpectedly retried: {other:?}")
+            }
+            other => panic!("expected a complete partial application plan, got {other:?}"),
+        };
+        assert!(matches!(
+            committed.receipt().grade(),
+            ModuleApplyGrade::AppliedIncomplete { completeness: actual }
+                if actual == &completeness
+        ));
+        assert!(
+            committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::Inspection)
+        );
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::CompleteInventory)
+        );
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::AuthoritativeCache)
+        );
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::FineInvalidation)
+        );
+        assert_eq!(base.graph().len(), 0);
+        assert_eq!(committed.state().graph().len(), 1);
     }
 }
