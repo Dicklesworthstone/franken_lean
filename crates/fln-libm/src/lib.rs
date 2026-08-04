@@ -387,7 +387,7 @@ pub fn exp2(x: f64) -> f64 {
 
 /// Exponential minus one, using a series near zero to avoid cancellation.
 pub fn expm1(x: f64) -> f64 {
-    if abs(x) < 0.03125 {
+    if abs(x) <= 0.5 {
         let mut term = x;
         let mut sum = x;
         for n in 2..=22 {
@@ -449,7 +449,7 @@ pub fn log1p(x: f64) -> f64 {
     if x == -1.0 {
         return f64::NEG_INFINITY;
     }
-    if abs(x) < 0.03125 {
+    if abs(x) <= 0.5 {
         let mut term = x;
         let mut sum = x;
         for n in 2..=80 {
@@ -778,11 +778,33 @@ mod tests {
     #[test]
     fn small_hyperbolic_vectors_preserve_low_bits() {
         for (input, expected_sinh, expected_asinh) in [
-            (0.1, 0x3fb9_a487_337b_59b3, 0x3fb9_8eb9_e7e5_fc40),
-            (-0.1, 0xbfb9_a487_337b_59b3, 0xbfb9_8eb9_e7e5_fc40),
+            (0.1, 0x3fb9_a487_337b_59b3, 0x3fb9_8eb9_e7e5_fc3f),
+            (-0.1, 0xbfb9_a487_337b_59b3, 0xbfb9_8eb9_e7e5_fc3f),
         ] {
             assert_eq!(sinh(input).to_bits(), expected_sinh);
             assert_eq!(asinh(input).to_bits(), expected_asinh);
+        }
+    }
+
+    #[test]
+    fn cancellation_sensitive_vectors_preserve_low_bits() {
+        for (input, expected_expm1, expected_log1p, expected_tanh) in [
+            (
+                0.1,
+                0x3fba_ec7b_35a0_0d3a,
+                0x3fb8_663f_793c_46c8,
+                0x3fb9_83d7_795f_413b,
+            ),
+            (
+                -0.1,
+                0xbfb8_5c93_3156_a62c,
+                0xbfba_f8e8_210a_415e,
+                0xbfb9_83d7_795f_413b,
+            ),
+        ] {
+            assert_eq!(expm1(input).to_bits(), expected_expm1);
+            assert_eq!(log1p(input).to_bits(), expected_log1p);
+            assert_eq!(tanh(input).to_bits(), expected_tanh);
         }
     }
 
