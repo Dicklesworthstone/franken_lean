@@ -25,8 +25,7 @@ const QUARTER_PI: f64 = f64::from_bits(0x3fe9_21fb_5444_2d18);
 const INV_LN2: f64 = f64::from_bits(0x3ff7_1547_652b_82fe);
 const LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fee0_0000);
 const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
-const SQRT_HALF: f64 = f64::from_bits(0x3fe6_a09e_667f_3bcd);
-const SQRT_TWO: f64 = f64::from_bits(0x3ff6_a09e_667f_3bcd);
+const LOG_REDUCTION_LOWER: f64 = f64::from_bits(0x3fe5_5555_5555_5555);
 const LN10: f64 = f64::from_bits(0x4002_6bb1_bbb5_5516);
 const LOG_MAX: f64 = 709.782_712_893_384;
 const LOG_2_MAX: f64 = 710.475_860_073_943_9;
@@ -472,7 +471,7 @@ pub fn expm1(x: f64) -> f64 {
     }
 }
 
-/// Natural logarithm through binary decomposition and an atanh series.
+/// Natural logarithm through binary decomposition and a compensated series.
 pub fn log(x: f64) -> f64 {
     if invalid(x) || x < 0.0 {
         return canonical_nan();
@@ -484,23 +483,25 @@ pub fn log(x: f64) -> f64 {
         return f64::INFINITY;
     }
     let (mut m, mut e) = frexp(x);
-    if m < SQRT_HALF {
+    // Keep m in [2/3, 4/3).  The resulting f = m - 1 has magnitude at most
+    // 1/3, so the fixed series converges quickly without a rounded division.
+    if m < LOG_REDUCTION_LOWER {
         m *= 2.0;
         e -= 1;
     }
-    if m > SQRT_TWO {
-        m *= 0.5;
-        e += 1;
+    let fraction = m - 1.0;
+    let mut term = fraction;
+    let mut sum = fraction;
+    let mut compensation = 0.0;
+    for n in 2..=40 {
+        term *= -fraction;
+        let contribution = term / n as f64;
+        let adjusted = contribution - compensation;
+        let next = sum + adjusted;
+        compensation = (next - sum) - adjusted;
+        sum = next;
     }
-    let z = (m - 1.0) / (m + 1.0);
-    let z2 = z * z;
-    let mut term = z;
-    let mut sum = z;
-    for n in 1..=40 {
-        term *= z2;
-        sum += term / (2 * n + 1) as f64;
-    }
-    (2.0 * sum) + (e as f64) * LN2_HI + (e as f64) * LN2_LO
+    (sum + (e as f64) * LN2_LO) + (e as f64) * LN2_HI
 }
 
 /// Base-two logarithm.
@@ -1007,6 +1008,25 @@ mod tests {
             (1024.0, 10.0),
         ] {
             same_bits(log2(input), expected);
+        }
+    }
+
+    #[test]
+    fn log_reduction_reference_vectors_stay_within_one_ulp() {
+        for (input, expected) in [
+            (0x3fe6_a09e_667f_2c55, 0xbfd6_2e42_fefa_65af),
+            (0x3ff2_1fe8_642e_b8eb, 0x3fbf_eb43_bd4c_81b0),
+            (0x3fe5_5555_5555_5554, 0xbfd9_f323_ecbf_9850),
+            (0x3fe5_5555_5555_5555, 0xbfd9_f323_ecbf_984d),
+            (0x3fe5_5555_5555_5556, 0xbfd9_f323_ecbf_984a),
+            (0x0000_0000_0000_0001, 0xc087_4385_446d_71c3),
+            (0x0010_0000_0000_0000, 0xc086_232b_dd7a_bcd2),
+            (0x7fef_ffff_ffff_ffff, 0x4086_2e42_fefa_39ef),
+        ] {
+            assert!(
+                ulp_distance(log(f64::from_bits(input)), f64::from_bits(expected)) <= 1,
+                "input={input:016x}"
+            );
         }
     }
 
