@@ -4863,7 +4863,13 @@ def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
         status = record.get("status")
         if not isinstance(bead_id, str) or not bead_id:
             raise EvidenceError(f"{path}:{number}: bead id is missing")
-        if status not in {"open", "in_progress", "closed", "tombstone"}:
+        # `blocked` is accepted PROVISIONALLY — bead franken_lean-px33, cc_2, 2026-08-04. `br`
+        # sets it (it refuses only the terminal states), four beads carried it, and refusing it
+        # here took `real_verification_manifest_covers_the_live_tracker` down for every pane while
+        # the owner was quota-blocked and could not clear them. See
+        # `derived_verification_coverage_state` for the mapping and for the word's OTHER meaning
+        # on this side, which px33 exists to have decided properly.
+        if status not in {"open", "in_progress", "blocked", "closed", "tombstone"}:
             raise EvidenceError(
                 f"{path}:{number}: bead {bead_id!r} has unsupported status {status!r}"
             )
@@ -4971,8 +4977,17 @@ def closure_citation_diagnosis(
 
 
 def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
-    """Derive lifecycle state from the tracker; coverage rows never declare it."""
-    if bead_status == "open":
+    """Derive lifecycle state from the tracker; coverage rows never declare it.
+
+    A bead at status ``blocked`` derives EXACTLY as ``open`` does, and that is the conservative
+    choice rather than an opinion: a blocked bead is unfinished work, so it must not reach
+    ``complete`` (which would owe evidence and invoke the closure-binding law) and must not escape
+    anything an open bead owes. Note the collision this sits on — ``blocked`` is ALSO a derived
+    state here, meaning the ROW declared ``skip: blocked``, which is an evidence disposition rather
+    than a work state. One word, two concepts, and bead ``franken_lean-px33`` exists to have that
+    decided deliberately. Until it is, this mapping adds no obligation and removes none.
+    """
+    if bead_status in {"open", "blocked"}:
         return "blocked" if skip == "blocked" else "planned"
     if bead_status == "in_progress":
         return "active"
