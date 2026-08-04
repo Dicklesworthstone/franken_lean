@@ -3221,6 +3221,126 @@ fn suite_lock_reference_pin() -> String {
         .to_string()
 }
 
+/// The corpus revision is an input identity, not a directory name: a corpus
+/// checkout at another revision can be complete and still cannot substantiate
+/// the pinned whole-corpus lane.
+fn suite_lock_corpus_commit() -> String {
+    const SUITE_LOCK: &str = include_str!("../../../SUITE.lock");
+    SUITE_LOCK
+        .lines()
+        .find(|line| line.starts_with("corpus "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("commit="))
+        })
+        .expect("SUITE.lock must pin the corpus with a commit= field")
+        .to_string()
+}
+
+/// Corpus provisioning is host state, never a repository fixture. Keep the
+/// discovery seam in one place so the resurrection sweep and later kernel
+/// differential cannot disagree on what they accepted as the Mathlib corpus.
+fn mathlib_corpus_root() -> PathBuf {
+    std::env::var_os("FLN_MATHLIB_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/tmp/mathlib4-corpus"))
+}
+
+/// Refuse before an expensive whole-corpus run when its external input cannot
+/// identify itself. This is intentionally stronger than `is_dir()`: a different
+/// Mathlib commit, a symlinked checkout, or a source-only checkout would make a
+/// seemingly successful sweep evidence about the wrong world.
+fn preflight_mathlib_corpus() -> Result<PathBuf, String> {
+    let corpus = mathlib_corpus_root();
+    let metadata = fs::symlink_metadata(&corpus)
+        .map_err(|error| format!("corpus root {} is unavailable: {error}", corpus.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "corpus root {} must be a real directory, not a symlink or non-directory",
+            corpus.display()
+        ));
+    }
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(&corpus)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot inspect corpus checkout {}: {error}",
+                corpus.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "corpus root {} is not a readable git checkout: {}",
+            corpus.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let expected = suite_lock_corpus_commit();
+    if actual != expected {
+        return Err(format!(
+            "corpus commit {actual} != SUITE.lock corpus commit {expected}"
+        ));
+    }
+    let library = corpus.join(".lake/build/lib/lean/Mathlib");
+    let library_metadata = fs::symlink_metadata(&library).map_err(|error| {
+        format!(
+            "pinned corpus has no built Mathlib olean root {}: {error}",
+            library.display()
+        )
+    })?;
+    if library_metadata.file_type().is_symlink() || !library_metadata.is_dir() {
+        return Err(format!(
+            "built Mathlib olean root {} must be a real directory",
+            library.display()
+        ));
+    }
+    Ok(library)
+}
+
+/// The cheap first gate for `franken_lean-t6r7`: establish that a full
+/// resurrection walk has the exact corpus it names before it touches thousands
+/// of oleans. It is on demand because host provisioning is an external input;
+/// a missing corpus emits a typed BLOCKED row and fails rather than becoming a
+/// green zero-module scan.
+///
+/// Run explicitly:
+/// `cargo test --locked -p fln-conformance --test kernel_replay \
+///   whole_mathlib_corpus_resurrection_preflight -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "on-demand host preflight for the whole-Mathlib corpus lane (franken_lean-t6r7)"]
+fn whole_mathlib_corpus_resurrection_preflight() {
+    match preflight_mathlib_corpus() {
+        Ok(library) => {
+            let mut paths = Vec::new();
+            collect_present_oleans(&library, &mut paths)
+                .expect("enumerate the pinned built Mathlib corpus");
+            paths.sort();
+            assert!(
+                paths.len() >= 8_000,
+                "whole-Mathlib preflight found only {} oleans under {}; a truncated corpus is not a smaller green sweep",
+                paths.len(),
+                library.display()
+            );
+            println!(
+                "{{\"schema\":\"fln-t6r7-mathlib-preflight/1\",\"status\":\"ready\",\"corpus_commit\":{},\"mathlib_oleans\":{}}}",
+                json_string(&suite_lock_corpus_commit()),
+                paths.len(),
+            );
+        }
+        Err(reason) => {
+            println!(
+                "{{\"schema\":\"fln-t6r7-mathlib-preflight/1\",\"status\":\"blocked\",\"reason\":{}}}",
+                json_string(&reason),
+            );
+            panic!("whole-Mathlib corpus preflight blocked: {reason}");
+        }
+    }
+}
+
 /// The executable corpus obligation. It remains ignored while fln-7odd is
 /// open because the selected oracle itself supplies no verdict for 1,425
 /// decoded rows; enabling a gate that is known to fail before that contract is
