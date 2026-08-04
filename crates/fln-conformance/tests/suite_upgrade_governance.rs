@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use fln_conformance::suite_upgrade::{
-    self, Candidate, CandidateReceipt, LedgerState, LockChange, Waiver,
+    self, Candidate, CandidateEvidenceRoots, CandidateReceipt, LedgerState, LockChange, Waiver,
 };
 
 fn root() -> std::path::PathBuf {
@@ -45,6 +45,19 @@ fn complete_receipt(change: LockChange) -> CandidateReceipt {
         rollback_root: root_identity('1'),
         external_evidence_root: root_identity('2'),
         final_current_lock_root: root_identity('a'),
+    }
+}
+
+fn observed_roots(receipt: &CandidateReceipt) -> CandidateEvidenceRoots {
+    CandidateEvidenceRoots {
+        current_lock_root: receipt.old_lock_root.clone(),
+        candidate_lock_root: receipt.candidate_lock_root.clone(),
+        closure_root: receipt.closure_root.clone(),
+        contract_and_census_root: receipt.contract_and_census_root.clone(),
+        tribunal_root: receipt.tribunal_root.clone(),
+        migration_root: receipt.migration_root.clone(),
+        rollback_root: receipt.rollback_root.clone(),
+        external_evidence_root: receipt.external_evidence_root.clone(),
     }
 }
 
@@ -173,6 +186,45 @@ fn candidate_receipt_ndjson_is_strict_and_canonical() {
         CandidateReceipt::from_ndjson(missing_newline).is_err(),
         "a receipt without final newline must refuse"
     );
+}
+
+#[test]
+fn candidate_receipt_binds_every_observed_evidence_root() {
+    let receipt = complete_receipt(LockChange::Upgrade);
+    receipt
+        .validate_observed_roots(&observed_roots(&receipt))
+        .expect("the exact observed candidate roots join");
+
+    for field in [
+        "current_lock_root",
+        "candidate_lock_root",
+        "closure_root",
+        "contract_and_census_root",
+        "tribunal_root",
+        "migration_root",
+        "rollback_root",
+        "external_evidence_root",
+    ] {
+        let mut observed = observed_roots(&receipt);
+        match field {
+            "current_lock_root" => observed.current_lock_root = root_identity('3'),
+            "candidate_lock_root" => observed.candidate_lock_root = root_identity('3'),
+            "closure_root" => observed.closure_root = root_identity('3'),
+            "contract_and_census_root" => observed.contract_and_census_root = root_identity('3'),
+            "tribunal_root" => observed.tribunal_root = root_identity('3'),
+            "migration_root" => observed.migration_root = root_identity('3'),
+            "rollback_root" => observed.rollback_root = root_identity('3'),
+            "external_evidence_root" => observed.external_evidence_root = root_identity('3'),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            receipt.validate_observed_roots(&observed),
+            Err(format!(
+                "candidate receipt `{field}` does not match the observed candidate evidence root"
+            )),
+            "substituted `{field}` evidence must not join"
+        );
+    }
 }
 
 #[test]

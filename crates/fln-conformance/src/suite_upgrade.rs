@@ -224,6 +224,21 @@ pub struct CandidateReceipt {
     pub final_current_lock_root: String,
 }
 
+/// Roots observed by the isolated-candidate runner. The runner owns deriving
+/// these from files; this model owns refusing a receipt that names different
+/// inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateEvidenceRoots {
+    pub current_lock_root: String,
+    pub candidate_lock_root: String,
+    pub closure_root: String,
+    pub contract_and_census_root: String,
+    pub tribunal_root: String,
+    pub migration_root: String,
+    pub rollback_root: String,
+    pub external_evidence_root: String,
+}
+
 impl CandidateReceipt {
     pub fn validate(&self) -> Result<(), String> {
         if self.candidate_id.is_empty()
@@ -309,6 +324,58 @@ impl CandidateReceipt {
             return Err("candidate receipt NDJSON is parseable but not canonical".to_string());
         }
         Ok(receipt)
+    }
+
+    /// Refuses stale or substituted evidence even when every named root is
+    /// individually well-formed. The wrapper calls this before it runs any
+    /// candidate-dependent command.
+    pub fn validate_observed_roots(&self, observed: &CandidateEvidenceRoots) -> Result<(), String> {
+        self.validate()?;
+        for (name, expected, actual) in [
+            (
+                "current_lock_root",
+                &self.old_lock_root,
+                &observed.current_lock_root,
+            ),
+            (
+                "candidate_lock_root",
+                &self.candidate_lock_root,
+                &observed.candidate_lock_root,
+            ),
+            ("closure_root", &self.closure_root, &observed.closure_root),
+            (
+                "contract_and_census_root",
+                &self.contract_and_census_root,
+                &observed.contract_and_census_root,
+            ),
+            (
+                "tribunal_root",
+                &self.tribunal_root,
+                &observed.tribunal_root,
+            ),
+            (
+                "migration_root",
+                &self.migration_root,
+                &observed.migration_root,
+            ),
+            (
+                "rollback_root",
+                &self.rollback_root,
+                &observed.rollback_root,
+            ),
+            (
+                "external_evidence_root",
+                &self.external_evidence_root,
+                &observed.external_evidence_root,
+            ),
+        ] {
+            if expected != actual {
+                return Err(format!(
+                    "candidate receipt `{name}` does not match the observed candidate evidence root"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
