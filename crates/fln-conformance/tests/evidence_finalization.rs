@@ -5069,7 +5069,7 @@ fn the_rch_fuzz_corpus_exclusion_is_still_inert() {
 
     // The decoy. The real population under `fuzz/` is empty, so without this the assertion
     // below would pass with the classifier deleted. Plant one and require it to be seen.
-    let planted = vec![
+    let planted = [
         "fuzz/corpus".to_string(),
         "crates/fln-syntax/tests/corpus".to_string(),
     ];
