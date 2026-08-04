@@ -726,6 +726,92 @@ pub enum ModuleApplyCandidateError {
     DeclarationDelta(DeclarationDeltaError),
 }
 
+/// Classify whether one preflight is the exact already-published result.
+///
+/// This is intentionally narrower than descendant retry: it does not infer
+/// ancestry from matching roots or permit a later state to stand in for the
+/// original result. Those cases require the lifecycle-owned ancestry witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyRetryDisposition {
+    NotCurrentResult {
+        requested: ModuleProvenanceRoot,
+        current: ModuleProvenanceRoot,
+    },
+    ExactResult {
+        module: ModuleId,
+        transaction_id: ModuleApplyTransactionId,
+        provenance_root: ModuleProvenanceRoot,
+    },
+}
+
+/// A same-root retry is never silently treated as exact when its canonical value or
+/// retained declaration values differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyRetryError {
+    SupersededPreflightSchema {
+        schema: u16,
+    },
+    State(ModuleApplyStateError),
+    RootCollision {
+        root: ModuleProvenanceRoot,
+    },
+    MissingPayload {
+        module: ModuleId,
+    },
+    PayloadConflict {
+        module: ModuleId,
+        expected: ModuleApplyTransactionId,
+        actual: ModuleApplyTransactionId,
+    },
+}
+
+/// Recognize only an exact retry against its already-published result.
+///
+/// A different current root is a normal non-idempotent result rather than a refusal;
+/// it may be an earlier base, a later descendant, or an unrelated state. This function
+/// deliberately exposes none of those as an accepted retry without a separate
+/// ancestry proof.
+pub fn classify_exact_result_retry(
+    preflight: &PreflightedModuleApply,
+    current: &ModuleApplyState,
+) -> Result<ModuleApplyRetryDisposition, ModuleApplyRetryError> {
+    if preflight.schema != MODULE_APPLY_SCHEMA_VERSION {
+        return Err(ModuleApplyRetryError::SupersededPreflightSchema {
+            schema: preflight.schema,
+        });
+    }
+    current.verify().map_err(ModuleApplyRetryError::State)?;
+    let current_root = current.manifest().root();
+    if current_root != preflight.manifest_root() {
+        return Ok(ModuleApplyRetryDisposition::NotCurrentResult {
+            requested: preflight.manifest_root(),
+            current: current_root,
+        });
+    }
+    if current.manifest() != preflight.transaction().manifest() {
+        return Err(ModuleApplyRetryError::RootCollision { root: current_root });
+    }
+    let module = preflight.transaction().contribution().module().id.clone();
+    let actual = ModuleApplyTransactionId::from_state(current, &module).ok_or_else(|| {
+        ModuleApplyRetryError::MissingPayload {
+            module: module.clone(),
+        }
+    })?;
+    let expected = preflight.transaction_id();
+    if actual != expected {
+        return Err(ModuleApplyRetryError::PayloadConflict {
+            module,
+            expected,
+            actual,
+        });
+    }
+    Ok(ModuleApplyRetryDisposition::ExactResult {
+        module,
+        transaction_id: expected,
+        provenance_root: current_root,
+    })
+}
+
 /// Bind a kernel-produced declaration candidate to a preflighted payload envelope.
 ///
 /// The temporary `Vec` clones `Arc` handles only; neither declaration payload bytes nor
@@ -1886,6 +1972,10 @@ mod tests {
             vec![ExtensionPayload::new(0, descriptor, 0, &b"candidate"[..])],
         ))
         .expect("payloads preflight");
+        assert!(matches!(
+            classify_exact_result_retry(&checked, &base),
+            Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. })
+        ));
         let declaration_candidate = base
             .environment()
             .add_decl((*checked.transaction().declarations()[0]).clone())
@@ -1988,6 +2078,34 @@ mod tests {
             committed.receipt().result_provenance_root(),
             committed.state().manifest().root()
         );
+        assert!(matches!(
+            classify_exact_result_retry(&checked, committed.state()),
+            Ok(ModuleApplyRetryDisposition::ExactResult {
+                transaction_id,
+                ..
+            }) if transaction_id == checked.transaction_id()
+        ));
+
+        let altered_declaration = match checked.transaction().declarations()[0].as_ref() {
+            ConstantInfo::Axiom(axiom) => {
+                let mut altered = axiom.clone();
+                altered.is_unsafe = true;
+                Arc::new(ConstantInfo::Axiom(altered))
+            }
+            other => panic!("fixture declaration changed kind: {other:?}"),
+        };
+        let altered = preflight_module_apply(ModuleApplyTransaction::new(
+            Arc::clone(&checked.transaction().manifest),
+            contribution,
+            vec![altered_declaration],
+            checked.transaction().extra_declarations().to_vec(),
+            checked.transaction().extension_payloads().to_vec(),
+        ))
+        .expect("same-name fixture mutation remains preflight-valid");
+        assert!(matches!(
+            classify_exact_result_retry(&altered, committed.state()),
+            Err(ModuleApplyRetryError::PayloadConflict { .. })
+        ));
         assert_eq!(base.graph().len(), 0);
     }
 }
