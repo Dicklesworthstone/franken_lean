@@ -30,6 +30,7 @@ pub mod effective_imports;
 pub mod environment;
 pub mod extensions;
 pub mod intern;
+pub mod module_apply;
 pub mod modules;
 pub mod pmap;
 pub mod provenance;
