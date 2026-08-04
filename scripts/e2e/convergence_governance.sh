@@ -126,7 +126,7 @@ br init --prefix cg --json --no-auto-flush --no-auto-import > "$SCRATCH/br-init.
 mkdir "$SCRATCH/ci"
 printf '%s\n' '{"schema":"fln.verification-manifest/2","bead":"e2e","gate_ids":["G0"],"kind":"coverage"}' \
   > "$SCRATCH/ci/VERIFICATION_MANIFEST.jsonl"
-event toolchain 'sealed command identities' "python=$(python3 --version 2>&1) br=$(br --version 2>&1) bv=$(bv --version 2>&1) judge_sha256=$(sha256_file "$POLICY_JUDGE")" 'br/bv/python versions collected before tracker mutation'
+event toolchain 'sealed command identities' "python=$(python3 -I -S --version 2>&1) br=$(br --version 2>&1) bv=$(bv --version 2>&1) judge_sha256=$(sha256_file "$POLICY_JUDGE")" 'br/bv/python versions collected before tracker mutation'
 ROOT_BEAD="$(create root-prerequisite)"
 READY_BEAD="$(create ready-g0-blocker)"
 BLOCKED_BEAD="$(create dependency-blocked-g0-blocker)"

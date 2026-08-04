@@ -2,7 +2,7 @@
 # suite_upgrade_candidate_preflight.sh — refuse an incomplete suite-upgrade
 # candidate before the governed no-mock runner is allowed to derive roots or
 # invoke Cargo/Tribunal work. This is deliberately a preflight, not an
-# fln.e2e/2 lane: no real candidate evidence bundle exists at HEAD yet.
+# evidence-bundle lane: no real candidate evidence bundle exists at HEAD yet.
 
 set -Eeuo pipefail
 
