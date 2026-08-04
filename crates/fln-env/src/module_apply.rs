@@ -156,6 +156,7 @@ pub struct ModuleApplyState {
     graph: ModuleGraph,
     manifest: Arc<ModuleProvenanceManifest>,
     indexes: ModuleProvenanceIndexes,
+    payloads: Arc<[AppliedModulePayload]>,
 }
 
 impl ModuleApplyState {
@@ -166,6 +167,20 @@ impl ModuleApplyState {
         environment: Environment,
         graph: ModuleGraph,
         manifest: Arc<ModuleProvenanceManifest>,
+    ) -> Result<Self, ModuleApplyStateError> {
+        Self::from_parts_with_payloads(environment, graph, manifest, vec![])
+    }
+
+    /// Join immutable components with the exact payload carriers they commit.
+    ///
+    /// `payloads` is canonicalised by module identity and then checked against every
+    /// manifest record. A nonempty manifest with an empty carrier array is refused:
+    /// an index-only state is not an applied module state.
+    pub fn from_parts_with_payloads(
+        environment: Environment,
+        graph: ModuleGraph,
+        manifest: Arc<ModuleProvenanceManifest>,
+        mut payloads: Vec<AppliedModulePayload>,
     ) -> Result<Self, ModuleApplyStateError> {
         manifest
             .verify_self_consistency()
@@ -182,6 +197,18 @@ impl ModuleApplyState {
                 manifest: manifest.records().len(),
             });
         }
+        payloads.sort_by(|left, right| {
+            left.contribution()
+                .module()
+                .id
+                .cmp(&right.contribution().module().id)
+        });
+        if payloads.len() != manifest.records().len() {
+            return Err(ModuleApplyStateError::PayloadCount {
+                payloads: payloads.len(),
+                manifest: manifest.records().len(),
+            });
+        }
 
         let expected_declarations = manifest
             .facts()
@@ -194,7 +221,25 @@ impl ModuleApplyState {
                 manifest: expected_declarations,
             });
         }
-        for record in manifest.records() {
+        for (record, payload) in manifest.records().iter().zip(&payloads) {
+            if payload.contribution() != record {
+                return Err(ModuleApplyStateError::PayloadRecordMismatch {
+                    module: record.module().id.clone(),
+                });
+            }
+            verify_payload_declarations(
+                &environment,
+                record.declarations(),
+                payload.declarations(),
+                DeclarationClass::Declaration,
+            )?;
+            verify_payload_declarations(
+                &environment,
+                record.extra_declarations(),
+                payload.extra_declarations(),
+                DeclarationClass::ExtraDeclaration,
+            )?;
+            verify_payload_extensions(manifest.epoch(), record, payload.extension_payloads())?;
             let module = record.module().id.clone();
             match graph.record(&module) {
                 Some(actual) if actual == record.module() => {}
@@ -265,6 +310,7 @@ impl ModuleApplyState {
             graph,
             manifest,
             indexes,
+            payloads: payloads.into(),
         })
     }
 
@@ -284,12 +330,18 @@ impl ModuleApplyState {
         &self.indexes
     }
 
+    /// Exact Arc-backed values retained for every manifest contribution.
+    pub fn applied_payloads(&self) -> &[AppliedModulePayload] {
+        &self.payloads
+    }
+
     /// Recheck the single-state invariant before a later apply plan consumes it.
     pub fn verify(&self) -> Result<(), ModuleApplyStateError> {
-        let rebuilt = Self::from_parts(
+        let rebuilt = Self::from_parts_with_payloads(
             self.environment.clone(),
             self.graph.clone(),
             Arc::clone(&self.manifest),
+            self.payloads.to_vec(),
         )?;
         if rebuilt.indexes != self.indexes {
             return Err(ModuleApplyStateError::IndexInconsistent(
@@ -320,6 +372,45 @@ pub enum ModuleApplyStateError {
     GraphRecordMismatch {
         module: ModuleId,
     },
+    PayloadCount {
+        payloads: usize,
+        manifest: usize,
+    },
+    PayloadRecordMismatch {
+        module: ModuleId,
+    },
+    PayloadDeclarationCount {
+        class: DeclarationClass,
+        expected: usize,
+        actual: usize,
+    },
+    PayloadDeclarationName {
+        class: DeclarationClass,
+        index: usize,
+        expected: Name,
+        actual: Name,
+    },
+    PayloadDeclarationValue {
+        class: DeclarationClass,
+        name: Name,
+    },
+    PayloadExtensionCount {
+        module: ModuleId,
+        expected: usize,
+        actual: usize,
+    },
+    PayloadExtensionOccurrence {
+        module: ModuleId,
+        payload_index: usize,
+    },
+    PayloadExtensionDescriptor {
+        module: ModuleId,
+        payload_index: usize,
+    },
+    PayloadExtensionIdentity {
+        module: ModuleId,
+        payload_index: usize,
+    },
     ManifestFactOverflow,
     EnvironmentDeclarationCount {
         environment: usize,
@@ -342,6 +433,107 @@ pub enum ModuleApplyStateError {
         offset: usize,
     },
     IndexInconsistent(ModuleProvenanceError),
+}
+
+fn verify_payload_declarations(
+    environment: &Environment,
+    expected: &[Name],
+    payloads: &[Arc<ConstantInfo>],
+    class: DeclarationClass,
+) -> Result<(), ModuleApplyStateError> {
+    if expected.len() != payloads.len() {
+        return Err(ModuleApplyStateError::PayloadDeclarationCount {
+            class,
+            expected: expected.len(),
+            actual: payloads.len(),
+        });
+    }
+    for (index, (expected, payload)) in expected.iter().zip(payloads).enumerate() {
+        if payload.name() != expected {
+            return Err(ModuleApplyStateError::PayloadDeclarationName {
+                class,
+                index,
+                expected: expected.clone(),
+                actual: payload.name().clone(),
+            });
+        }
+        if environment.find(expected) != Some(payload.as_ref()) {
+            return Err(ModuleApplyStateError::PayloadDeclarationValue {
+                class,
+                name: expected.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_payload_extensions(
+    epoch: &crate::modules::ModuleEpoch,
+    record: &ModuleContributionRecord,
+    payloads: &[ExtensionPayload],
+) -> Result<(), ModuleApplyStateError> {
+    let expected = record
+        .extension_contributions()
+        .iter()
+        .map(|contribution| contribution.entries().len())
+        .sum::<usize>();
+    let module = record.module().id.clone();
+    if payloads.len() != expected {
+        return Err(ModuleApplyStateError::PayloadExtensionCount {
+            module,
+            expected,
+            actual: payloads.len(),
+        });
+    }
+
+    let mut payload_index = 0usize;
+    for (contribution_index, contribution) in record.extension_contributions().iter().enumerate() {
+        for (entry_index, expected_identity) in contribution.entries().iter().enumerate() {
+            let payload = payloads.get(payload_index).ok_or_else(|| {
+                ModuleApplyStateError::PayloadExtensionCount {
+                    module: module.clone(),
+                    expected,
+                    actual: payloads.len(),
+                }
+            })?;
+            let expected_ordinal = u64::try_from(entry_index).map_err(|_| {
+                ModuleApplyStateError::PayloadExtensionOccurrence {
+                    module: module.clone(),
+                    payload_index,
+                }
+            })?;
+            if payload.contribution_index() != contribution_index
+                || payload.source_ordinal() != expected_ordinal
+            {
+                return Err(ModuleApplyStateError::PayloadExtensionOccurrence {
+                    module: module.clone(),
+                    payload_index,
+                });
+            }
+            if payload.descriptor() != contribution.descriptor() {
+                return Err(ModuleApplyStateError::PayloadExtensionDescriptor {
+                    module: module.clone(),
+                    payload_index,
+                });
+            }
+            if ExtensionEntryId::derive(epoch, payload.descriptor(), payload.payload())
+                != *expected_identity
+            {
+                return Err(ModuleApplyStateError::PayloadExtensionIdentity {
+                    module: module.clone(),
+                    payload_index,
+                });
+            }
+            payload_index = payload_index.checked_add(1).ok_or_else(|| {
+                ModuleApplyStateError::PayloadExtensionCount {
+                    module: module.clone(),
+                    expected,
+                    actual: payloads.len(),
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 impl PreflightedModuleApply {
@@ -375,7 +567,7 @@ impl PreflightedModuleApply {
 /// still non-authoritative until an aggregate state includes it through a prepared,
 /// base-bound commit; the type only prevents a later state layer from losing the
 /// values that preflight actually checked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppliedModulePayload {
     contribution: ModuleContributionRecord,
     declarations: Arc<[Arc<ConstantInfo>]>,
@@ -535,6 +727,7 @@ pub enum ModuleApplyPrepareError {
         module: ModuleId,
     },
     Replay(ModuleApplyReplayError),
+    Payload(ModuleApplyCandidateError),
     Graph(crate::modules::ModuleGraphError),
     State(ModuleApplyStateError),
 }
@@ -621,9 +814,20 @@ pub fn prepare_module_apply_candidate(
         Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
         Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
     };
+    let payload = match AppliedModulePayload::from_preflight(preflight) {
+        Ok(payload) => payload,
+        Err(error) => return Outcome::complete(Err(ModuleApplyPrepareError::Payload(error))),
+    };
+    let mut payloads = base.applied_payloads().to_vec();
+    payloads.push(payload);
     Outcome::complete(
-        ModuleApplyState::from_parts(replayed, graph, Arc::clone(&transaction.manifest))
-            .map_err(ModuleApplyPrepareError::State),
+        ModuleApplyState::from_parts_with_payloads(
+            replayed,
+            graph,
+            Arc::clone(&transaction.manifest),
+            payloads,
+        )
+        .map_err(ModuleApplyPrepareError::State),
     )
 }
 
@@ -1063,6 +1267,16 @@ mod tests {
         )
     }
 
+    fn applied_payload(
+        contribution: ModuleContributionRecord,
+        extension_payloads: Vec<ExtensionPayload>,
+    ) -> AppliedModulePayload {
+        let checked = preflight_module_apply(transaction(contribution, extension_payloads))
+            .expect("fixture payload binding is valid");
+        AppliedModulePayload::from_preflight(&checked)
+            .expect("current preflight schema retains fixture payloads")
+    }
+
     fn graph_with(record: &ModuleContributionRecord) -> ModuleGraph {
         let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
             .into_admitted_value()
@@ -1205,7 +1419,7 @@ mod tests {
         let descriptor = descriptor();
         let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"payload");
         let contribution = record(vec![ExtensionContribution::new(
-            descriptor,
+            descriptor.clone(),
             0,
             Digest([0; 32]),
             vec![entry],
@@ -1218,12 +1432,44 @@ mod tests {
             )
             .expect("fixture manifest is valid"),
         );
-        let state = ModuleApplyState::from_parts(
+        let payload = applied_payload(
+            contribution.clone(),
+            vec![ExtensionPayload::new(
+                0,
+                descriptor.clone(),
+                0,
+                &b"payload"[..],
+            )],
+        );
+        let wrong_extension_payload = AppliedModulePayload {
+            contribution: contribution.clone(),
+            declarations: Arc::clone(&payload.declarations),
+            extra_declarations: Arc::clone(&payload.extra_declarations),
+            extension_payloads: vec![ExtensionPayload::new(
+                0,
+                descriptor,
+                0,
+                &b"wrong payload"[..],
+            )]
+            .into(),
+        };
+        let state = ModuleApplyState::from_parts_with_payloads(
             environment_with_extension(Some(b"payload")),
             graph_with(&contribution),
-            manifest,
+            Arc::clone(&manifest),
+            vec![payload],
         )
         .expect("joined state is coherent");
+
+        assert!(matches!(
+            ModuleApplyState::from_parts_with_payloads(
+                environment_with_extension(Some(b"payload")),
+                graph_with(&contribution),
+                manifest,
+                vec![wrong_extension_payload],
+            ),
+            Err(ModuleApplyStateError::PayloadExtensionIdentity { .. })
+        ));
 
         state.verify().expect("stored state remains coherent");
         let owner = state
@@ -1253,7 +1499,7 @@ mod tests {
         let descriptor = descriptor();
         let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"payload");
         let contribution = record(vec![ExtensionContribution::new(
-            descriptor,
+            descriptor.clone(),
             0,
             Digest([0; 32]),
             vec![entry],
@@ -1269,8 +1515,17 @@ mod tests {
         let environment = environment_with_extension(None);
         let graph = graph_with(&contribution);
 
+        let payload = applied_payload(
+            contribution,
+            vec![ExtensionPayload::new(0, descriptor, 0, &b"payload"[..])],
+        );
         assert!(matches!(
-            ModuleApplyState::from_parts(environment.clone(), graph.clone(), manifest),
+            ModuleApplyState::from_parts_with_payloads(
+                environment.clone(),
+                graph.clone(),
+                manifest,
+                vec![payload],
+            ),
             Err(ModuleApplyStateError::ExtensionRange { .. })
         ));
         assert_eq!(environment.len(), 2);
@@ -1446,6 +1701,8 @@ mod tests {
         prepared.verify().expect("aggregate candidate is coherent");
         assert_eq!(prepared.graph().len(), 1);
         assert_eq!(prepared.manifest().records().len(), 1);
+        assert_eq!(prepared.applied_payloads().len(), 1);
+        assert!(prepared.applied_payloads()[0].shares_storage_with_preflight(&checked));
         assert_eq!(
             prepared
                 .environment()
