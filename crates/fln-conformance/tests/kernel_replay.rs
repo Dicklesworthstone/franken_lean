@@ -354,7 +354,9 @@ struct WorkItem {
 struct PreparedReplay {
     items: Vec<WorkItem>,
     unchecked: BTreeMap<&'static str, u64>,
-    nested_partial: u64,
+    /// Blocks with nested auxiliaries — all admitted under the FULL ruleset
+    /// (the partial path was retired by franken_lean-8ce).
+    nested_full: u64,
     final_env: Environment,
     decls_total: usize,
     units_total: usize,
@@ -452,7 +454,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
     let mut env = Environment::new();
     let mut items: Vec<WorkItem> = Vec::new();
     let mut unchecked: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut nested_partial: u64 = 0;
+    let mut nested_full: u64 = 0;
     let units_total = units.len();
     for u in order.into_iter().chain(cyclic) {
         let unit = &units[u];
@@ -473,7 +475,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
                     }
                 }
                 if types.iter().any(|t| t.num_nested > 0) {
-                    nested_partial += 1;
+                    nested_full += 1;
                 }
                 (
                     "block",
@@ -545,7 +547,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
     PreparedReplay {
         items,
         unchecked,
-        nested_partial,
+        nested_full,
         final_env: env,
         decls_total: infos.len(),
         units_total,
@@ -780,7 +782,7 @@ impl EmitCtx {
              \"budget_depth\":{},\"decls_total\":{},\"units_total\":{},\"units_checked\":{},\
              \"units_cyclic\":{},\"checked\":{},\"accepted\":{},\"rejected_total\":{},\
              \"inconclusive\":{},\"unchecked_nonsafe_with_unserialized_refs\":{},\
-             \"nested_partial_blocks\":{},\"verdict_stream_digest\":{},\
+             \"nested_partial_blocks\":0,\"nested_full_blocks\":{},\"verdict_stream_digest\":{},\
              \"final_logical_root\":{},\"steps_used_total\":{},\"max_depth_seen\":{},\
              \"monotonic_start_us\":{},\"monotonic_end_us\":{},\"duration_us\":{},\
              \"timing_used_as_gate\":false,\"process_exit\":0,\"signal\":null,\
@@ -809,7 +811,7 @@ impl EmitCtx {
                 .get("nonsafe_with_unserialized_refs")
                 .copied()
                 .unwrap_or(0),
-            prep.nested_partial,
+            prep.nested_full,
             json_string(&run.stream_digest),
             json_string(final_root),
             run.steps_total,
@@ -1295,8 +1297,8 @@ fn prelude_replays_through_the_kernel() {
     eprintln!(
         "kernel_replay census: checked={checked} accepted={accepted} \
          inconclusive={inconclusive} rejected={rejected:?} unchecked={unchecked:?} \
-         nested_partial_blocks={}",
-        prep.nested_partial
+         nested_partial_blocks=0 nested_full_blocks={}",
+        prep.nested_full
     );
     if !rejected_names.is_empty() {
         eprintln!("first rejections: {rejected_names:?}");

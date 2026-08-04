@@ -207,7 +207,8 @@ KERNEL_ADMISSION_CENSUS = {
     "rejected_total": 0,
     "inconclusive": 0,
     "unchecked_nonsafe_with_unserialized_refs": 6,
-    "nested_partial_blocks": 1,
+    "nested_partial_blocks": 0,
+    "nested_full_blocks": 1,
 }
 # The named single-defect admission mutants (bead franken_lean-ap6): every
 # one must be killed by a typed rejection in the fault matrix.
@@ -277,6 +278,7 @@ KERNEL_ADMISSION_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
     "inconclusive",
     "unchecked_nonsafe_with_unserialized_refs",
     "nested_partial_blocks",
+    "nested_full_blocks",
     "verdict_stream_digest",
     "final_logical_root",
     "steps_used_total",
@@ -10149,7 +10151,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         b"kernel_replay order: 1915 units over 2204 declarations\n"
         b'kernel_replay census: checked=2198 accepted=2198 inconclusive=0 '
         b'rejected={} unchecked={"nonsafe_with_unserialized_refs": 6} '
-        b"nested_partial_blocks=1\n"
+        b"nested_partial_blocks=0 nested_full_blocks=1\n"
     )
 
     def admission_validate(

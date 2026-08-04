@@ -975,4 +975,67 @@ mod tests {
         drop(retained_root);
         assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
     }
+
+    #[test]
+    fn iterative_drop_releases_every_recursive_expr_constructor_reference() {
+        let leaf = Expr::bvar(0).expect("small");
+        let mut roots = vec![
+            Expr::app(leaf.clone(), leaf.clone()),
+            Expr::lam(name("x"), leaf.clone(), leaf.clone(), BinderInfo::Default),
+            Expr::forall_e(name("x"), leaf.clone(), leaf.clone(), BinderInfo::Implicit),
+            Expr::let_e(name("x"), leaf.clone(), leaf.clone(), leaf.clone(), false),
+            Expr::mdata(KVMap::new(), leaf.clone()),
+            Expr::proj(name("S"), 0, leaf.clone()),
+        ];
+        assert_eq!(
+            Arc::strong_count(leaf.node_arc()),
+            12,
+            "every recursive field owns exactly one Arc"
+        );
+
+        // A deterministic permutation exercises last-owner release in an order
+        // unrelated to construction order.
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        while !roots.is_empty() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let index = (state as usize) % roots.len();
+            drop(roots.swap_remove(index));
+        }
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
+    }
+
+    #[test]
+    fn iterative_drop_drains_maximally_shared_expr_dag_after_clone_permutations() {
+        let leaf = Expr::bvar(0).expect("small");
+        let mut dag = leaf.clone();
+        let mut retained_roots = Vec::new();
+        for depth in 0_usize..64 {
+            dag = Expr::app(dag.clone(), dag.clone());
+            if depth.is_multiple_of(5) {
+                retained_roots.push(dag.clone());
+            }
+        }
+        retained_roots.push(dag);
+        assert_eq!(
+            Arc::strong_count(leaf.node_arc()),
+            3,
+            "the maximally shared bottom node has two DAG edges"
+        );
+
+        let mut state = 0x1319_8a2e_0370_7344_u64;
+        while !retained_roots.is_empty() {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            let index = (state as usize) % retained_roots.len();
+            drop(retained_roots.swap_remove(index));
+        }
+        assert_eq!(
+            Arc::strong_count(leaf.node_arc()),
+            1,
+            "no shared internal node may retain either leaf edge"
+        );
+    }
 }

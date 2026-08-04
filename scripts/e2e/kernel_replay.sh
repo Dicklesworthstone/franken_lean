@@ -331,7 +331,7 @@ for needle in (
     "inconclusive=0",
     "rejected={}",
     'unchecked={"nonsafe_with_unserialized_refs": 6}',
-    "nested_partial_blocks=1",
+    "nested_partial_blocks=0 nested_full_blocks=1",
 ):
     if needle not in line:
         raise SystemExit(f"census regressed: missing {needle!r} in {line!r}")
@@ -431,7 +431,7 @@ PY
     python3 "$AP6_CENSUS_CHECK" "$AP6_ART_DIR/admission_replay.err"
   ap6_assert_supervisor census_floor pass 0 0
   ap6_record_step census_floor \
-    "checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={nonsafe_with_unserialized_refs:6} nested_partial_blocks=1" \
+    "checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={nonsafe_with_unserialized_refs:6} nested_partial_blocks=0 nested_full_blocks=1" \
     "$AP6_LAST_CLASS/wrapper=$AP6_LAST_RC/child=$AP6_LAST_CHILD/census_artifact=admission_replay.err" \
     not_applicable pass 0 0 \
     "$AP6_SUBJECT_BEFORE" "$(ap6_hash_subject)"

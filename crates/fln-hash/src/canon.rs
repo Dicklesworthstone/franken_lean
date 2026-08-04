@@ -1142,6 +1142,211 @@ mod tests {
         RecursiveExprEncoder(recursive_expr_encoder_step).encode(expr, w);
     }
 
+    // Frozen test oracle for the recursive writer grammar that preceded 265f260.
+    // Keep this deliberately shallow-only: its purpose is byte compatibility, not
+    // lifecycle safety. Every nested canonical payload routes through the matching
+    // pre-change helper so the iterative implementation never acts as its own oracle.
+    fn prechange_name_body(name: &Name, w: &mut CanonWriter) {
+        fn components(name: &Name, out: &mut Vec<Name>) {
+            if name.is_anonymous() {
+                return;
+            }
+            components(&name.parent(), out);
+            out.push(name.clone());
+        }
+
+        let mut chain = Vec::new();
+        components(name, &mut chain);
+        w.u64(chain.len() as u64);
+        for link in chain {
+            match link.leaf() {
+                NameLeaf::Str(value) => {
+                    w.u8(NAME_STR);
+                    w.str(value);
+                }
+                NameLeaf::Num(value, false) => {
+                    w.u8(NAME_NUM);
+                    w.u64(value);
+                }
+                NameLeaf::Num(value, true) => {
+                    w.u8(NAME_NUM_OVERFLOW);
+                    w.u64(value);
+                }
+                NameLeaf::Anonymous => w.u8(NAME_ANON),
+            }
+        }
+    }
+
+    fn prechange_level_body(level: &Level, w: &mut CanonWriter) {
+        use fln_core::level::LevelView;
+
+        match level.view() {
+            LevelView::Zero => w.u8(LEVEL_ZERO),
+            LevelView::Succ(inner) => {
+                w.u8(LEVEL_SUCC);
+                prechange_level_body(inner, w);
+            }
+            LevelView::Max(left, right) => {
+                w.u8(LEVEL_MAX);
+                prechange_level_body(left, w);
+                prechange_level_body(right, w);
+            }
+            LevelView::IMax(left, right) => {
+                w.u8(LEVEL_IMAX);
+                prechange_level_body(left, w);
+                prechange_level_body(right, w);
+            }
+            LevelView::Param(name) => {
+                w.u8(LEVEL_PARAM);
+                prechange_name_body(name, w);
+            }
+            LevelView::MVar(id) => {
+                w.u8(LEVEL_MVAR);
+                prechange_name_body(&id.0, w);
+            }
+        }
+    }
+
+    fn prechange_kvmap_body(map: &KVMap, w: &mut CanonWriter) {
+        w.u64(map.entries().len() as u64);
+        for (key, value) in map.entries() {
+            prechange_name_body(key, w);
+            match value {
+                DataValue::OfString(value) => {
+                    w.u8(DV_STRING);
+                    w.str(value);
+                }
+                DataValue::OfBool(value) => {
+                    w.u8(DV_BOOL);
+                    w.bool(*value);
+                }
+                DataValue::OfName(value) => {
+                    w.u8(DV_NAME);
+                    prechange_name_body(value, w);
+                }
+                DataValue::OfNat(value) => {
+                    w.u8(DV_NAT);
+                    w.u64(*value);
+                }
+                DataValue::OfInt(value) => {
+                    w.u8(DV_INT);
+                    w.i64(*value);
+                }
+                DataValue::OfSyntax(value) => {
+                    w.u8(DV_SYNTAX);
+                    w.u64(value.0);
+                }
+            }
+        }
+    }
+
+    fn prechange_expr_body(expr: &Expr, w: &mut CanonWriter) {
+        match expr.node() {
+            ExprNode::BVar { idx } => {
+                w.u8(EXPR_BVAR);
+                w.u32(*idx);
+            }
+            ExprNode::FVar { id } => {
+                w.u8(EXPR_FVAR);
+                prechange_name_body(&id.0, w);
+            }
+            ExprNode::MVar { id } => {
+                w.u8(EXPR_MVAR);
+                prechange_name_body(&id.0, w);
+            }
+            ExprNode::Sort { level } => {
+                w.u8(EXPR_SORT);
+                prechange_level_body(level, w);
+            }
+            ExprNode::Const { name, levels } => {
+                w.u8(EXPR_CONST);
+                prechange_name_body(name, w);
+                w.u64(levels.len() as u64);
+                for level in levels {
+                    prechange_level_body(level, w);
+                }
+            }
+            ExprNode::App { f, a } => {
+                w.u8(EXPR_APP);
+                prechange_expr_body(f, w);
+                prechange_expr_body(a, w);
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                w.u8(EXPR_LAM);
+                prechange_name_body(binder_name, w);
+                prechange_expr_body(binder_type, w);
+                prechange_expr_body(body, w);
+                w.u8(binder_info_tag(*binder_info));
+            }
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                w.u8(EXPR_FORALL);
+                prechange_name_body(binder_name, w);
+                prechange_expr_body(binder_type, w);
+                prechange_expr_body(body, w);
+                w.u8(binder_info_tag(*binder_info));
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                w.u8(EXPR_LET);
+                prechange_name_body(decl_name, w);
+                prechange_expr_body(type_, w);
+                prechange_expr_body(value, w);
+                prechange_expr_body(body, w);
+                w.bool(*non_dep);
+            }
+            ExprNode::Lit { literal } => match literal {
+                Literal::Nat(value) => {
+                    w.u8(EXPR_LIT_NAT);
+                    w.u64(value.limbs_le().len() as u64);
+                    for limb in value.limbs_le() {
+                        w.u64(*limb);
+                    }
+                }
+                Literal::Str(value) => {
+                    w.u8(EXPR_LIT_STR);
+                    w.str(value);
+                }
+            },
+            ExprNode::MData { data, expr } => {
+                w.u8(EXPR_MDATA);
+                prechange_kvmap_body(data, w);
+                prechange_expr_body(expr, w);
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => {
+                w.u8(EXPR_PROJ);
+                prechange_name_body(struct_name, w);
+                w.u64(*idx);
+                prechange_expr_body(expr, w);
+            }
+        }
+    }
+
+    fn prechange_bytes(schema: SchemaId, write: impl FnOnce(&mut CanonWriter)) -> Vec<u8> {
+        let mut writer = CanonWriter::new();
+        writer.schema(schema);
+        write(&mut writer);
+        writer.into_bytes()
+    }
+
     fn drop_pair_concurrently<T: Send + 'static>(left: T, right: T) {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let spawn = |value, barrier: std::sync::Arc<std::sync::Barrier>| {
@@ -1329,6 +1534,119 @@ mod tests {
             let decoded = Expr::from_canonical_bytes(&bytes).expect("expr round-trip");
             assert_eq!(decoded.to_canonical_bytes(), bytes);
             assert_eq!(decoded.data(), expr.data());
+        }
+    }
+
+    #[test]
+    fn iterative_encoders_match_the_prechange_recursive_grammar() {
+        let base = Name::str(Name::anonymous(), "Lean");
+        let names = [
+            Name::anonymous(),
+            base.clone(),
+            Name::num(base.clone(), 17),
+            Name::num_overflowing(base.clone(), u64::MAX),
+        ];
+        for name in &names {
+            assert_eq!(
+                name.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_NAME, |writer| prechange_name_body(name, writer))
+            );
+        }
+
+        let zero = Level::zero();
+        let param = Level::param(base.clone());
+        let mvar_level = Level::mvar(LMVarId(Name::num(base.clone(), 3)));
+        let levels = [
+            zero.clone(),
+            zero.clone().succ().expect("shallow level"),
+            Level::max(param.clone(), mvar_level.clone()).expect("shallow level"),
+            Level::imax(mvar_level.clone(), param.clone()).expect("shallow level"),
+            param.clone(),
+            mvar_level.clone(),
+        ];
+        for level in &levels {
+            assert_eq!(
+                level.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_LEVEL, |writer| prechange_level_body(level, writer))
+            );
+        }
+
+        let leaf = Expr::bvar(7).expect("small bvar");
+        let mut metadata = KVMap::new();
+        metadata.insert(base.clone(), DataValue::OfString("value".to_string()));
+        metadata.insert(Name::num(base.clone(), 1), DataValue::OfBool(true));
+        metadata.insert(
+            Name::num(base.clone(), 2),
+            DataValue::OfName(Name::str(base.clone(), "Meta")),
+        );
+        metadata.insert(Name::num(base.clone(), 3), DataValue::OfNat(42));
+        metadata.insert(Name::num(base.clone(), 4), DataValue::OfInt(-7));
+        metadata.insert(
+            Name::num(base.clone(), 5),
+            DataValue::OfSyntax(SyntaxHandle(9)),
+        );
+
+        let mut expressions = vec![
+            leaf.clone(),
+            Expr::fvar(FVarId(base.clone())),
+            Expr::mvar(MVarId(Name::num(base.clone(), 6))),
+            Expr::sort(param.clone()),
+            Expr::const_(base.clone(), vec![param.clone(), mvar_level]),
+            Expr::app(leaf.clone(), Expr::sort(zero)),
+            Expr::let_e(base.clone(), leaf.clone(), leaf.clone(), leaf.clone(), true),
+            Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![1, 2]))),
+            Expr::lit(Literal::Str("text".to_string())),
+            Expr::mdata(metadata, leaf.clone()),
+            Expr::proj(base.clone(), 3, leaf.clone()),
+        ];
+        for binder_info in [
+            BinderInfo::Default,
+            BinderInfo::Implicit,
+            BinderInfo::StrictImplicit,
+            BinderInfo::InstImplicit,
+        ] {
+            expressions.push(Expr::lam(
+                base.clone(),
+                leaf.clone(),
+                leaf.clone(),
+                binder_info,
+            ));
+            expressions.push(Expr::forall_e(
+                base.clone(),
+                leaf.clone(),
+                leaf.clone(),
+                binder_info,
+            ));
+        }
+        for expr in &expressions {
+            assert_eq!(
+                expr.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_EXPR, |writer| prechange_expr_body(expr, writer))
+            );
+        }
+
+        let mut generator = Gen(0x6a09_e667_f3bc_c909);
+        for sample in 0..256 {
+            let name = generator.name(6);
+            assert_eq!(
+                name.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_NAME, |writer| prechange_name_body(&name, writer)),
+                "Name sample {sample}"
+            );
+
+            let level = generator.level(5);
+            assert_eq!(
+                level.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_LEVEL, |writer| prechange_level_body(&level, writer)),
+                "Level sample {sample}"
+            );
+
+            let expr = generator.expr(4);
+            assert_eq!(
+                expr.to_canonical_bytes(),
+                prechange_bytes(SCHEMA_EXPR, |writer| prechange_expr_body(&expr, writer)),
+                "Expr sample {sample}"
+            );
         }
     }
 

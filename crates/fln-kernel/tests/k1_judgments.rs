@@ -4701,3 +4701,470 @@ fn kr310_projection_congruence_on_stuck_scrutinees() {
         "projections of NON-defeq scrutinees stay apart"
     );
 }
+
+// ---------------------------------------------------------------------------
+// KR-608: the nested-inductive auxiliary translation (bead franken_lean-8ce).
+//
+// `MyTree` nests `MyList MyTree` (the minimal analogue of Lean.Syntax nesting
+// `Array Syntax`): admission must translate the occurrence into an auxiliary
+// copy of `MyList` instantiated at `MyTree`, run the FULL ruleset on the
+// synthesized two-type mutual block, regenerate BOTH recursors, restore
+// (`MyTree.rec`, `MyTree.rec_1`, original constructor names), and compare
+// byte-exactly against the decoded rows below — which are hand-built in
+// exactly the restored form the pin serializes.
+// ---------------------------------------------------------------------------
+
+/// The environment rows the translation copies: a plain parameterized
+/// `MyList` (α : Type) with nil/cons, monomorphic for fixture clarity.
+fn mylist_env() -> Environment {
+    let mylist = InductiveVal {
+        base: cval(
+            n("MyList"),
+            vec![],
+            Expr::forall_e(n("α"), sort1(), sort1(), BinderInfo::Default),
+        ),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![n("MyList")],
+        ctors: vec![nn("MyList", "nil"), nn("MyList", "cons")],
+        num_nested: 0,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let nil = ConstructorVal {
+        base: cval(
+            nn("MyList", "nil"),
+            vec![],
+            Expr::forall_e(
+                n("α"),
+                sort1(),
+                Expr::app(Expr::const_(n("MyList"), vec![]), bv(0)),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyList"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    let cons = ConstructorVal {
+        base: cval(
+            nn("MyList", "cons"),
+            vec![],
+            Expr::forall_e(
+                n("α"),
+                sort1(),
+                Expr::forall_e(
+                    n("head"),
+                    bv(0),
+                    Expr::forall_e(
+                        n("tail"),
+                        Expr::app(Expr::const_(n("MyList"), vec![]), bv(1)),
+                        Expr::app(Expr::const_(n("MyList"), vec![]), bv(2)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyList"),
+        cidx: 1,
+        num_params: 1,
+        num_fields: 2,
+        is_unsafe: false,
+    };
+    Environment::new()
+        .add_decl(ConstantInfo::Induct(mylist))
+        .expect("env")
+        .add_decl(ConstantInfo::Ctor(nil))
+        .expect("env")
+        .add_decl(ConstantInfo::Ctor(cons))
+        .expect("env")
+}
+
+/// The decoded (restored-form) nested block: `MyTree.node : MyList MyTree →
+/// MyTree`, with the two restored recursors the pin would serialize.
+fn mytree_block() -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let mlt = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = Level::param(n("u"));
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested: 1,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(
+            nn("MyTree", "node"),
+            vec![],
+            Expr::forall_e(n("l"), mlt(), tree(), BinderInfo::Default),
+        ),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    // Shared telescope: {motive_1 : MyTree → Sort u} {motive_2 : MyList
+    // MyTree → Sort u} (node …) (nil …) (cons …); result binders differ.
+    let motive_1_ty = Expr::forall_e(n("t"), tree(), Expr::sort(u.clone()), BinderInfo::Default);
+    let motive_2_ty = Expr::forall_e(n("t"), mlt(), Expr::sort(u.clone()), BinderInfo::Default);
+    // node : Π (l : MyList MyTree), motive_2 l → motive_1 (MyTree.node l)
+    // (at intro: m1 = #1, m2 = #0)
+    let node_minor_ty = Expr::forall_e(
+        n("l"),
+        mlt(),
+        Expr::forall_e(
+            n("l_ih"),
+            Expr::app(bv(1), bv(0)),
+            Expr::app(
+                bv(3),
+                Expr::app(Expr::const_(nn("MyTree", "node"), vec![]), bv(1)),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // nil : motive_2 (MyList.nil MyTree)   (at intro: m1 = #2, m2 = #1)
+    let nil_minor_ty = Expr::app(
+        bv(1),
+        Expr::app(Expr::const_(nn("MyList", "nil"), vec![]), tree()),
+    );
+    // cons : Π (head : MyTree) (tail : MyList MyTree), motive_1 head →
+    //   motive_2 tail → motive_2 (MyList.cons MyTree head tail)
+    // (at intro: m1 = #3, m2 = #2)
+    let cons_minor_ty = Expr::forall_e(
+        n("head"),
+        tree(),
+        Expr::forall_e(
+            n("tail"),
+            mlt(),
+            Expr::forall_e(
+                n("head_ih"),
+                Expr::app(bv(5), bv(1)),
+                Expr::forall_e(
+                    n("tail_ih"),
+                    Expr::app(bv(5), bv(1)),
+                    Expr::app(
+                        bv(6),
+                        Expr::app(
+                            Expr::app(
+                                Expr::app(Expr::const_(nn("MyList", "cons"), vec![]), tree()),
+                                bv(3),
+                            ),
+                            bv(2),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let telescope = |major_ty: Expr, result_motive_at: u32| {
+        Expr::forall_e(
+            n("motive_1"),
+            motive_1_ty.clone(),
+            Expr::forall_e(
+                n("motive_2"),
+                motive_2_ty.clone(),
+                Expr::forall_e(
+                    n("node"),
+                    node_minor_ty.clone(),
+                    Expr::forall_e(
+                        n("nil"),
+                        nil_minor_ty.clone(),
+                        Expr::forall_e(
+                            n("cons"),
+                            cons_minor_ty.clone(),
+                            Expr::forall_e(
+                                n("t"),
+                                major_ty,
+                                Expr::app(bv(result_motive_at), bv(0)),
+                                BinderInfo::Default,
+                            ),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Implicit,
+            ),
+            BinderInfo::Implicit,
+        )
+    };
+    let rec_ty = telescope(tree(), 5);
+    let rec_1_ty = telescope(mlt(), 4);
+    // Rule right-hand sides: λ motive_1 motive_2 node nil cons fields… .
+    let lam5 = |body: Expr, field_lams: &[(Name, Expr)]| {
+        let mut inner = body;
+        for (name, ty) in field_lams.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        Expr::lam(
+            n("motive_1"),
+            motive_1_ty.clone(),
+            Expr::lam(
+                n("motive_2"),
+                motive_2_ty.clone(),
+                Expr::lam(
+                    n("node"),
+                    node_minor_ty.clone(),
+                    Expr::lam(
+                        n("nil"),
+                        nil_minor_ty.clone(),
+                        Expr::lam(n("cons"), cons_minor_ty.clone(), inner, BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    let rec_call = |rec: &str, args: &[u32]| {
+        let mut app = Expr::const_(nn("MyTree", rec), vec![u.clone()]);
+        for a in args {
+            app = Expr::app(app, bv(*a));
+        }
+        app
+    };
+    // node rule: … (l) => node l (MyTree.rec_1 m1 m2 node nil cons l)
+    let node_rhs = lam5(
+        Expr::app(
+            Expr::app(bv(3), bv(0)),
+            rec_call("rec_1", &[5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("l"), mlt())],
+    );
+    // nil rule: … => nil
+    let nil_rhs = lam5(bv(1), &[]);
+    // cons rule: … (head) (tail) => cons head tail (MyTree.rec … head)
+    //   (MyTree.rec_1 … tail)
+    let cons_rhs = lam5(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                rec_call("rec", &[6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call("rec_1", &[6, 5, 4, 3, 2, 0]),
+        ),
+        &[(n("head"), tree()), (n("tail"), mlt())],
+    );
+    let mk_rec = |name: Name, ty: Expr, rules: Vec<RecursorRule>| RecursorVal {
+        base: cval(name, vec![n("u")], ty),
+        all: vec![n("MyTree")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 2,
+        num_minors: 3,
+        rules,
+        k: false,
+        is_unsafe: false,
+    };
+    let rec = mk_rec(
+        nn("MyTree", "rec"),
+        rec_ty,
+        vec![RecursorRule {
+            ctor: nn("MyTree", "node"),
+            nfields: 1,
+            rhs: node_rhs,
+        }],
+    );
+    let rec_1 = mk_rec(
+        nn("MyTree", "rec_1"),
+        rec_1_ty,
+        vec![
+            RecursorRule {
+                ctor: nn("MyList", "nil"),
+                nfields: 0,
+                rhs: nil_rhs,
+            },
+            RecursorRule {
+                ctor: nn("MyList", "cons"),
+                nfields: 2,
+                rhs: cons_rhs,
+            },
+        ],
+    );
+    (vec![ind], vec![node], vec![rec, rec_1])
+}
+
+#[test]
+fn kr608_nested_block_admits_with_byte_exact_translated_regeneration() {
+    // The acceptance test IS the translation: positivity and regeneration run
+    // on the synthesized `MyTree + _nested.MyList` block, and the restored
+    // recursors (renamed, original constructor names, original occurrences
+    // re-instated) must equal these hand-built restored rows byte-for-byte.
+    let (types, ctors, recursors) = mytree_block();
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "nested MyTree block must admit under the FULL ruleset; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_positivity_is_enforced_through_the_translation() {
+    // MUTANT (bead franken_lean-8ce: "skipped positivity on the translated
+    // block"): nest `MyList (MyTree → MyTree)` — the occurrence is nested
+    // (its parameter mentions the block), and the auxiliary copy places
+    // `MyTree` in a Π domain, so KR-606 must fire ON THE TRANSLATED BLOCK.
+    let (mut types, mut ctors, recursors) = mytree_block();
+    let bad_field = Expr::app(
+        Expr::const_(n("MyList"), vec![]),
+        Expr::forall_e(
+            n("x"),
+            Expr::const_(n("MyTree"), vec![]),
+            Expr::const_(n("MyTree"), vec![]),
+            BinderInfo::Default,
+        ),
+    );
+    ctors[0].base.type_ = Expr::forall_e(
+        n("l"),
+        bad_field,
+        Expr::const_(n("MyTree"), vec![]),
+        BinderInfo::Default,
+    );
+    types[0].is_reflexive = true;
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("non positive"),
+        "the rejection must be the KR-606 positivity judgment on the \
+         translated block, got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_decoded_nested_recursors_are_never_trusted() {
+    // MUTANT ("trusted decoded rules" / "corrupted motive-minor mapping"):
+    // swap the two rule right-hand sides of the decoded auxiliary recursor.
+    // A kernel that trusted the decoded rows would admit the corruption; the
+    // translated regeneration must catch it byte-exactly.
+    let (types, ctors, mut recursors) = mytree_block();
+    let rhs0 = recursors[1].rules[0].rhs.clone();
+    recursors[1].rules[0].rhs = recursors[1].rules[1].rhs.clone();
+    recursors[1].rules[1].rhs = rhs0;
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "decoded auxiliary rules must be regenerated, never trusted: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_num_nested_must_count_the_minted_auxiliaries() {
+    // MUTANT ("altered auxiliary accounting"): the decoded num_nested claims
+    // two auxiliaries where the translation mints exactly one.
+    let (mut types, ctors, recursors) = mytree_block();
+    types[0].num_nested = 2;
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("num_nested"),
+        "auxiliary count must be cross-checked: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_phantom_nesting_rejects() {
+    // MUTANT ("removed/misrouted nested occurrence"): num_nested is nonzero
+    // but no constructor field actually nests — the translation must refuse
+    // to fabricate auxiliaries.
+    let (mut types, mut ctors, mut recursors) = mytree_block();
+    ctors[0].base.type_ = Expr::forall_e(
+        n("l"),
+        Expr::const_(n("MyTree"), vec![]),
+        Expr::const_(n("MyTree"), vec![]),
+        BinderInfo::Default,
+    );
+    types[0].num_nested = 1;
+    recursors.truncate(1);
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("no nested occurrence"),
+        "phantom nesting must reject typed: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_translate_back_restores_the_original_recursor_names() {
+    // MUTANT ("broken translate-back"): the decoded auxiliary recursor
+    // carries the wrong restored name — the by-name match must fail typed,
+    // never fall back to positional trust.
+    let (types, ctors, mut recursors) = mytree_block();
+    recursors[1].base.name = nn("MyTree", "rec_2");
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("lacks recursor"),
+        "restored recursor names must match by name: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_nested_translation_exhaustion_is_typed() {
+    // FL-INV-07 on the translation path: a starved budget yields
+    // Inconclusive — never acceptance, never rejection.
+    let (types, ctors, recursors) = mytree_block();
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget {
+            steps: 5,
+            depth: 4096,
+        },
+    );
+    assert!(
+        verdict.is_inconclusive(),
+        "budget exhaustion in the translation must be typed Inconclusive; got {verdict:?}"
+    );
+    assert!(!verdict.is_accepted() && !verdict.is_rejected());
+}
