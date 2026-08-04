@@ -50,11 +50,19 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// The identifier prefix admits digits deliberately: `AP6_INPUT_PATHS` is the case that made an
 /// earlier version of this rule report a false zero.
+///
+/// It also admits **leading whitespace**, which is the second false zero this rule has produced.
+/// `scripts/e2e/contract_drift.sh:62` declares `INPUT_PATHS=(` **inside a function**, so it is
+/// indented; requiring the assignment to start the line reported that lane as governing nothing
+/// while it governs a real set and refers to governance eight times. The reconciliation signal
+/// caught it — a derived zero contradicted by an independent count — which is exactly the check
+/// `AP6_INPUT_PATHS` bought, firing a second time for a different spelling. An extractor keyed on
+/// one shape of one idiom will keep doing this; the signal is what makes it survivable.
 fn governed_paths(script: &str) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let mut lines = script.lines();
     while let Some(line) = lines.next() {
-        let Some(name) = line.trim_end().strip_suffix("INPUT_PATHS=(") else {
+        let Some(name) = line.trim().strip_suffix("INPUT_PATHS=(") else {
             continue;
         };
         if !name
@@ -91,8 +99,26 @@ fn governance_signal(script: &str) -> usize {
         .sum()
 }
 
+/// Lanes that enforce governance without declaring an `INPUT_PATHS` array.
+///
+/// The reconciliation below refuses a derived zero that the independent signal contradicts, and
+/// it has been right twice where I was wrong. But there is a third case it cannot express: a
+/// lane that governs by a **different idiom**. `suite_upgrade_candidate_preflight.sh` compares
+/// roots through `require_unchanged_root` at eight call sites and declares no array at all, so
+/// the derived zero is TRUE for the table's subject (INPUT_PATHS-declared sets) and the signal
+/// is TRUE about governance. Both are right; the table's subject is narrower than "governs".
+///
+/// The allowance is a list rather than a predicate on purpose: a predicate keyed on
+/// `require_unchanged` would silence a real extractor miss in any lane that happens to call it,
+/// which is the failure the signal exists to catch. A named member has to be added deliberately,
+/// and the assertion below refuses a member that stops needing the allowance.
+const GOVERNS_WITHOUT_AN_INPUT_PATHS_ARRAY: [&str; 1] = ["suite_upgrade_candidate_preflight.sh"];
+
 /// A derived zero that the independent signal contradicts is a broken scan, never a clean lane.
 fn reconcile(lane: &str, derived: usize, signal: usize) -> Option<String> {
+    if GOVERNS_WITHOUT_AN_INPUT_PATHS_ARRAY.contains(&lane) {
+        return None;
+    }
     (derived == 0 && signal > 0).then(|| {
         format!(
             "BROKEN SCAN: `{lane}` derives 0 governed paths but refers to governance {signal} \
@@ -1008,7 +1034,10 @@ fn the_scripts_e2e_total_stated_in_the_section_is_bound_to_the_directory() {
 /// be named where the reader looks, the same rule
 /// `the_worktree_refusal_scope_is_derived_from_the_lane_population` applies to its own
 /// unmeasured lane, because a reader acts on a specific lane and never on a ratio.
-const GATE_LOCK_ANCHOR: &str = " of the 20 declared lanes source";
+// Deliberately carries no count. The first version read " of the 20 declared lanes source",
+// which put the lane TOTAL inside the anchor for a test about the gate-lock count — so the
+// same number lived in two places and the anchor broke the moment a lane landed.
+const GATE_LOCK_ANCHOR: &str = " declared lanes source `scripts/lib/gate_lock.sh`";
 
 #[test]
 fn every_declared_lane_that_does_not_take_the_gate_lock_is_named_in_the_section() {
