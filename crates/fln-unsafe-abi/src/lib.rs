@@ -38,9 +38,10 @@
 //!   fln-3gv next slice;
 //! * forcing thunks / applying closures / external `m_foreach` traversal —
 //!   bead franken_lean-7xe (Golem apply machinery);
-//! * compacted-region loading — bead fln-wgp; the size-classed allocator
-//!   backend, deterministic thread-matrix, and soak evidence — fln-8w8 (its
-//!   calibrated small-allocation heartbeat hook is installed);
+//! * compacted-region loading — bead fln-wgp; allocator determinism,
+//!   fragmentation, thread-matrix, and soak evidence — fln-8w8 (the owned
+//!   page/bin backend and calibrated small-allocation heartbeat hook are
+//!   installed);
 //! * mpz arithmetic — the fln-bignum shim (Crucible workstream).
 
 #![deny(unsafe_code)]

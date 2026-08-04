@@ -1120,8 +1120,8 @@ fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
     );
     assert_eq!(crate::membrane::small_class_for_test(4097), None);
     assert!(
-        crate::membrane::small_bin_metadata_bytes_for_test() <= 5 * 1024,
-        "intrusive heads keep per-thread allocator metadata bounded"
+        crate::membrane::small_bin_metadata_bytes_for_test() <= 10 * 1024,
+        "intrusive heads plus one current-page pointer per class keep per-thread allocator metadata bounded"
     );
 
     for size in [1usize, 8, 9, 4095, 4096, 4097] {
@@ -1197,6 +1197,74 @@ fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
     })
     .join()
     .expect("cross-thread small-bin reuse");
+}
+
+#[test]
+fn small_heap_pages_reclaim_after_deferred_blocks_drain() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    crate::membrane::drain_small_bins_for_test();
+    let before = crate::membrane::small_page_metrics_for_test();
+    let mut blocks = Vec::new();
+    for _ in 0..32 {
+        let block = export_mi_malloc_small(9);
+        assert!(!block.is_null());
+        blocks.push(block);
+    }
+    for block in blocks {
+        export_mi_free(block);
+    }
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(9),
+        crate::membrane::small_bin_capacity_for_test(),
+        "the bounded deferred-free cache retains only its configured tail"
+    );
+
+    crate::membrane::drain_small_bins_for_test();
+    let after = crate::membrane::small_page_metrics_for_test();
+    assert_eq!(
+        after.0,
+        before.0 + 1,
+        "one class page served the allocation burst"
+    );
+    assert_eq!(
+        after.1,
+        before.1 + 1,
+        "draining the final deferred blocks reclaims its page"
+    );
+}
+
+#[test]
+fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    crate::membrane::drain_small_bins_for_test();
+    let before = crate::membrane::small_page_metrics_for_test();
+    let address = std::thread::spawn(|| {
+        let block = export_mi_malloc_small(24);
+        assert!(!block.is_null());
+        block.expose_provenance()
+    })
+    .join()
+    .expect("creator thread");
+
+    // The creator's TLS destructor surrendered its page-owner token, but this
+    // live block retains the low state token. The foreign thread may defer it
+    // normally, and its own drain is the sole page-reclaim transition.
+    let block = core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(address);
+    export_mi_free(block);
+    assert_eq!(crate::membrane::small_bin_depth_for_test(24), 1);
+    crate::membrane::drain_small_bins_for_test();
+
+    let after = crate::membrane::small_page_metrics_for_test();
+    assert_eq!(after.0, before.0 + 1, "the creator minted one class page");
+    assert_eq!(
+        after.1,
+        before.1 + 1,
+        "the foreign drain reclaims only after the creator has exited"
+    );
 }
 
 #[test]

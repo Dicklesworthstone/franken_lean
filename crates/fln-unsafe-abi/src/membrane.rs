@@ -33,17 +33,19 @@
 //! surface instead mirrors the pin's observable OOM behavior
 //! (`lean_internal_panic_out_of_memory`); see `export.rs`. The owned
 //! calibrated heartbeat hook is installed at the small-allocation seam.
-//! Small blocks now pass through bounded thread-local size-class bins: a free
-//! is deferred into the current runtime thread's bin, a same-class allocation
-//! reuses the most recent block, full bins release directly to `std::alloc`,
-//! and thread exit drains every retained block. This is the first owned
-//! allocator layer, not the page backend or the allocator bead's concurrency,
-//! soak, fragmentation, and fuel-parity closure. The membrane discipline and
-//! observable header facts are already final here.
+//! Small blocks now pass through bounded thread-local size-class bins backed
+//! by owned class-homogeneous pages: a free is deferred into the current
+//! runtime thread's bin, a same-class allocation reuses the most recent block,
+//! full bins return blocks to their page, and thread exit drains every retained
+//! block before yielding its page-owner token. This remains short of the
+//! allocator bead's lab thread matrix, soak, fragmentation, and calibrated
+//! fuel-parity closure. The membrane discipline and observable header facts
+//! are already final here.
 
 use crate::contract::{MAX_SMALL_OBJECT_SIZE, OBJECT_SIZE_DELTA, TAG_RESERVED};
 use crate::layout::LeanObject;
 use crate::shadow;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{Cell, RefCell};
 
@@ -59,9 +61,18 @@ pub(crate) fn align_obj_size(sz: usize) -> usize {
 /// quantum is `OBJECT_SIZE_DELTA = 8`.
 const OBJ_ALIGN: usize = 8;
 
-/// Hidden size prefix on every small-heap block (`lean.h:425-429` shape):
-/// one word, so the returned object pointer stays 8-aligned.
-const SMALL_PREFIX: usize = size_of::<usize>();
+/// Hidden allocator metadata on every small-heap block. The logical size
+/// retains the pin's `lean.h:425-429` fallback shape; the page pointer is
+/// private Marrow bookkeeping and never crosses the CompatHeap membrane.
+#[repr(C)]
+struct SmallBlockPrefix {
+    user_size: usize,
+    page: *mut SmallPage,
+}
+
+/// The prefix is a whole number of object-alignment words, so ABI pointers
+/// remain 8-aligned exactly as before.
+const SMALL_PREFIX: usize = size_of::<SmallBlockPrefix>();
 
 /// One bin for every 8-byte class accepted by the Reference small-object
 /// boundary, from 8 through 4096 bytes inclusive.
@@ -71,9 +82,36 @@ const SMALL_CLASS_COUNT: usize = MAX_SMALL_OBJECT_SIZE / OBJECT_SIZE_DELTA;
 /// memory; the ninth retained block returns directly to the backing allocator.
 const SMALL_BIN_CAPACITY: usize = 8;
 
+/// One owned page amortizes the backing allocator without retaining the
+/// multi-megabyte slabs that would make short-lived compiler workers look
+/// leaky merely because they exercised one allocation class.
+const SMALL_PAGE_TARGET_BYTES: usize = 64 * 1024;
+
+/// The high bit is the page owner's token; low bits count carved blocks held
+/// by clients or deferred-free bins. Exactly one caller transitions this
+/// state to zero, and that caller reclaims the page.
+const PAGE_OWNER_TOKEN: usize = 1usize << (usize::BITS - 1);
+
+struct SmallPage {
+    state: AtomicUsize,
+    owner_next: *mut SmallPage,
+    next_slot: Cell<usize>,
+    capacity: usize,
+    block_layout: Layout,
+    page_layout: Layout,
+}
+
+#[cfg(test)]
+static SMALL_PAGE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static SMALL_PAGE_FREES: AtomicUsize = AtomicUsize::new(0);
+
 struct SmallBins {
     heads: [*mut u8; SMALL_CLASS_COUNT],
     lengths: [u8; SMALL_CLASS_COUNT],
+    current_pages: [*mut SmallPage; SMALL_CLASS_COUNT],
+    owned_pages: *mut SmallPage,
 }
 
 // UNSAFE-LEDGER: FLN-UL-0202
@@ -83,6 +121,8 @@ impl SmallBins {
         Self {
             heads: [core::ptr::null_mut(); SMALL_CLASS_COUNT],
             lengths: [0; SMALL_CLASS_COUNT],
+            current_pages: [core::ptr::null_mut(); SMALL_CLASS_COUNT],
+            owned_pages: core::ptr::null_mut(),
         }
     }
 
@@ -120,6 +160,36 @@ impl SmallBins {
         true
     }
 
+    fn alloc_page_block(&mut self, class: usize) -> *mut u8 {
+        let mut page = self.current_pages[class];
+        // SAFETY: a page keeps its owner token until `SmallBins::drain`, so a
+        // current-page pointer remains live while this thread uses its bins.
+        let needs_page = page.is_null() || unsafe { (*page).next_slot.get() == (*page).capacity };
+        if needs_page {
+            // SAFETY: the page is linked only after successful initialization.
+            page = unsafe { alloc_small_page(self.owned_pages, class) };
+            if page.is_null() {
+                return core::ptr::null_mut();
+            }
+            self.current_pages[class] = page;
+            self.owned_pages = page;
+        }
+
+        // SAFETY: `page` is live by its owner token; `next_slot < capacity`
+        // above and every slot has `block_layout.size()` bytes.
+        unsafe {
+            let slot = (*page).next_slot.get();
+            (*page).next_slot.set(slot + 1);
+            (*page).state.fetch_add(1, Ordering::Relaxed);
+            let base = page
+                .cast::<u8>()
+                .add(size_of::<SmallPage>() + slot * (*page).block_layout.size());
+            base.cast::<SmallBlockPrefix>()
+                .write(SmallBlockPrefix { user_size: 0, page });
+            base
+        }
+    }
+
     #[cfg(test)]
     fn depth(&self, class: usize) -> usize {
         usize::from(self.lengths[class])
@@ -127,12 +197,24 @@ impl SmallBins {
 
     fn drain(&mut self) {
         for class in 0..SMALL_CLASS_COUNT {
-            let layout = small_class_layout(class);
             while let Some(block) = self.pop(class) {
-                // SAFETY: every retained link owns one block allocated with
-                // this class's backing layout and removed from live use by
-                // small_free_raw. Thread-local draining visits it once.
-                unsafe { dealloc(block, layout) };
+                // SAFETY: every retained link owns one block removed from
+                // live use by small_free_raw. Page-backed blocks return
+                // through their page accounting; fallback blocks use their
+                // exact individual layout.
+                unsafe { release_small_block(block) };
+            }
+        }
+        self.current_pages = [core::ptr::null_mut(); SMALL_CLASS_COUNT];
+        let mut page = self.owned_pages;
+        self.owned_pages = core::ptr::null_mut();
+        while !page.is_null() {
+            // SAFETY: read the list link before releasing the owner token;
+            // that release may reclaim this page when it held no blocks.
+            unsafe {
+                let next = (*page).owner_next;
+                release_page_owner(page);
+                page = next;
             }
         }
     }
@@ -194,6 +276,113 @@ fn small_class_layout(class: usize) -> Layout {
     Layout::from_size_align(total, OBJ_ALIGN).expect("small object size overflows Layout")
 }
 
+fn small_page_capacity(block_layout: Layout) -> usize {
+    let available = SMALL_PAGE_TARGET_BYTES.saturating_sub(size_of::<SmallPage>());
+    (available / block_layout.size()).max(1)
+}
+
+fn small_page_layout(block_layout: Layout, capacity: usize) -> Layout {
+    let bytes = size_of::<SmallPage>()
+        .checked_add(
+            block_layout
+                .size()
+                .checked_mul(capacity)
+                .expect("small page block count overflows Layout"),
+        )
+        .expect("small page size overflows Layout");
+    Layout::from_size_align(bytes, OBJ_ALIGN).expect("small page size overflows Layout")
+}
+
+/// Allocate and initialize one class-homogeneous page. Its owner token stays
+/// with the creating thread; carved blocks keep the page alive after a
+/// cross-thread deferred free until their eventual reuse or drain.
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+unsafe fn alloc_small_page(owner_next: *mut SmallPage, class: usize) -> *mut SmallPage {
+    let block_layout = small_class_layout(class);
+    let capacity = small_page_capacity(block_layout);
+    let page_layout = small_page_layout(block_layout, capacity);
+    // SAFETY: page_layout is non-zero and 8-aligned; the result is initialized
+    // in full before it is linked into a thread-local owner list.
+    unsafe {
+        let page = alloc(page_layout).cast::<SmallPage>();
+        if page.is_null() {
+            return page;
+        }
+        page.write(SmallPage {
+            state: AtomicUsize::new(PAGE_OWNER_TOKEN),
+            owner_next,
+            next_slot: Cell::new(0),
+            capacity,
+            block_layout,
+            page_layout,
+        });
+        #[cfg(test)]
+        SMALL_PAGE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        page
+    }
+}
+
+/// Return one carved page block. The caller that transitions the combined
+/// owner/block state to zero is the sole reclaimer, which keeps foreign-thread
+/// deferred frees from racing the creating thread's TLS destructor.
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+unsafe fn release_page_block(page: *mut SmallPage) {
+    // SAFETY: every page block retains one low-bit state token until this call.
+    unsafe {
+        let previous = (*page).state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous & !PAGE_OWNER_TOKEN > 0, "page block underflow");
+        if previous == 1 {
+            free_small_page(page);
+        }
+    }
+}
+
+/// Relinquish a creating thread's page-owner token after draining its bins.
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+unsafe fn release_page_owner(page: *mut SmallPage) {
+    // SAFETY: each page is linked into exactly one SmallBins owner list and
+    // drain visits that list exactly once.
+    unsafe {
+        let previous = (*page).state.fetch_sub(PAGE_OWNER_TOKEN, Ordering::AcqRel);
+        debug_assert!(previous & PAGE_OWNER_TOKEN != 0, "page owner underflow");
+        if previous == PAGE_OWNER_TOKEN {
+            free_small_page(page);
+        }
+    }
+}
+
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+unsafe fn free_small_page(page: *mut SmallPage) {
+    // SAFETY: callers won the unique transition of the combined page state to
+    // zero, so no client, deferred bin, or owner list can still dereference it.
+    unsafe {
+        let layout = (*page).page_layout;
+        #[cfg(test)]
+        SMALL_PAGE_FREES.fetch_add(1, Ordering::Relaxed);
+        dealloc(page.cast::<u8>(), layout);
+    }
+}
+
+/// Release a cached small block through its backing authority.
+// UNSAFE-LEDGER: FLN-UL-0202
+#[allow(unsafe_code)]
+unsafe fn release_small_block(base: *mut u8) {
+    // SAFETY: `base` points to the prefix of a block owned by a bin; the
+    // prefix was initialized by small_alloc_raw before the block escaped.
+    unsafe {
+        let prefix = base.cast::<SmallBlockPrefix>().read();
+        if prefix.page.is_null() {
+            dealloc(base, small_layout(prefix.user_size));
+        } else {
+            release_page_block(prefix.page);
+        }
+    }
+}
+
 fn small_layout(user_size: usize) -> Layout {
     match small_class(user_size) {
         Some((class, _)) => small_class_layout(class),
@@ -217,9 +406,8 @@ fn small_layout(user_size: usize) -> Layout {
 #[allow(unsafe_code)]
 pub(crate) unsafe fn small_alloc_raw(user_size: usize) -> *mut u8 {
     debug_assert!(user_size > 0);
-    let layout = small_layout(user_size);
-    // SAFETY: layout has non-zero size; the prefix word is in-bounds of the
-    // fresh or exclusively cached block.
+    // SAFETY: every branch returns a prefix-aligned block; cached blocks and
+    // new page slots both retain their page token until released.
     unsafe {
         let cached = small_class(user_size).and_then(|(class, _)| {
             SMALL_BINS
@@ -227,11 +415,38 @@ pub(crate) unsafe fn small_alloc_raw(user_size: usize) -> *mut u8 {
                 .ok()
                 .flatten()
         });
-        let base = cached.unwrap_or_else(|| alloc(layout));
+        let (base, page_backed) = if let Some(base) = cached {
+            (base, true)
+        } else if let Some((class, _)) = small_class(user_size) {
+            let page_block = SMALL_BINS
+                .try_with(|bins| {
+                    bins.try_borrow_mut()
+                        .ok()
+                        .map(|mut bins| bins.alloc_page_block(class))
+                })
+                .ok()
+                .flatten();
+            match page_block {
+                Some(base) => (base, true),
+                // Re-entrant TLS access cannot borrow the bin. Preserve the
+                // exact prefix/free contract with an individual fallback.
+                None => (alloc(small_layout(user_size)), false),
+            }
+        } else {
+            (alloc(small_layout(user_size)), false)
+        };
         if base.is_null() {
             return core::ptr::null_mut();
         }
-        base.cast::<usize>().write(user_size);
+        let prefix = base.cast::<SmallBlockPrefix>();
+        if page_backed {
+            (&raw mut (*prefix).user_size).write(user_size);
+        } else {
+            prefix.write(SmallBlockPrefix {
+                user_size,
+                page: core::ptr::null_mut(),
+            });
+        }
         base.add(SMALL_PREFIX)
     }
 }
@@ -249,7 +464,8 @@ pub(crate) unsafe fn small_free_raw(p: *mut u8) {
     // still holds the exact size passed to small_alloc_raw.
     unsafe {
         let base = p.sub(SMALL_PREFIX);
-        let user_size = base.cast::<usize>().read();
+        let prefix = base.cast::<SmallBlockPrefix>();
+        let user_size = (&raw const (*prefix).user_size).read();
         let cached = small_class(user_size).is_some_and(|(class, _)| {
             SMALL_BINS
                 .try_with(|bins| {
@@ -259,7 +475,7 @@ pub(crate) unsafe fn small_free_raw(p: *mut u8) {
                 .unwrap_or(false)
         });
         if !cached {
-            dealloc(base, small_layout(user_size));
+            release_small_block(base);
         }
     }
 }
@@ -272,7 +488,7 @@ pub(crate) unsafe fn small_free_raw(p: *mut u8) {
 #[allow(unsafe_code)]
 pub(crate) unsafe fn small_mem_size_raw(p: *mut u8) -> usize {
     // SAFETY: as small_free_raw; read-only.
-    unsafe { p.sub(SMALL_PREFIX).cast::<usize>().read() }
+    unsafe { (&raw const (*p.sub(SMALL_PREFIX).cast::<SmallBlockPrefix>()).user_size).read() }
 }
 
 #[cfg(test)]
@@ -288,6 +504,19 @@ pub(crate) fn small_bin_capacity_for_test() -> usize {
 #[cfg(test)]
 pub(crate) fn small_bin_metadata_bytes_for_test() -> usize {
     size_of::<SmallBins>()
+}
+
+#[cfg(test)]
+pub(crate) fn small_page_metrics_for_test() -> (usize, usize) {
+    (
+        SMALL_PAGE_ALLOCS.load(Ordering::Relaxed),
+        SMALL_PAGE_FREES.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn drain_small_bins_for_test() {
+    SMALL_BINS.with(|bins| bins.borrow_mut().drain());
 }
 
 #[cfg(test)]
