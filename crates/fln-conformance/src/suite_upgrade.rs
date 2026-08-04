@@ -591,15 +591,19 @@ impl Candidate {
     /// Binds the model's stage completion claims to the retained receipt. The
     /// receipt is deliberately separate so E2E runners can supply exact
     /// identities without treating an in-memory model as evidence.
-    pub fn publication_error_with_receipt(&self, receipt: &CandidateReceipt) -> Option<String> {
+    ///
+    /// This is result-typed so callers can propagate the validation directly;
+    /// an error string must never be mistaken for a successful join.
+    pub fn validate_publication_with_receipt(
+        &self,
+        receipt: &CandidateReceipt,
+    ) -> Result<(), String> {
         if let Some(error) = self.publication_error() {
-            return Some(error.to_string());
+            return Err(error.to_string());
         }
-        if let Err(error) = receipt.validate() {
-            return Some(error);
-        }
+        receipt.validate()?;
         if self.change != receipt.change {
-            return Some(format!(
+            return Err(format!(
                 "candidate change kind `{}` does not match receipt change kind `{}`",
                 self.change.label(),
                 receipt.change.label()
@@ -608,12 +612,12 @@ impl Candidate {
         if self.current_lock_root != receipt.old_lock_root
             || self.candidate_lock_root != receipt.candidate_lock_root
         {
-            return Some(
+            return Err(
                 "candidate lock roots do not match the receipt's exact old/proposed roots"
                     .to_string(),
             );
         }
-        None
+        Ok(())
     }
 }
 

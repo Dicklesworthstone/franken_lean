@@ -86,6 +86,15 @@ fn observed_roots(receipt: &CandidateReceipt) -> CandidateEvidenceRoots {
     }
 }
 
+fn validate_candidate_bundle(
+    receipt_text: &str,
+    observed: &CandidateEvidenceRoots,
+) -> Result<(), String> {
+    let receipt = CandidateReceipt::from_ndjson(receipt_text)?;
+    receipt.validate_observed_roots(observed)?;
+    candidate_from_receipt(&receipt).validate_publication_with_receipt(&receipt)
+}
+
 #[test]
 fn upstream_ledger_state_machine() {
     let text = std::fs::read_to_string(root().join("UPSTREAM_LEDGER.md")).expect("ledger exists");
@@ -132,8 +141,8 @@ fn suite_upgrade_candidate_model() {
         );
         assert!(
             complete_candidate(change)
-                .publication_error_with_receipt(&complete_receipt(change))
-                .is_none(),
+                .validate_publication_with_receipt(&complete_receipt(change))
+                .is_ok(),
             "complete candidate receipt must publish"
         );
     }
@@ -151,8 +160,8 @@ fn candidate_receipt_join_refuses_stale_or_mixed_roots() {
     let mut stale_current = complete_receipt(LockChange::Upgrade);
     stale_current.final_current_lock_root = root_identity('3');
     assert_eq!(
-        candidate.publication_error_with_receipt(&stale_current),
-        Some(
+        candidate.validate_publication_with_receipt(&stale_current),
+        Err(
             "candidate receipt observed an authoritative lock root different from its old root"
                 .to_string()
         ),
@@ -162,24 +171,24 @@ fn candidate_receipt_join_refuses_stale_or_mixed_roots() {
     let mut mixed_tribunal = complete_receipt(LockChange::Upgrade);
     mixed_tribunal.tribunal_root = "mixed-root".to_string();
     assert_eq!(
-        candidate.publication_error_with_receipt(&mixed_tribunal),
-        Some("candidate receipt `tribunal_root` is not a canonical SHA-256 root".to_string()),
+        candidate.validate_publication_with_receipt(&mixed_tribunal),
+        Err("candidate receipt `tribunal_root` is not a canonical SHA-256 root".to_string()),
         "a stale or mixed Tribunal receipt must fail"
     );
 
     let mut non_hex_root = complete_receipt(LockChange::Upgrade);
     non_hex_root.closure_root = root_identity('g');
     assert_eq!(
-        candidate.publication_error_with_receipt(&non_hex_root),
-        Some("candidate receipt `closure_root` is not a canonical SHA-256 root".to_string()),
+        candidate.validate_publication_with_receipt(&non_hex_root),
+        Err("candidate receipt `closure_root` is not a canonical SHA-256 root".to_string()),
         "a non-hex root must not pass as a canonical identity"
     );
 
     let mut wrong_change = complete_receipt(LockChange::Reference);
     wrong_change.candidate_id = "reference-candidate".to_string();
     assert_eq!(
-        candidate.publication_error_with_receipt(&wrong_change),
-        Some(
+        candidate.validate_publication_with_receipt(&wrong_change),
+        Err(
             "candidate change kind `upgrade` does not match receipt change kind `reference`"
                 .to_string()
         ),
@@ -280,7 +289,6 @@ fn suite_upgrade_candidate_bundle_from_environment() -> Result<(), String> {
     };
     let receipt_text = std::fs::read_to_string(receipt_path)
         .map_err(|error| format!("cannot read candidate receipt: {error}"))?;
-    let receipt = CandidateReceipt::from_ndjson(&receipt_text)?;
     let root = |name| {
         std::env::var(name)
             .map_err(|error| format!("candidate preflight did not supply {name}: {error}"))
@@ -295,11 +303,29 @@ fn suite_upgrade_candidate_bundle_from_environment() -> Result<(), String> {
         rollback_root: root("FLN_SUITE_UPGRADE_ROLLBACK_ROOT")?,
         external_evidence_root: root("FLN_SUITE_UPGRADE_EXTERNAL_EVIDENCE_ROOT")?,
     };
-    receipt.validate_observed_roots(&observed)?;
-    candidate_from_receipt(&receipt)
-        .publication_error_with_receipt(&receipt)
-        .ok_or_else(|| "candidate receipt did not satisfy the publication join".to_string())?;
-    Ok(())
+    validate_candidate_bundle(&receipt_text, &observed)
+}
+
+#[test]
+fn candidate_bundle_entrypoint_accepts_complete_and_propagates_refusal() {
+    let receipt = complete_receipt(LockChange::Upgrade);
+    let receipt_text = receipt.to_ndjson().expect("complete receipt renders");
+    assert_eq!(
+        validate_candidate_bundle(&receipt_text, &observed_roots(&receipt)),
+        Ok(()),
+        "the environment entrypoint must accept the complete publication join"
+    );
+
+    let mut substituted = observed_roots(&receipt);
+    substituted.tribunal_root = root_identity('3');
+    assert_eq!(
+        validate_candidate_bundle(&receipt_text, &substituted),
+        Err(
+            "candidate receipt `tribunal_root` does not match the observed candidate evidence root"
+                .to_string()
+        ),
+        "the environment entrypoint must propagate a publication refusal"
+    );
 }
 
 #[test]
@@ -378,8 +404,8 @@ fn suite_upgrade_no_mock_e2e() {
     candidate.tribunal_diff = true;
     assert!(
         candidate
-            .publication_error_with_receipt(&complete_receipt(LockChange::Upgrade))
-            .is_none(),
+            .validate_publication_with_receipt(&complete_receipt(LockChange::Upgrade))
+            .is_ok(),
         "complete isolated candidate receipt must pass"
     );
     candidate.cancelled = true;
