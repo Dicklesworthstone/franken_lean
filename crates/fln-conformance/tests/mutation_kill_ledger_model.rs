@@ -773,7 +773,7 @@ const MODULE_APPLY_PLANTS: &[ModuleApplyPlant] = &[
         file: MODULE_APPLY_TEST_FILE,
         find: concat!(
             "        if self.schema != MODULE_APPLY_SCHEMA_VERSION || !self.is_valid_for(base) {\n",
-            "            return Err(ModuleApplyCommitError::StaleBase);\n",
+            "            return Outcome::complete(Err(ModuleApplyCommitError::StaleBase));\n",
             "        }\n",
         ),
         replace: "",
@@ -792,9 +792,9 @@ const MODULE_APPLY_PLANTS: &[ModuleApplyPlant] = &[
         categories: &[ModuleApplyMutantCategory::RootPrecondition],
         file: MODULE_APPLY_TEST_FILE,
         find: concat!(
-            "        self.receipt\n",
-            "            .verify_for(base, &self.candidate)\n",
-            "            .map_err(ModuleApplyCommitError::Receipt)?;\n",
+            "        if let Err(error) = self.receipt.verify_for(base, &self.candidate) {\n",
+            "            return Outcome::complete(Err(ModuleApplyCommitError::Receipt(error)));\n",
+            "        }\n",
         ),
         replace: "",
         killer: ModuleApplyKiller {
