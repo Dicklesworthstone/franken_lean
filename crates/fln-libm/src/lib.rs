@@ -433,16 +433,21 @@ pub fn exp2(x: f64) -> f64 {
     if invalid(x) {
         return canonical_nan();
     }
-    if x.is_finite() && trunc(x) == x {
-        if x > 1023.0 {
-            return f64::INFINITY;
-        }
-        if x < -1074.0 {
-            return 0.0;
-        }
+    if x >= 1024.0 {
+        return f64::INFINITY;
+    }
+    if x <= -1075.0 {
+        return 0.0;
+    }
+    if trunc(x) == x {
         return scalbn(1.0, x as i32);
     }
-    exp(x * LN2_HI + x * LN2_LO)
+    // Reduce in base two before multiplying by ln(2).  Forming x * ln(2)
+    // first loses low bits in the large integral part even though exp then
+    // subtracts that same part during its own range reduction.
+    let exponent = round(x);
+    let fraction = x - exponent;
+    scalbn(exp(fraction * LN2_HI + fraction * LN2_LO), exponent as i32)
 }
 
 /// Exponential minus one, using a series near zero to avoid cancellation.
@@ -957,6 +962,7 @@ mod tests {
     #[test]
     fn exp2_integral_exponents_cover_binary64_boundaries_exactly() {
         for (input, expected) in [
+            (f64::NEG_INFINITY, 0.0),
             (-1075.0, 0.0),
             (-1074.0, f64::from_bits(1)),
             (-1022.0, f64::MIN_POSITIVE),
@@ -965,8 +971,28 @@ mod tests {
             (10.0, 1024.0),
             (1023.0, f64::from_bits(0x7fe0_0000_0000_0000)),
             (1024.0, f64::INFINITY),
+            (f64::INFINITY, f64::INFINITY),
         ] {
             same_bits(exp2(input), expected);
+        }
+    }
+
+    #[test]
+    fn exp2_fractional_exponents_reduce_before_ln2_multiplication() {
+        for (input, expected) in [
+            (-1074.75, 0x0000_0000_0000_0001),
+            (-1021.75, 0x0013_06fe_0a31_b715),
+            (-512.25, 0x1fea_e89f_995a_d3ad),
+            (-100.5, 0x39a6_a09e_667f_3bcd),
+            (100.5, 0x4636_a09e_667f_3bcd),
+            (512.125, 0x5ff1_72b8_3c7d_517b),
+            (971.75, 0x7caa_e89f_995a_d3ad),
+            (1023.5, 0x7fe6_a09e_667f_3bcd),
+        ] {
+            assert!(
+                ulp_distance(exp2(input), f64::from_bits(expected)) <= 1,
+                "input={input:?}"
+            );
         }
     }
 
