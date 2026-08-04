@@ -1742,6 +1742,73 @@ fn small_allocator_ticks_are_width_invariant_at_1_8_32_threads() {
     }
 }
 
+/// FL-INV-01 for fuel, stated the way `fln-8w8` states it: *"same input, same
+/// tick totals"* at {1, 8, 32}.
+///
+/// The sibling test above is a correct and useful per-thread charging test, and
+/// it is NOT this property. `HEARTBEAT` is `thread_local!`, each worker resets
+/// and reads its own cell, and each performs a constant `ROUNDS` allocations —
+/// so `ticks == ROUNDS` holds by construction at every width. There is no shared
+/// state for the width to perturb, and the total input SCALES with the width
+/// rather than being held fixed, so that assertion cannot fail for a
+/// width-dependent reason.
+///
+/// This one holds the WORK FIXED and varies only how it is distributed: the same
+/// `TOTAL` small allocations are split across 1, 8 and 32 threads, and the SUM of
+/// the per-thread counters must be identical in all three cases. That is the
+/// quantity a fuel-parity claim is about — a schedule-independent total — and it
+/// is the one an accounting bug that double-charges under contention, or loses a
+/// charge to a race on a shared backing structure, would actually move.
+#[test]
+fn small_allocator_tick_totals_are_schedule_independent_for_fixed_work() {
+    let _g = lock();
+    use crate::export::{export_lean_alloc_small, export_lean_free_small};
+
+    // Divisible by every width under test, so each cell does the SAME work.
+    const TOTAL: u64 = 3_072;
+
+    let run_total = |width: u64| -> u64 {
+        let per_worker = TOTAL / width;
+        assert_eq!(
+            per_worker * width,
+            TOTAL,
+            "work must divide evenly across {width}"
+        );
+        let mut workers = Vec::new();
+        for _ in 0..width {
+            workers.push(std::thread::spawn(move || {
+                crate::membrane::set_heartbeats(0);
+                for round in 0..per_worker {
+                    let size = [8u32, 16, 24, 64, 4096][(round as usize) % 5];
+                    let block = export_lean_alloc_small(size, size / 8 - 1);
+                    assert!(!block.is_null());
+                    export_lean_free_small(block);
+                }
+                crate::membrane::get_num_heartbeats()
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("allocator worker"))
+            .sum()
+    };
+
+    let one = run_total(1);
+    assert_eq!(
+        one, TOTAL,
+        "the single-threaded control must charge exactly one tick per allocation; \
+         without this the equalities below could hold at a uniformly wrong value"
+    );
+    for width in [8u64, 32] {
+        assert_eq!(
+            run_total(width),
+            one,
+            "the same {TOTAL} allocations split across {width} threads charged a \
+             different total than at width 1; fuel is schedule-dependent"
+        );
+    }
+}
+
 #[test]
 fn small_allocator_all_class_fuel_wraps_at_1_8_32_threads() {
     let _g = lock();
