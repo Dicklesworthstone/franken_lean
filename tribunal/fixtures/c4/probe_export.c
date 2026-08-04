@@ -81,6 +81,8 @@ extern uint8_t lean_io_check_canceled();
 extern lean_object *lean_io_cancel(lean_object *t);
 extern lean_object *lean_io_wait(lean_object *t);
 extern lean_object *lean_io_wait_any(lean_object *task_list);
+extern lean_object *lean_io_get_num_heartbeats(void);
+extern lean_object *lean_io_set_heartbeats(lean_object *count);
 
 /* Apply targets for the task facts, closured exactly as generated C does. */
 static lean_object *probe_double(lean_object *x) {
@@ -143,6 +145,16 @@ static void facts_mode(void) {
      * 5a): the Reference's stream globals are built in initialize_io, and
      * Marrow's twin seeds its trio + the SIGPIPE disposition here. */
     lean_initialize_runtime_module();
+
+    /* ---- heartbeat through the real generated-C small path
+     * The direct IO externs are intentionally reset before this cell.  The
+     * `lean.h` ctor inline below performs one `lean_inc_heartbeat` before its
+     * raw small allocation in the pin's LEAN_MIMALLOC configuration. */
+    lean_io_set_heartbeats(lean_box(0));
+    fact("heartbeat.after_reset", (long long)lean_unbox(lean_io_get_num_heartbeats()));
+    lean_object *heartbeat_ctor = lean_alloc_ctor(0, 0, 0);
+    fact("heartbeat.after_small_ctor", (long long)lean_unbox(lean_io_get_num_heartbeats()));
+    lean_dec(heartbeat_ctor);
 
     /* ---- ctor through the inline small path (mi_malloc_small underneath) */
     lean_object *o = lean_alloc_ctor(2, 2, 8);
