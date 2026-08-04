@@ -4860,6 +4860,165 @@ mod tests {
         }
     }
 
+    /// The mutant kinds `j8h`'s acceptance criteria name, each joined to the model that
+    /// kills it — or to `None`, which is the whole point of the mapping.
+    ///
+    /// # Why a mapping and not a list
+    ///
+    /// The campaign below is complete **against its own enum**: it asserts every
+    /// `AdmissionMutant::ALL` member is killed. That is a real property and it is not the
+    /// obligation. The obligation is the bead's, which names *eight* mutants, and nothing
+    /// joined the two — so a criterion with no model was **silently absent** rather than
+    /// named, and the suite stayed green. `AGENTS.md`'s item 7 exactly: a claim and its
+    /// evidence, each locally consistent, with the join unwatched.
+    ///
+    /// Naming the criteria makes a missing model say its own name. `dt5` did the same one
+    /// crate over and this goes one step further by carrying the mapping, so the answer to
+    /// "which criterion is unmet" is a lookup rather than a re-derivation.
+    ///
+    /// **The two `None`s are measured, not assumed.** `wrong-resource` occurs nowhere in
+    /// this crate, and `overflow` is *implemented* — the `checked_add` guards in
+    /// [`preflight_declaration_expressions`] refuse a typed stop rather than wrapping —
+    /// while no mutant *models* an implementation that omits the check. Implemented and
+    /// modelled are different claims and this table keeps them apart.
+    ///
+    /// **Do not read the criteria spelling as the code's.** `partial-publication` is killed
+    /// by `PartialInsert`: the criteria name the *effect*, the models name the *mechanism*.
+    /// Three separate scans for `partial_publication` returned zero before the model was
+    /// found by reading the enum, which is why this table exists rather than a grep.
+    const CRITERIA_NAMED_MUTANTS: [(&str, Option<AdmissionMutant>); 8] = [
+        ("missing-check", Some(AdmissionMutant::MissingCheck)),
+        ("late-check", Some(AdmissionMutant::LateCheck)),
+        ("wrong-resource", None),
+        ("wrong-actual", Some(AdmissionMutant::WrongActual)),
+        ("overflow", None),
+        ("partial-publication", Some(AdmissionMutant::PartialInsert)),
+        (
+            "cancellation-as-rejection",
+            Some(AdmissionMutant::CancellationAsRejection),
+        ),
+        ("digest-drift", Some(AdmissionMutant::DigestDrift)),
+    ];
+
+    /// The criteria names carrying no model yet — a **shrinking** declared remainder.
+    ///
+    /// Checked one-way (`unmodelled ⊆ declared`) plus a ceiling, deliberately, and not as
+    /// set equality. Equality would redden the moment somebody *models* one of these
+    /// without editing this constant in the same breath — a wall against the exact repair
+    /// the declaration exists to invite. Growth is still refused: a criterion that loses
+    /// its model, or a new criterion arriving unmodelled, is not in this list and fails.
+    const UNMODELLED_CRITERIA: [&str; 2] = ["wrong-resource", "overflow"];
+
+    /// The bead's named mutants are joined to the models, in both directions, with the
+    /// unmodelled remainder declared rather than absent.
+    /// Every way the criteria table and the models can disagree, as readable lines.
+    ///
+    /// Collected rather than asserted one at a time, and that is not a style choice: a
+    /// campaign against the first version killed 3 of 4 mutants but **two died at a
+    /// neighbour's assertion**, because an early `assert!` aborts before the check written
+    /// for that defect is ever reached. An assertion no mutant can reach on its own is
+    /// indistinguishable from one that works. Collecting makes each violation report
+    /// itself, so every cell dies at its own site or the guard is not doing its job.
+    fn criteria_join_findings() -> Vec<String> {
+        let mut findings = Vec::new();
+        let modelled: Vec<AdmissionMutant> = CRITERIA_NAMED_MUTANTS
+            .iter()
+            .filter_map(|(_, model)| *model)
+            .collect();
+
+        // Anti-vacuity on the MODELLED count. Note what is deliberately absent: an
+        // assertion that the table has eight rows. The constant is typed
+        // `[(&str, Option<AdmissionMutant>); 8]`, so a dropped row fails to COMPILE — the
+        // campaign proved it, scoring that cell a build abort rather than a kill. A check
+        // the type already carries is decorative, and this comment stands where it stood.
+        if modelled.len() < AdmissionMutant::ALL.len() {
+            findings.push(format!(
+                "only {} criteria are modelled against {} models, so at least one model is \
+                 unreachable from the criterion it exists to discharge",
+                modelled.len(),
+                AdmissionMutant::ALL.len()
+            ));
+        }
+
+        // Direction 1: every mapped criterion names a model the campaign actually kills.
+        for (criterion, model) in CRITERIA_NAMED_MUTANTS {
+            if let Some(model) = model
+                && !AdmissionMutant::ALL.contains(&model)
+            {
+                findings.push(format!(
+                    "criterion {criterion} maps to {} which is not in AdmissionMutant::ALL, \
+                     so the campaign never kills it",
+                    model.label()
+                ));
+            }
+        }
+
+        // Direction 2: injective, in both directions. Two criteria sharing one model would
+        // let a single assertion stand in for two obligations; a model no criterion names
+        // means the table has rotted away from the bead.
+        for model in AdmissionMutant::ALL {
+            let claims: Vec<&str> = CRITERIA_NAMED_MUTANTS
+                .iter()
+                .filter(|(_, m)| *m == Some(model))
+                .map(|(c, _)| *c)
+                .collect();
+            if claims.len() > 1 {
+                findings.push(format!(
+                    "{} is claimed by {claims:?}; one model cannot discharge two criteria",
+                    model.label()
+                ));
+            } else if claims.is_empty() {
+                findings.push(format!(
+                    "{} is a model no criterion names — either it is unnecessary, or the \
+                     criteria table has rotted away from the bead",
+                    model.label()
+                ));
+            }
+        }
+
+        // Direction 3: the remainder. One-way plus a ceiling, so modelling one of these is
+        // never a wall, while a criterion that quietly LOSES its model still fails.
+        let unmodelled: Vec<&str> = CRITERIA_NAMED_MUTANTS
+            .iter()
+            .filter(|(_, m)| m.is_none())
+            .map(|(c, _)| *c)
+            .collect();
+        for criterion in &unmodelled {
+            if !UNMODELLED_CRITERIA.contains(criterion) {
+                findings.push(format!(
+                    "{criterion} has no model and is not in the declared remainder. Either \
+                     model it, or add it there and say so — an obligation that quietly \
+                     loses its model is what this join exists to catch"
+                ));
+            }
+        }
+        if unmodelled.len() > UNMODELLED_CRITERIA.len() {
+            findings.push(format!(
+                "the unmodelled remainder grew to {} against a declared ceiling of {}",
+                unmodelled.len(),
+                UNMODELLED_CRITERIA.len()
+            ));
+        }
+        for declared in UNMODELLED_CRITERIA {
+            if !CRITERIA_NAMED_MUTANTS.iter().any(|(c, _)| *c == declared) {
+                findings.push(format!(
+                    "{declared} is declared unmodelled but is not one of the criteria; a \
+                     remainder naming nothing reads as maintained and is not"
+                ));
+            }
+        }
+
+        findings
+    }
+
+    /// The bead's named mutants are joined to the models, in both directions, with the
+    /// unmodelled remainder declared rather than absent.
+    #[test]
+    fn every_criteria_named_admission_mutant_maps_to_a_killed_model() {
+        let findings = criteria_join_findings();
+        assert!(findings.is_empty(), "{}", findings.join("\n"));
+    }
+
     /// Every named mutant dies for its own typed reason.
     #[test]
     fn declaration_admission_named_mutants_are_each_killed_by_their_own_typed_signal() {
