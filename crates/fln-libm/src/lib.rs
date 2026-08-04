@@ -651,6 +651,10 @@ pub fn cbrt(x: f64) -> f64 {
     }
     let a = abs(x);
     let (m, e) = frexp(a);
+    let binary_exponent = e - 1;
+    if m == 0.5 && binary_exponent % 3 == 0 {
+        return copysign(scalbn(1.0, binary_exponent / 3), x);
+    }
     let q = e.div_euclid(3);
     let r = e.rem_euclid(3);
     let mut y = if r == 0 {
@@ -962,6 +966,19 @@ mod tests {
             (scalbn(1.0, 1022), scalbn(1.0, 511)),
         ] {
             same_bits(sqrt(input), expected);
+        }
+    }
+
+    #[test]
+    fn cbrt_powers_of_eight_cover_binary64_boundaries_exactly() {
+        for (input, expected) in [
+            (f64::from_bits(1), scalbn(1.0, -358)),
+            (1.0, 1.0),
+            (8.0, 2.0),
+            (-8.0, -2.0),
+            (scalbn(1.0, 1023), scalbn(1.0, 341)),
+        ] {
+            same_bits(cbrt(input), expected);
         }
     }
 
