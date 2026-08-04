@@ -23,12 +23,15 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use fln_conformance::campaign::{
     CampaignError, Disposition, KILL_LEDGER_SCHEMA, KillLedger, KillVerdict, MutantBinding,
-    NotAKill, Observation,
+    MutationKiller, MutationSite, NotAKill, Observation, mutation_killer_recipe_digest,
+    mutation_site_digest,
 };
 
 fn root() -> PathBuf {
@@ -675,4 +678,689 @@ fn walk_rs(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// as7's concrete module-apply mutation campaign and retained receipts
+// ---------------------------------------------------------------------------
+
+const MODULE_APPLY_RECEIPT_SCHEMA: &str = "fln.module-apply-mutant-kill-receipt/1";
+const MODULE_APPLY_RECEIPT_BEAD: &str = "franken_lean-module-provenance-atomic-apply-as7";
+const MODULE_APPLY_RECEIPT_CLASS: &str = "bounded_model";
+const MODULE_APPLY_TREE_CLASS: &str = "committed_main_ancestor";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ModuleApplyMutantCategory {
+    DropDeclaration,
+    DropExtraDeclaration,
+    DropExtensionRow,
+    DropReverseRow,
+    PayloadBinding,
+    RootPrecondition,
+    PreflightCheck,
+}
+
+impl ModuleApplyMutantCategory {
+    const ALL: [Self; 7] = [
+        Self::DropDeclaration,
+        Self::DropExtraDeclaration,
+        Self::DropExtensionRow,
+        Self::DropReverseRow,
+        Self::PayloadBinding,
+        Self::RootPrecondition,
+        Self::PreflightCheck,
+    ];
+
+    const fn token(self) -> &'static str {
+        match self {
+            Self::DropDeclaration => "drop_declaration",
+            Self::DropExtraDeclaration => "drop_extra_declaration",
+            Self::DropExtensionRow => "drop_extension_row",
+            Self::DropReverseRow => "drop_reverse_row",
+            Self::PayloadBinding => "payload_binding",
+            Self::RootPrecondition => "root_precondition",
+            Self::PreflightCheck => "preflight_check",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModuleApplyKiller {
+    libtest_path: &'static str,
+    function: &'static str,
+    file: &'static str,
+    expected_failure: &'static [&'static str],
+}
+
+impl ModuleApplyKiller {
+    const fn as_digest_killer(self) -> MutationKiller<'static> {
+        MutationKiller {
+            libtest_path: self.libtest_path,
+            function: self.function,
+            file: self.file,
+            expected_failure: self.expected_failure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModuleApplyPlant {
+    id: &'static str,
+    categories: &'static [ModuleApplyMutantCategory],
+    file: &'static str,
+    find: &'static str,
+    replace: &'static str,
+    killer: ModuleApplyKiller,
+}
+
+impl ModuleApplyPlant {
+    const fn site(self) -> MutationSite<'static> {
+        MutationSite {
+            file: self.file,
+            find: self.find,
+            replace: self.replace,
+        }
+    }
+}
+
+const MODULE_APPLY_TEST_FILE: &str = "crates/fln-env/src/module_apply.rs";
+const MODULE_APPLY_PROVENANCE_FILE: &str = "crates/fln-env/src/provenance.rs";
+
+const MODULE_APPLY_PLANTS: &[ModuleApplyPlant] = &[
+    ModuleApplyPlant {
+        id: "root-precondition/stale-base",
+        categories: &[ModuleApplyMutantCategory::RootPrecondition],
+        file: MODULE_APPLY_TEST_FILE,
+        find: concat!(
+            "        if self.schema != MODULE_APPLY_SCHEMA_VERSION || !self.is_valid_for(base) {\n",
+            "            return Err(ModuleApplyCommitError::StaleBase);\n",
+            "        }\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::concurrent_module_apply_resolves_by_stale_base_and_converges_either_way",
+            function: "concurrent_module_apply_resolves_by_stale_base_and_converges_either_way",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &[
+                "expected StaleBase for the losing plan",
+                "got Receipt(BaseRoot",
+            ],
+        },
+    },
+    ModuleApplyPlant {
+        id: "root-precondition/receipt-verify",
+        categories: &[ModuleApplyMutantCategory::RootPrecondition],
+        file: MODULE_APPLY_TEST_FILE,
+        find: concat!(
+            "        self.receipt\n",
+            "            .verify_for(base, &self.candidate)\n",
+            "            .map_err(ModuleApplyCommitError::Receipt)?;\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::prepare_candidate_joins_every_component_only_after_target_binding",
+            function: "prepare_candidate_joins_every_component_only_after_target_binding",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["ModuleApplyReceiptError::ResultRoot"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "index/drop-declaration",
+        categories: &[ModuleApplyMutantCategory::DropDeclaration],
+        file: MODULE_APPLY_PROVENANCE_FILE,
+        find: "                (DeclarationClass::Declaration, record.declarations()),\n",
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::committed_state_derives_and_keeps_both_provenance_directions",
+            function: "committed_state_derives_and_keeps_both_provenance_directions",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["forward index does not cover exactly the manifest's declarations"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "index/drop-extra-declaration",
+        categories: &[ModuleApplyMutantCategory::DropExtraDeclaration],
+        file: MODULE_APPLY_PROVENANCE_FILE,
+        find: concat!(
+            "                (\n",
+            "                    DeclarationClass::ExtraDeclaration,\n",
+            "                    record.extra_declarations(),\n",
+            "                ),\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::committed_state_derives_and_keeps_both_provenance_directions",
+            function: "committed_state_derives_and_keeps_both_provenance_directions",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["forward index does not cover exactly the manifest's declarations"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "index/drop-reverse-row",
+        categories: &[ModuleApplyMutantCategory::DropReverseRow],
+        file: MODULE_APPLY_PROVENANCE_FILE,
+        find: "                    owners.insert(name.clone(), (module.clone(), class));\n",
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::committed_state_derives_and_keeps_both_provenance_directions",
+            function: "committed_state_derives_and_keeps_both_provenance_directions",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["reverse index does not cover exactly the manifest's declarations"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "index/drop-extension-row",
+        categories: &[ModuleApplyMutantCategory::DropExtensionRow],
+        file: MODULE_APPLY_PROVENANCE_FILE,
+        find: concat!(
+            "                for (offset, entry) in contribution.entries().iter().enumerate() {\n",
+            "                    // In range by construction",
+        ),
+        replace: concat!(
+            "                for (offset, entry) in contribution.entries().iter().enumerate().skip(1) {\n",
+            "                    // In range by construction",
+        ),
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::committed_state_derives_and_keeps_both_provenance_directions",
+            function: "committed_state_derives_and_keeps_both_provenance_directions",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &[
+                "entry-occurrence index does not cover exactly the manifest's entries",
+            ],
+        },
+    },
+    ModuleApplyPlant {
+        id: "payload-binding/declarations",
+        categories: &[
+            ModuleApplyMutantCategory::PayloadBinding,
+            ModuleApplyMutantCategory::PreflightCheck,
+        ],
+        file: MODULE_APPLY_TEST_FILE,
+        find: concat!(
+            "    verify_declaration_payloads(\n",
+            "        DeclarationClass::Declaration,\n",
+            "        transaction.contribution.declarations(),\n",
+            "        &transaction.declarations,\n",
+            "    )?;\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::declaration_order_is_a_typed_payload_binding_refusal",
+            function: "declaration_order_is_a_typed_payload_binding_refusal",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["DeclarationClass::Declaration"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "payload-binding/extra-declarations",
+        categories: &[
+            ModuleApplyMutantCategory::PayloadBinding,
+            ModuleApplyMutantCategory::PreflightCheck,
+        ],
+        file: MODULE_APPLY_TEST_FILE,
+        find: concat!(
+            "    verify_declaration_payloads(\n",
+            "        DeclarationClass::ExtraDeclaration,\n",
+            "        transaction.contribution.extra_declarations(),\n",
+            "        &transaction.extra_declarations,\n",
+            "    )?;\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::extra_declaration_payloads_are_bound_independently_of_the_primary_class",
+            function: "extra_declaration_payloads_are_bound_independently_of_the_primary_class",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["DeclarationClass::ExtraDeclaration"],
+        },
+    },
+    ModuleApplyPlant {
+        id: "payload-binding/extension-count",
+        categories: &[
+            ModuleApplyMutantCategory::PayloadBinding,
+            ModuleApplyMutantCategory::PreflightCheck,
+        ],
+        file: MODULE_APPLY_TEST_FILE,
+        find: concat!(
+            "    if transaction.extension_payloads.len() != expected_payloads {\n",
+            "        return Err(ModuleApplyPreflightError::ExtensionPayloadCount {\n",
+            "            expected: expected_payloads,\n",
+            "            actual: transaction.extension_payloads.len(),\n",
+            "        });\n",
+            "    }\n",
+        ),
+        replace: "",
+        killer: ModuleApplyKiller {
+            libtest_path: "module_apply::tests::an_extension_payload_shortfall_is_a_typed_count_refusal",
+            function: "an_extension_payload_shortfall_is_a_typed_count_refusal",
+            file: MODULE_APPLY_TEST_FILE,
+            expected_failure: &["ModuleApplyPreflightError::ExtensionPayloadCount"],
+        },
+    },
+];
+
+fn module_apply_receipt_path(workspace: &Path) -> PathBuf {
+    workspace.join("crates/fln-conformance/evidence/module_apply_mutants/kills.jsonl")
+}
+
+fn module_apply_site_digest(plant: ModuleApplyPlant) -> String {
+    mutation_site_digest(plant.site())
+}
+
+fn module_apply_killer_digest(workspace: &Path, plant: ModuleApplyPlant) -> String {
+    mutation_killer_recipe_digest(workspace, &[plant.killer.as_digest_killer()])
+        .unwrap_or_else(|error| panic!("{}: killer recipe cannot be bound: {error}", plant.id))
+}
+
+fn json_string_array(values: impl IntoIterator<Item = &'static str>) -> String {
+    values
+        .into_iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn module_apply_receipt_row(
+    plant: ModuleApplyPlant,
+    head_commit: &str,
+    observed_unix_s: u64,
+    site_digest: &str,
+    killer_digest: &str,
+) -> String {
+    let categories = json_string_array(plant.categories.iter().map(|category| category.token()));
+    format!(
+        "{{\"schema\":\"{MODULE_APPLY_RECEIPT_SCHEMA}\",\"bead\":\"{MODULE_APPLY_RECEIPT_BEAD}\",\
+         \"mutant_id\":\"{}\",\"categories\":[{categories}],\"head_commit\":\"{head_commit}\",\
+         \"observed_unix_s\":{observed_unix_s},\"site_file\":\"{}\",\
+         \"site_digest\":\"{site_digest}\",\"killers\":[\"{}\"],\
+         \"killer_digest\":\"{killer_digest}\",\"control_passed\":1,\"killed\":1,\
+         \"reasons_matched\":1,\"recovery_passed\":1,\"survivors\":[],\
+         \"class\":\"{MODULE_APPLY_RECEIPT_CLASS}\",\"tree_class\":\"{MODULE_APPLY_TREE_CLASS}\"}}",
+        plant.id, plant.file, plant.killer.libtest_path,
+    )
+}
+
+#[test]
+fn module_apply_registry_covers_every_named_category_with_a_live_unique_recipe() {
+    let workspace = root();
+    let required: BTreeSet<_> = ModuleApplyMutantCategory::ALL.into_iter().collect();
+    let mut covered: BTreeMap<ModuleApplyMutantCategory, Vec<&str>> = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+
+    for plant in MODULE_APPLY_PLANTS {
+        assert!(ids.insert(plant.id), "duplicate mutant id `{}`", plant.id);
+        assert!(
+            !plant.categories.is_empty(),
+            "{} has no acceptance category",
+            plant.id
+        );
+        for category in plant.categories {
+            covered.entry(*category).or_default().push(plant.id);
+        }
+
+        let path = workspace.join(plant.file);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
+        assert_eq!(
+            source.matches(plant.find).count(),
+            1,
+            "{} does not name exactly one live production edit in {}",
+            plant.id,
+            plant.file
+        );
+        assert_ne!(
+            plant.find, plant.replace,
+            "{} is a no-op mutation recipe",
+            plant.id
+        );
+        if !plant.replace.is_empty() {
+            assert!(
+                !source.contains(plant.replace),
+                "{} replacement is already present in {}",
+                plant.id,
+                plant.file
+            );
+        }
+        assert!(
+            !plant.killer.expected_failure.is_empty(),
+            "{} has no stated failure discriminator",
+            plant.id
+        );
+        let _ = module_apply_killer_digest(&workspace, *plant);
+    }
+
+    assert_eq!(
+        covered.keys().copied().collect::<BTreeSet<_>>(),
+        required,
+        "the concrete registry and the exhaustive category enum drifted: {covered:?}"
+    );
+    for category in ModuleApplyMutantCategory::ALL {
+        assert!(
+            covered
+                .get(&category)
+                .is_some_and(|plants| !plants.is_empty()),
+            "{} has no active plant",
+            category.token()
+        );
+    }
+}
+
+#[test]
+fn module_apply_receipts_are_canonical_current_complete_and_classify_as_kills() {
+    let workspace = root();
+    let path = module_apply_receipt_path(&workspace);
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "the module-apply mutation receipt is absent at {}: {error}. Run the ignored \
+             campaign deliberately in a clean linked worktree; a bead comment is not \
+             per-commit retention evidence",
+            path.display()
+        )
+    });
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut by_id = BTreeMap::new();
+    for row in rows {
+        let id = receipt_field(row, "mutant_id")
+            .unwrap_or_else(|| panic!("receipt row has no mutant_id: {row}"));
+        assert!(
+            by_id.insert(id.clone(), row).is_none(),
+            "duplicate receipt row for `{id}`"
+        );
+    }
+
+    let expected_ids: BTreeSet<&str> = MODULE_APPLY_PLANTS.iter().map(|plant| plant.id).collect();
+    let actual_ids: BTreeSet<&str> = by_id.keys().map(String::as_str).collect();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "receipt rows and live mutant recipes must account for each other exactly"
+    );
+
+    let mut ledger = KillLedger::new();
+    for plant in MODULE_APPLY_PLANTS {
+        let row = by_id[plant.id];
+        let head_commit = receipt_field(row, "head_commit").expect("row carries head_commit");
+        assert!(
+            head_commit.len() == 40 && head_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{} carries a malformed source commit {head_commit:?}",
+            plant.id
+        );
+        let observed = receipt_field(row, "observed_unix_s")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| panic!("{} carries no positive observation time", plant.id));
+        let site_digest = module_apply_site_digest(*plant);
+        let killer_digest = module_apply_killer_digest(&workspace, *plant);
+        let expected =
+            module_apply_receipt_row(*plant, &head_commit, observed, &site_digest, &killer_digest);
+        assert_eq!(
+            row, expected,
+            "{} receipt is stale, noncanonical, incomplete, or contains an unrecognised field",
+            plant.id
+        );
+
+        let binding = MutantBinding::new(
+            plant.id,
+            &head_commit,
+            &site_digest,
+            "pinned-nightly (see rust-toolchain.toml)",
+            plant.file,
+            &format!(
+                "{} fails for every recipe-bound stated reason",
+                plant.killer.libtest_path
+            ),
+            "test-target-only",
+        )
+        .expect("the concrete receipt supplies every mutation-ledger bind");
+        ledger
+            .register(binding, Disposition::Active)
+            .expect("every module-apply mutant registers exactly once");
+        ledger
+            .record(plant.id, Observation::FailedForStatedReason)
+            .expect("the canonical receipt is a stated-reason kill");
+    }
+
+    let summary = ledger.summary();
+    assert_eq!(summary.killed, summary.active);
+    assert_eq!(summary.survived, 0);
+    assert_eq!(summary.not_killed, 0);
+    assert!(ledger.unrun_mutants().is_empty());
+}
+
+struct PlantedModuleApplyMutant {
+    path: PathBuf,
+    original: String,
+    restored: bool,
+}
+
+impl PlantedModuleApplyMutant {
+    fn plant(path: PathBuf, original: String, find: &str, replace: &str) -> Self {
+        fs::write(&path, original.replacen(find, replace, 1))
+            .unwrap_or_else(|error| panic!("plant {}: {error}", path.display()));
+        Self {
+            path,
+            original,
+            restored: false,
+        }
+    }
+
+    fn restore(mut self) {
+        fs::write(&self.path, &self.original)
+            .unwrap_or_else(|error| panic!("restore {}: {error}", self.path.display()));
+        let restored = fs::read_to_string(&self.path)
+            .unwrap_or_else(|error| panic!("re-read {}: {error}", self.path.display()));
+        assert_eq!(
+            restored,
+            self.original,
+            "{} was not restored byte-for-byte",
+            self.path.display()
+        );
+        self.restored = true;
+    }
+}
+
+impl Drop for PlantedModuleApplyMutant {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = fs::write(&self.path, &self.original);
+        }
+    }
+}
+
+fn command_output(mut command: Command, what: &str) -> Output {
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("{what} could not start: {error}"))
+}
+
+fn git_output(workspace: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(workspace);
+    command_output(command, "git")
+}
+
+fn run_module_apply_killer(
+    workspace: &Path,
+    inner_target: &Path,
+    killer: ModuleApplyKiller,
+) -> Output {
+    let mut command = Command::new("cargo");
+    command
+        .arg("test")
+        .arg("--locked")
+        .arg("-p")
+        .arg("fln-env")
+        .arg("--lib")
+        .arg(killer.libtest_path)
+        .arg("--")
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .current_dir(workspace)
+        .env("CARGO_TARGET_DIR", inner_target);
+    command_output(command, killer.libtest_path)
+}
+
+fn combined_output(output: &Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+fn assert_killer_control(plant: ModuleApplyPlant, output: &Output, phase: &str) {
+    let text = combined_output(output);
+    assert!(
+        output.status.success(),
+        "{}: {phase} control failed before attribution was possible:\n{text}",
+        plant.id
+    );
+    assert!(
+        text.contains(&format!("test {} ... ok", plant.killer.libtest_path)),
+        "{}: {phase} exited successfully without observing the exact named killer; a libtest \
+         filter that matches nothing is not a control:\n{text}",
+        plant.id
+    );
+}
+
+/// Plant every active as7 recipe in a retained linked worktree and replace the bounded receipt.
+///
+/// This is intentionally ignored and additionally refuses a normal checkout: a panic must never
+/// leave a shared pane with a production precondition deleted. Ordinary CI runs the retention test,
+/// not this source-mutating measurement.
+#[test]
+#[ignore = "edits production source; run deliberately in a clean linked worktree"]
+fn the_module_apply_mutants_are_killed_for_their_recipe_bound_reasons() {
+    let workspace = root();
+    let git_pointer = workspace.join(".git");
+    assert!(
+        git_pointer.is_file(),
+        "this source-mutating campaign runs only in a linked worktree; {} is not a gitdir \
+         pointer file, so this appears to be the shared checkout",
+        git_pointer.display()
+    );
+    let pointer = fs::read_to_string(&git_pointer).expect("linked-worktree gitdir is readable");
+    assert!(
+        pointer.starts_with("gitdir: "),
+        "{} is a file but not a linked-worktree gitdir pointer",
+        git_pointer.display()
+    );
+
+    let mut protected: Vec<&str> = MODULE_APPLY_PLANTS
+        .iter()
+        .flat_map(|plant| [plant.file, plant.killer.file])
+        .collect();
+    protected.sort_unstable();
+    protected.dedup();
+    let mut status_command = Command::new("git");
+    status_command
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--")
+        .args(&protected)
+        .current_dir(&workspace);
+    let status = command_output(status_command, "git status");
+    assert!(status.status.success(), "git status failed");
+    let collisions = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        collisions.trim().is_empty(),
+        "the campaign would overwrite or digest in-flight work in protected files:\n{collisions}"
+    );
+
+    let head_output = git_output(&workspace, &["rev-parse", "HEAD"]);
+    assert!(head_output.status.success(), "HEAD does not resolve");
+    let head_commit = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(head_commit.len(), 40, "HEAD is not a full commit id");
+    let reachable = git_output(
+        &workspace,
+        &["merge-base", "--is-ancestor", &head_commit, "main"],
+    );
+    assert!(
+        reachable.status.success(),
+        "{head_commit} is not reachable from main; a throwaway-commit receipt is not durable evidence"
+    );
+
+    let inner_target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace.join("target"))
+        .join("module-apply-mutants");
+    let observed_unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_secs();
+    let mut rows = Vec::new();
+
+    for plant in MODULE_APPLY_PLANTS {
+        let path = workspace.join(plant.file);
+        let original =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert_eq!(
+            original.matches(plant.find).count(),
+            1,
+            "{} anchor is absent or ambiguous",
+            plant.id
+        );
+
+        let control = run_module_apply_killer(&workspace, &inner_target, plant.killer);
+        assert_killer_control(*plant, &control, "pre-mutation");
+
+        let planted = PlantedModuleApplyMutant::plant(
+            path.clone(),
+            original.clone(),
+            plant.find,
+            plant.replace,
+        );
+        let mutated = run_module_apply_killer(&workspace, &inner_target, plant.killer);
+        let mutated_text = combined_output(&mutated);
+        assert!(
+            !mutated.status.success(),
+            "{} SURVIVED: the named killer still passed under the mutation:\n{mutated_text}",
+            plant.id
+        );
+        assert!(
+            mutated_text.contains(&format!("test {} ... FAILED", plant.killer.libtest_path)),
+            "{} did not kill the exact named test; compilation or another failure is not a kill:\n{}",
+            plant.id,
+            mutated_text
+        );
+        for expected in plant.killer.expected_failure {
+            assert!(
+                mutated_text.contains(expected),
+                "{} killed its test for an unstated reason; missing {expected:?}:\n{mutated_text}",
+                plant.id
+            );
+        }
+
+        planted.restore();
+        let recovery = run_module_apply_killer(&workspace, &inner_target, plant.killer);
+        assert_killer_control(*plant, &recovery, "post-restore recovery");
+
+        rows.push(module_apply_receipt_row(
+            *plant,
+            &head_commit,
+            observed_unix_s,
+            &module_apply_site_digest(*plant),
+            &module_apply_killer_digest(&workspace, *plant),
+        ));
+        println!(
+            "module_apply_mutants: {} KILLED by {}",
+            plant.id, plant.killer.libtest_path
+        );
+    }
+
+    let output = std::env::var("FLN_MODULE_APPLY_MUTANT_RECEIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| module_apply_receipt_path(&workspace));
+    let parent = output.parent().expect("receipt has a parent directory");
+    fs::create_dir_all(parent).expect("receipt directory is creatable");
+    let mut text = rows.join("\n");
+    text.push('\n');
+    fs::write(&output, text).expect("receipt is writable");
+    println!(
+        "module_apply_mutants: {} recipe-bound kills recorded at {} against main-reachable \
+         {head_commit}; class {MODULE_APPLY_RECEIPT_CLASS}, one host and one instant",
+        rows.len(),
+        output.display()
+    );
 }
