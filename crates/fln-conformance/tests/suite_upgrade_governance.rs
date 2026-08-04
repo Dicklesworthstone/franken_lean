@@ -48,6 +48,23 @@ fn complete_receipt(change: LockChange) -> CandidateReceipt {
     }
 }
 
+fn candidate_from_receipt(receipt: &CandidateReceipt) -> Candidate {
+    Candidate {
+        change: receipt.change,
+        current_lock_root: receipt.old_lock_root.clone(),
+        candidate_lock_root: receipt.candidate_lock_root.clone(),
+        isolated: true,
+        closure_delta: true,
+        canonical_contract_and_census_diff: true,
+        tribunal_diff: true,
+        component_migration: true,
+        rollback_proven: true,
+        current_root_unchanged: true,
+        external_evidence_identity: true,
+        cancelled: false,
+    }
+}
+
 fn observed_roots(receipt: &CandidateReceipt) -> CandidateEvidenceRoots {
     CandidateEvidenceRoots {
         current_lock_root: receipt.old_lock_root.clone(),
@@ -225,6 +242,37 @@ fn candidate_receipt_binds_every_observed_evidence_root() {
             "substituted `{field}` evidence must not join"
         );
     }
+}
+
+#[test]
+fn suite_upgrade_candidate_bundle_from_environment() -> Result<(), String> {
+    let Some(receipt_path) = std::env::var_os("FLN_SUITE_UPGRADE_RECEIPT_PATH") else {
+        // This test is an E2E entry point. The shell preflight refuses with a typed
+        // inconclusive outcome when no real candidate bundle is supplied.
+        return Ok(());
+    };
+    let receipt_text = std::fs::read_to_string(receipt_path)
+        .map_err(|error| format!("cannot read candidate receipt: {error}"))?;
+    let receipt = CandidateReceipt::from_ndjson(&receipt_text)?;
+    let root = |name| {
+        std::env::var(name)
+            .map_err(|error| format!("candidate preflight did not supply {name}: {error}"))
+    };
+    let observed = CandidateEvidenceRoots {
+        current_lock_root: root("FLN_SUITE_UPGRADE_CURRENT_LOCK_ROOT")?,
+        candidate_lock_root: root("FLN_SUITE_UPGRADE_CANDIDATE_LOCK_ROOT")?,
+        closure_root: root("FLN_SUITE_UPGRADE_CLOSURE_ROOT")?,
+        contract_and_census_root: root("FLN_SUITE_UPGRADE_CONTRACT_CENSUS_ROOT")?,
+        tribunal_root: root("FLN_SUITE_UPGRADE_TRIBUNAL_ROOT")?,
+        migration_root: root("FLN_SUITE_UPGRADE_MIGRATION_ROOT")?,
+        rollback_root: root("FLN_SUITE_UPGRADE_ROLLBACK_ROOT")?,
+        external_evidence_root: root("FLN_SUITE_UPGRADE_EXTERNAL_EVIDENCE_ROOT")?,
+    };
+    receipt.validate_observed_roots(&observed)?;
+    candidate_from_receipt(&receipt)
+        .publication_error_with_receipt(&receipt)
+        .ok_or_else(|| "candidate receipt did not satisfy the publication join".to_string())?;
+    Ok(())
 }
 
 #[test]
