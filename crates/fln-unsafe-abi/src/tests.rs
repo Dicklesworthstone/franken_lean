@@ -1236,6 +1236,37 @@ fn small_heap_pages_reclaim_after_deferred_blocks_drain() {
 }
 
 #[test]
+fn small_heap_pages_reclaim_across_every_size_class() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    crate::membrane::drain_small_bins_for_test();
+    let before = crate::membrane::small_page_metrics_for_test();
+    let mut blocks = Vec::new();
+    for size in (8..=4096).step_by(8) {
+        let block = export_mi_malloc_small(size);
+        assert!(!block.is_null(), "class {size} allocation must succeed");
+        blocks.push(block);
+    }
+    for block in blocks {
+        export_mi_free(block);
+    }
+
+    crate::membrane::drain_small_bins_for_test();
+    let after = crate::membrane::small_page_metrics_for_test();
+    assert_eq!(
+        after.0,
+        before.0 + 512,
+        "one page backs the first allocation in every exact 8-byte class"
+    );
+    assert_eq!(
+        after.1,
+        before.1 + 512,
+        "draining all class bins releases every corresponding page"
+    );
+}
+
+#[test]
 fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
     let _g = lock();
     use crate::export::{export_mi_free, export_mi_malloc_small};
