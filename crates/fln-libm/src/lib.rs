@@ -471,8 +471,17 @@ pub fn sinh(x: f64) -> f64 {
         return x;
     }
     let a = abs(x);
-    let value = if a < 1.0 {
-        0.5 * (expm1(a) - expm1(-a))
+    let value = if a < 0.5 {
+        // The direct expm1 difference loses low bits around zero.  This fixed
+        // odd Taylor schedule has no cancellation on the small domain.
+        let square = a * a;
+        let mut term = a;
+        let mut sum = a;
+        for n in 1..=16 {
+            term *= square / ((2 * n) as f64 * (2 * n + 1) as f64);
+            sum += term;
+        }
+        sum
     } else {
         0.5 * (exp(a) - exp(-a))
     };
@@ -512,7 +521,12 @@ pub fn asinh(x: f64) -> f64 {
         return if invalid(x) { canonical_nan() } else { x };
     }
     let a = abs(x);
-    let value = if a > 67_108_864.0 {
+    let value = if a < 0.5 {
+        // log1p(a + a²/(1 + sqrt(1 + a²))) is algebraically asinh(a),
+        // but does not discard the small increment in a + sqrt(1 + a²).
+        let square = a * a;
+        log1p(a + square / (1.0 + sqrt(1.0 + square)))
+    } else if a > 67_108_864.0 {
         log(a) + LN2_HI + LN2_LO
     } else {
         log(a + sqrt(a * a + 1.0))
@@ -758,6 +772,17 @@ mod tests {
         for x in [0.125, 0.5, 1.0, 2.0, 8.0] {
             close(sqrt(x) * sqrt(x), x, 2.0e-14);
             close(cbrt(x) * cbrt(x) * cbrt(x), x, 2.0e-13);
+        }
+    }
+
+    #[test]
+    fn small_hyperbolic_vectors_preserve_low_bits() {
+        for (input, expected_sinh, expected_asinh) in [
+            (0.1, 0x3fb9_a487_337b_59b3, 0x3fb9_8eb9_e7e5_fc40),
+            (-0.1, 0xbfb9_a487_337b_59b3, 0xbfb9_8eb9_e7e5_fc40),
+        ] {
+            assert_eq!(sinh(input).to_bits(), expected_sinh);
+            assert_eq!(asinh(input).to_bits(), expected_asinh);
         }
     }
 
