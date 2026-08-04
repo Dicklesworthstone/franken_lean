@@ -110,10 +110,13 @@ pub fn round(x: f64) -> f64 {
     if x.is_infinite() || x == 0.0 {
         return x;
     }
-    if x > 0.0 {
-        floor(x + 0.5)
+    let integral = trunc(x);
+    if abs(x - integral) < 0.5 {
+        integral
+    } else if x > 0.0 {
+        integral + 1.0
     } else {
-        ceil(x - 0.5)
+        integral - 1.0
     }
 }
 
@@ -980,6 +983,28 @@ mod tests {
         ] {
             same_bits(cbrt(input), expected);
         }
+    }
+
+    #[test]
+    fn rounding_boundaries_distinguish_adjacent_values_from_ties() {
+        let smallest = f64::from_bits(1);
+        same_bits(floor(smallest), 0.0);
+        same_bits(ceil(smallest), 1.0);
+        same_bits(trunc(smallest), 0.0);
+        same_bits(round(smallest), 0.0);
+        same_bits(floor(-smallest), -1.0);
+        same_bits(ceil(-smallest), -0.0);
+        same_bits(trunc(-smallest), -0.0);
+        same_bits(round(-smallest), -0.0);
+
+        let below_half = f64::from_bits(0x3fdf_ffff_ffff_ffff);
+        let above_half = f64::from_bits(0x3fe0_0000_0000_0001);
+        same_bits(round(below_half), 0.0);
+        same_bits(round(0.5), 1.0);
+        same_bits(round(above_half), 1.0);
+        same_bits(round(-below_half), -0.0);
+        same_bits(round(-0.5), -1.0);
+        same_bits(round(-above_half), -1.0);
     }
 
     #[test]
