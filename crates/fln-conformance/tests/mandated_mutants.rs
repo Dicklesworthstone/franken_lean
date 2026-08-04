@@ -69,6 +69,10 @@ const SOURCE_READING: [&str; 2] = ["include_str!", "read_to_string"];
 // source-reading token, so anything above would join the scanned region. A `use` carries no
 // such token, and putting it here keeps that reasoning true by construction rather than by
 // nobody having tested it.
+use fln_conformance::campaign::{
+    MutationKiller, MutationSite, mutation_function_body, mutation_killer_body_digest,
+    mutation_site_digest,
+};
 use fln_conformance::execution::{TriggerReachability, trigger_reachability};
 
 /// The marker a killing test carries to claim one of §18's names.
@@ -606,44 +610,16 @@ fn kill_receipt_path(root: &std::path::Path) -> std::path::PathBuf {
 // The two digests a receipt is bound to
 // ---------------------------------------------------------------------------
 
-fn hex(bytes: &[u8]) -> String {
-    fln_hash::domain::hash(fln_hash::domain::Domain::Fixture, bytes).to_hex()
-}
-
 /// The mutated site: the file path and the exact text the plant replaces.
 ///
 /// Binding the path as well as the text means moving the anchor to another file invalidates
 /// the kill even if the text is byte-identical there.
 fn site_digest(plant: &Plant) -> String {
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(plant.file.as_bytes());
-    preimage.push(0);
-    preimage.extend_from_slice(plant.find.as_bytes());
-    preimage.push(0);
-    preimage.extend_from_slice(plant.replace.as_bytes());
-    hex(&preimage)
-}
-
-/// The body of a `fn`, from its signature line to the closing brace at the same indent.
-///
-/// Brace *counting* is wrong here: these bodies contain format strings like `{verdict:?}`,
-/// and a lone `{` inside a string literal would desynchronise a counter. Matching the
-/// closing brace by indentation needs no lexer and fails loudly rather than silently
-/// returning a truncated body — a short body would weaken the digest exactly where it is
-/// supposed to be strict.
-fn fn_body(source: &str, func: &str) -> Option<String> {
-    let needle = format!("fn {func}(");
-    let at = source.find(&needle)?;
-    let line_start = source[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let indent = &source[line_start..at];
-    if !indent.chars().all(|c| c == ' ' || c == '\t') {
-        // `pub fn`, `async fn`, a trailing comment — anything but plain indentation means
-        // the closing-brace rule below is not the right rule for this item.
-        return None;
-    }
-    let closing = format!("\n{indent}}}\n");
-    let end = source[at..].find(&closing)? + at + closing.len();
-    Some(source[line_start..end].to_string())
+    mutation_site_digest(MutationSite {
+        file: plant.file,
+        find: plant.find,
+        replace: plant.replace,
+    })
 }
 
 /// Every killer body for a plant, concatenated in declaration order.
@@ -651,25 +627,23 @@ fn fn_body(source: &str, func: &str) -> Option<String> {
 /// This is what makes gutting a marked test fail: the marker survives an edit, the digest
 /// does not.
 fn killer_digest(root: &std::path::Path, plant: &Plant) -> String {
-    let mut preimage = Vec::new();
-    for killer in plant.killers {
-        let source = std::fs::read_to_string(root.join(killer.file))
-            .unwrap_or_else(|error| panic!("{} is readable: {error}", killer.file));
-        let body = fn_body(&source, killer.func).unwrap_or_else(|| {
-            panic!(
-                "`fn {}(` was not found in {} with a closing brace at its own indentation. \
-                 The killer this mutant is joined to cannot be located, so no digest can be \
-                 computed and the kill cannot be re-bound — find where it moved to and \
-                 update PLANTS rather than deleting the entry",
-                killer.func, killer.file
-            )
-        });
-        preimage.extend_from_slice(killer.path.as_bytes());
-        preimage.push(0);
-        preimage.extend_from_slice(body.as_bytes());
-        preimage.push(0);
-    }
-    hex(&preimage)
+    let killers: Vec<MutationKiller<'_>> = plant
+        .killers
+        .iter()
+        .map(|killer| MutationKiller {
+            libtest_path: killer.path,
+            function: killer.func,
+            file: killer.file,
+            expected_failure: &[],
+        })
+        .collect();
+    mutation_killer_body_digest(root, &killers).unwrap_or_else(|error| {
+        panic!(
+            "{error}. The killer this mutant is joined to cannot be located, so no digest \
+             can be computed and the kill cannot be re-bound — find where it moved to and \
+             update PLANTS rather than deleting the entry"
+        )
+    })
 }
 
 /// One field out of a receipt row.
@@ -845,7 +819,7 @@ fn deferrals_expire_on_their_declared_production_trigger() {
 #[test]
 fn the_body_extractor_finds_whole_bodies_and_refuses_rather_than_truncating() {
     let top_level = "fn a() {\n    let s = \"}\";\n}\nfn b() {}\n";
-    let body = fn_body(top_level, "a").expect("top-level fn is extractable");
+    let body = mutation_function_body(top_level, "a").expect("top-level fn is extractable");
     assert!(
         body.contains("let s") && !body.contains("fn b"),
         "the body must stop at its own closing brace: {body:?}"
@@ -854,16 +828,16 @@ fn the_body_extractor_finds_whole_bodies_and_refuses_rather_than_truncating() {
     // A brace inside a string literal must not end the body — the reason this is
     // indentation-matched rather than brace-counted.
     let indented = "mod t {\n    fn c() {\n        p(\"{x:?}\");\n    }\n    fn d() {}\n}\n";
-    let body = fn_body(indented, "c").expect("indented fn is extractable");
+    let body = mutation_function_body(indented, "c").expect("indented fn is extractable");
     assert!(
         body.contains("{x:?}") && !body.contains("fn d"),
         "an indented body must match its own indent: {body:?}"
     );
 
-    assert!(fn_body(top_level, "nonexistent").is_none());
+    assert!(mutation_function_body(top_level, "nonexistent").is_none());
     // Refusing is the point: a `pub fn` is not covered by the indent rule, and returning a
     // wrong body would be worse than returning none.
-    assert!(fn_body("pub fn e() {\n}\n", "e").is_none());
+    assert!(mutation_function_body("pub fn e() {\n}\n", "e").is_none());
 }
 
 /// **The retention check.** A recorded kill must still describe the code it was measured on.

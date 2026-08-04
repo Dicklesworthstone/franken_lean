@@ -1285,7 +1285,7 @@ impl ModuleApplyReceipt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedModuleApply {
     state: ModuleApplyState,
-    receipt: ModuleApplyReceipt,
+    receipt: Box<ModuleApplyReceipt>,
 }
 
 impl CommittedModuleApply {
@@ -1333,16 +1333,6 @@ impl AlreadyAppliedModuleApply {
 }
 
 /// The terminal result of consuming an aggregate apply plan.
-///
-/// PROVISIONAL SUPPRESSION, added 2026-08-04 by cc_2, and it is NOT a design decision about this
-/// type. `clippy::large_enum_variant` fires here (688 vs 368 bytes) and, with the mandated
-/// `-D warnings`, took `cargo clippy --workspace --all-targets` to exit 101 — a hard gate down for
-/// every pane, for hours, while this module's author (`as7`) was quota-blocked and unable to
-/// answer. The two available repairs are not equivalent: boxing a variant changes this crate's
-/// PUBLIC type mid-design, which is theirs to choose; an `allow` changes nothing observable and is
-/// one line to delete. I took the reversible one. **`as7`'s owner: replace this with a `Box` if
-/// that is what you intended, and delete the attribute — nothing here argues the lint is wrong.**
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModuleApplyCommitResult {
     Published(CommittedModuleApply),
@@ -1350,10 +1340,6 @@ pub enum ModuleApplyCommitResult {
 }
 
 /// A prepared publication or an exact-result retry awaiting one final base check.
-///
-/// Provisional suppression on the same terms as [`ModuleApplyCommitResult`] above (832 vs 328
-/// bytes): reversible, non-semantic, and owed back to `as7`'s author for a real decision.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ModuleApplyPlan {
     Prepared(PreparedModuleApply),
@@ -1408,7 +1394,7 @@ pub struct PreparedModuleApply {
     base_graph: ModuleGraph,
     base_manifest: Arc<ModuleProvenanceManifest>,
     candidate: ModuleApplyState,
-    receipt: ModuleApplyReceipt,
+    receipt: Box<ModuleApplyReceipt>,
 }
 
 impl PreparedModuleApply {
@@ -1520,7 +1506,7 @@ pub fn prepare_module_apply(
                 base_environment: base.environment().clone(),
                 base_graph: base.graph().clone(),
                 base_manifest: Arc::clone(&base.manifest),
-                receipt: ModuleApplyReceipt {
+                receipt: Box::new(ModuleApplyReceipt {
                     schema: preflight.schema(),
                     module: preflight.transaction().contribution().module().id.clone(),
                     contribution: preflight.transaction().contribution().clone(),
@@ -1532,7 +1518,7 @@ pub fn prepare_module_apply(
                     result_logical_root: candidate.logical_root(),
                     base_provenance_root: base.manifest().root(),
                     result_provenance_root: candidate.manifest().root(),
-                },
+                }),
                 candidate,
             })))
         }

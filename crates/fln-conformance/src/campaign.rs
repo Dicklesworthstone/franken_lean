@@ -32,6 +32,157 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
+
+/// One exact production edit exercised by a mutation campaign.
+///
+/// The digest binds the repository-relative path as well as both sides of the edit. Moving
+/// an otherwise byte-identical anchor therefore expires the observation instead of silently
+/// transferring it to a different production surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationSite<'a> {
+    pub file: &'a str,
+    pub find: &'a str,
+    pub replace: &'a str,
+}
+
+/// One named discriminator whose body is retained with a mutation observation.
+///
+/// [`mutation_killer_body_digest`] preserves the historical mandated-mutant receipt shape:
+/// it binds `libtest_path` and the extracted function body. New campaigns should use
+/// [`mutation_killer_recipe_digest`], which additionally binds the source location, function
+/// name, and every expected failure substring so weakening the campaign recipe expires its
+/// receipt too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationKiller<'a> {
+    pub libtest_path: &'a str,
+    pub function: &'a str,
+    pub file: &'a str,
+    pub expected_failure: &'a [&'a str],
+}
+
+/// A mutation receipt cannot be bound when its discriminator source is absent or ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationDigestError {
+    EmptyKillerSet,
+    SourceUnreadable { path: String, error: String },
+    FunctionBodyUnresolvable { path: String, function: String },
+}
+
+impl fmt::Display for MutationDigestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyKillerSet => write!(f, "a mutation receipt must bind at least one killer"),
+            Self::SourceUnreadable { path, error } => {
+                write!(f, "mutation killer source {path} is unreadable: {error}")
+            }
+            Self::FunctionBodyUnresolvable { path, function } => write!(
+                f,
+                "`fn {function}(` was not found in {path} with a closing brace at its own indentation"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MutationDigestError {}
+
+fn mutation_digest(preimage: &[u8]) -> String {
+    fln_hash::domain::hash(fln_hash::domain::Domain::Fixture, preimage).to_hex()
+}
+
+/// Bind the exact path, anchor, and replacement of one plantable mutation.
+pub fn mutation_site_digest(site: MutationSite<'_>) -> String {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(site.file.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(site.find.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(site.replace.as_bytes());
+    mutation_digest(&preimage)
+}
+
+/// Extract a plain `fn` body from its signature line through the closing brace at the same
+/// indentation.
+///
+/// Indentation rather than brace counting is deliberate: format strings and string literals
+/// carry braces that are not Rust block delimiters. Unsupported item shapes refuse with
+/// `None`; returning a truncated body would weaken every digest built on this function.
+pub fn mutation_function_body(source: &str, function: &str) -> Option<String> {
+    let needle = format!("fn {function}(");
+    let at = source.find(&needle)?;
+    let line_start = source[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let indent = &source[line_start..at];
+    if !indent.chars().all(|c| c == ' ' || c == '\t') {
+        return None;
+    }
+    let closing = format!("\n{indent}}}\n");
+    let end = source[at..].find(&closing)? + at + closing.len();
+    Some(source[line_start..end].to_string())
+}
+
+fn mutation_killer_digest(
+    root: &Path,
+    killers: &[MutationKiller<'_>],
+    bind_recipe: bool,
+) -> Result<String, MutationDigestError> {
+    if killers.is_empty() {
+        return Err(MutationDigestError::EmptyKillerSet);
+    }
+    let mut preimage = Vec::new();
+    for killer in killers {
+        let source_path = root.join(killer.file);
+        let source = std::fs::read_to_string(&source_path).map_err(|error| {
+            MutationDigestError::SourceUnreadable {
+                path: killer.file.to_string(),
+                error: error.to_string(),
+            }
+        })?;
+        let body = mutation_function_body(&source, killer.function).ok_or_else(|| {
+            MutationDigestError::FunctionBodyUnresolvable {
+                path: killer.file.to_string(),
+                function: killer.function.to_string(),
+            }
+        })?;
+        preimage.extend_from_slice(killer.libtest_path.as_bytes());
+        preimage.push(0);
+        if bind_recipe {
+            preimage.extend_from_slice(killer.file.as_bytes());
+            preimage.push(0);
+            preimage.extend_from_slice(killer.function.as_bytes());
+            preimage.push(0);
+            for expected in killer.expected_failure {
+                preimage.extend_from_slice(expected.as_bytes());
+                preimage.push(0);
+            }
+        }
+        preimage.extend_from_slice(body.as_bytes());
+        preimage.push(0);
+    }
+    Ok(mutation_digest(&preimage))
+}
+
+/// Digest the named libtest paths and current killer bodies.
+///
+/// This byte shape is the existing `fln.mandated-mutant-kill-receipt/1` contract. Keep it
+/// stable so promoting the helper does not invalidate already measured §18 receipts.
+pub fn mutation_killer_body_digest(
+    root: &Path,
+    killers: &[MutationKiller<'_>],
+) -> Result<String, MutationDigestError> {
+    mutation_killer_digest(root, killers, false)
+}
+
+/// Digest every campaign-recipe field plus the current killer bodies.
+///
+/// New receipts should use this stronger form: changing the expected failure discriminator,
+/// moving the function, or renaming its source file expires the observation even when the
+/// body bytes happen to remain identical.
+pub fn mutation_killer_recipe_digest(
+    root: &Path,
+    killers: &[MutationKiller<'_>],
+) -> Result<String, MutationDigestError> {
+    mutation_killer_digest(root, killers, true)
+}
 
 /// The ledger row schema. Versioned so a drifted emitter fails loudly rather than
 /// feeding a stale shape to a consumer that trusts it.
