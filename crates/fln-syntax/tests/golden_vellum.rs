@@ -105,9 +105,14 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// **172 -> 177 with `franken_lean-gii.19`'s close, and the SHORT forms are the lesson.** The
 /// scanner takes any hex run of 7..=40 characters, so an abbreviated sha is its own candidate:
 /// declaring a 40-character token does nothing for the 8-character prefix of the same commit. The
-/// close carried five, and only two were predicted. Three — `d98ed115`, `e2568c03`, `f486003f` —
-/// came from the closing pane's *own* judgement comment, which cited the rebase's old→new map in
-/// abbreviated form and so minted three orphan candidates in the act of explaining them. The
+/// close carried five, and only two were predicted. Three were the abbreviated forms of the dt5
+/// comment-repair commit, the j8h owed-measurement commit and the j8h named-mutants commit, and
+/// they came from the closing pane's *own* judgement comment, which cited the rebase's old→new map
+/// in abbreviated form and so minted three orphan candidates in the act of explaining them. **This
+/// paragraph originally spelled those three shas out and thereby minted them a second time, here:
+/// `commit_anchor_reachability` scans this file too, and went from `declared 1, measured 1` to
+/// `measured 4 (+3)` on the commit that added the warning against doing precisely this.** Naming a
+/// pre-rewrite commit in prose is the same act as citing it. Describe it; do not spell it. The
 /// prediction said +2; a calibrated replica of this scan, checked first against this guard's own
 /// green on the committed tree, said +5 before the commit was made. **Prefer a main-reachable sha
 /// when writing an immutable comment: a bead comment cannot be edited, so every abbreviated
