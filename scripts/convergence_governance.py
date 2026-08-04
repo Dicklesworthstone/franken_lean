@@ -212,7 +212,7 @@ def parse_policy(path):
     policy = read_json(path, "policy")
     if not isinstance(policy, dict) or policy.get("schema") != POLICY_SCHEMA:
         raise InputFault(f"policy-schema: expected {POLICY_SCHEMA}")
-    for field in ("policy_version", "wip", "gates", "registry", "exceptions"):
+    for field in ("policy_version", "workstreams", "wip", "review", "gates", "registry", "exceptions"):
         if field not in policy:
             raise InputFault(f"policy-missing-{field}")
     if not isinstance(policy["policy_version"], str) or not policy["policy_version"]:
@@ -224,6 +224,23 @@ def parse_policy(path):
             raise InputFault(f"policy-wip-{field}")
     if policy["wip"]["max_active_workstreams"] < 1:
         raise InputFault("policy-wip-max-active-workstreams-must-be-positive")
+    workstreams = policy["workstreams"]
+    if (
+        not isinstance(workstreams, list)
+        or not workstreams
+        or not all(isinstance(item, str) and item for item in workstreams)
+        or len(workstreams) != len(set(workstreams))
+    ):
+        raise InputFault("policy-workstreams-schema-or-duplicate")
+    review = policy["review"]
+    if not isinstance(review, dict):
+        raise InputFault("policy-review-schema")
+    if not isinstance(review.get("authority"), str) or not review["authority"]:
+        raise InputFault("policy-review-missing-authority")
+    cadence = review.get("cadence_days")
+    if not isinstance(cadence, int) or isinstance(cadence, bool) or cadence < 1:
+        raise InputFault("policy-review-invalid-cadence")
+    utc(review.get("next_review"))
     if not isinstance(policy["gates"], list) or not policy["gates"]:
         raise InputFault("policy-gates-empty")
     if not isinstance(policy["registry"], list) or not isinstance(policy["exceptions"], list):
@@ -249,6 +266,8 @@ def utc(value):
 
 def validate(policy, snapshot, now):
     issues = {row["id"]: row for row in snapshot["issues"]}
+    if utc(policy["review"]["next_review"]) <= now:
+        raise InputFault(f"policy-review-expired: {policy['review']['next_review']}")
     registry = {}
     for row in policy["registry"]:
         if not isinstance(row, dict):
@@ -260,9 +279,14 @@ def validate(policy, snapshot, now):
             raise InputFault(f"registry-unknown-class-{issue_id}: {kind}")
         if not isinstance(workstream, str) or not workstream:
             raise InputFault(f"registry-missing-workstream: {issue_id}")
-        if kind == "implementation" and workstream not in policy.get("workstreams", []):
+        if kind != "adoption" and workstream not in policy["workstreams"]:
             raise InputFault(f"registry-unreviewed-workstream: {issue_id}:{workstream}")
+        if kind == "adoption" and workstream != "adoption":
+            raise InputFault(f"registry-adoption-workstream: {issue_id}:{workstream}")
         registry[issue_id] = row
+    missing_registry = sorted(set(registry) - set(issues))
+    if missing_registry:
+        raise InputFault("registry-missing-from-tracker: " + ",".join(missing_registry[:16]))
     gates = []
     seen_gates = set()
     for ordinal, gate in enumerate(policy["gates"]):
@@ -484,6 +508,7 @@ def self_test():
         "policy_version": "self-test",
         "workstreams": ["W1", "W2", "W3"],
         "wip": {"max_active_workstreams": 2, "verification_reservation": 1, "incident_reservation": 1},
+        "review": {"authority": "self-test", "cadence_days": 1, "next_review": "2026-08-05T10:10:00Z"},
         "gates": [
             {"id": "G0", "state": "failed", "root_beads": ["root"]},
             {"id": "G1", "state": "not_yet_runnable", "root_beads": ["later"]},
@@ -654,7 +679,13 @@ def self_test():
             expired_exception,
             normalize_snapshot(
                 {
-                    "issues": issues + [{"id": "incident-a", "status": "open"}],
+                    "issues": issues
+                    + [
+                        {"id": "verification-a", "status": "open"},
+                        {"id": "verification-b", "status": "open"},
+                        {"id": "incident-a", "status": "open"},
+                        {"id": "incident-b", "status": "open"},
+                    ],
                     "edges": edges,
                     "evidence": raw["evidence"],
                 }
@@ -666,6 +697,35 @@ def self_test():
             raise AssertionError(f"expired exception wrong refusal: {error}") from error
     else:
         raise AssertionError("evergreen exception mutant survived")
+    expired_review = copy.deepcopy(policy)
+    expired_review["review"]["next_review"] = "2026-08-04T10:10:00Z"
+    try:
+        decide(expired_review, first, now)
+    except InputFault as error:
+        if "policy-review-expired" not in str(error):
+            raise AssertionError(f"expired review wrong refusal: {error}") from error
+    else:
+        raise AssertionError("expired review mutant survived")
+    relabeled = copy.deepcopy(policy)
+    relabeled["registry"][0]["workstream"] = "W999"
+    try:
+        decide(relabeled, first, now)
+    except InputFault as error:
+        if "registry-unreviewed-workstream" not in str(error):
+            raise AssertionError(f"relabeling wrong refusal: {error}") from error
+    else:
+        raise AssertionError("workstream relabel mutant survived")
+    orphaned = copy.deepcopy(policy)
+    orphaned["registry"].append(
+        {"id": "orphaned-registry", "class": "verification", "workstream": "W1", "gate": "G0"}
+    )
+    try:
+        decide(orphaned, first, now)
+    except InputFault as error:
+        if "registry-missing-from-tracker" not in str(error):
+            raise AssertionError(f"orphan registry wrong refusal: {error}") from error
+    else:
+        raise AssertionError("orphan registry mutant survived")
     drifting = copy.deepcopy(raw)
     drifting["issues"] = [
         {**issue, "status": "in_progress"} if issue["id"] == "ready" else issue
@@ -682,7 +742,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 16 named model/mutation cells passed"
+    return "convergence-governance self-test: 19 named model/mutation cells passed"
 
 
 def main(argv):

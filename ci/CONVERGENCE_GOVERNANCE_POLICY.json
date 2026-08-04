@@ -24,6 +24,7 @@
   "exceptions": [],
   "registry": [
     {"id": "fln-l8f", "class": "prerequisite", "workstream": "W1", "gate": "G0"},
+    {"id": "fln-private-index-worktree-sync-mbh9", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-d3-safety-note-unenforced-cdbg", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-convergence-wip-governance-149", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-census-empty-referent-no-mock-krb0", "class": "verification", "workstream": "W1", "gate": "G0"},
