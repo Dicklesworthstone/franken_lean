@@ -1268,6 +1268,42 @@ fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
 }
 
 #[test]
+fn small_allocator_ticks_are_width_invariant_at_1_8_32_threads() {
+    let _g = lock();
+    use crate::export::{export_lean_alloc_small, export_lean_free_small};
+
+    const ROUNDS: u64 = 1_000;
+    let run = |width: usize| {
+        let mut workers = Vec::with_capacity(width);
+        for _ in 0..width {
+            workers.push(std::thread::spawn(|| {
+                crate::membrane::set_heartbeats(0);
+                for round in 0..ROUNDS {
+                    let size = [8u32, 16, 24, 64, 4096][(round as usize) % 5];
+                    let block = export_lean_alloc_small(size, size / 8 - 1);
+                    assert!(!block.is_null());
+                    export_lean_free_small(block);
+                }
+                crate::membrane::get_num_heartbeats()
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("allocator worker"))
+            .collect::<Vec<_>>()
+    };
+
+    for width in [1, 8, 32] {
+        let totals = run(width);
+        assert_eq!(totals.len(), width);
+        assert!(
+            totals.iter().all(|&ticks| ticks == ROUNDS),
+            "every worker at width {width} must report exactly one tick per real small allocation: {totals:?}"
+        );
+    }
+}
+
+#[test]
 fn export_alloc_object_marks_big_path_and_frees() {
     let _g = lock();
     use crate::export::{export_lean_alloc_object, export_lean_free_object};
