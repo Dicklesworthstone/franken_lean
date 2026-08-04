@@ -101,7 +101,18 @@ const REPOSITORY_EVIDENCE_SCOPE: &[&str] = &[
 /// `missing_objects` intersection rather than dropping out, so no backup ref is needed to keep
 /// these rows honest — and one was deliberately not created, since an undeclared locally
 /// resolvable backup commit is itself a refusal.
-const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 172;
+///
+/// **172 -> 177 with `franken_lean-gii.19`'s close, and the SHORT forms are the lesson.** The
+/// scanner takes any hex run of 7..=40 characters, so an abbreviated sha is its own candidate:
+/// declaring a 40-character token does nothing for the 8-character prefix of the same commit. The
+/// close carried five, and only two were predicted. Three — `d98ed115`, `e2568c03`, `f486003f` —
+/// came from the closing pane's *own* judgement comment, which cited the rebase's old→new map in
+/// abbreviated form and so minted three orphan candidates in the act of explaining them. The
+/// prediction said +2; a calibrated replica of this scan, checked first against this guard's own
+/// green on the committed tree, said +5 before the commit was made. **Prefer a main-reachable sha
+/// when writing an immutable comment: a bead comment cannot be edited, so every abbreviated
+/// pre-rewrite sha in one is a permanent allowance row.**
+const REVIEWED_BACKUP_ONLY_ALLOWANCE_COUNT: usize = 177;
 const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "0382d-7b",
     "041ad-4e0",
@@ -186,6 +197,8 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "6b61d-76",
     "6c0e4-06",
     "6c0e4-064",
+    "6d43a-9bc",
+    "6d43a-9bcff-55404-a912b-3ea88-991ef-956b5-e6afd",
     "73e68-1cf",
     "74aed-94a",
     "768a3-6c4",
@@ -252,6 +265,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "d6421-8a954-f8447-b3f29-c4ca2-30ae5-d158d-56dc9",
     "d927b-7d",
     "d954a-a9f",
+    "d98ed-115",
     "d98ed-115c3-f7ffb-ccc01-b1edd-a044e-70a8f-ba09b",
     "dc4e8-1e6",
     "dd447-7bf",
@@ -260,6 +274,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "e14fe-98b",
     "e165d-db1",
     "e1a59-ac",
+    "e2568-c03",
     "e2e19-fb2",
     "e3164-55e",
     "e3add-54c",
@@ -270,6 +285,7 @@ const LOCAL_BACKUP_ONLY_ALLOWANCE: &[&str] = &[
     "f2190-330",
     "f2578-87",
     "f3b98-d22",
+    "f4860-03f",
     "f4860-03f17-73a0d-950c0-e28f3-34ff2-e00a4-8b4a9",
     "f4c22-a2d",
     "f4db9-1f6b8-90785-2e03a-988ea-0d8ca-bf5cb-812c6",
