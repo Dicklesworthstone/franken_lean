@@ -654,6 +654,16 @@ pub fn pow(x: f64, y: f64) -> f64 {
             0.0
         };
     }
+    if x == f64::NEG_INFINITY {
+        // Once the base has reached negative infinity, the real-valued limit
+        // is defined by its magnitude even for a finite fractional exponent.
+        // An odd integral exponent is the only case that carries the sign.
+        return if y < 0.0 {
+            copysign(0.0, if odd_integer(y) { -1.0 } else { 1.0 })
+        } else {
+            copysign(f64::INFINITY, if odd_integer(y) { -1.0 } else { 1.0 })
+        };
+    }
     if x == 0.0 {
         if y < 0.0 {
             return if odd_integer(y) {
@@ -774,6 +784,18 @@ mod tests {
             (f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0),
         ] {
             same_bits(pow(base, exponent), expected);
+        }
+    }
+
+    #[test]
+    fn pow_negative_infinity_keeps_only_odd_integer_signs() {
+        for (exponent, expected) in [
+            (0.5, f64::INFINITY),
+            (-0.5, 0.0),
+            (3.0, f64::NEG_INFINITY),
+            (-3.0, -0.0),
+        ] {
+            same_bits(pow(f64::NEG_INFINITY, exponent), expected);
         }
     }
 
