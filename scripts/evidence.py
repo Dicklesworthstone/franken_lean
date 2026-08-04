@@ -89,7 +89,7 @@ VERIFICATION_LEGACY_CLASSIFICATIONS = frozenset(
 CHECK_HUMAN_SCHEMA = "fln.check-human/1"
 CHECK_HUMAN_LOG = "human.semantic.log"
 CENSUS_AVAILABILITY_SCHEMA = "fln.census-availability/1"
-STRUCTURE_GUARD_SCHEMA = "structure-guard/5"
+STRUCTURE_GUARD_SCHEMA = "structure-guard/6"
 CENSUS_AVAILABILITY_STAGE = "contract-handoff-no-mock"
 CENSUS_AVAILABILITY_RECEIPT = f"{CENSUS_AVAILABILITY_STAGE}.availability.json"
 CENSUS_SKIP_LIMITATION_SUFFIX = (
@@ -6589,6 +6589,56 @@ def require_guard_name_list(path: Path, value: Any, *, label: str) -> list[str]:
     return value
 
 
+def validate_guard_line_count_covenants(
+    path: Path, terminal: Mapping[str, Any]
+) -> None:
+    """Validate the guard's measured LOC covenant gauge (bead t0g7).
+
+    The producer carries the one `count_loc` result out of its enforcing walk;
+    this consumer makes the robot disclosure load-bearing without attempting a
+    second count.  It checks only shape, ordering, and the arithmetic derived
+    from the emitted facts.  Whether a particular crate has a covenant remains
+    the reviewed graph's responsibility, because a failing guard may be
+    reporting precisely that graph/workspace mismatch.
+    """
+    facts = terminal.get("line_count_covenants")
+    if not isinstance(facts, list):
+        raise EvidenceError(f"{path}: line-count covenant facts are missing")
+    names: list[str] = []
+    for index, fact in enumerate(facts):
+        if not isinstance(fact, dict):
+            raise EvidenceError(f"{path}: line-count covenant {index} is not an object")
+        require_guard_keys(
+            path,
+            fact,
+            {"crate_name", "loc", "limit", "headroom"},
+            label=f"line_count_covenants[{index}]",
+        )
+        crate_name = fact.get("crate_name")
+        if (
+            not isinstance(crate_name, str)
+            or re.fullmatch(r"fln-[a-z0-9-]+", crate_name) is None
+        ):
+            raise EvidenceError(
+                f"{path}: line-count covenant {index} has an invalid crate name"
+            )
+        loc = require_guard_nat(path, fact.get("loc"), label=f"{crate_name}.loc")
+        limit = require_guard_nat(path, fact.get("limit"), label=f"{crate_name}.limit")
+        headroom = require_guard_nat(
+            path, fact.get("headroom"), label=f"{crate_name}.headroom"
+        )
+        if headroom != max(limit - loc, 0):
+            raise EvidenceError(
+                f"{path}: line-count covenant {crate_name} headroom does not match "
+                "its measured loc and limit"
+            )
+        names.append(crate_name)
+    if names != sorted(set(names)):
+        raise EvidenceError(
+            f"{path}: line-count covenant facts are not sorted and unique by crate"
+        )
+
+
 def validate_guard_mode_closure(
     path: Path, terminal: Mapping[str, Any], crate_count: int, expected_verdict: str
 ) -> None:
@@ -6730,6 +6780,7 @@ def validate_guard(
         "contract_handoff_root",
         "traversal",
         "mode_closure",
+        "line_count_covenants",
         "authority_count_rule",
         "authority_count_rule_holds",
         "governed_root_before",
@@ -6931,6 +6982,7 @@ def validate_guard(
         if scanned + skipped != discovered:
             raise EvidenceError(f"{path}: authority count conservation failed")
         validate_guard_mode_closure(path, terminal, crate_count, expected_verdict)
+        validate_guard_line_count_covenants(path, terminal)
         authority_count_rule_holds = require_guard_bool(
             path,
             terminal.get("authority_count_rule_holds"),
@@ -6993,6 +7045,7 @@ def validate_guard(
             or terminal.get("contract_handoff_root") is not None
             or terminal.get("traversal") is not None
             or terminal.get("mode_closure") is not None
+            or terminal.get("line_count_covenants") is not None
             or terminal.get("governed_root_before") is not None
             or terminal.get("governed_root_after") is not None
         ):
@@ -18207,6 +18260,62 @@ def artifact_role(rel: str) -> str:
     return "artifact"
 
 
+# The one location that may hold a retained test input whose artifact kind the
+# bundle publisher forbids.  It is deliberately not under the repository and not
+# under any artifact root: nothing published ever walks it.
+RETAINED_FIXTURE_ROOT = Path("/data/tmp")
+
+
+def forbidden_artifact_kind(mode: int) -> str | None:
+    """Name the artifact kind a publishable evidence root may not contain.
+
+    Bead fln-selftest-symlink-blocks-bundle-4yhd: the evidence self-test must
+    create a real symlink to exercise the artifact classifier, and the bundle
+    publisher must refuse a symlink under any root it publishes.  Both
+    requirements are correct; before this function the contradiction between
+    them was expressed nowhere, so the self-test's own fixture silently made
+    publication impossible for every gate run and the only report was an
+    `INTERNAL FAULT` after the terminal verdict had already been set.
+
+    This is that contradiction as one predicate.  `artifact_inventory_once`
+    enforces it over every root it walks, and
+    `require_publishable_artifact_root` derives from it, early and by name,
+    that a fixture holding one of these kinds belongs under
+    RETAINED_FIXTURE_ROOT instead.  Both halves read this function, so the two
+    can no longer drift apart.
+    """
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if not stat.S_ISDIR(mode) and not stat.S_ISREG(mode):
+        return "special"
+    return None
+
+
+def require_publishable_artifact_root(root: Path, *, context: str) -> int:
+    """Refuse now, by name, exactly what the bundle publisher refuses at the end.
+
+    Returns the number of entries scanned, so a caller can hold this to an
+    anti-vacuity floor: a scan of an empty tree refuses nothing and proves
+    nothing.
+    """
+    scanned = 0
+    for entry in sorted(root.rglob("*"), key=lambda item: item.as_posix().encode()):
+        scanned += 1
+        kind = forbidden_artifact_kind(entry.lstat().st_mode)
+        if kind is None:
+            continue
+        raise EvidenceError(
+            f"{context}: {kind} artifact under the publishable root {root}: "
+            f"{entry}. The bundle publisher forbids this artifact kind, so "
+            f"every run that publishes this root would fail at publication "
+            f"with no bundle.decision written and no citable evidence, after "
+            f"the terminal verdict had already been set. A retained test "
+            f"input that must hold this kind belongs under "
+            f"{RETAINED_FIXTURE_ROOT}, outside every publishable root."
+        )
+    return scanned
+
+
 def artifact_inventory_once(
     art_dir: Path, *, excluded: set[Path]
 ) -> list[dict[str, Any]]:
@@ -18221,11 +18330,14 @@ def artifact_inventory_once(
             raise EvidenceError(
                 f"artifact disappeared during inventory: {path}"
             ) from error
-        if stat.S_ISLNK(mode):
+        kind = forbidden_artifact_kind(mode)
+        if kind == "symlink":
             raise EvidenceError(f"artifact symlink is forbidden: {path}")
         rel = path.relative_to(art_dir).as_posix()
         if rel.startswith("/") or ".." in Path(rel).parts or ".partial." in rel:
             raise EvidenceError(f"non-canonical or incomplete artifact path: {rel}")
+        if kind is not None:
+            raise EvidenceError(f"{kind} artifact file is forbidden: {path}")
         if stat.S_ISDIR(mode):
             entries.append(
                 {
@@ -18236,7 +18348,10 @@ def artifact_inventory_once(
                     "complete": True,
                 }
             )
-        elif stat.S_ISREG(mode):
+        else:
+            # `kind is None` already established this is a regular file: the
+            # only two kinds `forbidden_artifact_kind` tolerates are directory
+            # and regular file, so a third branch here would be unreachable.
             _data, size, digest = stable_file_facts(path)
             entries.append(
                 {
@@ -18247,8 +18362,6 @@ def artifact_inventory_once(
                     "complete": True,
                 }
             )
-        else:
-            raise EvidenceError(f"special artifact file is forbidden: {path}")
     return entries
 
 
@@ -23562,11 +23675,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     # bundle is constitutionally symlink-free. Keep this retained test input
     # outside every publishable artifact root and bind its unique name to this
     # self-test attempt; no cleanup is performed.
+    # This comment is not what holds the two apart — `forbidden_artifact_kind`
+    # is, and the checks below hold this fixture to it.  See bead
+    # fln-selftest-symlink-blocks-bundle-4yhd.
     classification_fixture_id = hashlib.sha256(
         str(verification_root).encode()
     ).hexdigest()[:24]
     classification_root = (
-        Path("/data/tmp")
+        RETAINED_FIXTURE_ROOT
         / f"fln-evidence-artifact-classification-{classification_fixture_id}"
     )
     if classification_root.exists() or classification_root.is_symlink():
@@ -23585,6 +23701,89 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     (classification_root / "symlink.log").symlink_to("tracked.log")
     (classification_root / "target").mkdir()
     write_new(classification_root / "target" / "live.log", b"transient\n")
+
+    # --- the retained fixture is bound to the publisher's law (bead
+    # fln-selftest-symlink-blocks-bundle-4yhd).  Three checks, in the order
+    # their failures matter.
+    #
+    # First, anti-vacuity: everything below is about a fixture that holds an
+    # artifact kind the publisher forbids.  If it stops holding one — because
+    # somebody "fixed" publication by deleting the symlink — the placement
+    # checks would pass while the coverage they exist to protect is gone, so
+    # this refuses before them.
+    classification_forbidden_kinds = sorted(
+        {
+            kind
+            for entry in classification_root.rglob("*")
+            if (kind := forbidden_artifact_kind(entry.lstat().st_mode)) is not None
+        }
+    )
+    require(
+        classification_forbidden_kinds == ["symlink"],
+        "the artifact-classification fixture must hold exactly the symlink "
+        "kind the publisher forbids — the whole reason it lives outside the "
+        f"bundle root — but holds {classification_forbidden_kinds!r}",
+    )
+    #
+    # Second, the kill.  This is the defect this bead was filed for: the
+    # fixture used to be built under the bundle root, so publication failed
+    # after the terminal verdict on every gate run and nothing named the cause
+    # until an `INTERNAL FAULT` line at the very end.  Refuse it here, early,
+    # by name, over the real artifact root and not over the fixture's declared
+    # location — so a scenario that builds a forbidden kind under the bundle
+    # root some other way dies here too.
+    publishable_scanned = require_publishable_artifact_root(
+        art_dir,
+        context="self-test artifact root holds an unpublishable artifact kind",
+    )
+    require(
+        publishable_scanned > 0,
+        "the publishable-root scan of the self-test artifact root was empty, "
+        "so it refused nothing and proves nothing",
+    )
+    #
+    # Third, the negative control for the law itself.  The two checks above
+    # would both pass if the publisher had simply stopped refusing symlinks,
+    # which is the repair this bead refuses.  Hand the publisher's own walk a
+    # root holding a symlink and require the refusal, with a clean positive
+    # control on the same root so the refusal cannot be read off a scan that
+    # was failing for some other reason.  Built under the retained root: a
+    # forbidden kind is never created beneath a publishable root, not even for
+    # a control.
+    law_root = classification_root.parent / f"{classification_root.name}-law"
+    law_root.mkdir()
+    write_new(law_root / "tracked.log", b"tracked\n")
+    law_clean = artifact_inventory(law_root, excluded=set())
+    require(
+        [entry["path"] for entry in law_clean] == ["tracked.log"],
+        f"the publisher's walk did not inventory a clean control root: "
+        f"{law_clean!r}",
+    )
+    (law_root / "planted-symlink.log").symlink_to("tracked.log")
+    try:
+        artifact_inventory(law_root, excluded=set())
+    except EvidenceError as law_error:
+        require(
+            "artifact symlink is forbidden" in str(law_error),
+            f"a symlink under a root the publisher walks was refused for the "
+            f"wrong reason: {law_error}",
+        )
+    else:
+        raise EvidenceError(
+            "the publisher inventoried a symlink instead of refusing it: the "
+            "no-artifact-symlink law has been weakened"
+        )
+    cases.append(
+        {
+            "case": "retained_forbidden_kind_fixture",
+            "ok": True,
+            "fixture": str(classification_root),
+            "forbidden_kinds": classification_forbidden_kinds,
+            "publishable_entries_scanned": publishable_scanned,
+            "law_control": str(law_root),
+        }
+    )
+
     classification_absolute_path = str(
         (classification_root / "tracked.log").resolve()
     )
@@ -24412,6 +24611,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "nodes": 1,
             "edges": 0,
         },
+        "line_count_covenants": [
+            {"crate_name": "fln-kernel", "loc": 6112, "limit": 12000, "headroom": 5888}
+        ],
         "authority_count_rule": (
             "files_scanned+files_skipped_unreadable=files_discovered"
         ),
@@ -24488,10 +24690,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             )
 
     def old_guard_schema(records: list[dict[str, Any]]) -> None:
-        # The immediately preceding version is the discriminating mutant: `/4` has the
-        # same D18 scope but no data-grade join.
+        # The immediately preceding version is the discriminating mutant: `/5` has the
+        # same D18 scope and data-grade join but no line-count covenant gauge.
         for record in records:
-            record["schema"] = "structure-guard/4"
+            record["schema"] = "structure-guard/5"
 
     def missing_guard_field(records: list[dict[str, Any]]) -> None:
         records[0].pop("root_identity")
@@ -24557,6 +24759,17 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     def guard_scope_over_a_foreign_workspace(records: list[dict[str, Any]]) -> None:
         records[1]["mode_closure"]["nodes"] = 2
 
+    def absent_guard_line_count_covenants(records: list[dict[str, Any]]) -> None:
+        records[1].pop("line_count_covenants")
+
+    def guard_line_count_headroom_lie(records: list[dict[str, Any]]) -> None:
+        records[1]["line_count_covenants"][0]["headroom"] = 5889
+
+    def guard_line_count_duplicate_crate(records: list[dict[str, Any]]) -> None:
+        records[1]["line_count_covenants"].append(
+            {"crate_name": "fln-kernel", "loc": 1, "limit": 1, "headroom": 0}
+        )
+
     guard_mutants = [
         ("old-schema", old_guard_schema),
         ("missing-field", missing_guard_field),
@@ -24576,6 +24789,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         ("mode-closure-closure-without-nodes", guard_closure_without_nodes),
         ("mode-closure-closure-without-a-root", guard_closure_without_a_root),
         ("mode-closure-foreign-workspace", guard_scope_over_a_foreign_workspace),
+        ("line-count-covenants-absent", absent_guard_line_count_covenants),
+        ("line-count-covenants-headroom-lie", guard_line_count_headroom_lie),
+        ("line-count-covenants-duplicate-crate", guard_line_count_duplicate_crate),
     ]
     for mutant_name, mutate in guard_mutants:
         mutant = write_guard_stream(mutant_name, mutate)
@@ -24587,7 +24803,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             raise EvidenceError(f"structure-guard validator survived mutant {mutant_name}")
     cases.append(
         {
-            "case": "structure_guard_v5_contract",
+            "case": "structure_guard_v6_contract",
             "ok": True,
             "mutants_killed": [
                 name for name, _mutate in (*provisional_mutants, *guard_mutants)
