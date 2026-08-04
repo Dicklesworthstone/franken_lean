@@ -643,6 +643,17 @@ pub fn pow(x: f64, y: f64) -> f64 {
     if x == -1.0 && y.is_infinite() {
         return 1.0;
     }
+    if y.is_infinite() {
+        // IEEE pow treats an infinite exponent as a limit in the magnitude of
+        // the base.  In particular, -2 raised to +infinity is +infinity, not
+        // the negative-base/non-integral-exponent domain error below.
+        let magnitude = abs(x);
+        return if (magnitude > 1.0) == y.is_sign_positive() {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+    }
     if x == 0.0 {
         if y < 0.0 {
             return if odd_integer(y) {
@@ -750,6 +761,20 @@ mod tests {
         same_bits(hypot(3.0, 4.0), 5.0);
         same_bits(round(-2.5), -3.0);
         same_bits(round(2.5), 3.0);
+    }
+
+    #[test]
+    fn pow_infinite_exponents_follow_base_magnitude() {
+        for (base, exponent, expected) in [
+            (-2.0, f64::INFINITY, f64::INFINITY),
+            (-2.0, f64::NEG_INFINITY, 0.0),
+            (-0.5, f64::INFINITY, 0.0),
+            (-0.5, f64::NEG_INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0),
+        ] {
+            same_bits(pow(base, exponent), expected);
+        }
     }
 
     #[test]
