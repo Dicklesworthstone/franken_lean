@@ -460,11 +460,17 @@ pub fn log(x: f64) -> f64 {
 
 /// Base-two logarithm.
 pub fn log2(x: f64) -> f64 {
+    if invalid(x) {
+        return canonical_nan();
+    }
     log(x) * INV_LN2
 }
 
 /// Base-ten logarithm.
 pub fn log10(x: f64) -> f64 {
+    if invalid(x) {
+        return canonical_nan();
+    }
     log(x) / LN10
 }
 
@@ -849,6 +855,13 @@ mod tests {
         assert_eq!(fraction.to_bits(), CANONICAL_NAN_BITS);
         assert_eq!(exponent, 0);
         assert_eq!(scalbn(payload_nan, 5).to_bits(), CANONICAL_NAN_BITS);
+    }
+
+    #[test]
+    fn derived_logarithms_canonicalize_nan() {
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        assert_eq!(log2(payload_nan).to_bits(), CANONICAL_NAN_BITS);
+        assert_eq!(log10(payload_nan).to_bits(), CANONICAL_NAN_BITS);
     }
 
     #[test]
