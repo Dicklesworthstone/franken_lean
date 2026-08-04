@@ -11150,7 +11150,8 @@ mod tests {
         ),
     ];
 
-    /// The mutant kinds `dt5`'s acceptance criteria name, transcribed from the bead.
+    /// The mutant kinds `dt5`'s acceptance criteria name — **named here from the
+    /// criteria's semantics, not transcribed from its text**; see the measurement below.
     ///
     /// # What this does and does not buy
     ///
@@ -11159,12 +11160,30 @@ mod tests {
     /// twelve entries and cannot report *which* criterion is unmet. Binding to names
     /// makes a missing mutant say its own name.
     ///
-    /// It does **not** close the join. This list is a transcription, so a criteria edit
-    /// on the bead still moves nothing here — the same shape as `AGENTS.md`'s item 7,
-    /// one artifact over. `mandated_mutants.rs` closes its version of this join by
-    /// deriving the names from `AGENTS.md` at test time; the equivalent move here would
-    /// derive from `.beads/issues.jsonl`, which is `fln-conformance`'s territory, not a
-    /// unit test's. Recorded as a known limit rather than implied to be a mechanism.
+    /// It does **not** close the join, and a criteria edit on the bead still moves
+    /// nothing here — the same shape as `AGENTS.md`'s item 7, one artifact over.
+    ///
+    /// **The repair this comment used to prescribe is NOT AVAILABLE, and saying so is the
+    /// point — it would otherwise cost the next reader a day.** It read: `mandated_mutants.rs`
+    /// closes its version by deriving the names from `AGENTS.md` at test time, so the
+    /// equivalent move here would derive from `.beads/issues.jsonl`. That premise is false.
+    /// Measured at `6d42ea04` over the real record: **0 of these 14 identifiers occur in the
+    /// bead's `acceptance_criteria` field at all**, and only 4 occur anywhere in the record —
+    /// in `notes`, which is *mutable* and so is the weaker of the two halves `br show` prints.
+    /// The `AGENTS.md` precedent works because §18 states its five names **verbatim**; this
+    /// bead states its mutants **semantically**, e.g. "compiling semantic mutants skip each
+    /// descriptor field (name, merge, checkpoint, provenance)". Deriving `descriptor_skip_name`
+    /// from that sentence is a *semantic* predicate, which is `fln-ysvo`'s measured-unbindable
+    /// shape rather than an unwritten mechanism.
+    ///
+    /// **One genuine sub-join does exist and is deliberately not built here.** That
+    /// parenthetical is lexically derivable, and it binds exactly the four `descriptor_skip_*`
+    /// rows — 4 of 14, with the other 10 remaining semantic. Building it means reading the
+    /// tracker from `fln-conformance` (a unit test is the wrong home, and `ownership.rs`'s
+    /// parser exposes id sets only, so it would need a JSON string-field reader in a crate
+    /// where D1 forbids `serde`). Priced and left undone rather than left unstated: a
+    /// four-row join advertised as closing a fourteen-row obligation is worth less than an
+    /// accurate note saying which ten cannot be closed that way.
     const CRITERIA_NAMED_MUTANTS: [&str; 14] = [
         "descriptor_skip_name",
         "descriptor_skip_merge",
