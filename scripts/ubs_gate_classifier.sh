@@ -120,7 +120,7 @@ run_path_baseline() {
         say 'REFUSED - --base is not a resolvable commit.'
         return 2
     }
-    timeout=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1140}}
+    timeout=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1160}}
     case "$timeout" in
         ''|*[!0-9]*|0)
             say "REFUSED - UBS module timeout must be a positive integer, got: $timeout"
@@ -281,10 +281,10 @@ fi
 
 # The Python module's measured two-file run takes about sixteen minutes on this host. UBS's
 # meta-runner default is 300 seconds, while check.sh's outer stage authority is 1,200 seconds.
-# Give one language 1,140 seconds by default: the exact governed evidence.py scan measured
-# 1,135.48 seconds on this host, and this remains strictly inside the outer supervisor so a
-# wedged child is typed here before the whole stage is killed.
-module_timeout_seconds=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1140}}
+# Give one language 1,160 seconds by default: exact governed evidence.py scans measured
+# 1,135.48 and 1,139.06 seconds on this host, and this remains strictly inside the outer
+# supervisor so a wedged child is typed here before the whole stage is killed.
+module_timeout_seconds=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1160}}
 case "$module_timeout_seconds" in
     ''|*[!0-9]*|0)
         say "REFUSED - UBS module timeout must be a positive integer, got: $module_timeout_seconds"

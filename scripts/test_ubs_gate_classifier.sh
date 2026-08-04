@@ -260,11 +260,11 @@ stub_ubs 0 "$LAB/clean.out"
 run_cell "$LAB/subject.rs"
 check 'a clean scan accounting for its files passes' \
     0 completed_clean "$CELL_RC" "$CELL_TEXT"
-if printf '%s' "$CELL_TEXT" | grep -qF 'timeout_seconds=1140'; then
-    printf 'ok   the default module budget preserves the measured 1,140-second allowance\n'
+if printf '%s' "$CELL_TEXT" | grep -qF 'timeout_seconds=1160'; then
+    printf 'ok   the default module budget preserves the measured 1,160-second allowance\n'
     PASSES=$((PASSES + 1))
 else
-    printf 'FAIL clean default-budget classification did not disclose timeout_seconds=1140\n%s\n' "$CELL_TEXT"
+    printf 'FAIL clean default-budget classification did not disclose timeout_seconds=1160\n%s\n' "$CELL_TEXT"
     FAILS=$((FAILS + 1))
 fi
 
