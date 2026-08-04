@@ -449,7 +449,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 97;
 /// citation is a new symbol token and no existing row lost a resolving citation.
 /// 120 -> 121 in the FLN-UL-0328 semantic reentrant landing: its one exact test-function
 /// citation is a new symbol token and no existing row lost a resolving citation.
-const RESOLVING_CITATION_TOKENS: usize = 121;
+/// 121 -> 122 in the all-class semantic reentrant matrix: FLN-UL-0328 gains the exact
+/// all-class test citation, while its row remains symbol-resolved and no row is added.
+const RESOLVING_CITATION_TOKENS: usize = 122;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -479,7 +481,7 @@ const PROSE_EVIDENCE_ROWS: usize = 226;
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
 franken_lean-d3-safety-note-unenforced-cdbg). 324 rows: 1 cites an e2e lane, 97 carry \
-symbol-resolved evidence, and 226 remain prose; 121 individual tokens resolve. The exact \
+symbol-resolved evidence, and 226 remain prose; 122 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\

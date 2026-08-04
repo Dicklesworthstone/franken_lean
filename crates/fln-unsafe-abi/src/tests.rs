@@ -1429,7 +1429,6 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
 
     for width in [1, 8, 32] {
         crate::membrane::drain_small_bins_for_test();
-        let before = crate::membrane::small_page_metrics_for_test();
         let start = std::sync::Arc::new(std::sync::Barrier::new(width));
         let allocations_ready = std::sync::Arc::new(std::sync::Barrier::new(width));
         let mut senders = Vec::with_capacity(width);
@@ -1446,6 +1445,7 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
             let start = std::sync::Arc::clone(&start);
             let allocations_ready = std::sync::Arc::clone(&allocations_ready);
             workers.push(std::thread::spawn(move || {
+                let before = crate::membrane::small_page_local_metrics_for_test();
                 start.wait();
                 let mut blocks = Vec::with_capacity(SIZES.len() * BLOCKS_PER_CLASS);
                 for size in SIZES {
@@ -1465,23 +1465,25 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
                         core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(address);
                     export_mi_free(block);
                 }
+                crate::membrane::drain_small_bins_for_test();
+                (before, crate::membrane::small_page_local_metrics_for_test())
             }));
         }
 
+        let mut reclaimed_pages = 0;
         for worker in workers {
-            worker.join().expect("concurrent small-page handoff worker");
+            let (before, after) = worker.join().expect("concurrent small-page handoff worker");
+            assert_eq!(
+                after.0,
+                before.0 + SIZES.len(),
+                "width {width}: each worker creates one page per class"
+            );
+            reclaimed_pages += after.1 - before.1;
         }
-
-        let after = crate::membrane::small_page_metrics_for_test();
         assert_eq!(
-            after.0,
-            before.0 + width * SIZES.len(),
-            "width {width} creates one page per thread and class"
-        );
-        assert_eq!(
-            after.1,
-            before.1 + width * SIZES.len(),
-            "width {width} concurrently returns every peer-owned page"
+            reclaimed_pages,
+            width * SIZES.len(),
+            "width {width}: concurrent owner and block releases reclaim every page exactly once"
         );
     }
 }
@@ -1549,6 +1551,50 @@ fn small_heap_reentrant_tls_borrow_charges_one_semantic_tick() {
         "freeing the fallback does not perturb the allocation-linked tick"
     );
     crate::membrane::drain_small_bins_for_test();
+}
+
+#[test]
+fn small_heap_reentrant_semantic_fallback_is_one_tick_in_every_class() {
+    let _g = lock();
+    use crate::export::{export_lean_free_small, export_lean_small_mem_size};
+
+    let (before_ticks, after_ticks, before_pages, after_pages) = std::thread::spawn(|| {
+        let before_ticks = crate::membrane::get_num_heartbeats();
+        let before_pages = crate::membrane::small_page_local_metrics_for_test();
+        for size in (8usize..=4096).step_by(8) {
+            let block =
+                crate::membrane::reentrant_alloc_small_for_test(size).cast::<core::ffi::c_void>();
+            assert!(
+                !block.is_null(),
+                "class {size} must allocate through fallback"
+            );
+            assert_eq!(
+                export_lean_small_mem_size(block),
+                u32::try_from(size).expect("small class fits c_uint"),
+                "class {size} preserves its aligned ABI size"
+            );
+            export_lean_free_small(block);
+        }
+        crate::membrane::drain_small_bins_for_test();
+        (
+            before_ticks,
+            crate::membrane::get_num_heartbeats(),
+            before_pages,
+            crate::membrane::small_page_local_metrics_for_test(),
+        )
+    })
+    .join()
+    .expect("all-class reentrant semantic fallback worker");
+
+    assert_eq!(
+        after_ticks,
+        before_ticks + 512,
+        "every exact small class charges one semantic allocation tick"
+    );
+    assert_eq!(
+        after_pages, before_pages,
+        "the reentrant individual fallbacks mint no TLS-owned pages"
+    );
 }
 
 #[test]
