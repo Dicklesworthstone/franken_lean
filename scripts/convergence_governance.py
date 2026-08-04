@@ -143,6 +143,23 @@ def load_live(root, evidence_path):
     return {"issues": issues, "edges": edges, "evidence": evidence, "bv": advisory_bv(root)}
 
 
+def stable_snapshot(load_snapshot):
+    """Return a double-read snapshot or refuse a moving authority surface.
+
+    ``bv`` is deliberately excluded from this equality root: it is advisory telemetry, so a
+    timeout or ranking refresh cannot turn a stable tracker/evidence authority into a different
+    admission decision.  The normalized tracker graph and evidence rows are the authority.
+    """
+
+    first = normalize_snapshot(load_snapshot())
+    second = normalize_snapshot(load_snapshot())
+    first_root = digest({"issues": first["issues"], "edges": first["edges"], "evidence": first["evidence"]})
+    second_root = digest({"issues": second["issues"], "edges": second["edges"], "evidence": second["evidence"]})
+    if not hmac.compare_digest(first_root, second_root):
+        raise InputFault("snapshot-drift: pre/post br-or-evidence roots differ")
+    return second
+
+
 def normalize_snapshot(raw):
     issues = raw.get("issues") if isinstance(raw, dict) else None
     edges = raw.get("edges") if isinstance(raw, dict) else None
@@ -649,7 +666,23 @@ def self_test():
             raise AssertionError(f"expired exception wrong refusal: {error}") from error
     else:
         raise AssertionError("evergreen exception mutant survived")
-    return "convergence-governance self-test: 14 named model/mutation cells passed"
+    drifting = copy.deepcopy(raw)
+    drifting["issues"] = [
+        {**issue, "status": "in_progress"} if issue["id"] == "ready" else issue
+        for issue in drifting["issues"]
+    ]
+    snapshots = iter((raw, drifting))
+    try:
+        stable_snapshot(lambda: next(snapshots))
+    except InputFault as error:
+        if "snapshot-drift" not in str(error):
+            raise AssertionError(f"snapshot drift wrong refusal: {error}") from error
+    else:
+        raise AssertionError("stale-snapshot admission mutant survived")
+    advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
+    if decide(policy, advisory_absent, now) != first_decision:
+        raise AssertionError("advisory bv absence changed an admission decision")
+    return "convergence-governance self-test: 16 named model/mutation cells passed"
 
 
 def main(argv):
@@ -681,12 +714,7 @@ def main(argv):
             second = first
         else:
             evidence_path = root / "ci/VERIFICATION_MANIFEST.jsonl"
-            first = normalize_snapshot(load_live(root, evidence_path))
-            second = normalize_snapshot(load_live(root, evidence_path))
-            first_root = digest({"issues": first["issues"], "edges": first["edges"], "evidence": first["evidence"]})
-            second_root = digest({"issues": second["issues"], "edges": second["edges"], "evidence": second["evidence"]})
-            if not hmac.compare_digest(first_root, second_root):
-                raise InputFault("snapshot-drift: pre/post br-or-evidence roots differ")
+            second = stable_snapshot(lambda: load_live(root, evidence_path))
         value = report(policy, second, decide(policy, second, now), now)
         code = 0 if (not args.check or value["verdict"] == "complete") else 2
     except InputFault as error:

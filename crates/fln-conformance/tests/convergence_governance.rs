@@ -32,7 +32,7 @@ fn convergence_policy_model_and_mutation_cells_are_live() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("14 named model/mutation cells passed"),
+        String::from_utf8_lossy(&output.stdout).contains("16 named model/mutation cells passed"),
         "the self-test must name its exercised cells; a bare exit zero is not evidence"
     );
 }
