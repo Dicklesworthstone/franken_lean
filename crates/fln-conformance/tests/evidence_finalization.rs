@@ -149,35 +149,35 @@ with tempfile.TemporaryDirectory() as scratch:
     git(root, "config", "user.email", "probe@example.invalid")
     git(root, "config", "user.name", "private-index-sync-probe")
 
-    write(root, "manifest.jsonl", b"row=stable\\nrow=draft\\n")
-    write(root, "coverage.jsonl", b"row=stable\\n")
-    write(root, "foreign.txt", b"row=stable\\n")
-    write(root, "batch-safe.txt", b"row=stable\\n")
-    write(root, "batch-foreign.txt", b"row=stable\\n")
+    write(root, "manifest.jsonl", b"row=stable\nrow=draft\n")
+    write(root, "coverage.jsonl", b"row=stable\n")
+    write(root, "foreign.txt", b"row=stable\n")
+    write(root, "batch-safe.txt", b"row=stable\n")
+    write(root, "batch-foreign.txt", b"row=stable\n")
     commit(root, "initial")
 
-    write(root, "manifest.jsonl", b"row=stable\\nrow=final\\n")
-    write(root, "coverage.jsonl", b"row=stable\\nrow=committed-coverage\\n")
-    write(root, "sparse.jsonl", b"row=committed-sparse\\n")
-    write(root, "batch-safe.txt", b"row=stable\\nrow=committed-safe\\n")
+    write(root, "manifest.jsonl", b"row=stable\nrow=final\n")
+    write(root, "coverage.jsonl", b"row=stable\nrow=committed-coverage\n")
+    write(root, "sparse.jsonl", b"row=committed-sparse\n")
+    write(root, "batch-safe.txt", b"row=stable\nrow=committed-safe\n")
     commit(root, "private-index result")
 
-    write(root, "manifest.jsonl", b"row=stable\\nrow=draft\\n")
+    write(root, "manifest.jsonl", b"row=stable\nrow=draft\n")
     draft = sync(root, "manifest.jsonl")
     cells["draft_supersession"] = (
         "refused" if draft.returncode and "foreign-only lines" in draft.stderr else "wrong"
     )
     cells["draft_preserved"] = (
-        "yes" if (root / "manifest.jsonl").read_bytes().endswith(b"row=draft\\n") else "no"
+        "yes" if (root / "manifest.jsonl").read_bytes().endswith(b"row=draft\n") else "no"
     )
 
-    write(root, "coverage.jsonl", b"row=stable\\n")
+    write(root, "coverage.jsonl", b"row=stable\n")
     coverage = sync(root, "coverage.jsonl")
     cells["missing_coverage_row"] = (
         "synced"
         if coverage.returncode == 0
         and (root / "coverage.jsonl").read_bytes()
-            == b"row=stable\\nrow=committed-coverage\\n"
+            == b"row=stable\nrow=committed-coverage\n"
         else "wrong"
     )
 
@@ -186,21 +186,21 @@ with tempfile.TemporaryDirectory() as scratch:
     cells["added_sparse_row"] = (
         "synced"
         if sparse.returncode == 0
-        and (root / "sparse.jsonl").read_bytes() == b"row=committed-sparse\\n"
+        and (root / "sparse.jsonl").read_bytes() == b"row=committed-sparse\n"
         else "wrong"
     )
 
-    write(root, "foreign.txt", b"row=stable\\nrow=foreign\\n")
+    write(root, "foreign.txt", b"row=stable\nrow=foreign\n")
     foreign = sync(root, "foreign.txt")
     cells["foreign_line"] = (
         "refused" if foreign.returncode and "foreign-only lines" in foreign.stderr else "wrong"
     )
     cells["foreign_preserved"] = (
-        "yes" if (root / "foreign.txt").read_bytes().endswith(b"row=foreign\\n") else "no"
+        "yes" if (root / "foreign.txt").read_bytes().endswith(b"row=foreign\n") else "no"
     )
 
     write(root, "batch-safe.txt", b"")
-    write(root, "batch-foreign.txt", b"row=stable\\nrow=foreign\\n")
+    write(root, "batch-foreign.txt", b"row=stable\nrow=foreign\n")
     batch = sync(root, "batch-safe.txt", "batch-foreign.txt")
     cells["batch_preflight"] = (
         "refused-before-write"
