@@ -1414,6 +1414,76 @@ fn small_heap_cross_thread_page_handoffs_reclaim_at_1_8_32_creators() {
 }
 
 #[test]
+fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    // These represent six distinct classes. Nine blocks per class pressure
+    // the eight-block deferred-free cache while fitting even the largest class
+    // into one 64 KiB page.
+    const SIZES: [usize; 6] = [1, 9, 17, 255, 1025, 4089];
+    const BLOCKS_PER_CLASS: usize = 9;
+
+    for width in [1, 8, 32] {
+        crate::membrane::drain_small_bins_for_test();
+        let before = crate::membrane::small_page_metrics_for_test();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let allocations_ready = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let mut senders = Vec::with_capacity(width);
+        let mut receivers = Vec::with_capacity(width);
+        for _ in 0..width {
+            let (sender, receiver) = std::sync::mpsc::channel::<Vec<usize>>();
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+
+        senders.rotate_left(1);
+        let mut workers = Vec::with_capacity(width);
+        for (receiver, successor) in receivers.into_iter().zip(senders) {
+            let start = std::sync::Arc::clone(&start);
+            let allocations_ready = std::sync::Arc::clone(&allocations_ready);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let mut blocks = Vec::with_capacity(SIZES.len() * BLOCKS_PER_CLASS);
+                for size in SIZES {
+                    for _ in 0..BLOCKS_PER_CLASS {
+                        let block = export_mi_malloc_small(size);
+                        assert!(!block.is_null(), "class {size} allocation must succeed");
+                        blocks.push(block.expose_provenance());
+                    }
+                }
+
+                // Every thread owns a live page set before the ring exchange;
+                // each receiver then frees a peer's allocations concurrently.
+                allocations_ready.wait();
+                successor.send(blocks).expect("ring successor is live");
+                for address in receiver.recv().expect("ring predecessor is live") {
+                    let block =
+                        core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(address);
+                    export_mi_free(block);
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("concurrent small-page handoff worker");
+        }
+
+        let after = crate::membrane::small_page_metrics_for_test();
+        assert_eq!(
+            after.0,
+            before.0 + width * SIZES.len(),
+            "width {width} creates one page per thread and class"
+        );
+        assert_eq!(
+            after.1,
+            before.1 + width * SIZES.len(),
+            "width {width} concurrently returns every peer-owned page"
+        );
+    }
+}
+
+#[test]
 fn small_allocator_ticks_are_width_invariant_at_1_8_32_threads() {
     let _g = lock();
     use crate::export::{export_lean_alloc_small, export_lean_free_small};
