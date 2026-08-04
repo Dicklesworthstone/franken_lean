@@ -25,7 +25,15 @@ use std::time::Instant;
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
 use fln_hash::domain::{Digest, Domain, hash};
 
-pub const BENCHMARK_EVIDENCE_VERSION: u16 = 1;
+/// Bumped 1 -> 2 by `franken_lean-odwj` when [`WorkloadKind`] was added.
+///
+/// All six schema ids below share this version deliberately, so the durable
+/// shapes move together and `read_supported_evidence_version` refuses any other
+/// version outright rather than guessing at a layout. Version 1 bytes are
+/// therefore rejected rather than silently reinterpreted — there are no
+/// persisted v1 bundles, which is exactly why the discriminator was added now
+/// rather than after baselines existed.
+pub const BENCHMARK_EVIDENCE_VERSION: u16 = 2;
 
 pub const BENCHMARK_HOST_PROFILE_SCHEMA: SchemaId = SchemaId {
     name: "fln.bench.host-profile",
@@ -385,11 +393,101 @@ pub struct ResourceBounds {
     pub max_elapsed_ns_per_attempt: u64,
 }
 
+/// What a workload actually DOES, as a first-class declaration.
+///
+/// Added by `franken_lean-odwj`. Before it existed, the manifest carried no
+/// representation of the measured operation at all: the difference between
+/// rechecking an olean set and merely loading the modules lived in
+/// `workload_id`, a free-form string nothing constrains, and in
+/// `cache_state.imported_modules`, which is a cache *condition* rather than an
+/// operation. A lane that loaded modules and called itself a recheck produced a
+/// bundle that was valid, internally consistent, and wrong.
+///
+/// odwj requires the "module-load-as-recheck" mutation to be killed, and a
+/// mutation cannot be killed while the property it attacks has nowhere to live
+/// (`fln-bench-apparatus-empty-referent-bkw6`). This enum is that place. It does
+/// not make a declaration *true* — nothing in this crate can witness what a
+/// lane actually ran — but it makes the claim explicit, bound into the workload
+/// root, and therefore falsifiable by review and refusable when it contradicts
+/// the cache state declared alongside it.
+///
+/// The variants are odwj's own required workload matrix, so a row of that matrix
+/// cannot be measured without saying which row it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// Full-Corpus build wall time, cold or warm per the declared cache state.
+    CorpusBuild,
+    /// Per-file elaboration latency.
+    Elaboration,
+    /// Kernel recheck of an olean set. Distinct from [`Self::ModuleImport`] by
+    /// construction: this is the "not module loading relabeled as checking"
+    /// requirement expressed as a type rather than as a naming convention.
+    KernelRecheck,
+    /// Loading/importing modules. The operation most easily mistaken for — or
+    /// passed off as — a recheck.
+    ModuleImport,
+    /// Server worker import/attach and resident set size.
+    ServerAttach,
+    /// First-goal latency in an editor session.
+    FirstGoalLatency,
+    /// Interpreter micro-corpus.
+    InterpreterMicro,
+    /// `bv_decide`, whose oracle-side tool identity is D4 and lives in the
+    /// Tribunal baseline only, never as a FrankenLean runtime dependency.
+    BvDecide,
+}
+
+impl WorkloadKind {
+    /// Every variant, so a scan over kinds cannot silently miss one.
+    pub const ALL: [Self; 8] = [
+        Self::CorpusBuild,
+        Self::Elaboration,
+        Self::KernelRecheck,
+        Self::ModuleImport,
+        Self::ServerAttach,
+        Self::FirstGoalLatency,
+        Self::InterpreterMicro,
+        Self::BvDecide,
+    ];
+
+    /// The stable wire tag. Written out per variant rather than derived from
+    /// discriminant order, so reordering the enum cannot silently reinterpret
+    /// persisted bytes.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::CorpusBuild => 0,
+            Self::Elaboration => 1,
+            Self::KernelRecheck => 2,
+            Self::ModuleImport => 3,
+            Self::ServerAttach => 4,
+            Self::FirstGoalLatency => 5,
+            Self::InterpreterMicro => 6,
+            Self::BvDecide => 7,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::CorpusBuild),
+            1 => Some(Self::Elaboration),
+            2 => Some(Self::KernelRecheck),
+            3 => Some(Self::ModuleImport),
+            4 => Some(Self::ServerAttach),
+            5 => Some(Self::FirstGoalLatency),
+            6 => Some(Self::InterpreterMicro),
+            7 => Some(Self::BvDecide),
+            _ => None,
+        }
+    }
+}
+
 /// Frozen before the first attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadManifest {
     pub schema_version: u16,
     pub workload_id: String,
+    /// What this workload measures. See [`WorkloadKind`].
+    pub workload_kind: WorkloadKind,
     pub corpus_root: Digest,
     pub input_order_root: Digest,
     pub warmup_iterations: u32,
@@ -1719,6 +1817,9 @@ fn read_host_policy(reader: &mut CanonReader<'_>) -> Result<HostQualificationPol
 fn write_workload_body(writer: &mut CanonWriter, workload: &WorkloadManifest) {
     writer.u16(workload.schema_version);
     writer.str(&workload.workload_id);
+    // The measured operation is SEMANTIC: it must move the workload root, so a
+    // module import cannot share an identity with a kernel recheck.
+    writer.u8(workload.workload_kind.tag());
     write_digest(writer, workload.corpus_root);
     write_digest(writer, workload.input_order_root);
     writer.u32(workload.warmup_iterations);
@@ -1753,6 +1854,8 @@ fn read_workload_body(reader: &mut CanonReader<'_>) -> Result<WorkloadManifest, 
     if workload_id.len() > MAX_TEXT_BYTES {
         return Err(decode_problem("benchmark workload id exceeds limit"));
     }
+    let workload_kind = WorkloadKind::from_tag(reader.u8()?)
+        .ok_or_else(|| decode_problem("unknown benchmark workload kind"))?;
     let corpus_root = read_digest(reader)?;
     let input_order_root = read_digest(reader)?;
     let warmup_iterations = reader.u32()?;
@@ -1782,6 +1885,7 @@ fn read_workload_body(reader: &mut CanonReader<'_>) -> Result<WorkloadManifest, 
     Ok(WorkloadManifest {
         schema_version,
         workload_id,
+        workload_kind,
         corpus_root,
         input_order_root,
         warmup_iterations,
@@ -3407,6 +3511,7 @@ mod tests {
         WorkloadManifest {
             schema_version: BENCHMARK_EVIDENCE_VERSION,
             workload_id: "fixture-workload".to_string(),
+            workload_kind: WorkloadKind::CorpusBuild,
             corpus_root: digest("corpus"),
             input_order_root: digest("input-order"),
             warmup_iterations: 2,
@@ -3661,10 +3766,19 @@ mod tests {
             "a moved declaration must also be detectably unregistered"
         );
 
+        // The planted mutant must name the version the source ACTUALLY carries,
+        // or `replacen` matches nothing, the "mutated" source equals the
+        // original, and this assertion fails for the wrong reason on every
+        // legitimate version bump. Moved 1->2 to 2->3 with the odwj bump.
         let version_drift_source = source.replacen(
-            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 1;",
             "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 2;",
+            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 3;",
             1,
+        );
+        assert_ne!(
+            version_drift_source, source,
+            "the planted version mutant matched nothing; it has drifted from the \
+             constant it is supposed to perturb"
         );
         let version_drift = declared_schema_pairs(&version_drift_source)?;
         assert_ne!(

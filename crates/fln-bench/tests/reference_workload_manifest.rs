@@ -32,8 +32,8 @@
 use fln_bench::{
     AttemptRecord, AttemptStatus, BENCHMARK_EVIDENCE_VERSION, BenchmarkRefusal, BenchmarkTelemetry,
     CacheCondition, CacheState, ConfidenceAlgorithm, HostQualificationPolicy, MeasurementUnit,
-    OutlierPolicy, ProfilerState, QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadManifest,
-    assemble_bundle,
+    OutlierPolicy, ProfilerState, QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadKind,
+    WorkloadManifest, assemble_bundle,
 };
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -76,6 +76,7 @@ fn preregistered() -> WorkloadManifest {
     WorkloadManifest {
         schema_version: BENCHMARK_EVIDENCE_VERSION,
         workload_id: "odwj-reference-baseline".to_string(),
+        workload_kind: WorkloadKind::KernelRecheck,
         corpus_root: digest("corpus/mathlib4@pin"),
         input_order_root: digest("input-order/declared"),
         warmup_iterations: 3,
@@ -105,6 +106,10 @@ fn one_rule_changed() -> Vec<(&'static str, WorkloadManifest)> {
     let mut m = preregistered();
     m.workload_id = "odwj-reference-baseline-other".to_string();
     cells.push(("workload-id", m));
+
+    let mut m = preregistered();
+    m.workload_kind = WorkloadKind::ModuleImport;
+    cells.push(("workload-kind", m));
 
     let mut m = preregistered();
     m.corpus_root = digest("corpus/mathlib4@different-pin");
@@ -165,7 +170,7 @@ fn every_preregistered_rule_is_bound_into_the_workload_root() {
     // must refuse rather than pass over nothing.
     let cells = one_rule_changed();
     assert!(
-        cells.len() >= 11,
+        cells.len() >= 12,
         "the pre-registration cell list has shrunk to {}; a rule is going unchecked",
         cells.len()
     );

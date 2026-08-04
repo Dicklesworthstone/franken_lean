@@ -43,7 +43,7 @@ use fln_bench::{
     AttemptRecord, AttemptStatus, BENCHMARK_EVIDENCE_VERSION, BenchmarkRefusal, BenchmarkTelemetry,
     CacheCondition, CacheState, ConfidenceAlgorithm, HostProfile, HostQualificationPolicy,
     LocalBuildIdentity, MeasurementUnit, OutlierPolicy, ProfilerState, QuantileAlgorithm,
-    ResourceBounds, SamplePlan, WorkloadManifest, assemble_bundle,
+    ResourceBounds, SamplePlan, WorkloadKind, WorkloadManifest, assemble_bundle,
 };
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -90,6 +90,7 @@ fn workload_under(cache: CacheState) -> WorkloadManifest {
     WorkloadManifest {
         schema_version: BENCHMARK_EVIDENCE_VERSION,
         workload_id: "reference-kernel-recheck".to_string(),
+        workload_kind: WorkloadKind::KernelRecheck,
         corpus_root: hash(Domain::OperationalMeta, b"olean-set/reference@pin"),
         input_order_root: hash(Domain::OperationalMeta, b"olean-set/declared-order"),
         warmup_iterations: 0,
@@ -283,6 +284,102 @@ fn attempts_agreeing_with_their_workloads_cache_state_are_not_refused_for_it() {
             "attempts agreeing with their workload's cache state were refused \
              (attempt {attempt_id}); the cache comparison is firing on unchanged input"
         );
+    }
+}
+
+/// THE MUTATION THIS SUITE OWES odwj: module-load-as-recheck.
+///
+/// Before `WorkloadKind` existed this mutation was unkillable, because the
+/// property it attacks had nowhere to live — a module-load lane could be
+/// byte-identical to a recheck lane. The discriminator gives it a place, and
+/// this cell is the kill: two workloads identical in **every other field**,
+/// differing only in the declared operation, must not share an identity, and an
+/// attempt measured under one must not be admissible under the other.
+///
+/// Note precisely what this earns. It does **not** establish that a workload
+/// declaring `KernelRecheck` performed one — nothing in this crate can witness
+/// what a lane actually ran, and no cell here pretends otherwise. What it earns
+/// is that the claim is now **explicit, semantic, and falsifiable**: passing a
+/// module load off as a recheck now requires writing `KernelRecheck` into a
+/// field whose only purpose is that assertion, rather than relying on a
+/// free-form `workload_id` string nobody checks.
+#[test]
+fn a_module_load_cannot_be_presented_as_a_kernel_recheck() {
+    let recheck = workload_under(recheck_cache_state());
+    assert_eq!(
+        recheck.workload_kind,
+        WorkloadKind::KernelRecheck,
+        "the baseline of this suite must be the recheck kind"
+    );
+
+    // Identical in every field except the declared operation — including the
+    // cache state, so this cell cannot pass for slice 3's cache reason.
+    let mut relabelled = workload_under(recheck_cache_state());
+    relabelled.workload_kind = WorkloadKind::ModuleImport;
+    assert_eq!(
+        relabelled.cache_state, recheck.cache_state,
+        "the mutation must differ ONLY in the declared operation"
+    );
+    assert_eq!(
+        relabelled.workload_id, recheck.workload_id,
+        "the mutation must differ ONLY in the declared operation"
+    );
+
+    assert_ne!(
+        relabelled.root(),
+        recheck.root(),
+        "a module import and a kernel recheck that differ only in the declared \
+         operation share a workload identity; the discriminator is not bound \
+         into the root and module-load-as-recheck is undetectable again"
+    );
+
+    // And the identity is load-bearing rather than cosmetic: an attempt
+    // measured as a module import cannot enter a recheck bundle.
+    let h = host();
+    let host_root = h.root();
+    let attempts = vec![attempt_with(
+        0,
+        host_root,
+        relabelled.root(),
+        recheck_cache_state(),
+    )];
+
+    let refusal = assemble_bundle(
+        "odwj-module-load-as-recheck",
+        h,
+        recheck,
+        attempts,
+        no_telemetry(),
+    )
+    .expect_err("an attempt measured as a module import must not enter a recheck bundle");
+
+    assert!(
+        matches!(refusal, BenchmarkRefusal::WorkloadSubstitution { .. }),
+        "expected WorkloadSubstitution, got {refusal:?}"
+    );
+}
+
+#[test]
+fn every_workload_kind_has_a_distinct_identity() {
+    // Anti-vacuity for the kill above: if two kinds shared a wire tag, the
+    // mutation cell could pass for one pair while another pair silently
+    // collided. All eight are compared pairwise.
+    let mut roots = Vec::new();
+    for kind in WorkloadKind::ALL {
+        let mut w = workload_under(recheck_cache_state());
+        w.workload_kind = kind;
+        roots.push((kind, w.root()));
+    }
+    assert_eq!(roots.len(), 8, "WorkloadKind::ALL must list every variant");
+
+    for (i, (kind_a, root_a)) in roots.iter().enumerate() {
+        for (kind_b, root_b) in roots.iter().skip(i + 1) {
+            assert_ne!(
+                root_a, root_b,
+                "workload kinds {kind_a:?} and {kind_b:?} produce the same workload \
+                 root, so one can be substituted for the other undetected"
+            );
+        }
     }
 }
 

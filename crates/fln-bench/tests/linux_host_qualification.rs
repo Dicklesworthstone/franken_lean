@@ -39,7 +39,7 @@ use fln_bench::{
     AttemptRecord, AttemptStatus, BENCHMARK_EVIDENCE_VERSION, BenchmarkRefusal, BenchmarkTelemetry,
     CacheCondition, CacheState, Captured, ConfidenceAlgorithm, HostProfile,
     HostQualificationPolicy, LocalBuildIdentity, MeasurementUnit, OutlierPolicy, ProfilerState,
-    QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadManifest, assemble_bundle,
+    QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadKind, WorkloadManifest, assemble_bundle,
 };
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -94,6 +94,9 @@ fn workload_with(policy: HostQualificationPolicy) -> WorkloadManifest {
     WorkloadManifest {
         schema_version: BENCHMARK_EVIDENCE_VERSION,
         workload_id: "odwj-host-qualification-probe".to_string(),
+        // A placeholder kind: this probe measures no workload at all, and the
+        // host-admission verdict under test is independent of the operation.
+        workload_kind: WorkloadKind::CorpusBuild,
         corpus_root: hash(
             Domain::OperationalMeta,
             b"odwj-host-qualification-probe/corpus",
