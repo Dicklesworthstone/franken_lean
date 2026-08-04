@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":450,"projection_hash":"b9e9dece83f941bc7a8a21c0b9ddd57ddbccc90bce768736369292b8a677e2b7"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":451,"projection_hash":"fb279a76103d85c39e58d39f349942af8b224686d1784e54024c47f31b76126f"}
 {"id":"fln-0bw5"}
 {"id":"fln-0rxm"}
 {"id":"fln-0uvk"}
@@ -150,6 +150,7 @@
 {"id":"fln-parity-ledger-l2-pinned-source-qydn"}
 {"id":"fln-parser-structural-identity-tzux"}
 {"id":"fln-path-classification-coverage-unbound-9teu"}
+{"id":"fln-private-index-worktree-sync-mbh9"}
 {"id":"fln-pu6i"}
 {"id":"fln-publish-rewrite-indexes-gca"}
 {"id":"fln-pv1"}
