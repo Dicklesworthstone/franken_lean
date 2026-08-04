@@ -102,7 +102,7 @@ REVIEWED_UNWALKED_CEILING = 16
 # Measured at the R3/R5 landing point. This is intentionally a floor, not an exact count: new
 # claims still flow through the disclosure and registry, while a wording-only population shrink
 # is refused until this constant is deliberately revisited in code.
-LIVE_CLAIM_FLOOR = 33
+LIVE_CLAIM_FLOOR = 35
 
 # The disclosure line AGENTS.md must carry, so the census is stated where the claim is made.
 DISCLOSURE = re.compile(

@@ -1857,8 +1857,36 @@ fn softening_a_claim_lowering_counts_and_deleting_its_row_hits_the_independent_f
         code, 2,
         "coordinated prose softening must hit the typed anti-softening floor:\n{output}"
     );
+    // The floor is DERIVED from the census script, never transcribed here. It used to read a
+    // literal `33`, and raising `LIVE_CLAIM_FLOOR` — which is the sanctioned, reviewed way to
+    // record a grown population — reddened this cell for a reason that had nothing to do with
+    // softening. That is a claim and its producer sitting in two artifacts with nothing joining
+    // them, which is the defect this whole file exists to catch, arriving inside its own guard.
+    let floor = declared_live_claim_floor();
     assert!(
-        output.contains("anti-softening floor") && output.contains("below the measured floor 33"),
-        "the refusal must identify the independent floor, not a stale count: {output}"
+        output.contains("anti-softening floor")
+            && output.contains(&format!("below the measured floor {floor}")),
+        "the refusal must identify the independent floor, not a stale count \
+         (derived floor {floor}): {output}"
     );
+}
+
+/// Read `LIVE_CLAIM_FLOOR` out of the census script. Refuses rather than defaulting: a floor
+/// this function could not find would make the assertion above pass against any message.
+fn declared_live_claim_floor() -> usize {
+    let source = std::fs::read_to_string(workspace_root().join(CENSUS))
+        .expect("the census script is readable");
+    let value = source
+        .lines()
+        .find_map(|line| line.strip_prefix("LIVE_CLAIM_FLOOR = "))
+        .expect(
+            "scripts/agents_enforcement_census.py no longer declares LIVE_CLAIM_FLOOR at line \
+             start, so this test cannot derive the floor it is asserting about and refuses \
+             rather than comparing against a number it invented",
+        );
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.parse().ok())
+        .expect("LIVE_CLAIM_FLOOR must be an integer")
 }
