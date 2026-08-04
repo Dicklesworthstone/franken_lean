@@ -104,6 +104,147 @@ fn verification_receipts_never_promote_libtest_ok_to_execution() {
     }
 }
 
+/// The post-private-index helper may repair a worktree copy only after proving that
+/// every current line is already present in the pinned `HEAD` blob.  A missing row is
+/// safe to restore; a superseded draft and explicit foreign line are not distinguishable
+/// by line provenance, so both are refused rather than overwritten.
+const PRIVATE_INDEX_WORKTREE_SYNC_PROBE: &str = r#"
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script = Path(sys.argv[1])
+cells = {}
+
+def git(root, *args):
+    completed = subprocess.run(
+        ["git", *args], cwd=root, text=True, capture_output=True, check=False
+    )
+    if completed.returncode:
+        raise RuntimeError(f"git {args!r} failed: {completed.stderr}")
+
+def write(root, relative, data):
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+
+def commit(root, message):
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", message)
+
+def sync(root, *paths):
+    command = [
+        "python3", "-I", "-S", str(script), "private-index-worktree-sync",
+        "--root", str(root),
+    ]
+    for relative in paths:
+        command.extend(["--path", relative])
+    return subprocess.run(command, text=True, capture_output=True, check=False)
+
+with tempfile.TemporaryDirectory() as scratch:
+    root = Path(scratch) / "repo"
+    root.mkdir()
+    git(root, "init", "-q")
+    git(root, "config", "user.email", "probe@example.invalid")
+    git(root, "config", "user.name", "private-index-sync-probe")
+
+    write(root, "manifest.jsonl", b"row=stable\\nrow=draft\\n")
+    write(root, "coverage.jsonl", b"row=stable\\n")
+    write(root, "foreign.txt", b"row=stable\\n")
+    write(root, "batch-safe.txt", b"row=stable\\n")
+    write(root, "batch-foreign.txt", b"row=stable\\n")
+    commit(root, "initial")
+
+    write(root, "manifest.jsonl", b"row=stable\\nrow=final\\n")
+    write(root, "coverage.jsonl", b"row=stable\\nrow=committed-coverage\\n")
+    write(root, "sparse.jsonl", b"row=committed-sparse\\n")
+    write(root, "batch-safe.txt", b"row=stable\\nrow=committed-safe\\n")
+    commit(root, "private-index result")
+
+    write(root, "manifest.jsonl", b"row=stable\\nrow=draft\\n")
+    draft = sync(root, "manifest.jsonl")
+    cells["draft_supersession"] = (
+        "refused" if draft.returncode and "foreign-only lines" in draft.stderr else "wrong"
+    )
+    cells["draft_preserved"] = (
+        "yes" if (root / "manifest.jsonl").read_bytes().endswith(b"row=draft\\n") else "no"
+    )
+
+    write(root, "coverage.jsonl", b"row=stable\\n")
+    coverage = sync(root, "coverage.jsonl")
+    cells["missing_coverage_row"] = (
+        "synced"
+        if coverage.returncode == 0
+        and (root / "coverage.jsonl").read_bytes()
+            == b"row=stable\\nrow=committed-coverage\\n"
+        else "wrong"
+    )
+
+    write(root, "sparse.jsonl", b"")
+    sparse = sync(root, "sparse.jsonl")
+    cells["added_sparse_row"] = (
+        "synced"
+        if sparse.returncode == 0
+        and (root / "sparse.jsonl").read_bytes() == b"row=committed-sparse\\n"
+        else "wrong"
+    )
+
+    write(root, "foreign.txt", b"row=stable\\nrow=foreign\\n")
+    foreign = sync(root, "foreign.txt")
+    cells["foreign_line"] = (
+        "refused" if foreign.returncode and "foreign-only lines" in foreign.stderr else "wrong"
+    )
+    cells["foreign_preserved"] = (
+        "yes" if (root / "foreign.txt").read_bytes().endswith(b"row=foreign\\n") else "no"
+    )
+
+    write(root, "batch-safe.txt", b"")
+    write(root, "batch-foreign.txt", b"row=stable\\nrow=foreign\\n")
+    batch = sync(root, "batch-safe.txt", "batch-foreign.txt")
+    cells["batch_preflight"] = (
+        "refused-before-write"
+        if batch.returncode and (root / "batch-safe.txt").read_bytes() == b""
+        else "wrong"
+    )
+
+for name in sorted(cells):
+    print(f"{name}={cells[name]}")
+print("PROBE-COMPLETE")
+"#;
+
+#[test]
+fn private_index_worktree_sync_preserves_foreign_lines_and_repairs_only_contained_stale_copies() {
+    let root = fln_conformance::checked_workspace_root!();
+    let evidence = root.join("scripts/evidence.py");
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", PRIVATE_INDEX_WORKTREE_SYNC_PROBE])
+        .arg(&evidence)
+        .output()
+        .expect("the sealed interpreter must run the private-index sync probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "private-index sync probe did not complete: status={:?} stderr={stderr}",
+        run.status.code()
+    );
+    for expected in [
+        "draft_supersession=refused",
+        "draft_preserved=yes",
+        "missing_coverage_row=synced",
+        "added_sparse_row=synced",
+        "foreign_line=refused",
+        "foreign_preserved=yes",
+        "batch_preflight=refused-before-write",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "private-index sync probe omitted {expected:?}: {stdout}"
+        );
+    }
+}
+
 /// The artifact kinds a publishable evidence root may not contain, exercised against
 /// real filesystem shapes rather than against the prose that used to hold them apart.
 ///

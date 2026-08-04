@@ -17606,6 +17606,206 @@ def git_text(root: Path, args: Sequence[str], *, subject: str) -> str:
     return value
 
 
+def private_index_sync_relative_path(raw: str) -> str:
+    """Require one normalized, repository-relative target path.
+
+    This command is deliberately narrow.  It is a post-private-index repair for a
+    worktree copy known to be behind ``HEAD``; accepting a path which escapes the
+    named repository would turn that repair into an unchecked overwrite primitive.
+    """
+    candidate = Path(raw)
+    if (
+        not raw
+        or candidate.is_absolute()
+        or raw != candidate.as_posix()
+        or any(component in {"", ".", ".."} for component in candidate.parts)
+    ):
+        raise EvidenceError(
+            f"private-index worktree sync requires a normalized repository-relative path: {raw!r}"
+        )
+    return raw
+
+
+def private_index_sync_read_worktree_file(
+    target: Path,
+) -> tuple[bytes, tuple[int, int, int, int, int] | None]:
+    """Read one ordinary worktree file through a no-follow parent directory.
+
+    An absent file is the safe "missing committed row" shape: it has no
+    foreign-only lines and can be recreated from the pinned ``HEAD`` blob.  A
+    symlink or special file is never a sync target.
+    """
+    _parent, parent_fd = open_directory_nofollow(target.parent, create=False)
+    try:
+        try:
+            descriptor = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return b"", None
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise EvidenceError(
+                    f"private-index worktree sync target is not a regular file: {target}"
+                )
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    snapshot = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if snapshot != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise EvidenceError(f"private-index worktree sync target changed while read: {target}")
+    return b"".join(chunks), snapshot
+
+
+def private_index_sync_foreign_lines(worktree: bytes, head: bytes) -> set[bytes]:
+    """Return raw worktree lines absent from the candidate ``HEAD`` blob.
+
+    Keep line terminators in the comparison: a missing final newline is content,
+    not a formatting normalization the helper may erase without a judgement.
+    """
+    return set(worktree.splitlines(keepends=True)) - set(head.splitlines(keepends=True))
+
+
+def synchronize_private_index_worktree(
+    root: Path, requested_paths: Sequence[str]
+) -> dict[str, Any]:
+    """Synchronize contained stale copies after a private-index commit.
+
+    First pin ``HEAD`` and preflight *every* requested file.  A worktree line
+    absent from that pinned blob is foreign WIP (or an unjudged draft) and causes
+    refusal before this function writes any requested target.  Only a copy whose
+    raw-line set is contained in ``HEAD`` is replaced, using a same-directory
+    no-follow temporary followed by ``os.replace``.  A race after preflight is
+    refused by re-reading the target and ``HEAD`` immediately before replacement.
+
+    The helper intentionally does not delete a retained temporary when a post-write
+    check fails: preserving the interrupted state is safer than guessing which bytes
+    may be discarded.
+    """
+    root = lexical_absolute(root)
+    if not requested_paths:
+        raise EvidenceError("private-index worktree sync requires at least one --path")
+    paths = [private_index_sync_relative_path(raw) for raw in requested_paths]
+    if len(set(paths)) != len(paths):
+        raise EvidenceError("private-index worktree sync received a duplicate --path")
+
+    head = git_text(root, ["rev-parse", "HEAD"], subject="private-index sync HEAD")
+    prepared: list[tuple[str, Path, bytes, bytes, tuple[int, int, int, int, int] | None]] = []
+    for relative in paths:
+        target = require_within(
+            root / relative,
+            root,
+            label="private-index worktree sync target",
+        )
+        head_data = run_git(
+            root,
+            ["show", "--no-textconv", f"{head}:{relative}"],
+            subject=f"private-index sync HEAD blob for {relative}",
+        )
+        worktree_data, snapshot = private_index_sync_read_worktree_file(target)
+        foreign_lines = private_index_sync_foreign_lines(worktree_data, head_data)
+        if foreign_lines:
+            raise EvidenceError(
+                "private-index worktree sync refuses foreign-only lines in "
+                f"{relative}: count={len(foreign_lines)}; no requested file was synced"
+            )
+        prepared.append((relative, target, head_data, worktree_data, snapshot))
+
+    for relative, target, head_data, expected_data, expected_snapshot in prepared:
+        if git_text(root, ["rev-parse", "HEAD"], subject="private-index sync HEAD") != head:
+            raise EvidenceError(
+                "private-index worktree sync HEAD changed after containment preflight; "
+                "no further file was synced"
+            )
+        current_data, current_snapshot = private_index_sync_read_worktree_file(target)
+        if current_data != expected_data or current_snapshot != expected_snapshot:
+            raise EvidenceError(
+                f"private-index worktree sync target changed after containment preflight: {relative}"
+            )
+
+        _parent, parent_fd = open_directory_nofollow(target.parent, create=False)
+        temporary_name = (
+            ".fln-private-index-sync-"
+            f"{hashlib.sha256(relative.encode('utf-8')).hexdigest()[:16]}-"
+            f"{time.monotonic_ns()}"
+        )
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+                dir_fd=parent_fd,
+            )
+            try:
+                view = memoryview(head_data)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise EvidenceError(
+                            f"private-index worktree sync short write for {relative}"
+                        )
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+            if git_text(root, ["rev-parse", "HEAD"], subject="private-index sync HEAD") != head:
+                raise EvidenceError(
+                    "private-index worktree sync HEAD changed before replacement; "
+                    f"retained temporary {target.parent / temporary_name}"
+                )
+            current_data, current_snapshot = private_index_sync_read_worktree_file(target)
+            if current_data != expected_data or current_snapshot != expected_snapshot:
+                raise EvidenceError(
+                    "private-index worktree sync target changed before replacement: "
+                    f"{relative}; retained temporary {target.parent / temporary_name}"
+                )
+            os.replace(
+                temporary_name,
+                target.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    return {
+        "schema": "fln.private-index-worktree-sync/1",
+        "head": head,
+        "paths": paths,
+    }
+
+
+def cmd_private_index_worktree_sync(args: argparse.Namespace) -> int:
+    report = synchronize_private_index_worktree(Path(args.root), args.path)
+    sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def parse_reference_lock(root: Path) -> dict[str, str]:
     data, _size, _digest = stable_file_facts(
         root / "SUITE.lock", max_bytes=MAX_RECORD_BYTES
@@ -31753,6 +31953,14 @@ def build_parser() -> argparse.ArgumentParser:
     verification_manifest_parser.set_defaults(
         func=cmd_validate_verification_manifest
     )
+
+    private_index_sync_parser = subparsers.add_parser(
+        "private-index-worktree-sync",
+        help="sync contained stale worktree files from one pinned HEAD after a private-index commit",
+    )
+    private_index_sync_parser.add_argument("--root", required=True)
+    private_index_sync_parser.add_argument("--path", action="append", required=True)
+    private_index_sync_parser.set_defaults(func=cmd_private_index_worktree_sync)
 
     check_human_parser = subparsers.add_parser(
         "render-check-human",
