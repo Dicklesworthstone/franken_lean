@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+mod reduction;
+
 /// The one NaN representation returned for invalid operations.
 pub const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 const CANONICAL_NAN: f64 = f64::from_bits(CANONICAL_NAN_BITS);
@@ -20,8 +22,6 @@ const FRAC: u64 = 0x000f_ffff_ffff_ffff;
 const PI: f64 = f64::from_bits(0x4009_21fb_5444_2d18);
 const HALF_PI: f64 = f64::from_bits(0x3ff9_21fb_5444_2d18);
 const QUARTER_PI: f64 = f64::from_bits(0x3fe9_21fb_5444_2d18);
-const TAU: f64 = f64::from_bits(0x4019_21fb_5444_2d18);
-const INV_TAU: f64 = f64::from_bits(0x3fc4_5f30_6dc9_c883);
 const INV_LN2: f64 = f64::from_bits(0x3ff7_1547_652b_82fe);
 const LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fee0_0000);
 const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
@@ -181,46 +181,37 @@ pub fn sqrt(x: f64) -> f64 {
     scalbn(y, exponent / 2)
 }
 
-fn reduce_quadrant(x: f64) -> (f64, i32) {
-    // Fixed reduction.  Inputs beyond this bound need a multiword
-    // Payne-Hanek reducer before an accuracy claim can be made; retaining a
-    // deterministic fallback is preferable to delegating to platform libm.
-    if abs(x) > 1_125_899_906_842_624.0 {
-        return (signed_zero(x), 0);
-    }
-    let turns = round(x * INV_TAU);
-    let mut r = x - turns * TAU;
-    if r > PI {
-        r -= TAU;
-    }
-    if r < -PI {
-        r += TAU;
-    }
-    let quadrant = round(r / HALF_PI) as i32;
-    (r - (quadrant as f64) * HALF_PI, quadrant & 3)
+fn reduce_quadrant(x: f64) -> (f64, f64, i32) {
+    let (quadrant, head, tail) = reduction::rem_pio2(x);
+    (head, tail, quadrant & 3)
 }
 
-fn sin_kernel(x: f64) -> f64 {
+fn sin_kernel(x: f64, tail: f64) -> f64 {
     let z = x * x;
-    // Horner form of sin on [-pi/4, pi/4].
-    let p = 1.589_690_995_211_55e-10;
-    let p = -2.505_076_025_340_686_3e-8 + z * p;
-    let p = 2.755_731_370_707_006_8e-6 + z * p;
-    let p = -1.984_126_982_985_795e-4 + z * p;
-    let p = 8.333_333_333_322_49e-3 + z * p;
-    let p = -1.666_666_666_666_663_2e-1 + z * p;
-    x * (1.0 + z * p)
+    let w = z * z;
+    let r = 8.333_333_333_322_49e-3
+        + z * (-1.984_126_982_985_795e-4 + z * 2.755_731_370_707_006_8e-6)
+        + z * w * (-2.505_076_025_340_686_3e-8 + z * 1.589_690_995_211_55e-10);
+    let v = z * x;
+    if tail == 0.0 {
+        x + v * (-1.666_666_666_666_663_2e-1 + z * r)
+    } else {
+        x - ((z * (0.5 * tail - v * r) - tail) + v * 1.666_666_666_666_663_2e-1)
+    }
 }
 
-fn cos_kernel(x: f64) -> f64 {
+fn cos_kernel(x: f64, tail: f64) -> f64 {
     let z = x * x;
-    let p = -1.135_964_755_778_819_5e-11;
-    let p = 2.087_572_321_298_175e-9 + z * p;
-    let p = -2.755_731_435_139_066_3e-7 + z * p;
-    let p = 2.480_158_728_947_673e-5 + z * p;
-    let p = -1.388_888_888_887_305_6e-3 + z * p;
-    let p = 4.166_666_666_666_659e-2 + z * p;
-    1.0 + z * (-0.5 + z * p)
+    let w = z * z;
+    let r = z
+        * (4.166_666_666_666_66e-2
+            + z * (-1.388_888_888_887_411e-3 + z * 2.480_158_728_947_673e-5))
+        + w * w
+            * (-2.755_731_435_139_066e-7
+                + z * (2.087_572_321_298_175e-9 - z * 1.135_964_755_778_819_5e-11));
+    let half_z = 0.5 * z;
+    let head = 1.0 - half_z;
+    head + (((1.0 - head) - half_z) + (z * r - x * tail))
 }
 
 /// Sine with fixed range reduction and polynomial evaluation.
@@ -231,12 +222,12 @@ pub fn sin(x: f64) -> f64 {
     if x == 0.0 {
         return x;
     }
-    let (r, q) = reduce_quadrant(x);
+    let (r, tail, q) = reduce_quadrant(x);
     match q {
-        0 => sin_kernel(r),
-        1 => cos_kernel(r),
-        2 => -sin_kernel(r),
-        _ => -cos_kernel(r),
+        0 => sin_kernel(r, tail),
+        1 => cos_kernel(r, tail),
+        2 => -sin_kernel(r, tail),
+        _ => -cos_kernel(r, tail),
     }
 }
 
@@ -245,12 +236,12 @@ pub fn cos(x: f64) -> f64 {
     if invalid(x) || x.is_infinite() {
         return canonical_nan();
     }
-    let (r, q) = reduce_quadrant(x);
+    let (r, tail, q) = reduce_quadrant(x);
     match q {
-        0 => cos_kernel(r),
-        1 => -sin_kernel(r),
-        2 => -cos_kernel(r),
-        _ => sin_kernel(r),
+        0 => cos_kernel(r, tail),
+        1 => -sin_kernel(r, tail),
+        2 => -cos_kernel(r, tail),
+        _ => sin_kernel(r, tail),
     }
 }
 
@@ -262,11 +253,11 @@ pub fn tan(x: f64) -> f64 {
     if x == 0.0 {
         return x;
     }
-    let (r, q) = reduce_quadrant(x);
+    let (r, tail, q) = reduce_quadrant(x);
     if q & 1 == 0 {
-        sin_kernel(r) / cos_kernel(r)
+        sin_kernel(r, tail) / cos_kernel(r, tail)
     } else {
-        -cos_kernel(r) / sin_kernel(r)
+        -cos_kernel(r, tail) / sin_kernel(r, tail)
     }
 }
 
