@@ -561,6 +561,7 @@ fn append_frame(output: &mut Vec<u8>, record: &[u8]) {
 
 /// Encode a structurally validated proof as a header followed by length-framed
 /// action records and one mandatory conclusion record.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: structured-proof-serialization
 pub fn encode_unsat_proof(proof: &UnsatProof) -> Vec<u8> {
     let mut writer = CanonWriter::new();
     writer.schema(UNSAT_PROOF_SCHEMA);
@@ -735,6 +736,7 @@ impl<'a, R: Read, P: CancellationProbe + ?Sized> StreamInput<'a, R, P> {
 }
 
 /// Decode a proof stream without cancellation.
+// FLN-FL-INV-06-CERTIFICATE-ALIAS: framed-proof-decode
 pub fn decode_unsat_proof<R: Read>(
     reader: R,
     cnf: &CanonicalCnf,
@@ -745,6 +747,7 @@ pub fn decode_unsat_proof<R: Read>(
 
 /// Decode a proof stream with cooperative cancellation between framing reads and
 /// within count-directed record loops.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: framed-proof-decode
 pub fn decode_unsat_proof_with_cancellation<R: Read, P: CancellationProbe + ?Sized>(
     reader: R,
     cnf: &CanonicalCnf,

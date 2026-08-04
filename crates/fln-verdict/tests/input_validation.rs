@@ -1780,7 +1780,7 @@ struct ExpectedCall {
     count: usize,
 }
 
-const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 7] = [
+const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 9] = [
     ExpectedBoundary {
         id: "structured-proof-construction",
         path: "crates/fln-verdict/src/lib.rs",
@@ -1816,15 +1816,32 @@ const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 7] = [
         path: "crates/fln-verdict/src/solver.rs",
         function: "solve_with_unsat_certificate",
     },
+    ExpectedBoundary {
+        id: "structured-proof-serialization",
+        path: "crates/fln-verdict/src/codec.rs",
+        function: "encode_unsat_proof",
+    },
+    ExpectedBoundary {
+        id: "framed-proof-decode",
+        path: "crates/fln-verdict/src/codec.rs",
+        function: "decode_unsat_proof_with_cancellation",
+    },
 ];
 
-const EXPECTED_VERDICT_ALIASES: [ExpectedBoundary; 1] = [ExpectedBoundary {
-    id: "streaming-semantic-checker",
-    path: "crates/fln-verdict/src/checker.rs",
-    function: "check_unsat_streams_with_cancel",
-}];
+const EXPECTED_VERDICT_ALIASES: [ExpectedBoundary; 2] = [
+    ExpectedBoundary {
+        id: "streaming-semantic-checker",
+        path: "crates/fln-verdict/src/checker.rs",
+        function: "check_unsat_streams_with_cancel",
+    },
+    ExpectedBoundary {
+        id: "framed-proof-decode",
+        path: "crates/fln-verdict/src/codec.rs",
+        function: "decode_unsat_proof",
+    },
+];
 
-const EXPECTED_VERDICT_CALLS: [ExpectedCall; 6] = [
+const EXPECTED_VERDICT_CALLS: [ExpectedCall; 7] = [
     ExpectedCall {
         needle: "check_unsat_streams_with_cancel(",
         path: "crates/fln-verdict/src/checker.rs",
@@ -1847,6 +1864,12 @@ const EXPECTED_VERDICT_CALLS: [ExpectedCall; 6] = [
         needle: "UnsatProof::new(",
         path: "crates/fln-verdict/src/solver.rs",
         function: "finish_unsat",
+        count: 1,
+    },
+    ExpectedCall {
+        needle: "UnsatProof::new(",
+        path: "crates/fln-verdict/src/codec.rs",
+        function: "decode_unsat_proof_with_cancellation",
         count: 1,
     },
     ExpectedCall {
@@ -1958,10 +1981,13 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
                 && matches!(site.name.as_str(), "proof" | "from_checked");
             let allowed_orchestration_alias = site.path == "crates/fln-verdict/src/bv_decide.rs"
                 && site.name == "bv_decide_with_cancel";
+            let allowed_proof_identity_projection =
+                site.path == "crates/fln-verdict/src/schema.rs" && site.name == "root";
             if sensitive
                 && site.marker.is_none()
                 && !allowed_projection
                 && !allowed_orchestration_alias
+                && !allowed_proof_identity_projection
             {
                 unmarked_sensitive_functions
                     .insert(format!("{}:{}:{}", site.path, site.line, site.name));
@@ -2270,8 +2296,8 @@ fn fl_inv_06_census_mutants_change_the_referent_and_die() {
     let mut verdict_count = baseline;
     verdict_count.edit(VERDICT_CENSUS, |document| {
         document.replacen(
-            "Certificate-accepting path cardinality: `7`.",
-            "Certificate-accepting path cardinality: `6`.",
+            "Certificate-accepting path cardinality: `9`.",
+            "Certificate-accepting path cardinality: `8`.",
             1,
         )
     });
