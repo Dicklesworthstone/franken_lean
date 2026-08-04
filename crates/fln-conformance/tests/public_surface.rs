@@ -220,7 +220,7 @@ fn generated_consumer_compile() {
 fn public_surface_drift_model() {
     let corrupted_root = replace_once(
         CONTRACT_TEXT,
-        "contract-root fnv1a64:4ba1ecf934118013",
+        "contract-root fnv1a64:ea895085a8087887",
         "contract-root fnv1a64:0000000000000000",
     );
     PublicSurfaceContract::parse(&corrupted_root).expect_err("root drift must be refused");
