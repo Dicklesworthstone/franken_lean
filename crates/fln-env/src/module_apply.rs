@@ -369,6 +369,64 @@ impl PreflightedModuleApply {
     }
 }
 
+/// The payload side of one contribution once its manifest binding has completed.
+///
+/// This retains the original `Arc` allocations rather than a flattened copy. It is
+/// still non-authoritative until an aggregate state includes it through a prepared,
+/// base-bound commit; the type only prevents a later state layer from losing the
+/// values that preflight actually checked.
+#[derive(Debug, Clone)]
+pub struct AppliedModulePayload {
+    contribution: ModuleContributionRecord,
+    declarations: Arc<[Arc<ConstantInfo>]>,
+    extra_declarations: Arc<[Arc<ConstantInfo>]>,
+    extension_payloads: Arc<[ExtensionPayload]>,
+}
+
+impl AppliedModulePayload {
+    /// Retain exactly the already-validated transaction allocations.
+    pub fn from_preflight(
+        preflight: &PreflightedModuleApply,
+    ) -> Result<Self, ModuleApplyCandidateError> {
+        if preflight.schema != MODULE_APPLY_SCHEMA_VERSION {
+            return Err(ModuleApplyCandidateError::SupersededPreflightSchema {
+                schema: preflight.schema,
+            });
+        }
+        let transaction = preflight.transaction();
+        Ok(Self {
+            contribution: transaction.contribution.clone(),
+            declarations: Arc::clone(&transaction.declarations),
+            extra_declarations: Arc::clone(&transaction.extra_declarations),
+            extension_payloads: Arc::clone(&transaction.extension_payloads),
+        })
+    }
+
+    pub fn contribution(&self) -> &ModuleContributionRecord {
+        &self.contribution
+    }
+
+    pub fn declarations(&self) -> &[Arc<ConstantInfo>] {
+        &self.declarations
+    }
+
+    pub fn extra_declarations(&self) -> &[Arc<ConstantInfo>] {
+        &self.extra_declarations
+    }
+
+    pub fn extension_payloads(&self) -> &[ExtensionPayload] {
+        &self.extension_payloads
+    }
+
+    /// The storage law required before committed state may retain this payload.
+    pub fn shares_storage_with_preflight(&self, preflight: &PreflightedModuleApply) -> bool {
+        let transaction = preflight.transaction();
+        Arc::ptr_eq(&self.declarations, &transaction.declarations)
+            && Arc::ptr_eq(&self.extra_declarations, &transaction.extra_declarations)
+            && Arc::ptr_eq(&self.extension_payloads, &transaction.extension_payloads)
+    }
+}
+
 /// Every preflight refusal names the contribution field that disagreed.  No variant
 /// chooses a winner or normalizes mismatched payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1054,6 +1112,8 @@ mod tests {
         );
         let declaration = Arc::clone(&transaction.declarations()[0]);
         let checked = preflight_module_apply(transaction).expect("exact payload binding");
+        let applied = AppliedModulePayload::from_preflight(&checked)
+            .expect("current preflight schema retains payloads");
 
         assert!(!checked.is_cacheable());
         assert_eq!(checked.schema(), MODULE_APPLY_SCHEMA_VERSION);
@@ -1066,6 +1126,9 @@ mod tests {
             checked.transaction().extension_payloads()[0]
                 .shares_payload_with(&ExtensionPayload::new(0, descriptor.clone(), 0, payload))
         );
+        assert!(applied.shares_storage_with_preflight(&checked));
+        assert!(Arc::ptr_eq(&declaration, &applied.declarations()[0]));
+        assert_eq!(applied.contribution(), checked.transaction().contribution());
     }
 
     #[test]
