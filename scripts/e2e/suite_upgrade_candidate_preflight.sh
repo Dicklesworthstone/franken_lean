@@ -75,6 +75,19 @@ digest() {
   printf '%s\n' "${digest_line%% *}"
 }
 
+require_unchanged_root() {
+  local label="$1"
+  local expected_root="$2"
+  local path="$3"
+  local actual_root
+  actual_root="$(digest "$path")" || actual_root=""
+  if [[ -z "$actual_root" || "$actual_root" != "$expected_root" ]]; then
+    printf '[suite_upgrade_candidate_preflight] inconclusive: %s changed during candidate preflight\n' \
+      "$label" >&2
+    return 1
+  fi
+}
+
 current_lock_root="$(digest "$ROOT/SUITE.lock")"
 candidate_lock_root="$(digest "$CANDIDATE_DIR/SUITE.lock")"
 closure_root="$(digest "$CANDIDATE_DIR/closure.ndjson")"
@@ -96,10 +109,22 @@ FLN_SUITE_UPGRADE_EXTERNAL_EVIDENCE_ROOT="$external_evidence_root" \
   cargo test --locked -q -p fln-conformance --test suite_upgrade_governance \
     suite_upgrade_candidate_bundle_from_environment
 
-final_current_lock_root="$(digest "$ROOT/SUITE.lock")"
-if [[ "$final_current_lock_root" != "$current_lock_root" ]]; then
-  printf '%s\n' \
-    '[suite_upgrade_candidate_preflight] inconclusive: authoritative SUITE.lock changed during candidate preflight' >&2
+if ! require_unchanged_root \
+  'authoritative SUITE.lock' "$current_lock_root" "$ROOT/SUITE.lock" \
+  || ! require_unchanged_root \
+    'candidate SUITE.lock' "$candidate_lock_root" "$CANDIDATE_DIR/SUITE.lock" \
+  || ! require_unchanged_root \
+    'candidate closure evidence' "$closure_root" "$CANDIDATE_DIR/closure.ndjson" \
+  || ! require_unchanged_root \
+    'candidate contract/census evidence' "$contract_census_root" "$CANDIDATE_DIR/contract-census.ndjson" \
+  || ! require_unchanged_root \
+    'candidate Tribunal evidence' "$tribunal_root" "$CANDIDATE_DIR/tribunal.ndjson" \
+  || ! require_unchanged_root \
+    'candidate migration evidence' "$migration_root" "$CANDIDATE_DIR/migration.ndjson" \
+  || ! require_unchanged_root \
+    'candidate rollback evidence' "$rollback_root" "$CANDIDATE_DIR/rollback.ndjson" \
+  || ! require_unchanged_root \
+    'candidate external evidence' "$external_evidence_root" "$CANDIDATE_DIR/external-evidence.ndjson"; then
   exit 3
 fi
 
