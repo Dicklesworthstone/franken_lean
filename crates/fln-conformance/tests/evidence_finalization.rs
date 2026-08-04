@@ -104,6 +104,166 @@ fn verification_receipts_never_promote_libtest_ok_to_execution() {
     }
 }
 
+/// The artifact kinds a publishable evidence root may not contain, exercised against
+/// real filesystem shapes rather than against the prose that used to hold them apart.
+///
+/// Bead `fln-selftest-symlink-blocks-bundle-4yhd`. The evidence self-test must create a
+/// real symlink to exercise the artifact classifier; the bundle publisher must refuse a
+/// symlink under any root it publishes. Both are correct, and while the contradiction
+/// between them was expressed only in a comment the self-test's own fixture made
+/// publication impossible for every gate run — thirteen green stages, no
+/// `bundle.decision`, and the only report an `INTERNAL FAULT` line emitted after the
+/// terminal verdict had already been set.
+///
+/// `forbidden_artifact_kind` is that contradiction as one predicate and both halves read
+/// it, so this binds all three: the predicate itself, the publisher's walk that enforces
+/// it, and the early guard that refuses the same kinds by name before publication. The
+/// `fifo` cells matter as much as the `symlink` ones — the law is about a *class* of
+/// artifact kind, and a guard that only ever sees the kind it was filed for is a guard
+/// nobody has shown to generalise. `guard_clean` carries the anti-vacuity floor: a scan
+/// that walked nothing refuses nothing and would let every cell below pass on an empty
+/// tree.
+const FORBIDDEN_ARTIFACT_KIND_PROBE: &str = r#"
+import importlib.util
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("fln_evidence_4yhd_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+cells = {}
+with tempfile.TemporaryDirectory() as scratch:
+    scratch = Path(scratch)
+
+    shapes = scratch / "shapes"
+    shapes.mkdir()
+    (shapes / "dir").mkdir()
+    (shapes / "reg").write_bytes(b"x\n")
+    (shapes / "symlink").symlink_to("reg")
+    os.mkfifo(shapes / "fifo")
+    for name in ("dir", "reg", "symlink", "fifo"):
+        kind = module.forbidden_artifact_kind((shapes / name).lstat().st_mode)
+        cells[f"predicate_{name}"] = "none" if kind is None else kind
+
+    def publisher(name, expected, plant):
+        root = scratch / f"publisher_{name}"
+        root.mkdir()
+        (root / "tracked.log").write_bytes(b"tracked\n")
+        clean = module.artifact_inventory(root, excluded=set())
+        cells[f"publisher_{name}_control"] = (
+            "inventoried"
+            if [entry["path"] for entry in clean] == ["tracked.log"]
+            else "lost"
+        )
+        plant(root)
+        try:
+            module.artifact_inventory(root, excluded=set())
+        except module.EvidenceError as error:
+            cells[f"publisher_{name}"] = (
+                "refused" if expected in str(error) else "wrong_reason"
+            )
+        else:
+            cells[f"publisher_{name}"] = "published"
+
+    publisher(
+        "symlink",
+        "artifact symlink is forbidden",
+        lambda root: (root / "p.log").symlink_to("tracked.log"),
+    )
+    publisher(
+        "special",
+        "special artifact file is forbidden",
+        lambda root: os.mkfifo(root / "p"),
+    )
+
+    clean_root = scratch / "guard_clean"
+    (clean_root / "nested").mkdir(parents=True)
+    (clean_root / "nested" / "a.log").write_bytes(b"a\n")
+    cells["guard_clean"] = str(
+        module.require_publishable_artifact_root(clean_root, context="probe")
+    )
+
+    def guard(name, plant):
+        root = scratch / f"guard_{name}"
+        nested = root / "verification-manifest" / "artifact-classification"
+        nested.mkdir(parents=True)
+        (nested / "tracked.log").write_bytes(b"tracked\n")
+        plant(nested)
+        try:
+            module.require_publishable_artifact_root(root, context="probe context")
+        except module.EvidenceError as error:
+            text = str(error)
+            named = (
+                "probe context" in text
+                and f"{name} artifact under the publishable root" in text
+                and "no bundle.decision" in text
+                and str(module.RETAINED_FIXTURE_ROOT) in text
+            )
+            cells[f"guard_{name}"] = "refused" if named else "unnamed_refusal"
+        else:
+            cells[f"guard_{name}"] = "tolerated"
+
+    guard("symlink", lambda at: (at / "symlink.log").symlink_to("tracked.log"))
+    guard("special", lambda at: os.mkfifo(at / "pipe"))
+
+for name in sorted(cells):
+    print(f"{name}={cells[name]}")
+print("PROBE-COMPLETE")
+"#;
+
+#[test]
+fn a_forbidden_artifact_kind_is_refused_by_the_publisher_and_named_before_publication() {
+    let root = fln_conformance::checked_workspace_root!();
+    let evidence = root.join("scripts/evidence.py");
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", FORBIDDEN_ARTIFACT_KIND_PROBE])
+        .arg(&evidence)
+        .output()
+        .expect("the sealed interpreter must run the forbidden-artifact-kind probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "forbidden-artifact-kind probe did not complete against {}: status={:?} stderr={stderr}",
+        evidence.display(),
+        run.status.code()
+    );
+    for expected in [
+        // the predicate names each kind, and tolerates exactly the two publishable ones
+        "predicate_dir=none",
+        "predicate_reg=none",
+        "predicate_symlink=symlink",
+        "predicate_fifo=special",
+        // the publisher's walk still refuses both, and still inventories a clean root —
+        // without the control a refusal could be read off a scan failing for any reason
+        "publisher_symlink_control=inventoried",
+        "publisher_symlink=refused",
+        "publisher_special_control=inventoried",
+        "publisher_special=refused",
+        // and the same kinds are refused early, by name, before anything is published
+        "guard_symlink=refused",
+        "guard_special=refused",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "forbidden-artifact-kind probe omitted {expected:?}: {stdout}"
+        );
+    }
+    let scanned: usize = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("guard_clean="))
+        .expect("the probe must report the clean-root scan width")
+        .parse()
+        .expect("the clean-root scan width must be a count");
+    assert!(
+        scanned > 0,
+        "the clean-root scan walked nothing, so every refusal cell above is vacuous: {stdout}"
+    );
+}
+
 #[test]
 fn terminal_human_log_is_sealed_before_manifest_generation() {
     let script = check_script();
