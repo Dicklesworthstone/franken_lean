@@ -292,9 +292,22 @@ fn atan_kernel(x: f64) -> f64 {
     // atan(x) = x * sum (-z)^n/(2n+1), |x| <= tan(pi/8).
     let mut term = x;
     let mut sum = x;
+    let mut compensation = 0.0;
+    let use_compensation = abs(x) >= 0.015_625;
     for n in 1..=34 {
         term *= -z;
-        sum += term / (2 * n + 1) as f64;
+        let contribution = term / (2 * n + 1) as f64;
+        if use_compensation {
+            let adjusted = contribution - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
+        } else {
+            // The tiny atan2-derived path is already accurately conditioned;
+            // retaining its direct evaluation avoids an extra compensation
+            // rounding at the acos(+1) endpoint.
+            sum += contribution;
+        }
     }
     sum
 }
@@ -1264,6 +1277,20 @@ mod tests {
                     "input={input:?} actual={actual:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inverse_trig_reference_vectors_stay_within_one_ulp() {
+        for (actual, expected) in [
+            (atan(-0.1), 0xbfb9_83e2_82e2_cc4d),
+            (atan(0.1), 0x3fb9_83e2_82e2_cc4d),
+            (acos(0.95), 0x3fd4_52e8_fa93_e43c),
+        ] {
+            assert!(
+                ulp_distance(actual, f64::from_bits(expected)) <= 1,
+                "actual={actual:?}"
+            );
         }
     }
 }
