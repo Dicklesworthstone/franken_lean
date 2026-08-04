@@ -1838,6 +1838,15 @@ mod tests {
         }
     }
 
+    fn opaque_descriptor() -> ExtensionDescriptor {
+        ExtensionDescriptor {
+            name: name("fixture.opaque-ext"),
+            merge: MergeSemantics::AppendOrdered,
+            checkpoint: CheckpointSemantics::JournalSuffix,
+            provenance: PayloadProvenance::Opaque,
+        }
+    }
+
     fn axiom(value: &str) -> Arc<ConstantInfo> {
         Arc::new(ConstantInfo::Axiom(AxiomVal {
             base: ConstantVal {
@@ -2805,5 +2814,92 @@ mod tests {
         );
         assert_eq!(base.graph().len(), 0);
         assert_eq!(committed.state().graph().len(), 1);
+    }
+
+    #[test]
+    fn opaque_complete_payload_retains_cache_identity_but_blocks_fine_invalidation() {
+        let descriptor = opaque_descriptor();
+        let environment = Environment::new()
+            .register_extension(descriptor.clone())
+            .expect("opaque fixture extension is unique");
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(environment.clone(), empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let bytes: Arc<[u8]> = Arc::from(&b"opaque bytes remain exact"[..]);
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, &bytes);
+        let completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
+            vec![],
+        );
+        let checked = preflight_module_apply(transaction(
+            record_with_completeness(
+                vec![ExtensionContribution::new(
+                    descriptor.clone(),
+                    0,
+                    environment
+                        .extension(&descriptor.name)
+                        .expect("opaque extension is registered")
+                        .content_digest(),
+                    vec![entry],
+                )],
+                completeness.clone(),
+            ),
+            vec![ExtensionPayload::new(
+                0,
+                descriptor.clone(),
+                0,
+                Arc::clone(&bytes),
+            )],
+        ))
+        .expect("opaque bytes bind without decoding or normalization");
+        let declaration_candidate = base
+            .environment()
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+        let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
+                plan.commit(&base).expect("base remains current")
+            }
+            other => panic!("expected a complete opaque application plan, got {other:?}"),
+        };
+        assert!(matches!(
+            committed.receipt().grade(),
+            ModuleApplyGrade::Complete { completeness: actual } if actual == &completeness
+        ));
+        for authority in [
+            ProvenanceAuthority::Inspection,
+            ProvenanceAuthority::ExactReplay,
+            ProvenanceAuthority::CompleteInventory,
+            ProvenanceAuthority::AuthoritativeCache,
+        ] {
+            assert!(committed.receipt().grade().grants(authority));
+        }
+        assert!(
+            !committed
+                .receipt()
+                .grade()
+                .grants(ProvenanceAuthority::FineInvalidation)
+        );
+        assert_eq!(
+            committed
+                .state()
+                .environment()
+                .extension(&descriptor.name)
+                .expect("opaque extension remains registered")
+                .entries()
+                .next()
+                .expect("opaque payload was replayed")
+                .payload,
+            bytes
+        );
     }
 }
