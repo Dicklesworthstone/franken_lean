@@ -42,6 +42,24 @@
 //! the *measured* count as well as membership — the count cannot creep upward even if the
 //! membership list grows stale.
 //!
+//! # It reads the WORKTREE, and the sibling guard reads HEAD — the difference is deliberate
+//!
+//! [`closure_binding_population`](../closure_binding_population/index.html) judges **HEAD**,
+//! because a peer's half-done close in the shared tracker made the manifest validator refuse
+//! outright while HEAD validated clean: there, reading the working copy makes the guard a function
+//! of other panes' uncommitted work — red for a cause its own author cannot fix.
+//!
+//! This guard reads the **working copy** instead, and the reason is the direction of the failure it
+//! catches. A non-resolving citation is introduced BY the commit that adds it. A HEAD-reading guard
+//! would pass for the pane that lands one and redden for everyone else afterwards — the offending
+//! commit green, the innocent panes red, which is the worst available attribution. Reading the
+//! working copy puts the red in front of the pane about to commit it, which is where it can be
+//! fixed.
+//!
+//! The cost is accepted and bounded: a peer's in-flight row carrying a bad citation reddens this
+//! guard transiently. That is survivable precisely because the allowance is one-way — a peer's
+//! *repair* never reddens it, only new undeclared rot does, and that is a red somebody should see.
+//!
 //! # What this does not earn
 //!
 //! Resolution proves the named function **exists** in tracked Rust source. It does not prove the
@@ -49,8 +67,20 @@
 //! the citation names — that dimension was measured separately and is **empty** (0 mismatches
 //! across 1827 citations, with a planted control proving the detector fires), so a guard on it
 //! would have no live members and is deliberately not built here rather than added as decoration.
-//! `#[ignore]` detection is not attempted: only six ignored test functions exist workspace-wide,
-//! too few to rest a rule on without a separate measurement.
+//! `#[ignore]` is the other dimension deliberately left out, and it is left out on a measurement
+//! rather than on a hunch. Tracked Rust source carries exactly **six** `#[ignore` lines, and two
+//! independent detectors — a ±3-line window around the `#[test]` attribute, and a walk from the
+//! attribute down to the `fn` accepting the attribute in either order — agree at six with **zero**
+//! disagreement in either direction. Of the entries in the twelve fields, **none** names any of
+//! those six. So, like package membership, this dimension has no live members: a guard on it would
+//! be unkillable by mutation and decorative unless exercised by a planted one. The detector was
+//! proven capable against five cells before the zero was believed — two plants naming real ignored
+//! tests in both citation grammars fire, and a real non-ignored test, a typed `not_applicable_*`
+//! and a line of prose do not.
+//!
+//! One gap that follows from this and is named rather than left to be discovered: `f2t9`'s
+//! `granularity-ignored` join reads `artifacts` only, so if an ignored citation ever appears in an
+//! evidence field, **nothing catches it**. That is a currently-empty gap, not a live defect.
 
 #![forbid(unsafe_code)]
 

@@ -283,6 +283,19 @@ def validate(policy, snapshot, now):
             raise InputFault(f"registry-unreviewed-workstream: {issue_id}:{workstream}")
         if kind == "adoption" and workstream != "adoption":
             raise InputFault(f"registry-adoption-workstream: {issue_id}:{workstream}")
+        if kind == "implementation":
+            issue = issues.get(issue_id)
+            labels = issue.get("labels") if isinstance(issue, dict) else None
+            tracker_workstreams = sorted(
+                label
+                for label in labels
+                if isinstance(label, str) and label.startswith("W") and label[1:].isdigit()
+            ) if isinstance(labels, list) else []
+            if tracker_workstreams != [workstream]:
+                raise InputFault(
+                    f"registry-tracker-workstream-mismatch: {issue_id}:"
+                    f"registry={workstream}:tracker={','.join(tracker_workstreams) or '-'}"
+                )
         registry[issue_id] = row
     missing_registry = sorted(set(registry) - set(issues))
     if missing_registry:
@@ -529,8 +542,8 @@ def self_test():
         {"id": "ready", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
         {"id": "blocked", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
         {"id": "additive", "status": "open", "created_at": "2026-07-01T00:00:00Z"},
-        {"id": "active-w1", "status": "in_progress", "created_at": "2026-08-01T00:00:00Z"},
-        {"id": "active-w2", "status": "in_progress", "created_at": "2026-08-01T00:00:00Z"},
+        {"id": "active-w1", "status": "in_progress", "labels": ["W1"], "created_at": "2026-08-01T00:00:00Z"},
+        {"id": "active-w2", "status": "in_progress", "labels": ["W2"], "created_at": "2026-08-01T00:00:00Z"},
     ]
     edges = [{"issue_id": "blocked", "depends_on_id": "root", "type": "blocks"}]
     raw = {"issues": issues, "edges": edges, "evidence": [{"bead": "root", "gate_ids": ["G0"]}]}
@@ -564,7 +577,7 @@ def self_test():
             raise AssertionError(f"{mutant} survived")
     over_policy = copy.deepcopy(policy)
     over_policy["registry"].append({"id": "active-w3", "class": "implementation", "workstream": "W3", "gate": "G0"})
-    over_issues = issues + [{"id": "active-w3", "status": "in_progress", "created_at": "2026-08-01T00:00:00Z"}]
+    over_issues = issues + [{"id": "active-w3", "status": "in_progress", "labels": ["W3"], "created_at": "2026-08-01T00:00:00Z"}]
     if decide(over_policy, normalize_snapshot({"issues": over_issues, "edges": edges, "evidence": raw["evidence"]}), now)["state"] != "over_cap":
         raise AssertionError("over-cap mutant survived")
     expired = copy.deepcopy(policy)
@@ -627,7 +640,7 @@ def self_test():
         capacity_policy,
         normalize_snapshot(
             {
-                "issues": issues + [{"id": "candidate-w3", "status": "open"}],
+                "issues": issues + [{"id": "candidate-w3", "status": "open", "labels": ["W3"]}],
                 "edges": edges,
                 "evidence": raw["evidence"],
             }
@@ -726,6 +739,18 @@ def self_test():
             raise AssertionError(f"orphan registry wrong refusal: {error}") from error
     else:
         raise AssertionError("orphan registry mutant survived")
+    tracker_relabel = copy.deepcopy(first)
+    tracker_relabel["issues"] = [
+        {**issue, "labels": ["W2"]} if issue["id"] == "active-w1" else issue
+        for issue in tracker_relabel["issues"]
+    ]
+    try:
+        decide(policy, tracker_relabel, now)
+    except InputFault as error:
+        if "registry-tracker-workstream-mismatch" not in str(error):
+            raise AssertionError(f"tracker relabel wrong refusal: {error}") from error
+    else:
+        raise AssertionError("tracker workstream relabel mutant survived")
     drifting = copy.deepcopy(raw)
     drifting["issues"] = [
         {**issue, "status": "in_progress"} if issue["id"] == "ready" else issue
@@ -742,7 +767,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 19 named model/mutation cells passed"
+    return "convergence-governance self-test: 20 named model/mutation cells passed"
 
 
 def main(argv):
