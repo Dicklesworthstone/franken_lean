@@ -393,6 +393,9 @@ pub fn exp2(x: f64) -> f64 {
 
 /// Exponential minus one, using a series near zero to avoid cancellation.
 pub fn expm1(x: f64) -> f64 {
+    if invalid(x) {
+        return canonical_nan();
+    }
     if abs(x) <= 0.5 {
         let mut term = x;
         let mut sum = x;
@@ -805,6 +808,12 @@ mod tests {
         same_bits(hypot(f64::INFINITY, nan), f64::INFINITY);
         same_bits(hypot(nan, f64::NEG_INFINITY), f64::INFINITY);
         assert_eq!(hypot(nan, 1.0).to_bits(), CANONICAL_NAN_BITS);
+    }
+
+    #[test]
+    fn expm1_canonicalizes_nan_before_its_series_path() {
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        assert_eq!(expm1(payload_nan).to_bits(), CANONICAL_NAN_BITS);
     }
 
     #[test]
