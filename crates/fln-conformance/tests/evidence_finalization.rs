@@ -4675,3 +4675,207 @@ fn dead_sealed_build_roots_are_pruned_before_the_envelope_opens() {
 
     fs::remove_dir_all(&fixture).expect("the fixture reclaims on the passing path");
 }
+
+// ---------------------------------------------------------------------------
+// The interpreter-configuration family is decided in ONE place — imuu
+// ---------------------------------------------------------------------------
+
+/// The Python half of the family rule has exactly one definition and both sites route to it.
+///
+/// **This guard is STRUCTURAL and earns nothing about runtime.** It reads the source of
+/// `scripts/evidence.py` and says where the rule is written, not what it computes.
+///
+/// Bead `franken_lean-evidence-python-config-rule-drift-imuu`. The rule existed twice: the
+/// producer read `PYTHON_CONFIGURATION_ENV_EXACT` and `PYTHON_CONFIGURATION_ENV_PREFIXES`,
+/// and the strict NDJSON run-record validator independently hardcoded
+/// `name.startswith("PYTHON")`. Widening the prefix tuple — the whole reason the tuple
+/// exists — made the runner emit names its own validator refused as malformed.
+///
+/// **A behavioural test cannot replace this one, and that is a consequence rather than an
+/// excuse.** Once both sites call one predicate, "the validator accepts what the producer
+/// emits" compares `f` to `f` and can never fail; the disagreement was observable only while
+/// two copies existed, and the repair is precisely what removes the observation. A rig that
+/// kept asserting it behaviourally would be green forever while proving nothing. The
+/// behavioural half that stays meaningful is the one landed at `29cf8a8e` — that every
+/// required channel is actually classified — because it tests the predicate against reality
+/// rather than against its twin.
+///
+/// No self-exclusion problem: this is Rust scanning Python, so the guard's own text is
+/// outside its search space — unlike `fln-8zsq`, where it was not.
+#[test]
+fn the_python_interpreter_configuration_rule_has_exactly_one_definition() {
+    const PREDICATE: &str = "is_python_configuration_name";
+    let source = trusted_script("scripts/evidence.py");
+    let defs = python_def_blocks(&source);
+
+    // Anti-vacuity first: a parse that found nothing would satisfy every "no second copy"
+    // assertion below by reading no code at all.
+    assert!(
+        defs.len() > 100,
+        "python_def_blocks parsed only {} functions out of scripts/evidence.py, which is a \
+         broken parse rather than a small file — and every containment check below would \
+         then pass vacuously",
+        defs.len()
+    );
+    let predicate = defs.get(PREDICATE).unwrap_or_else(|| {
+        panic!(
+            "`{PREDICATE}` is not defined in scripts/evidence.py. The interpreter-configuration \
+             family must be decided in exactly one place; if the predicate was renamed, rename \
+             it here in the same change"
+        )
+    });
+    assert_eq!(
+        source.matches(&format!("def {PREDICATE}(")).count(),
+        1,
+        "`{PREDICATE}` is defined more than once, which is the defect this guard exists to \
+         refuse rather than a second opinion about it"
+    );
+
+    // The constants may be named by the predicate and by their own definitions, nowhere else.
+    // Keyed on the CONSTANTS rather than on the deleted literal: a grep for
+    // `startswith("PYTHON")` passes the moment somebody rephrases the copy.
+    for constant in [
+        "PYTHON_CONFIGURATION_ENV_EXACT",
+        "PYTHON_CONFIGURATION_ENV_PREFIXES",
+    ] {
+        assert!(
+            predicate.contains(constant),
+            "`{PREDICATE}` does not read {constant}, so the rule it claims to hold is \
+             somewhere else"
+        );
+        let in_predicate = predicate.matches(constant).count();
+        let in_file = source.matches(constant).count();
+        // one definition + the predicate's uses. Anything beyond that is a second copy.
+        assert_eq!(
+            in_file,
+            in_predicate + 1,
+            "{constant} is named {in_file} times in scripts/evidence.py and {in_predicate} of \
+             those are inside `{PREDICATE}` (plus its own definition). The remainder is a \
+             second copy of the family rule — the exact shape imuu was filed for"
+        );
+    }
+    // Scoped OUTSIDE the predicate, because the predicate's own docstring QUOTES the deleted
+    // literal while explaining what it replaced. A whole-file count refuses the correction
+    // for containing the thing it corrects — the gate matching the token instead of the
+    // claim, and it fired on the first run of this test.
+    let outside_predicate = source.replace(predicate.as_str(), "");
+    assert_eq!(
+        outside_predicate.matches(r#"startswith("PYTHON")"#).count(),
+        0,
+        "scripts/evidence.py hardcodes a startswith test for the interpreter-configuration \
+         family outside `{PREDICATE}`. That is the validator's old independent copy; route \
+         it through the predicate"
+    );
+
+    // Both call sites, named, so a rename that orphans one is caught.
+    for caller in [
+        "overridden_python_environment",
+        "validate_run_record_sealed_interpreter",
+    ] {
+        if let Some(body) = defs.get(caller) {
+            assert!(
+                body.contains(PREDICATE),
+                "`{caller}` no longer routes through `{PREDICATE}`, so it is deciding the \
+                 family itself again"
+            );
+        }
+    }
+    assert!(
+        defs.get("overridden_python_environment")
+            .is_some_and(|body| body.contains(PREDICATE)),
+        "the producer `overridden_python_environment` must exist and route through \
+         `{PREDICATE}`; if it was renamed, this guard is enforcing a claim about a function \
+         that is gone"
+    );
+    assert!(
+        source.matches(&format!("{PREDICATE}(name)")).count() >= 2,
+        "`{PREDICATE}` is called fewer than twice, so at most one of the producer and the \
+         validator routes through it and the other is still deciding the family itself"
+    );
+}
+
+/// The SHELL half of the same family is a third copy, and this names its population.
+///
+/// **Structural, and it asserts a defect rather than a repair.** imuu unified the two Python
+/// sites; it did not unify the shell. `[[ "$environment_name" == PYTHON* ]]` is written out
+/// by hand in every file below — prefix-only, with no access to
+/// `PYTHON_CONFIGURATION_ENV_EXACT`. Unifying nineteen governed inputs is a separate change
+/// with its own freeze cost and is deliberately not folded into a bead about two Python
+/// functions.
+///
+/// What this test buys is that the population cannot grow, shrink or move without somebody
+/// deciding to. It is safe today only because the exact set is entirely subsumed by the
+/// prefix tuple; the first exact name that does not begin with `PYTHON` makes every file
+/// below stop refusing that channel at the door.
+#[test]
+fn the_shell_copies_of_the_interpreter_configuration_rule_are_a_named_population() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["ls-files", "*.sh"])
+        .output()
+        .expect("git ls-files must run: the shell population is derived from it");
+    assert!(listed.status.success(), "git ls-files failed");
+
+    let mut carrying: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for path in String::from_utf8_lossy(&listed.stdout).lines() {
+        let Ok(text) = fs::read_to_string(repo.join(path)) else {
+            continue;
+        };
+        scanned += 1;
+        if text.contains(r#""$environment_name" == PYTHON*"#) {
+            carrying.push(path.to_string());
+        }
+    }
+    assert!(
+        scanned >= 30,
+        "only {scanned} shell scripts were read, which is a broken scan rather than a \
+         repository with no shell — an empty scan would report an empty population"
+    );
+
+    let expected: std::collections::BTreeSet<&str> = [
+        "scripts/check.sh",
+        "scripts/e2e/attribute_state_census.sh",
+        "scripts/e2e/bignum_vectors.sh",
+        "scripts/e2e/campaign_frameworks.sh",
+        "scripts/e2e/closure_audit.sh",
+        "scripts/e2e/contract_drift.sh",
+        "scripts/e2e/contract_handoff.sh",
+        "scripts/e2e/dynamic_parser_no_mock_e2e.sh",
+        "scripts/e2e/env_snapshots.sh",
+        "scripts/e2e/evidence_runner.sh",
+        "scripts/e2e/kernel_replay.sh",
+        "scripts/e2e/lexer_no_mock_e2e.sh",
+        "scripts/e2e/olean_resurrection.sh",
+        "scripts/e2e/parser_corpus_no_mock_e2e.sh",
+        "scripts/e2e/structure_gate.sh",
+        "scripts/e2e/unsafe_note_clippy.sh",
+        "scripts/e2e/vellum_naming_no_mock_e2e.sh",
+        "scripts/e2e/verdict_schema.sh",
+        "scripts/tribunal/ref_vs_ref.sh",
+        // Not an e2e lane. It was absent from a hand recursive scan that reported 19 and
+        // present in a `git ls-files` scan that reported 20, at the same commit, with the
+        // needle provably in the file at both. The index-derived population is the one to
+        // trust; a recursive walk is not reproducible enough to found a claim on.
+        "scripts/verify_vendor_tree.sh",
+    ]
+    .into_iter()
+    .collect();
+    let measured: std::collections::BTreeSet<&str> = carrying.iter().map(String::as_str).collect();
+    assert!(
+        !measured.is_empty(),
+        "no shell script carries the hand-written family test, which contradicts the \
+         measurement this list records. Either the copies were unified — delete this test and \
+         say so — or the needle changed and the scan is blind"
+    );
+    let arrived: Vec<&&str> = measured.difference(&expected).collect();
+    let gone: Vec<&&str> = expected.difference(&measured).collect();
+    assert!(
+        arrived.is_empty() && gone.is_empty(),
+        "the shell copies of the interpreter-configuration rule moved. arrived: {arrived:?}, \
+         gone: {gone:?}. A new copy is a fourth place the family is decided; a copy that \
+         disappeared is progress and this list must shrink with it"
+    );
+}

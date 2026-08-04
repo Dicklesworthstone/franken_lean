@@ -265,6 +265,33 @@ PYTHON_CONFIGURATION_ENV_EXACT = frozenset(
     }
 )
 PYTHON_CONFIGURATION_ENV_PREFIXES = ("PYTHON",)
+
+
+def is_python_configuration_name(name: str) -> bool:
+    """Decide the interpreter-configuration family, in the one place it is decided.
+
+    Bead ``franken_lean-evidence-python-config-rule-drift-imuu``. This rule used to
+    exist twice: the producer read the two constants above, and the strict NDJSON
+    run-record validator independently hardcoded ``name.startswith("PYTHON")``.
+    Nothing bound them, so widening the prefix tuple -- which is the entire point of
+    the tuple, for when CPython adds a channel -- made the runner emit names its own
+    validator then refused as malformed. It rejected a record it had just produced.
+
+    ``PYTHON_CONFIGURATION_ENV_EXACT`` is presently INERT and that is recorded here
+    rather than left for the next reader to rediscover: all seven of its names begin
+    with ``PYTHON``, so the prefix tuple already matches every one of them and
+    emptying the frozenset changes no classification. That subsumption is why the two
+    copies agreed -- they were extensionally equal, not merely lucky -- and the first
+    exact name that does NOT begin with ``PYTHON`` ends the agreement. Keep the
+    frozenset: it states which channels are known by name, and it stops being inert
+    the moment the family grows sideways rather than longer.
+    """
+
+    return name in PYTHON_CONFIGURATION_ENV_EXACT or any(
+        name.startswith(prefix) for prefix in PYTHON_CONFIGURATION_ENV_PREFIXES
+    )
+
+
 # Compiler state intentionally replaced by the sealed-cargo lane. Python
 # configuration is not in this set: the interpreter envelope rejects it
 # before target spawn instead of silently sanitizing it.
@@ -1652,15 +1679,7 @@ def overridden_python_environment(environ: Mapping[str, str]) -> list[str]:
     attempted channel was classified, while values may contain host data.
     """
 
-    return sorted(
-        name
-        for name in environ
-        if name in PYTHON_CONFIGURATION_ENV_EXACT
-        or any(
-            name.startswith(prefix)
-            for prefix in PYTHON_CONFIGURATION_ENV_PREFIXES
-        )
-    )
+    return sorted(name for name in environ if is_python_configuration_name(name))
 
 
 def effective_interpreter_identity(
@@ -15954,7 +15973,7 @@ def validate_supervisor_object(
         if (
             not isinstance(overridden_env, list)
             or not all(
-                isinstance(name, str) and name.startswith("PYTHON")
+                isinstance(name, str) and is_python_configuration_name(name)
                 for name in overridden_env
             )
             or overridden_env != sorted(set(overridden_env))
