@@ -9,7 +9,7 @@
 //! separate **operational-metadata root** — two hosts producing the same trusted
 //! environment share a logical root even when their operational manifests differ.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::Expr;
@@ -767,6 +767,30 @@ pub enum EnvError {
     Checkpoint(CheckpointError),
 }
 
+/// A candidate environment is not an admission authority merely because it contains
+/// declarations. This records an exact, non-publishing comparison against a known base
+/// so an integration layer can consume a kernel-produced declaration delta without
+/// opening a second declaration-admission path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclarationDeltaError {
+    /// The candidate changed an extension before the module-apply replay phase.
+    ExtensionStateChanged,
+    /// The requested addition list names a declaration the base already owns.
+    AdditionConflictsWithBase { name: Name },
+    /// The input list repeats a name, so it cannot describe a one-name-one-constant delta.
+    DuplicateAddition { name: Name },
+    /// The expected post-delta count could not be represented.
+    DeclarationCountOverflow,
+    /// The candidate carries too few or too many declarations.
+    DeclarationCount { expected: usize, actual: usize },
+    /// A declaration already present in the base changed under the candidate.
+    BaseDeclarationChanged { name: Name },
+    /// A requested declaration was not present in the candidate.
+    AdditionAbsent { name: Name },
+    /// A requested declaration name was present with a different exact value.
+    AdditionMismatch { name: Name },
+}
+
 impl std::fmt::Display for EnvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -886,6 +910,71 @@ impl Environment {
 
     pub fn contains(&self, name: &Name) -> bool {
         self.constants.contains_key(name)
+    }
+
+    /// Verify that `self` differs from `base` by exactly `additions` and by nothing
+    /// else. This is a comparison boundary, never declaration admission: it allocates
+    /// no environment state, does not derive an authority token, and cannot make an
+    /// unadmitted declaration reachable.
+    ///
+    /// Module application consumes this after the kernel has performed the only
+    /// authorised declaration-admission step. The extension map must remain byte-for-
+    /// byte equivalent at this point; replaying extension payloads is a later, separate
+    /// phase so a substituted candidate cannot smuggle a semantic delta past the
+    /// transaction envelope.
+    pub fn verify_declaration_delta(
+        &self,
+        base: &Environment,
+        additions: &[Arc<ConstantInfo>],
+    ) -> Result<(), DeclarationDeltaError> {
+        if self.extensions != base.extensions {
+            return Err(DeclarationDeltaError::ExtensionStateChanged);
+        }
+        let expected = base
+            .len()
+            .checked_add(additions.len())
+            .ok_or(DeclarationDeltaError::DeclarationCountOverflow)?;
+        if self.len() != expected {
+            return Err(DeclarationDeltaError::DeclarationCount {
+                expected,
+                actual: self.len(),
+            });
+        }
+        let mut added_names = BTreeSet::new();
+        for addition in additions {
+            let name = addition.name();
+            if base.contains(name) {
+                return Err(DeclarationDeltaError::AdditionConflictsWithBase {
+                    name: name.clone(),
+                });
+            }
+            if !added_names.insert(name.clone()) {
+                return Err(DeclarationDeltaError::DuplicateAddition { name: name.clone() });
+            }
+        }
+        for (name, expected) in base.constants.iter() {
+            match self.constants.get(name) {
+                Some(actual) if actual == expected => {}
+                _ => {
+                    return Err(DeclarationDeltaError::BaseDeclarationChanged {
+                        name: name.clone(),
+                    });
+                }
+            }
+        }
+        for addition in additions {
+            let name = addition.name();
+            match self.constants.get(name) {
+                None => {
+                    return Err(DeclarationDeltaError::AdditionAbsent { name: name.clone() });
+                }
+                Some(actual) if actual.as_ref() == addition.as_ref() => {}
+                Some(_) => {
+                    return Err(DeclarationDeltaError::AdditionMismatch { name: name.clone() });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Add a constant. One name, one constant — a duplicate is a typed refusal

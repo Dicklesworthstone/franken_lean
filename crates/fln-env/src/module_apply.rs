@@ -11,7 +11,7 @@ use fln_core::name::Name;
 use fln_hash::domain::Digest;
 
 use crate::constants::ConstantInfo;
-use crate::environment::Environment;
+use crate::environment::{DeclarationDeltaError, Environment};
 use crate::extensions::ExtensionDescriptor;
 use crate::modules::{ModuleGraph, ModuleId};
 use crate::provenance::{
@@ -407,6 +407,46 @@ pub enum ModuleApplyPreflightError {
         expected: ExtensionEntryId,
         actual: ExtensionEntryId,
     },
+}
+
+/// A preflighted module payload can only join a declaration environment when the
+/// kernel-produced candidate differs from the recorded base by exactly those retained
+/// declaration values. This remains a non-authoritative comparison: kernel admission
+/// is deliberately outside this crate's D6 boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyCandidateError {
+    SupersededPreflightSchema { schema: u16 },
+    DeclarationDelta(DeclarationDeltaError),
+}
+
+/// Bind a kernel-produced declaration candidate to a preflighted payload envelope.
+///
+/// The temporary `Vec` clones `Arc` handles only; neither declaration payload bytes nor
+/// syntax trees are flattened or re-encoded. Extension state must still equal `base`;
+/// extension replay happens only after this check under the contribution's precise
+/// descriptor, ordinal, and entry identity binding.
+pub fn verify_kernel_declaration_candidate(
+    preflight: &PreflightedModuleApply,
+    base: &Environment,
+    candidate: &Environment,
+) -> Result<(), ModuleApplyCandidateError> {
+    if preflight.schema != MODULE_APPLY_SCHEMA_VERSION {
+        return Err(ModuleApplyCandidateError::SupersededPreflightSchema {
+            schema: preflight.schema,
+        });
+    }
+    let transaction = preflight.transaction();
+    let mut additions = Vec::with_capacity(
+        transaction
+            .declarations()
+            .len()
+            .saturating_add(transaction.extra_declarations().len()),
+    );
+    additions.extend(transaction.declarations().iter().cloned());
+    additions.extend(transaction.extra_declarations().iter().cloned());
+    candidate
+        .verify_declaration_delta(base, &additions)
+        .map_err(ModuleApplyCandidateError::DeclarationDelta)
 }
 
 /// Bind every actual payload to the validated contribution record.
@@ -851,5 +891,51 @@ mod tests {
         ));
         assert_eq!(environment.len(), 2);
         assert_eq!(graph.len(), 1);
+    }
+
+    #[test]
+    fn kernel_candidate_must_be_the_exact_declaration_delta_and_nothing_else() {
+        let transaction = transaction(record(vec![]), vec![]);
+        let checked = preflight_module_apply(transaction).expect("payloads preflight");
+        let base = Environment::new()
+            .register_extension(descriptor())
+            .expect("fixture extension is unique");
+        let candidate = base
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+
+        verify_kernel_declaration_candidate(&checked, &base, &candidate)
+            .expect("kernel candidate is the exact declared delta");
+
+        let substituted = base
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: name("fixture.decl"),
+                    level_params: vec![],
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: true,
+            }))
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+        assert!(matches!(
+            verify_kernel_declaration_candidate(&checked, &base, &substituted),
+            Err(ModuleApplyCandidateError::DeclarationDelta(
+                DeclarationDeltaError::AdditionMismatch { .. }
+            ))
+        ));
+
+        let extension_smuggled = candidate
+            .push_extension_entry(&name("fixture.ext"), &b"unbound"[..])
+            .expect("fixture extension is registered");
+        assert!(matches!(
+            verify_kernel_declaration_candidate(&checked, &base, &extension_smuggled),
+            Err(ModuleApplyCandidateError::DeclarationDelta(
+                DeclarationDeltaError::ExtensionStateChanged
+            ))
+        ));
     }
 }
