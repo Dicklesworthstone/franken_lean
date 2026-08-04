@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use fln_core::name::Name;
+use fln_core::outcome::Outcome;
 use fln_hash::domain::Digest;
 
 use crate::constants::ConstantInfo;
@@ -451,6 +452,121 @@ pub fn verify_kernel_declaration_candidate(
     candidate
         .verify_declaration_delta(base, &additions)
         .map_err(ModuleApplyCandidateError::DeclarationDelta)
+}
+
+/// Completed refusals while joining a replay candidate to the graph and its target
+/// manifest. Resource and cancellation non-answers stay in [`Outcome`]'s outer arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyPrepareError {
+    BaseState(ModuleApplyStateError),
+    ExistingModule {
+        module: ModuleId,
+    },
+    TargetEpoch {
+        base: crate::modules::ModuleEpoch,
+        target: crate::modules::ModuleEpoch,
+    },
+    TargetRecordCount {
+        expected: usize,
+        actual: usize,
+    },
+    TargetBaseRecordMismatch {
+        module: ModuleId,
+    },
+    TargetContributionMismatch {
+        module: ModuleId,
+    },
+    Replay(ModuleApplyReplayError),
+    Graph(crate::modules::ModuleGraphError),
+    State(ModuleApplyStateError),
+}
+
+/// Build one complete, immutable module-application candidate without publishing it.
+///
+/// The target manifest must be exactly the base manifest plus this transaction's one
+/// contribution. Graph preparation remains consumable and non-authoritative until it
+/// is committed against the held base; an inconclusive or fault from that protocol is
+/// propagated intact. Every completed refusal returns before a `ModuleApplyState` is
+/// constructed, so no partial declaration, extension, graph, or index state escapes.
+pub fn prepare_module_apply_candidate(
+    preflight: &PreflightedModuleApply,
+    base: &ModuleApplyState,
+    declaration_candidate: &Environment,
+) -> Outcome<Result<ModuleApplyState, ModuleApplyPrepareError>> {
+    if let Err(error) = base.verify() {
+        return Outcome::complete(Err(ModuleApplyPrepareError::BaseState(error)));
+    }
+    let transaction = preflight.transaction();
+    let contribution = transaction.contribution();
+    let module = contribution.module().id.clone();
+    let target = transaction.manifest();
+    if base.manifest().record(&module).is_some() {
+        return Outcome::complete(Err(ModuleApplyPrepareError::ExistingModule { module }));
+    }
+    if base.manifest().epoch() != target.epoch() {
+        return Outcome::complete(Err(ModuleApplyPrepareError::TargetEpoch {
+            base: base.manifest().epoch().clone(),
+            target: target.epoch().clone(),
+        }));
+    }
+    let expected_records = match base.manifest().records().len().checked_add(1) {
+        Some(value) => value,
+        None => {
+            return Outcome::complete(Err(ModuleApplyPrepareError::TargetRecordCount {
+                expected: usize::MAX,
+                actual: target.records().len(),
+            }));
+        }
+    };
+    if target.records().len() != expected_records {
+        return Outcome::complete(Err(ModuleApplyPrepareError::TargetRecordCount {
+            expected: expected_records,
+            actual: target.records().len(),
+        }));
+    }
+    for held in base.manifest().records() {
+        let held_module = &held.module().id;
+        if target.record(held_module) != Some(held) {
+            return Outcome::complete(Err(ModuleApplyPrepareError::TargetBaseRecordMismatch {
+                module: held_module.clone(),
+            }));
+        }
+    }
+    if target.record(&module) != Some(contribution) {
+        return Outcome::complete(Err(ModuleApplyPrepareError::TargetContributionMismatch {
+            module,
+        }));
+    }
+
+    let replayed =
+        match replay_preflighted_extensions(preflight, base.environment(), declaration_candidate) {
+            Ok(candidate) => candidate,
+            Err(error) => return Outcome::complete(Err(ModuleApplyPrepareError::Replay(error))),
+        };
+    let prepared = match base
+        .graph()
+        .prepare_registration(contribution.module().clone(), None)
+        .into_status()
+    {
+        Outcome::Complete(Ok(prepared)) => prepared,
+        Outcome::Complete(Err(error)) => {
+            return Outcome::complete(Err(ModuleApplyPrepareError::Graph(error)));
+        }
+        Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+    };
+    let graph = match prepared.commit(base.graph(), None).into_status() {
+        Outcome::Complete(Ok(registration)) => registration.graph,
+        Outcome::Complete(Err(error)) => {
+            return Outcome::complete(Err(ModuleApplyPrepareError::Graph(error)));
+        }
+        Outcome::Inconclusive(inconclusive) => return Outcome::Inconclusive(inconclusive),
+        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+    };
+    Outcome::complete(
+        ModuleApplyState::from_parts(replayed, graph, Arc::clone(&transaction.manifest))
+            .map_err(ModuleApplyPrepareError::State),
+    )
 }
 
 /// Refusals while replaying a preflighted extension contribution onto a verified
@@ -1143,5 +1259,67 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn prepare_candidate_joins_every_component_only_after_target_binding() {
+        let descriptor = descriptor();
+        let environment = Environment::new()
+            .register_extension(descriptor.clone())
+            .expect("fixture extension is unique");
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(environment.clone(), empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let history = environment
+            .extension(&descriptor.name)
+            .expect("fixture extension is registered")
+            .content_digest();
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"candidate");
+        let contribution = record(vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            history,
+            vec![entry],
+        )]);
+        let checked = preflight_module_apply(transaction(
+            contribution.clone(),
+            vec![ExtensionPayload::new(0, descriptor, 0, &b"candidate"[..])],
+        ))
+        .expect("payloads preflight");
+        let declaration_candidate = base
+            .environment()
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+
+        let prepared = match prepare_module_apply_candidate(&checked, &base, &declaration_candidate)
+        {
+            Outcome::Complete(Ok(prepared)) => prepared,
+            other => panic!("expected a complete aggregate candidate, got {other:?}"),
+        };
+        prepared.verify().expect("aggregate candidate is coherent");
+        assert_eq!(prepared.graph().len(), 1);
+        assert_eq!(prepared.manifest().records().len(), 1);
+        assert_eq!(
+            prepared
+                .environment()
+                .extension(&name("fixture.ext"))
+                .expect("replayed extension is registered")
+                .len(),
+            1
+        );
+        assert_eq!(base.graph().len(), 0);
+        assert_eq!(base.environment().len(), 0);
+        assert!(matches!(
+            prepare_module_apply_candidate(&checked, &base, &declaration_candidate),
+            Outcome::Complete(Ok(_))
+        ));
     }
 }
