@@ -83,7 +83,7 @@ for arg in "$@"; do
     esac
 done
 printf '%s|%s|%s|%s\n' "$PWD" "$input" "$report" "$comparison" >> "$UBS_PATH_BASELINE_CALLS"
-python3 - "$report" "$comparison" <<'PY'
+python3 -I -S - "$report" "$comparison" <<'PY'
 import json
 import sys
 

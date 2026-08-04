@@ -193,7 +193,7 @@ run_path_baseline() {
             > "$current_stdout" 2> "$current_stderr"
         current_exit=$?
 
-        python3 - "$input_path" "$base" "$base_report" "$current_report" "$base_exit" "$current_exit" <<'PY'
+        python3 -I -S - "$input_path" "$base" "$base_report" "$current_report" "$base_exit" "$current_exit" <<'PY'
 import json
 import sys
 
