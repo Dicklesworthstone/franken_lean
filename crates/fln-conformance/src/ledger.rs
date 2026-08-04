@@ -588,98 +588,169 @@ pub fn validate_allowance_has_no_orphans_against(
     }
 }
 
-/// Freshness tags that name a run which only READ the pin, never asked it.
+/// Value-producing freshness tags and the checked-in rig that emits each run.
 ///
-/// The ledger's header calls `freshness` "the evidence run", and the tags bear that out: each
-/// names a *run* by prefix and the pin epoch by suffix (`core-observables-` / `pin-census-` /
-/// `core-ext-observables-`, all at `v4.32.0`). So the tag encodes the same provenance fact
-/// that `oracle_kind` does — and until this law it was the one field of the twelve that was
-/// parsed into a typed field and never compared to anything, which is verbatim the defect
-/// this bead opened with about `level` and `oracle_kind`.
+/// `freshness` is not a decorative string: a row above L1 on a value-producing oracle must
+/// name a registered run and cite that run's rig. This deliberately fails closed for a newly
+/// invented tag. Registering a legitimate new run is one cheap, reviewable tuple that binds a
+/// tag to its producer; it is not an ever-growing denylist of bad spellings.
 ///
-/// A DENYLIST, not an allowlist. TWO reasons were given for that direction and only the
-/// SECOND still holds; both are named because a reader cannot otherwise tell which one is
-/// load-bearing, and a justification resting on a false premise is worse than one resting on
-/// a narrow premise.
-///
-/// EXPIRED — "repairing the twelve requires a tag that does not exist yet (both pin rigs are
-/// deliberately fixture-less, so their run has no tag today)". True when written at
-/// `3208f099` (2026-07-26 12:27:40) and falsified 31 minutes later by `8eb2f892`, which
-/// repaired the thirteen rows and created exactly those tags: measured at `efc5e730`,
-/// `pin-option-defaults-v4.32.0` sits on 8 rows and `pin-ctor-inventory-v4.32.0` on 4. That
-/// commit edited THIS doc block — it rewrote the `pin-census-v4.32.0` paragraph below for the
-/// new state — and left this paragraph asserting the old one.
-///
-/// STANDS — a new honest tag must pass without asking anyone's permission, and a known
-/// source-reading tag must not. The permission test
-/// `source_read_at_l1_and_value_produced_above_it_are_both_permitted` exercises `rfc-vectors`,
-/// which still appears nowhere in the real ledger: re-measured at `efc5e730`, 0 occurrences.
-///
-/// So the conclusion survives and one of its two supports does not. This is NOT the repair
-/// bead `fln-parity-freshness-denylist-direction-dy22` asks for — that bead's finding is that
-/// this denylist classifies 0 of 85 produced-value rows, and its proposed repair is a DERIVED
-/// tag-to-rig binding rather than a hand-maintained allowlist, which the now-existing tags
-/// make cheaper than when it was filed. Correcting a justification does not perform a repair;
-/// dy22 stays open.
-///
-/// `unit-suite-v4.32.0` and `inventory-v4.32.0` sit on L1/L0 rows today, where the law never
-/// reaches them. They are declared anyway, so that raising one of those rows without moving
-/// its tag is caught at the moment it happens rather than becoming instance ten.
-///
-/// `pin-census-v4.32.0` no longer appears on a real row after qydn, but stays here
-/// permanently. This is a denylist of provenance facts, not an allowance: removing a retired
-/// tag would let a later produced-value row reuse a run already known to have read only source.
-pub const SOURCE_READING_FRESHNESS_TAGS: [&str; 3] = [
-    "inventory-v4.32.0",
-    "pin-census-v4.32.0",
-    "unit-suite-v4.32.0",
+/// The registration is also live in both useful directions. The real-ledger gate below checks
+/// that every rig still exists and that every tuple is used by at least one produced-value row;
+/// moving a rig or retiring its tag therefore cannot leave a silent, stale registry entry.
+pub const VALUE_PRODUCING_FRESHNESS_RUNS: [(&str, &str); 6] = [
+    (
+        "blake3-official-vectors",
+        "crates/fln-hash/fixtures/blake3_vectors.txt",
+    ),
+    (
+        "core-ext-observables-v4.32.0",
+        "crates/fln-core/tests/pin_ext_observables.rs",
+    ),
+    (
+        "core-observables-v4.32.0",
+        "crates/fln-conformance/fixtures/core_observables.txt",
+    ),
+    (
+        "hosts-sensedemobox-hetzner2-20260725",
+        "crates/fln-hash/fixtures/host_attestations.txt",
+    ),
+    (
+        "pin-ctor-inventory-v4.32.0",
+        "crates/fln-conformance/tests/pin_ctor_inventory.rs",
+    ),
+    (
+        "pin-option-defaults-v4.32.0",
+        "crates/fln-conformance/tests/pin_option_defaults.rs",
+    ),
 ];
 
-/// A row that claims a produced value may not name a source-reading run as its evidence.
+/// Measured from the current Parity Ledger: all 85 produced-value rows are bound to a
+/// registered run and its cited rig. This is a floor, so new observed rows can grow the
+/// population, but withdrawing published rows or letting the guard go quiet cannot pass.
+pub const VALUE_PRODUCING_FRESHNESS_LIVE_FLOOR: usize = 85;
+
+/// A row that claims a produced value must name and cite its registered evidence run.
 ///
-/// THE GAP THIS CLOSES, which is a two-field repair passing every existing check. Repairing
-/// one of the twelve means moving three fields: `oracle_kind` to `pinned-binary`, `fixtures`
-/// to cite the rig, and `freshness` to name the rig's run. The oracle law watches the first,
-/// [`validate_repaired_rows_cite_their_oracle`] watches the second, and nothing watched the
-/// third. A row flipped to `pinned-binary` and citing `pin_option_defaults.rs` while still
-/// tagged `pin-census-v4.32.0` was fully green, with its stated evidence run naming the
-/// source-reading census as the provenance of a binary-produced level.
-///
-/// Read entirely off the ROW, for the reason cc_3 recorded when they made the successor law
-/// row-derived: keying it on a second constant would make the law depend on a join between
-/// two lists staying in step, and would make it untestable, because no synthetic ledger can
-/// shrink a compile-time const.
-///
-/// Scoped by exactly [`claims_a_produced_value`], so the coverage hands off cleanly rather
-/// than overlapping: while a row is still at `pinned-source` the oracle law owns it and this
-/// one is silent; the instant it claims a produced value this one takes over. The handoff is
-/// the transition the gap lived in.
+/// This is the third field of the three-field repair: `oracle_kind` establishes that a value
+/// was produced, fixtures cite the rig, and `freshness` names that exact run. Unknown tags
+/// fail closed. The scope remains exactly [`claims_a_produced_value`], so L0/L1 and
+/// source-reading rows stay with their respective laws.
 pub fn validate_freshness_names_the_oracle_it_claims(
     ledger: &Ledger,
+) -> Result<(), Vec<LedgerError>> {
+    validate_freshness_names_the_oracle_it_claims_against(ledger, &VALUE_PRODUCING_FRESHNESS_RUNS)
+}
+
+/// The freshness law over an explicit tag-to-rig registry.
+///
+/// Public only for the planted admission test: a new legitimate run is registered with the
+/// rig that emits it, rather than being admitted by inventing a string outside a denylist.
+#[doc(hidden)]
+pub fn validate_freshness_names_the_oracle_it_claims_against(
+    ledger: &Ledger,
+    runs: &[(&str, &str)],
 ) -> Result<(), Vec<LedgerError>> {
     let mut errors: Vec<LedgerError> = Vec::new();
     for row in &ledger.rows {
         if !claims_a_produced_value(row) {
             continue;
         }
-        if !SOURCE_READING_FRESHNESS_TAGS.contains(&row.freshness.as_str()) {
+        let Some((_, rig)) = runs.iter().find(|(tag, _)| *tag == row.freshness) else {
+            errors.push(LedgerError {
+                line: row.line,
+                what: format!(
+                    "`{}` claims {:?} on oracle-kind `{}`, but freshness tag `{}` has no \
+                     registered value-producing rig. Freshness names the evidence run, so an \
+                     unknown tag cannot be trusted merely because it is new; register the tag \
+                     with the rig that emits it and cite that rig in the row.",
+                    row.symbol, row.level, row.oracle_kind, row.freshness
+                ),
+            });
+            continue;
+        };
+        if row.fixtures.iter().any(|fixture| fixture == rig) {
             continue;
         }
         errors.push(LedgerError {
             line: row.line,
             what: format!(
-                "`{}` claims {:?} on oracle-kind `{}`, but its freshness tag `{}` names a run \
-                 that only READ the pin. The ledger's header defines freshness as the evidence \
-                 run, so this row reports a binary-produced level whose evidence run is a \
-                 source reader — our READING of the oracle under the name of the oracle, which \
-                 is the substitution this bead exists to prevent. Repairing a row moves THREE \
-                 fields: oracle-kind, fixtures, and this one. Give it a tag naming the run that \
-                 produced the value.",
+                "`{}` claims {:?} on oracle-kind `{}` with freshness tag `{}`, registered \
+                 to rig `{rig}`, but does not cite that rig. Repairing a row binds all THREE \
+                 provenance fields: oracle-kind, fixtures, and freshness.",
                 row.symbol, row.level, row.oracle_kind, row.freshness
             ),
         });
     }
     errors.sort_by_key(|error| error.line);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Count the produced-value rows the freshness registry actually binds.
+pub fn rows_bound_by_value_producing_freshness_runs(ledger: &Ledger) -> Vec<&str> {
+    ledger
+        .rows
+        .iter()
+        .filter(|row| claims_a_produced_value(row))
+        .filter(|row| {
+            VALUE_PRODUCING_FRESHNESS_RUNS
+                .iter()
+                .find(|(tag, _)| *tag == row.freshness)
+                .is_some_and(|(_, rig)| row.fixtures.iter().any(|fixture| fixture == rig))
+        })
+        .map(|row| row.symbol.as_str())
+        .collect()
+}
+
+/// Registered runs must remain live rather than becoming unreviewed historical aliases.
+pub fn validate_value_producing_freshness_runs_are_live(
+    ledger: &Ledger,
+) -> Result<(), Vec<LedgerError>> {
+    let mut errors = Vec::new();
+    for (tag, rig) in VALUE_PRODUCING_FRESHNESS_RUNS {
+        if ledger.rows.iter().any(|row| {
+            claims_a_produced_value(row)
+                && row.freshness == tag
+                && row.fixtures.iter().any(|fixture| fixture == rig)
+        }) {
+            continue;
+        }
+        errors.push(LedgerError {
+            line: 0,
+            what: format!(
+                "freshness tag `{tag}` is registered to `{rig}` but binds no produced-value \
+                 row. Retire the tuple with the run, or cite its rig from the row it emits."
+            ),
+        });
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Every registered freshness rig must exist at the workspace root.
+pub fn validate_value_producing_freshness_run_paths_exist(
+    root: &Path,
+) -> Result<(), Vec<LedgerError>> {
+    let mut errors = Vec::new();
+    for (tag, rig) in VALUE_PRODUCING_FRESHNESS_RUNS {
+        if root.join(rig).exists() {
+            continue;
+        }
+        errors.push(LedgerError {
+            line: 0,
+            what: format!(
+                "freshness tag `{tag}` is registered to missing rig `{rig}`. Move the binding \
+                 in the change that moved the run."
+            ),
+        });
+    }
     if errors.is_empty() {
         Ok(())
     } else {

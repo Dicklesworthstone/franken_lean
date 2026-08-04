@@ -389,16 +389,27 @@ fn source_read_at_l1_and_value_produced_above_it_are_both_permitted() {
 // (bead fln-parity-ledger-freshness-names-the-run-igxr)
 // ---------------------------------------------------------------------------
 
-/// The live ledger obeys the freshness law, and a retired source-reading tag remains denied.
-///
-/// The second assertion is the anti-forgetting half. `pin-census-v4.32.0` no longer occurs
-/// on a real row, but removing it from the denylist would let a future produced-value row
-/// reuse provenance already known to name a source-reading run.
+/// The live ledger binds every produced-value freshness tag to a live rig.
 #[test]
 fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
-    let text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
-        .expect("ledger exists");
+    let root = workspace_root();
+    let text = std::fs::read_to_string(root.join("ci/PARITY_LEDGER.txt")).expect("ledger exists");
     let parsed = ledger::parse(&text).expect("ledger parses");
+
+    ledger::validate_value_producing_freshness_run_paths_exist(root)
+        .expect("every registered freshness rig exists");
+    ledger::validate_value_producing_freshness_runs_are_live(&parsed)
+        .expect("every registered freshness tag binds at least one produced-value row");
+
+    let bound = ledger::rows_bound_by_value_producing_freshness_runs(&parsed);
+    assert!(
+        bound.len() >= ledger::VALUE_PRODUCING_FRESHNESS_LIVE_FLOOR,
+        "the freshness registry binds {} produced-value rows, below the measured floor {}. A \
+         clean verdict after the registry stopped classifying the live ledger is not a pass. \
+         Bound rows: {bound:?}",
+        bound.len(),
+        ledger::VALUE_PRODUCING_FRESHNESS_LIVE_FLOOR,
+    );
 
     let outcome = ledger::validate_freshness_names_the_oracle_it_claims(&parsed);
     let rendered = outcome
@@ -414,12 +425,7 @@ fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
         .unwrap_or_default();
     assert!(
         outcome.is_ok(),
-        "a row claims a produced value on a source-reading evidence run:\n  {rendered}"
-    );
-
-    assert!(
-        ledger::SOURCE_READING_FRESHNESS_TAGS.contains(&"pin-census-v4.32.0"),
-        "a known source-reading tag remains denied after the last real row moves off it"
+        "a produced-value row does not name and cite its registered evidence run:\n  {rendered}"
     );
 }
 
@@ -432,8 +438,8 @@ fn the_real_ledger_never_names_a_source_reading_run_for_a_produced_value() {
 /// gap rather than describing it, and it is what keeps this test honest if either of them
 /// later grows to cover freshness itself.
 ///
-/// This is also the FLOOR. Gutting the law, or emptying
-/// [`ledger::SOURCE_READING_FRESHNESS_TAGS`], turns this red.
+/// This remains a permanent negative control: the old source-reading tag is no longer
+/// registered, so repairing only two provenance fields is refused.
 #[test]
 fn a_two_field_repair_that_leaves_its_freshness_tag_behind_is_refused() {
     let two_field = synthetic(&[
@@ -470,18 +476,13 @@ fn a_two_field_repair_that_leaves_its_freshness_tag_behind_is_refused() {
     assert!(
         errors.iter().any(|error| error.what.contains("maxErrors")
             && error.what.contains("pin-census-v4.32.0")
-            && error.what.contains("THREE fields")),
+            && error.what.contains("no registered value-producing rig")),
         "the finding must name the row, the offending tag, and that the repair is three \
          fields — or it cannot be acted on: {errors:?}"
     );
 }
 
-/// THE PERMISSION HALF, in both directions, so the law is not a wall.
-///
-/// A three-field repair is admitted on a tag outside the source-reading denylist. When this
-/// guard was introduced the tag did not yet exist; the completed qydn repair now uses it on
-/// eight real rows. That transition is the permission proof: a denylist admits a new honest
-/// producing run without requiring a second registry to predict its name.
+/// THE PERMISSION HALF, in both directions, so a rig-bound registry is not a wall.
 #[test]
 fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
     let three_field = synthetic(&[
@@ -519,10 +520,36 @@ fn the_three_field_repair_is_admitted_and_an_unrepaired_row_is_untouched() {
     );
 }
 
-/// A known source-reading tag stays denied after no real row carries it.
-///
-/// This is a denylist, not an allowance: forgetting a retired tag would let a later
-/// produced-value row reuse the known source-reading provenance and pass.
+/// A newly coined tag is refused until it is explicitly bound to its producing rig, and then
+/// admitted without changing any denylist. This is the direction the previous law missed.
+#[test]
+fn an_invented_tag_is_refused_but_a_registered_new_run_is_admitted() {
+    let invented = synthetic(&[
+        "row meta-api | Lean.Fresh.run | function | native | L2 | faithful | pinned-binary | \
+         exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | \
+         newly-invented-run-v4.32.0",
+    ]);
+    let errors = ledger::validate_freshness_names_the_oracle_it_claims(&invented)
+        .expect_err("an invented freshness tag must not pass by being absent from a denylist");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.what.contains("newly-invented-run-v4.32.0")
+                && error.what.contains("no registered value-producing rig")),
+        "{errors:?}"
+    );
+
+    ledger::validate_freshness_names_the_oracle_it_claims_against(
+        &invented,
+        &[(
+            "newly-invented-run-v4.32.0",
+            "crates/fln-conformance/fixtures/core_observables.txt",
+        )],
+    )
+    .expect("a legitimate new run is admitted once bound to the rig it cites");
+}
+
+/// A retired source-reading tag stays unregistered after no real row carries it.
 #[test]
 fn a_known_source_reading_tag_stays_denied_after_no_real_row_carries_it() {
     let real_text = std::fs::read_to_string(workspace_root().join("ci/PARITY_LEDGER.txt"))
@@ -542,7 +569,7 @@ fn a_known_source_reading_tag_stays_denied_after_no_real_row_carries_it() {
          OBSERVED | pin-census-v4.32.0",
     ]);
     let errors = ledger::validate_freshness_names_the_oracle_it_claims(&reused)
-        .expect_err("a known source-reading tag must stay denied after retirement");
+        .expect_err("a retired source-reading tag must not regain admission after retirement");
     assert!(
         errors
             .iter()
