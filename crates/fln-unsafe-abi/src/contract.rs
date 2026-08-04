@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 /// SHA-256 of `contracts/abi_inventory.json` this module was rendered from.
-pub(crate) const INVENTORY_DIGEST: &str = "f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254";
+pub(crate) const INVENTORY_DIGEST: &str = "3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6";
 /// The Reference pin this contract is extracted from.
 pub(crate) const PIN_TAG: &str = "v4.32.0";
 pub(crate) const PIN_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";

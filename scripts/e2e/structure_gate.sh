@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # Real-path E2E for fln-8mj's structural policy. Every child is bounded and its
-# structure-guard/2 output is parsed as JSON with an exact ordered finding contract.
+# structure-guard/5 output is parsed as JSON with an exact ordered finding contract.
 # Negative fixtures are immutable evidence; recovery uses independent clean fixtures.
 
 set -Eeuo pipefail
 
-command -v python3 >/dev/null 2>&1 || {
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || {
   echo "[structure_gate] setup failure: python3 is required" >&2
   exit 2
 }
+PYTHON=("$PYTHON_BIN" -I -S)
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  [[ "$environment_name" == PYTHON* ]] \
+    && HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+done < <(compgen -e | LC_ALL=C sort)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  printf '[structure_gate] setup failure: sealed_interpreter_hostile_environment names=%s\n' \
+    "$(IFS=,; printf '%s' "${HOSTILE_PYTHON_CONFIGURATION[*]}")" >&2
+  exit 2
+fi
 command -v setsid >/dev/null 2>&1 || {
   echo "[structure_gate] setup failure: setsid is required" >&2
   exit 2
@@ -32,7 +44,7 @@ OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
 TIMEOUT_MS="${FLN_E2E_TIMEOUT_MS:-300000}"
 GRACE_MS="${FLN_E2E_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_E2E_READY_WAIT_MS:-30000}"
-START_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
+START_NS="$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')"
 SEQ=0
 ACTIVE_STEP="setup"
 ACTIVE_RUNNER_PID=""
@@ -48,6 +60,7 @@ FINAL_VERDICT="internal_fault"
 FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
+HUMAN_LOG_SEALED=0
 FINALIZING=0
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
@@ -61,14 +74,22 @@ FINALIZATION_SIGNAL_GENERATION=0
 FINALIZATION_DECISION="$ART_DIR/bundle.decision"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
+RUN_STARTED=0
+ART_DIR_CLAIMED=0
+EARLY_STEP=preflight
+TEST_EARLY_FAULT="${FLN_SG_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
-  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
   vendor/NOTICE
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh .github/workflows/ci.yml
 )
-SUBJECT_PATHS=(Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools)
+SUBJECT_PATHS=(
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
+  ABI_CONTRACT.md OLEAN_CONTRACT.md ci contracts crates tools
+)
 VENDOR_PATH="vendor/lean4-src"
 VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 HASH_ARGS=()
@@ -83,16 +104,20 @@ for subject_path in "${SUBJECT_PATHS[@]}"; do
 done
 
 note() {
+  if [ "$HUMAN_LOG_SEALED" -eq 1 ]; then
+    printf '[structure_gate] %s\n' "$*" >&2
+    return 0
+  fi
   printf '[structure_gate] %s\n' "$*" | tee -a "$HUMAN" >&2
 }
 
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
-  EVENT_COMMAND=(python3 "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
+  EVENT_COMMAND=("${PYTHON[@]}" "$EVIDENCE" emit --file "$LOG" --artifact-root "$ART_DIR" \
     --string schema "$SCHEMA" --string run_id "$RUN_ID" --string bead "$BEAD" \
     --string scenario "$SCENARIO" --integer sequence "$sequence" \
-    --integer monotonic_ns "$(python3 -c 'import time; print(time.monotonic_ns())')" \
+    --integer monotonic_ns "$("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())')" \
     --string wall_time_utc "$(date -u -Is)" "$@")
 }
 
@@ -102,6 +127,52 @@ emit_event() {
 }
 
 set_final() { FINAL_SET=1; FINAL_VERDICT="$1"; FINAL_REASON="$2"; FINAL_EXIT="$3"; }
+
+# Typed early-envelope faults (bead fln-evidence-runner-bootstrap-btk): any
+# failure between artifact-directory creation and the run_start emission still
+# finalizes a typed durable PARTIAL bundle — never a complete one.
+early_fault() {
+  local reason="$1" message="$2"
+  echo "[structure_gate] setup failure: $message" >&2
+  set_final internal_fault "$reason" 2
+  exit 2
+}
+
+# shellcheck disable=SC2317
+finalize_early_envelope() {
+  local observed_rc="$1"
+  trap '' HUP INT TERM
+  set +e
+  if [ "$FINAL_SET" -eq 0 ]; then
+    if [ "$observed_rc" -eq 0 ]; then
+      set_final internal_fault "early_${EARLY_STEP}_uncommitted_success" 2
+    else
+      set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
+    fi
+  fi
+  if [ "$ART_DIR_CLAIMED" -eq 1 ] && [ -d "$ART_DIR" ]; then
+    note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON verdict=$FINAL_VERDICT"
+    if ! "${PYTHON[@]}" "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+        --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
+        --step "$EARLY_STEP" --reason "$FINAL_REASON" \
+        --classification "$FINAL_VERDICT" \
+        --argv-json '["scripts/e2e/structure_gate.sh"]' \
+        --cwd "$ROOT"; then
+      printf '[structure_gate] INTERNAL FAULT: early evidence bundle did not publish: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    if ! "${PYTHON[@]}" "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
+        --artifact-root "$ART_DIR" >/dev/null; then
+      printf '[structure_gate] INTERNAL FAULT: early evidence bundle did not validate: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    printf '[structure_gate] %s — reason=%s; partial early-envelope evidence: %s\n' \
+      "$FINAL_VERDICT" "$FINAL_REASON" "$ART_DIR" >&2
+  fi
+  exit "$FINAL_EXIT"
+}
 
 mark_process_tree_cleanup_unproven() {
   PROCESS_TREE_CLEANUP_UNPROVEN=1
@@ -143,7 +214,7 @@ bounded_readiness_wait() {
 # The launch gate guarantees that this direct child has not forked yet.
 terminate_unreleased_runner() {
   local pid="$1"
-  if ! setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-direct-child --pid "$pid" \
       --expected-parent-pid "$$" --wait-ms 5000; then
     return 1
   fi
@@ -153,7 +224,7 @@ terminate_unreleased_runner() {
 release_guardian_launch() {
   local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
   for _ in 1 2; do
-    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+    if setsid -- "${PYTHON[@]}" "$EVIDENCE" release-process-launch --ready "$ready" \
       --output "$output" --artifact-root "$ART_DIR" --stage-id "$stage" \
       --pid "$pid" --expected-start-ticks "$ticks" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
@@ -170,13 +241,13 @@ stop_active_runner() {
   [ -n "$pid" ] || return 0
   if bounded_readiness_wait "$pid" "$ACTIVE_READINESS" "$READY_WAIT_MS" \
       && [ -n "$ACTIVE_RUNNER_START_TICKS" ]; then
-    python3 "$EVIDENCE" signal-bound-process --pid "$pid" \
+    "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal "$name" \
       >/dev/null 2>&1 || true
   fi
   if ! bounded_pid_exit_wait "$pid" "$((READY_WAIT_MS + 3 * GRACE_MS))"; then
     if [ -s "$ACTIVE_READINESS" ]; then
-      if ! python3 "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
+      if ! "${PYTHON[@]}" "$EVIDENCE" emergency-kill --readiness "$ACTIVE_READINESS" \
         --expected-wrapper-pid "$pid" --expected-stage-id "$ACTIVE_STEP" \
         >/dev/null 2>&1; then
         cleanup_rc=1
@@ -239,7 +310,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
       --expected-start-ticks "$FINALIZER_START_TICKS" \
       --expected-parent-pid "$$" >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
@@ -247,7 +318,7 @@ contain_bound_finalizer() {
     mark_process_tree_cleanup_unproven
     return 1
   fi
-  if ! setsid -- python3 "$EVIDENCE" assert-process-group-empty \
+  if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" assert-process-group-empty \
       --pgid "$FINALIZER_PID" --wait-ms 2000 >/dev/null 2>&1; then
     FINALIZER_CLEANUP_UNPROVEN=1
     FINALIZER_WAIT_UNSAFE=1
@@ -297,11 +368,11 @@ run_finalizer_command() {
   [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
-  setsid -- python3 "$EVIDENCE" stopped-exec \
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" stopped-exec \
     --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" \
       --session-leader --stopped \
       2>/dev/null
@@ -322,7 +393,7 @@ run_finalizer_command() {
   # A terminal trap can interrupt Bash's command-substitution wait after the
   # isolated binder emitted a valid identity, so the canonical digits are the proof.
   if [ -z "$FINALIZATION_SIGNAL" ]; then
-    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+    if ! setsid -- "${PYTHON[@]}" "$EVIDENCE" resume-bound-process \
         --pid "$FINALIZER_PID" \
         --expected-start-ticks "$FINALIZER_START_TICKS" \
         --expected-parent-pid "$$"; then
@@ -383,6 +454,10 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" first_divergence="none"
   local publish_rc=0 hash_rc=0
+  if [ "$RUN_STARTED" -eq 0 ]; then
+    trap - EXIT
+    finalize_early_envelope "$observed_rc"
+  fi
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
@@ -393,7 +468,7 @@ on_exit() {
   if [ "$FINAL_SET" -eq 0 ]; then
     set_final internal_fault "$([ "$observed_rc" -eq 0 ] && printf uncommitted_success || printf unexpected_shell_exit)" 2
   fi
-  run_finalizer_command python3 "$EVIDENCE" hash-tree --root "$ROOT" \
+  run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" \
     "${HASH_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
     --output "$FINAL_ROOT_FILE" --artifact-root "$ART_DIR" 2>/dev/null || hash_rc=$?
   abort_if_finalizer_signalled
@@ -411,7 +486,7 @@ on_exit() {
     build_event_command --string event run_end --string verdict "$FINAL_VERDICT" \
       --string reason_code "$FINAL_REASON" --integer process_exit "$FINAL_EXIT" \
       --string active_step "$ACTIVE_STEP" \
-      --integer duration_ns "$(( $(python3 -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
+      --integer duration_ns "$(( $("${PYTHON[@]}" -c 'import time; print(time.monotonic_ns())') - START_NS ))" \
       --string cleanup_status retained_by_policy --string final_state "$final_root" \
       --string logical_root "$final_root" --string receipt_root "$final_root" \
       --string first_divergence "$first_divergence" \
@@ -426,26 +501,42 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" validate-run --file "$LOG" --schema "$SCHEMA" \
       --expected-verdict "$FINAL_VERDICT" --artifact-root "$ART_DIR" \
       --output "$ART_DIR/run.validation.json" || publish_rc=2
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" manifest --art-dir "$ART_DIR" \
+    # human.log is a manifested artifact. Append its terminal semantic record,
+    # then permanently seal it before the manifest inventories any artifact.
+    # Later publisher diagnostics remain visible on stderr but cannot invalidate
+    # the manifest's byte count or digest.
+    note "terminal verdict=$FINAL_VERDICT reason=$FINAL_REASON process_exit=$FINAL_EXIT" \
+      || publish_rc=2
+    HUMAN_LOG_SEALED=1
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" manifest --art-dir "$ART_DIR" \
       --output "$ART_DIR/manifest.json" --digest-output "$ART_DIR/manifest.digest" \
       --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
       --verdict "$FINAL_VERDICT" --input-root "$INPUT_ROOT" --final-root "$final_root" \
       || publish_rc=2
     abort_if_finalizer_signalled
   fi
+  if [ "$publish_rc" -eq 0 ] && [ "$TEST_EARLY_FAULT" = unexpected_first_step ]; then
+    # Regression probe for fln-g6d1: this diagnostic is deliberately emitted
+    # after manifest generation. It must remain stderr-only so the independently
+    # validated complete bundle still binds the final human.log bytes.
+    note "post-seal diagnostic probe: unexpected_first_step"
+  fi
   if [ "$publish_rc" -eq 0 ]; then
-    run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
+    run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
       --vendor-path "$VENDOR_PATH" || true
-    if run_finalizer_command python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+    if run_finalizer_command "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null; then
@@ -468,30 +559,50 @@ on_exit() {
 
 # Hash the complete governed input before creating an artifact directory. A broken
 # preflight therefore cannot leave a directory that resembles a typed evidence run.
-if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+if ! INPUT_ROOT="$("${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
   --vendor-path "$VENDOR_PATH")"; then
   echo "[structure_gate] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
-mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
-  echo "[structure_gate] refusing reused evidence directory: $ART_DIR" >&2
-  exit 2
-fi
-mkdir "$ART_DIR"
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
-  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
-    echo "[structure_gate] setup failure: cannot verify the pinned Reference tree" >&2
-    exit 2
-  }
-
-# From the first artifact write onward every exit is typed. In particular, the
-# human log is initialized only after run_start has committed successfully.
+# From artifact-directory creation onward every exit is typed: the envelope
+# runs under the terminal/finalizer state machine and any pre-run_start fault
+# still finalizes a typed durable partial bundle
+# (bead fln-evidence-runner-bootstrap-btk).
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
+EARLY_STEP=artifact_directory_creation
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  # The leaf mkdir is the single-writer claim. The losing process owns no
+  # artifact path and therefore must not run its already-armed finalizer.
+  trap - EXIT
+  echo "[structure_gate] evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
+ART_DIR_CLAIMED=1
+if [ "$TEST_EARLY_FAULT" = early_signal_hold ]; then
+  # Deterministic early-signal window for the deliberate fault scenarios.
+  : > "$ART_DIR/early.hold"
+  for _ in $(seq 1 3000); do
+    if [ -e "$ART_DIR/early.release" ]; then break; fi
+    sleep 0.01
+  done
+fi
+EARLY_STEP=vendor_binding
+if [ "$TEST_EARLY_FAULT" = vendor_binding ]; then
+  # A directory at the output path makes the real write path fail typed.
+  mkdir "$VENDOR_BINDING"
+fi
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
+  || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
 
+EARLY_STEP=run_start_emission
+if [ "$TEST_EARLY_FAULT" = run_start_emission ]; then
+  mkdir "$LOG"
+fi
 emit_event --new-log --string event run_start \
   --json-value argv '["scripts/e2e/structure_gate.sh"]' \
   --string cwd "$ROOT" \
@@ -506,17 +617,31 @@ emit_event --new-log --string event run_start \
   --string parity_ledger_row not_applicable_structural_governance \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" \
-  --json-value host_facts "$(python3 -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
+  --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},separators=(",",":")))')" \
   --integer thread_count 1 \
   --string seed deterministic-fixture-v1 --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" \
   --string vendor_binding vendor-binding.json \
-  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}"
+  --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
+  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}" \
+  || early_fault early_run_start_emission_failure "cannot emit run_start"
 
-: > "$HUMAN"
+EARLY_STEP=human_log
+if [ "$TEST_EARLY_FAULT" = human_log ]; then
+  mkdir "$HUMAN"
+fi
+: > "$HUMAN" || early_fault early_human_log_failure "cannot create the human log"
+# From here the run log exists with its run_start, so the full finalizer owns
+# terminal publication; the early-envelope partial machinery stands down.
+RUN_STARTED=1
+if [ "$TEST_EARLY_FAULT" = post_run_start_abort ]; then
+  # Deliberate internal fault after run_start: an unexpected shell exit must
+  # still finalize a complete typed internal_fault bundle.
+  exit 9
+fi
 
 read_meta_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())[sys.argv[2]]
 print("null" if value is None else value)
@@ -524,7 +649,7 @@ PY
 }
 
 read_meta_resource_field() {
-  python3 - "$1" "$2" <<'PY'
+  "${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())["resource"][sys.argv[2]]
 if value is True:
@@ -539,16 +664,16 @@ PY
 }
 
 hash_governed() {
-  python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
     --vendor-path "$VENDOR_PATH"
 }
 
 hash_subject() {
   local subject="$1"
   if [ -f "$subject/Cargo.toml" ]; then
-    python3 "$EVIDENCE" hash-tree --root "$subject" "${SUBJECT_HASH_ARGS[@]}"
+    "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$subject" "${SUBJECT_HASH_ARGS[@]}"
   else
-    python3 "$EVIDENCE" hash-tree --root "$subject" --path .
+    "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$subject" --path .
   fi
 }
 
@@ -569,7 +694,11 @@ launch_supervisor() {
   ACTIVE_STEP="$step"
   ACTIVE_READINESS="$LAST_READY"
   SPAWNING=1
-  setsid -- python3 "$EVIDENCE" run --cwd "$ROOT" --metadata "$LAST_META" \
+  # Supervised commands normally run from the workspace root. STEP_CWD lets a step run
+  # the guard from a member directory instead, which is how the acceptance requires the
+  # invocation-directory independence of the verdict to be demonstrated. It is reset by
+  # the caller after each such step so no later step inherits it.
+  setsid -- "${PYTHON[@]}" "$EVIDENCE" run --cwd "${STEP_CWD:-$ROOT}" --metadata "$LAST_META" \
     --stdout "$LAST_OUT" --stderr "$LAST_ERR" --readiness "$LAST_READY" \
     --launch-ready "$launch_ready" --launch-release "$launch_release" \
     --artifact-root "$ART_DIR" --capture-bytes "$capture_bytes" \
@@ -577,7 +706,7 @@ launch_supervisor() {
     --grace-ms "$GRACE_MS" --stage-id "$step" "${semantic_args[@]}" -- "$@" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+    setsid -- "${PYTHON[@]}" "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
       --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS" --session-leader \
       2>/dev/null
   )"; then
@@ -829,16 +958,16 @@ guard_step() {
     set_final inconclusive "$step:governed_inputs_changed" 3
     exit 3
   fi
-  if ! python3 "$EVIDENCE" validate-guard --file "$LAST_OUT" \
+  if ! "${PYTHON[@]}" "$EVIDENCE" validate-guard --file "$LAST_OUT" \
     --expected-exit "$expected_exit" --expected-verdict "$expected_verdict" \
     --expected-root "$fixture_root" --observed-exit "$LAST_CHILD_EXIT" \
     --artifact-root "$ART_DIR" "${validate_args[@]}" --output "$validation"; then
-    record_contract_failure "$step" structure-guard/2_exact_contract_mismatch \
+    record_contract_failure "$step" structure-guard/5_exact_contract_mismatch \
       "$expected_classification" "$expected_wrapper" "$expected_exit" \
       "$SUBJECT_BEFORE" "$SUBJECT_AFTER" "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
   fi
   record_step "$step" pass \
-    "structure-guard/2:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
+    "structure-guard/5:$expected_verdict/wrapper=$expected_wrapper/child=$expected_exit" \
     "$LAST_CLASSIFICATION/wrapper=$LAST_RC/child=$LAST_CHILD_EXIT" \
     "${validation#"$ART_DIR"/}" "$expected_classification" "$expected_wrapper" \
     "$expected_exit" "$SUBJECT_BEFORE" "$SUBJECT_AFTER" \
@@ -850,9 +979,11 @@ copy_fixture() {
   snapshot_before "$ROOT" "$step"
   mkdir "$destination"
   note "running step=$step: supervised source copy to $destination"
-  supervise "$step" cp -R -- "$ROOT/ci" "$ROOT/crates" "$ROOT/tools" \
+  supervise "$step" cp -R --reflink=auto -- \
+    "$ROOT/ci" "$ROOT/contracts" "$ROOT/crates" "$ROOT/tools" \
     "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" "$ROOT/SUITE.lock" \
-    "$ROOT/rust-toolchain.toml" "$destination/"
+    "$ROOT/rust-toolchain.toml" "$ROOT/ABI_CONTRACT.md" \
+    "$ROOT/OLEAN_CONTRACT.md" "$destination/"
   inspect_supervisor "$step"
   propagate_supervisor_taxonomy "$step" none
   snapshot_after "$ROOT" "$step"
@@ -921,7 +1052,7 @@ cancel_arm_ready() {
 }
 
 cancelled_pids_are_dead() {
-  python3 - "$1" <<'PY'
+  "${PYTHON[@]}" - "$1" <<'PY'
 import os
 import pathlib
 import sys
@@ -949,7 +1080,7 @@ cancellation_step() {
   snapshot_before "$subject" "$step"
   note "running step=$step: readiness-triggered process-tree cancellation"
   launch_supervisor "$step" 4096 65536 "$TIMEOUT_MS" \
-    python3 -c "$parent_program" "$pid_path"
+    "${PYTHON[@]}" -c "$parent_program" "$pid_path"
   runner_pid="$ACTIVE_RUNNER_PID"
   if ! cancel_arm_ready "$runner_pid" "$pid_path"; then
     if ! stop_active_runner TERM; then
@@ -959,7 +1090,7 @@ cancellation_step() {
     set_final internal_fault "$step:cancellation_fixture_not_ready" 2
     exit 2
   fi
-  if ! python3 "$EVIDENCE" signal-bound-process --pid "$runner_pid" \
+  if ! "${PYTHON[@]}" "$EVIDENCE" signal-bound-process --pid "$runner_pid" \
       --expected-start-ticks "$ACTIVE_RUNNER_START_TICKS" --signal TERM; then
     if ! stop_active_runner TERM; then
       mark_process_tree_cleanup_unproven
@@ -1002,9 +1133,28 @@ cancellation_step() {
     "$GLOBAL_BEFORE" "$GLOBAL_AFTER"
 }
 
-run_pass_step build_guard "$ROOT" \
-  --semantic-failure-exit 101 \
-  env CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked -p structure-guard --quiet
+if [ "$TEST_EARLY_FAULT" = unexpected_first_step ]; then
+  # Deliberate unexpected-failure scenario (bead
+  # fln-evidence-runner-bootstrap-btk): exit 7 is outside every registered
+  # semantic set, so the real step supervision must type internal_fault.
+  run_pass_step build_guard "$ROOT" sh -c 'exit 7'
+elif [ "$TEST_EARLY_FAULT" = during_first_step_drift ]; then
+  # Deliberate concurrent source drift, CLONE-ONLY: the mutator appends to a
+  # governed input while the (argv-swapped, cheap) first step runs, so the
+  # per-step snapshot law must type inconclusive. The confirmation guard
+  # makes accidental use against a real working tree impossible.
+  if [ "${FLN_SG_DRIFT_ROOT_CONFIRM:-}" != "$ROOT" ]; then
+    note "drift plant refused: FLN_SG_DRIFT_ROOT_CONFIRM does not name this root"
+    set_final internal_fault drift_plant_guard_refused 2
+    exit 2
+  fi
+  ( sleep 2; printf '\n' >> "$ROOT/ci/WORKSPACE_GRAPH.txt" ) &
+  run_pass_step build_guard "$ROOT" sleep 5
+else
+  run_pass_step build_guard "$ROOT" \
+    --semantic-failure-exit 101 \
+    env CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked -p structure-guard --quiet
+fi
 BUILT_GUARD="$BUILD_TARGET/debug/structure-guard"
 run_pass_step verify_built_guard "$ROOT" test -x "$BUILT_GUARD"
 mkdir "$ART_DIR/bin"
@@ -1020,19 +1170,38 @@ SETUP_ERROR_ROOT="$SCRATCH_ROOT/setup-error"
 mkdir "$SETUP_ERROR_ROOT"
 guard_step robot_setup_failure "$SETUP_ERROR_ROOT" 2 setup_error
 
+# The seeded fln-core -> fln-kernel edge now also completes the prohibited
+# transitive path fln-unsafe-abi -> fln-bignum -> fln-core -> fln-kernel
+# (FLN-STRUCT-008, the D3 layering law). Because the plant intentionally changes
+# Cargo.toml without regenerating Cargo.lock, FLN-STRUCT-018 also records that
+# exact manifest/lock disagreement; the same unresolved edge makes the
+# FLN-STRUCT-025 expansion covenant (bead fln-lld) fail closed with two typed
+# findings per boundary crate (lib, lib+test-cfg).
 UNACKNOWLEDGED="$SCRATCH_ROOT/unacknowledged"
 copy_fixture copy_unacknowledged "$UNACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$UNACKNOWLEDGED/crates/fln-core/Cargo.toml"
 guard_step seeded_unacknowledged "$UNACKNOWLEDGED" 1 fail \
   FLN-STRUCT-005@crates/fln-core/Cargo.toml \
-  FLN-STRUCT-007@crates/fln-core/Cargo.toml
+  FLN-STRUCT-007@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-018@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src
 
 ACKNOWLEDGED="$SCRATCH_ROOT/acknowledged"
 copy_fixture copy_acknowledged "$ACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$ACKNOWLEDGED/crates/fln-core/Cargo.toml"
 printf 'edge fln-core -> fln-kernel\n' >> "$ACKNOWLEDGED/ci/WORKSPACE_GRAPH.txt"
 guard_step seeded_acknowledged "$ACKNOWLEDGED" 1 fail \
-  FLN-STRUCT-007@crates/fln-core/Cargo.toml
+  FLN-STRUCT-007@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-018@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src
 
 RECOVERED="$SCRATCH_ROOT/recovered"
 copy_fixture copy_dependency_recovery "$RECOVERED"
@@ -1057,7 +1226,11 @@ EXPORTED="$SCRATCH_ROOT/exported"
 copy_fixture copy_exported "$EXPORTED"
 printf '\npub fn seeded_public_export<T>() -> T { panic!("not executed") }\n' \
   >> "$EXPORTED/crates/fln-unsafe-abi/src/lib.rs"
+# The one plant violates two independent FLN-STRUCT-022 laws: it is absent from the reviewed
+# boundary inventory, and its caller-chosen return type cannot be reviewed away. The exact
+# contract retains both findings even though their stable code/path identities coincide.
 guard_step seeded_export "$EXPORTED" 1 fail \
+  FLN-STRUCT-022@crates/fln-unsafe-abi/src/lib.rs \
   FLN-STRUCT-022@crates/fln-unsafe-abi/src/lib.rs
 
 RESTRICTED="$SCRATCH_ROOT/restricted"
@@ -1065,6 +1238,67 @@ copy_fixture copy_export_recovery "$RESTRICTED"
 printf '\npub(crate) fn seeded_crate_local_api() {}\n' \
   >> "$RESTRICTED/crates/fln-unsafe-abi/src/lib.rs"
 guard_step export_recovery "$RESTRICTED" 0 pass
+
+# The configuration-discovery family. Cargo merges .cargo/config(.toml) from the
+# invocation directory upward and rustup resolves the toolchain the same way, so
+# every one of these plants is live for a supported command yet appears in no
+# reviewed manifest. The nested plant is the one the root-only audit could not
+# see: `cd crates/fln-kernel && cargo build` would compile the kernel with
+# `--cap-lints allow`, which silently defeats the D3 forbid(unsafe_code) posture.
+NESTED_CARGO_CONFIG="$SCRATCH_ROOT/nested-cargo-config"
+copy_fixture copy_nested_cargo_config "$NESTED_CARGO_CONFIG"
+mkdir "$NESTED_CARGO_CONFIG/crates/fln-kernel/.cargo"
+printf '[build]\nrustflags = ["--cap-lints", "allow"]\n' \
+  > "$NESTED_CARGO_CONFIG/crates/fln-kernel/.cargo/config.toml"
+guard_step seeded_nested_cargo_config "$NESTED_CARGO_CONFIG" 1 fail \
+  FLN-STRUCT-016@crates/fln-kernel/.cargo/config.toml
+
+# rustup prefers rust-toolchain.toml when both spellings exist, so an unreviewed
+# legacy file can sit beside the reviewed pin undetected. The plant is a byte copy
+# of the reviewed pin, so it selects the SAME compiler: that isolates the finding
+# to the structural law (this filename may not exist) instead of entangling it with
+# whatever a redirected toolchain would do to the rest of the run.
+LEGACY_TOOLCHAIN="$SCRATCH_ROOT/legacy-toolchain"
+copy_fixture copy_legacy_toolchain "$LEGACY_TOOLCHAIN"
+cp -- "$LEGACY_TOOLCHAIN/rust-toolchain.toml" "$LEGACY_TOOLCHAIN/rust-toolchain"
+guard_step seeded_legacy_toolchain "$LEGACY_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain
+
+# An ambiguous shape of the reviewed pin itself: a decoy section carrying a channel
+# while [toolchain] is what actually selects. The [toolchain] table keeps the real
+# pin for the same reason as above, so the guard's own compiler is untouched and the
+# parse refusal is the only observable. The path-based and duplicate-key shapes are
+# deliberately NOT run here: both make rustup unable to resolve a toolchain at all,
+# so the observable becomes the expansion covenant (bead fln-lld) failing under a
+# broken compiler rather than this bead's structural law. They are covered exactly
+# where they belong, in lockfile::tests::parses_toolchain_channel.
+DECOY_TOOLCHAIN="$SCRATCH_ROOT/decoy-toolchain"
+copy_fixture copy_decoy_toolchain "$DECOY_TOOLCHAIN"
+{
+  printf '[metadata]\nchannel = "decoy-not-the-pin"\n'
+  cat -- "$DECOY_TOOLCHAIN/rust-toolchain.toml"
+} > "$DECOY_TOOLCHAIN/rust-toolchain.decoy"
+mv -- "$DECOY_TOOLCHAIN/rust-toolchain.decoy" "$DECOY_TOOLCHAIN/rust-toolchain.toml"
+guard_step seeded_decoy_toolchain "$DECOY_TOOLCHAIN" 1 fail \
+  FLN-STRUCT-016@rust-toolchain.toml
+
+# Recovery: an untouched copy still passes, proving the depth-walk did not start
+# rejecting the one legal member of the family (the reviewed root pin).
+CONFIG_RECOVERY="$SCRATCH_ROOT/config-recovery"
+copy_fixture copy_config_recovery "$CONFIG_RECOVERY"
+guard_step config_recovery "$CONFIG_RECOVERY" 0 pass
+
+# Invocation-directory independence. The whole reason the configuration-discovery walk
+# above exists is that a supported command can run from a member directory, where cargo
+# and rustup resolve configuration differently than at the root. So the gate itself must
+# be demonstrated from those directories and not only from the root: a verdict that
+# depends on the caller's working directory would mean the evidence names a scan nobody
+# can reproduce. Same frozen binary, same explicit --root, same expected pass.
+STEP_CWD="$ROOT/crates/fln-kernel"
+guard_step crate_dir_invocation "$ROOT" 0 pass
+STEP_CWD="$ROOT/tools/structure-guard"
+guard_step tool_dir_invocation "$ROOT" 0 pass
+unset STEP_CWD
 
 # A real guard invocation that exceeds a deliberately tiny output budget is typed
 # inconclusive. The same frozen binary immediately recovers under the normal budget.

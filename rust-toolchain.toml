@@ -3,4 +3,12 @@
 # the two must then agree, enforced in CI.
 [toolchain]
 channel = "nightly-2026-07-13"
-components = ["rustfmt", "clippy"]
+# `miri` and `rust-src` are here because the Marrow concurrency guards need them
+# and a fresh clone otherwise has neither (bead fln-nhf5). They are components of
+# the pin, not a second pin: SUITE.lock governs the CHANNEL, which is unchanged.
+#   miri     — crates/fln-unsafe-abi/MIRI_CONCURRENCY_GUARD.md, the four-test
+#              guard that fails on the real reverted data race.
+#   rust-src — required by `-Zbuild-std`, which is what makes ThreadSanitizer
+#              usable at this pin at all: without a std rebuilt under the same
+#              `-Zsanitizer=thread`, cargo refuses with an ABI mismatch.
+components = ["rustfmt", "clippy", "miri", "rust-src"]

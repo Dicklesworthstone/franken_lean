@@ -279,11 +279,31 @@ impl<'a> DeclDecoder<'a> {
                     what: "Level arity",
                 });
             }
+            if (tag == 4 || tag == 5) && other != 1 {
+                // param/mvar carry exactly one slot: the eager Name decode below
+                // and the stored Level.Data word are both indexed by `other`, so
+                // any other arity reads past the object (found by review).
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Level param/mvar arity",
+                });
+            }
             let mut pending = false;
             for i in 0..child_count {
                 let child = self.view.read_u64(off + 8 + 8 * i)?;
                 if !Self::is_scalar(child) {
                     let coff = self.view.deref(child)?;
+                    if coff >= off {
+                        // The writer's post-order law: every heap child resolves
+                        // strictly below its parent. A violation means a cycle,
+                        // and a cycle never builds a node, so no budget would
+                        // ever trip — the runaway must be refused here, typed
+                        // (fln-abaz finding 1).
+                        return Err(DeclError::Shape {
+                            offset: off,
+                            what: "Level child not below its parent (post-order law)",
+                        });
+                    }
                     if !self.levels.contains_key(&coff) {
                         stack.push(child);
                         pending = true;
@@ -569,6 +589,17 @@ impl<'a> DeclDecoder<'a> {
                     });
                 }
                 let coff = self.view.deref(child)?;
+                if coff >= off {
+                    // The writer's post-order law: every heap child resolves
+                    // strictly below its parent. A violation means a cycle, and
+                    // a cycle never builds a node, so the decode budget would
+                    // never trip and the loop grows the stack without bound
+                    // (fln-abaz finding 1).
+                    return Err(DeclError::Shape {
+                        offset: off,
+                        what: "Expr child not below its parent (post-order law)",
+                    });
+                }
                 if !self.exprs.contains_key(&coff) {
                     stack.push(child);
                     pending = true;

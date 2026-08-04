@@ -16,16 +16,764 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fln_core::name::Name;
+use fln_core::outcome::{InconclusiveCause, Outcome};
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
-use fln_hash::domain::{Digest, Domain, hash};
+use fln_hash::domain::{Digest, Domain, DomainHasher, hash};
 
 use crate::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
 };
 use crate::modules::{
     ArtifactEvidence, ArtifactGrade, ArtifactProducer, DirectImport, ModuleEpoch, ModuleGraph,
-    ModuleGraphError, ModuleGraphLimits, ModuleId, ModuleRecord, name_stats,
+    ModuleGraphError, ModuleGraphLimits, ModuleGraphResource, ModuleGraphStop, ModuleId,
+    ModuleRecord, name_stats,
 };
+
+// ---------------------------------------------------------------------------------
+// The normative V1 contribution table (bead `franken_lean-3ldh`).
+//
+// The schema layout used to live only in prose plus a set of sensitivity tests. Prose
+// cannot be joined against the encoder, so a field could be added, moved, or silently
+// dropped from the root without any artifact disagreeing. This table is the normative
+// statement, in data, and the tests below hold it to the standard the design set:
+// **missing, duplicate, stale, or unclassified rows block closure.**
+// ---------------------------------------------------------------------------------
+
+/// Whether a field is a scalar, an ordered replay sequence, a canonical set, or a
+/// count derived from the sequence it introduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1SequenceLaw {
+    Scalar,
+    /// Order is semantic replay data and duplicates are retained.
+    OrderedSequence,
+    /// Order is canonical (sorted) and duplicates are removed.
+    CanonicalSet,
+    /// A length introducing the sequence that follows it.
+    DerivedCount,
+}
+
+/// The ordinal namespace a row's position belongs to. Separate namespaces are what
+/// keep an ordinary declaration and an extra generated declaration from sharing a
+/// coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1OrdinalNamespace {
+    None,
+    DirectImport,
+    OrdinaryContribution,
+    ExtraContribution,
+    ExtensionSource,
+    MissingDependency,
+}
+
+/// What happens when the same value appears twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1DuplicatePolicy {
+    NotApplicable,
+    /// Retained verbatim — this is ordered replay data.
+    Retained,
+    /// A typed refusal: the same declaration cannot be published twice.
+    RefusedAsConflict,
+    /// Sorted and deduplicated as part of canonicalization.
+    DedupedCanonically,
+}
+
+/// Whether a row carries identity or points at payload owned elsewhere. The schema is
+/// identity-only by design: values and raw bytes stay `Arc`-backed in the Environment
+/// and the extension journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Ownership {
+    /// The row *is* identity — a name, tag, count, or digest.
+    Identity,
+    /// The row names payload owned by another layer and never copied here.
+    PayloadOwnedElsewhere,
+}
+
+/// How a row reaches [`ModuleProvenanceRoot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1RootParticipation {
+    /// Written into the canonical bytes; changing it changes the root.
+    Direct,
+    /// Not written, because validation pins it to a value that is written. Omitting
+    /// it is safe *only* while that validation exists — the join is the evidence.
+    ViaValidation,
+    /// Deliberately excluded from the canonical bytes.
+    Excluded,
+}
+
+/// Which completeness axis a row feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1CompletenessAxis {
+    None,
+    Capture,
+    Transparency,
+    MissingDependencies,
+}
+
+/// Exact canonical width, so the table can predict a manifest's byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Width {
+    /// A fixed number of bytes (`u8`/`bool` = 1, `u64` = 8, …).
+    Fixed(usize),
+    /// `CanonWriter::bytes`: an 8-byte length prefix plus the payload.
+    LengthPrefixed(usize),
+    /// A `Name` body, whose width depends on the name and is measured from the
+    /// fixture rather than guessed.
+    NameBody,
+    /// `CanonWriter::schema`: a length-prefixed name plus a `u16` version.
+    SchemaHeader,
+}
+
+/// How many times a row occurs in a manifest, so the width prediction can be scaled
+/// by the manifest's own facts instead of a hand-counted constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Multiplicity {
+    Once,
+    PerModule,
+    PerDirectImportRow,
+    PerDeclaration,
+    PerExtraDeclaration,
+    PerExtensionContribution,
+    PerExtensionEntry,
+    PerMissingDependency,
+    /// Present in the value but not in the canonical bytes.
+    NotEncoded,
+}
+
+/// One row of the normative V1 contribution table.
+#[derive(Debug, Clone, Copy)]
+pub struct V1FieldRow {
+    /// Stable field tag. Unique across the table — duplicates block closure.
+    pub tag: &'static str,
+    /// The decoder source field this row is pinned to.
+    pub decoder_source: &'static str,
+    pub value_type: &'static str,
+    pub sequence_law: V1SequenceLaw,
+    pub ordinal_namespace: V1OrdinalNamespace,
+    /// Ordinal width in bits, where the row has an ordinal.
+    pub ordinal_width_bits: Option<u32>,
+    pub duplicate_policy: V1DuplicatePolicy,
+    /// The canonical inputs that decide this row's identity.
+    pub identity_inputs: &'static str,
+    pub ownership: V1Ownership,
+    pub root_participation: V1RootParticipation,
+    pub completeness_axis: V1CompletenessAxis,
+    /// The typed outcome a malformed value earns.
+    pub malformed_outcome: &'static str,
+    /// The resource this row is charged against, if any.
+    pub resource_charge: Option<ModuleProvenanceResource>,
+    pub width: V1Width,
+    pub multiplicity: V1Multiplicity,
+    /// The label of the field-family sensitivity observation that witnesses this
+    /// row's root participation, where one exists. Every `Direct` row must either
+    /// carry a witness or be a `DerivedCount` (whose sensitivity is witnessed by the
+    /// sequence it introduces).
+    pub sensitivity_witness: Option<&'static str>,
+}
+
+/// The normative V1 contribution table. One row per field of the canonical
+/// encoding, in encoder order, plus the rows that are deliberately *not* encoded.
+///
+/// This is the artifact the design asked for: per row, the field tag, its pinned
+/// decoder source, value type, ordered-sequence versus canonical-set law, ordinal
+/// namespace and width, duplicate policy, canonical identity inputs,
+/// payload-versus-identity ownership, root participation, completeness-axis effect,
+/// malformed outcome, and resource charge.
+pub const MODULE_PROVENANCE_V1_TABLE: &[V1FieldRow] = &[
+    V1FieldRow {
+        tag: "schema",
+        decoder_source: "MODULE_PROVENANCE_SCHEMA",
+        value_type: "SchemaId",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "schema name and version",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding / UnsupportedSchemaVersion",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::SchemaHeader,
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "epoch.tag",
+        decoder_source: "ModuleEpoch::tag",
+        value_type: "str",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact tag bytes",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(MalformedEpoch)",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(0),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: Some("epoch.tag"),
+    },
+    V1FieldRow {
+        tag: "epoch.commit",
+        decoder_source: "ModuleEpoch::commit",
+        value_type: "str",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact commit bytes",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(MalformedEpoch)",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(0),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: Some("epoch.commit"),
+    },
+    V1FieldRow {
+        tag: "records.count",
+        decoder_source: "records.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "module-record cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(Modules) / MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::Modules),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::Once,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "module.id",
+        decoder_source: "ModuleRecord::id",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::CanonicalSet,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateModule / InvalidModuleGraph(AnonymousModule)",
+        resource_charge: Some(ModuleProvenanceResource::NameDepth),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("module.id"),
+    },
+    V1FieldRow {
+        tag: "module.is_module",
+        decoder_source: "ModuleRecord::is_module",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "flag value",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("module.is_module"),
+    },
+    V1FieldRow {
+        tag: "module.direct_imports.count",
+        decoder_source: "ModuleRecord::direct_imports().len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "direct-row cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DirectImportRows)",
+        resource_charge: Some(ModuleProvenanceResource::DirectImportRows),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "direct_import.module",
+        decoder_source: "DirectImport::module",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "structural Name at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "InvalidModuleGraph(AnonymousImport)",
+        resource_charge: Some(ModuleProvenanceResource::DirectImportRows),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.module+missing_dependency"),
+    },
+    V1FieldRow {
+        tag: "direct_import.import_all",
+        decoder_source: "DirectImport::import_all",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.import_all"),
+    },
+    V1FieldRow {
+        tag: "direct_import.is_exported",
+        decoder_source: "DirectImport::is_exported",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.is_exported"),
+    },
+    V1FieldRow {
+        tag: "direct_import.is_meta",
+        decoder_source: "DirectImport::is_meta",
+        value_type: "bool",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::DirectImport,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "flag value at this ordinal",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerDirectImportRow,
+        sensitivity_witness: Some("direct_import.is_meta"),
+    },
+    V1FieldRow {
+        tag: "artifact.content_digest",
+        decoder_source: "ArtifactEvidence::content_digest",
+        value_type: "Digest",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact 32 digest bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.content_digest"),
+    },
+    V1FieldRow {
+        tag: "artifact.producer",
+        decoder_source: "ArtifactEvidence::producer",
+        value_type: "ArtifactProducer tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown artifact producer tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.producer"),
+    },
+    V1FieldRow {
+        tag: "artifact.grade",
+        decoder_source: "ArtifactEvidence::grade",
+        value_type: "ArtifactGrade tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown artifact grade tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("artifact.grade"),
+    },
+    V1FieldRow {
+        tag: "artifact.epoch",
+        decoder_source: "ArtifactEvidence::epoch",
+        value_type: "ModuleEpoch",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "pinned equal to the manifest epoch by validation",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::ViaValidation,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "InvalidModuleGraph(EpochMismatch)",
+        resource_charge: None,
+        width: V1Width::Fixed(0),
+        multiplicity: V1Multiplicity::NotEncoded,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "declarations.count",
+        decoder_source: "ModuleContributionRecord::declarations.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "ordinary-contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DeclarationNames)",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "declarations.name",
+        decoder_source: "ModuleContributionRecord::declarations[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::OrdinaryContribution,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name at this ordinal",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateDeclaration / ConflictingDeclarationOwner / AnonymousDeclaration",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerDeclaration,
+        sensitivity_witness: Some("declarations.order"),
+    },
+    V1FieldRow {
+        tag: "extra_declarations.count",
+        decoder_source: "ModuleContributionRecord::extra_declarations.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "extra-contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(DeclarationNames)",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "extra_declarations.name",
+        decoder_source: "ModuleContributionRecord::extra_declarations[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtraContribution,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::RefusedAsConflict,
+        identity_inputs: "structural Name at this ordinal, in its own namespace",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "DuplicateDeclaration / ConflictingDeclarationOwner",
+        resource_charge: Some(ModuleProvenanceResource::DeclarationNames),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerExtraDeclaration,
+        sensitivity_witness: Some("extra_declarations.identity"),
+    },
+    V1FieldRow {
+        tag: "extension_contributions.count",
+        decoder_source: "ModuleContributionRecord::extension_contributions.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "contribution cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "ResourceLimitExceeded(ExtensionContributions)",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionContributions),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.name",
+        decoder_source: "ExtensionDescriptor::name",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "structural Name",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "AnonymousExtension",
+        resource_charge: Some(ModuleProvenanceResource::NameDepth),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.name"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.merge",
+        decoder_source: "ExtensionDescriptor::merge",
+        value_type: "MergeSemantics tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown merge policy tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.merge"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.checkpoint",
+        decoder_source: "ExtensionDescriptor::checkpoint",
+        value_type: "CheckpointSemantics tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding(unknown checkpoint policy tag)",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.checkpoint"),
+    },
+    V1FieldRow {
+        tag: "extension.descriptor.provenance",
+        decoder_source: "ExtensionDescriptor::provenance",
+        value_type: "PayloadProvenance tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Transparency,
+        malformed_outcome: "MalformedEncoding / PayloadTransparencyMismatch",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.provenance+transparency"),
+    },
+    V1FieldRow {
+        tag: "extension.range_start",
+        decoder_source: "ExtensionContribution::start",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "target-journal start; scoped to one root and extension, NOT stable content identity",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EntryRangeOverflow",
+        resource_charge: None,
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.range_start"),
+    },
+    V1FieldRow {
+        tag: "extension.base_history_digest",
+        decoder_source: "ExtensionContribution::base_history_digest",
+        value_type: "Digest",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "exact 32 digest bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::EncodedBytes),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.base_history_digest"),
+    },
+    V1FieldRow {
+        tag: "extension.entries.count",
+        decoder_source: "ExtensionContribution::entries.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "occurrence cardinality; also the applied range length",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EmptyExtensionContribution / ResourceLimitExceeded(ExtensionEntries)",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionEntries),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerExtensionContribution,
+        sensitivity_witness: Some("extension.entry_count"),
+    },
+    V1FieldRow {
+        tag: "extension.entry_id",
+        decoder_source: "ExtensionContribution::entries[j]",
+        value_type: "ExtensionEntryId",
+        sequence_law: V1SequenceLaw::OrderedSequence,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::Retained,
+        identity_inputs: "entry schema, epoch, descriptor identity, exact payload bytes",
+        ownership: V1Ownership::PayloadOwnedElsewhere,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "MalformedEncoding",
+        resource_charge: Some(ModuleProvenanceResource::ExtensionEntries),
+        width: V1Width::LengthPrefixed(32),
+        multiplicity: V1Multiplicity::PerExtensionEntry,
+        sensitivity_witness: Some("extension.entry_id"),
+    },
+    V1FieldRow {
+        tag: "extension.target_position",
+        decoder_source: "derived: start + source ordinal",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::ExtensionSource,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "none: a derived coordinate, never an identity input",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Excluded,
+        completeness_axis: V1CompletenessAxis::None,
+        malformed_outcome: "EntryRangeOverflow",
+        resource_charge: None,
+        width: V1Width::Fixed(0),
+        multiplicity: V1Multiplicity::NotEncoded,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "completeness.capture",
+        decoder_source: "ProvenanceCompleteness::capture",
+        value_type: "CaptureStatus tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Capture,
+        malformed_outcome: "MalformedEncoding / CaptureStatusContradicted",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("completeness.capture"),
+    },
+    V1FieldRow {
+        tag: "completeness.transparency",
+        decoder_source: "ProvenanceCompleteness::transparency",
+        value_type: "PayloadTransparency tag",
+        sequence_law: V1SequenceLaw::Scalar,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "frozen enum tag, recomputed from descriptors",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::Transparency,
+        malformed_outcome: "MalformedEncoding / PayloadTransparencyMismatch",
+        resource_charge: None,
+        width: V1Width::Fixed(1),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: Some("completeness.transparency"),
+    },
+    V1FieldRow {
+        tag: "completeness.missing_dependencies.count",
+        decoder_source: "ProvenanceCompleteness::missing_dependencies.len()",
+        value_type: "u64",
+        sequence_law: V1SequenceLaw::DerivedCount,
+        ordinal_namespace: V1OrdinalNamespace::None,
+        ordinal_width_bits: None,
+        duplicate_policy: V1DuplicatePolicy::NotApplicable,
+        identity_inputs: "missing-target cardinality",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "ResourceLimitExceeded(MissingDependencies)",
+        resource_charge: Some(ModuleProvenanceResource::MissingDependencies),
+        width: V1Width::Fixed(8),
+        multiplicity: V1Multiplicity::PerModule,
+        sensitivity_witness: None,
+    },
+    V1FieldRow {
+        tag: "completeness.missing_dependencies.name",
+        decoder_source: "ProvenanceCompleteness::missing_dependencies[i]",
+        value_type: "Name",
+        sequence_law: V1SequenceLaw::CanonicalSet,
+        ordinal_namespace: V1OrdinalNamespace::MissingDependency,
+        ordinal_width_bits: Some(64),
+        duplicate_policy: V1DuplicatePolicy::DedupedCanonically,
+        identity_inputs: "structural Name, sorted and deduplicated",
+        ownership: V1Ownership::Identity,
+        root_participation: V1RootParticipation::Direct,
+        completeness_axis: V1CompletenessAxis::MissingDependencies,
+        malformed_outcome: "MissingDependenciesMismatch",
+        resource_charge: Some(ModuleProvenanceResource::MissingDependencies),
+        width: V1Width::NameBody,
+        multiplicity: V1Multiplicity::PerMissingDependency,
+        sensitivity_witness: Some("completeness.missing_dependency_set"),
+    },
+];
 
 /// Frozen canonical schema for the complete provenance manifest.
 ///
@@ -36,17 +784,24 @@ use crate::modules::{
 ///    direct-import rows (target, `import_all`, `is_exported`, `is_meta`), then
 ///    artifact digest/producer/grade;
 /// 3. ordered declarations, ordered extra declarations, and ordered extension
-///    contributions; each contribution carries its descriptor, start ordinal,
-///    base-history digest, and contiguous `(ordinal, payload_digest)` identities;
-/// 4. decode completeness, extension knowledge, and the canonical missing-target set.
+///    contributions; each contribution carries its descriptor, target-journal start,
+///    base-history digest, and its module-local source sequence of
+///    [`ExtensionEntryId`] content identities — the source ordinal is the position in
+///    that sequence and the target position is `start + ordinal`, so no rebasable
+///    journal coordinate is stored per entry;
+/// 4. the capture-status and payload-transparency axes, and the canonical
+///    missing-target set. The authority axis is derived from that tuple and is
+///    deliberately absent from the bytes, so no record can assert a capability it has
+///    not earned.
 ///
 /// Enum tags are frozen below by paired exhaustive `*_tag`/`read_*` functions:
 /// producer `Reference=0, FrankenLean=1`; grade
 /// `Provisional=0, Verified=1, OracleFixture=2`; merge
 /// `AppendOrdered=0, SetUnion=1, ConflictsRequireReview=2`; checkpoint
 /// `JournalSuffix=0, FullJournal=1`; payload provenance
-/// `Understood=0, Opaque=1`; decode `Complete=0, Partial=1`; extension knowledge
-/// `AllUnderstood=0, ContainsOpaque=1`. Unknown tags and future schema versions are
+/// `Understood=0, Opaque=1`; capture status `Complete=0, Partial=1, Missing=2`;
+/// payload transparency
+/// `Understood=0, Mixed=1, Opaque=2`. Unknown tags and future schema versions are
 /// typed refusals. Any incompatible layout change registers version 2 rather than
 /// reinterpreting version-1 bytes.
 ///
@@ -60,95 +815,230 @@ pub const MODULE_PROVENANCE_SCHEMA: SchemaId = SchemaId {
     version: 1,
 };
 
-/// Whether the decoder produced every contribution-bearing section it understood.
+/// **Capture axis** — how much of this module's contribution the decoder obtained.
+///
+/// This says nothing about whether the captured bytes are understood; that is the
+/// independent [`PayloadTransparency`] axis. `Missing` is not "empty": a module that
+/// genuinely contributes nothing is `Complete` with zero contributions, whereas
+/// `Missing` records that the contributions could not be captured at all. The two
+/// encode the same empty content and make opposite claims about it, which is precisely
+/// why the axis is explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DecodeCompleteness {
+pub enum CaptureStatus {
     Complete,
     Partial,
+    Missing,
 }
 
-/// Whether every retained extension contribution is semantically understood.
+/// **Transparency axis** — whether the captured extension payloads are semantically
+/// understood.
+///
+/// Orthogonal to [`CaptureStatus`]: an opaque payload can be byte-complete, and an
+/// understood one can be partially captured. `Mixed` is a real state, not a rounding
+/// of `Opaque` — it is what keeps an opaque boundary *localized* and addressable
+/// instead of condemning the whole module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExtensionKnowledge {
-    AllUnderstood,
-    ContainsOpaque,
+pub enum PayloadTransparency {
+    Understood,
+    Mixed,
+    Opaque,
 }
 
-/// Orthogonal completeness dimensions. Missing dependencies are a canonical set;
-/// declaration and extension arrays elsewhere remain ordered sequences.
+/// **Authority axis** — one capability a consumer may exercise over a record.
+///
+/// Authority is *derived*, never stored: it is a pure function of the capture and
+/// transparency axes plus the missing-dependency set (see
+/// [`ProvenanceCompleteness::authority`]). Because the manifest carries no authority
+/// field, a record cannot assert a capability it has not earned — unjustified
+/// authority is unrepresentable rather than merely rejected on decode, and every
+/// decode recomputes it by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProvenanceAuthority {
+    /// Read what was recorded. Requires only that something was captured.
+    Inspection,
+    /// Replay this module's exact ordered extension entries. Opacity is irrelevant —
+    /// opaque bytes replay verbatim — so this needs capture alone.
+    ExactReplay,
+    /// Enumerate every declaration and contribution the module owns.
+    CompleteInventory,
+    /// Serve as an authoritative cache identity. Opacity is tolerable because entry
+    /// identity is byte-exact, but an unresolved import means the recorded closure is
+    /// not the real one.
+    AuthoritativeCache,
+    /// Compute a precise invalidation cone. The strictest capability: it is the only
+    /// one that needs semantic attribution, so an opaque or mixed payload withholds it.
+    FineInvalidation,
+}
+
+impl ProvenanceAuthority {
+    /// Every capability, in strengthening order. Iterating this rather than a
+    /// hand-written list is what makes "omit an axis" detectable in the tests.
+    pub const ALL: [ProvenanceAuthority; 5] = [
+        ProvenanceAuthority::Inspection,
+        ProvenanceAuthority::ExactReplay,
+        ProvenanceAuthority::CompleteInventory,
+        ProvenanceAuthority::AuthoritativeCache,
+        ProvenanceAuthority::FineInvalidation,
+    ];
+}
+
+/// The three independent completeness axes.
+///
+/// They are deliberately *not* reducible to one another and there is no boolean
+/// "complete" accessor: a single flag would have to pick an axis to privilege, and
+/// every caller that asked it would silently inherit that choice. Ask the axis you
+/// actually mean — [`capture`](Self::capture), [`transparency`](Self::transparency),
+/// [`missing_dependencies`](Self::missing_dependencies) — or ask what you are allowed
+/// to do, via [`authority`](Self::authority).
+///
+/// Missing dependencies are a canonical set; declaration and extension arrays
+/// elsewhere remain ordered sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenanceCompleteness {
-    decode: DecodeCompleteness,
-    extension_knowledge: ExtensionKnowledge,
+    capture: CaptureStatus,
+    transparency: PayloadTransparency,
     missing_dependencies: Arc<[ModuleId]>,
 }
 
 impl ProvenanceCompleteness {
     pub fn new(
-        decode: DecodeCompleteness,
-        extension_knowledge: ExtensionKnowledge,
+        capture: CaptureStatus,
+        transparency: PayloadTransparency,
         mut missing_dependencies: Vec<ModuleId>,
     ) -> Self {
         missing_dependencies.sort();
         missing_dependencies.dedup();
         Self {
-            decode,
-            extension_knowledge,
+            capture,
+            transparency,
             missing_dependencies: missing_dependencies.into(),
         }
     }
 
-    pub fn decode(&self) -> DecodeCompleteness {
-        self.decode
+    pub fn capture(&self) -> CaptureStatus {
+        self.capture
     }
 
-    pub fn extension_knowledge(&self) -> ExtensionKnowledge {
-        self.extension_knowledge
+    pub fn transparency(&self) -> PayloadTransparency {
+        self.transparency
     }
 
     pub fn missing_dependencies(&self) -> &[ModuleId] {
         &self.missing_dependencies
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.decode == DecodeCompleteness::Complete
-            && self.extension_knowledge == ExtensionKnowledge::AllUnderstood
-            && self.missing_dependencies.is_empty()
-    }
-}
-
-/// Stable identity of one extension journal entry. The payload is not copied into
-/// provenance: the ordinal binds replay position and the digest binds exact bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExtensionEntryIdentity {
-    index: u64,
-    payload_digest: Digest,
-}
-
-impl ExtensionEntryIdentity {
-    pub const fn new(index: u64, payload_digest: Digest) -> Self {
-        Self {
-            index,
-            payload_digest,
+    /// Whether the full axis tuple justifies one capability.
+    ///
+    /// Each arm names the axes it consults and ignores the rest. `Complete + Opaque`
+    /// and `Partial + Understood` are both legal here and both yield a *reduced* set
+    /// rather than nothing — that is the whole point of keeping the axes apart.
+    pub fn grants(&self, authority: ProvenanceAuthority) -> bool {
+        // ubs:ignore — public provenance classification, not authentication material.
+        let captured_everything = self.capture == CaptureStatus::Complete;
+        let closure_is_known = self.missing_dependencies.is_empty();
+        // ubs:ignore — public provenance classification, not authentication material.
+        let semantics_are_attributable = self.transparency == PayloadTransparency::Understood;
+        match authority {
+            // ubs:ignore — public provenance classification, not authentication material.
+            ProvenanceAuthority::Inspection => self.capture != CaptureStatus::Missing,
+            ProvenanceAuthority::ExactReplay | ProvenanceAuthority::CompleteInventory => {
+                captured_everything
+            }
+            ProvenanceAuthority::AuthoritativeCache => captured_everything && closure_is_known,
+            ProvenanceAuthority::FineInvalidation => {
+                captured_everything && closure_is_known && semantics_are_attributable
+            }
         }
     }
 
-    pub fn index(&self) -> u64 {
-        self.index
+    /// The complete derived capability set, in strengthening order.
+    pub fn authority(&self) -> Vec<ProvenanceAuthority> {
+        ProvenanceAuthority::ALL
+            .into_iter()
+            .filter(|candidate| self.grants(*candidate))
+            .collect()
+    }
+}
+
+/// Dedicated versioned derivation for extension-entry content identity.
+///
+/// It shares [`Domain::ModuleProvenance`] with the manifest root but is separated from
+/// it by this canonical schema prefix, so an entry-id preimage can never coincide with
+/// a manifest preimage.
+pub const EXTENSION_ENTRY_ID_SCHEMA: SchemaId = SchemaId {
+    name: "fln.env.module-provenance.entry-id",
+    version: 1,
+};
+
+/// Stable content identity of one extension journal entry.
+///
+/// Derived from the versioned entry schema, the module epoch, the exact extension
+/// descriptor identity, and the exact raw payload bytes — and from nothing else. The
+/// contributing module, the module-local source ordinal, the target journal position,
+/// the applied range, the journal branch, and every allocation or `Arc` fact are
+/// deliberately excluded, so the identity survives journal rebasing, replay, restore,
+/// and merge. Two occurrences carrying the same descriptor and payload therefore share
+/// this id by construction; they remain distinguishable *as occurrences* by the
+/// contributing [`ModuleId`] plus the module-local source ordinal
+/// ([`ExtensionContribution::source_ordinal`]).
+///
+/// The id is a locator and a fast inequality check. Digest collision resistance is a
+/// HYPOTHESIS of the selected digest, never an injectivity proof: wherever equality or
+/// ownership is load-bearing, the exact canonical fields decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtensionEntryId(Digest);
+
+impl ExtensionEntryId {
+    /// Derive the identity from the only inputs it is permitted to depend on. The
+    /// payload is hashed, never retained: provenance stores identity, and the bytes
+    /// themselves stay `Arc`-backed in the extension journal.
+    pub fn derive(epoch: &ModuleEpoch, descriptor: &ExtensionDescriptor, payload: &[u8]) -> Self {
+        let mut writer = CanonWriter::new();
+        writer.schema(EXTENSION_ENTRY_ID_SCHEMA);
+        writer.str(epoch.tag());
+        writer.str(epoch.commit());
+        descriptor.name.write_body(&mut writer);
+        writer.u8(merge_semantics_tag(descriptor.merge));
+        writer.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+        writer.u8(payload_provenance_tag(descriptor.provenance));
+        writer.bytes(payload);
+        Self(hash(Domain::ModuleProvenance, &writer.into_bytes()))
     }
 
-    pub fn payload_digest(&self) -> Digest {
-        self.payload_digest
+    /// Reconstruct from canonical bytes. Crate-internal on purpose: an external caller
+    /// must [`derive`](Self::derive) the id from the payload rather than assert one,
+    /// so no fabricated identity can enter a manifest.
+    pub(crate) const fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
+    pub fn digest(&self) -> Digest {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ExtensionEntryId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
 /// One exact ordered range contributed to a registered extension.
+///
+/// `entries` is the module-local source sequence: the array index *is* the entry's
+/// `ExtensionSourceOrdinal` (zero-based), and empty or repeated occurrences are
+/// retained rather than deduplicated, because this is ordered replay data.
+///
+/// `start` is the target journal position the range was applied at. It is scoped to
+/// one committed provenance root and one extension, may change after replay, restore,
+/// or merge, and is never an input to any [`ExtensionEntryId`]. Source ordinal and
+/// target position are therefore two different coordinates and never aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionContribution {
     descriptor: ExtensionDescriptor,
     start: u64,
     base_history_digest: Digest,
-    entries: Arc<[ExtensionEntryIdentity]>,
+    entries: Arc<[ExtensionEntryId]>,
 }
 
 impl ExtensionContribution {
@@ -156,7 +1046,7 @@ impl ExtensionContribution {
         descriptor: ExtensionDescriptor,
         start: u64,
         base_history_digest: Digest,
-        entries: Vec<ExtensionEntryIdentity>,
+        entries: Vec<ExtensionEntryId>,
     ) -> Self {
         Self {
             descriptor,
@@ -170,6 +1060,7 @@ impl ExtensionContribution {
         &self.descriptor
     }
 
+    /// Target-journal start of the applied range. Not stable content identity.
     pub fn start(&self) -> u64 {
         self.start
     }
@@ -178,8 +1069,23 @@ impl ExtensionContribution {
         self.base_history_digest
     }
 
-    pub fn entries(&self) -> &[ExtensionEntryIdentity] {
+    pub fn entries(&self) -> &[ExtensionEntryId] {
         &self.entries
+    }
+
+    /// Module-local source ordinal of the occurrence at `index` — the coordinate that,
+    /// with the contributing module and the entry id, identifies an occurrence.
+    pub fn source_ordinal(&self, index: usize) -> Option<u64> {
+        if index >= self.entries.len() {
+            return None;
+        }
+        u64::try_from(index).ok()
+    }
+
+    /// Current target-journal position of the occurrence at `index`. Scoped to one
+    /// committed root and extension; it may differ after replay, restore, or merge.
+    pub fn target_position(&self, index: usize) -> Option<u64> {
+        self.start.checked_add(self.source_ordinal(index)?)
     }
 
     pub fn end(&self) -> Option<u64> {
@@ -341,6 +1247,76 @@ pub struct ModuleProvenanceFacts {
     pub encoded_bytes: u128,
 }
 
+/// How an untrusted candidate that claims an identity relates to one already held.
+///
+/// The whole point of this type is that [`IdentityVerdict::Collision`] is a *reported
+/// outcome*, never a resolution. Nothing here picks a winner, merges, or falls back to
+/// the digest: an equal root over unequal canonical values is handed upward as a
+/// candidate for atomic application to adjudicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// Same root, same canonical bytes. Safe to treat as the same object, which is what
+    /// makes cache hits and re-imports idempotent.
+    Idempotent,
+    /// Different roots. Unrelated objects; the digest's inequality is conclusive because
+    /// a hash never reports different for equal inputs.
+    Distinct,
+    /// Same root, **different** canonical bytes.
+    Collision(IdentityCollision),
+}
+
+/// Evidence for an equal-digest/unequal-value pair, carrying enough to diagnose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityCollision {
+    pub root: ModuleProvenanceRoot,
+    pub held_len: usize,
+    pub candidate_len: usize,
+    /// Byte offset of the first disagreement, or the shorter length when one canonical
+    /// value is a strict prefix of the other.
+    pub first_divergence: usize,
+}
+
+/// Classify a candidate against a held object by claimed root, then by exact canonical
+/// value.
+///
+/// This is the schema's **bounded-model collision seam**. It takes roots and bytes as
+/// separate inputs rather than reading them off two manifests, precisely so a test can
+/// *inject* the digest equality that a real collision would produce. Injecting that
+/// equality is a bounded model: it assumes, counterfactually and only inside the model,
+/// that two distinct canonical values digest alike. **No cryptographic collision is
+/// claimed, searched for, or found**, and this seam must never be cited as evidence
+/// that one exists.
+///
+/// What the seam does establish is the property that matters if collision resistance
+/// ever fails: equal digest plus unequal canonical identity stays *distinguishable*,
+/// because equality is decided by the exact bytes and the digest is only ever a fast
+/// inequality check. Collision resistance is a HYPOTHESIS of the selected digest
+/// (claim type `bounded_model`), never an injectivity proof.
+pub fn classify_identity(
+    held: (ModuleProvenanceRoot, &[u8]),
+    candidate: (ModuleProvenanceRoot, &[u8]),
+) -> IdentityVerdict {
+    let (held_root, held_bytes) = held;
+    let (candidate_root, candidate_bytes) = candidate;
+    if held_root != candidate_root {
+        return IdentityVerdict::Distinct;
+    }
+    if held_bytes == candidate_bytes {
+        return IdentityVerdict::Idempotent;
+    }
+    let first_divergence = held_bytes
+        .iter()
+        .zip(candidate_bytes.iter())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| held_bytes.len().min(candidate_bytes.len()));
+    IdentityVerdict::Collision(IdentityCollision {
+        root: held_root,
+        held_len: held_bytes.len(),
+        candidate_len: candidate_bytes.len(),
+        first_divergence,
+    })
+}
+
 /// Dedicated identity type prevents accidental substitution for a logical or
 /// operational root even though all three contain a `Digest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -393,21 +1369,23 @@ pub enum ModuleProvenanceError {
         module: ModuleId,
         contribution_index: usize,
     },
-    EntryIndexMismatch {
-        module: ModuleId,
-        contribution_index: usize,
-        entry_index: usize,
-        expected: u64,
-        actual: u64,
-    },
     EntryRangeOverflow {
         module: ModuleId,
         contribution_index: usize,
     },
-    ExtensionKnowledgeMismatch {
+    PayloadTransparencyMismatch {
         module: ModuleId,
-        expected: ExtensionKnowledge,
-        actual: ExtensionKnowledge,
+        expected: PayloadTransparency,
+        actual: PayloadTransparency,
+    },
+    /// A record claims its contributions were not captured while carrying some. The
+    /// axes are independent, but each still has to describe the same record.
+    CaptureStatusContradicted {
+        module: ModuleId,
+        capture: CaptureStatus,
+        declarations: usize,
+        extra_declarations: usize,
+        extension_contributions: usize,
     },
     MissingDependenciesMismatch {
         module: ModuleId,
@@ -420,11 +1398,25 @@ pub enum ModuleProvenanceError {
         limit: u128,
         actual: u128,
     },
+    /// A layer below reported an outcome this construction path cannot request.
+    /// An invariant failure, never a verdict about a module (FL-INV-07).
+    GraphAdmissionFault {
+        what: &'static str,
+    },
     Canonical(CanonError),
     MalformedEncoding {
         what: &'static str,
     },
     NonCanonicalEncoding,
+    /// An inconsistency inside already-validated state. This is an invariant failure,
+    /// never a verdict about a module and never a diagnostic a user caused: the same
+    /// shape arriving from outside is an [`IdentityVerdict::Collision`] instead
+    /// (FL-INV-07 — inconclusive and faulted outcomes are not rejections).
+    InternalFault {
+        what: &'static str,
+        held: ModuleProvenanceRoot,
+        recomputed: ModuleProvenanceRoot,
+    },
 }
 
 impl std::fmt::Display for ModuleProvenanceError {
@@ -488,17 +1480,6 @@ impl std::fmt::Display for ModuleProvenanceError {
                 "module `{}` extension contribution {contribution_index} is empty",
                 module.name().to_display_string()
             ),
-            Self::EntryIndexMismatch {
-                module,
-                contribution_index,
-                entry_index,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "module `{}` extension contribution {contribution_index} entry {entry_index} has index {actual}, expected {expected}",
-                module.name().to_display_string()
-            ),
             Self::EntryRangeOverflow {
                 module,
                 contribution_index,
@@ -507,13 +1488,24 @@ impl std::fmt::Display for ModuleProvenanceError {
                 "module `{}` extension contribution {contribution_index} range overflows u64",
                 module.name().to_display_string()
             ),
-            Self::ExtensionKnowledgeMismatch {
+            Self::CaptureStatusContradicted {
+                module,
+                capture,
+                declarations,
+                extra_declarations,
+                extension_contributions,
+            } => write!(
+                formatter,
+                "module `{}` claims capture {capture:?} while carrying {declarations} declaration(s), {extra_declarations} extra declaration(s), and {extension_contributions} extension contribution(s)",
+                module.name().to_display_string()
+            ),
+            Self::PayloadTransparencyMismatch {
                 module,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "module `{}` extension knowledge mismatch: expected {expected:?}, actual {actual:?}",
+                "module `{}` payload transparency mismatch: expected {expected:?}, actual {actual:?}",
                 module.name().to_display_string()
             ),
             Self::MissingDependenciesMismatch {
@@ -525,6 +1517,9 @@ impl std::fmt::Display for ModuleProvenanceError {
                 "module `{}` missing-dependency mismatch: expected {expected:?}, actual {actual:?}",
                 module.name().to_display_string()
             ),
+            Self::GraphAdmissionFault { what } => {
+                write!(formatter, "module-provenance internal fault: {what}")
+            }
             Self::ResourceLimitExceeded {
                 module,
                 resource,
@@ -542,6 +1537,14 @@ impl std::fmt::Display for ModuleProvenanceError {
             Self::MalformedEncoding { what } => {
                 write!(formatter, "malformed module-provenance encoding: {what}")
             }
+            Self::InternalFault {
+                what,
+                held,
+                recomputed,
+            } => write!(
+                formatter,
+                "module-provenance internal fault: {what} (held {held}, recomputed {recomputed})"
+            ),
             Self::NonCanonicalEncoding => {
                 formatter.write_str("module-provenance bytes are not canonical")
             }
@@ -603,13 +1606,117 @@ impl ModuleProvenanceManifest {
             limits.max_name_depth,
             u128::MAX,
         );
-        let mut graph = ModuleGraph::new(epoch.clone(), graph_limits)
-            .map_err(ModuleProvenanceError::InvalidModuleGraph)?;
+        // Construction splits the same way registration does: a malformed epoch is a
+        // rejection, a bound payload budget is inconclusive. This path sets the
+        // graph's payload budget to `u128::MAX`, so only the rejection arm is
+        // reachable — but it is matched explicitly rather than assumed away.
+        let (construction, construction_stop) =
+            ModuleGraph::new(epoch.clone(), graph_limits).into_parts();
+        let mut graph = match construction {
+            Outcome::Complete(Ok(graph)) => graph,
+            Outcome::Complete(Err(error)) => {
+                return Err(ModuleProvenanceError::InvalidModuleGraph(error));
+            }
+            // Our own invariant broke below us. Not a verdict about the manifest, and never
+            // a user diagnostic (FL-INV-07).
+            Outcome::InternalFault(_) => {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: "module-graph construction reported an internal fault",
+                });
+            }
+            Outcome::Inconclusive(_) => {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: match construction_stop {
+                        Some(ModuleGraphStop::Resource { .. }) => {
+                            "module-graph construction bound a budget this path sets to u128::MAX"
+                        }
+                        Some(ModuleGraphStop::Cancelled { .. }) => {
+                            "module-graph construction reported cancellation without a request"
+                        }
+                        // Construction decides and publishes in one step; there is no
+                        // plan to supersede. Reaching this is an invariant failure of
+                        // the layer below, not a verdict about the manifest.
+                        Some(ModuleGraphStop::PlanSuperseded { .. }) => {
+                            "module-graph construction reported a superseded plan it never prepared"
+                        }
+                        None => "module-graph construction stopped without naming a stop",
+                    },
+                });
+            }
+        };
         for record in &records {
-            graph = graph
-                .register(record.module.clone())
-                .map_err(ModuleProvenanceError::InvalidModuleGraph)?
-                .graph;
+            // The three arms are kept apart deliberately. A rejection is a real
+            // determination about the record; an exhausted budget is not, and folding
+            // it into `InvalidModuleGraph` would report "this graph is invalid" for
+            // what is only "we ran out of room" (FL-INV-07, bead
+            // franken_lean-module-graph-resource-outcomes-46b).
+            let (admission, stop) = graph.register(record.module.clone()).into_parts();
+            graph = match admission {
+                Outcome::Complete(Ok(registration)) => registration.graph,
+                Outcome::Complete(Err(error)) => {
+                    return Err(ModuleProvenanceError::InvalidModuleGraph(error));
+                }
+                Outcome::InternalFault(_) => {
+                    return Err(ModuleProvenanceError::GraphAdmissionFault {
+                        what: "module-graph registration reported an internal fault",
+                    });
+                }
+                Outcome::Inconclusive(inconclusive) => match stop {
+                    Some(ModuleGraphStop::Resource { module, resource }) => {
+                        // The numbers moved onto the shared usage when this seam folded
+                        // onto the FL-INV-07 algebra (bead `fln-um4a`): one fact, one
+                        // home. A resource stop whose authority is not a resource
+                        // exhaustion is our own inconsistency, not a verdict about the
+                        // manifest — so it is refused typed rather than assumed away.
+                        let InconclusiveCause::ResourceExhausted { usage } = inconclusive.cause
+                        else {
+                            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                                what: "module-graph registration reported a resource stop whose \
+                                       outcome was not a resource exhaustion",
+                            });
+                        };
+                        return Err(ModuleProvenanceError::ResourceLimitExceeded {
+                            module,
+                            resource: match resource {
+                                ModuleGraphResource::Modules => ModuleProvenanceResource::Modules,
+                                ModuleGraphResource::DirectImportRows => {
+                                    ModuleProvenanceResource::DirectImportRows
+                                }
+                                ModuleGraphResource::NameDepth => {
+                                    ModuleProvenanceResource::NameDepth
+                                }
+                                // Unreachable here: this path sets the graph's payload
+                                // budget to `u128::MAX`, so only the three above can bind.
+                                ModuleGraphResource::PayloadBytes => {
+                                    ModuleProvenanceResource::EncodedBytes
+                                }
+                            },
+                            limit: u128::from(usage.allowed),
+                            actual: u128::from(usage.observed),
+                        });
+                    }
+                    Some(ModuleGraphStop::Cancelled { .. }) => {
+                        // This path requests no cancellation, so a cancelled outcome is an
+                        // invariant failure of the layer below — never a verdict about the
+                        // module, and never a user-facing diagnostic.
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration reported cancellation without a request",
+                        });
+                    }
+                    Some(ModuleGraphStop::PlanSuperseded { .. }) => {
+                        // Same class: this path registers directly against a graph it
+                        // holds exclusively, so nothing can supersede a plan under it.
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration reported a superseded plan under exclusive ownership",
+                        });
+                    }
+                    None => {
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "module-graph registration stopped without naming a stop",
+                        });
+                    }
+                },
+            };
         }
 
         let present: BTreeSet<ModuleId> = records
@@ -678,6 +1785,46 @@ impl ModuleProvenanceManifest {
         encode_manifest(&self.epoch, &self.records)
     }
 
+    /// Classify an **untrusted** candidate against this manifest.
+    ///
+    /// Equality is decided by the exact canonical value; the root is only the fast
+    /// inequality check that lets the common case skip the comparison. A candidate that
+    /// shares this manifest's root but not its bytes yields
+    /// [`IdentityVerdict::Collision`] — reported for atomic application to adjudicate,
+    /// never silently resolved in either direction.
+    ///
+    /// Both arguments here are validated manifests, so the collision arm is unreachable
+    /// in practice; [`classify_identity`] is the seam where a bounded model can exercise
+    /// it without claiming a real collision.
+    pub fn classify_candidate(&self, candidate: &ModuleProvenanceManifest) -> IdentityVerdict {
+        classify_identity(
+            (self.root, &self.to_canonical_bytes()),
+            (candidate.root(), &candidate.to_canonical_bytes()),
+        )
+    }
+
+    /// Re-derive this manifest's root from its own records and confirm it still matches.
+    ///
+    /// The same equal-digest/unequal-value inconsistency means two different things
+    /// depending on where it is found. Arriving from outside it is an
+    /// [`IdentityVerdict::Collision`] — untrusted input, a normal thing to receive and
+    /// refuse. Found *inside* validated state it is an invariant failure: this manifest
+    /// was checked at construction, so a disagreement now means the value or the
+    /// derivation was corrupted, and the typed answer is `InternalFault`, never a
+    /// verdict about the module (FL-INV-07).
+    pub fn verify_self_consistency(&self) -> Result<(), ModuleProvenanceError> {
+        let recomputed =
+            ModuleProvenanceRoot(hash(Domain::ModuleProvenance, &self.to_canonical_bytes()));
+        if recomputed == self.root {
+            return Ok(());
+        }
+        Err(ModuleProvenanceError::InternalFault {
+            what: "validated manifest root disagrees with its canonical value",
+            held: self.root,
+            recomputed,
+        })
+    }
+
     pub fn from_canonical_bytes(
         bytes: &[u8],
         limits: ModuleProvenanceLimits,
@@ -717,6 +1864,7 @@ impl ModuleProvenanceManifest {
         }
         reader.finish()?;
         let manifest = Self::new(epoch, records, limits)?;
+        // ubs:ignore — public canonical bytes, not authentication material.
         if manifest.to_canonical_bytes() != bytes {
             return Err(ModuleProvenanceError::NonCanonicalEncoding);
         }
@@ -764,20 +1912,49 @@ fn validate_contribution_record(
         facts.missing_dependencies as u128,
     )?;
 
-    let expected_knowledge = if record
+    // The transparency axis is recomputed from the descriptors rather than trusted, and
+    // it resolves to three states, not two: a module with both understood and opaque
+    // contributions is `Mixed`, which keeps the opaque boundary localized instead of
+    // condemning the module wholesale.
+    let opaque = record
         .extension_contributions
         .iter()
-        .any(|contribution| contribution.descriptor.provenance == PayloadProvenance::Opaque)
-    {
-        ExtensionKnowledge::ContainsOpaque
+        // ubs:ignore — public payload classification, not authentication material.
+        .filter(|contribution| contribution.descriptor.provenance == PayloadProvenance::Opaque)
+        .count();
+    let expected_transparency = if opaque == 0 {
+        PayloadTransparency::Understood
+    } else if opaque == record.extension_contributions.len() {
+        PayloadTransparency::Opaque
     } else {
-        ExtensionKnowledge::AllUnderstood
+        PayloadTransparency::Mixed
     };
-    if expected_knowledge != record.completeness.extension_knowledge {
-        return Err(ModuleProvenanceError::ExtensionKnowledgeMismatch {
+    // ubs:ignore — public provenance classification, not authentication material.
+    if expected_transparency != record.completeness.transparency {
+        return Err(ModuleProvenanceError::PayloadTransparencyMismatch {
             module: module.clone(),
-            expected: expected_knowledge,
-            actual: record.completeness.extension_knowledge,
+            expected: expected_transparency,
+            actual: record.completeness.transparency,
+        });
+    }
+
+    // Capture cannot be recomputed — whether the decoder obtained everything it should
+    // have is knowledge from outside the record. Exactly one cross-check is available
+    // and is therefore mandatory: a record cannot claim it captured nothing while
+    // carrying contributions. This is the only coupling between the axes, and it is a
+    // consistency obligation, not a collapse: it never lets one axis *derive* another.
+    // ubs:ignore — public capture classification, not authentication material.
+    if record.completeness.capture == CaptureStatus::Missing
+        && !(record.declarations.is_empty()
+            && record.extra_declarations.is_empty()
+            && record.extension_contributions.is_empty())
+    {
+        return Err(ModuleProvenanceError::CaptureStatusContradicted {
+            module: module.clone(),
+            capture: record.completeness.capture,
+            declarations: record.declarations.len(),
+            extra_declarations: record.extra_declarations.len(),
+            extension_contributions: record.extension_contributions.len(),
         });
     }
 
@@ -850,30 +2027,11 @@ fn validate_contribution_record(
                 contribution_index,
             });
         }
-        for (entry_index, entry) in contribution.entries.iter().enumerate() {
-            let entry_offset = u64::try_from(entry_index).map_err(|_| {
-                ModuleProvenanceError::EntryRangeOverflow {
-                    module: module.clone(),
-                    contribution_index,
-                }
-            })?;
-            let expected = contribution
-                .start
-                .checked_add(entry_offset)
-                .ok_or_else(|| ModuleProvenanceError::EntryRangeOverflow {
-                    module: module.clone(),
-                    contribution_index,
-                })?;
-            if entry.index != expected {
-                return Err(ModuleProvenanceError::EntryIndexMismatch {
-                    module: module.clone(),
-                    contribution_index,
-                    entry_index,
-                    expected,
-                    actual: entry.index,
-                });
-            }
-        }
+        // Source ordinal and target position are both derived from the array index and
+        // `start`, so neither can disagree with the range by construction — the
+        // `EntryIndexMismatch` this loop used to raise is unrepresentable now that no
+        // entry carries a journal coordinate of its own. `end()` above already proved
+        // the whole range fits, which is the only remaining arithmetic obligation.
         facts.extension_entries = facts
             .extension_entries
             .saturating_add(contribution.entries.len());
@@ -948,7 +2106,22 @@ fn encode_manifest(epoch: &ModuleEpoch, records: &[ModuleContributionRecord]) ->
     writer.into_bytes()
 }
 
+/// One record's canonical encoding, as the four families that partition it.
+///
+/// The families are not a second encoding: [`write_contribution_record`] is exactly
+/// these four in this order, so a family's bytes are literally the slice of the
+/// committed canonical bytes that family owns. `subdigests_partition_the_canonical_
+/// encoding_without_gap_or_overlap` asserts that with zero residue, which is what
+/// makes a subdigest a projection of the record rather than an opinion about it.
 fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
+    write_topology_family(record, writer);
+    write_artifact_family(record, writer);
+    write_contribution_family(record, writer);
+    write_completeness_family(record, writer);
+}
+
+/// Module identity and the import edges: who this module is and what it sees.
+fn write_topology_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     record.module.id.name().write_body(writer);
     writer.bool(record.module.is_module);
     writer.u64(record.module.direct_imports().len() as u64);
@@ -958,10 +2131,18 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
         writer.bool(import.is_exported);
         writer.bool(import.is_meta);
     }
+}
+
+/// The serialized artifact this record was read from: content digest, producer, grade.
+fn write_artifact_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     writer.bytes(&record.module.artifact.content_digest.0);
     writer.u8(artifact_producer_tag(record.module.artifact.producer));
     writer.u8(artifact_grade_tag(record.module.artifact.grade));
+}
 
+/// What the module contributed: declarations, generated declarations, and the
+/// extension entries with their descriptors and journal anchors.
+fn write_contribution_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
     writer.u64(record.declarations.len() as u64);
     for name in record.declarations.iter() {
         name.write_body(writer);
@@ -980,14 +2161,18 @@ fn write_contribution_record(record: &ModuleContributionRecord, writer: &mut Can
         writer.bytes(&contribution.base_history_digest.0);
         writer.u64(contribution.entries.len() as u64);
         for entry in contribution.entries.iter() {
-            writer.u64(entry.index);
-            writer.bytes(&entry.payload_digest.0);
+            // The occurrence's source ordinal is its position in this sequence and its
+            // target position is `start + ordinal`; writing either again would put a
+            // rebasable journal coordinate inside the entry identity.
+            writer.bytes(&entry.digest().0);
         }
     }
-    writer.u8(decode_completeness_tag(record.completeness.decode));
-    writer.u8(extension_knowledge_tag(
-        record.completeness.extension_knowledge,
-    ));
+}
+
+/// How much of the module was actually captured, and how legible its payloads are.
+fn write_completeness_family(record: &ModuleContributionRecord, writer: &mut CanonWriter) {
+    writer.u8(capture_status_tag(record.completeness.capture));
+    writer.u8(payload_transparency_tag(record.completeness.transparency));
     writer.u64(record.completeness.missing_dependencies.len() as u64);
     for module in record.completeness.missing_dependencies.iter() {
         module.name().write_body(writer);
@@ -1196,10 +2381,7 @@ fn read_contribution_record(
         )?;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            entries.push(ExtensionEntryIdentity::new(
-                reader.u64()?,
-                read_digest(reader)?,
-            ));
+            entries.push(ExtensionEntryId::from_digest(read_digest(reader)?));
         }
         contributions.push(ExtensionContribution::new(
             descriptor,
@@ -1209,8 +2391,8 @@ fn read_contribution_record(
         ));
     }
 
-    let decode = read_decode_completeness(reader.u8()?)?;
-    let extension_knowledge = read_extension_knowledge(reader.u8()?)?;
+    let capture = read_capture_status(reader.u8()?)?;
+    let transparency = read_payload_transparency(reader.u8()?)?;
     let missing_count = read_count(
         reader,
         ModuleProvenanceResource::MissingDependencies,
@@ -1230,7 +2412,7 @@ fn read_contribution_record(
         declarations,
         extra_declarations,
         contributions,
-        ProvenanceCompleteness::new(decode, extension_knowledge, missing),
+        ProvenanceCompleteness::new(capture, transparency, missing),
     ))
 }
 
@@ -1297,17 +2479,19 @@ fn payload_provenance_tag(value: PayloadProvenance) -> u8 {
     }
 }
 
-fn decode_completeness_tag(value: DecodeCompleteness) -> u8 {
+fn capture_status_tag(value: CaptureStatus) -> u8 {
     match value {
-        DecodeCompleteness::Complete => 0,
-        DecodeCompleteness::Partial => 1,
+        CaptureStatus::Complete => 0,
+        CaptureStatus::Partial => 1,
+        CaptureStatus::Missing => 2,
     }
 }
 
-fn extension_knowledge_tag(value: ExtensionKnowledge) -> u8 {
+fn payload_transparency_tag(value: PayloadTransparency) -> u8 {
     match value {
-        ExtensionKnowledge::AllUnderstood => 0,
-        ExtensionKnowledge::ContainsOpaque => 1,
+        PayloadTransparency::Understood => 0,
+        PayloadTransparency::Mixed => 1,
+        PayloadTransparency::Opaque => 2,
     }
 }
 
@@ -1363,23 +2547,627 @@ fn read_payload_provenance(tag: u8) -> Result<PayloadProvenance, ModuleProvenanc
     }
 }
 
-fn read_decode_completeness(tag: u8) -> Result<DecodeCompleteness, ModuleProvenanceError> {
+fn read_capture_status(tag: u8) -> Result<CaptureStatus, ModuleProvenanceError> {
     match tag {
-        0 => Ok(DecodeCompleteness::Complete),
-        1 => Ok(DecodeCompleteness::Partial),
+        0 => Ok(CaptureStatus::Complete),
+        1 => Ok(CaptureStatus::Partial),
+        2 => Ok(CaptureStatus::Missing),
         _ => Err(ModuleProvenanceError::MalformedEncoding {
-            what: "unknown decode completeness tag",
+            what: "unknown capture status tag",
         }),
     }
 }
 
-fn read_extension_knowledge(tag: u8) -> Result<ExtensionKnowledge, ModuleProvenanceError> {
+fn read_payload_transparency(tag: u8) -> Result<PayloadTransparency, ModuleProvenanceError> {
     match tag {
-        0 => Ok(ExtensionKnowledge::AllUnderstood),
-        1 => Ok(ExtensionKnowledge::ContainsOpaque),
+        0 => Ok(PayloadTransparency::Understood),
+        1 => Ok(PayloadTransparency::Mixed),
+        2 => Ok(PayloadTransparency::Opaque),
         _ => Err(ModuleProvenanceError::MalformedEncoding {
-            what: "unknown extension knowledge tag",
+            what: "unknown payload transparency tag",
         }),
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// The `.9.3` consumer handoff (bead `franken_lean-3ldh`).
+//
+// `franken_lean-module-provenance-atomic-apply-as7` is the consumer. What it needs is
+// not a description of this module but the set of statements it must implement
+// identically or knowingly diverge from — and, just as importantly, the statements
+// this schema does NOT make, so it cannot be relied on for durability it never
+// claimed. Same discipline as the V1 table: this is data joined against the code by
+// tests, not prose that can drift away from it.
+// ---------------------------------------------------------------------------------
+
+/// One handoff obligation: the thing being pinned, and the rule about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffRule {
+    pub subject: &'static str,
+    pub rule: &'static str,
+}
+
+/// Pinned vectors over the in-crate fixture named by
+/// [`ModuleProvenanceHandoff::vector_fixture`]. A consumer that reproduces these
+/// agrees with this implementation bit for bit; one that does not has found a real
+/// divergence, not a formatting difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffVectors {
+    pub root: &'static str,
+    pub canonical_bytes: usize,
+    pub topology_subdigest: &'static str,
+    pub artifact_subdigest: &'static str,
+    pub contribution_subdigest: &'static str,
+    pub completeness_subdigest: &'static str,
+}
+
+/// The versioned data contract handed to atomic import application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleProvenanceHandoff {
+    /// Version of *this handoff*, distinct from the schema version: the handoff can
+    /// gain obligations without the canonical layout moving.
+    pub handoff_version: u16,
+    pub schema: SchemaId,
+    pub root_domain_tag: &'static str,
+    pub vector_fixture: &'static str,
+    /// What an [`ExtensionEntryId`] is derived from, in order. Journal coordinates are
+    /// deliberately absent.
+    pub entry_identity_inputs: &'static [&'static str],
+    pub subdigest_tags: [(ProvenanceFamily, &'static str); 4],
+    pub ordinal_rules: &'static [HandoffRule],
+    pub completeness_rules: &'static [HandoffRule],
+    pub collision_outcomes: &'static [HandoffRule],
+    pub index_reconstruction: &'static [HandoffRule],
+    /// The W8 boundary: what this schema explicitly does *not* claim.
+    pub durability: &'static [HandoffRule],
+    pub vectors: HandoffVectors,
+}
+
+/// The published handoff. Every field is joined against the implementation by
+/// `handoff_states_the_contract_the_code_actually_implements`.
+pub const MODULE_PROVENANCE_HANDOFF: ModuleProvenanceHandoff = ModuleProvenanceHandoff {
+    handoff_version: 1,
+    schema: MODULE_PROVENANCE_SCHEMA,
+    root_domain_tag: Domain::ModuleProvenance.tag(),
+    vector_fixture: "fln_env::provenance::tests::sample_manifest",
+    entry_identity_inputs: &["module epoch", "extension descriptor", "payload bytes"],
+    subdigest_tags: [
+        (
+            ProvenanceFamily::Topology,
+            "fln.module-provenance.subdigest.topology/1",
+        ),
+        (
+            ProvenanceFamily::Artifact,
+            "fln.module-provenance.subdigest.artifact/1",
+        ),
+        (
+            ProvenanceFamily::Contribution,
+            "fln.module-provenance.subdigest.contribution/1",
+        ),
+        (
+            ProvenanceFamily::Completeness,
+            "fln.module-provenance.subdigest.completeness/1",
+        ),
+    ],
+    ordinal_rules: &[
+        HandoffRule {
+            subject: "source ordinal",
+            rule: "an occurrence's position within its contribution; module-local, u64, \
+                   never written into the entry identity",
+        },
+        HandoffRule {
+            subject: "target position",
+            rule: "contribution start + source ordinal; scoped to one committed root and \
+                   extension, and may differ after replay, restore, or merge — a \
+                   consumer must not persist it as an identity",
+        },
+        HandoffRule {
+            subject: "ordinal namespaces",
+            rule: "direct import, ordinary declaration, extra declaration, extension \
+                   source, and missing dependency are separate namespaces; an ordinary \
+                   and an extra declaration never share a coordinate",
+        },
+        HandoffRule {
+            subject: "record order",
+            rule: "records are canonicalized by module id at construction, so input \
+                   order never reaches the root; duplicate module ids are refused",
+        },
+    ],
+    completeness_rules: &[
+        HandoffRule {
+            subject: "capture",
+            rule: "knowledge from outside the record and never recomputed; the single \
+                   cross-check is that Missing cannot carry declarations or \
+                   contributions",
+        },
+        HandoffRule {
+            subject: "transparency",
+            rule: "RECOMPUTED from the contributions' descriptors and refused on \
+                   mismatch — a consumer must derive it, not trust it, and must expect \
+                   a descriptor change to move the completeness subdigest too",
+        },
+        HandoffRule {
+            subject: "authority",
+            rule: "derived from the capture and transparency axes on demand, never \
+                   stored and never written into the root",
+        },
+    ],
+    collision_outcomes: &[
+        HandoffRule {
+            subject: "Idempotent",
+            rule: "same root, same canonical bytes: safe to treat as the same object, \
+                   which is what makes re-import and cache hits idempotent",
+        },
+        HandoffRule {
+            subject: "Distinct",
+            rule: "different roots: unrelated objects, and the inequality is conclusive \
+                   because a hash never reports different for equal inputs",
+        },
+        HandoffRule {
+            subject: "Collision",
+            rule: "same root, different canonical bytes: REPORTED, never resolved. \
+                   Nothing here picks a winner, merges, or falls back to the digest; \
+                   atomic application adjudicates",
+        },
+    ],
+    index_reconstruction: &[
+        HandoffRule {
+            subject: "derivation",
+            rule: "indexes and subdigests are functions of the committed records alone; \
+                   deriving, holding, or dropping them cannot move the aggregate root",
+        },
+        HandoffRule {
+            subject: "bidirectional coverage",
+            rule: "the forward and reverse declaration indexes are exact inverses, and \
+                   the declaration class survives the projection",
+        },
+        HandoffRule {
+            subject: "count conservation",
+            rule: "indexed modules, declarations, and entry occurrences equal the \
+                   manifest's own facts exactly — the check re-derivation cannot supply",
+        },
+        HandoffRule {
+            subject: "disagreement",
+            rule: "a projection that disagrees with the records is InternalFault or \
+                   GraphAdmissionFault (FL-INV-07), never a verdict about a module and \
+                   never a second opinion to reconcile",
+        },
+    ],
+    durability: &[
+        HandoffRule {
+            subject: "in-memory only",
+            rule: "this schema claims NO durability: not for the Arc-backed records, \
+                   not for derived indexes, not for snapshots",
+        },
+        HandoffRule {
+            subject: "restart and crash recovery",
+            rule: "no restart, replay, or crash-recovery guarantee is made or implied; \
+                   W8 (Ledger records + CAS) owns durable persistence and is where such \
+                   a claim must be earned",
+        },
+        HandoffRule {
+            subject: "persisted projections",
+            rule: "an index may be persisted only as a rebuildable cache; on reload it \
+                   must verify against the records, and disagreement is a fault rather \
+                   than a recovery input",
+        },
+    ],
+    vectors: HandoffVectors {
+        root: "9af861837929fcff05062054d8a328377d5bfd2bf55a23ab7b3009dc5067146f",
+        canonical_bytes: 669,
+        topology_subdigest: "c2679e114320013741ba040984bdf84a9fad0f9ec522b745b2e27e821d249d51",
+        artifact_subdigest: "59051e7c3b04086c6198b9746bf802bc28bb9cbc6246ae6cd993430ded92d7f0",
+        contribution_subdigest: "0def00f2db2e504fe8cfceb546f6ca2f29e70c6bae46727b1dcf892252054394",
+        completeness_subdigest: "52b394d44ec197612404654f23214fa2a0980af6ae52898b67677e23b07d9e1c",
+    },
+};
+
+/// The four families that partition a record's canonical encoding.
+///
+/// Order is the order they appear in [`write_contribution_record`], and that is not a
+/// coincidence to be maintained by hand: the partition test rebuilds the canonical
+/// bytes from these four and requires zero residue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProvenanceFamily {
+    /// Module identity and import edges.
+    Topology,
+    /// The serialized artifact the record was read from.
+    Artifact,
+    /// Declarations, generated declarations, and extension entries.
+    Contribution,
+    /// Capture status, payload transparency, and missing dependencies.
+    Completeness,
+}
+
+impl ProvenanceFamily {
+    /// Every family, in canonical (encoding) order.
+    pub const ALL: [ProvenanceFamily; 4] = [
+        Self::Topology,
+        Self::Artifact,
+        Self::Contribution,
+        Self::Completeness,
+    ];
+
+    /// Domain-separation tag. Distinct per family so that two families whose bytes
+    /// happen to coincide cannot produce the same subdigest, and versioned so a
+    /// layout change cannot silently reuse a published value.
+    const fn tag(self) -> &'static [u8] {
+        match self {
+            Self::Topology => b"fln.module-provenance.subdigest.topology/1",
+            Self::Artifact => b"fln.module-provenance.subdigest.artifact/1",
+            Self::Contribution => b"fln.module-provenance.subdigest.contribution/1",
+            Self::Completeness => b"fln.module-provenance.subdigest.completeness/1",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Topology => 0,
+            Self::Artifact => 1,
+            Self::Contribution => 2,
+            Self::Completeness => 3,
+        }
+    }
+
+    /// Write this family's slice of one record. Dispatches to the very functions
+    /// [`write_contribution_record`] calls, so there is no second encoder to drift.
+    fn write(self, record: &ModuleContributionRecord, writer: &mut CanonWriter) {
+        match self {
+            Self::Topology => write_topology_family(record, writer),
+            Self::Artifact => write_artifact_family(record, writer),
+            Self::Contribution => write_contribution_family(record, writer),
+            Self::Completeness => write_completeness_family(record, writer),
+        }
+    }
+
+    const fn disagreement(self) -> &'static str {
+        match self {
+            Self::Topology => "topology subdigest disagrees with the committed records",
+            Self::Artifact => "artifact subdigest disagrees with the committed records",
+            Self::Contribution => "contribution subdigest disagrees with the committed records",
+            Self::Completeness => "completeness subdigest disagrees with the committed records",
+        }
+    }
+}
+
+/// Named per-family digests, for diagnosis only.
+///
+/// **These are projections, not identities.** [`ModuleProvenanceRoot`] is computed
+/// from the canonical bytes and never from these values; deriving, holding, or
+/// dropping subdigests cannot move it. Their purpose is to answer *which family
+/// changed* when two manifests disagree — a question the aggregate root deliberately
+/// cannot answer, because one root over everything is what makes it an identity.
+///
+/// They are typed as [`Digest`] and never as [`ModuleProvenanceRoot`], and no
+/// constructor here produces a root. A subdigest is therefore not a thing that can be
+/// passed where an identity is expected, which is the structural half of "never
+/// authoritative"; the tested half is that none of them equals the root and that
+/// tampering with one is a fault rather than a second opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleProvenanceSubdigests {
+    /// Indexed by [`ProvenanceFamily::index`].
+    digests: [Digest; 4],
+    /// The aggregate root these were derived from. A back reference, never an
+    /// identity of its own.
+    derived_from: ModuleProvenanceRoot,
+}
+
+impl ModuleProvenanceSubdigests {
+    /// Derive one digest per family from the manifest's committed records.
+    pub fn derive(manifest: &ModuleProvenanceManifest) -> Self {
+        let records = manifest.records();
+        Self {
+            digests: ProvenanceFamily::ALL.map(|family| family_subdigest(family, records)),
+            derived_from: manifest.root(),
+        }
+    }
+
+    /// This family's digest.
+    pub fn of(&self, family: ProvenanceFamily) -> Digest {
+        self.digests[family.index()]
+    }
+
+    /// The aggregate root these were derived from.
+    pub fn derived_from(&self) -> ModuleProvenanceRoot {
+        self.derived_from
+    }
+
+    /// Re-derive and confirm every family still agrees with the committed records.
+    ///
+    /// Names the family that disagrees, because the whole point of the subdigests is
+    /// to localize a disagreement the root can only report as "different".
+    pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        // ubs:ignore — public content-integrity root, not authentication material.
+        if self.derived_from != manifest.root() {
+            return Err(ModuleProvenanceError::InternalFault {
+                what: "subdigest projection was derived from a different committed root",
+                held: self.derived_from,
+                recomputed: manifest.root(),
+            });
+        }
+        let rebuilt = Self::derive(manifest);
+        for family in ProvenanceFamily::ALL {
+            if rebuilt.of(family) != self.of(family) {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: family.disagreement(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Hash one family's slice across every record.
+///
+/// The record count is bound first so that a family whose per-record bytes are empty
+/// (an artifact-only manifest, say) still distinguishes two records from three, and
+/// the byte length is bound before the bytes so no two family encodings can be
+/// concatenation-confused.
+fn family_subdigest(family: ProvenanceFamily, records: &[ModuleContributionRecord]) -> Digest {
+    let mut writer = CanonWriter::new();
+    writer.u64(records.len() as u64);
+    for record in records {
+        family.write(record, &mut writer);
+    }
+    let bytes = writer.into_bytes();
+    let mut hasher = DomainHasher::new(Domain::ModuleProvenance);
+    hasher.update(family.tag());
+    hasher.update(&[0]);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    hasher.finalize()
+}
+
+/// Where one extension entry occurrence lives: the contributing module, its
+/// contribution index, and the module-local source ordinal within that contribution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryOccurrence {
+    pub module: ModuleId,
+    pub contribution_index: usize,
+    pub source_ordinal: u64,
+}
+
+/// Derived forward and reverse indexes over a validated manifest.
+///
+/// **These are projections, not truth.** The manifest's records are the committed
+/// state and [`ModuleProvenanceRoot`] is the sole authoritative aggregate identity.
+/// An index is a rebuildable cache: it carries the root it was derived from so it can
+/// be checked against the records, and it never contributes to that root. Persisting
+/// one and later disagreeing with the records is an invariant failure, not a second
+/// opinion — [`verify`](Self::verify) reports that as `InternalFault`.
+///
+/// Index layout, ordering, and sharing are deliberately outside the canonical bytes:
+/// building, dropping, or rebuilding indexes cannot move the aggregate root, and a
+/// test asserts exactly that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleProvenanceIndexes {
+    /// Reverse: declaration name -> its owning module and contribution class.
+    owners: BTreeMap<Name, (ModuleId, DeclarationClass)>,
+    /// Forward: module -> the declaration names it owns, in canonical order.
+    declarations_by_module: BTreeMap<ModuleId, Vec<Name>>,
+    /// Reverse: entry identity -> every occurrence of it, canonically ordered.
+    entry_occurrences: BTreeMap<ExtensionEntryId, Vec<EntryOccurrence>>,
+    /// The aggregate root these projections were derived from. Carried for checking,
+    /// never as an identity of its own.
+    derived_from: ModuleProvenanceRoot,
+}
+
+impl ModuleProvenanceIndexes {
+    /// Derive both indexes from the manifest's primary records.
+    ///
+    /// Deterministic and total: every input row lands in both directions, so a
+    /// rebuild from the same records is byte-for-byte the same projection.
+    ///
+    /// Fallible on purpose. A projection that quietly drops a row it could not
+    /// place would still re-derive *identically* — both sides would skip the same
+    /// row — so silence here is unfalsifiable. Every refusal is a
+    /// [`GraphAdmissionFault`](ModuleProvenanceError::GraphAdmissionFault) about
+    /// validated state disagreeing with itself, never a verdict about a module.
+    pub fn derive(manifest: &ModuleProvenanceManifest) -> Result<Self, ModuleProvenanceError> {
+        let mut owners = BTreeMap::new();
+        let mut declarations_by_module = BTreeMap::new();
+        let mut entry_occurrences: BTreeMap<ExtensionEntryId, Vec<EntryOccurrence>> =
+            BTreeMap::new();
+        for record in manifest.records() {
+            let module = record.module().id.clone();
+            let mut owned =
+                Vec::with_capacity(record.declarations().len() + record.extra_declarations().len());
+            for (class, names) in [
+                (DeclarationClass::Declaration, record.declarations()),
+                (
+                    DeclarationClass::ExtraDeclaration,
+                    record.extra_declarations(),
+                ),
+            ] {
+                for name in names {
+                    owners.insert(name.clone(), (module.clone(), class));
+                    owned.push(name.clone());
+                }
+            }
+            owned.sort();
+            declarations_by_module.insert(module.clone(), owned);
+            for (contribution_index, contribution) in
+                record.extension_contributions().iter().enumerate()
+            {
+                for (offset, entry) in contribution.entries().iter().enumerate() {
+                    // In range by construction, so `None` here means the committed
+                    // record cannot address a row it committed. Skipping it would
+                    // hide the hole from re-derivation; refusing surfaces it.
+                    let source_ordinal = contribution.source_ordinal(offset).ok_or(
+                        ModuleProvenanceError::GraphAdmissionFault {
+                            what: "validated contribution cannot supply a source ordinal for a row it committed",
+                        },
+                    )?;
+                    entry_occurrences
+                        .entry(*entry)
+                        .or_default()
+                        .push(EntryOccurrence {
+                            module: module.clone(),
+                            contribution_index,
+                            source_ordinal,
+                        });
+                }
+            }
+        }
+        for occurrences in entry_occurrences.values_mut() {
+            occurrences.sort();
+        }
+        let indexes = Self {
+            owners,
+            declarations_by_module,
+            entry_occurrences,
+            derived_from: manifest.root(),
+        };
+        indexes.check_coverage(&manifest.facts())?;
+        Ok(indexes)
+    }
+
+    /// Count conservation against the facts the manifest computed when it validated.
+    ///
+    /// This is the half that re-derivation cannot supply. Comparing a projection to a
+    /// rebuild of itself proves only that the same code twice agrees with itself; a
+    /// systematic hole — a row class the loop never visits, a name silently
+    /// overwritten by a later one — survives that comparison intact. `facts` is
+    /// counted by the validator over the same records without consulting this loop,
+    /// so joining against it is an independent statement.
+    ///
+    /// Every equality below is exact, in the shape of the project's other
+    /// conservation law (`checked + artifact_incomplete == decls_total`): a validated
+    /// manifest admits no duplicate module id and no duplicate declaration name, in a
+    /// module or across modules, so each committed row must appear exactly once.
+    fn check_coverage(&self, facts: &ModuleProvenanceFacts) -> Result<(), ModuleProvenanceError> {
+        if self.declarations_by_module.len() != facts.modules {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not carry exactly the manifest's modules",
+            });
+        }
+        let expected_declarations = facts
+            .declarations
+            .checked_add(facts.extra_declarations)
+            .ok_or(ModuleProvenanceError::GraphAdmissionFault {
+                what: "manifest declaration counts overflow their own total",
+            })?;
+        let indexed: usize = self
+            .declarations_by_module
+            .values()
+            .map(|names| names.len())
+            .sum();
+        if indexed != expected_declarations {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not cover exactly the manifest's declarations",
+            });
+        }
+        // Distinct from the forward count: `owners` is keyed by name, so a duplicate
+        // that slipped past validation would be absorbed by last-writer-wins here and
+        // nowhere else. Equality is what makes that absorption impossible.
+        if self.owners.len() != expected_declarations {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            });
+        }
+        let occurrences: usize = self
+            .entry_occurrences
+            .values()
+            .map(|occurrences| occurrences.len())
+            .sum();
+        if occurrences != facts.extension_entries {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence index does not cover exactly the manifest's entries",
+            });
+        }
+        Ok(())
+    }
+
+    /// The aggregate root these projections were derived from. This is a *back
+    /// reference*, not an identity: two different index layouts over the same records
+    /// report the same value because the records decide it.
+    pub fn derived_from(&self) -> ModuleProvenanceRoot {
+        self.derived_from
+    }
+
+    /// Reverse query: which module owns this declaration, and in which class.
+    pub fn owner_of(&self, name: &Name) -> Option<&(ModuleId, DeclarationClass)> {
+        self.owners.get(name)
+    }
+
+    /// Forward query: the declarations this module owns, canonically ordered.
+    pub fn declarations_of(&self, module: &ModuleId) -> Option<&[Name]> {
+        self.declarations_by_module
+            .get(module)
+            .map(|names| names.as_slice())
+    }
+
+    /// Reverse query: every occurrence of one entry identity.
+    pub fn occurrences_of(&self, entry: &ExtensionEntryId) -> Option<&[EntryOccurrence]> {
+        self.entry_occurrences
+            .get(entry)
+            .map(|occurrences| occurrences.as_slice())
+    }
+
+    /// Re-derive from `manifest` and confirm this projection still agrees with it.
+    ///
+    /// Any disagreement — a stale root, a missing row, an extra row, or a
+    /// contradictory one — is an [`InternalFault`](ModuleProvenanceError::InternalFault)
+    /// or a [`GraphAdmissionFault`](ModuleProvenanceError::GraphAdmissionFault),
+    /// never a verdict about a module. Validated state that disagrees with itself is
+    /// an invariant failure by definition (FL-INV-07).
+    pub fn verify(&self, manifest: &ModuleProvenanceManifest) -> Result<(), ModuleProvenanceError> {
+        // ubs:ignore — public content-integrity root, not authentication material.
+        if self.derived_from != manifest.root() {
+            return Err(ModuleProvenanceError::InternalFault {
+                what: "index projection was derived from a different committed root",
+                held: self.derived_from,
+                recomputed: manifest.root(),
+            });
+        }
+        // Coverage first, on `self`: it is the check that does not depend on the
+        // rebuild agreeing, so it stays meaningful even if `derive` is the thing at
+        // fault.
+        self.check_coverage(&manifest.facts())?;
+        let rebuilt = Self::derive(manifest)?;
+        if rebuilt.owners != self.owners {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "declaration-owner projection disagrees with the committed records",
+            });
+        }
+        if rebuilt.declarations_by_module != self.declarations_by_module {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward declaration projection disagrees with the committed records",
+            });
+        }
+        if rebuilt.entry_occurrences != self.entry_occurrences {
+            return Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence projection disagrees with the committed records",
+            });
+        }
+        // Bidirectional coverage: the forward and reverse declaration indexes must be
+        // exact inverses. A one-way index is how a projection quietly becomes a second
+        // source of truth.
+        for (name, (module, _)) in &self.owners {
+            let owned =
+                self.declarations_of(module)
+                    .ok_or(ModuleProvenanceError::GraphAdmissionFault {
+                        what: "reverse index names a module the forward index does not carry",
+                    })?;
+            if !owned.contains(name) {
+                return Err(ModuleProvenanceError::GraphAdmissionFault {
+                    what: "reverse index maps a declaration to a module that does not own it",
+                });
+            }
+        }
+        for (module, names) in &self.declarations_by_module {
+            for name in names {
+                match self.owner_of(name) {
+                    Some((owner, _)) if owner == module => {}
+                    _ => {
+                        return Err(ModuleProvenanceError::GraphAdmissionFault {
+                            what: "forward index owns a declaration the reverse index does not",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1388,6 +3176,12 @@ mod tests {
     use super::*;
     use fln_core::options::KVMap;
     use fln_hash::domain::hash;
+
+    macro_rules! fixture_panic {
+        ($($arg:tt)*) => {
+            panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+        };
+    }
 
     const PIN_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const TEST_LIMITS: ModuleProvenanceLimits = ModuleProvenanceLimits::new(
@@ -1434,8 +3228,20 @@ mod tests {
         }
     }
 
-    fn entry(index: u64, seed: u8) -> ExtensionEntryIdentity {
-        ExtensionEntryIdentity::new(index, hash(Domain::Fixture, &[seed]))
+    /// Fixture entries are derived exactly as production entries are — from the epoch,
+    /// the descriptor, and raw payload bytes. No test may assert an id it fabricated,
+    /// or the derivation law would be tested against itself.
+    fn entry_for(descriptor: &ExtensionDescriptor, payload: &[u8]) -> ExtensionEntryId {
+        ExtensionEntryId::derive(&epoch(), descriptor, payload)
+    }
+
+    /// The common case: an entry under the `simpExt`/Understood descriptor that
+    /// `sample_records` uses.
+    fn entry(seed: u8) -> ExtensionEntryId {
+        entry_for(
+            &extension_descriptor("simpExt", PayloadProvenance::Understood),
+            &[seed],
+        )
     }
 
     fn sample_records() -> Vec<ModuleContributionRecord> {
@@ -1452,7 +3258,7 @@ mod tests {
             extension_descriptor("simpExt", PayloadProvenance::Understood),
             7,
             Digest([0x31; 32]),
-            vec![entry(7, 0x41), entry(8, 0x42)],
+            vec![entry(0x41), entry(0x42)],
         );
         let a = ModuleContributionRecord::new(
             module_a,
@@ -1460,8 +3266,8 @@ mod tests {
             vec![name("A.generated")],
             vec![contribution],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![id("Ghost")],
             ),
         );
@@ -1471,8 +3277,8 @@ mod tests {
             vec![],
             vec![],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![],
             ),
         );
@@ -1501,7 +3307,11 @@ mod tests {
     fn domain_registry_covers_operational_and_module_provenance_domains() {
         assert!(Domain::ALL.contains(&Domain::OperationalMeta));
         assert!(Domain::ALL.contains(&Domain::ModuleProvenance));
-        assert_eq!(Domain::ALL.len(), 15);
+        assert!(Domain::ALL.contains(&Domain::ShadowSemantic));
+        assert!(Domain::ALL.contains(&Domain::ShadowTelemetry));
+        assert!(Domain::ALL.contains(&Domain::ShadowPublication));
+        assert!(Domain::ALL.contains(&Domain::ShadowSampling));
+        assert_eq!(Domain::ALL.len(), 16);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")
@@ -1552,18 +3362,23 @@ mod tests {
                 Ok(value)
             );
         }
-        for value in [DecodeCompleteness::Complete, DecodeCompleteness::Partial] {
-            assert_eq!(
-                read_decode_completeness(decode_completeness_tag(value)),
-                Ok(value)
-            );
+        // Every variant of both axes round-trips, including the two states added when
+        // the axes were separated: an axis whose new variant had no tag would be an
+        // "omit a completeness axis" mutant that only shows up on real data.
+        for value in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            assert_eq!(read_capture_status(capture_status_tag(value)), Ok(value));
         }
         for value in [
-            ExtensionKnowledge::AllUnderstood,
-            ExtensionKnowledge::ContainsOpaque,
+            PayloadTransparency::Understood,
+            PayloadTransparency::Mixed,
+            PayloadTransparency::Opaque,
         ] {
             assert_eq!(
-                read_extension_knowledge(extension_knowledge_tag(value)),
+                read_payload_transparency(payload_transparency_tag(value)),
                 Ok(value)
             );
         }
@@ -1574,8 +3389,8 @@ mod tests {
             read_merge_semantics(u8::MAX).expect_err("unknown merge policy is refused"),
             read_checkpoint_semantics(u8::MAX).expect_err("unknown checkpoint policy is refused"),
             read_payload_provenance(u8::MAX).expect_err("unknown provenance is refused"),
-            read_decode_completeness(u8::MAX).expect_err("unknown completeness is refused"),
-            read_extension_knowledge(u8::MAX).expect_err("unknown knowledge grade is refused"),
+            read_capture_status(u8::MAX).expect_err("unknown completeness is refused"),
+            read_payload_transparency(u8::MAX).expect_err("unknown knowledge grade is refused"),
         ] {
             assert!(matches!(
                 error,
@@ -1595,10 +3410,12 @@ mod tests {
         assert_eq!(decoded.root(), manifest.root());
         assert_eq!(
             manifest.root().to_string(),
-            "8c0a18d29e8d4401615c33de39a516612aabe400cb9888088013c02ef8134b48",
+            "9af861837929fcff05062054d8a328377d5bfd2bf55a23ab7b3009dc5067146f",
             "schema/domain changes require an explicit golden update"
         );
-        assert_eq!(bytes.len(), 685, "canonical layout size is frozen");
+        // Re-pinned when per-entry journal ordinals left the encoding: each occurrence
+        // is now a bare content id, so the two sample entries shed one `u64` each.
+        assert_eq!(bytes.len(), 669, "canonical layout size is frozen");
         assert_eq!(
             manifest.facts(),
             ModuleProvenanceFacts {
@@ -1657,10 +3474,9 @@ mod tests {
         let mut contribution_reordered = sample_records();
         let contribution = &contribution_reordered[0].extension_contributions[0];
         let mut entries = contribution.entries().to_vec();
+        // Source order is the array order, so a swap is the whole mutation: no journal
+        // coordinate has to be rewritten to keep the applied range valid.
         entries.swap(0, 1);
-        // Preserve a valid contiguous range while reversing payload identities.
-        entries[0] = ExtensionEntryIdentity::new(7, entries[0].payload_digest());
-        entries[1] = ExtensionEntryIdentity::new(8, entries[1].payload_digest());
         contribution_reordered[0].extension_contributions = vec![ExtensionContribution::new(
             contribution.descriptor().clone(),
             contribution.start(),
@@ -1678,7 +3494,10 @@ mod tests {
             extension_descriptor("traceExt", PayloadProvenance::Understood),
             0,
             Digest([0x52; 32]),
-            vec![entry(0, 0x53)],
+            vec![entry_for(
+                &extension_descriptor("traceExt", PayloadProvenance::Understood),
+                &[0x53],
+            )],
         );
         let first = two_contributions[0].extension_contributions[0].clone();
         two_contributions[0].extension_contributions = vec![first.clone(), second.clone()].into();
@@ -1696,8 +3515,8 @@ mod tests {
         );
 
         let canonical_missing = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Lost"), id("Ghost"), id("Lost")],
         );
         assert_eq!(
@@ -1720,8 +3539,8 @@ mod tests {
             vec![],
             vec![],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Complete,
-                ExtensionKnowledge::AllUnderstood,
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
                 vec![id("B")],
             ),
         );
@@ -1755,8 +3574,8 @@ mod tests {
         let mut drop_extension = sample_records();
         drop_extension[0].extension_contributions = Arc::from([]);
         drop_extension[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let drop_extension = ModuleProvenanceManifest::new(epoch(), drop_extension, TEST_LIMITS)
@@ -1765,8 +3584,8 @@ mod tests {
 
         let mut drop_completeness = sample_records();
         drop_completeness[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Partial,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let drop_completeness =
@@ -1803,7 +3622,7 @@ mod tests {
         let mut entry_payload = sample_records();
         let contribution = &entry_payload[0].extension_contributions[0];
         let mut entries = contribution.entries().to_vec();
-        entries[1] = entry(8, 0x99);
+        entries[1] = entry(0x99);
         entry_payload[0].extension_contributions = vec![ExtensionContribution::new(
             contribution.descriptor().clone(),
             contribution.start(),
@@ -1840,7 +3659,12 @@ mod tests {
         let baseline_bytes = baseline.to_canonical_bytes();
         let baseline_root = baseline.root();
         let mut roots = BTreeSet::from([baseline_root]);
+        // Collected so the normative V1 table can be joined against what was actually
+        // witnessed: a table row claiming root participation with no observation is
+        // stale, and an observation with no row means the table is missing one.
+        let mut witnessed: BTreeSet<&'static str> = BTreeSet::new();
         let mut observe = |field: &'static str, variant_epoch: ModuleEpoch, records: Vec<_>| {
+            witnessed.insert(field);
             let candidate = ModuleProvenanceManifest::new(variant_epoch, records, TEST_LIMITS)
                 .expect("field variant remains structurally valid");
             let bytes = candidate.to_canonical_bytes();
@@ -1896,8 +3720,8 @@ mod tests {
             evidence(0xA1),
         );
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Phantom")],
         );
         observe("direct_import.module+missing_dependency", epoch(), records);
@@ -2001,11 +3825,11 @@ mod tests {
         )]
         .into();
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::ContainsOpaque,
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
             vec![id("Ghost")],
         );
-        observe("extension.provenance+extension_knowledge", epoch(), records);
+        observe("extension.provenance+transparency", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2013,10 +3837,12 @@ mod tests {
             original.descriptor().clone(),
             9,
             original.base_history_digest(),
-            vec![entry(9, 0x41), entry(10, 0x42)],
+            vec![entry(0x41), entry(0x42)],
         )]
         .into();
-        observe("extension.range_start+entry_ordinals", epoch(), records);
+        // Only the applied range start moves here: entry ordinals are positions in the
+        // source sequence now, not stored fields, so they cannot vary independently.
+        observe("extension.range_start", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2035,10 +3861,10 @@ mod tests {
             original.descriptor().clone(),
             original.start(),
             original.base_history_digest(),
-            vec![entry(7, 0x41), entry(8, 0x99)],
+            vec![entry(0x41), entry(0x99)],
         )]
         .into();
-        observe("extension.entry_payload_digest", epoch(), records);
+        observe("extension.entry_id", epoch(), records);
 
         let mut records = sample_records();
         let original = records[0].extension_contributions[0].clone();
@@ -2046,18 +3872,18 @@ mod tests {
             original.descriptor().clone(),
             original.start(),
             original.base_history_digest(),
-            vec![entry(7, 0x41), entry(8, 0x42), entry(9, 0x43)],
+            vec![entry(0x41), entry(0x42), entry(0x43)],
         )]
         .into();
         observe("extension.entry_count", epoch(), records);
 
         let mut records = sample_records();
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Partial,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
-        observe("completeness.decode", epoch(), records);
+        observe("completeness.capture", epoch(), records);
 
         let mut records = sample_records();
         records[0].module = ModuleRecord::new(
@@ -2071,13 +3897,972 @@ mod tests {
             evidence(0xA1),
         );
         records[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Lost"), id("Ghost")],
         );
         observe("completeness.missing_dependency_set", epoch(), records);
 
-        assert_eq!(roots.len(), 24, "baseline plus every field-family variant");
+        // One gap the normative V1 table exposed: transparency was only ever
+        // witnessed together with the descriptor's provenance, so it was never known
+        // to reach the root on its own. (The three import flags turned out to be
+        // witnessed already, by the loop above — the table's job is to make that
+        // checkable either way.)
+
+        let mut records = sample_records();
+        let contribution = records[0].extension_contributions[0].clone();
+        records[0].extension_contributions = vec![
+            contribution.clone(),
+            ExtensionContribution::new(
+                extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                0,
+                Digest([0x77; 32]),
+                vec![entry_for(
+                    &extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                    &[0x5A],
+                )],
+            ),
+        ]
+        .into();
+        records[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Mixed,
+            vec![id("Ghost")],
+        );
+        observe("completeness.transparency", epoch(), records);
+
+        assert_eq!(roots.len(), 25, "baseline plus every field-family variant");
+
+        // ---- the join: the table and the witnesses must agree exactly -----------
+        let claimed: BTreeSet<&'static str> = MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter_map(|row| row.sensitivity_witness)
+            .collect();
+        assert_eq!(
+            claimed.difference(&witnessed).copied().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "a V1 table row claims a sensitivity witness that was never observed (stale row)"
+        );
+        assert_eq!(
+            witnessed.difference(&claimed).copied().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "a field family was observed with no V1 table row (missing row)"
+        );
+    }
+
+    /// Canonical width of one `Name` body, measured rather than guessed.
+    fn name_body_len(name: &Name) -> usize {
+        let mut writer = CanonWriter::new();
+        name.write_body(&mut writer);
+        writer.into_bytes().len()
+    }
+
+    /// The V1 table is normative, so it must be well formed on its own terms:
+    /// unique tags, and every row classified on every axis the design requires.
+    /// An unclassified row is exactly as bad as a missing one — it looks specified.
+    #[test]
+    fn the_v1_table_has_unique_and_fully_classified_rows() {
+        let mut tags = BTreeSet::new();
+        for row in MODULE_PROVENANCE_V1_TABLE {
+            assert!(
+                tags.insert(row.tag),
+                "duplicate V1 table row for tag `{}`",
+                row.tag
+            );
+            for (column, value) in [
+                ("decoder_source", row.decoder_source),
+                ("value_type", row.value_type),
+                ("identity_inputs", row.identity_inputs),
+                ("malformed_outcome", row.malformed_outcome),
+            ] {
+                assert!(
+                    !value.is_empty(),
+                    "row `{}` leaves `{column}` unclassified",
+                    row.tag
+                );
+            }
+            // An ordinal namespace and an ordinal width are one fact in two halves;
+            // declaring either alone leaves the coordinate ambiguous.
+            assert_eq!(
+                row.ordinal_namespace != V1OrdinalNamespace::None,
+                row.ordinal_width_bits.is_some(),
+                "row `{}` declares an ordinal namespace without a width, or vice versa",
+                row.tag
+            );
+            // Ordered replay data and canonical sets must state a duplicate policy.
+            if matches!(
+                row.sequence_law,
+                V1SequenceLaw::OrderedSequence | V1SequenceLaw::CanonicalSet
+            ) {
+                assert_ne!(
+                    row.duplicate_policy,
+                    V1DuplicatePolicy::NotApplicable,
+                    "row `{}` is a sequence or set but declares no duplicate policy",
+                    row.tag
+                );
+            }
+            // Encoded rows must have a width; unencoded rows must not claim one.
+            let encoded = row.multiplicity != V1Multiplicity::NotEncoded;
+            assert_eq!(
+                encoded,
+                row.root_participation == V1RootParticipation::Direct,
+                "row `{}`: only directly-encoded rows may claim Direct root participation",
+                row.tag
+            );
+            if !encoded {
+                assert_eq!(
+                    row.width,
+                    V1Width::Fixed(0),
+                    "row `{}` is not encoded yet claims a width",
+                    row.tag
+                );
+            }
+        }
+        // The two deliberately-unencoded rows are the ones this schema reasons about
+        // most: the artifact epoch (pinned by validation) and the target journal
+        // position (derived, and excluded from entry identity on purpose).
+        let unencoded: Vec<_> = MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter(|row| row.multiplicity == V1Multiplicity::NotEncoded)
+            .map(|row| row.tag)
+            .collect();
+        assert_eq!(
+            unencoded,
+            vec!["artifact.epoch", "extension.target_position"],
+            "the set of deliberately-unencoded fields changed without a table update"
+        );
+    }
+
+    /// **Completeness, mechanically.** The table predicts the exact canonical byte
+    /// length of a manifest from its own rows plus that manifest's facts. If the
+    /// encoder writes a field the table does not list — or stops writing one it does
+    /// — the totals disagree. This is what makes "missing rows block closure"
+    /// enforceable instead of aspirational.
+    #[test]
+    fn the_v1_table_predicts_the_exact_canonical_byte_length() {
+        let manifest = sample_manifest();
+        let facts = manifest.facts();
+        let actual = manifest.to_canonical_bytes().len();
+
+        // Data-dependent widths are measured from the fixture; the table supplies
+        // which fields exist and how each is framed.
+        let sum_names = |names: Vec<&Name>| names.iter().map(|n| name_body_len(n)).sum::<usize>();
+        let module_ids: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .map(|r| r.module().id.name())
+            .collect();
+        let import_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.module().direct_imports().iter().map(|i| i.module.name()))
+            .collect();
+        let declaration_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.declarations().iter())
+            .collect();
+        let extra_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.extra_declarations().iter())
+            .collect();
+        let extension_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| {
+                r.extension_contributions()
+                    .iter()
+                    .map(|c| &c.descriptor().name)
+            })
+            .collect();
+        let missing_names: Vec<&Name> = manifest
+            .records()
+            .iter()
+            .flat_map(|r| r.completeness().missing_dependencies().iter())
+            .map(|m| m.name())
+            .collect();
+
+        let mut predicted = 0usize;
+        for row in MODULE_PROVENANCE_V1_TABLE {
+            let occurrences = match row.multiplicity {
+                V1Multiplicity::Once => 1,
+                V1Multiplicity::PerModule => facts.modules,
+                V1Multiplicity::PerDirectImportRow => facts.direct_import_rows,
+                V1Multiplicity::PerDeclaration => facts.declarations,
+                V1Multiplicity::PerExtraDeclaration => facts.extra_declarations,
+                V1Multiplicity::PerExtensionContribution => facts.extension_contributions,
+                V1Multiplicity::PerExtensionEntry => facts.extension_entries,
+                V1Multiplicity::PerMissingDependency => facts.missing_dependencies,
+                V1Multiplicity::NotEncoded => 0,
+            };
+            predicted += match (row.width, row.tag) {
+                (V1Width::Fixed(width), _) => width * occurrences,
+                (V1Width::LengthPrefixed(_), "epoch.tag") => 8 + manifest.epoch().tag().len(),
+                (V1Width::LengthPrefixed(_), "epoch.commit") => 8 + manifest.epoch().commit().len(),
+                (V1Width::LengthPrefixed(payload), _) => (8 + payload) * occurrences,
+                (V1Width::SchemaHeader, _) => 8 + MODULE_PROVENANCE_SCHEMA.name.len() + 2,
+                (V1Width::NameBody, "module.id") => sum_names(module_ids.clone()),
+                (V1Width::NameBody, "direct_import.module") => sum_names(import_names.clone()),
+                (V1Width::NameBody, "declarations.name") => sum_names(declaration_names.clone()),
+                (V1Width::NameBody, "extra_declarations.name") => sum_names(extra_names.clone()),
+                (V1Width::NameBody, "extension.descriptor.name") => {
+                    sum_names(extension_names.clone())
+                }
+                (V1Width::NameBody, "completeness.missing_dependencies.name") => {
+                    sum_names(missing_names.clone())
+                }
+                (width, tag) => fixture_panic!("unhandled V1 width {width:?} for row `{tag}`"),
+            };
+        }
+        assert_eq!(
+            predicted, actual,
+            "the V1 table no longer accounts for every canonical byte — a field was \
+             added to or removed from the encoder without a table row"
+        );
+        assert_eq!(actual, 669, "the pinned canonical size is unchanged");
+    }
+
+    /// **Identity-only, proved rather than asserted.** Declaration values and raw
+    /// extension payload bytes stay `Arc`-backed in the Environment and the journal;
+    /// this schema stores names, tags, counts and digests. A second copy of semantic
+    /// payload state here would be a durability and divergence hazard, so the table
+    /// records ownership per row and this test holds the encoding to it.
+    #[test]
+    fn the_v1_schema_is_identity_only_and_copies_no_payload() {
+        // Payload bytes that exist only inside the extension journal, never here.
+        const SECRET_PAYLOAD: &[u8] = b"PAYLOAD-BYTES-THAT-MUST-NOT-BE-COPIED";
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let mut records = sample_records();
+        records[0].extension_contributions = vec![ExtensionContribution::new(
+            descriptor.clone(),
+            7,
+            Digest([0x31; 32]),
+            vec![ExtensionEntryId::derive(
+                &epoch(),
+                &descriptor,
+                SECRET_PAYLOAD,
+            )],
+        )]
+        .into();
+        let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("the payload-bearing fixture validates");
+        let bytes = manifest.to_canonical_bytes();
+
+        assert!(
+            !bytes
+                .windows(SECRET_PAYLOAD.len())
+                // ubs:ignore — test-only public sentinel bytes, not a credential.
+                .any(|window| window == SECRET_PAYLOAD),
+            "raw extension payload bytes leaked into the canonical provenance encoding"
+        );
+        // The entry is still fully identified — identity-only is not identity-poor.
+        assert_eq!(
+            manifest.records()[0].extension_contributions()[0].entries()[0],
+            ExtensionEntryId::derive(&epoch(), &descriptor, SECRET_PAYLOAD)
+        );
+
+        // Every row that names payload owned elsewhere stores a fixed-width digest or
+        // a name, never the payload itself.
+        for row in MODULE_PROVENANCE_V1_TABLE
+            .iter()
+            .filter(|row| row.ownership == V1Ownership::PayloadOwnedElsewhere)
+        {
+            assert!(
+                matches!(row.width, V1Width::LengthPrefixed(32) | V1Width::NameBody),
+                "row `{}` claims to own payload elsewhere but is not a digest or a name",
+                row.tag
+            );
+        }
+    }
+
+    /// Projections are rebuildable caches, never truth. The properties that make
+    /// that claim real: they are exactly derivable from the primary records, they
+    /// cover both directions, and their existence cannot move the aggregate root.
+    #[test]
+    fn index_projections_are_derivable_bidirectional_and_never_authoritative() {
+        let manifest = sample_manifest();
+        let root_before = manifest.root();
+        let indexes = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+
+        // Derivable: a rebuild from the same records is the same projection, and it
+        // verifies against the manifest it came from.
+        assert_eq!(
+            indexes,
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest")
+        );
+        assert_eq!(indexes.verify(&manifest), Ok(()));
+        assert_eq!(indexes.derived_from(), root_before);
+
+        // NEVER AUTHORITATIVE: deriving, holding, cloning, and dropping projections
+        // leaves the aggregate root and the canonical bytes untouched. Index layout
+        // is outside the identity by construction, and this is the assertion that
+        // keeps it there.
+        let bytes_before = manifest.to_canonical_bytes();
+        let _clone = indexes.clone();
+        drop(ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest"));
+        assert_eq!(
+            manifest.root(),
+            root_before,
+            "an index moved the aggregate root"
+        );
+        assert_eq!(manifest.to_canonical_bytes(), bytes_before);
+
+        // Bidirectional coverage over real data: every owned declaration resolves
+        // back to its owner, and every owner's list is exactly its declarations.
+        let mut seen = 0usize;
+        for record in manifest.records() {
+            let module = &record.module().id;
+            let owned = indexes
+                .declarations_of(module)
+                .expect("every module is in the forward index");
+            let mut expected: Vec<Name> = record
+                .declarations()
+                .iter()
+                .chain(record.extra_declarations().iter())
+                .cloned()
+                .collect();
+            expected.sort();
+            assert_eq!(owned, expected.as_slice(), "forward index disagrees");
+            for name in &expected {
+                let (owner, class) = indexes
+                    .owner_of(name)
+                    .expect("every declaration is in the reverse index");
+                assert_eq!(owner, module);
+                // The class distinction survives the projection: an ordinary and an
+                // extra generated declaration are not interchangeable.
+                let expected_class = if record.declarations().contains(name) {
+                    DeclarationClass::Declaration
+                } else {
+                    DeclarationClass::ExtraDeclaration
+                };
+                assert_eq!(*class, expected_class, "declaration class was flattened");
+                seen += 1;
+            }
+        }
+        assert_eq!(
+            seen,
+            manifest.facts().declarations + manifest.facts().extra_declarations,
+            "bidirectional walk did not cover every declaration"
+        );
+
+        // Reverse entry index: occurrences resolve to real coordinates.
+        for record in manifest.records() {
+            for (contribution_index, contribution) in
+                record.extension_contributions().iter().enumerate()
+            {
+                for (offset, entry) in contribution.entries().iter().enumerate() {
+                    let occurrences = indexes
+                        .occurrences_of(entry)
+                        .expect("every entry occurrence is indexed");
+                    assert!(
+                        occurrences.contains(&EntryOccurrence {
+                            module: record.module().id.clone(),
+                            contribution_index,
+                            source_ordinal: contribution
+                                .source_ordinal(offset)
+                                .expect("offset is in range"),
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    /// The named mutants: a projection that disagrees with the committed records, or
+    /// one carried across to a different manifest, must fault rather than answer.
+    #[test]
+    fn a_disagreeing_index_projection_is_a_fault_not_a_second_opinion() {
+        let manifest = sample_manifest();
+        let other = other_manifest();
+
+        // Carried across to a different committed root: caught by the back reference
+        // before any row is compared.
+        let stale = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        assert!(matches!(
+            stale.verify(&other),
+            Err(ModuleProvenanceError::InternalFault {
+                what: "index projection was derived from a different committed root",
+                ..
+            })
+        ));
+
+        // Tampered rows, with the root reference left intact so the row comparison is
+        // what has to catch it. Each is a distinct way a cache can rot.
+        let mut dropped_owner =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        let victim = manifest.records()[0].declarations()[0].clone();
+        dropped_owner.owners.remove(&victim);
+        assert!(matches!(
+            dropped_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        let mut wrong_owner =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        wrong_owner
+            .owners
+            .insert(victim.clone(), (id("B"), DeclarationClass::Declaration));
+        assert!(matches!(
+            wrong_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        let mut flattened_class =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        let extra = manifest.records()[0].extra_declarations()[0].clone();
+        flattened_class
+            .owners
+            .insert(extra, (id("A"), DeclarationClass::Declaration));
+        assert!(
+            matches!(
+                flattened_class.verify(&manifest),
+                Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+            ),
+            "collapsing the ordinary/extra class distinction must fault"
+        );
+
+        let mut lost_occurrence =
+            ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        let entry = manifest.records()[0].extension_contributions()[0].entries()[0];
+        lost_occurrence.entry_occurrences.remove(&entry);
+        assert!(matches!(
+            lost_occurrence.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault { .. })
+        ));
+
+        // And the healthy projection still verifies, so none of the above is a
+        // blanket refusal.
+        assert_eq!(
+            ModuleProvenanceIndexes::derive(&manifest)
+                .expect("validated manifest")
+                .verify(&manifest),
+            Ok(())
+        );
+    }
+
+    /// A manifest identical to `sample_manifest` except in exactly one family.
+    ///
+    /// Every variant edits one field of module `A` and nothing else, so "only this
+    /// subdigest moved" is a statement about the family partition rather than about
+    /// how much of the fixture the edit happened to touch.
+    fn single_family_variant(family: ProvenanceFamily) -> ModuleProvenanceManifest {
+        let mut records = sample_records();
+        let a = &records[0];
+        let (module, declarations, extra, contributions, completeness) = (
+            a.module.clone(),
+            a.declarations.to_vec(),
+            a.extra_declarations.to_vec(),
+            a.extension_contributions.to_vec(),
+            a.completeness.clone(),
+        );
+        records[0] = match family {
+            // One import flag flips: import_all on A's existing edge to B. The graph
+            // itself is untouched, so nothing outside topology can move.
+            ProvenanceFamily::Topology => ModuleContributionRecord::new(
+                ModuleRecord::new(
+                    id("A"),
+                    true,
+                    vec![
+                        DirectImport::new(id("B"), true, true, false),
+                        DirectImport::new(id("Ghost"), true, false, true),
+                    ],
+                    evidence(0xA1),
+                ),
+                declarations,
+                extra,
+                contributions,
+                completeness,
+            ),
+            // A different serialized artifact behind the same module.
+            ProvenanceFamily::Artifact => ModuleContributionRecord::new(
+                ModuleRecord::new(
+                    id("A"),
+                    true,
+                    module.direct_imports().to_vec(),
+                    evidence(0xA9),
+                ),
+                declarations,
+                extra,
+                contributions,
+                completeness,
+            ),
+            // One declaration renamed.
+            ProvenanceFamily::Contribution => ModuleContributionRecord::new(
+                module,
+                vec![name("A.one"), name("A.three")],
+                extra,
+                contributions,
+                completeness,
+            ),
+            // Capture downgraded, alone. It has to be capture: transparency is
+            // *recomputed* from the descriptors and refused if it disagrees
+            // (`PayloadTransparencyMismatch`), so it is not independently settable in
+            // validated state. Capture is knowledge from outside the record and is the
+            // one completeness field a variant can move on its own.
+            ProvenanceFamily::Completeness => ModuleContributionRecord::new(
+                module,
+                declarations,
+                extra,
+                contributions,
+                ProvenanceCompleteness::new(
+                    CaptureStatus::Partial,
+                    PayloadTransparency::Understood,
+                    vec![id("Ghost")],
+                ),
+            ),
+        };
+        ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("single-family variant validates")
+    }
+
+    /// The subdigests are a partition of the committed canonical bytes, not a second
+    /// encoding of the same facts. Header plus the four families, in canonical order,
+    /// must reproduce the manifest byte for byte with zero residue -- which is what
+    /// makes each one a projection of the record rather than an opinion about it.
+    #[test]
+    fn subdigests_partition_the_canonical_encoding_without_gap_or_overlap() {
+        let manifest = sample_manifest();
+        let canonical = manifest.to_canonical_bytes();
+
+        let mut header = CanonWriter::new();
+        header.schema(MODULE_PROVENANCE_SCHEMA);
+        header.str(manifest.epoch().tag());
+        header.str(manifest.epoch().commit());
+        header.u64(manifest.records().len() as u64);
+        let header = header.into_bytes();
+
+        let mut rebuilt = header.clone();
+        let mut family_bytes = 0usize;
+        for record in manifest.records() {
+            for family in ProvenanceFamily::ALL {
+                let mut writer = CanonWriter::new();
+                family.write(record, &mut writer);
+                let bytes = writer.into_bytes();
+                family_bytes += bytes.len();
+                rebuilt.extend_from_slice(&bytes);
+            }
+        }
+
+        assert_eq!(
+            rebuilt, canonical,
+            "the four families do not partition the record encoding"
+        );
+        // The same statement as arithmetic: every canonical byte is either header --
+        // which belongs to no family by design -- or owned by exactly one family.
+        assert_eq!(header.len() + family_bytes, canonical.len(), "residue");
+
+        // And no family is a no-op, so `ALL` is not carrying a decorative variant.
+        for family in ProvenanceFamily::ALL {
+            let mut writer = CanonWriter::new();
+            for record in manifest.records() {
+                family.write(record, &mut writer);
+            }
+            assert!(
+                !writer.into_bytes().is_empty(),
+                "family {family:?} owns no bytes"
+            );
+        }
+    }
+
+    /// Subdigests answer *which family changed* -- the one question the aggregate root
+    /// cannot answer, because one root over everything is what makes it an identity.
+    /// They must earn that without ever becoming an identity themselves.
+    #[test]
+    fn subdigests_localize_a_change_and_are_never_authoritative() {
+        let manifest = sample_manifest();
+        let root_before = manifest.root();
+        let bytes_before = manifest.to_canonical_bytes();
+        let subdigests = ModuleProvenanceSubdigests::derive(&manifest);
+
+        assert_eq!(subdigests.verify(&manifest), Ok(()));
+        assert_eq!(subdigests.derived_from(), root_before);
+
+        // NEVER AUTHORITATIVE: deriving and dropping cannot move the identity, and no
+        // family digest is ever equal to the aggregate root.
+        let _ = ModuleProvenanceSubdigests::derive(&manifest);
+        assert_eq!(manifest.root(), root_before, "a subdigest moved the root");
+        assert_eq!(manifest.to_canonical_bytes(), bytes_before);
+        for family in ProvenanceFamily::ALL {
+            assert_ne!(
+                subdigests.of(family),
+                root_before.0,
+                "{family:?} subdigest equals the aggregate root"
+            );
+        }
+        // Mutually distinct on this fixture: the per-family tags are doing work.
+        for (position, family) in ProvenanceFamily::ALL.iter().enumerate() {
+            for other in &ProvenanceFamily::ALL[position + 1..] {
+                assert_ne!(
+                    subdigests.of(*family),
+                    subdigests.of(*other),
+                    "{family:?} and {other:?} share a digest"
+                );
+            }
+        }
+
+        // LOCALIZATION: change exactly one family and exactly that subdigest moves,
+        // while the aggregate root moves for every one of them.
+        for family in ProvenanceFamily::ALL {
+            let variant = single_family_variant(family);
+            let moved = ModuleProvenanceSubdigests::derive(&variant);
+            assert_ne!(
+                variant.root(),
+                root_before,
+                "the {family:?} variant did not move the aggregate root"
+            );
+            assert_ne!(
+                moved.of(family),
+                subdigests.of(family),
+                "the {family:?} subdigest did not move with its own family"
+            );
+            // ubs:ignore — test-only public enum identity, not authentication material.
+            for other in ProvenanceFamily::ALL.iter().filter(|f| **f != family) {
+                assert_eq!(
+                    moved.of(*other),
+                    subdigests.of(*other),
+                    "a {family:?} change leaked into the {other:?} subdigest"
+                );
+            }
+        }
+
+        // THE CAVEAT, PINNED RATHER THAN LEFT TO A READER: the families partition the
+        // *bytes*, which does not make them causally independent. `transparency` lives
+        // in the completeness family but is recomputed from the contribution family's
+        // descriptors, so flipping a descriptor to Opaque legitimately moves two
+        // subdigests. A consumer that reads "only family X moved" as "only family X
+        // was edited" is wrong in exactly this case, and the .9.3 handoff has to say
+        // so.
+        let mut opaque_records = sample_records();
+        let opaque_descriptor = extension_descriptor("simpExt", PayloadProvenance::Opaque);
+        opaque_records[0] = ModuleContributionRecord::new(
+            opaque_records[0].module.clone(),
+            opaque_records[0].declarations.to_vec(),
+            opaque_records[0].extra_declarations.to_vec(),
+            vec![ExtensionContribution::new(
+                opaque_descriptor.clone(),
+                7,
+                Digest([0x31; 32]),
+                vec![
+                    entry_for(&opaque_descriptor, &[0x41]),
+                    entry_for(&opaque_descriptor, &[0x42]),
+                ],
+            )],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Opaque,
+                vec![id("Ghost")],
+            ),
+        );
+        let opaque = ModuleProvenanceManifest::new(epoch(), opaque_records, TEST_LIMITS)
+            .expect("opaque variant validates");
+        let opaque_subdigests = ModuleProvenanceSubdigests::derive(&opaque);
+        assert_ne!(
+            opaque_subdigests.of(ProvenanceFamily::Contribution),
+            subdigests.of(ProvenanceFamily::Contribution)
+        );
+        assert_ne!(
+            opaque_subdigests.of(ProvenanceFamily::Completeness),
+            subdigests.of(ProvenanceFamily::Completeness),
+            "transparency is derived from the descriptors, so completeness must move too"
+        );
+        assert_eq!(
+            opaque_subdigests.of(ProvenanceFamily::Topology),
+            subdigests.of(ProvenanceFamily::Topology)
+        );
+        assert_eq!(
+            opaque_subdigests.of(ProvenanceFamily::Artifact),
+            subdigests.of(ProvenanceFamily::Artifact)
+        );
+
+        // A tampered projection is a fault that NAMES ITS FAMILY, not a second
+        // opinion -- and tampering cannot touch the identity it projects.
+        let mut tampered = subdigests;
+        tampered.digests[ProvenanceFamily::Contribution.index()] = Digest([0x00; 32]);
+        assert!(matches!(
+            tampered.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "contribution subdigest disagrees with the committed records",
+            })
+        ));
+        assert_eq!(manifest.root(), root_before);
+
+        // Carried across to a different manifest: caught by the back reference.
+        assert!(matches!(
+            subdigests.verify(&other_manifest()),
+            Err(ModuleProvenanceError::InternalFault {
+                what: "subdigest projection was derived from a different committed root",
+                ..
+            })
+        ));
+    }
+
+    /// The handoff is a joined statement, not a description that can drift.
+    ///
+    /// Every field is checked against the thing it claims to describe: the schema
+    /// against the schema, each subdigest tag against the tag the hasher actually
+    /// uses, each vector against a recomputation, and each rule list against the
+    /// requirement that no obligation is blank or duplicated. A handoff that cannot be
+    /// joined is the failure mode the V1 table existed to end, and it would be a worse
+    /// failure here — a consumer reads this one.
+    #[test]
+    fn handoff_states_the_contract_the_code_actually_implements() {
+        let handoff = MODULE_PROVENANCE_HANDOFF;
+        assert_eq!(handoff.schema, MODULE_PROVENANCE_SCHEMA);
+        assert_eq!(handoff.root_domain_tag, Domain::ModuleProvenance.tag());
+        assert_eq!(handoff.handoff_version, 1);
+
+        // Every family appears exactly once, and each declared tag is the tag the
+        // hasher is actually keyed with -- not a copy that can drift from it.
+        let mut declared = BTreeSet::new();
+        for (family, tag) in handoff.subdigest_tags {
+            assert!(declared.insert(family), "{family:?} declared twice");
+            assert_eq!(
+                tag.as_bytes(),
+                family.tag(),
+                "{family:?} handoff tag disagrees with the hasher"
+            );
+        }
+        assert_eq!(
+            declared,
+            ProvenanceFamily::ALL.into_iter().collect::<BTreeSet<_>>(),
+            "the handoff does not cover exactly the families that exist"
+        );
+
+        // Vectors, recomputed rather than restated.
+        let manifest = sample_manifest();
+        let subdigests = ModuleProvenanceSubdigests::derive(&manifest);
+        let vectors = handoff.vectors;
+        assert_eq!(manifest.root().to_string(), vectors.root);
+        assert_eq!(manifest.to_canonical_bytes().len(), vectors.canonical_bytes);
+        for (family, pinned) in [
+            (ProvenanceFamily::Topology, vectors.topology_subdigest),
+            (ProvenanceFamily::Artifact, vectors.artifact_subdigest),
+            (
+                ProvenanceFamily::Contribution,
+                vectors.contribution_subdigest,
+            ),
+            (
+                ProvenanceFamily::Completeness,
+                vectors.completeness_subdigest,
+            ),
+        ] {
+            assert_eq!(
+                subdigests.of(family).to_string(),
+                pinned,
+                "{family:?} vector moved -- a schema or domain change needs an explicit \
+                 handoff update, not a silent re-pin"
+            );
+        }
+
+        // No blank or duplicated obligation: an unclassified row blocks closure here
+        // exactly as it does in the V1 table.
+        let lists: [(&str, &[HandoffRule]); 5] = [
+            ("ordinal", handoff.ordinal_rules),
+            ("completeness", handoff.completeness_rules),
+            ("collision", handoff.collision_outcomes),
+            ("index reconstruction", handoff.index_reconstruction),
+            ("durability", handoff.durability),
+        ];
+        for (list_name, rules) in lists {
+            assert!(!rules.is_empty(), "{list_name} rules are empty");
+            let mut subjects = BTreeSet::new();
+            for rule in rules {
+                assert!(
+                    !rule.subject.is_empty() && !rule.rule.is_empty(),
+                    "{list_name} carries a blank obligation"
+                );
+                assert!(
+                    subjects.insert(rule.subject),
+                    "{list_name} declares `{}` twice",
+                    rule.subject
+                );
+            }
+        }
+
+        // The collision outcomes cover every verdict the code can produce. The match is
+        // exhaustive on purpose: adding a variant fails to compile here rather than
+        // silently leaving the consumer a case the handoff never mentioned.
+        for verdict in [
+            IdentityVerdict::Idempotent,
+            IdentityVerdict::Distinct,
+            IdentityVerdict::Collision(IdentityCollision {
+                root: manifest.root(),
+                held_len: 669,
+                candidate_len: 669,
+                first_divergence: 0,
+            }),
+        ] {
+            let subject = match verdict {
+                IdentityVerdict::Idempotent => "Idempotent",
+                IdentityVerdict::Distinct => "Distinct",
+                IdentityVerdict::Collision(_) => "Collision",
+            };
+            assert!(
+                handoff
+                    .collision_outcomes
+                    .iter()
+                    .any(|rule| rule.subject == subject),
+                "the handoff does not name the {subject} outcome"
+            );
+        }
+
+        // The W8 boundary is a statement about what is NOT claimed, so it has to say
+        // so in the negative or it is not a boundary at all.
+        assert!(
+            handoff
+                .durability
+                .iter()
+                .any(|rule| rule.rule.contains("NO durability")),
+            "the durability boundary does not actually disclaim durability"
+        );
+    }
+
+    /// The last two named mutants from the parent bead: admitting allocation identity
+    /// into the aggregate root, and letting insertion order decide canonical order.
+    ///
+    /// Both are invisible on a fixture built once and used once, which is exactly why
+    /// they are worth a test that builds the same value twice, differently.
+    #[test]
+    fn identity_is_by_value_never_by_allocation_or_input_order() {
+        let first = sample_manifest();
+        // A second, independently allocated construction of the same value. The
+        // storage assertion is what stops this from being a vacuous comparison of one
+        // object with itself.
+        let second = sample_manifest();
+        assert!(
+            !first.shares_storage_with(&second),
+            "the two fixtures share storage, so this proves nothing about allocation"
+        );
+        assert_eq!(first.root(), second.root(), "allocation reached the root");
+        assert_eq!(first.to_canonical_bytes(), second.to_canonical_bytes());
+
+        // The projections inherit the same law: they are functions of the records, so
+        // two allocations of one value project identically.
+        assert_eq!(
+            ModuleProvenanceSubdigests::derive(&first),
+            ModuleProvenanceSubdigests::derive(&second)
+        );
+        assert_eq!(
+            ModuleProvenanceIndexes::derive(&first).expect("validated manifest"),
+            ModuleProvenanceIndexes::derive(&second).expect("validated manifest")
+        );
+
+        // Sharing does not change identity in the other direction either: a clone that
+        // *does* share every allocation still reports the same root.
+        let shared = first.clone();
+        assert!(first.shares_storage_with(&shared));
+        assert_eq!(first.root(), shared.root());
+
+        // Canonical order is decided by canonicalization, not by the order records
+        // arrived in. Reversing the input must be undetectable in the identity.
+        let mut reversed = sample_records();
+        reversed.reverse();
+        let reordered = ModuleProvenanceManifest::new(epoch(), reversed, TEST_LIMITS)
+            .expect("reordered records validate");
+        assert_eq!(
+            reordered.root(),
+            first.root(),
+            "input order reached the root"
+        );
+        assert_eq!(reordered.to_canonical_bytes(), first.to_canonical_bytes());
+        assert_eq!(
+            reordered.records()[0].module.id,
+            id("A"),
+            "records are not in canonical order"
+        );
+    }
+
+    /// Count conservation is the half that re-derivation cannot supply.
+    ///
+    /// Diffing a projection against a rebuild of itself proves only that the same
+    /// loop twice agrees with itself: a systematic hole — a row class never visited,
+    /// a name absorbed by last-writer-wins — survives that comparison untouched.
+    /// `facts` is counted by the validator over the same records without consulting
+    /// this loop, so each equality below is an independent statement, and each hole
+    /// is pinned to the specific equality that must catch it.
+    #[test]
+    fn index_coverage_is_conserved_against_independently_counted_facts() {
+        let manifest = sample_manifest();
+        let facts = manifest.facts();
+        let healthy = ModuleProvenanceIndexes::derive(&manifest).expect("validated manifest");
+        assert_eq!(healthy.check_coverage(&facts), Ok(()));
+
+        // Exact equality, not "at least": a validated manifest admits no duplicate
+        // module id and no duplicate declaration name, in a module or across modules,
+        // so every committed row appears exactly once in each direction.
+        let declarations = facts.declarations + facts.extra_declarations;
+        assert_eq!(healthy.owners.len(), declarations);
+        assert_eq!(healthy.declarations_by_module.len(), facts.modules);
+        assert_eq!(
+            healthy
+                .entry_occurrences
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            facts.extension_entries
+        );
+
+        let victim_module = manifest.records()[0].module().id.clone();
+        let victim_name = manifest.records()[0].declarations()[0].clone();
+
+        // A whole module missing from the forward index.
+        let mut lost_module = healthy.clone();
+        lost_module.declarations_by_module.remove(&victim_module);
+        assert!(matches!(
+            lost_module.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not carry exactly the manifest's modules",
+            })
+        ));
+
+        // A declaration dropped from a module that is itself still present, so the
+        // module count stays right and only the declaration total can catch it.
+        let mut short_module = healthy.clone();
+        short_module
+            .declarations_by_module
+            .get_mut(&victim_module)
+            .expect("the victim module is indexed")
+            .pop()
+            .expect("the victim module owns declarations");
+        assert!(matches!(
+            short_module.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "forward index does not cover exactly the manifest's declarations",
+            })
+        ));
+
+        // The same row lost from the reverse direction only. This is the shape a
+        // duplicate name would take if one ever slipped past validation: absorbed
+        // silently by the name-keyed map and visible nowhere else.
+        let mut lost_owner = healthy.clone();
+        lost_owner.owners.remove(&victim_name);
+        assert!(matches!(
+            lost_owner.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            })
+        ));
+
+        // An entry occurrence dropped.
+        let mut lost_occurrence = healthy.clone();
+        let entry = manifest.records()[0].extension_contributions()[0].entries()[0];
+        lost_occurrence.entry_occurrences.remove(&entry);
+        assert!(matches!(
+            lost_occurrence.check_coverage(&facts),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "entry-occurrence index does not cover exactly the manifest's entries",
+            })
+        ));
+
+        // Ordering: verify() reaches coverage before the row diff, so a hole is
+        // reported as a hole rather than as generic disagreement.
+        assert!(matches!(
+            lost_owner.verify(&manifest),
+            Err(ModuleProvenanceError::GraphAdmissionFault {
+                what: "reverse index does not cover exactly the manifest's declarations",
+            })
+        ));
     }
 
     #[test]
@@ -2101,8 +4886,8 @@ mod tests {
             evidence(0xA1),
         );
         topology_changed[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![id("Ghost")],
         );
         let topology_changed =
@@ -2115,6 +4900,66 @@ mod tests {
             logical_before.0,
             "typed domains do not alias even for unrelated current values"
         );
+
+        // Non-interference across field families, not just one variant: move a
+        // representative field from each independently-rooted family and assert the
+        // environment's logical root never observes any of it, and that no provenance
+        // root ever aliases it. Building, varying, encoding and decoding provenance is
+        // all invisible to the environment by construction — this pins that.
+        let mut transparency = sample_records();
+        transparency[0].extension_contributions = vec![ExtensionContribution::new(
+            extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+            7,
+            Digest([0x31; 32]),
+            vec![entry_for(
+                &extension_descriptor("opaqueExt", PayloadProvenance::Opaque),
+                &[0x41],
+            )],
+        )]
+        .into();
+        transparency[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
+            vec![id("Ghost")],
+        );
+
+        let mut capture = sample_records();
+        capture[0].completeness = ProvenanceCompleteness::new(
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
+            vec![id("Ghost")],
+        );
+
+        let mut artifact = sample_records();
+        artifact[0].module.artifact.content_digest = Digest([0xEE; 32]);
+
+        let mut roots = BTreeSet::from([base.root()]);
+        for (family, records) in [
+            ("transparency", transparency),
+            ("capture", capture),
+            ("artifact", artifact),
+        ] {
+            let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+                .expect("variant validates");
+            // Round-trip too: decoding is equally invisible to the environment.
+            let decoded = ModuleProvenanceManifest::from_canonical_bytes(
+                &manifest.to_canonical_bytes(),
+                TEST_LIMITS,
+            )
+            .expect("variant round-trips");
+            assert_eq!(decoded.root(), manifest.root(), "family={family}");
+            assert!(roots.insert(manifest.root()), "family={family} is distinct");
+            assert_eq!(
+                logical_before,
+                environment.logical_root(&KVMap::new()),
+                "family={family} disturbed the environment's logical root"
+            );
+            assert_ne!(
+                manifest.root().0,
+                logical_before.0,
+                "family={family} provenance root aliased the logical root"
+            );
+        }
     }
 
     #[test]
@@ -2272,8 +5117,8 @@ mod tests {
 
         let mut wrong_missing = baseline_records.clone();
         wrong_missing[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::AllUnderstood,
+            CaptureStatus::Complete,
+            PayloadTransparency::Understood,
             vec![],
         );
         assert!(matches!(
@@ -2283,13 +5128,13 @@ mod tests {
 
         let mut wrong_knowledge = baseline_records.clone();
         wrong_knowledge[0].completeness = ProvenanceCompleteness::new(
-            DecodeCompleteness::Complete,
-            ExtensionKnowledge::ContainsOpaque,
+            CaptureStatus::Complete,
+            PayloadTransparency::Opaque,
             vec![id("Ghost")],
         );
         assert!(matches!(
             ModuleProvenanceManifest::new(epoch(), wrong_knowledge, TEST_LIMITS),
-            Err(ModuleProvenanceError::ExtensionKnowledgeMismatch { .. })
+            Err(ModuleProvenanceError::PayloadTransparencyMismatch { .. })
         ));
 
         let mut empty_contribution = baseline_records.clone();
@@ -2306,19 +5151,11 @@ mod tests {
             Err(ModuleProvenanceError::EmptyExtensionContribution { .. })
         ));
 
-        let mut wrong_entry = baseline_records.clone();
-        let original = &wrong_entry[0].extension_contributions[0];
-        wrong_entry[0].extension_contributions = vec![ExtensionContribution::new(
-            original.descriptor().clone(),
-            original.start(),
-            original.base_history_digest(),
-            vec![entry(7, 1), entry(99, 2)],
-        )]
-        .into();
-        assert!(matches!(
-            ModuleProvenanceManifest::new(epoch(), wrong_entry, TEST_LIMITS),
-            Err(ModuleProvenanceError::EntryIndexMismatch { .. })
-        ));
+        // There is deliberately no "entry index disagrees with the range" row here any
+        // more: an occurrence carries no journal coordinate of its own, so that class of
+        // malformed input is unrepresentable rather than merely rejected. The property
+        // that replaced it is proved by
+        // `entry_identity_is_content_derived_and_survives_journal_rebasing`.
 
         let mut overflow = baseline_records.clone();
         let original = &overflow[0].extension_contributions[0];
@@ -2326,7 +5163,7 @@ mod tests {
             original.descriptor().clone(),
             u64::MAX,
             original.base_history_digest(),
-            vec![entry(u64::MAX, 1)],
+            vec![entry(1)],
         )]
         .into();
         assert!(matches!(
@@ -2439,38 +5276,737 @@ mod tests {
     #[test]
     fn opaque_and_partial_grades_are_explicit_and_payloads_are_not_copied() {
         let descriptor = extension_descriptor("opaqueExt", PayloadProvenance::Opaque);
+        let opaque_entry = entry_for(&descriptor, &[9]);
         let contribution =
-            ExtensionContribution::new(descriptor, 0, Digest([0; 32]), vec![entry(0, 9)]);
+            ExtensionContribution::new(descriptor.clone(), 0, Digest([0; 32]), vec![opaque_entry]);
         let record = ModuleContributionRecord::new(
             ModuleRecord::new(id("Opaque"), true, vec![], evidence(9)),
             vec![name("Opaque.one")],
             vec![],
             vec![contribution],
             ProvenanceCompleteness::new(
-                DecodeCompleteness::Partial,
-                ExtensionKnowledge::ContainsOpaque,
+                CaptureStatus::Partial,
+                PayloadTransparency::Opaque,
                 vec![],
             ),
         );
         let manifest = ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS)
             .expect("opaque partial manifest is retained honestly");
+        let completeness = manifest.records()[0].completeness();
+        assert_eq!(completeness.capture(), CaptureStatus::Partial);
+        assert_eq!(completeness.transparency(), PayloadTransparency::Opaque);
+        // Partial + Opaque is a legal state that keeps inspection and nothing else.
+        // There is deliberately no `is_complete()` to ask instead: that accessor ANDed
+        // the two axes together, so a byte-complete opaque module reported "incomplete"
+        // and the caller could not tell which axis had said so.
         assert_eq!(
-            manifest.records()[0].completeness().decode(),
-            DecodeCompleteness::Partial
+            completeness.authority(),
+            vec![ProvenanceAuthority::Inspection]
         );
+        // An opaque payload still gets a full content identity: opacity is about
+        // understanding the bytes, not about being unable to name them.
         assert_eq!(
-            manifest.records()[0].completeness().extension_knowledge(),
-            ExtensionKnowledge::ContainsOpaque
-        );
-        assert!(!manifest.records()[0].completeness().is_complete());
-        assert_eq!(
-            manifest.records()[0].extension_contributions()[0].entries()[0].payload_digest(),
-            hash(Domain::Fixture, &[9])
+            manifest.records()[0].extension_contributions()[0].entries()[0],
+            ExtensionEntryId::derive(&epoch(), &descriptor, &[9])
         );
         // The schema contains only a fixed-size digest, not the source payload Arc.
         assert_eq!(
-            std::mem::size_of::<ExtensionEntryIdentity>(),
-            std::mem::size_of::<u64>() + std::mem::size_of::<Digest>()
+            std::mem::size_of::<ExtensionEntryId>(),
+            std::mem::size_of::<Digest>()
+        );
+    }
+
+    /// The authority table, written out independently of the implementation so it can
+    /// serve as an oracle rather than a restatement. Consulted by both axis tests.
+    fn expected_authority(
+        capture: CaptureStatus,
+        transparency: PayloadTransparency,
+        has_missing: bool,
+    ) -> Vec<ProvenanceAuthority> {
+        use ProvenanceAuthority::*;
+        match capture {
+            // Nothing was captured, so there is nothing to inspect, replay, or trust.
+            CaptureStatus::Missing => vec![],
+            // Something was captured but not all of it: it can be read and nothing more.
+            CaptureStatus::Partial => vec![Inspection],
+            CaptureStatus::Complete => {
+                if has_missing {
+                    // The module's own content is whole, but its import closure is not,
+                    // so it cannot anchor a cache key or an invalidation cone.
+                    vec![Inspection, ExactReplay, CompleteInventory]
+                // ubs:ignore — test-only public classification, not authentication material.
+                } else if transparency == PayloadTransparency::Understood {
+                    vec![
+                        Inspection,
+                        ExactReplay,
+                        CompleteInventory,
+                        AuthoritativeCache,
+                        FineInvalidation,
+                    ]
+                } else {
+                    // Byte-complete but not semantically attributable: everything except
+                    // the one capability that needs to know what the payloads *mean*.
+                    vec![
+                        Inspection,
+                        ExactReplay,
+                        CompleteInventory,
+                        AuthoritativeCache,
+                    ]
+                }
+            }
+        }
+    }
+
+    /// The named mutant this kills: *collapse capture with transparency*.
+    ///
+    /// The rejected design exposed one `is_complete()` boolean that ANDed the capture
+    /// axis, the transparency axis, and the missing-dependency set together. That is
+    /// not merely imprecise, it is lossy: it maps genuinely different states onto the
+    /// same answer, so no caller could recover which axis objected. This test executes
+    /// that collapsed predicate and shows exactly what it destroys.
+    #[test]
+    fn the_axes_are_independent_and_capture_is_not_collapsed_with_transparency() {
+        let completeness = |capture, transparency, missing: Vec<ModuleId>| {
+            ProvenanceCompleteness::new(capture, transparency, missing)
+        };
+
+        // The two states the design names as "both valid with limited authority".
+        let complete_opaque =
+            completeness(CaptureStatus::Complete, PayloadTransparency::Opaque, vec![]);
+        let partial_understood = completeness(
+            CaptureStatus::Partial,
+            PayloadTransparency::Understood,
+            vec![],
+        );
+
+        // The collapsed predicate the axes replaced, executed rather than described.
+        let collapsed = |c: &ProvenanceCompleteness| {
+            // ubs:ignore — test-only public classification, not authentication material.
+            c.capture() == CaptureStatus::Complete
+                // ubs:ignore — test-only public classification, not authentication material.
+                && c.transparency() == PayloadTransparency::Understood
+                && c.missing_dependencies().is_empty()
+        };
+        assert!(!collapsed(&complete_opaque));
+        assert!(!collapsed(&partial_understood));
+        assert_eq!(
+            collapsed(&complete_opaque),
+            collapsed(&partial_understood),
+            "the collapsed predicate is expected to conflate these two states — that is the defect"
+        );
+
+        // The axes keep them apart, and so does the authority derived from them: one is
+        // byte-complete and cacheable, the other can only be looked at.
+        assert_ne!(complete_opaque.capture(), partial_understood.capture());
+        assert_ne!(
+            complete_opaque.transparency(),
+            partial_understood.transparency()
+        );
+        assert_ne!(
+            complete_opaque.authority(),
+            partial_understood.authority(),
+            "the collapse mutant survives if authority cannot tell these apart"
+        );
+        assert!(complete_opaque.grants(ProvenanceAuthority::AuthoritativeCache));
+        assert!(!complete_opaque.grants(ProvenanceAuthority::FineInvalidation));
+        assert_eq!(
+            partial_understood.authority(),
+            vec![ProvenanceAuthority::Inspection]
+        );
+
+        // Neither axis may be inferred from the other anywhere in the cross-product: for
+        // each fixed capture there exist transparencies that differ, and vice versa.
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for transparency in [
+                PayloadTransparency::Understood,
+                PayloadTransparency::Mixed,
+                PayloadTransparency::Opaque,
+            ] {
+                let value = completeness(capture, transparency, vec![]);
+                assert_eq!(value.capture(), capture, "capture was rewritten");
+                assert_eq!(
+                    value.transparency(),
+                    transparency,
+                    "transparency was rewritten"
+                );
+            }
+        }
+
+        // The sharp form of "not collapsed", and the reason this test carries the
+        // mutant's name: transparency is permitted to move EXACTLY ONE capability, the
+        // one that needs semantic attribution. Every collapse — the original
+        // `is_complete()` shape, or a later one that lets transparency gate replay or
+        // inventory — widens this set, so it is caught here rather than only by the
+        // cross-product table. Found by injecting exactly that mutant and observing
+        // that the earlier version of this test still passed.
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for missing in [Vec::new(), vec![id("Ghost")]] {
+                let understood =
+                    completeness(capture, PayloadTransparency::Understood, missing.clone());
+                for other in [PayloadTransparency::Mixed, PayloadTransparency::Opaque] {
+                    let shifted = completeness(capture, other, missing.clone());
+                    let moved: Vec<_> = ProvenanceAuthority::ALL
+                        .into_iter()
+                        .filter(|candidate| {
+                            // ubs:ignore — test-only public capability result, not authentication material.
+                            understood.grants(*candidate) != shifted.grants(*candidate)
+                        })
+                        .collect();
+                    assert!(
+                        moved
+                            .iter()
+                            .all(|candidate| *candidate == ProvenanceAuthority::FineInvalidation),
+                        "transparency moved {moved:?} for {capture:?}; only FineInvalidation \
+                         may depend on it, so an axis has been collapsed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The named mutant this kills: *grant authority*.
+    ///
+    /// Authority is derived, never stored, so a record cannot assert a capability in
+    /// its bytes. What remains possible is a derivation that hands out too much, which
+    /// this pins against an independently written table over the whole cross-product.
+    #[test]
+    fn every_authority_capability_is_earned_from_the_full_axis_tuple() {
+        let mut observed = BTreeSet::new();
+        for capture in [
+            CaptureStatus::Complete,
+            CaptureStatus::Partial,
+            CaptureStatus::Missing,
+        ] {
+            for transparency in [
+                PayloadTransparency::Understood,
+                PayloadTransparency::Mixed,
+                PayloadTransparency::Opaque,
+            ] {
+                for missing in [Vec::new(), vec![id("Ghost")]] {
+                    let has_missing = !missing.is_empty();
+                    let value = ProvenanceCompleteness::new(capture, transparency, missing);
+                    let expected = expected_authority(capture, transparency, has_missing);
+                    assert_eq!(
+                        value.authority(),
+                        expected,
+                        "authority for {capture:?}/{transparency:?}/missing={has_missing} \
+                         disagrees with the reviewed table"
+                    );
+                    // `grants` and `authority` must agree capability by capability, or
+                    // one of the two surfaces could quietly widen.
+                    for candidate in ProvenanceAuthority::ALL {
+                        assert_eq!(
+                            value.grants(candidate),
+                            expected.contains(&candidate),
+                            "{candidate:?} disagrees for {capture:?}/{transparency:?}"
+                        );
+                    }
+                    observed.insert(value.authority());
+                }
+            }
+        }
+        // The tuple must produce genuinely different capability sets: exactly four
+        // distinct ones (none, inspection-only, complete-with-unknown-closure,
+        // complete-but-opaque, and fully authoritative is five). A derivation that
+        // ignored an axis would collapse this count.
+        assert_eq!(observed.len(), 5, "an axis stopped affecting authority");
+    }
+
+    /// Capture is knowledge from outside the record, so it cannot be recomputed — but
+    /// the one available cross-check is mandatory: claiming nothing was captured while
+    /// carrying contributions is a contradiction, not a permitted axis combination.
+    #[test]
+    fn a_record_cannot_claim_missing_capture_while_carrying_contributions() {
+        for (tag, declarations, extra, contributions) in [
+            ("declaration", vec![name("A.one")], vec![], vec![]),
+            ("extra", vec![], vec![name("A.generated")], vec![]),
+            (
+                "contribution",
+                vec![],
+                vec![],
+                vec![ExtensionContribution::new(
+                    extension_descriptor("simpExt", PayloadProvenance::Understood),
+                    0,
+                    Digest([0x31; 32]),
+                    vec![entry(0x41)],
+                )],
+            ),
+        ] {
+            let record = ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                declarations,
+                extra,
+                contributions,
+                ProvenanceCompleteness::new(
+                    CaptureStatus::Missing,
+                    PayloadTransparency::Understood,
+                    vec![],
+                ),
+            );
+            assert!(
+                matches!(
+                    ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS),
+                    Err(ModuleProvenanceError::CaptureStatusContradicted { .. })
+                ),
+                "a Missing record carrying a {tag} was accepted"
+            );
+        }
+
+        // The refusal is not blanket: Missing over genuinely empty content is the whole
+        // point of the variant, and it is distinguishable from an empty Complete record.
+        let empty = |capture| {
+            ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                vec![],
+                vec![],
+                vec![],
+                ProvenanceCompleteness::new(capture, PayloadTransparency::Understood, vec![]),
+            )
+        };
+        let missing = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![empty(CaptureStatus::Missing)],
+            TEST_LIMITS,
+        )
+        .expect("Missing over empty content is legal");
+        let complete = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![empty(CaptureStatus::Complete)],
+            TEST_LIMITS,
+        )
+        .expect("Complete over empty content is legal");
+        assert_ne!(
+            missing.root(),
+            complete.root(),
+            "the two opposite claims about the same empty content must not share a root"
+        );
+        assert_eq!(missing.records()[0].completeness().authority(), vec![]);
+    }
+
+    /// Transparency is recomputed from the descriptors and resolves to three states.
+    /// `Mixed` is what keeps an opaque boundary localized; folding it into `Opaque`
+    /// would condemn every understood contribution beside it.
+    #[test]
+    fn mixed_transparency_is_derived_and_localizes_the_opaque_boundary() {
+        let understood = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let opaque = extension_descriptor("opaqueExt", PayloadProvenance::Opaque);
+        let contribution = |descriptor: &ExtensionDescriptor, seed: u8| {
+            ExtensionContribution::new(
+                descriptor.clone(),
+                0,
+                Digest([0x31; 32]),
+                vec![entry_for(descriptor, &[seed])],
+            )
+        };
+
+        for (contributions, expected) in [
+            (
+                vec![contribution(&understood, 1)],
+                PayloadTransparency::Understood,
+            ),
+            (vec![contribution(&opaque, 2)], PayloadTransparency::Opaque),
+            (
+                vec![contribution(&understood, 1), contribution(&opaque, 2)],
+                PayloadTransparency::Mixed,
+            ),
+            // A module with no extension contributions is vacuously understood.
+            (vec![], PayloadTransparency::Understood),
+        ] {
+            let record = ModuleContributionRecord::new(
+                ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+                vec![name("A.one")],
+                vec![],
+                contributions,
+                ProvenanceCompleteness::new(CaptureStatus::Complete, expected, vec![]),
+            );
+            let manifest = ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS)
+                .expect("the claimed transparency matches the descriptors");
+            assert_eq!(
+                manifest.records()[0].completeness().transparency(),
+                expected
+            );
+
+            // Mixed is byte-complete, so it keeps every capability except the semantic
+            // one — the localization claim, stated as authority rather than prose.
+            // ubs:ignore — test-only public classification, not authentication material.
+            if expected == PayloadTransparency::Mixed {
+                let completeness = manifest.records()[0].completeness();
+                assert!(completeness.grants(ProvenanceAuthority::AuthoritativeCache));
+                assert!(!completeness.grants(ProvenanceAuthority::FineInvalidation));
+            }
+        }
+
+        // A record that rounds Mixed off to Opaque is refused by the recomputation.
+        let record = ModuleContributionRecord::new(
+            ModuleRecord::new(id("A"), true, vec![], evidence(0xA1)),
+            vec![name("A.one")],
+            vec![],
+            vec![contribution(&understood, 1), contribution(&opaque, 2)],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Opaque,
+                vec![],
+            ),
+        );
+        assert!(matches!(
+            ModuleProvenanceManifest::new(epoch(), vec![record], TEST_LIMITS),
+            Err(ModuleProvenanceError::PayloadTransparencyMismatch {
+                expected: PayloadTransparency::Mixed,
+                actual: PayloadTransparency::Opaque,
+                ..
+            })
+        ));
+    }
+
+    /// Destructure a verdict that must be a collision, with the offending verdict in the
+    /// failure message. One helper rather than a destructure-or-panic at each site.
+    fn expect_collision(verdict: IdentityVerdict, context: &str) -> IdentityCollision {
+        match verdict {
+            IdentityVerdict::Collision(collision) => collision,
+            other => fixture_panic!("{context}: expected a collision verdict, got {other:?}"),
+        }
+    }
+
+    /// A manifest that differs from `sample_manifest` in one authoritative field, used
+    /// as the second canonical value in the collision model.
+    fn other_manifest() -> ModuleProvenanceManifest {
+        let mut records = sample_records();
+        records[0].declarations = vec![name("A.one"), name("A.different")].into();
+        ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("the variant manifest validates")
+    }
+
+    /// Identity is decided by the exact canonical value. The root is a *locator* and a
+    /// fast inequality check, never the equality test itself.
+    #[test]
+    fn identity_equality_is_exact_canonical_value_and_the_root_is_only_a_locator() {
+        let held = sample_manifest();
+        let same = sample_manifest();
+        let other = other_manifest();
+
+        assert_eq!(held.classify_candidate(&same), IdentityVerdict::Idempotent);
+        assert_eq!(held.classify_candidate(&other), IdentityVerdict::Distinct);
+        assert_ne!(held.root(), other.root());
+
+        // A decoded candidate recomputes its own root at construction, so it cannot
+        // arrive claiming an identity its bytes do not have. That is the precondition
+        // `classify_identity` relies on, asserted rather than assumed.
+        let decoded = ModuleProvenanceManifest::from_canonical_bytes(
+            &other.to_canonical_bytes(),
+            TEST_LIMITS,
+        )
+        .expect("the variant round-trips");
+        assert_eq!(decoded.root(), other.root());
+        assert_eq!(decoded.verify_self_consistency(), Ok(()));
+        assert_eq!(held.verify_self_consistency(), Ok(()));
+    }
+
+    /// **Bounded-model collision seam.**
+    ///
+    /// This test does NOT find a digest collision and must never be cited as evidence
+    /// that one exists. It *injects* the equality a collision would produce — by
+    /// handing `classify_identity` two genuinely different canonical values under one
+    /// root — and asks the only question that matters if collision resistance ever
+    /// failed: does the schema still tell the two values apart? Claim type is
+    /// `bounded_model`; collision resistance itself remains a HYPOTHESIS of the digest,
+    /// never an injectivity proof.
+    ///
+    /// This is also why `classify_identity` takes roots and bytes separately instead of
+    /// re-deriving the digest: re-deriving would make the injection impossible and the
+    /// property untestable.
+    #[test]
+    fn a_bounded_model_collision_stays_distinguishable_and_is_reported_not_resolved() {
+        let held = sample_manifest();
+        let other = other_manifest();
+        let held_bytes = held.to_canonical_bytes();
+        let other_bytes = other.to_canonical_bytes();
+        assert_ne!(
+            held_bytes, other_bytes,
+            "the model needs two genuinely different canonical values"
+        );
+
+        // The counterfactual: assume these two values digest alike. Only `other`'s root
+        // is replaced; its bytes are untouched.
+        let injected = classify_identity(
+            (held.root(), &held_bytes),
+            (held.root(), &other_bytes), // <- `other`'s value under `held`'s root
+        );
+        let collision = expect_collision(injected, "an injected equal-digest/unequal-value pair");
+        assert_eq!(collision.root, held.root());
+        assert_eq!(collision.held_len, held_bytes.len());
+        assert_eq!(collision.candidate_len, other_bytes.len());
+        // First-divergence data must actually locate the disagreement, so the outcome is
+        // diagnosable from the artifact alone.
+        assert!(collision.first_divergence < held_bytes.len().max(other_bytes.len()));
+        assert_eq!(
+            held_bytes[..collision.first_divergence],
+            other_bytes[..collision.first_divergence],
+            "everything before the reported divergence must actually agree"
+        );
+
+        // Reported, never resolved: the seam picks no winner. Swapping the two sides
+        // yields a collision again with the lengths exchanged and the same offset — if
+        // either side were being preferred, the swap would disagree.
+        let swapped = classify_identity((held.root(), &other_bytes), (held.root(), &held_bytes));
+        let swapped = expect_collision(swapped, "the verdict must not depend on argument order");
+        assert_eq!(swapped.first_divergence, collision.first_divergence);
+        assert_eq!(swapped.held_len, collision.candidate_len);
+        assert_eq!(swapped.candidate_len, collision.held_len);
+
+        // The digest's *inequality* remains conclusive — that direction never depends on
+        // collision resistance, because a hash cannot report different for equal inputs.
+        assert_eq!(
+            classify_identity((held.root(), &held_bytes), (other.root(), &other_bytes)),
+            IdentityVerdict::Distinct
+        );
+        // And equal value under one root is still idempotent, so the collision arm has
+        // not swallowed the common case.
+        assert_eq!(
+            classify_identity((held.root(), &held_bytes), (held.root(), &held_bytes)),
+            IdentityVerdict::Idempotent
+        );
+    }
+
+    /// A strict-prefix pair is the boundary case for first-divergence reporting: there
+    /// is no disagreeing byte, so the offset must be the shorter length rather than a
+    /// panic or a silent zero.
+    #[test]
+    fn a_prefix_collision_reports_the_shorter_length_as_its_divergence() {
+        let held = sample_manifest();
+        let bytes = held.to_canonical_bytes();
+        let truncated = &bytes[..bytes.len() - 1];
+        let collision = expect_collision(
+            classify_identity((held.root(), &bytes), (held.root(), truncated)),
+            "a strict prefix is a different canonical value",
+        );
+        assert_eq!(collision.first_divergence, truncated.len());
+        assert_eq!(collision.held_len, bytes.len());
+        assert_eq!(collision.candidate_len, truncated.len());
+    }
+
+    /// The same shape means two different things depending on where it is found.
+    /// Arriving from outside it is untrusted input and a normal thing to refuse; found
+    /// inside validated state it is an invariant failure, and FL-INV-07 forbids
+    /// rendering that as a verdict about the module.
+    #[test]
+    fn the_same_inconsistency_inside_validated_state_is_an_internal_fault() {
+        let healthy = sample_manifest();
+        assert_eq!(healthy.verify_self_consistency(), Ok(()));
+
+        // Only reachable from inside the module: the constructor recomputes the root, so
+        // no external caller can build this state. That is exactly why finding it later
+        // is a fault rather than a rejection.
+        let mut corrupted = sample_manifest();
+        corrupted.root = ModuleProvenanceRoot(Digest([0x00; 32]));
+        let error = corrupted
+            .verify_self_consistency()
+            .expect_err("a corrupted validated manifest must fault");
+        assert!(matches!(
+            error,
+            ModuleProvenanceError::InternalFault { held, recomputed, .. }
+                // ubs:ignore — test-only public content root, not authentication material.
+                if held == ModuleProvenanceRoot(Digest([0x00; 32]))
+                    // ubs:ignore — test-only public content root, not authentication material.
+                    && recomputed == healthy.root()
+        ));
+        // It is a fault, not any of the refusals a malformed input earns.
+        assert!(!matches!(
+            error,
+            ModuleProvenanceError::MalformedEncoding { .. }
+                | ModuleProvenanceError::NonCanonicalEncoding
+        ));
+        assert!(
+            error.to_string().contains("internal fault"),
+            "the fault must be self-identifying in diagnostics: {error}"
+        );
+    }
+
+    /// The named mutant this kills: *alias `ExtensionEntryId` to the mutable journal
+    /// ordinal*. If the target position were folded into the identity, replaying the
+    /// same module's contribution at a different journal offset would silently rename
+    /// every entry, and no downstream consumer could recognise an entry across a
+    /// rebase, restore, or merge.
+    #[test]
+    fn entry_identity_is_content_derived_and_survives_journal_rebasing() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let entries = vec![entry(0x41), entry(0x42)];
+
+        let rebase = |start: u64| {
+            let mut records = sample_records();
+            records[0].extension_contributions = vec![ExtensionContribution::new(
+                descriptor.clone(),
+                start,
+                Digest([0x31; 32]),
+                entries.clone(),
+            )]
+            .into();
+            ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+                .expect("a rebased range is still a valid manifest")
+        };
+
+        let at_seven = rebase(7);
+        let at_zero = rebase(0);
+        let far = rebase(1_000_000);
+
+        // Rebasing invariance: the ids are byte-identical at every applied offset.
+        for rebased in [&at_zero, &far] {
+            assert_eq!(
+                at_seven.records()[0].extension_contributions()[0].entries(),
+                rebased.records()[0].extension_contributions()[0].entries(),
+                "a journal offset must not rename an entry"
+            );
+        }
+
+        // The applied range is still authoritative committed state, so moving it does
+        // change the aggregate root. Identity-stability must not be bought by dropping
+        // the range from the canonical bytes.
+        assert_ne!(at_seven.root(), at_zero.root());
+        assert_ne!(at_seven.root(), far.root());
+
+        // Source ordinal and target position are two coordinates, not aliases.
+        let contribution = &at_seven.records()[0].extension_contributions()[0];
+        assert_eq!(contribution.source_ordinal(0), Some(0));
+        assert_eq!(contribution.source_ordinal(1), Some(1));
+        assert_eq!(contribution.target_position(0), Some(7));
+        assert_eq!(contribution.target_position(1), Some(8));
+        assert_eq!(contribution.source_ordinal(2), None);
+        assert_eq!(contribution.target_position(2), None);
+        assert_eq!(contribution.end(), Some(9));
+
+        // The mutant, executed rather than merely described: derive the id the way the
+        // rejected design would have, by folding the target position in. If that mutant
+        // were also offset-invariant the assertions above would be vacuous, so this
+        // proves the property discriminates instead of holding for free.
+        let mutant = |start: u64| {
+            let mut writer = CanonWriter::new();
+            writer.schema(EXTENSION_ENTRY_ID_SCHEMA);
+            writer.str(epoch().tag());
+            writer.str(epoch().commit());
+            descriptor.name.write_body(&mut writer);
+            writer.u8(merge_semantics_tag(descriptor.merge));
+            writer.u8(checkpoint_semantics_tag(descriptor.checkpoint));
+            writer.u8(payload_provenance_tag(descriptor.provenance));
+            writer.bytes(&[0x41]);
+            writer.u64(start); // the defect: a rebasable journal coordinate
+            hash(Domain::ModuleProvenance, &writer.into_bytes())
+        };
+        assert_ne!(
+            mutant(7),
+            mutant(0),
+            "the position-folding mutant must be offset-sensitive, or this test proves nothing"
+        );
+        assert_ne!(
+            ExtensionEntryId::from_digest(mutant(7)),
+            entry(0x41),
+            "the shipped derivation must not be the position-folding mutant"
+        );
+    }
+
+    /// The identity's input set is exactly epoch + descriptor + payload. Every one of
+    /// those must move it, and the excluded facts must not — that pair of claims is
+    /// what makes the id a *content* id rather than a position or a contributor tag.
+    #[test]
+    fn entry_identity_binds_epoch_descriptor_and_payload_and_nothing_else() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let baseline = ExtensionEntryId::derive(&epoch(), &descriptor, &[0x41]);
+
+        // Each authoritative input moves the identity.
+        let mut moved = BTreeSet::new();
+        moved.insert(baseline);
+        moved.insert(ExtensionEntryId::derive(
+            &ModuleEpoch::new("v4.33.0", PIN_COMMIT),
+            &descriptor,
+            &[0x41],
+        ));
+        moved.insert(ExtensionEntryId::derive(&epoch(), &descriptor, &[0x42]));
+        moved.insert(ExtensionEntryId::derive(&epoch(), &descriptor, &[]));
+        for altered in [
+            extension_descriptor("otherExt", PayloadProvenance::Understood),
+            extension_descriptor("simpExt", PayloadProvenance::Opaque),
+            ExtensionDescriptor {
+                merge: MergeSemantics::SetUnion,
+                ..descriptor.clone()
+            },
+            ExtensionDescriptor {
+                checkpoint: CheckpointSemantics::FullJournal,
+                ..descriptor.clone()
+            },
+        ] {
+            moved.insert(ExtensionEntryId::derive(&epoch(), &altered, &[0x41]));
+        }
+        assert_eq!(
+            moved.len(),
+            8,
+            "an authoritative input failed to move the id"
+        );
+
+        // The excluded facts do not move it: the same payload contributed by a
+        // different module, at a different source ordinal, in a different range, is the
+        // same entry.
+        let elsewhere = ExtensionContribution::new(
+            descriptor.clone(),
+            4_096,
+            Digest([0xAB; 32]),
+            vec![entry(0x99), entry(0x41)],
+        );
+        assert_eq!(elsewhere.entries()[1], baseline);
+        assert_eq!(elsewhere.source_ordinal(1), Some(1));
+        assert_eq!(elsewhere.target_position(1), Some(4_097));
+    }
+
+    /// Equal descriptor and payload share one content id by construction; occurrences
+    /// stay distinct through `(ModuleId, source ordinal, entry id)`. This is what lets
+    /// duplicate replay data be retained without collapsing it.
+    #[test]
+    fn equal_payloads_share_one_content_id_while_occurrences_stay_distinct() {
+        let descriptor = extension_descriptor("simpExt", PayloadProvenance::Understood);
+        let repeated = entry(0x41);
+        let mut records = sample_records();
+        records[0].extension_contributions = vec![ExtensionContribution::new(
+            descriptor,
+            7,
+            Digest([0x31; 32]),
+            vec![repeated, repeated, entry(0x42)],
+        )]
+        .into();
+        let manifest = ModuleProvenanceManifest::new(epoch(), records, TEST_LIMITS)
+            .expect("repeated occurrences are ordered replay data, not a duplicate error");
+
+        let contribution = &manifest.records()[0].extension_contributions()[0];
+        assert_eq!(
+            contribution.entries().len(),
+            3,
+            "an occurrence was collapsed"
+        );
+        assert_eq!(contribution.entries()[0], contribution.entries()[1]);
+        assert_ne!(contribution.entries()[0], contribution.entries()[2]);
+
+        // The two identical entries are the same *entry* at two different occurrences.
+        assert_ne!(
+            contribution.source_ordinal(0),
+            contribution.source_ordinal(1)
+        );
+        assert_ne!(
+            contribution.target_position(0),
+            contribution.target_position(1)
+        );
+
+        // Retention is observable in the canonical bytes, not just in memory.
+        let bytes = manifest.to_canonical_bytes().to_vec();
+        let decoded = ModuleProvenanceManifest::from_canonical_bytes(&bytes, TEST_LIMITS)
+            .expect("repeated occurrences round-trip");
+        assert_eq!(decoded.root(), manifest.root());
+        assert_eq!(
+            decoded.records()[0].extension_contributions()[0].entries(),
+            contribution.entries()
         );
     }
 
@@ -2517,8 +6053,8 @@ mod tests {
                     },
                     vec![],
                     ProvenanceCompleteness::new(
-                        DecodeCompleteness::Complete,
-                        ExtensionKnowledge::AllUnderstood,
+                        CaptureStatus::Complete,
+                        PayloadTransparency::Understood,
                         vec![],
                     ),
                 )

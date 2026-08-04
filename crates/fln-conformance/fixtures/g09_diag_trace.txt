@@ -1,0 +1,39 @@
+[diag] Diagnostics
+  [reduction] unfolded reducible declarations (max: 9, num: 1):
+    [reduction] outParam ↦ 9
+  [type_class] used instances (max: 2, num: 3):
+    [type_class] instAddNat ↦ 2
+    [type_class] instHAdd ↦ 2
+    [type_class] Lean.Grind.CommRing.OfCommSemiring.instOfNatQ ↦ 2
+  use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
+[diag] Diagnostics
+  [reduction] unfolded reducible declarations (max: 9, num: 1):
+    [reduction] outParam ↦ 9
+  [type_class] used instances (max: 4, num: 4):
+    [type_class] Lean.Grind.CommRing.OfCommSemiring.instOfNatQ ↦ 4
+    [type_class] instAddNat ↦ 2
+    [type_class] instHAdd ↦ 2
+    [type_class] instOfNatNat ↦ 2
+  use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
+[diag] Diagnostics
+  [reduction] unfolded declarations (max: 2, num: 3):
+    [reduction] wrapped ↦ 2
+    [reduction] Add.add ↦ 2
+    [reduction] HAdd.hAdd ↦ 2
+  [reduction] unfolded reducible declarations (max: 9, num: 1):
+    [reduction] outParam ↦ 9
+  [type_class] used instances (max: 4, num: 4):
+    [type_class] Lean.Grind.CommRing.OfCommSemiring.instOfNatQ ↦ 4
+    [type_class] instAddNat ↦ 2
+    [type_class] instHAdd ↦ 2
+    [type_class] instOfNatNat ↦ 2
+  [kernel] unfolded declarations (max: 2, num: 4):
+    [kernel] instOfNatNat ↦ 2
+    [kernel] Add.add ↦ 2
+    [kernel] HAdd.hAdd ↦ 2
+    [kernel] OfNat.ofNat ↦ 2
+  use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
+[diag] Diagnostics
+  [reduction] unfolded declarations (max: 3, num: 1):
+    [reduction] id ↦ 3
+  use `set_option diagnostics.threshold <num>` to control threshold for reporting counters

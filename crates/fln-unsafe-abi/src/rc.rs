@@ -49,11 +49,13 @@ pub struct Header {
 #[allow(unsafe_code)]
 pub(crate) unsafe fn read_header(o: *mut LeanObject) -> Header {
     debug_assert!(!is_scalar(o));
-    // SAFETY: live object per caller contract; plain reads mirror the C
-    // fast-path access discipline.
+    // SAFETY: live object per caller contract. `m_rc` goes through the atomic
+    // probe because it is concurrently modified on MT objects; the other three
+    // fields are plain reads, which is sound because nothing ever writes them
+    // after `init_st_header` — they are immutable for the object's lifetime.
     unsafe {
         Header {
-            rc: (&raw const (*o).m_rc).read(),
+            rc: atomic_rc(o).load(Ordering::Relaxed),
             cs_sz: (&raw const (*o).m_cs_sz).read(),
             other: (&raw const (*o).m_other).read(),
             tag: (&raw const (*o).m_tag).read(),
@@ -77,9 +79,51 @@ pub(crate) unsafe fn init_st_header(o: *mut LeanObject, tag: u8, other: u8) {
     }
 }
 
-/// `lean_get_rc_mt_addr` (`lean.h:552-554`): the MT branches address `m_rc`
-/// atomically while ST/persistent branches read it plainly — the exact mixed
-/// discipline the Reference compiles to.
+/// The multi-threaded header (`lean_set_task_header`, `object.cpp:1125-1130`):
+/// born with one MT token (`m_rc = -1`). `m_cs_sz` keeps the membrane's size
+/// prefix — the disclosed deviation from the pin's zeroing (task_manager.rs
+/// module doc).
+///
+/// # Safety
+/// Exclusive access to a fresh allocation.
+// UNSAFE-LEDGER: FLN-UL-0243
+#[allow(unsafe_code)]
+pub(crate) unsafe fn init_mt_header(o: *mut LeanObject, tag: u8, other: u8) {
+    // SAFETY: exclusive access to a fresh allocation.
+    unsafe {
+        (&raw mut (*o).m_rc).write(-1);
+        (&raw mut (*o).m_other).write(other);
+        (&raw mut (*o).m_tag).write(tag);
+    }
+}
+
+/// `lean_get_rc_mt_addr` (`lean.h:552-554`): the atomic view of `m_rc`.
+///
+/// EVERY read of `m_rc` goes through here as a `Relaxed` load, including the
+/// mode probes that only want to know which arm of the tri-state protocol
+/// applies. That is a deliberate DIVERGENCE from the Reference, which reads
+/// plainly on the ST/persistent branches.
+///
+/// The reason: on an MT object other threads are performing atomic
+/// read-modify-writes on this exact address, so a plain `ptr::read` races with
+/// them. Miri reports "Data race detected between (1) non-atomic read and (2)
+/// atomic read-modify-write" on precisely this shape, and `mt_stress` drives it
+/// thousands of times per run. Aligned 32-bit loads do not tear on any
+/// certified platform, so the value was never wrong in practice — but a data
+/// race is UB by the memory model whatever the hardware does, and the crate
+/// whose job is to promise memory safety across a threading boundary cannot
+/// rest on "the compiler probably will not exploit this". Upstream's C++ has
+/// the same shape and gets away with it because no sanitizer is pointed at it.
+///
+/// `Relaxed` is the right strength and costs nothing (the same `mov` on x86-64
+/// and aarch64): a probe deliberately accepts a possibly-stale value, and
+/// whichever arm it selects re-establishes its own guarantee — the MT arm
+/// through its `AcqRel` RMW, the ST arm through the single-owner invariant that
+/// makes a stale read impossible there.
+///
+/// The WRITE side still matches the Reference exactly: ST writes stay plain,
+/// because the single-owner invariant means nothing else can be touching them,
+/// and the ST-to-MT transition happens before the object is published.
 ///
 /// # Safety
 /// `o` live object; `m_rc` is 4-aligned by the header layout.
@@ -105,11 +149,18 @@ pub(crate) unsafe fn inc_ref_n(o: *mut LeanObject, n: usize) {
     // SAFETY: live object; ST branch has single-thread exclusivity by the
     // tri-state invariant, MT branch is atomic.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 0 {
             let n = i32::try_from(n).expect("rc increment overflows i32");
-            debug_assert!(rc.checked_add(n).is_some(), "single-threaded RC overflow");
-            (&raw mut (*o).m_rc).write(rc.wrapping_add(n));
+            // Faults in every profile, deliberately. A wrapped ST count is not
+            // a large count — it is a negative one, and `m_rc < 0` *is* the MT
+            // encoding here, so wrapping would silently hand the object to the
+            // atomic path with nothing synchronizing it. This guard was a
+            // `debug_assert!` beside a `wrapping_add`, i.e. absent from release
+            // builds; `st_refcount_overflow_faults_rather_than_wrapping_into_the_mt_encoding`
+            // fails in `--release` without the `checked_add`.
+            let next = rc.checked_add(n).expect("single-threaded RC overflow");
+            (&raw mut (*o).m_rc).write(next);
         } else if rc != 0 {
             atomic_rc(o).fetch_sub(
                 i32::try_from(n).expect("rc increment overflows i32"),
@@ -131,7 +182,7 @@ pub(crate) unsafe fn dec_ref(o: *mut LeanObject) {
     }
     // SAFETY: live object; branches mirror the upstream inline exactly.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 1 {
             (&raw mut (*o).m_rc).write(rc - 1);
         } else if rc != 0 {
@@ -156,7 +207,7 @@ unsafe fn dec_child(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
     // SAFETY: live object; mirrors object.cpp's dec() including the MT
     // acquire-release handshake on the last release.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc > 1 {
             (&raw mut (*o).m_rc).write(rc - 1);
         } else if rc == 1 {
@@ -269,21 +320,42 @@ unsafe fn del_core(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
                 membrane::release_with_size(o, sz, "del.ref");
             }
             t if t == TAG_TASK => {
-                let (v, imp) = object::task_fields(o);
-                debug_assert!(
-                    imp.is_null(),
-                    "scheduled tasks require fln-3gv (deactivate_task)"
-                );
-                if !imp.is_null() {
-                    shadow::on_traversal_skip(TAG_TASK, "del.task.imp");
+                if let Some(mgr) = crate::task_manager::manager() {
+                    // `deactivate_task` (object.cpp:1025-1037,1115-1121):
+                    // finished tasks release value + block; unfinished ones
+                    // are stripped and left Deactivated for the manager's
+                    // own transitions to free. The manager pushes exactly
+                    // the references this teardown owes to the todo stack.
+                    mgr.deactivate_for_teardown(
+                        crate::task_manager::TaskPtr(o.cast()),
+                        &mut |child| dec_child(child, todo),
+                    );
+                } else {
+                    let (v, imp) = object::task_fields(o);
+                    debug_assert!(
+                        imp.is_null(),
+                        "scheduled tasks cannot exist without the task manager"
+                    );
+                    if !imp.is_null() {
+                        shadow::on_traversal_skip(TAG_TASK, "del.task.imp");
+                    }
+                    if !v.is_null() {
+                        dec_child(v, todo);
+                    }
+                    membrane::release_with_size(o, sz, "del.task");
                 }
-                if !v.is_null() {
-                    dec_child(v, todo);
-                }
-                membrane::release_with_size(o, sz, "del.task");
             }
             t if t == TAG_PROMISE => {
                 let r = (&raw const (*o.cast::<LeanPromiseObject>()).m_result).read();
+                if let Some(mgr) = crate::task_manager::manager() {
+                    // `deactivate_promise` (object.cpp:1314-1318): dropping
+                    // an unresolved promise resolves its task to `none`
+                    // (box 0) and wakes every waiter, then releases the
+                    // promise's task token.
+                    if !r.is_null() {
+                        mgr.resolve(crate::task_manager::TaskPtr(r), crate::tagged::boxi(0));
+                    }
+                }
                 if !r.is_null() {
                     dec_child(r.cast::<LeanObject>(), todo);
                 }
@@ -312,10 +384,19 @@ unsafe fn del_core(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
 // UNSAFE-LEDGER: FLN-UL-0043
 #[allow(unsafe_code)]
 pub(crate) unsafe fn dec_ref_cold(o: *mut LeanObject) {
-    // SAFETY: mirrors the upstream cold path exactly; the AcqRel fetch_add
-    // pairs MT decrements so exactly one thread observes -1 and frees.
+    // The cold path is also a public entry point, and it was the only RC
+    // entry that skipped the shadow: a double-release or a foreign pointer
+    // through it recorded nothing and proceeded to free (review finding).
+    // Same law as every sibling: check first, and on a failed check release
+    // nothing.
+    if !shadow::check_rc_target(o as usize, "dec_ref_cold") {
+        return;
+    }
+    // SAFETY: live object; mirrors the upstream cold path exactly; the AcqRel
+    // fetch_add pairs MT decrements so exactly one thread observes -1 and
+    // frees.
     unsafe {
-        let rc = (&raw const (*o).m_rc).read();
+        let rc = atomic_rc(o).load(Ordering::Relaxed);
         if rc == 1 || atomic_rc(o).fetch_add(1, Ordering::AcqRel) == -1 {
             let mut todo: Vec<*mut LeanObject> = Vec::new();
             del_core(o, &mut todo);
@@ -368,7 +449,7 @@ pub(crate) unsafe fn mark_mt(o: *mut LeanObject) {
     // SAFETY: as mark_persistent; only ST objects are flipped, exactly as
     // upstream (`if (lean_is_scalar(o) || !lean_is_st(o)) return`).
     unsafe {
-        if (&raw const (*o).m_rc).read() <= 0 {
+        if atomic_rc(o).load(Ordering::Relaxed) <= 0 {
             return;
         }
         let mut todo = vec![o];
@@ -386,9 +467,32 @@ pub(crate) unsafe fn mark_mt(o: *mut LeanObject) {
     }
 }
 
+/// `mark_persistent_fn` (`object.cpp:542-545`): the closure target the
+/// external arm hands to a class's `m_foreach`.
+// UNSAFE-LEDGER: FLN-UL-0312
+#[allow(unsafe_code)]
+extern "C" fn mark_persistent_fn(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: o is a live child the foreach yields; marking never frees.
+    unsafe {
+        mark_persistent(o);
+    }
+    crate::tagged::boxi(0)
+}
+
+/// `mark_mt_fn` (`object.cpp:625-628`): the mt-walk sibling.
+// UNSAFE-LEDGER: FLN-UL-0313
+#[allow(unsafe_code)]
+extern "C" fn mark_mt_fn(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: o is a live child the foreach yields; marking never frees.
+    unsafe {
+        mark_mt(o);
+    }
+    crate::tagged::boxi(0)
+}
+
 /// Shared child-traversal for the mark walks (the category switches of
-/// `object.cpp:571-617` / `646-681` minus the external/task arms the slice
-/// cannot run).
+/// `object.cpp:571-617` / `646-681`; the external arm applies the class's
+/// `m_foreach` with the op's marking closure, the pin's own mechanism).
 ///
 /// # Safety
 /// `o` live object with header `h`; `todo` receives borrowed child pointers.
@@ -412,15 +516,42 @@ unsafe fn push_children(
         match h.tag {
             t if t == TAG_SCALAR_ARRAY || t == TAG_STRING || t == TAG_MPZ => {}
             t if t == TAG_EXTERNAL => {
-                debug_assert!(
-                    false,
-                    "external traversal requires apply machinery (franken_lean-7xe)"
-                );
-                shadow::on_traversal_skip(TAG_EXTERNAL, op);
+                // The pin's arm exactly (object.cpp:582-587 persistent,
+                // 663-668 mt): the class's m_foreach applies a marking
+                // closure per boxed child. Implementable since 83r slice
+                // 4's apply machinery landed — this closes the slice-1
+                // restriction (franken_lean-7xe) that used to refuse here;
+                // an unknown op still refuses rather than guessing a walk.
+                let target: *mut core::ffi::c_void = match op {
+                    "mark_persistent" => mark_persistent_fn as *mut core::ffi::c_void,
+                    "mark_mt" => mark_mt_fn as *mut core::ffi::c_void,
+                    _ => {
+                        debug_assert!(false, "external traversal under unknown op {op}");
+                        shadow::on_traversal_skip(TAG_EXTERNAL, op);
+                        return;
+                    }
+                };
+                let (class, data) = object::external_fields(o);
+                let f = object::alloc_closure(target, 1, 0);
+                ((*class).m_foreach)(data, f);
+                dec_ref(f);
             }
             t if t == TAG_TASK => {
-                let (v, imp) = object::task_fields(o);
-                debug_assert!(imp.is_null(), "scheduled tasks require fln-3gv");
+                // The pin's traversal FORCES a task (`lean_task_get`,
+                // object.cpp:589/664): marking blocks until the task is
+                // finished, then walks its value.
+                let (mut v, imp) = object::task_fields(o);
+                if v.is_null() {
+                    if let Some(mgr) = crate::task_manager::manager() {
+                        mgr.wait_for(crate::task_manager::TaskPtr(o.cast()));
+                        v = object::task_fields(o).0;
+                    } else {
+                        debug_assert!(
+                            imp.is_null(),
+                            "scheduled tasks cannot exist without the task manager"
+                        );
+                    }
+                }
                 if !v.is_null() {
                     todo.push(v);
                 }

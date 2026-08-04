@@ -3,9 +3,37 @@
 > **@generated** by `scripts/extract/gen_abi_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.
 > Layout constants are derived, never remembered; regenerate with the script.
 >
-> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
+> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> — the tag and commit above are **transcribed from `SUITE.lock`** and this
+>   extractor verifies neither. The **tree is established at the producer**:
+>   every run, before anything is rendered, invokes the one predicate in this
+>   repository that establishes it — `scripts/evidence.py vendor-binding`,
+>   the same one `scripts/verify_vendor_tree.sh` runs lane-side — which
+>   recomputes the staged `vendor/lean4-src` tree and refuses unless it equals
+>   the pinned tree. The extractor calls that predicate rather than
+>   reimplementing tree hashing, so no second copy of it exists.
+> — the **outcome is typed on stderr and is deliberately NOT rendered here**,
+>   in three states: `established`; `inconclusive`, where the repository
+>   `.git` is absent or is not a directory so the predicate cannot run at all
+>   — an FL-INV-07 environment fault, never a verdict about the tree and
+>   never a silent pass; and a hard failure, which *is* a verdict and stops
+>   extraction. These bytes do not vary with that outcome on purpose: a cold
+>   root built by `git archive` has no `.git`, so an artifact that varied
+>   would report `--check` DRIFT for the ENVIRONMENT rather than for the
+>   contract. The artifact states the rule; the run states the result.
+> — so what remains UNESTABLISHED here is narrow and named: a run whose
+>   establishment came back `inconclusive` renders these same bytes, and
+>   only its stderr says so. Bead
+>   `franken_lean-contract-pin-tree-producer-side-f8zo`.
+> — what this extractor **does** establish: the vendored source below is
+>   byte-identical to the installed pinned toolchain's own copy of it, and the
+>   extraction fails if they differ. That source set is complete — this
+>   extractor reads exactly one vendored file and records exactly one sha256,
+>   which is the one dimension in which it is NOT short where the `.olean`
+>   extractor was (bead `franken_lean-contract-pin-tree-unestablished-monc`).
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
-> inventory: `contracts/abi_inventory.json` sha256 `f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254`
+> inventory: `contracts/abi_inventory.json` sha256 `3eefadc8e70c2fd711a95d47e033d26f7451d6066a06adbf0eedd7790d1018f6`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)
 > rust (boundary): `crates/fln-unsafe-abi/src/contract.rs` (layout partition, `pub(crate)`, same inventory)
 
@@ -182,7 +210,7 @@ The reference-count field `m_rc` encodes thread-state: `> 0` single-threaded,
 
 ## 5. Function census
 
-210 `LEAN_EXPORT` prototypes; 565 `static inline` definitions.
+211 `LEAN_EXPORT` prototypes; 565 `static inline` definitions.
 Ownership classes: `owned_arg`/`borrowed_arg`/`unique_arg` (`lean_obj_arg`/
 `b_lean_obj_arg`/`u_lean_obj_arg`), `owned_res`/`borrowed_res`, `raw_object`
 (bare `lean_object *`), `value` (non-object). Duplicate names arise from
@@ -705,6 +733,7 @@ platform `#if` branches and are intentional; rows are keyed by (name, line).
 | `lean_nat_sub` | inline | (a1: borrowed_arg, a2: borrowed_arg) -> owned_res | 1430 |
 | `lean_nat_succ` | inline | (a: borrowed_arg) -> owned_res | 1416 |
 | `lean_nat_to_int` | inline | (a: owned_arg) -> owned_res | 1641 |
+| `lean_notify_assert` | export | (fileName: value, line: value, condition: value) -> value | 66 |
 | `lean_obj_once` | inline | (loc: raw_object, tok: value, raw_object) -> raw_object | 3278 |
 | `lean_obj_once_cold` | export | (loc: raw_object, tok: value, raw_object) -> raw_object | 3276 |
 | `lean_obj_tag` | inline | (o: raw_object) -> value | 597 |

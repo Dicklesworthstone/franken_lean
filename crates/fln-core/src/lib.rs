@@ -16,16 +16,28 @@
 //!   (including the `imax u 0 = 0` collapse Prop impredicativity depends on);
 //! * [`expr`] — the kernel expression inventory with per-constructor cached data;
 //! * [`options`] — `KVMap`/`DataValue` and the canonical resource limits;
+//! * [`outcome`] — the FL-INV-07 operation-outcome algebra: complete / inconclusive /
+//!   internal-fault, kept orthogonal to the [`diag`] cause vocabulary;
 //! * [`pos`] — byte positions and the `FileMap` line/column model;
 //! * [`ids`] — the distinct semantic-kind newtypes of §8.2b.
+//!
+//! [`scratch`] is the deliberate exception to "term-plane vocabulary": the
+//! workspace's single test-scratch reclaimer lives at rank 0 so every harness
+//! stands behind one fence with zero new dependency edges (bead
+//! `franken_lean-eir2`, Option B; the decision record is the module's own header).
 
 #![forbid(unsafe_code)]
+
+mod debug_walk;
 
 pub mod diag;
 pub mod expr;
 pub mod ids;
 pub mod lean_hash;
 pub mod level;
+pub mod mode;
 pub mod name;
 pub mod options;
+pub mod outcome;
 pub mod pos;
+pub mod scratch;

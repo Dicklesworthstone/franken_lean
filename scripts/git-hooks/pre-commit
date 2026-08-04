@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# Pre-commit governance guard:
+#
+#   * ci/KERNEL_CONTRACT_OWNERSHIP.jsonl may never lag .beads/issues.jsonl
+#     (bead franken_lean-projection-republish-mechanical-voz4).
+#   * ci/VERIFICATION_MANIFEST.jsonl must carry complete human judgment for the
+#     prospective tracker whenever the tracker, manifest, or validator changes
+#     (bead franken_lean-e5k7).
+#   * a crate root this commit adds or modifies must carry its D3 unsafe-posture
+#     attribute (bead franken_lean-d3-root-attr-no-creation-affordance-sso4).
+#
+# WHY THIS EXISTS. The projection is a canonical hash over the sorted id set of
+# .beads/issues.jsonl. A commit that carries the JSONL without a matching
+# projection leaves HEAD with a binding over the wrong id set, and the
+# kernel_contract suite then fails `bead-evidence/stale-binding` — turning
+# cargo test red WORKSPACE-WIDE for every agent, not just the one who committed.
+#
+# It is a missing mechanism, not a knowledge gap. Four separate agents violated
+# the rule on 2026-07-25 alone, each of whom knew it and had followed it
+# correctly earlier the same day. The reasons are structural: the two files live
+# in unrelated trees, nothing fails at commit time, and the agent who forgets is
+# never the one who sees the red. The fourth instance was worse — an incidental
+# `git add` by an agent who had not touched beads at all swept the JSONL into
+# its commit, so no amount of care by the bead's author could have prevented it.
+#
+# WHAT IT CHECKS, and why each detail matters:
+#
+#   * It fires on ANY commit whose prospective tree changes the JSONL, including
+#     an incidental sweep by someone who never ran `br`. A guard scoped to
+#     "commits that look like bead commits" would miss the fourth instance,
+#     which is the one no agent could have caught by being careful.
+#   * It projects from the PROSPECTIVE tree, not the working tree. Under
+#     `git commit --only` (which this project treats as mandatory on a shared
+#     tree) the index and the working tree differ, and git hands the hook a
+#     temporary index through GIT_INDEX_FILE describing exactly what will be
+#     committed. `git cat-file blob :<path>` reads that, so the guard judges the
+#     commit rather than the checkout.
+#   * It compares BYTE-FOR-BYTE against a freshly regenerated manifest, never by
+#     counting records. Two id sets of equal size with different members produce
+#     the same count and a different projection hash, so a count check passes a
+#     stale binding.
+#   * It regenerates using the publisher BINARY, never a reimplementation of the
+#     projection. A second copy of the algorithm here could drift from the real
+#     one and the guard would certify staleness as fresh.
+#   * A leftover ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate refuses too:
+#     structure-guard already treats that state as typed inconclusive, so
+#     committing across it hands the next agent an unexplained gate failure.
+#
+# The verification-coverage half uses the same prospective-tree rule and the
+# same single-authority rule. It extracts the prospective tracker, manifest, and
+# scripts/evidence.py from Git's index and executes that exact validator. It does
+# not reimplement the adoption boundary, lifecycle derivation, or evidence
+# taxonomy in shell. Coverage lifecycle is projected from the tracker, so a
+# claim or close never needs a hand-maintained state edit. New beads still need
+# judgment rows, and a close whose judgment is incomplete refuses at the commit
+# which creates the debt. A manifest-only or validator-only corruption refuses
+# too, instead of waiting for scripts/check.sh stage 2.
+#
+# THE D3 ROOT-ATTRIBUTE HALF, and why it is a WARNING SITE rather than a second
+# authority. A new file under tests/ (or examples/, benches/, src/bin/) is its
+# own crate root, so D3 requires an inner #![forbid(unsafe_code)] in it. Nothing
+# says so at creation time. The only thing that ever does is structure-guard's
+# FLN-STRUCT-011, which runs after the file is committed and reddens the shared
+# workspace for every pane rather than for the author. Measured three times on
+# 2026-07-27 alone — ee59d283, 7d4c3ba4, 45cba069 — the third landing two hours
+# AFTER the bead documenting the gap was filed, which is the whole argument:
+# documentation demonstrably did not prevent it. The third stood workspace-red
+# for eleven commits, because the fix sat uncommitted in the shared worktree
+# while `structure-guard --root .` read PASS locally for everyone.
+#
+# STRUCTURE-GUARD REMAINS THE AUTHORITY. This check does not reimplement it and
+# must never be read as equivalent. The real predicate is ledger::lint_posture,
+# a Rust attribute parser that resolves inner attributes at delimiter depth 0
+# and deliberately ignores lints nested in cfg_attr; this is a line pattern. So
+# the two can disagree, and the asymmetry is the design: this half ERRS TOWARD
+# PASSING wherever it cannot be sure — an unreadable blob, a boundary crate, a
+# shape it does not recognise — because a false refusal is a wall against a
+# correct commit, while a false pass merely restores the status quo in which
+# structure-guard catches it a few minutes later. That is the opposite of the
+# projection half's fail-closed rule, and it is deliberate: there, an unanswered
+# question IS the defect; here, the defect is already covered downstream.
+#
+# Scope is the auxiliary target dirs, where roots get created casually. The
+# fln-unsafe-* boundary crates are excluded by DERIVED prefix rather than by a
+# list of three names, because their posture rule is the opposite one
+# (#![deny(unsafe_code)], FLN-STRUCT-012) and demanding forbid there would be a
+# wall. src/lib.rs, src/main.rs and build.rs are left to structure-guard: a new
+# primary root means a new crate, which is rare and deliberate.
+#
+# Bypassable with `git commit --no-verify`, which is a deliberate limit: this is
+# a guard that closes the feedback loop at the moment of the mistake, not a
+# proof. Making the failure impossible is Option A on the bead (have whatever
+# writes the JSONL republish), and this does not pretend to be that.
+#
+# Exit codes: 0 pass, 1 refusal (the commit is stale), 2 the guard itself could
+# not decide. It never exits 0 on a question it could not answer.
+
+set -euo pipefail
+
+SOURCE_RELATIVE='.beads/issues.jsonl'
+MANIFEST_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl'
+CANDIDATE_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate'
+VERIFICATION_MANIFEST_RELATIVE='ci/VERIFICATION_MANIFEST.jsonl'
+VERIFICATION_VALIDATOR_RELATIVE='scripts/evidence.py'
+PUBLISHER_DIR='tools/structure-guard/kernel-ownership-publisher'
+PUBLISHER_BIN_NAME='kernel-ownership-publisher'
+WAIT_MS=30000
+
+# Auxiliary Cargo target dirs, whose .rs files are each a crate root. Recursive
+# by design: structure-guard's crate_roots walks tests/ with collect_rs_files,
+# which recurses, so a nested tests/common/mod.rs is a governed root too — and
+# that is exactly the case a depth-1 reading would miss.
+D3_ROOT_PATTERN='^(crates|tools)/[^/]+/(tests|examples|benches|src/bin)/.*\.rs$'
+# Derived, not a list of three names, so a new fln-unsafe-* crate is covered.
+D3_BOUNDARY_PREFIX='crates/fln-unsafe-'
+# Tolerant on purpose: multi-lint forms and interior spacing must not be walls.
+# cfg_attr-nested lints do not match, matching lint_posture's own exclusion.
+D3_ATTR_PATTERN='^[[:space:]]*#![[:space:]]*\[[[:space:]]*forbid[[:space:]]*\([^)]*unsafe_code'
+
+say() { printf 'projection-guard: %s\n' "$1" >&2; }
+coverage_say() { printf 'verification-coverage-guard: %s\n' "$1" >&2; }
+d3_say() { printf 'd3-root-attr-guard: %s\n' "$1" >&2; }
+
+# This hook is reached through core.hooksPath, which makes git ignore
+# .git/hooks/ entirely. Anything installed there — MCP Agent Mail's file
+# reservation guard, most likely — would be silently disabled, and a guard that
+# disables another guard is worse than no guard. So every passing path runs it.
+pass() {
+    local chained='.git/hooks/pre-commit'
+    if [ -x "$chained" ] && ! [ "$chained" -ef "${BASH_SOURCE[0]}" ]; then
+        exec "$chained" "$@"
+    fi
+    exit 0
+}
+
+refuse() {
+    say "REFUSED — $1"
+    say ''
+    say 'This commit changes .beads/issues.jsonl, so it owes a matching'
+    say 'ci/KERNEL_CONTRACT_OWNERSHIP.jsonl. Without one, HEAD binds the wrong id'
+    say 'set and cargo test goes red workspace-wide for every agent.'
+    say ''
+    say 'Fix, then commit both files together:'
+    say "  (cd ${PUBLISHER_DIR} && cargo run --quiet -- --root \"\$(git rev-parse --show-toplevel)\" --wait-ms 30000 --robot)"
+    say "  git add ${MANIFEST_RELATIVE}"
+    say ''
+    say 'If you are certain this commit should not carry a projection, re-run with'
+    say '--no-verify and say why in the commit message.'
+    exit 1
+}
+
+undecided() {
+    say "COULD NOT DECIDE — $1"
+    say 'Refusing rather than passing: an unanswered staleness question is the'
+    say 'state this guard exists to prevent. Resolve and retry.'
+    exit 2
+}
+
+coverage_refuse() {
+    coverage_say "REFUSED — $1"
+    coverage_say ''
+    coverage_say 'The prospective tracker and verification manifest must validate'
+    coverage_say 'together. Lifecycle is derived from the tracker; rows must not'
+    coverage_say 'declare it. New beads need judgment rows, and closed beads need'
+    coverage_say 'complete human-authored evidence in the same commit.'
+    coverage_say ''
+    coverage_say 'Check the exact prospective-tree obligation with:'
+    coverage_say "  python3 -I -S ${VERIFICATION_VALIDATOR_RELATIVE} validate-verification-manifest \\"
+    coverage_say "    --manifest ${VERIFICATION_MANIFEST_RELATIVE} --beads ${SOURCE_RELATIVE}"
+    exit 1
+}
+
+path_changes_in_prospective_tree() {
+    local path=$1
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+        if git diff --cached --quiet HEAD -- "$path"; then
+            return 1
+        fi
+        return 0
+    else
+        git ls-files --cached --error-unmatch -- "$path" >/dev/null 2>&1
+    fi
+}
+
+repo_root=$(git rev-parse --show-toplevel) || undecided 'not inside a git work tree'
+cd "$repo_root" || undecided "cannot enter $repo_root"
+
+# ---- D3 crate-root attribute ------------------------------------------------
+# Deliberately BEFORE the projection half's early exit. A commit that adds a
+# crate root usually touches neither the tracker nor the manifest, so anything
+# gated behind that exit would never look at the commit that matters here.
+d3_changed_roots() {
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+        # --no-renames so a file moved into tests/ is judged as an addition
+        # rather than carried across unexamined as a rename.
+        git diff --cached --name-only --no-renames --diff-filter=AM HEAD
+    else
+        git ls-files --cached
+    fi
+}
+
+d3_missing=''
+d3_skipped=''
+d3_candidates=$(d3_changed_roots | grep -E "$D3_ROOT_PATTERN" || true)
+if [ -n "$d3_candidates" ]; then
+    while IFS= read -r d3_path; do
+        [ -n "$d3_path" ] || continue
+        case "$d3_path" in
+            "$D3_BOUNDARY_PREFIX"*) continue ;;
+        esac
+        if ! d3_text=$(git cat-file blob ":$d3_path" 2>/dev/null); then
+            d3_skipped="${d3_skipped}    ${d3_path} (prospective blob unreadable)"$'\n'
+            continue
+        fi
+        # A herestring, NOT a pipeline, and the difference is a wall. `grep -q` exits on
+        # the first match, so with the attribute near the top of a LARGE blob `printf` is
+        # still writing when the pipe closes, dies of SIGPIPE (141), and `pipefail`
+        # promotes that to the pipeline's status -- so `if !` fired and the guard reported
+        # the attribute MISSING on files that carry it, keyed on nothing but FILE SIZE.
+        # Found by cc_1 against a real 188 KB blob within an hour of the guard landing;
+        # every small fixture passed, which is exactly why it shipped.
+        #
+        # IT IS A RACE WITH A PROBABILISTIC BAND, NOT A THRESHOLD, and the sentence that
+        # stood here said "the threshold is the kernel pipe buffer" -- measured wrong by
+        # its own author at 60b2e176, in the direction that manufactures a false
+        # refutation. Re-measured under bash 5.2.37, 40-100 trials per cell, one variable
+        # per cell; the refusal RATE against real tracked blobs:
+        #
+        #     45 824 B   0/40      48 580 B   0/40      49 919 B   3/40  ( 7%)
+        #     50 627 B   5/100     72 725 B  37/40      76 834 B  39/40  (97%)
+        #     79 774 B  40/40     169 783 B  40/40     261 554 B  40/40  (100%)
+        #
+        # So retry is a FALSE REFUTATION: in the band a re-run passes 5-95% of the time,
+        # and a pane that hits the wall, retries, and sees green concludes there is no
+        # defect. Only above ~80 KB is it deterministic.
+        #
+        # AND THE TRIGGER IS NOT SIZE -- size only correlates. `grep -q` exits as soon as
+        # it holds a complete MATCHING LINE, so what decides the race is how many bytes
+        # `printf` still has unwritten at that instant. Isolated at ~50.6 KB, 100 trials,
+        # newlines the only variable: synthetic one-long-line 0/100; synthetic many short
+        # lines 14/100; the real blob 5/100; THE REAL BLOB'S OWN BYTES WITH NEWLINES
+        # REMOVED 0/100. Same bytes, same size, opposite verdict. Consequence for anyone
+        # writing a cell here: a synthetic size sweep UNDER-REPORTS this defect and is not
+        # a valid control -- use real blobs, or filler with realistic line structure.
+        #
+        # It is a WALL and never a hole -- with the attribute genuinely absent grep reads
+        # to EOF, printf completes, and the pipeline still exits 1, so a real D3 violation
+        # was always still refused. Blast radius of the form that shipped, measured across
+        # all 88 tracked roots this guard governs: 8 disagreed with the fixed form, all 8
+        # false refusals of correct files, 0 real violations let through.
+        #
+        # THE SHELL IS PART OF THE FINDING: this reproduces under bash, which the shebang
+        # pins, and NOT under zsh, which is the interactive shell on this host. A reader
+        # probing it by hand here gets zsh and concludes there is no defect.
+        if ! grep -Eq "$D3_ATTR_PATTERN" <<<"$d3_text"; then
+            d3_missing="${d3_missing}    ${d3_path}"$'\n'
+        fi
+    done <<< "$d3_candidates"
+fi
+
+# Named out loud rather than silently dropped: a root this guard declined to
+# judge is one structure-guard still judges, and a disclosure that vanishes is
+# worse than one never written.
+if [ -n "$d3_skipped" ]; then
+    d3_say 'not judged here (erring toward passing; structure-guard still owns these):'
+    printf '%s' "$d3_skipped" >&2
+fi
+
+if [ -n "$d3_missing" ]; then
+    d3_say 'REFUSED — a crate root in this commit has no D3 unsafe-posture attribute:'
+    printf '%s' "$d3_missing" >&2
+    d3_say ''
+    d3_say 'Every .rs file under tests/, examples/, benches/ or src/bin/ is its own'
+    d3_say 'crate root, so D3 requires this exact line in it — below any //! doc'
+    d3_say 'comment, above the first item:'
+    d3_say ''
+    d3_say '    #![forbid(unsafe_code)]'
+    d3_say ''
+    d3_say 'Without it structure-guard raises FLN-STRUCT-011 only after the commit'
+    d3_say 'lands, turning cargo test red workspace-wide for every pane instead of'
+    d3_say 'for you. Seeing it here is the whole point (bead'
+    d3_say 'franken_lean-d3-root-attr-no-creation-affordance-sso4).'
+    d3_say ''
+    d3_say 'If this root genuinely must not carry it, re-run with --no-verify and say'
+    d3_say 'why in the commit message. structure-guard remains the authority.'
+    exit 1
+fi
+
+source_changed=false
+verification_manifest_changed=false
+verification_validator_changed=false
+if path_changes_in_prospective_tree "$SOURCE_RELATIVE"; then
+    source_changed=true
+fi
+if path_changes_in_prospective_tree "$VERIFICATION_MANIFEST_RELATIVE"; then
+    verification_manifest_changed=true
+fi
+if path_changes_in_prospective_tree "$VERIFICATION_VALIDATOR_RELATIVE"; then
+    verification_validator_changed=true
+fi
+
+if [ "$source_changed" = false ] &&
+    [ "$verification_manifest_changed" = false ] &&
+    [ "$verification_validator_changed" = false ]; then
+    pass "$@"
+fi
+
+# A tracker change owes its id-set projection. Manifest-only and validator-only
+# commits skip this half and proceed directly to verification coverage.
+if [ "$source_changed" = true ]; then
+
+if ! git cat-file -e ":$SOURCE_RELATIVE" 2>/dev/null; then
+    refuse "the commit removes $SOURCE_RELATIVE; a projection cannot be derived from an absent source"
+fi
+if ! git cat-file -e ":$MANIFEST_RELATIVE" 2>/dev/null; then
+    refuse "$SOURCE_RELATIVE changes but $MANIFEST_RELATIVE is not in the commit at all"
+fi
+if git cat-file -e ":$CANDIDATE_RELATIVE" 2>/dev/null; then
+    refuse "the commit carries $CANDIDATE_RELATIVE; a leftover candidate is typed inconclusive to structure-guard"
+fi
+if [ -e "$CANDIDATE_RELATIVE" ]; then
+    refuse "$CANDIDATE_RELATIVE exists in the working tree; a previous publish died mid-flight and must be resolved first"
+fi
+
+# The publisher binary, never a second copy of the projection algorithm.
+publisher=''
+for candidate_bin in \
+    "${CARGO_TARGET_DIR:-target}/debug/$PUBLISHER_BIN_NAME" \
+    "${CARGO_TARGET_DIR:-target}/release/$PUBLISHER_BIN_NAME" \
+    "$PUBLISHER_DIR/target/debug/$PUBLISHER_BIN_NAME" \
+    "$PUBLISHER_DIR/target/release/$PUBLISHER_BIN_NAME"; do
+    if [ -x "$candidate_bin" ]; then
+        publisher=$candidate_bin
+        break
+    fi
+done
+if [ -z "$publisher" ]; then
+    say "building $PUBLISHER_BIN_NAME once (no prebuilt binary found)"
+    (cd "$PUBLISHER_DIR" && cargo build --quiet) \
+        || undecided "cannot build $PUBLISHER_BIN_NAME"
+    for candidate_bin in \
+        "${CARGO_TARGET_DIR:-target}/debug/$PUBLISHER_BIN_NAME" \
+        "$PUBLISHER_DIR/target/debug/$PUBLISHER_BIN_NAME"; do
+        if [ -x "$candidate_bin" ]; then
+            publisher=$candidate_bin
+            break
+        fi
+    done
+    [ -n "$publisher" ] || undecided "built $PUBLISHER_BIN_NAME but cannot find the binary"
+fi
+publisher=$(cd "$(dirname "$publisher")" && pwd)/$(basename "$publisher")
+
+# A throwaway root shaped like the workspace, holding exactly what the commit
+# will contain. The publisher rewrites the manifest in place, so the prospective
+# one is kept aside for the comparison.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/fln-projection-guard.XXXXXXXX") \
+    || undecided 'cannot create a scratch directory'
+
+# Explicit, named cleanup. No recursive delete and no globbing: every path
+# removed here is one this script wrote itself.
+cleanup() {
+    rm -f -- \
+        "$scratch/$SOURCE_RELATIVE" \
+        "$scratch/$MANIFEST_RELATIVE" \
+        "$scratch/$CANDIDATE_RELATIVE" \
+        "$scratch/expected-manifest" >/dev/null 2>&1 || true
+    rmdir -- "$scratch/ci" "$scratch/.beads" "$scratch" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+mkdir -p -- "$scratch/.beads" "$scratch/ci" || undecided 'cannot lay out the scratch root'
+git cat-file blob ":$SOURCE_RELATIVE" > "$scratch/$SOURCE_RELATIVE" \
+    || undecided "cannot read the prospective $SOURCE_RELATIVE"
+git cat-file blob ":$MANIFEST_RELATIVE" > "$scratch/expected-manifest" \
+    || undecided "cannot read the prospective $MANIFEST_RELATIVE"
+cp -- "$scratch/expected-manifest" "$scratch/$MANIFEST_RELATIVE" \
+    || undecided 'cannot seed the scratch manifest'
+
+publisher_status=0
+publisher_output=$("$publisher" --root "$scratch" --wait-ms "$WAIT_MS" --robot 2>&1) \
+    || publisher_status=$?
+case "$publisher_status" in
+    0) ;;
+    3) undecided "a publish is in flight and the lock did not free within ${WAIT_MS}ms; retry" ;;
+    *) undecided "the publisher refused the prospective tree (exit $publisher_status): $publisher_output" ;;
+esac
+
+if cmp -s -- "$scratch/$MANIFEST_RELATIVE" "$scratch/expected-manifest"; then
+    cleanup
+    trap - EXIT
+else
+    staged_count=$(head -n 1 -- "$scratch/expected-manifest" | grep -o '"record_count":[0-9]*' || true)
+    fresh_count=$(head -n 1 -- "$scratch/$MANIFEST_RELATIVE" | grep -o '"record_count":[0-9]*' || true)
+    refuse "the committed projection is not a projection of the committed ${SOURCE_RELATIVE} (committed ${staged_count:-record_count:?}, derived ${fresh_count:-record_count:?})"
+fi
+fi
+
+# Any prospective change to the tracker, coverage manifest, or validator is
+# judged by the exact prospective validator. The scratch tree contains no
+# working-tree bytes and therefore stays correct under `git commit --only`.
+if ! git cat-file -e ":$SOURCE_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${SOURCE_RELATIVE}"
+fi
+if ! git cat-file -e ":$VERIFICATION_MANIFEST_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${VERIFICATION_MANIFEST_RELATIVE}"
+fi
+if ! git cat-file -e ":$VERIFICATION_VALIDATOR_RELATIVE" 2>/dev/null; then
+    coverage_refuse "the commit has no ${VERIFICATION_VALIDATOR_RELATIVE}"
+fi
+
+coverage_scratch=$(mktemp -d "${TMPDIR:-/tmp}/fln-verification-coverage-guard.XXXXXXXX") \
+    || undecided 'cannot create a verification-coverage scratch directory'
+
+coverage_cleanup() {
+    rm -f -- \
+        "$coverage_scratch/$SOURCE_RELATIVE" \
+        "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+        "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" >/dev/null 2>&1 || true
+    rmdir -- \
+        "$coverage_scratch/.beads" \
+        "$coverage_scratch/ci" \
+        "$coverage_scratch/scripts" \
+        "$coverage_scratch" >/dev/null 2>&1 || true
+}
+trap coverage_cleanup EXIT
+
+mkdir -p -- \
+    "$coverage_scratch/.beads" \
+    "$coverage_scratch/ci" \
+    "$coverage_scratch/scripts" \
+    || undecided 'cannot lay out the verification-coverage scratch tree'
+git cat-file blob ":$SOURCE_RELATIVE" > "$coverage_scratch/$SOURCE_RELATIVE" \
+    || undecided "cannot read the prospective $SOURCE_RELATIVE"
+git cat-file blob ":$VERIFICATION_MANIFEST_RELATIVE" \
+    > "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+    || undecided "cannot read the prospective $VERIFICATION_MANIFEST_RELATIVE"
+git cat-file blob ":$VERIFICATION_VALIDATOR_RELATIVE" \
+    > "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+    || undecided "cannot read the prospective $VERIFICATION_VALIDATOR_RELATIVE"
+
+coverage_status=0
+coverage_output=$(
+    python3 -I -S "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+        validate-verification-manifest \
+        --manifest "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+        --beads "$coverage_scratch/$SOURCE_RELATIVE" 2>&1
+) || coverage_status=$?
+if [ "$coverage_status" -ne 0 ]; then
+    coverage_refuse "prospective verification coverage is invalid (exit ${coverage_status}): ${coverage_output}"
+fi
+
+coverage_cleanup
+trap - EXIT
+pass "$@"

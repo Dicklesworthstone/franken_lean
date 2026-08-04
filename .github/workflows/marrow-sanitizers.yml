@@ -1,0 +1,152 @@
+# The dispatcher for the Marrow concurrency guards (bead fln-nhf5).
+#
+# WHY THIS FILE IS SEPARATE FROM ci.yml. Two reasons, and the second is the one that
+# decides the shape. First, the bead asks for a cadence rather than a per-commit gate:
+# "a nightly or pre-release run would have caught this". Second, a per-commit `fln.e2e/2`
+# lane must register its scenario in `E2E_STEP_ORDERS` at the top of `scripts/evidence.py`,
+# and that file is one of the two `franken_lean-h4o1` orphans (+543/-1, authored by a pane
+# out until 2026-08-01). Committing that registration would land 543 lines of someone
+# else's unfinished work under the committer's authorship — the same wall that blocks the
+# `franken_lean-2tcr` lane seed. A separate workflow needs no registry entry.
+#
+# THE EXIT CODE IS THE ONLY RELIABLE SIGNAL, AND THIS IS NOT STYLE. ThreadSanitizer reports
+# at process teardown, AFTER libtest has already declared the test green. Measured at
+# `7b5dd549` against the real crate on the pinned toolchain, with `dec_ref`'s mode probe at
+# `rc.rs:167` reverted to the plain non-atomic read it had before `8cd1d3b`:
+#
+#     test tests::mark_mt_negates_and_atomics_conserve ... ok
+#     test result: ok. 1 passed; 0 failed; ...
+#
+# and the process exited **66**, with two `WARNING: ThreadSanitizer: data race` lines on
+# stderr. So a step that greps `test result: ok`, or reads the last line of output, reports
+# a clean run while two data races were detected. Every step below therefore lets the
+# non-zero exit fail the job and NEVER inspects libtest's verdict. Do not "simplify" any of
+# these into a piped grep.
+#
+# WHY BOTH DETECTORS. Neither subsumes the other. Miri finds UB with no observable effect on
+# this hardware — precisely the class the fixed refcount race belonged to, since aligned
+# 32-bit loads do not tear — while TSAN runs real OS threads, the real allocator, and the
+# syscalls Miri refuses. Running only the stricter one, or only the faster one, is choosing
+# which half of the evidence to discard.
+#
+# WHY A TARGETED SET. The whole fln-unsafe-abi suite under Miri exceeds ten minutes and was
+# killed; most of its 39 tests are layout and codec assertions with no threads. The four
+# named here are the ones that spawn threads or contend on a shared artifact. The guard
+# covers the concurrency protocols, not the crate, and says so.
+#
+# THE JOIN BACK. `crates/fln-conformance/tests/marrow_sanitizer_dispatch.rs` reads this
+# directory and refuses if the disclosed cadence and the actual dispatcher disagree in
+# EITHER direction. Deleting this file, or dropping its cron, is therefore not silent: it
+# turns the recorded claim into one with nothing producing it and the per-commit suite goes
+# red saying so. Without that join this workflow would become a documented command nobody
+# invokes, which is bead fln-nhf5's own item 1 returning.
+#
+# WHAT THIS DOES NOT EARN. A cron proves the cadence is CONFIGURED, never that a run
+# OCCURRED — a workflow GitHub silently disables is invisible from inside this repository.
+# That is the open half of `fln-mandated-mutant-join-unwatched-uagk`, and this lane inherits
+# it rather than closing it. Nothing here reaches `fln-unsafe-region`'s mmap primitive (Miri
+# cannot execute mmap) or the exported C surface under a real C caller (the stage0 ABI
+# gauntlet is that instrument).
+
+name: marrow concurrency sanitizers
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Weekly, offset from contract-drift (Mon 05:17) and mandated-mutants (Tue 04:23)
+    # so the three never contend for a runner.
+    - cron: "41 3 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: marrow-sanitizers
+  cancel-in-progress: false
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # `-Zsanitizer=thread` invalidates every artifact built without it. Sharing the
+      # workspace target directory would force a full rebuild for the next consumer, and
+      # another when they rebuild without it, so both detectors get their own.
+      MIRI_TARGET_DIR: ${{ github.workspace }}/target-miri
+      TSAN_TARGET_DIR: ${{ github.workspace }}/target-tsan
+      TSAN_TRIPLE: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain with miri and rust-src
+        run: |
+          set -euo pipefail
+          # The channel is read from rust-toolchain.toml rather than transcribed, so this
+          # step cannot drift from the pin. `components` there already lists miri and
+          # rust-src; the explicit add is belt-and-braces for a runner image that honours
+          # the channel but not the component list.
+          CHANNEL=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$CHANNEL"
+          echo "pinned channel: $CHANNEL"
+          rustup toolchain install "$CHANNEL" --profile minimal
+          rustup component add --toolchain "$CHANNEL" miri rust-src
+          rustup run "$CHANNEL" cargo miri --version
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- Miri
+      # Flags, each with a reason rather than as incantation:
+      #   -Zmiri-disable-isolation : the publication test is ABOUT a real filesystem
+      #                              rename and cannot be stubbed.
+      #   -Zmiri-ignore-leaks      : mt_object_dies_on_last_dec enables the ownership
+      #                              shadow, which QUARANTINES freed memory by design, and
+      #                              Miri's leak checker correctly reports that retention.
+      - name: Miri — fln-unsafe-abi concurrency tests
+        env:
+          CARGO_TARGET_DIR: ${{ env.MIRI_TARGET_DIR }}
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: |
+          set -euo pipefail
+          for t in mark_mt_negates_and_atomics_conserve \
+                   mt_object_dies_on_last_dec \
+                   rc_clone_and_drop_balance; do
+            echo "::group::miri $t"
+            ./scripts/ci/run_sanitizer_test.sh "miri:$t" \
+              cargo "+$CHANNEL" miri test -p fln-unsafe-abi --lib "$t"
+            echo "::endgroup::"
+          done
+
+      - name: Miri — fln-rt concurrent publication
+        env:
+          CARGO_TARGET_DIR: ${{ env.MIRI_TARGET_DIR }}
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-ignore-leaks"
+        run: |
+          set -euo pipefail
+          ./scripts/ci/run_sanitizer_test.sh miri:concurrent_publication \
+            cargo "+$CHANNEL" miri test -p fln-rt --test region_engine \
+              concurrent_publication
+
+      # ---------------------------------------------------------------- ThreadSanitizer
+      # `-Zbuild-std` rebuilds std under the same `-Zsanitizer=thread`, which is what
+      # removes the ABI-mismatch refusal ("mixing -Zsanitizer will cause an ABI mismatch in
+      # crate fln_core ... incompatible with unset -Zsanitizer in dependency memchr") that
+      # made TSAN look impossible at this pin. It needs rust-src, installed above.
+      - name: ThreadSanitizer — Marrow concurrency tests
+        env:
+          CARGO_TARGET_DIR: ${{ env.TSAN_TARGET_DIR }}
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+        run: |
+          set -euo pipefail
+          for t in mark_mt_negates_and_atomics_conserve \
+                   mt_object_dies_on_last_dec \
+                   rc_clone_and_drop_balance; do
+            echo "::group::tsan $t"
+            ./scripts/ci/run_sanitizer_test.sh "tsan:$t" \
+              cargo "+$CHANNEL" test -Zbuild-std --target "$TSAN_TRIPLE" \
+                -p fln-unsafe-abi --lib "$t"
+            echo "::endgroup::"
+          done
+          ./scripts/ci/run_sanitizer_test.sh tsan:concurrent_publication \
+            cargo "+$CHANNEL" test -Zbuild-std --target "$TSAN_TRIPLE" \
+              -p fln-rt --test region_engine concurrent_publication

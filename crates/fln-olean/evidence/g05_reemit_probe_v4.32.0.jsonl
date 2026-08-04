@@ -1,0 +1,5 @@
+{"schema":"fln-g05-reemit-probe/1","step":"fresh_determinism","runs_identical":true}
+{"schema":"fln-g05-reemit-probe/1","step":"fixture_provenance","fixture_identical":true,"sha256":"569faebe61d1dca0f42c8407949c181d7eb71b5f1d8bc37c6f417bf2a105e1a5"}
+{"schema":"fln-g05-reemit-probe/1","step":"async_identity","identical_to_sync":true}
+{"schema":"fln-g05-reemit-probe/1","step":"negative_control","corrupted_copy_detected":true}
+{"schema":"fln-g05-reemit-probe/1","step":"summary","pin":"v4.32.0","verdict":"all-cells-hold"}

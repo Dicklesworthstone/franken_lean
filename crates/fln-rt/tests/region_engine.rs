@@ -247,3 +247,128 @@ fn real_olean_recompaction_fixpoint() {
     let ours2 = compact(&again, BASE_B).expect("recompact");
     assert_eq!(ours1, ours2, "fixpoint holds on a real module graph");
 }
+
+/// Extreme mpz header fields must be a TYPED fault, not a panic and not a
+/// misfiled one (FL-INV-07; the module contract is "malformed input yields a
+/// typed RegionFault, never a panic").
+///
+/// `_mp_size` and `_mp_alloc` are four attacker-controlled bytes each, and the
+/// coherence law `_mp_alloc >= |_mp_size|` used to be checked with
+/// `mp_size.abs()`. On `i32::MIN` that negation overflows: it PANICKED in a
+/// debug build, and in release it silently stayed negative, so the comparison
+/// was false, the object passed its integrity check, and the fault surfaced
+/// later and wrongly as `Truncated` (from the absurd 17 GB size) instead of
+/// `MpzIntegrity`. Checking in the unsigned domain fixes both.
+///
+/// `audit` is the entry the olean codec runs over shared/sealed mappings, so
+/// the input here is exactly a corrupt `.olean` byte range.
+#[test]
+fn mpz_header_extremes_are_typed_faults_not_panics() {
+    // A region is [root word][objects…]; the root is a scalar (odd) word so
+    // the walk reaches the object at offset 8.
+    let region_with = |alloc: i32, mp_size: i32| {
+        let mut buf = vec![0u8; 32];
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+        buf[15] = fln_rt::abi::TAG_MPZ;
+        buf[16..20].copy_from_slice(&alloc.to_le_bytes());
+        buf[20..24].copy_from_slice(&mp_size.to_le_bytes());
+        buf
+    };
+
+    for (alloc, mp_size, what) in [
+        (0, i32::MIN, "the negation that overflowed"),
+        (i32::MIN, i32::MIN, "both fields extreme"),
+        (i32::MIN, 1, "negative _mp_alloc"),
+        (-1, 1, "_mp_alloc below |_mp_size|"),
+        (4, 0, "zero limb count"),
+    ] {
+        let buf = region_with(alloc, mp_size);
+        assert_eq!(
+            fln_rt::region::audit(&buf, 0),
+            Err(RegionFault::MpzIntegrity { offset: 8 }),
+            "{what}: must be MpzIntegrity at the offending object"
+        );
+    }
+
+    // And the coherent shape still walks: 2 limbs, alloc >= |size|, limb
+    // pointer inside this object's own inline block.
+    // Object at 8 spans MPZ_FIXED(24) + 2 limbs * 8 = 40 bytes, so the region
+    // is 8 + 40 = 48 and the inline limb block is [32, 48).
+    let mut ok = vec![0u8; 48];
+    ok[0..8].copy_from_slice(&1u64.to_le_bytes());
+    ok[15] = fln_rt::abi::TAG_MPZ;
+    ok[16..20].copy_from_slice(&2i32.to_le_bytes());
+    ok[20..24].copy_from_slice(&(-2i32).to_le_bytes()); // negative size = sign, |size| = 2
+    ok[24..32].copy_from_slice(&32u64.to_le_bytes()); // limb ptr -> the block start
+    assert!(
+        fln_rt::region::audit(&ok, 0).is_ok(),
+        "a coherent mpz must still audit clean"
+    );
+}
+
+/// Two threads publishing the SAME target must never produce a mixture.
+///
+/// The staging file used to be keyed on the process id alone, so two threads
+/// publishing one target shared it: `File::create` truncates, so T1 could write
+/// half its bytes, T2 truncate and write its own, and T1 then fsync and rename
+/// the MIXTURE into place — a corrupt artifact published through the very path
+/// whose job is to make publication atomic. Keying the staging name on
+/// (process, thread, target) fixes it; `rename` does the rest.
+///
+/// The assertion is deliberately "equals one input exactly", not "is
+/// non-empty": a torn publication is usually still a plausible-looking file,
+/// which is exactly why it would survive a weaker check.
+///
+/// This test is part of the Miri concurrency guard and runs under it in ~2 s —
+/// see `crates/fln-unsafe-abi/MIRI_CONCURRENCY_GUARD.md` for the command, the
+/// flags each arm needs, and the proof that the guard fails on the real defect.
+#[test]
+fn concurrent_publication_of_one_target_never_yields_a_mixture() {
+    let dir = std::env::temp_dir().join(format!("fln-rt-pubrace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("region.bin");
+
+    // Distinct, equal-length payloads so a mixture is detectable but a
+    // truncation-based tear would not change the length.
+    let a = vec![0xAAu8; 64 * 1024];
+    let b = vec![0xBBu8; 64 * 1024];
+
+    for _round in 0..8 {
+        std::thread::scope(|s| {
+            for payload in [&a, &b] {
+                let target = target.clone();
+                s.spawn(move || {
+                    let _ = fln_rt::region::write_region_file(payload, &target);
+                });
+            }
+        });
+        let got = std::fs::read(&target).expect("target published");
+        assert!(
+            got == a || got == b,
+            "published region is a MIXTURE: len {}, first byte {:#x}, \
+             distinct bytes {:?}",
+            got.len(),
+            got.first().copied().unwrap_or(0),
+            {
+                let mut seen: Vec<u8> = got.to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                seen
+            }
+        );
+    }
+
+    // The staging names must actually differ per thread, which is the property
+    // the fix rests on.
+    let mine = fln_rt::region::staging_tmp_path(&target);
+    let theirs = std::thread::scope(|s| {
+        s.spawn(|| fln_rt::region::staging_tmp_path(&target))
+            .join()
+            .expect("thread")
+    });
+    assert_ne!(
+        mine, theirs,
+        "two threads must not share a staging file for the same target"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

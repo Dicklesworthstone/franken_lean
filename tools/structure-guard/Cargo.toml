@@ -6,3 +6,17 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+# Observes the authoritative D18 mode-closure scanner; never reimplements the
+# traversal or the mode algebra (bead franken_lean-r2st, edge acknowledged in
+# ci/WORKSPACE_GRAPH.txt).
+fln-core = { path = "../../crates/fln-core" }
+
+[dev-dependencies]
+# Test-only. Every rig here resolves the repository root through
+# fln_conformance::checked_workspace_root!(), so a test binary compiled in another
+# checkout refuses rather than reporting this tree's verdict about that one
+# (bead fln-cross-tree-baked-root-k60n). The predicate lives in exactly one crate:
+# a second copy is the defect family that bead belongs to. Upward edge, legal
+# because FLN-STRUCT-007 exempts kind=tool from layering; acknowledged in
+# ci/WORKSPACE_GRAPH.txt.
+fln-conformance = { path = "../../crates/fln-conformance" }

@@ -1,0 +1,33 @@
+# fln-bignum kernel-reduction profile
+schema	fln.bignum-kernel-reduction-profile/2
+claim_class	benchmark
+reference	leanprover/lean4	v4.32.0	8c9756b28d64dab099da31a4c09229a9e6a2ef35
+corpus	leanprover-community/mathlib4	v4.32.0	81a5d257c8e410db227a6665ed08f64fea08e997
+rustc	1.99.0-nightly	77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
+host	Linux-x86_64	AMD_EPYC_7282_16-Core_Processor	64-logical-cpus
+artifact	target/e2e/bignum-threshold-calibration-20260730T000003Z/report-high-width.log
+source	crates/fln-kernel/tests/k1_judgments.rs	bf3f1a241c47fb36749ab70a0a2b6c89b301bfebb6fb4a472cd1423b971cef15	d462b0d8fb8f9242dfdc595c1cec550de28969a480e80d0ce6883433a79bd83b	kr313-operation-test-body-v1
+source	tribunal/fixtures/c4/probe_export.c	ed68226881833b5a309175a9c13177845bd132e269d8e098643f45a7278a4588	df9c42da38f94b124c5bd43a5f78cf9cfe838926a702771e6c54b2bcc71c4818	c4-nat-slice-v1
+population	bounded-bootstrap-kernel-and-C4-fixtures
+observation	k1-max-input-limbs	1
+observation	c4-max-input-limbs	2
+observation	all-enumerated-multiplications-dispatch	schoolbook
+limitation	not-a-mathlib-wide-operation-frequency-claim
+method	release-build	5-deterministic-operand-pairs-per-width	rounds=max(1,8192/width)	monotonic-wall-clock
+sample	width	rounds	schoolbook_ns	karatsuba_ns	toom3_ns
+sample	64	128	5288	4743	8631
+sample	72	113	6733	5947	9973
+sample	80	102	8289	7141	11230
+sample	96	85	12573	10164	14870
+sample	128	64	21558	17200	21590
+sample	1024	8	1350434	492650	467946
+sample	1536	5	3135477	981781	993095
+sample	2048	4	5542439	1556021	1501500
+sample	2560	3	8439259	2107989	2046123
+sample	3072	2	12161928	2874310	2842124
+sample	4096	2	21569380	4370844	4297672
+sample	6144	1	50001246	8431542	7743897
+sample	8192	1	86156590	12835446	12066602
+sample	12288	1	195863469	23051393	22275133
+decision	karatsuba-threshold-limbs	80	conservative-first-stable-win-after-repeated-low-width-calibration
+decision	toom3-threshold-limbs	2048	avoids-observed-mid-width-regressions-and-wins-through-the-high-width-tail

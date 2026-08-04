@@ -1,0 +1,7 @@
+{"schema":"fln-x4-option-probe/1","step":"dump","runs_identical":true,"binary_total":"661","crosscheck":"binary_only_allowlisted=4 binary_rows=661 dynamic_rows=3 literal_defaults_agree=649 nonliteral_defaults=8 source_rows=657"}
+{"schema":"fln-x4-option-probe/1","step":"unknown","refused":true,"shape_held":true}
+{"schema":"fln-x4-option-probe/1","step":"malformed-nat","refused":true,"shape_held":true}
+{"schema":"fln-x4-option-probe/1","step":"malformed-bool","refused":true,"shape_held":true}
+{"schema":"fln-x4-option-probe/1","step":"precedence","cli_default_applied":true,"scoped_override_wins":true,"scope_restored":true,"zero_disables":true}
+{"schema":"fln-x4-option-probe/1","step":"negative_control","corrupted_census_refused":true}
+{"schema":"fln-x4-option-probe/1","step":"summary","pin":"v4.32.0","verdict":"all-cells-hold"}

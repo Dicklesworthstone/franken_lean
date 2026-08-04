@@ -25,10 +25,12 @@
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
 use fln_core::name::{LeafView, Name};
+use fln_core::outcome::Outcome;
 use fln_env::constants::{
     ConstantInfo, ConstructorVal, InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal,
 };
-use fln_env::environment::Environment;
+use fln_env::environment::{DeclarationBudget, DeclarationCommitted, DeclarationPlan, Environment};
+use fln_env::pmap::CollisionBudget;
 
 use crate::tc::{Stop, TypeChecker};
 use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
@@ -623,10 +625,13 @@ impl<'a> Engine<'a> {
     }
 
     fn remaining(&self) -> Budget {
-        Budget {
-            steps: self.budget.steps.saturating_sub(self.used.steps_used),
-            depth: self.budget.depth,
-        }
+        // `narrowed` rather than a fresh literal: the remaining allowance is
+        // the SAME derivation with less of it left, and rebuilding a budget
+        // beside the calibration is how a ceiling loses its provenance.
+        self.budget.narrowed(
+            self.budget.steps.saturating_sub(self.used.steps_used),
+            self.budget.depth,
+        )
     }
 
     fn charge(&mut self, c: Consumption) -> KResult<()> {
@@ -1155,7 +1160,24 @@ impl<'a> Engine<'a> {
                     let s = tc.infer(&l.type_.clone(), 0)?;
                     tc.whnf_public(&s, 0)
                 })?;
-                if !matches!(field_sort.node(), ExprNode::Sort { level } if level.is_zero()) {
+                // NORMALISE THE LEVEL BEFORE ASKING WHETHER IT IS ZERO.
+                // `Level::is_zero` is purely structural, and `whnf` reduces the
+                // EXPRESSION without normalising the level inside a `Sort`. A
+                // field of sort `Sort (imax u 0)` is semantically a Prop but is
+                // not `Node::Zero`, so it was treated as data, pushed to
+                // `to_check`, found absent from the result's arguments, and the
+                // whole inductive was restricted to Prop-only elimination.
+                //
+                // That cost 228 corpus rows across 76 subsingleton types (bead
+                // `franken_lean-d17i`): the regenerated recursor carried no
+                // motive universe and its level-parameter list came out one
+                // shorter than the pin's, rejecting every declaration in the
+                // block. Restrictive, so never unsound — but wrong.
+                let is_prop = matches!(
+                    field_sort.node(),
+                    ExprNode::Sort { level } if level.normalize_fixpoint().is_zero()
+                );
+                if !is_prop {
                     to_check.push(l.clone());
                 }
                 l
@@ -1577,33 +1599,11 @@ impl<'a> Engine<'a> {
         // Declare the types (pin declare_inductive_types), then check ctors
         // against the extended scratch env.
         for ind in &self.block.types {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Induct(ind.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ind.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Induct(ind.clone()), &ind.base.name)?;
         }
         self.check_constructors(!nested)?;
         for ctor in &self.block.ctors {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Ctor(ctor.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ctor.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Ctor(ctor.clone()), &ctor.base.name)?;
         }
         if nested {
             return self.check_nested_full();
@@ -1623,33 +1623,11 @@ impl<'a> Engine<'a> {
         let is_rec = self.compute_is_rec()?;
         let is_reflexive = self.compute_is_reflexive()?;
         for ind in &self.block.types {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Induct(ind.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ind.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Induct(ind.clone()), &ind.base.name)?;
         }
         self.check_constructors(true)?;
         for ctor in &self.block.ctors {
-            self.env = self
-                .env
-                .add_decl(ConstantInfo::Ctor(ctor.clone()))
-                .map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::AlreadyDeclared,
-                        format!(
-                            "`{}` is already declared",
-                            ctor.base.name.to_display_string()
-                        ),
-                    )
-                })?;
+            self.env = scratch_admit(&self.env, ConstantInfo::Ctor(ctor.clone()), &ctor.base.name)?;
         }
         self.init_elim_level()?;
         self.init_k_target();
@@ -2506,9 +2484,25 @@ fn compare_recursors(generated: &RecursorVal, decoded: &RecursorVal) -> KResult<
         );
     }
     if generated.base.level_params != decoded.base.level_params {
+        // Print BOTH lists. The message used to say only that they diverged,
+        // which made 228 corpus rows (bead `franken_lean-d17i`) impossible to
+        // classify from the log alone: a name difference, an order difference
+        // and a missing motive universe all read identically. A divergence
+        // report that does not say what diverged is a measurement defect.
+        let show = |ps: &[fln_core::name::Name]| -> String {
+            ps.iter()
+                .map(fln_core::name::Name::to_display_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         return reject(
             RejectClass::BlockMismatch,
-            format!("`{name}`: recursor level parameters diverge from regeneration"),
+            format!(
+                "`{name}`: recursor level parameters diverge from regeneration \
+                 (generated [{}], decoded [{}])",
+                show(&generated.base.level_params),
+                show(&decoded.base.level_params)
+            ),
         );
     }
     if generated.all != decoded.all
@@ -3007,4 +3001,76 @@ fn check_quotient_inner(env: &Environment, decls: &[QuotVal]) -> KResult<()> {
         }
     }
     Ok(())
+}
+
+/// Insert one already-checked constant into a SCRATCH environment through the
+/// bounded admission path (`fln-kernel-bounded-decl-admission-ukzx`).
+///
+/// The five production callers all build temporary environments out of
+/// declarations the kernel is itself checking, so three decisions are recorded
+/// here once rather than repeated five times:
+///
+/// **The budget is explicitly UNBOUNDED, not absent.** These sites insert
+/// material the kernel has ALREADY traversed under its own [`Budget`] during
+/// header inference and constructor checking. `DeclarationBudget` bounds the
+/// same row families that traversal just walked, so re-bounding here would
+/// double-charge the same declaration and could refuse one the kernel had
+/// already found structurally sound. The untrusted-input boundary is upstream,
+/// at `check`; this is downstream of it.
+///
+/// **A duplicate name stays a rejection.** It is a completed determination
+/// about the declaration — the name is taken — and it was a rejection before
+/// this migration too.
+///
+/// **A non-answer never becomes one.** `Inconclusive` and `InternalFault` from
+/// the environment are propagated as the kernel's own non-answers. Collapsing
+/// either into `AlreadyDeclared` would be the FL-INV-07 failure this migration
+/// exists to avoid: recording "we ran out of room" or "we broke" as "this
+/// declaration is invalid" caches a wrong verdict about someone else's code.
+pub(crate) fn scratch_admit(
+    env: &Environment,
+    info: ConstantInfo,
+    name: &Name,
+) -> Result<Environment, Stop> {
+    let plan = match env.plan_add_decl(
+        info,
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::UNBOUNDED,
+        None,
+    ) {
+        Outcome::Complete(DeclarationPlan::Prepared(plan)) => plan,
+        Outcome::Complete(DeclarationPlan::DuplicateName { name }) => {
+            return Err(Stop::Reject(
+                RejectClass::AlreadyDeclared,
+                format!("`{}` is already declared", name.to_display_string()),
+            ));
+        }
+        Outcome::Inconclusive(reason) => {
+            return Err(Stop::Fault(format!(
+                "scratch admission of `{}` was inconclusive: {reason:?}",
+                name.to_display_string()
+            )));
+        }
+        Outcome::InternalFault(fault) => {
+            return Err(Stop::Fault(format!(
+                "scratch admission of `{}` faulted: {fault:?}",
+                name.to_display_string()
+            )));
+        }
+    };
+    match plan.commit(env, None) {
+        Outcome::Complete(DeclarationCommitted::Published(published)) => Ok(published.environment),
+        Outcome::Complete(DeclarationCommitted::DuplicateName { name }) => Err(Stop::Reject(
+            RejectClass::AlreadyDeclared,
+            format!("`{}` is already declared", name.to_display_string()),
+        )),
+        Outcome::Inconclusive(reason) => Err(Stop::Fault(format!(
+            "scratch publication of `{}` was inconclusive: {reason:?}",
+            name.to_display_string()
+        ))),
+        Outcome::InternalFault(fault) => Err(Stop::Fault(format!(
+            "scratch publication of `{}` faulted: {fault:?}",
+            name.to_display_string()
+        ))),
+    }
 }

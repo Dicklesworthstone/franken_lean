@@ -11,11 +11,12 @@
 //! Bool.true-reflection machinery in defeq, wired to fln-bignum), String literal
 //! expansion (KR-314: recursor major, projection scrutinee, and the defeq
 //! `String.ofList` rung), unit-like eta (KR-315), structure eta in defeq
-//! (KR-903), and declaration admission for axioms, definitions, and theorems
-//! (KR-970..974). `reduce_native` (`Lean.reduceBool`/`Lean.reduceNat` — the
-//! native_decide trust surface), opaque/mutual admission, and receipts are
-//! follow-up slices; none of their absence widens acceptance — an unimplemented
-//! reduction can only make defeq FAIL (a rejection), never succeed.
+//! (KR-903), and declaration admission for axioms, definitions, theorems,
+//! opaques, and non-safe mutual definitions (KR-970..977). `reduce_native`
+//! (`Lean.reduceBool`/`Lean.reduceNat` — the native_decide trust surface) and
+//! receipts are follow-up slices; neither absence widens acceptance — an
+//! unimplemented reduction can only make defeq FAIL (a rejection), never
+//! succeed.
 //!
 //! Traversal discipline (§8.2c): every recursive descent charges the step budget
 //! and carries an explicit depth that is checked BEFORE descending, so
@@ -41,6 +42,14 @@ use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
 pub(crate) enum Stop {
     Reject(RejectClass, String),
     Exhausted(ExhaustionReason),
+    /// OUR accounting contradicted itself — not a statement about the
+    /// declaration. Added for the bounded admission migration
+    /// (`fln-kernel-bounded-decl-admission-ukzx`): the bounded environment path
+    /// can return an InternalFault, and the two existing arms could only have
+    /// reported it as a rejection (an FL-INV-07 collapse — "we broke" recorded
+    /// as "your declaration is invalid") or as resource exhaustion (a
+    /// misreport, since ExhaustionReason is Steps|Depth and neither happened).
+    Fault(String),
 }
 
 type KResult<T> = Result<T, Stop>;
@@ -603,7 +612,10 @@ impl<'a> TypeChecker<'a> {
                 // Result size is input bits + shift count: charge it up front.
                 let Some(count) = vb.to_u64() else {
                     // A shift count beyond u64 is beyond any feasible memory:
-                    // typed exhaustion, never an attempted allocation.
+                    // charge the smallest representable over-budget forecast so
+                    // the typed exhaustion carries genuine allowed/observed facts,
+                    // never an attempted allocation or a fabricated completion.
+                    self.used.steps_used = self.budget.steps.saturating_add(1);
                     return Err(Stop::Exhausted(ExhaustionReason::Steps));
                 };
                 self.charge_bulk(count / 64 + 1)?;
@@ -2459,5 +2471,76 @@ fn collect_undeclared_param(level: &Level, declared: &[Name], found: &mut Option
             collect_undeclared_param(b, declared, found);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-202's substitution primitive: when `instantiate` consumes binder `k`,
+    /// every loose bvar ABOVE `k` must shift down by one, because the binder it
+    /// used to count past is gone.
+    ///
+    /// This is tested here, against the primitive, rather than through `check`,
+    /// because the branch is unreachable from the public surface: KR-100 rejects
+    /// terms with loose bvars, so in a closed term every bvar reached at depth
+    /// `k` has index at most `k`. A mutation campaign confirmed that directly —
+    /// dropping the `- 1` left all 93 kernel tests passing, and a panic planted
+    /// in the branch was never once reached by the suite.
+    ///
+    /// That makes the arm defensive code inside the TCB whose correctness rested
+    /// on an unstated precondition. It is one `pub(crate)` caller away from
+    /// being live, and a wrong shift there silently rebinds a variable to the
+    /// wrong binder — a term that still typechecks and means something else.
+    #[test]
+    fn instantiate_shifts_loose_bvars_down_past_the_consumed_binder() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let subst = Expr::sort(Level::zero());
+
+        // `#0 #1` with binder 0 consumed: #0 becomes the substitute, and #1 —
+        // which pointed one binder further out — must become #0.
+        let open = Expr::app(bv(0), bv(1));
+        // `assert!` rather than `assert_eq!`: FLN-STRUCT-030 admits exactly
+        // {assert, format, matches, unreachable, vec} inside the kernel, so
+        // that every expansion maps to a reviewed, LOC-counted callsite.
+        assert!(
+            tc.instantiate(&open, 0, &subst, 0).expect("instantiates")
+                == Expr::app(subst.clone(), bv(0)),
+            "a free bvar above the consumed binder must shift down by one"
+        );
+
+        // The same law one binder deeper, where `k` has advanced to 1: #0 is
+        // the inner binder and is untouched, #2 shifts to #1.
+        let under_binder = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            subst.clone(),
+            Expr::app(bv(0), bv(2)),
+            fln_core::expr::BinderInfo::Default,
+        );
+        let expected = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            subst.clone(),
+            Expr::app(bv(0), bv(1)),
+            fln_core::expr::BinderInfo::Default,
+        );
+        assert!(
+            tc.instantiate(&under_binder, 0, &subst, 0)
+                .expect("instantiates")
+                == expected,
+            "the shift must apply under binders with k advanced, and must not \
+             disturb bvars bound inside the term"
+        );
+
+        // Bvars strictly below `k` are bound inside and must not move at all.
+        let inner_bound = Expr::app(bv(0), bv(0));
+        assert!(
+            tc.instantiate(&inner_bound, 1, &subst, 0)
+                .expect("instantiates")
+                == inner_bound,
+            "bvars below the consumed binder are untouched"
+        );
     }
 }

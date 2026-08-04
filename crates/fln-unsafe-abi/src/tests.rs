@@ -356,27 +356,221 @@ fn array_and_sarray_facts() {
 #[test]
 fn closure_ref_thunk_task_mpz_facts() {
     let _g = lock();
-    let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9)]);
-    assert_eq!(cl.closure_view(), (3, 1));
+    let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9), Obj::mk_string("fixed")]);
+    assert_eq!(cl.closure_view(), (3, 2));
+    let (arity, fixed) = cl
+        .closure_shell_parts()
+        .expect("mk_closure produces an inspectable shell");
+    assert_eq!(arity, 3);
+    assert_eq!(fixed.len(), 2);
+    assert_eq!(fixed[0].unbox(), 9);
     assert_eq!(cl.header().cs_sz, 0, "closures ride the big path");
+    drop(cl);
+    let (size, _, _, bytes) = fixed[1].string_view();
+    assert_eq!(
+        &bytes[..size],
+        b"fixed\0",
+        "retained shell children outlive the original closure handle"
+    );
 
     let r = Obj::mk_ref(Obj::mk_string("cell"));
     assert_eq!(
         usize::from(r.header().cs_sz),
         align_obj_size(size_of::<LeanRefObject>())
     );
+    let alias = r.clone_ref();
+    assert!(r.ref_ptr_eq(&alias));
+    let distinct = Obj::mk_ref(Obj::mk_string("cell"));
+    assert!(
+        !r.ref_ptr_eq(&distinct),
+        "equal contents do not collapse reference identity"
+    );
+    let before = r.ref_get();
+    let old = r.ref_swap(Obj::mk_string("swapped"));
+    let after = alias.ref_get();
+    let (_, _, _, before_bytes) = before.string_view();
+    let (_, _, _, old_bytes) = old.string_view();
+    let (_, _, _, after_bytes) = after.string_view();
+    assert_eq!(before_bytes, b"cell\0");
+    assert_eq!(old_bytes, b"cell\0");
+    assert_eq!(after_bytes, b"swapped\0");
+    alias.ref_set(Obj::mk_string("set"));
+    let set = r.ref_get();
+    let (_, _, _, set_bytes) = set.string_view();
+    assert_eq!(set_bytes, b"set\0");
 
-    let t = Obj::mk_thunk_value(Obj::mk_nat(4));
+    let t = Obj::mk_thunk_value(Obj::mk_string("thunk"));
     assert_eq!(t.obj_tag(), usize::from(contract::TAG_THUNK));
+    let thunk_value = t
+        .evaluated_thunk_value()
+        .expect("Thunk.pure is already evaluated");
+    drop(t);
+    let (_, _, _, thunk_bytes) = thunk_value.string_view();
+    assert_eq!(
+        thunk_bytes, b"thunk\0",
+        "retained thunk payload outlives its container"
+    );
 
-    let task = Obj::mk_task_pure(Obj::mk_nat(5));
+    let delayed = Obj::mk_thunk_closure(Obj::mk_closure(1, Vec::new()));
+    assert!(delayed.evaluated_thunk_value().is_none());
+    let claimed = delayed
+        .claim_thunk_closure()
+        .expect("the delayed closure is claimed exactly once");
+    assert_eq!(claimed.closure_view(), (1, 0));
+    assert!(
+        delayed.claim_thunk_closure().is_none(),
+        "a second force sees the in-flight state"
+    );
+    drop(claimed);
+    assert!(delayed.complete_claimed_thunk(Obj::mk_string("forced")));
+    assert!(
+        !delayed.complete_claimed_thunk(Obj::mk_string("discarded")),
+        "a completed thunk cannot be overwritten"
+    );
+    let delayed_value = delayed
+        .evaluated_thunk_value()
+        .expect("the completed payload is retained");
+    let (_, _, _, delayed_bytes) = delayed_value.string_view();
+    assert_eq!(delayed_bytes, b"forced\0");
+
+    let task = Obj::mk_task_pure(Obj::mk_string("task"));
     assert_eq!(task.obj_tag(), usize::from(contract::TAG_TASK));
+    let task_value = task
+        .finished_task_value()
+        .expect("Task.pure is already finished");
+    drop(task);
+    let (_, _, _, task_bytes) = task_value.string_view();
+    assert_eq!(
+        task_bytes, b"task\0",
+        "retained task payload outlives its container"
+    );
 
     let m = Obj::mk_mpz(&[0xDEAD_BEEF, 0x1], true);
     let (alloc, size, limbs) = m.mpz_view();
     assert_eq!(alloc, 2);
     assert_eq!(size, -2, "sign of the value is the sign of m_size");
-    assert_eq!(limbs, vec![0xDEAD_BEEF, 0x1]);
+    assert_eq!(limbs, &[0xDEAD_BEEF, 0x1]);
+}
+
+#[test]
+fn ref_take_transfers_the_exact_cell_token_and_refill_restores_ownership() {
+    let _g = lock();
+    shadow::enable();
+    {
+        let payload = Obj::mk_string("single-threaded");
+        let payload_identity = payload.identity_token();
+        let cell = Obj::mk_ref(payload);
+        let taken = cell.ref_take();
+        assert_eq!(
+            taken.identity_token(),
+            payload_identity,
+            "take transfers the cell token without retaining or replacing it"
+        );
+        cell.ref_set(Obj::mk_string("refilled"));
+        let refilled = cell.ref_get();
+        let (_, _, _, refilled_bytes) = refilled.string_view();
+        assert_eq!(refilled_bytes, b"refilled\0");
+
+        let shared_payload = Obj::mk_string("shared");
+        let shared_identity = shared_payload.identity_token();
+        let shared_cell = Obj::mk_ref(shared_payload);
+        let shared_alias = shared_cell.clone_ref();
+        shared_cell.make_mt();
+        let shared_taken = shared_alias.ref_take();
+        assert_eq!(
+            shared_taken.identity_token(),
+            shared_identity,
+            "the atomic lane transfers the same owned cell token"
+        );
+        shared_cell.ref_set(Obj::mk_string("shared-refill"));
+        let shared_refilled = shared_alias.ref_get();
+        let (_, _, _, shared_bytes) = shared_refilled.string_view();
+        assert_eq!(shared_bytes, b"shared-refill\0");
+
+        let drop_payload = Obj::mk_string("outlives-empty-cell");
+        let drop_identity = drop_payload.identity_token();
+        let empty_cell = Obj::mk_ref(drop_payload);
+        let survivor = empty_cell.ref_take();
+        drop(empty_cell);
+        assert_eq!(
+            survivor.identity_token(),
+            drop_identity,
+            "dropping an empty cell does not release the transferred token"
+        );
+        let (_, _, _, survivor_bytes) = survivor.string_view();
+        assert_eq!(survivor_bytes, b"outlives-empty-cell\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "take and refill leave no live ABI allocation");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::DoubleRelease && event.kind != EventKind::ForeignPointer
+        }),
+        "take and refill preserve exact cell ownership"
+    );
+}
+
+#[test]
+fn mt_ref_cell_operations_preserve_owned_values_on_the_atomic_lane() {
+    let _g = lock();
+    shadow::enable();
+    {
+        let cell = Obj::mk_ref(Obj::mk_string("old"));
+        let alias = cell.clone_ref();
+        cell.make_mt();
+        assert_eq!(cell.header().rc, -2);
+
+        cell.ref_set(Obj::mk_string("new"));
+        let retained = alias.ref_get();
+        assert!(
+            retained.header().rc <= -2,
+            "the cell and owned read retain distinct MT references"
+        );
+        let previous = cell.ref_swap(Obj::mk_string("final"));
+        assert_eq!(
+            retained.identity_token(),
+            previous.identity_token(),
+            "swap transfers the exact previous ABI object"
+        );
+        let (_, _, _, previous_bytes) = previous.string_view();
+        assert_eq!(previous_bytes, b"new\0");
+        let current = alias.ref_get();
+        let (_, _, _, current_bytes) = current.string_view();
+        assert_eq!(current_bytes, b"final\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::DoubleRelease && event.kind != EventKind::ForeignPointer
+        }),
+        "the atomic ref lane preserves exact ownership"
+    );
+}
+
+#[test]
+fn mpz_view_is_zero_copy_normalized_and_excludes_negative_zero() {
+    let _g = lock();
+    let m = Obj::mk_mpz(&[0xDEAD_BEEF, 0x1], false);
+    let (alloc, size, first) = m.mpz_view();
+    let (_, _, second) = m.mpz_view();
+    assert_eq!((alloc, size), (2, 2));
+    assert_eq!(first.as_ptr(), second.as_ptr(), "the view must not copy");
+    let magnitude = fln_bignum::nat::BigNatView::from_limbs_le(first);
+    assert_eq!(
+        magnitude.limbs_le().as_ptr(),
+        first.as_ptr(),
+        "the bignum view must alias the ABI limb buffer"
+    );
+
+    let normalized = Obj::mk_mpz(&[7, 0, 0], true);
+    let (alloc, size, limbs) = normalized.mpz_view();
+    assert_eq!((alloc, size, limbs), (1, -1, &[7][..]));
+
+    let zero = Obj::mk_mpz(&[0, 0], true);
+    let (alloc, size, limbs) = zero.mpz_view();
+    assert_eq!((alloc, size), (0, 0), "negative zero is impossible");
+    assert!(limbs.is_empty());
 }
 
 #[test]
@@ -448,6 +642,40 @@ fn mark_mt_negates_and_atomics_conserve() {
     assert_eq!(s.header().rc, -1, "MT dec via atomic fetch_add");
 }
 
+/// An ST refcount that overflows must FAULT, not wrap (D3; FL-INV-07).
+///
+/// A wrapped positive count does not become "a very large count" — it becomes a
+/// NEGATIVE one, and `m_rc < 0` *is* the multi-threaded encoding in this ABI.
+/// `mark_mt_negates_and_atomics_conserve` above asserts exactly that negation,
+/// so an overflow silently reclassifies an object's threading discipline: every
+/// later dec takes the atomic MT path on an object nothing is synchronizing,
+/// and the tri-state invariant the whole RC surface rests on is gone.
+///
+/// The site's only guard was a `debug_assert!` sitting next to a
+/// `wrapping_add`, which is to say there was no guard in a release build at
+/// all — the shape this test exists to keep out.
+///
+/// Reachability: `lean_inc_ref_n` takes a caller-supplied `size_t n` at the pin
+/// (`lean.h:556`, and it is already specified in `fln_rt::abi::FUNCTION_CENSUS`),
+/// so once that export is wired this is one hostile call from C. Today it is
+/// only reachable internally, where `n` is always 1.
+#[test]
+#[should_panic(expected = "single-threaded RC overflow")]
+fn st_refcount_overflow_faults_rather_than_wrapping_into_the_mt_encoding() {
+    let _g = lock();
+    let s = Obj::mk_string("overflow");
+    assert_eq!(s.header().rc, 1);
+    // rc is 1, so one increment of i32::MAX carries it past i32::MAX.
+    // UNSAFE-LEDGER: FLN-UL-0180
+    #[allow(unsafe_code)]
+    unsafe {
+        // SAFETY: `s` keeps the object alive for the call; the pointer is this
+        // handle's own address. The call is expected to fault before it writes,
+        // leaving rc at 1 so the handle still drops cleanly.
+        crate::rc::inc_ref_n(s.identity_token() as *mut LeanObject, i32::MAX as usize);
+    }
+}
+
 #[test]
 fn mt_object_dies_on_last_dec() {
     let _g = lock();
@@ -475,6 +703,15 @@ fn mt_object_dies_on_last_dec() {
 
 /// RC balance property: a seeded random object soup — builds, shares, and
 /// drops — must tear down completely with zero ownership faults.
+///
+/// MANDATED MUTANT (AGENTS testing policy: "dropped retain"): neutering
+/// `rc::inc_ref_n` fails this test at `rc.rs`'s ownership-fault check. Verified
+/// by planting it on 2026-07-26 (bead
+/// `fln-mandated-mutant-join-unwatched-uagk`), not by inspection —
+/// `mt_object_dies_on_last_dec` and `rc_clone_and_drop_balance` also die, the
+/// latter by SIGABRT rather than a clean assertion. The marker is what joins
+/// this test to §18's list; without it the kill was real but nothing recorded
+/// which obligation it discharged.
 #[test]
 fn rc_balance_property_random_graphs() {
     let _g = lock();
@@ -560,6 +797,65 @@ fn shadow_kills_double_release() {
     assert!(
         events.iter().any(|e| e.kind == EventKind::DoubleRelease),
         "seeded double release must be detected"
+    );
+}
+
+#[test]
+fn shadow_kills_cold_double_release() {
+    let _g = lock();
+    shadow::enable();
+    Obj::probe_cold_double_release();
+    let (events, _) = shadow::disable_and_drain();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::DoubleRelease),
+        "the cold path must detect a double release like every sibling"
+    );
+}
+
+#[test]
+fn ctor_scalar_bounds_refuse_every_escape() {
+    let _g = lock();
+    // One child slot and a 16-byte scalar area: the object extent is
+    // header(8) + slot(8) + 16, so scalar bytes span [8, 24) from obj_cptr.
+    let obj = Obj::mk_ctor(1, vec![Obj::mk_nat(1)], &[0xAB; 16]);
+    // Control first: the valid ends of the area read and write cleanly.
+    obj.ctor_scalar_set_u64(8, 0x1122_3344_5566_7788);
+    obj.ctor_scalar_set_u64(16, 0x8877_6655_4433_2211);
+    assert_eq!(obj.ctor_scalar_u64(8), 0x1122_3344_5566_7788);
+    assert_eq!(obj.ctor_scalar_u64(16), 0x8877_6655_4433_2211);
+
+    for bad in [0usize, 24, 128, usize::MAX - 8] {
+        let read =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| obj.ctor_scalar_u64(bad)));
+        assert!(
+            read.is_err(),
+            "an out-of-area read at {bad} must refuse, not escape"
+        );
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            obj.ctor_scalar_set_u64(bad, 0)
+        }));
+        assert!(
+            write.is_err(),
+            "an out-of-area write at {bad} must refuse, not escape"
+        );
+    }
+}
+
+#[test]
+fn stress_mt_refuses_a_single_threaded_object() {
+    let _g = lock();
+    let st = Obj::mk_ctor(0, vec![], &[]);
+    assert!(st.header().rc > 0, "the fixture is single-threaded");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.stress_mt(2, 8)));
+    let payload = unwound.expect_err("an ST object must refuse the MT storm");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string payload>");
+    assert!(
+        message.contains("MT or persistent"),
+        "the refusal must name the precondition, got: {message}"
     );
 }
 
@@ -766,9 +1062,10 @@ fn collect_c4_facts() -> Vec<(String, i64)> {
 fn export_small_heap_prefix_roundtrip() {
     let _g = lock();
     use crate::export::{
-        export_lean_alloc_small, export_lean_free_small, export_lean_small_mem_size,
-        export_mi_free, export_mi_malloc_small,
+        export_lean_alloc_small, export_lean_free_small, export_lean_inc_heartbeat,
+        export_lean_small_mem_size, export_mi_free, export_mi_malloc_small,
     };
+    let before = crate::membrane::get_num_heartbeats();
     // mi twin: size preserved through the prefix, pointer 8-aligned.
     let p = export_mi_malloc_small(24);
     assert!(!p.is_null());
@@ -781,11 +1078,125 @@ fn export_small_heap_prefix_roundtrip() {
     let z = export_mi_malloc_small(0);
     assert!(!z.is_null());
     export_mi_free(z);
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before,
+        "the raw mimalloc shim is downstream of lean.h's explicit bump"
+    );
+    // The distributed lean.h path performs this exact composition:
+    // lean_inc_heartbeat(), then mi_malloc_small(). It must charge once.
+    export_lean_inc_heartbeat();
+    let composed = export_mi_malloc_small(16);
+    assert!(!composed.is_null());
+    export_mi_free(composed);
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 1,
+        "the distributed lean.h small-allocation path must not double-charge"
+    );
     // SMALL_ALLOCATOR surface: aligned size + slot-idx law.
     let q = export_lean_alloc_small(32, 3);
     assert!(!q.is_null());
     assert_eq!(export_lean_small_mem_size(q), 32);
     export_lean_free_small(q);
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 2,
+        "the small-allocator entry point owns exactly one bump"
+    );
+}
+
+#[test]
+fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
+    let _g = lock();
+    use crate::export::{export_lean_small_mem_size, export_mi_free, export_mi_malloc_small};
+
+    assert_eq!(crate::membrane::small_class_for_test(1), Some((0, 8)));
+    assert_eq!(crate::membrane::small_class_for_test(8), Some((0, 8)));
+    assert_eq!(crate::membrane::small_class_for_test(9), Some((1, 16)));
+    assert_eq!(
+        crate::membrane::small_class_for_test(4096),
+        Some((511, 4096))
+    );
+    assert_eq!(crate::membrane::small_class_for_test(4097), None);
+    assert!(
+        crate::membrane::small_bin_metadata_bytes_for_test() <= 5 * 1024,
+        "intrusive heads keep per-thread allocator metadata bounded"
+    );
+
+    for size in [1usize, 8, 9, 4095, 4096, 4097] {
+        let block = export_mi_malloc_small(size);
+        assert!(!block.is_null());
+        assert_eq!(
+            export_lean_small_mem_size(block),
+            u32::try_from(size).expect("test size fits c_uint"),
+            "the hidden prefix preserves logical size across every class edge"
+        );
+        export_mi_free(block);
+    }
+
+    let capacity = crate::membrane::small_bin_capacity_for_test();
+    let mut held = Vec::new();
+    for _ in 0..capacity + 3 {
+        let block = export_mi_malloc_small(9);
+        assert!(!block.is_null());
+        held.push(block);
+    }
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(9),
+        0,
+        "holding more than one full bin drains every prior cached block"
+    );
+
+    let recycled = held.pop().expect("one held class-16 block");
+    let recycled_address = recycled.addr();
+    export_mi_free(recycled);
+    assert_eq!(crate::membrane::small_bin_depth_for_test(9), 1);
+
+    let reused = export_mi_malloc_small(15);
+    assert_eq!(
+        reused.addr(),
+        recycled_address,
+        "same-class allocation reuses the most recently deferred block"
+    );
+    assert_eq!(
+        export_lean_small_mem_size(reused),
+        15,
+        "reuse rewrites the logical-size prefix"
+    );
+    export_mi_free(reused);
+    for block in held {
+        export_mi_free(block);
+    }
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(9),
+        capacity,
+        "each thread-local class is bounded exactly"
+    );
+
+    let cross_thread = export_mi_malloc_small(24);
+    assert!(!cross_thread.is_null());
+    let cross_thread_address = cross_thread.expose_provenance();
+    std::thread::spawn(move || {
+        let block =
+            core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(cross_thread_address);
+        export_mi_free(block);
+        assert_eq!(
+            crate::membrane::small_bin_depth_for_test(24),
+            1,
+            "a foreign-thread release is adopted by the freeing thread"
+        );
+        let reused = export_mi_malloc_small(17);
+        assert_eq!(
+            reused.addr(),
+            cross_thread_address,
+            "the adopting thread owns the next same-class reuse"
+        );
+        assert_eq!(export_lean_small_mem_size(reused), 17);
+        export_mi_free(reused);
+    })
+    .join()
+    .expect("cross-thread small-bin reuse");
 }
 
 #[test]
@@ -796,6 +1207,9 @@ fn export_alloc_object_marks_big_path_and_frees() {
     assert!(!o.is_null());
     // Header init through the internal twin, then release through the
     // exported category dispatch.
+    // SAFETY: `o` was minted by this crate's own exported allocator and
+    // asserted non-null above; the test owns it exclusively until it frees it
+    // below, and `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0103
     #[allow(unsafe_code)]
     unsafe {
@@ -820,6 +1234,10 @@ fn export_string_constructors_match_pin_semantics() {
         export_lean_mk_string_from_bytes, export_lean_object_byte_size,
         export_lean_object_data_byte_size, export_lean_string_eq_cold,
     };
+    // SAFETY: every object here is minted by this crate's own constructors from
+    // literals that satisfy their contracts, is owned exclusively by this test,
+    // and is released through the exported cold path before the block ends;
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0104
     #[allow(unsafe_code)]
     unsafe {
@@ -902,6 +1320,10 @@ fn export_panic_fn_balances_ownership_and_returns_default() {
     // Quiet: the message plane is exercised by the gauntlet lane with real
     // process boundaries; here we assert the ownership contract only.
     export_lean_set_panic_messages(false);
+    // SAFETY: both objects are minted by this crate's own constructors and owned
+    // exclusively by this test; the ownership contract under assertion is
+    // exactly which of them the exported panic path consumes, and each is
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0105
     #[allow(unsafe_code)]
     unsafe {
@@ -925,26 +1347,79 @@ fn export_panic_fn_balances_ownership_and_returns_default() {
 #[test]
 fn export_heartbeat_is_thread_local_counting() {
     let _g = lock();
-    use crate::export::{export_lean_inc_heartbeat, heartbeat_value};
-    let before = heartbeat_value();
+    use crate::export::{
+        export_lean_big_uint64_to_nat, export_lean_dec_ref_cold, export_lean_inc_heartbeat,
+        export_lean_io_get_num_heartbeats, export_lean_io_set_heartbeats,
+        export_lean_uint64_of_big_nat,
+    };
+
+    let unit = export_lean_io_set_heartbeats(tagged::boxi(0));
+    assert_eq!(tagged::unbox(unit), 0);
     for _ in 0..5 {
         export_lean_inc_heartbeat();
     }
-    assert_eq!(heartbeat_value(), before + 5);
+    assert_eq!(crate::membrane::get_num_heartbeats(), 5);
+    assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 5);
+
     // A fresh thread starts its own counter (LEAN_THREAD_VALUE semantics).
     std::thread::spawn(|| {
-        assert_eq!(heartbeat_value(), 0);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 0);
         export_lean_inc_heartbeat();
-        assert_eq!(heartbeat_value(), 1);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 1);
+        let unit = export_lean_io_set_heartbeats(tagged::boxi(9));
+        assert_eq!(tagged::unbox(unit), 0);
+        assert_eq!(tagged::unbox(export_lean_io_get_num_heartbeats()), 9);
     })
     .join()
     .expect("heartbeat thread");
+    assert_eq!(crate::membrane::get_num_heartbeats(), 5);
+
+    // The u64 boundary takes the heap-Nat arm. The getter snapshots first,
+    // then its returned big Nat is itself one small allocation: MAX wraps to
+    // zero in the live counter while the returned value remains MAX.
+    let maximum = export_lean_big_uint64_to_nat(u64::MAX);
+    let unit = export_lean_io_set_heartbeats(maximum);
+    assert_eq!(tagged::unbox(unit), 0);
+    let snapshot = export_lean_io_get_num_heartbeats();
+    assert!(!tagged::is_scalar(snapshot));
+    assert_eq!(export_lean_uint64_of_big_nat(snapshot), u64::MAX);
+    assert_eq!(crate::membrane::get_num_heartbeats(), 0);
+    export_lean_dec_ref_cold(snapshot);
+
+    let unit = export_lean_io_set_heartbeats(tagged::boxi(0));
+    assert_eq!(tagged::unbox(unit), 0);
+}
+
+#[test]
+fn marrow_small_objects_charge_and_big_objects_do_not() {
+    let _g = lock();
+    let before = crate::membrane::get_num_heartbeats();
+
+    let small = Obj::mk_ref(Obj::mk_nat(7));
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 1,
+        "a Marrow small-object constructor charges one allocation tick"
+    );
+    drop(small);
+
+    let big = Obj::mk_array(Vec::new());
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 1,
+        "the Reference heartbeat law does not charge a big allocation"
+    );
+    drop(big);
 }
 
 #[test]
 fn export_dec_ref_cold_tears_down_graphs() {
     let _g = lock();
     use crate::export::export_lean_dec_ref_cold;
+    // SAFETY: the whole object graph is built here by this crate's own
+    // constructors and is owned exclusively by this test; the single
+    // `dec_ref_cold` at the root is the only release, which is the property
+    // under test. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0106
     #[allow(unsafe_code)]
     unsafe {
@@ -964,6 +1439,10 @@ fn export_dec_ref_cold_tears_down_graphs() {
 fn export_mark_persistent_via_c_surface() {
     let _g = lock();
     use crate::export::export_lean_mark_persistent;
+    // SAFETY: the string and ctor are minted by this crate's own constructors
+    // and owned exclusively by this test; marking them persistent is the
+    // operation under test and is applied to objects this block created.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0107
     #[allow(unsafe_code)]
     unsafe {
@@ -989,6 +1468,10 @@ fn export_platform_and_byte_array_roundtrip() {
         tagged::unbox(export_lean_system_platform_nbits(tagged::boxi(0))),
         64
     );
+    // SAFETY: the string is minted from a NUL-terminated literal through this
+    // crate's own exported constructor and is owned exclusively by this test;
+    // each conversion in the roundtrip consumes or borrows exactly as its
+    // contract states. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0112
     #[allow(unsafe_code)]
     unsafe {
@@ -1015,6 +1498,10 @@ fn export_array_list_roundtrip_and_push_laws() {
         export_lean_array_mk, export_lean_array_push, export_lean_array_to_list,
         export_lean_dec_ref_cold,
     };
+    // SAFETY: the list is built here from boxed scalars, so every node is this
+    // test's own and exclusively owned; the Array/List conversions consume and
+    // produce objects of the shapes their contracts require, and the result is
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0131
     #[allow(unsafe_code)]
     unsafe {
@@ -1067,6 +1554,10 @@ fn export_byte_array_families_match_pin_laws() {
         export_lean_byte_array_data, export_lean_byte_array_mk, export_lean_byte_array_push,
         export_lean_dec_ref_cold,
     };
+    // SAFETY: the array is allocated here with matching size and capacity and
+    // every slot is written before it is read; the ByteArray conversions
+    // consume and produce objects of the shapes their contracts require.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0132
     #[allow(unsafe_code)]
     unsafe {
@@ -1107,6 +1598,10 @@ fn export_string_list_roundtrip_and_hash() {
         export_lean_dec_ref_cold, export_lean_mk_string, export_lean_string_data,
         export_lean_string_eq_cold, export_lean_string_hash, export_lean_string_mk,
     };
+    // SAFETY: the string is minted from a NUL-terminated literal through this
+    // crate's own exported constructor; the extra reference this test takes is
+    // matched by the releases below, so every borrow is live for its use.
+    // `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0133
     #[allow(unsafe_code)]
     unsafe {
@@ -1146,20 +1641,36 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
         export_lean_nat_overflow_mul, export_lean_string_of_usize, export_lean_uint8_of_big_nat,
         export_lean_uint64_of_big_nat, export_lean_usize_of_big_nat,
     };
+    // SAFETY: every value here is either a boxed scalar, which carries no
+    // pointer, or an mpz minted by this crate's own constructor and owned
+    // exclusively by this test; each arithmetic entry point is handed operands
+    // of the shape it documents. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0160
     #[allow(unsafe_code)]
     unsafe {
+        let mpz_copy = |object| {
+            let (alloc, size, pointer, live) = crate::object::mpz_fields(object);
+            assert!(alloc >= 0 && live <= alloc as usize);
+            let limbs = if live == 0 {
+                Vec::new()
+            } else {
+                assert!(!pointer.is_null());
+                core::slice::from_raw_parts(pointer, live).to_vec()
+            };
+            (size, limbs)
+        };
+
         // Boundary law: MAX_SMALL_NAT boxes, MAX_SMALL_NAT+1 mints mpz.
         let max_small = tagged::MAX_SMALL_NAT;
         assert!(tagged::is_scalar(export_lean_big_usize_to_nat(max_small)));
         let big = export_lean_big_uint64_to_nat(u64::MAX);
         assert!(!tagged::is_scalar(big), "2^64-1 exceeds MAX_SMALL_NAT");
-        let (_, sz, limbs) = crate::object::mpz_fields(big);
+        let (sz, limbs) = mpz_copy(big);
         assert_eq!((sz, limbs.as_slice()), (1, &[u64::MAX][..]));
 
         // add: big + 1 = 2^64 (stays mpz, _core arm).
         let big2 = export_lean_nat_big_add(big, tagged::boxi(1));
-        let (_, sz2, limbs2) = crate::object::mpz_fields(big2);
+        let (sz2, limbs2) = mpz_copy(big2);
         assert_eq!((sz2, limbs2.as_slice()), (2, &[0, 1][..]));
 
         // sub: 2^64 - (2^64-1) = 1 -> NORMALIZED to a boxed scalar.
@@ -1212,13 +1723,13 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
 
         // overflow_mul: 2^40 * 2^40 = 2^80.
         let of = export_lean_nat_overflow_mul(1 << 40, 1 << 40);
-        let (_, osz, olimbs) = crate::object::mpz_fields(of);
+        let (osz, olimbs) = mpz_copy(of);
         assert_eq!((osz, olimbs.as_slice()), (2, &[0, 1 << 16][..]));
 
         // cstr parse: small and 2^128 + 1.
         assert_eq!(tagged::unbox(export_lean_cstr_to_nat(c"123".as_ptr())), 123);
         let c128 = export_lean_cstr_to_nat(c"340282366920938463463374607431768211457".as_ptr());
-        let (_, csz, climbs) = crate::object::mpz_fields(c128);
+        let (csz, climbs) = mpz_copy(c128);
         assert_eq!((csz, climbs.as_slice()), (3, &[1, 0, 1][..]));
 
         // truncations: lowest limb / low bits.
@@ -1244,6 +1755,10 @@ fn export_name_eq_walks_prefixes_exactly() {
     use crate::export::{
         export_lean_big_uint64_to_nat, export_lean_dec_ref_cold, export_lean_name_eq,
     };
+    // SAFETY: the Name node is built here with the field and scalar counts the
+    // ctor layout requires, so the cached-hash slot this test reads is inside
+    // the allocation, and the graph is owned exclusively by this test and
+    // released once. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0161
     #[allow(unsafe_code)]
     unsafe {
@@ -1308,6 +1823,10 @@ mod apply_targets {
     }
     /// arity-1 returning a NEW closure (for the over-application arm).
     pub(crate) extern "C" fn make_adder(a: *mut LeanObject) -> *mut LeanObject {
+        // SAFETY: reached only as a closure target invoked by the apply arms in
+        // this module, which pass `a` as an owned argument. The closure is
+        // allocated here with the arity and fixed-argument count `add2`
+        // declares, and takes ownership of `a` in slot 0.
         // UNSAFE-LEDGER: FLN-UL-0176
         #[allow(unsafe_code)]
         unsafe {
@@ -1322,6 +1841,10 @@ mod apply_targets {
 fn export_apply_arms_match_generated_semantics() {
     let _g = lock();
     use crate::export::{export_lean_apply_1, export_lean_apply_2, export_lean_apply_3};
+    // SAFETY: each closure is allocated here with an arity and fixed-argument
+    // count matching the `extern "C"` target it wraps, which is what makes the
+    // apply arms well-formed; every closure and result is owned exclusively by
+    // this test. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0177
     #[allow(unsafe_code)]
     unsafe {
@@ -1389,12 +1912,20 @@ fn export_once_cells_initialize_exactly_once() {
         0xFEED
     }
     extern "C" fn init_obj() -> *mut LeanObject {
+        // SAFETY: reached only as the once-initialisation target invoked by the
+        // test below. It takes no arguments and mints a fresh string from a
+        // static literal whose length it states correctly, so the constructor's
+        // contract is satisfied by construction.
         // UNSAFE-LEDGER: FLN-UL-0178
         #[allow(unsafe_code)]
         unsafe {
             crate::object::mk_string_unchecked(b"once", 4)
         }
     }
+    // SAFETY: `cell` is a local array owned by this test, so the pointer handed
+    // to the once-initialisation entry point is valid, aligned and exclusively
+    // borrowed for the call; it stands in for the C-side static and outlives
+    // every use here. `lock()` serialises the heap-observing tests.
     // UNSAFE-LEDGER: FLN-UL-0179
     #[allow(unsafe_code)]
     unsafe {
@@ -1419,4 +1950,1283 @@ fn export_once_cells_initialize_exactly_once() {
             "once objects are persistent"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// G0-3: the closures-corpus semantics through the SAFE surface, with the RC
+// shadow asserting balance per cell (bead franken_lean-7xe; the raw arms are
+// 83r slice 4's, held by export_apply_arms_match_generated_semantics — these
+// cells hold the covenant surface and acceptance (c) in the same breath).
+// ---------------------------------------------------------------------------
+
+mod corpus_targets {
+    use crate::layout::LeanObject;
+    use crate::tagged;
+
+    /// `addN`'s body under the boxed convention: `fun n x => x + n` at
+    /// saturation (fixed `n`, applied `x`).
+    pub(crate) extern "C" fn add2(n: *mut LeanObject, x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(n) + tagged::unbox(x))
+    }
+
+    /// `(· * 2)`.
+    pub(crate) extern "C" fn double(x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) * 2)
+    }
+
+    /// `fun x y z => x * y + z` — the corpus's ternary lambda.
+    pub(crate) extern "C" fn mul_add3(
+        x: *mut LeanObject,
+        y: *mut LeanObject,
+        z: *mut LeanObject,
+    ) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) * tagged::unbox(y) + tagged::unbox(z))
+    }
+
+    /// `fun _ => 6 * 7` — tasks.lean's `Task.spawn` body (the unit argument
+    /// is the boxed scalar the manager applies).
+    pub(crate) extern "C" fn six_times_seven(_u: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(6 * 7)
+    }
+
+    /// `(· + 1)` — tasks.lean's `Task.map` body.
+    pub(crate) extern "C" fn succ(x: *mut LeanObject) -> *mut LeanObject {
+        tagged::boxi(tagged::unbox(x) + 1)
+    }
+}
+
+#[test]
+fn handle_apply_reproduces_the_closures_corpus_semantics_with_rc_balance() {
+    let _g = lock();
+    use crate::handle::Obj;
+    shadow::enable();
+    {
+        // corpus closures.lean line 3: `compose (addN 5) (· * 2) 10` = 25.
+        // compose = fun f g x => f (g x), evaluated by chaining the safe
+        // surface exactly as the corpus's saturated call tree does.
+        let add5 = Obj::mk_closure_fn2(corpus_targets::add2, vec![Obj::mk_nat(5)]);
+        let doubled =
+            Obj::mk_closure_fn1(corpus_targets::double, vec![]).apply(vec![Obj::mk_nat(10)]);
+        let composed = add5.apply(vec![doubled]);
+        assert_eq!(composed.unbox(), 25, "compose (addN 5) (.*2) 10");
+
+        // corpus line 4 shape: under-application curries — `addN 100` alone is
+        // a closure with one fixed slot, and applying it later completes.
+        let add100 =
+            Obj::mk_closure_fn2(corpus_targets::add2, vec![]).apply(vec![Obj::mk_nat(100)]);
+        assert!(!add100.is_scalar(), "under-application yields a closure");
+        assert_eq!(
+            add100.header().tag,
+            crate::contract::TAG_CLOSURE,
+            "curried value is a closure object"
+        );
+        assert_eq!(
+            add100.apply(vec![Obj::mk_nat(4)]).unbox(),
+            104,
+            "addN 100 applied to 4"
+        );
+
+        // corpus line 5: `(fun x y z => x * y + z) 2 3 4` = 10 — saturation in
+        // one call, and the same result arg-by-arg (over-application re-entry
+        // through the chunked safe path).
+        let f3 = Obj::mk_closure_fn3(corpus_targets::mul_add3, vec![]);
+        assert_eq!(
+            f3.apply(vec![Obj::mk_nat(2), Obj::mk_nat(3), Obj::mk_nat(4)])
+                .unbox(),
+            10
+        );
+        let g3 = Obj::mk_closure_fn3(corpus_targets::mul_add3, vec![]);
+        assert_eq!(
+            g3.apply(vec![Obj::mk_nat(2)])
+                .apply(vec![Obj::mk_nat(3)])
+                .apply(vec![Obj::mk_nat(4)])
+                .unbox(),
+            10,
+            "one-at-a-time currying agrees with saturation"
+        );
+    }
+    // Acceptance (c)'s instrument: every closure allocated above was freed
+    // exactly once — no leak, no double-free — under the debug ownership
+    // shadow. Scalars are unboxed and never enter the shadow, so live=0 is
+    // the whole balance claim.
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance: every apply cell freed its objects");
+}
+
+#[test]
+fn handle_apply_reproduces_the_arrays_and_strings_corpus_slices_with_rc_balance() {
+    let _g = lock();
+    use crate::handle::Obj;
+    shadow::enable();
+    {
+        // arrays.lean line 3 shape: `#[1,2,3,4].map (· * 2) |>.foldl (· + ·) 0`
+        // = 20 — map as apply-per-element through the safe surface, fold as a
+        // chained binary apply, exactly Golem's dispatch shape.
+        let arr = Obj::mk_array(vec![
+            Obj::mk_nat(1),
+            Obj::mk_nat(2),
+            Obj::mk_nat(3),
+            Obj::mk_nat(4),
+        ]);
+        let (size, capacity) = arr.array_view();
+        assert_eq!((size, capacity), (4, 4), "capacity == size by construction");
+        let mut mapped = Vec::new();
+        for i in 0..size {
+            let doubler = Obj::mk_closure_fn1(corpus_targets::double, vec![]);
+            mapped.push(doubler.apply(vec![arr.array_child(i)]));
+        }
+        let mut acc = Obj::mk_nat(0);
+        for m in mapped {
+            let adder = Obj::mk_closure_fn2(corpus_targets::add2, vec![]);
+            acc = adder.apply(vec![acc, m]);
+        }
+        assert_eq!(acc.unbox(), 20, "map-then-fold over the ABI array");
+
+        // strings.lean semantics natively: the UTF-8 length law ("héllo" is 5
+        // chars / 6 bytes, m_size includes NUL) and append reproducing the
+        // corpus's byte-and-char accounting.
+        let s = Obj::mk_string("héllo");
+        let (m_size, m_capacity, m_length, bytes) = s.string_view();
+        assert_eq!(m_length, 5, "char length (the corpus's .length observable)");
+        assert_eq!(m_size, 7, "byte size includes the NUL");
+        assert!(m_capacity >= m_size);
+        assert_eq!(&bytes[..6], "héllo".as_bytes());
+        let appended = Obj::mk_string(&format!("{}{}", "franken", "lean"));
+        let (_, _, app_len, app_bytes) = appended.string_view();
+        assert_eq!(app_len, 11);
+        assert_eq!(&app_bytes[..11], b"frankenlean");
+
+        // The ctor slice: Tree.node Tree.leaf Tree.leaf from the corpus's
+        // inductive, traversed back out through ctor_child.
+        let leaf = || Obj::mk_ctor(0, vec![], &[]);
+        let node = Obj::mk_ctor(1, vec![leaf(), leaf()], &[]);
+        assert_eq!(node.header().tag, 1);
+        assert_eq!(node.ctor_child(0).header().tag, 0);
+        assert_eq!(node.ctor_child(1).header().tag, 0);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across arrays, strings, and ctors");
+}
+
+#[test]
+fn export_string_append_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::export_lean_string_append;
+    shadow::enable();
+    // SAFETY: every string below is allocated here and settled here: owned
+    // references are yielded to the append exactly per lean.h:1225 (s1 owned,
+    // s2 borrowed), borrowed ones dec'd at the end; field reads are within
+    // live objects. `lock()` serialises the heap-observing tests.
+    // UNSAFE-LEDGER: FLN-UL-0185
+    #[allow(unsafe_code)]
+    unsafe {
+        // SHARED arm (object.cpp:2084-2096): a second reference forces the
+        // fresh-alloc path — capacity EXACTLY mk_capacity(new_sz) = 2*new_sz,
+        // and the shared original survives with its bytes intact.
+        let s1 = crate::object::mk_string_unchecked(b"franken", 7);
+        crate::rc::inc_ref_n(s1, 1); // the keeper reference
+        let s2 = crate::object::mk_string_unchecked(b"lean", 4);
+        let appended = export_lean_string_append(s1, s2);
+        assert_ne!(appended, s1, "shared arm allocates fresh");
+        let (a_size, a_cap, a_len, a_bytes) = crate::object::string_fields(appended);
+        assert_eq!(&a_bytes[..11], b"frankenlean");
+        assert_eq!(
+            (a_size, a_len),
+            (12, 11),
+            "combined bytes + NUL / char count"
+        );
+        assert_eq!(a_cap, 24, "shared arm: capacity == 2 * new_sz exactly");
+        let (_, _, _, kept) = crate::object::string_fields(s1);
+        assert_eq!(&kept[..7], b"franken", "the shared original is untouched");
+        crate::rc::dec_ref(s1); // drop the keeper
+
+        // EXCLUSIVE arm, in-place: `appended` is exclusively owned with
+        // capacity 24 and size 12 — room for the tail, so identity holds.
+        let bang = crate::object::mk_string_unchecked(b"!", 1);
+        let grown = export_lean_string_append(appended, bang);
+        assert_eq!(grown, appended, "exclusive fit reuses the block in place");
+        let (g_size, g_cap, g_len, g_bytes) = crate::object::string_fields(grown);
+        assert_eq!(&g_bytes[..12], b"frankenlean!");
+        assert_eq!((g_size, g_cap, g_len), (13, 24, 12));
+        crate::rc::dec_ref(grown);
+        crate::rc::dec_ref(bang);
+
+        // EXCLUSIVE arm, grow (string_ensure_capacity, object.cpp:1966): a
+        // fresh exact-capacity string must reallocate at cap + sz1 + extra,
+        // and the old identity dies.
+        let tight = crate::object::mk_string_unchecked(b"ab", 2); // size 3, cap 3
+        let add = crate::object::mk_string_unchecked(b"cd", 2); // sz2 = 3, extra = 2
+        let g2 = export_lean_string_append(tight, add);
+        assert_ne!(g2, tight, "exclusive grow reallocates");
+        let (z_size, z_cap, z_len, z_bytes) = crate::object::string_fields(g2);
+        assert_eq!(&z_bytes[..4], b"abcd");
+        assert_eq!((z_size, z_len), (5, 4));
+        assert_eq!(z_cap, 3 + 3 + 2, "grow law: cap + sz1 + extra");
+        crate::rc::dec_ref(g2);
+        crate::rc::dec_ref(add);
+        crate::rc::dec_ref(s2);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across all three append arms");
+}
+
+#[test]
+fn export_assert_violation_format_matches_upstream() {
+    // debug.cpp:48-55 byte-for-byte: four lines, each newline-terminated, the
+    // condition bare on its own line. The abort half is the crash path and is
+    // deliberately not crossed in-process; the format is the testable half.
+    assert_eq!(
+        crate::export::format_assert_violation("plug.c", 42, "x != NULL"),
+        "LEAN ASSERTION VIOLATION\nFile: plug.c\nLine: 42\nx != NULL\n"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn door_loads_a_reference_built_plugin_end_to_end() {
+    let _g = lock();
+    use crate::door::{LoadedPlugin, RTLD_GLOBAL, RTLD_NOW};
+    use std::ffi::CString;
+    use std::process::Command;
+
+    // Env-gated on the pinned toolchain (the kernel_replay pattern): the
+    // committed fixture is the SOURCE plus the build protocol; the .so is
+    // regenerable platform-bound output, never committed.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let bin =
+        std::path::PathBuf::from(&home).join(".elan/toolchains/leanprover--lean4---v4.32.0/bin");
+    if !bin.join("lean").is_file() {
+        eprintln!("SKIP: pinned Reference toolchain not installed");
+        return;
+    }
+    let plug_lean = g03_fixture("plug.lean");
+    let work = std::env::temp_dir().join(format!("fln-g03-door-{}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("workdir");
+    std::fs::copy(&plug_lean, work.join("plug.lean")).expect("fixture copy");
+
+    let run = |cmd: &mut Command| {
+        let out = cmd.output().expect("spawn");
+        assert!(
+            out.status.success(),
+            "{:?} failed:\n{}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    // The receipt protocol from the plugin import census, verbatim.
+    run(Command::new(bin.join("lean"))
+        .current_dir(&work)
+        .env_remove("LEAN_PATH")
+        .env_remove("LEAN_SYSROOT")
+        .env("LC_ALL", "C")
+        .args(["plug.lean", "-c", "plug.c"]));
+    run(Command::new(bin.join("leanc")).current_dir(&work).args([
+        "-DLEAN_EXPORTING",
+        "-shared",
+        "-fPIC",
+        "plug.c",
+        "-o",
+        "plug.so",
+    ]));
+    // The initializer shim: initialize_Init served as a leanc-compiled object
+    // whose io-result construction resolves against THIS binary's exports.
+    std::fs::write(
+        work.join("shim.c"),
+        "#include <lean/lean.h>\nLEAN_EXPORT lean_object * initialize_Init(uint8_t builtin) {\n  (void)builtin;\n  return lean_io_result_mk_ok(lean_box(0));\n}\n",
+    )
+    .expect("shim");
+    run(Command::new(bin.join("leanc")).current_dir(&work).args([
+        "-DLEAN_EXPORTING",
+        "-shared",
+        "-fPIC",
+        "shim.c",
+        "-o",
+        "shim.so",
+    ]));
+
+    shadow::enable();
+    {
+        // RTLD_NOW on both loads: every undefined symbol — the census demand
+        // list — must resolve at bind time against this test binary's
+        // -rdynamic export surface, or the loader names the first miss.
+        let cpath =
+            |p: std::path::PathBuf| CString::new(p.into_os_string().into_encoded_bytes()).unwrap();
+        let _shim = LoadedPlugin::open(&cpath(work.join("shim.so")), RTLD_NOW | RTLD_GLOBAL)
+            .expect("the initializer shim binds against Marrow's exports");
+        let plug = LoadedPlugin::open(&cpath(work.join("plug.so")), RTLD_NOW)
+            .expect("the REAL Reference-built plugin binds against Marrow's exports");
+
+        let init = plug
+            .symbol(&CString::new("initialize_plug").unwrap())
+            .expect("initializer");
+        let add = plug
+            .symbol(&CString::new("plug_add_five").unwrap())
+            .expect("plug_add_five");
+        let greet = plug
+            .symbol(&CString::new("plug_greet").unwrap())
+            .expect("plug_greet");
+        // SAFETY: the census-declared signatures — initializer (uint8_t) ->
+        // lean_object*, and the two boxed-convention exports; every returned
+        // object is owned here and released here.
+        // UNSAFE-LEDGER: FLN-UL-0189
+        #[allow(unsafe_code)]
+        unsafe {
+            let f: extern "C" fn(u8) -> *mut LeanObject = core::mem::transmute(init);
+            let res = f(1);
+            assert!(!tagged::is_scalar(res), "io-result is a heap object");
+            assert_eq!(crate::rc::read_header(res).tag, 0, "ok-branch ctor tag");
+            crate::rc::dec_ref(res);
+
+            // The exported functions are callable from the host over ABI
+            // values: the corpus meaning holds through a REAL plugin.
+            let fa: extern "C" fn(*mut LeanObject) -> *mut LeanObject = core::mem::transmute(add);
+            assert_eq!(
+                tagged::unbox(fa(tagged::boxi(37))),
+                42,
+                "addFive 37 through the membrane"
+            );
+
+            let fg: extern "C" fn(*mut LeanObject) -> *mut LeanObject = core::mem::transmute(greet);
+            let s = crate::object::mk_string_unchecked(b"hello", 5);
+            let out = fg(s);
+            let (_, _, olen, obytes) = crate::object::string_fields(out);
+            assert_eq!(&obytes[..21], b"hello from the plugin");
+            assert_eq!(olen, 21, "the plugin's append ran on OUR wrapper");
+            crate::rc::dec_ref(out);
+        }
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the whole plugin round trip");
+    // The per-pid workdir is scratch: reclaimed on the passing path (the census's
+    // SELF_CLEANING class; a failed assert leaves it for forensics, which is the
+    // class's own shape, not an accident).
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn export_st_ref_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_st_mk_ref, export_lean_st_ref_get, export_lean_st_ref_ptr_eq,
+        export_lean_st_ref_set, export_lean_st_ref_swap, export_lean_st_ref_take,
+    };
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the ref exports'
+    // ownership contracts (io.cpp:1423-1532) are exercised token-for-token,
+    // and `lock()` serialises the heap-observing tests.
+    // UNSAFE-LEDGER: FLN-UL-0216
+    #[allow(unsafe_code)]
+    unsafe {
+        // ST fast path: mk consumes, get duplicates, set displaces + releases.
+        let v1 = crate::object::mk_string_unchecked(b"alpha", 5);
+        let cell = export_lean_st_mk_ref(v1);
+        let got = export_lean_st_ref_get(cell);
+        assert_eq!(got, v1, "ST get returns the stored object identity");
+        crate::rc::dec_ref(got);
+        let v2 = crate::object::mk_string_unchecked(b"beta", 4);
+        let unit = export_lean_st_ref_set(cell, v2);
+        assert_eq!(crate::tagged::unbox(unit), 0, "set returns box(0)");
+        // swap returns the old token and installs the new value.
+        let v3 = crate::object::mk_string_unchecked(b"gamma", 5);
+        let old = export_lean_st_ref_swap(cell, v3);
+        let (_, _, _, old_bytes) = crate::object::string_fields(old);
+        assert_eq!(&old_bytes[..4], b"beta", "swap yields the displaced value");
+        crate::rc::dec_ref(old);
+        // take moves the token out and leaves the slot null until re-set.
+        let taken = export_lean_st_ref_take(cell);
+        let (_, _, _, taken_bytes) = crate::object::string_fields(taken);
+        assert_eq!(&taken_bytes[..5], b"gamma");
+        let refill = crate::object::mk_string_unchecked(b"delta", 5);
+        let unit2 = export_lean_st_ref_set(cell, refill);
+        assert_eq!(crate::tagged::unbox(unit2), 0);
+        crate::rc::dec_ref(taken);
+        // identity, never value equality.
+        let other_v = crate::object::mk_string_unchecked(b"delta", 5);
+        let other = export_lean_st_mk_ref(other_v);
+        assert_eq!(export_lean_st_ref_ptr_eq(cell, cell), 1);
+        assert_eq!(
+            export_lean_st_ref_ptr_eq(cell, other),
+            0,
+            "equal values in distinct cells are not ptr-equal"
+        );
+        // The maybe-mt arm: a PERSISTENT cell must take the atomic path and
+        // mark stored values multi-threaded (io.cpp's global-Ref law). The
+        // observable: the value stored into a persistent cell leaves the ST
+        // rc regime (m_rc no longer positive after mark_mt).
+        crate::rc::mark_persistent(other);
+        let mt_v = crate::object::mk_string_unchecked(b"epsilon", 7);
+        let unit3 = export_lean_st_ref_set(other, mt_v);
+        assert_eq!(crate::tagged::unbox(unit3), 0);
+        let back = export_lean_st_ref_get(other);
+        let (_, _, _, back_bytes) = crate::object::string_fields(back);
+        assert_eq!(
+            &back_bytes[..7],
+            b"epsilon",
+            "persistent-cell get round-trips"
+        );
+        assert!(
+            (&raw const (*back).m_rc).read() < 0,
+            "a value stored into a persistent cell is marked multi-threaded"
+        );
+        crate::rc::dec_ref(back);
+        crate::rc::dec_ref(cell);
+        // `other` is persistent: never counted, deliberately not dec'd.
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_string_utf8_get_set_match_upstream_arms() {
+    let _g = lock();
+    use crate::export::{export_lean_string_utf8_get, export_lean_string_utf8_set};
+    shadow::enable();
+    // SAFETY: strings allocated and settled here; get borrows, set consumes,
+    // per lean.h:1229/1255.
+    // UNSAFE-LEDGER: FLN-UL-0217
+    #[allow(unsafe_code)]
+    unsafe {
+        // h(0x68) é(0xC3 0xA9) l l o — the same vector family the hash and
+        // lossy suites pin.
+        let s = crate::object::mk_string_unchecked(b"h\xc3\xa9llo", 5);
+        let get =
+            |st: *mut LeanObject, i: usize| export_lean_string_utf8_get(st, crate::tagged::boxi(i));
+        assert_eq!(get(s, 0), u32::from(b'h'));
+        assert_eq!(get(s, 1), 0xE9, "two-byte scalar decodes at its first byte");
+        assert_eq!(
+            get(s, 2),
+            u32::from('A'),
+            "continuation byte is the default char"
+        );
+        assert_eq!(get(s, 3), u32::from(b'l'));
+        assert_eq!(
+            get(s, 99),
+            u32::from('A'),
+            "out of range is the default char"
+        );
+        // Exclusive ASCII-over-ASCII: in place, identity preserved.
+        let s2 = export_lean_string_utf8_set(s, crate::tagged::boxi(0), u32::from(b'H'));
+        assert_eq!(s2, s, "exclusive ASCII set writes in place");
+        assert_eq!(get(s2, 0), u32::from(b'H'));
+        // Multi-byte replacement rebuilds; codepoint length is preserved.
+        let s3 = export_lean_string_utf8_set(s2, crate::tagged::boxi(1), 0x2603 /* SNOWMAN */);
+        let (size3, _, len3, bytes3) = crate::object::string_fields(s3);
+        assert_eq!(&bytes3[..size3 - 1], b"H\xe2\x98\x83llo");
+        assert_eq!(len3, 5, "codepoint count survives the rebuild");
+        assert_eq!(get(s3, 1), 0x2603);
+        // Non-first-byte target returns the string unchanged.
+        let s4 = export_lean_string_utf8_set(s3, crate::tagged::boxi(2), u32::from(b'x'));
+        assert_eq!(s4, s3, "a continuation-byte index is a no-op");
+        crate::rc::dec_ref(s4);
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+/// fln-3gv slice 2 apply targets — safe bodies only; ownership passthrough
+/// carries the non-scalar arm without touching rc.
+mod task_state_targets {
+    use crate::layout::LeanObject;
+
+    /// `id` under the boxed convention: consumes `x` by returning it.
+    pub(crate) extern "C" fn ident(x: *mut LeanObject) -> *mut LeanObject {
+        x
+    }
+
+    /// Spawn target `fun _ => 42` under the boxed convention.
+    pub(crate) extern "C" fn forty_two(_w: *mut LeanObject) -> *mut LeanObject {
+        crate::tagged::boxi(42)
+    }
+
+    /// Bind target `fun v => t_captured`: releases the owned input value and
+    /// returns the captured task, exercising the re-arm arm.
+    // UNSAFE-LEDGER: FLN-UL-0251
+    #[allow(unsafe_code)]
+    pub(crate) extern "C" fn return_captured_task(
+        t: *mut LeanObject,
+        v: *mut LeanObject,
+    ) -> *mut LeanObject {
+        if !crate::tagged::is_scalar(v) {
+            // SAFETY: v is the owned input value this closure consumes.
+            unsafe { crate::rc::dec_ref(v) };
+        }
+        t
+    }
+
+    /// `fun a => pure (a * 2)` under the compiled BaseIO convention (bare
+    /// result, world token ignored).
+    pub(crate) extern "C" fn io_double(a: *mut LeanObject, _w: *mut LeanObject) -> *mut LeanObject {
+        crate::tagged::boxi(crate::tagged::unbox(a) * 2)
+    }
+
+    /// `fun a => pure (Task.pure (a + 1))` — the bindTask target returning
+    /// a task, through the safe export wrapper.
+    pub(crate) extern "C" fn io_task_succ(
+        a: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        crate::export::export_lean_task_pure(crate::tagged::boxi(crate::tagged::unbox(a) + 1))
+    }
+
+    /// Wrap a value as `Except.ok` (ctor index 1) — the shape an `IO.asTask`
+    /// action's compiled `toBaseIO` composition publishes as its bare
+    /// BaseIO result at this pin.
+    // UNSAFE-LEDGER: FLN-UL-0265
+    #[allow(unsafe_code)]
+    pub(crate) fn mk_except_ok(v: *mut LeanObject) -> *mut LeanObject {
+        // SAFETY: a fresh 1-field ctor is allocated and its single slot
+        // initialized with the consumed `v` before the object escapes.
+        unsafe {
+            let r = crate::object::alloc_ctor(1, 1, 0);
+            crate::object::ctor_set(r, 0, v);
+            r
+        }
+    }
+
+    /// `pure (a + b)` seen through `IO.asTask`: the action computes on the
+    /// worker and publishes `Except.ok (a + b)` (tasks.lean line 2's shape).
+    pub(crate) extern "C" fn except_ok_add(
+        a: *mut LeanObject,
+        b: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        mk_except_ok(crate::tagged::boxi(
+            crate::tagged::unbox(a) + crate::tagged::unbox(b),
+        ))
+    }
+
+    /// `pure (a * b)` seen through `IO.asTask` (tasks.lean line 3's shape).
+    pub(crate) extern "C" fn except_ok_mul(
+        a: *mut LeanObject,
+        b: *mut LeanObject,
+        _w: *mut LeanObject,
+    ) -> *mut LeanObject {
+        mk_except_ok(crate::tagged::boxi(
+            crate::tagged::unbox(a) * crate::tagged::unbox(b),
+        ))
+    }
+}
+
+#[test]
+fn export_task_promise_state_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_get_task_state, export_lean_option_get_or_block, export_lean_task_get,
+        export_lean_task_map_core, export_lean_task_pure,
+    };
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the family's live
+    // (managerless) arms — object.cpp:1162/1176-eager/1187-finished,
+    // io.cpp:1627-some — are exercised with the shadow oracle watching the
+    // ownership balance. The refusal arms terminate the process by design
+    // and belong to the gauntlet's panic-parity lane, not to in-process
+    // cells.
+    // UNSAFE-LEDGER: FLN-UL-0226
+    #[allow(unsafe_code)]
+    unsafe {
+        // Task.pure over a scalar: Finished at birth, single-threaded header,
+        // borrowed get, state 2 before any manager is consulted.
+        let t = export_lean_task_pure(crate::tagged::boxi(21));
+        assert_eq!(
+            export_lean_io_get_task_state(t),
+            2,
+            "Task.pure is born Finished (m_imp == NULL answers 2, object.cpp:1260-1263)"
+        );
+        assert!(
+            (&raw const (*t).m_rc).read() > 0,
+            "Task.pure is born single-threaded (alloc_task's lean_set_st_header arm)"
+        );
+        let v = export_lean_task_get(t);
+        assert_eq!(
+            crate::tagged::unbox(v),
+            21,
+            "task_get returns m_value borrowed"
+        );
+        let v2 = export_lean_task_get(t);
+        assert_eq!(v, v2, "task_get does not consume the task or the value");
+
+        // map_core's managerless-eager arm over a scalar payload:
+        // task_pure(apply_1(f, get_own(t))) with f = (· * 2).
+        let double =
+            crate::object::alloc_closure(corpus_targets::double as *mut core::ffi::c_void, 1, 0);
+        let t2 = export_lean_task_map_core(double, t, 0, false, false);
+        assert_eq!(
+            export_lean_io_get_task_state(t2),
+            2,
+            "the eager arm funnels through task_pure, so the result is Finished"
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_task_get(t2)),
+            42,
+            "map_core applied f eagerly on the calling thread (object.cpp:1176)"
+        );
+        crate::rc::dec_ref(t2);
+
+        // map_core over a NON-scalar payload — the arm class whose scalar
+        // guards the slice-1 differential had to teach us; here the value
+        // rides through get_own's inc/dec with the shadow oracle watching.
+        // sync and keep_alive are both silently ignored on this arm,
+        // exactly as the pin ignores them (object.cpp:1175-1178).
+        let s = crate::object::mk_string_unchecked(b"alpha", 5);
+        let ts = export_lean_task_pure(s);
+        let ident =
+            crate::object::alloc_closure(task_state_targets::ident as *mut core::ffi::c_void, 1, 0);
+        let t3 = export_lean_task_map_core(ident, ts, 0, true, true);
+        let out = export_lean_task_get(t3);
+        assert_eq!(
+            out, s,
+            "identity map hands the same object through the eager arm"
+        );
+        assert!(
+            (&raw const (*out).m_rc).read() > 0,
+            "the eager arm never marks the value multi-threaded (task_pure's deliberate exception)"
+        );
+        crate::rc::dec_ref(t3);
+
+        // option_get_or_block's `some` arm: the value is stolen out of the
+        // consumed cell (io.cpp:1627-1631's option_ref discipline).
+        let s2 = crate::object::mk_string_unchecked(b"beta", 4);
+        let some = crate::object::alloc_ctor(1, 1, 0);
+        crate::object::ctor_set(some, 0, s2);
+        let r = export_lean_option_get_or_block(some);
+        assert_eq!(
+            r, s2,
+            "getOrBlock! steals the value out of the consumed some cell"
+        );
+        crate::rc::dec_ref(r);
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_task_manager_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_get_task_state, export_lean_io_promise_new, export_lean_io_promise_resolve,
+        export_lean_io_promise_result_opt, export_lean_task_bind_core, export_lean_task_get,
+        export_lean_task_map_core, export_lean_task_spawn_core,
+    };
+    shadow::enable();
+    /// Finalize on every exit path, so a failing assertion cannot leak a
+    /// live manager into the other cells (the manager is process-global and
+    /// flips the rc teardown arms).
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the manager arms
+    // of object.cpp:727-1312 are exercised end to end with the shadow
+    // oracle watching, and the sync-priority cells pin the pin's
+    // inline-execution ordering guarantees.
+    // UNSAFE-LEDGER: FLN-UL-0252
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // spawn + get: Queued -> Running -> Finished on a pooled worker;
+        // get blocks until the value is published (object.cpp:1152-1160,
+        // 1187-1203).
+        let c = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        let t = export_lean_task_spawn_core(c, 0, false);
+        let v = export_lean_task_get(t);
+        assert_eq!(
+            crate::tagged::unbox(v),
+            42,
+            "spawned closure ran on a worker and get returned its value"
+        );
+        assert_eq!(export_lean_io_get_task_state(t), 2, "finished after get");
+        crate::rc::dec_ref(t);
+
+        // The promise lifecycle: Promised (state 1) -> resolve publishes
+        // some(value), marked multi-threaded, first call wins
+        // (object.cpp:960-972, 1271-1312).
+        let p = export_lean_io_promise_new();
+        let rt = export_lean_io_promise_result_opt(p);
+        assert_eq!(
+            export_lean_io_get_task_state(rt),
+            1,
+            "an unresolved promise's task reports running (closure-less imp)"
+        );
+        let s = crate::object::mk_string_unchecked(b"gamma", 5);
+        let unit = export_lean_io_promise_resolve(s, p);
+        assert!(crate::tagged::is_scalar(unit), "resolve returns unit");
+        assert_eq!(export_lean_io_get_task_state(rt), 2, "resolved is finished");
+        let some_v = export_lean_task_get(rt);
+        assert_eq!(
+            crate::object::ctor_get(some_v, 0),
+            s,
+            "the resolved payload is some(value) around the exact object"
+        );
+        assert!(
+            (&raw const (*some_v).m_rc).read() < 0,
+            "resolve_core marked the published value multi-threaded (object.cpp:893)"
+        );
+        let s2 = crate::object::mk_string_unchecked(b"delta", 5);
+        export_lean_io_promise_resolve(s2, p);
+        assert_eq!(
+            export_lean_task_get(rt),
+            some_v,
+            "the second resolve is silently dropped — only the first has an effect"
+        );
+        crate::rc::dec_ref(rt);
+        crate::rc::dec_ref(p);
+
+        // sync := true on an UNFINISHED promise task: the dependent joins
+        // the graph Waiting (state 0), and resolve runs it INLINE before
+        // returning — the ordering CancelToken.onSet relies on
+        // (enqueue_core's LEAN_SYNC_PRIO arm, object.cpp:758-763).
+        let p2 = export_lean_io_promise_new();
+        let rt2 = export_lean_io_promise_result_opt(p2);
+        let fident =
+            crate::object::alloc_closure(task_state_targets::ident as *mut core::ffi::c_void, 1, 0);
+        let mapped = export_lean_task_map_core(fident, rt2, 0, true, false);
+        assert_eq!(
+            export_lean_io_get_task_state(mapped),
+            0,
+            "a sync dependent of an unresolved promise is Waiting (closure present)"
+        );
+        export_lean_io_promise_resolve(crate::tagged::boxi(9), p2);
+        assert_eq!(
+            export_lean_io_get_task_state(mapped),
+            2,
+            "the sync dependent ran inline during resolve, before it returned"
+        );
+        let got = export_lean_task_get(mapped);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::ctor_get(got, 0)),
+            9,
+            "identity map over some(9)"
+        );
+        crate::rc::dec_ref(mapped);
+        crate::rc::dec_ref(p2);
+
+        // Dropping an unresolved promise resolves its task to none
+        // (deactivate_promise, object.cpp:1314-1318).
+        let p3 = export_lean_io_promise_new();
+        let rt3 = export_lean_io_promise_result_opt(p3);
+        crate::rc::dec_ref(p3);
+        assert_eq!(export_lean_io_get_task_state(rt3), 2);
+        assert!(
+            crate::tagged::is_scalar(export_lean_task_get(rt3)),
+            "a dropped unresolved promise publishes none"
+        );
+        crate::rc::dec_ref(rt3);
+
+        // bind through the RE-ARM path, made deterministic with sync:
+        // resolve(p4) runs bind_fn1 inline, f returns p5's still-unfinished
+        // task, so the bound task re-arms on it (run_task's NULL-sentinel
+        // arm, object.cpp:874-885); resolve(p5) then finishes it inline.
+        let p4 = export_lean_io_promise_new();
+        let rt4 = export_lean_io_promise_result_opt(p4);
+        let p5 = export_lean_io_promise_new();
+        let rt5 = export_lean_io_promise_result_opt(p5);
+        let fbind = crate::object::alloc_closure(
+            task_state_targets::return_captured_task as *mut core::ffi::c_void,
+            2,
+            1,
+        );
+        crate::object::closure_set(fbind, 0, rt5);
+        let bound = export_lean_task_bind_core(rt4, fbind, 0, true, false);
+        export_lean_io_promise_resolve(crate::tagged::boxi(1), p4);
+        assert_eq!(
+            export_lean_io_get_task_state(bound),
+            0,
+            "after the outer resolve the bound task is re-armed Waiting on the nested one (its continuation closure is installed)"
+        );
+        export_lean_io_promise_resolve(crate::tagged::boxi(7), p5);
+        let bv = export_lean_task_get(bound);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::ctor_get(bv, 0)),
+            7,
+            "the re-armed bind carries the nested task's published value"
+        );
+        crate::rc::dec_ref(bound);
+        crate::rc::dec_ref(p4);
+        crate::rc::dec_ref(p5);
+
+        drop(_fin); // join the workers before the shadow drain
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+#[test]
+fn export_io_task_wrapper_family_matches_upstream_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_as_task, export_lean_io_bind_task, export_lean_io_cancel,
+        export_lean_io_check_canceled, export_lean_io_get_task_state, export_lean_io_map_task,
+        export_lean_io_promise_new, export_lean_io_promise_result_opt, export_lean_io_wait,
+        export_lean_io_wait_any, export_lean_io_wait_any_core, export_lean_task_pure,
+    };
+    shadow::enable();
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the io.cpp wrapper
+    // family (io.cpp:1534-1592) is exercised over the live manager and the
+    // managerless finished-scan arm, with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0264
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // asTask: the BaseIO action's bare result becomes the task value;
+        // keep_alive means the task runs even if its reference is dropped.
+        let act = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        let t1 = export_lean_io_as_task(act, crate::tagged::boxi(0));
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t1)),
+            42,
+            "asTask ran the action on a worker; wait consumed the task"
+        );
+
+        // mapTask: f applied to the value and the world token, bare result.
+        let f2 = crate::object::alloc_closure(
+            task_state_targets::io_double as *mut core::ffi::c_void,
+            2,
+            0,
+        );
+        let t2 = export_lean_io_map_task(
+            f2,
+            export_lean_task_pure(crate::tagged::boxi(21)),
+            crate::tagged::boxi(0),
+            0,
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t2)),
+            42,
+            "mapTask applied f through io_bind_task_fn"
+        );
+
+        // bindTask: f returns a Task; the bound task continues as it.
+        let f3 = crate::object::alloc_closure(
+            task_state_targets::io_task_succ as *mut core::ffi::c_void,
+            2,
+            0,
+        );
+        let t3 = export_lean_io_bind_task(
+            export_lean_task_pure(crate::tagged::boxi(5)),
+            f3,
+            crate::tagged::boxi(0),
+            0,
+        );
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait(t3)),
+            6,
+            "bindTask continued as f's task"
+        );
+
+        // waitAny: the first FINISHED member in list order — the unresolved
+        // promise task is skipped, the pure task answers.
+        let pw = export_lean_io_promise_new();
+        let pwt = export_lean_io_promise_result_opt(pw);
+        let fin3 = export_lean_task_pure(crate::tagged::boxi(3));
+        let nil = crate::tagged::boxi(0);
+        let l2 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l2, 0, fin3);
+        crate::object::ctor_set(l2, 1, nil);
+        let l1 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l1, 0, pwt);
+        crate::object::ctor_set(l1, 1, l2);
+        assert_eq!(
+            crate::tagged::unbox(export_lean_io_wait_any(l1)),
+            3,
+            "waitAny returns the first finished member's value in list order"
+        );
+        crate::rc::dec_ref(l1);
+        crate::rc::dec_ref(pw);
+
+        // cancel wrapper on a finished task is a unit no-op; the check
+        // wrapper answers false off-task.
+        let fc = export_lean_task_pure(crate::tagged::boxi(1));
+        assert!(crate::tagged::is_scalar(export_lean_io_cancel(fc)));
+        assert_eq!(
+            export_lean_io_get_task_state(fc),
+            2,
+            "cancel of a finished task is the pin's pre-manager no-op"
+        );
+        crate::rc::dec_ref(fc);
+        assert_eq!(export_lean_io_check_canceled(), 0, "false off-task");
+
+        drop(_fin); // join the workers, then exercise the managerless arm
+        let lone = export_lean_task_pure(crate::tagged::boxi(4));
+        let nil2 = crate::tagged::boxi(0);
+        let l3 = crate::object::alloc_ctor(1, 2, 0);
+        crate::object::ctor_set(l3, 0, lone);
+        crate::object::ctor_set(l3, 1, nil2);
+        let w = export_lean_io_wait_any_core(l3);
+        assert_eq!(
+            crate::tagged::unbox(crate::object::task_fields(w).0),
+            4,
+            "managerless wait_any_core still answers from the finished scan"
+        );
+        crate::rc::dec_ref(l3);
+    }
+    let _ = shadow::disable_and_drain();
+}
+
+/// The G0-3 parity-corpus fixture directory (fln-vm's committed corpus),
+/// resolved from this crate's manifest location — the file's single raw
+/// manifest-dir site, declared in tree_identity's residue at count 1.
+fn g03_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fln-vm/fixtures/g03")
+        .join(name)
+}
+
+// ---------------------------------------------------------------------------
+// fln-3gv slice 4: the G0-3 tasks.lean corpus cell on the LIVE task plane —
+// the io/tasks residue franken_lean-7xe recorded as waiting on this bead's
+// effect runtime (7xe comment 1739: "the io/tasks/panics cells, which need
+// fln-3gv's effect runtime"). The corpus observables are computed through
+// the exports exactly as the compiled file would call them, and bound
+// byte-for-byte to the committed .expected oracle so the cell cannot drift
+// from the fixture it claims to reproduce.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_task_plane_reproduces_the_tasks_corpus_slice_with_rc_balance() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_finalize_task_manager, export_lean_init_task_manager_using,
+        export_lean_io_as_task, export_lean_io_wait, export_lean_task_map_core,
+        export_lean_task_spawn_core,
+    };
+
+    // The pinned oracle first: fixtures/g03/tasks.lean.expected carries the
+    // Reference's own double-run output, byte-deterministic. Reading it here
+    // binds this cell's computed observables to those bytes — the join is
+    // the committed file, never a transcribed constant.
+    let expected =
+        std::fs::read_to_string(g03_fixture("tasks.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one header line + the two corpus observables"
+    );
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+
+    shadow::enable();
+    struct Fin;
+    impl Drop for Fin {
+        fn drop(&mut self) {
+            export_lean_finalize_task_manager();
+        }
+    }
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // task plane (asTask/get, spawn/map/get) runs over the live manager with
+    // the shadow oracle watching, and the manager is finalized on every exit
+    // path (Fin guard) so worker-side frees complete before the drain.
+    // UNSAFE-LEDGER: FLN-UL-0266
+    #[allow(unsafe_code)]
+    unsafe {
+        export_lean_init_task_manager_using(2);
+        let _fin = Fin;
+
+        // tasks.lean:2-3 — `let t1 <- IO.asTask (pure (2 + 3) : IO Nat)`,
+        // `let t2 <- IO.asTask (pure (10 * 4) : IO Nat)`: each compiled
+        // action computes ON A WORKER and publishes the Except.ok shape.
+        let a1 = crate::object::alloc_closure(
+            task_state_targets::except_ok_add as *mut core::ffi::c_void,
+            3,
+            2,
+        );
+        crate::object::closure_set(a1, 0, crate::tagged::boxi(2));
+        crate::object::closure_set(a1, 1, crate::tagged::boxi(3));
+        let t1 = export_lean_io_as_task(a1, crate::tagged::boxi(0));
+        let a2 = crate::object::alloc_closure(
+            task_state_targets::except_ok_mul as *mut core::ffi::c_void,
+            3,
+            2,
+        );
+        crate::object::closure_set(a2, 0, crate::tagged::boxi(10));
+        crate::object::closure_set(a2, 1, crate::tagged::boxi(4));
+        let t2 = export_lean_io_as_task(a2, crate::tagged::boxi(0));
+
+        // tasks.lean:4-5 — `IO.ofExcept t?.get`: `Task.get` is the lean.h
+        // `lean_task_get_own` inline, whose body is exactly `lean_io_wait`'s
+        // at this pin; ofExcept's ok-arm takes field 0 of the Except ctor.
+        let e1 = export_lean_io_wait(t1);
+        let e2 = export_lean_io_wait(t2);
+        assert_eq!(
+            (&raw const (*e1).m_tag).read(),
+            1,
+            "the published action result is Except.ok (ctor index 1)"
+        );
+        let a = crate::tagged::unbox(crate::object::ctor_get(e1, 0));
+        let b = crate::tagged::unbox(crate::object::ctor_get(e2, 0));
+
+        // tasks.lean:6 — `IO.println s!"sum {a + b}"`, against the oracle.
+        assert_eq!(
+            format!("sum {}", a + b),
+            lines[1],
+            "tasks.lean:6's observable equals the pinned oracle bytes"
+        );
+        crate::rc::dec_ref(e1);
+        crate::rc::dec_ref(e2);
+
+        // tasks.lean:7 — `Task.spawn (fun _ => 6 * 7) |>.map (· + 1)`:
+        // spawn is the lean.h inline over spawn_core (keep_alive=false),
+        // map the inline over map_core (sync=false, keep_alive=false).
+        let sp = export_lean_task_spawn_core(
+            crate::object::alloc_closure(
+                corpus_targets::six_times_seven as *mut core::ffi::c_void,
+                1,
+                0,
+            ),
+            0,
+            false,
+        );
+        let ch = export_lean_task_map_core(
+            crate::object::alloc_closure(corpus_targets::succ as *mut core::ffi::c_void, 1, 0),
+            sp,
+            0,
+            false,
+            false,
+        );
+        let chained = crate::tagged::unbox(export_lean_io_wait(ch));
+
+        // tasks.lean:8 — `IO.println s!"chained {chained.get}"`.
+        assert_eq!(
+            format!("chained {chained}"),
+            lines[2],
+            "tasks.lean:8's observable equals the pinned oracle bytes"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the tasks-corpus cell");
+}
+
+#[test]
+fn export_stdio_reproduces_the_io_println_corpus_slice_with_swap_capture() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_apply_1, export_lean_apply_2, export_lean_get_set_stdout,
+        export_lean_get_stdout, export_lean_io_prim_handle_mk, export_lean_stream_of_handle,
+        export_lean_string_append,
+    };
+
+    // The pinned oracle: io_println.lean.expected — an exit=0 header plus
+    // the three corpus observables, compared as BYTES at the end.
+    let expected =
+        std::fs::read_to_string(g03_fixture("io_println.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert_eq!(lines.len(), 4, "one header line + three corpus observables");
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+    let body = format!("{}\n{}\n{}\n", lines[1], lines[2], lines[3]);
+
+    // Seed the process-initial trio BEFORE the shadow window: those three
+    // streams are persistent and immortal (the pin's initialize_io half),
+    // so their one-time allocations must not enter this cell's balance.
+    crate::stdio::initialize_streams();
+
+    let capture = std::env::temp_dir().join(format!("fln-g03-println-{}", std::process::id()));
+    let capture_str = capture.to_str().expect("temp path is UTF-8").to_string();
+
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // println path runs through the exports over the pin's own capture seam
+    // (a stream over a temp-file handle installed via get_set_stdout, the
+    // withStdout shape), with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0311
+    #[allow(unsafe_code)]
+    unsafe {
+        // io_println's implicit Handle.mk: mode 1 is the pin's
+        // O_WRONLY|O_CREAT|O_TRUNC write arm (io.cpp:398).
+        let fname =
+            crate::object::mk_string_unchecked(capture_str.as_bytes(), capture_str.chars().count());
+        let r = export_lean_io_prim_handle_mk(fname, 1);
+        assert_eq!(
+            (&raw const (*r).m_tag).read(),
+            0,
+            "handle_mk answered the io_result ok arm"
+        );
+        let h = crate::object::ctor_get(r, 0);
+        crate::rc::inc_ref_n(h, 1);
+        crate::rc::dec_ref(r);
+        crate::rc::dec_ref(fname);
+
+        // The capture seam: our stream becomes this thread's stdout.
+        let stream = export_lean_stream_of_handle(h);
+        let old = export_lean_get_set_stdout(stream);
+
+        // (Both closures inherit this block's unsafe context.)
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        // Each println is getStdout >>= putStr on the CURRENT stream —
+        // fetched per line exactly as the compiled file does; cur is a
+        // fresh reference, put duplicated out of it and consumed by the
+        // apply along with s and the world token.
+        let put_line = |s: *mut crate::layout::LeanObject| {
+            let cur = export_lean_get_stdout();
+            let put = crate::object::ctor_get(cur, 4);
+            crate::rc::inc_ref_n(put, 1);
+            let res = export_lean_apply_2(put, s, crate::tagged::boxi(0));
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "putStr ok");
+            crate::rc::dec_ref(res);
+            crate::rc::dec_ref(cur);
+        };
+        // io_println.lean:2 — a plain literal.
+        put_line(mk("first\n"));
+        // io_println.lean:3 — s!"second {1 + 1}": the interpolation's
+        // compiled shape is the live append arm (s1 owned, s2 borrowed).
+        let two = mk("2\n");
+        let second = export_lean_string_append(mk("second "), two);
+        crate::rc::dec_ref(two);
+        put_line(second);
+        // io_println.lean:4 — a plain literal.
+        put_line(mk("third\n"));
+
+        // Flush through the stream's own flush field (field 0), then
+        // restore the initial stdout and drop the capture stream — the
+        // handle's finalizer fcloses the FILE*.
+        let cur = export_lean_get_stdout();
+        let fl = crate::object::ctor_get(cur, 0);
+        crate::rc::inc_ref_n(fl, 1);
+        let fres = export_lean_apply_1(fl, crate::tagged::boxi(0));
+        assert_eq!((&raw const (*fres).m_tag).read(), 0, "flush ok");
+        crate::rc::dec_ref(fres);
+        crate::rc::dec_ref(cur);
+        let mine = export_lean_get_set_stdout(old);
+        crate::rc::dec_ref(mine);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the io_println cell");
+
+    // The observable: the captured bytes equal the pinned oracle body.
+    let got = std::fs::read_to_string(&capture).expect("captured output");
+    std::fs::remove_file(&capture).ok();
+    assert_eq!(
+        got, body,
+        "io_println.lean's observables equal the pinned oracle bytes"
+    );
+}
+
+#[test]
+fn export_stdio_reproduces_the_io_file_corpus_slice_with_roundtrip() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_prim_handle_mk, export_lean_io_prim_handle_put_str,
+        export_lean_io_prim_handle_read,
+    };
+
+    // The pinned oracle: io_file.lean.expected's LAST line is the runtime
+    // observable; the lines above it are ELABORATOR diagnostics (a
+    // String.trim deprecation warning) an ABI cell cannot and must not
+    // fabricate — bound here to the runtime line only, disclosed.
+    let expected =
+        std::fs::read_to_string(g03_fixture("io_file.lean.expected")).expect("pinned oracle");
+    let lines: Vec<&str> = expected.lines().collect();
+    assert!(
+        lines[0].starts_with("# exit=0 "),
+        "the pinned Reference run exited 0"
+    );
+    let runtime_line = *lines.last().expect("runtime observable");
+    assert!(
+        runtime_line.starts_with("read back: "),
+        "the last oracle line is the runtime observable"
+    );
+
+    crate::stdio::initialize_streams();
+    let scratch = std::env::temp_dir().join(format!("fln-g03-file-{}", std::process::id()));
+    let scratch_str = scratch.to_str().expect("temp path is UTF-8").to_string();
+    // io_file.lean:2's payload, byte-exact.
+    let payload = "roundtrip payload \u{2200}\n";
+
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the corpus file's
+    // write-then-read roundtrip runs through the exports exactly as the
+    // compiled writeFile/readFile would drive them, with the shadow oracle
+    // watching.
+    // UNSAFE-LEDGER: FLN-UL-0320
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+
+        // io_file.lean:2 — `IO.FS.writeFile`: Handle.mk (write) + putStr +
+        // drop; the drop's finalizer fcloses, which is what publishes the
+        // bytes (writeFile never flushes explicitly).
+        let fname = mk(&scratch_str);
+        let wr = export_lean_io_prim_handle_mk(fname, 1);
+        assert_eq!((&raw const (*wr).m_tag).read(), 0, "write-handle mk ok");
+        let wh = crate::object::ctor_get(wr, 0);
+        crate::rc::inc_ref_n(wh, 1);
+        crate::rc::dec_ref(wr);
+        let content = mk(payload);
+        let pres = export_lean_io_prim_handle_put_str(wh, content);
+        assert_eq!((&raw const (*pres).m_tag).read(), 0, "putStr ok");
+        crate::rc::dec_ref(pres);
+        crate::rc::dec_ref(content);
+        crate::rc::dec_ref(wh); // finalizer fcloses — the publish point
+
+        // io_file.lean:3 — `IO.FS.readFile`: Handle.mk (read) + the read
+        // loop; one 1024-byte chunk holds the whole payload, and a second
+        // read exercises the pin's EOF arm (empty array, ok).
+        let fname2 = mk(&scratch_str);
+        let rr = export_lean_io_prim_handle_mk(fname2, 0);
+        assert_eq!((&raw const (*rr).m_tag).read(), 0, "read-handle mk ok");
+        let rh = crate::object::ctor_get(rr, 0);
+        crate::rc::inc_ref_n(rh, 1);
+        crate::rc::dec_ref(rr);
+        crate::rc::dec_ref(fname2);
+        let chunk = export_lean_io_prim_handle_read(rh, 1024);
+        assert_eq!((&raw const (*chunk).m_tag).read(), 0, "read ok");
+        let ba = crate::object::ctor_get(chunk, 0);
+        let (_, n, _, data) = crate::object::sarray_fields(ba);
+        assert_eq!(n, payload.len(), "the whole payload in one chunk");
+        let bytes = core::slice::from_raw_parts(data, n).to_vec();
+        let eof = export_lean_io_prim_handle_read(rh, 1024);
+        assert_eq!((&raw const (*eof).m_tag).read(), 0, "EOF arm answers ok");
+        let eba = crate::object::ctor_get(eof, 0);
+        assert_eq!(
+            crate::object::sarray_fields(eba).1,
+            0,
+            "EOF yields the empty array (io.cpp:598-601)"
+        );
+        crate::rc::dec_ref(eof);
+        crate::rc::dec_ref(chunk);
+        crate::rc::dec_ref(rh);
+        crate::rc::dec_ref(fname);
+
+        // io_file.lean:4 — the content String's accounting and the
+        // observable: readFile validates UTF-8 (cell-side via str), trim
+        // drops the trailing newline (pure library logic), length counts
+        // CHARS including the newline.
+        let content_str = core::str::from_utf8(&bytes).expect("valid UTF-8 roundtrip");
+        assert_eq!(content_str, payload, "byte-exact roundtrip");
+        let trimmed = content_str.trim_end_matches('\n');
+        let computed = format!(
+            "read back: {} ({} chars)",
+            trimmed,
+            content_str.chars().count()
+        );
+        assert_eq!(
+            computed, runtime_line,
+            "io_file.lean:4's observable equals the pinned oracle's runtime line"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the io_file cell");
+    std::fs::remove_file(&scratch).ok();
 }

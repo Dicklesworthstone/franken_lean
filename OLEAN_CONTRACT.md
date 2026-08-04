@@ -3,17 +3,50 @@
 > **@generated** by `scripts/extract/gen_olean_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.
 > Format constants are derived, never remembered; regenerate with the script.
 >
-> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
-> inventory: `contracts/olean_inventory.json` sha256 `901a2970a31a945a05bbf5e6f3bcb13fe01016a16930bcd654879403076437f8`
+> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35`
+> — tag and commit are **established here**: cross-checked against the pinned
+>   Reference binary's `lean --version` and against every pinned `.olean`
+>   artifact's `lean_version` and `githash` fields.
+> — tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91` is transcribed from `SUITE.lock` and is now
+>   **established at the producer**: every run, before anything is
+>   rendered, invokes the one predicate in this repository that establishes
+>   it — `scripts/evidence.py vendor-binding`, the same one
+>   `scripts/verify_vendor_tree.sh` runs lane-side — which recomputes the
+>   staged `vendor/lean4-src` tree and refuses unless it equals the pinned
+>   tree. The extractor calls that predicate rather than reimplementing
+>   tree hashing, so no second copy of it exists.
+> — the **outcome is typed on stderr and is deliberately NOT rendered
+>   here**, in three states: `established`; `inconclusive`, where the
+>   repository `.git` is absent or is not a directory so the predicate
+>   cannot run at all — an FL-INV-07 environment fault, never a verdict
+>   about the tree and never a silent pass; and a hard failure, which *is*
+>   a verdict and stops extraction. These bytes do not vary with that
+>   outcome on purpose: a cold root built by `git archive` has no `.git`,
+>   so an artifact that varied would report `--check` DRIFT for the
+>   ENVIRONMENT rather than for the contract. The artifact states the rule;
+>   the run states the result.
+> — so what remains UNESTABLISHED here is narrow and named: a run whose
+>   establishment came back `inconclusive` renders these same bytes, and
+>   only its stderr says so. Bead
+>   `franken_lean-contract-pin-tree-producer-side-f8zo`.
+> — what IS bound here is *content*: a sha256 is recorded below for **every**
+>   vendored source this extractor reads, and that set is DERIVED from the
+>   extractor's own path constants rather than listed, so it cannot fall
+>   behind the reads. A change to any of them is caught; a staged tree
+>   differing from the pin in a file this extractor does not read is not.
+> inventory: `contracts/olean_inventory.json` sha256 `ecd0f18e64358bb69d1ce3e2880d08f5553d2f3789df46d531988cbfe7b577dc`
 > rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)
 >
 > sources:
-> - `vendor/lean4-src/src/library/module.cpp` (632 lines, sha256 `7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469`)
 > - `vendor/lean4-src/src/runtime/compact.cpp` (736 lines, sha256 `490928b63b781f43956463bc418e3ab1cd218a4f438b72320a463f8dd12cde2c`)
 > - `vendor/lean4-src/src/runtime/compact.h` (145 lines, sha256 `89c7868a99e9f494313a5ce6286cf41194e60fea0e0c7178947a0f8ad3673ab6`)
+> - `vendor/lean4-src/src/Lean/CompactedRegion.lean` (111 lines, sha256 `56ef2a63c2394faefe590b58a5e3bd239589ddb6657a8523e5b0385800043f94`)
 > - `vendor/lean4-src/src/Lean/Environment.lean` (2835 lines, sha256 `100b207523d1005ae87f62f4e1693806854a35c59cd9b3210dfeeaa875d0ff98`)
-> - `vendor/lean4-src/src/Lean/Setup.lean` (204 lines, sha256 `7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c`)
+> - `vendor/lean4-src/src/Lean/Elab/Frontend.lean` (383 lines, sha256 `2616fef6e97c0a898d4b0c0e2207675c23396233748e5bf94b38fd72cf76733d`)
+> - `vendor/lean4-src/src/Lean/Data/Lsp/Internal.lean` (426 lines, sha256 `ebcd1850babf4c78f50d03f76d7d1b15b0bd1f3506a8fb8b29db39682a53f6c2`)
+> - `vendor/lean4-src/src/library/module.cpp` (632 lines, sha256 `7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469`)
 > - `vendor/lean4-src/src/Lean/Server/References.lean` (858 lines, sha256 `b7022ed1a659d5181735d9ef0cd2f13cc2e3f96b11f5ece3e6e5defe8363ee88`)
+> - `vendor/lean4-src/src/Lean/Setup.lean` (204 lines, sha256 `7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c`)
 
 ## 1. The fixed header
 

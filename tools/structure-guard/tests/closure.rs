@@ -6,36 +6,78 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::ops::Deref;
 
 use structure_guard::checks::{self, RunOutcome};
+use structure_guard::contract_handoff::{
+    REQUIRED_OUTPUTS, SCHEMA_DEFINITION as HANDOFF_SCHEMA_DEFINITION,
+};
+use structure_guard::contract_inventory::{SCHEMA_DEFINITION, canonical_inventory_text};
+use structure_guard::scratch::{CLOSURE_PREFIX, ScratchRoot};
+use structure_guard::{
+    ABI_TARGET_LAYOUT_FILE, CONTRACT_HANDOFF_FILE, CONTRACT_HANDOFF_POLICY_FILE,
+    CONTRACT_HANDOFF_SCHEMA_FILE, CONTRACT_INVENTORY_FILE, CONTRACT_INVENTORY_POLICY_FILE,
+    CONTRACT_INVENTORY_SCHEMA_FILE, EXTERN_BUILTIN_ENVIRONMENT_FILE, OLEAN_ILEAN_FORMAT_FILE,
+};
 
-/// Materialized retained fixture root (mirrors the seeded.rs no-deletion policy).
-fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let root = loop {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let candidate = std::env::temp_dir().join(format!(
-            "structure-guard-closure-{}-{stamp}-{n}-{tag}",
-            std::process::id()
-        ));
-        let created = fs::create_dir(&candidate);
-        if created
-            .as_ref()
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
-        {
-            continue;
+/// A fixture root that reclaims itself when its test passes and is retained when the test fails
+/// (bead `franken_lean-s2sn`). The fence, the `Drop` body and the retention message live once in
+/// `structure_guard::scratch`; this file holds no second copy of them.
+///
+/// This was the largest unrepaired producer in the workspace: **3,776 directories / 2,486.9 MiB
+/// allocated** on 2026-07-28, still growing that afternoon. It is larger than the
+/// `contract-handoff-` pile by allocated bytes despite being a fortieth of it by *apparent*
+/// bytes, which is the whole reason `st_blocks` is the measure and `st_size` is not.
+fn materialize(tag: &str, files: &[(String, String)]) -> ScratchRoot {
+    let root = ScratchRoot::create(CLOSURE_PREFIX, "closure", tag).expect("create fixture root");
+    let mut rendered_files: Vec<(String, String)> = files
+        .iter()
+        .map(|(rel, content)| {
+            (
+                rel.clone(),
+                content.replace(
+                    "@FIXTURE_ROOT@",
+                    root.to_str().expect("temporary fixture root is UTF-8"),
+                ),
+            )
+        })
+        .collect();
+    if !rendered_files
+        .iter()
+        .any(|(path, _)| path == CONTRACT_INVENTORY_FILE)
+    {
+        let source = |path: &str| {
+            rendered_files
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, content)| content.as_str())
+        };
+        if let (
+            Some(suite_lock),
+            Some(schema),
+            Some(policy),
+            Some(abi_target_layout),
+            Some(olean_ilean_format),
+            Some(extern_builtin_environment),
+        ) = (
+            source("SUITE.lock"),
+            source(CONTRACT_INVENTORY_SCHEMA_FILE),
+            source(CONTRACT_INVENTORY_POLICY_FILE),
+            source(ABI_TARGET_LAYOUT_FILE),
+            source(OLEAN_ILEAN_FORMAT_FILE),
+            source(EXTERN_BUILTIN_ENVIRONMENT_FILE),
+        ) && let Ok(inventory) = canonical_inventory_text(
+            suite_lock,
+            schema,
+            policy,
+            abi_target_layout,
+            olean_ilean_format,
+            extern_builtin_environment,
+        ) {
+            rendered_files.push((CONTRACT_INVENTORY_FILE.to_string(), inventory));
         }
-        created.expect("create retained fixture root");
-        break candidate;
-    };
-    for (rel, content) in files {
+    }
+    for (rel, rendered) in &rendered_files {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         let mut f = OpenOptions::new()
@@ -43,9 +85,14 @@ fn materialize(tag: &str, files: &[(String, String)]) -> PathBuf {
             .create_new(true)
             .open(&path)
             .expect("create fixture file without overwrite");
-        f.write_all(content.as_bytes()).expect("write");
+        f.write_all(rendered.as_bytes()).expect("write");
     }
-    eprintln!("retained closure fixture: {}", root.display());
+    if !rendered_files
+        .iter()
+        .any(|(path, _)| path == CONTRACT_HANDOFF_FILE)
+    {
+        let _ = structure_guard::contract_handoff::publish(&root);
+    }
     root
 }
 
@@ -55,6 +102,7 @@ const GRAPH: &str = "\
 	crate fln-hash rank=1 kind=ordinary
 	crate fln-bignum rank=1 kind=ordinary
 	crate fln-libm rank=1 kind=ordinary
+	crate fln-bench rank=2 kind=ordinary
 	crate fln-unsafe-abi rank=2 kind=unsafe-boundary
 	crate fln-unsafe-region rank=2 kind=unsafe-boundary
 	crate fln-rt rank=3 kind=ordinary
@@ -90,7 +138,7 @@ const GRAPH: &str = "\
 	prohibit fln-checker ->* fln-rt
 	prohibit fln-checker ->* fln-unsafe-*
 	allow-direct fln-kernel = fln-core, fln-hash, fln-bignum, fln-env
-	allow-direct fln-checker = fln-core, fln-hash, fln-bignum
+	allow-direct fln-checker = fln-core, fln-hash
 	covenant fln-kernel max-loc=12000
 	suite-dep asupersync
 	";
@@ -98,17 +146,41 @@ const GRAPH: &str = "\
 const LEDGER: &str = "schema fln-unsafe-ledger/1\n";
 
 const LIB: &str = "//! stub\n#![forbid(unsafe_code)]\n";
-const BOUNDARY_LIB: &str = "//! boundary stub\n#![deny(unsafe_code)]\n";
+// Carries the SAFETY-note lint because FLN-STRUCT-040 requires every boundary root to
+// enforce it or declare that it does not; a baseline fixture must satisfy every rule.
+const BOUNDARY_LIB: &str =
+    "//! boundary stub\n#![deny(unsafe_code)]\n#![deny(clippy::undocumented_unsafe_blocks)]\n";
 
 const SUITE_LOCK: &str = "\
 schema fln-suite-lock/1
 rust-nightly nightly-2026-07-13
+rust-release 1.99.0-nightly
+rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
 target x86_64-unknown-linux-gnu
 suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
 crate asupersync repo=asupersync
 reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
 corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997
 ";
+
+const CONTRACT_INVENTORY_POLICY: &str = "\
+schema fln-contract-inventory-policy/1
+row abi-layout:target:0001 kind=abi-layout support=required target-class=certified abi-class=lp64-le
+row artifact-format:ilean kind=artifact-format support=required target-class=none abi-class=none
+row artifact-format:olean:target:0001 kind=artifact-format support=required target-class=certified abi-class=lp64-le
+row corpus kind=corpus support=required target-class=none abi-class=none
+row environment-census:builtin kind=environment-census support=required target-class=none abi-class=none
+row environment-census:extern kind=environment-census support=required target-class=none abi-class=none
+row reference kind=reference support=required target-class=none abi-class=none
+row suite:asupersync kind=suite support=required target-class=none abi-class=none
+row target:0001 kind=target support=required target-class=certified abi-class=none
+row toolchain kind=toolchain support=required target-class=none abi-class=none
+";
+
+const ABI_TARGET_LAYOUT: &str = include_str!("../../../contracts/ABI_TARGET_LAYOUT.txt");
+const OLEAN_ILEAN_FORMAT: &str = include_str!("../../../contracts/OLEAN_ILEAN_FORMAT.txt");
+const EXTERN_BUILTIN_ENVIRONMENT: &str =
+    include_str!("../../../contracts/EXTERN_BUILTIN_ENVIRONMENT.txt");
 
 const TOOLCHAIN: &str =
     "[toolchain]\nchannel = \"nightly-2026-07-13\"\ncomponents = [\"rustfmt\", \"clippy\"]\n";
@@ -119,6 +191,7 @@ fn base_files() -> Vec<(String, String)> {
         ("fln-hash", false),
         ("fln-bignum", false),
         ("fln-libm", false),
+        ("fln-bench", false),
         ("fln-unsafe-abi", true),
         ("fln-unsafe-region", true),
         ("fln-rt", false),
@@ -154,9 +227,50 @@ fn base_files() -> Vec<(String, String)> {
         ),
         ("ci/WORKSPACE_GRAPH.txt".to_string(), GRAPH.to_string()),
         ("ci/UNSAFE_LEDGER.txt".to_string(), LEDGER.to_string()),
+        (
+            CONTRACT_INVENTORY_SCHEMA_FILE.to_string(),
+            SCHEMA_DEFINITION.to_string(),
+        ),
+        (
+            CONTRACT_INVENTORY_POLICY_FILE.to_string(),
+            CONTRACT_INVENTORY_POLICY.to_string(),
+        ),
+        (
+            CONTRACT_HANDOFF_SCHEMA_FILE.to_string(),
+            HANDOFF_SCHEMA_DEFINITION.to_string(),
+        ),
+        (
+            CONTRACT_HANDOFF_POLICY_FILE.to_string(),
+            include_str!("../../../ci/CONTRACT_HANDOFF_POLICY.txt").to_string(),
+        ),
+        (
+            ABI_TARGET_LAYOUT_FILE.to_string(),
+            ABI_TARGET_LAYOUT.to_string(),
+        ),
+        (
+            OLEAN_ILEAN_FORMAT_FILE.to_string(),
+            OLEAN_ILEAN_FORMAT.to_string(),
+        ),
+        (
+            EXTERN_BUILTIN_ENVIRONMENT_FILE.to_string(),
+            EXTERN_BUILTIN_ENVIRONMENT.to_string(),
+        ),
         ("SUITE.lock".to_string(), SUITE_LOCK.to_string()),
         ("rust-toolchain.toml".to_string(), TOOLCHAIN.to_string()),
     ];
+    for output in REQUIRED_OUTPUTS {
+        if output.path == CONTRACT_INVENTORY_FILE {
+            // `materialize` derives the canonical prerequisite after applying
+            // fixture substitutions; never shadow it with a dummy output.
+            continue;
+        }
+        if !files.iter().any(|(path, _)| path == output.path) {
+            files.push((
+                output.path.to_string(),
+                format!("@generated fixture {}\n", output.key),
+            ));
+        }
+    }
     let mut cargo_lock = "version = 4\n".to_string();
     let mut allowlist = "schema fln-closure-allowlist/1\n".to_string();
     for (name, boundary) in crates {
@@ -174,7 +288,7 @@ fn base_files() -> Vec<(String, String)> {
             "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
         ));
         allowlist.push_str(&format!(
-            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={} policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={} policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
             if boundary { "deny-ledgered" } else { "forbid" }
         ));
     }
@@ -183,11 +297,35 @@ fn base_files() -> Vec<(String, String)> {
     files
 }
 
-fn run_with(tag: &str, mutate: impl FnOnce(&mut Vec<(String, String)>)) -> RunOutcome {
+/// A guard run together with the fixture it ran against.
+///
+/// The fixture must outlive the *assertions*, not merely the guard invocation: a closure test
+/// asserts on the outcome after `run_with` returns, so binding the root inside `run_with` would
+/// reclaim it before the assertion that fails — losing exactly the workspace a failing run wants
+/// inspected. Deref-transparent to [`RunOutcome`], so `codes(&out)` and `out.findings` at the
+/// eighteen call sites are unchanged.
+struct FixtureRun {
+    outcome: RunOutcome,
+    _root: ScratchRoot,
+}
+
+impl Deref for FixtureRun {
+    type Target = RunOutcome;
+
+    fn deref(&self) -> &RunOutcome {
+        &self.outcome
+    }
+}
+
+fn run_with(tag: &str, mutate: impl FnOnce(&mut Vec<(String, String)>)) -> FixtureRun {
     let mut files = base_files();
     mutate(&mut files);
     let root = materialize(tag, &files);
-    checks::run(&root).expect("guard runs")
+    let outcome = checks::run(&root).expect("guard runs");
+    FixtureRun {
+        outcome,
+        _root: root,
+    }
 }
 
 fn codes(outcome: &RunOutcome) -> Vec<&'static str> {
@@ -216,6 +354,45 @@ fn replace_fragment(files: &mut [(String, String)], rel: &str, before: &str, aft
         .1;
     assert!(content.contains(before), "fixture fragment exists");
     *content = content.replacen(before, after, 1);
+}
+
+fn add_asupersync_dependency(files: &mut Vec<(String, String)>, declared_path: &str) {
+    replace_fragment(
+        files,
+        "SUITE.lock",
+        "path=/dp/asupersync",
+        "path=@FIXTURE_ROOT@/suite/asupersync",
+    );
+    replace_fragment(
+        files,
+        "crates/fln-core/Cargo.toml",
+        "\n[dependencies]\n",
+        &format!("\n[dependencies]\nasupersync = {{ path = \"{declared_path}\" }}\n"),
+    );
+    replace_fragment(
+        files,
+        "Cargo.lock",
+        "name = \"fln-core\"\nversion = \"0.0.0\"\n",
+        "name = \"fln-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"asupersync\",\n]\n",
+    );
+    append(
+        files,
+        "Cargo.lock",
+        "\n[[package]]\nname = \"asupersync\"\nversion = \"0.1.0\"\n",
+    );
+    append(
+        files,
+        "ci/CLOSURE_ALLOWLIST.txt",
+        "package asupersync version=0.1.0 source=suite checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=external policy=runtime owner=asupersync upgrade=suite-lock reason=pinned fixture\n",
+    );
+    files.push((
+        "suite/asupersync/Cargo.toml".to_string(),
+        "[package]\nname = \"asupersync\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\n".to_string(),
+    ));
+    files.push((
+        "suite/asupersync/.git/HEAD".to_string(),
+        "e464a484cb65c1a55be0d9c925e6e9c20318edcb\n".to_string(),
+    ));
 }
 
 #[test]
@@ -247,7 +424,7 @@ fn unlisted_lock_package_is_flagged_and_recovers_when_allowlisted() {
         append(
             files,
             "ci/CLOSURE_ALLOWLIST.txt",
-            "package rogue version=0.1.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package rogue version=0.1.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
         );
         let graph = GRAPH.replace(
             "suite-dep asupersync\n",
@@ -277,12 +454,45 @@ fn registry_sourced_package_is_prohibited_outright() {
 }
 
 #[test]
+fn malformed_cargo_lock_v4_is_a_typed_shape_finding() {
+    for (tag, mutation) in [
+        ("lock-missing-version", "missing"),
+        ("lock-wrong-version", "wrong"),
+        ("lock-duplicate-key", "duplicate"),
+        ("lock-unterminated-array", "unterminated"),
+    ] {
+        let out = run_with(tag, |files| match mutation {
+            "missing" => replace_fragment(files, "Cargo.lock", "version = 4\n", ""),
+            "wrong" => replace_fragment(files, "Cargo.lock", "version = 4", "version = 3"),
+            "duplicate" => replace_fragment(
+                files,
+                "Cargo.lock",
+                "name = \"fln-core\"\nversion = \"0.0.0\"",
+                "name = \"fln-core\"\nname = \"fln-core\"\nversion = \"0.0.0\"",
+            ),
+            "unterminated" => append(
+                files,
+                "Cargo.lock",
+                "\n[[package]]\nname = \"partial\"\nversion = \"0.1.0\"\ndependencies = [\n \"fln-core\",\n",
+            ),
+            _ => unreachable!("closed mutation inventory"),
+        });
+        assert_eq!(
+            codes(&out),
+            vec!["FLN-STRUCT-016"],
+            "{tag} did not fail as a typed lock shape: {:?}",
+            out.findings
+        );
+    }
+}
+
+#[test]
 fn stale_allowlist_row_is_flagged() {
     let out = run_with("stale-row", |files| {
         append(
             files,
             "ci/CLOSURE_ALLOWLIST.txt",
-            "package ghost version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=fl upgrade=workspace reason=fixture\n",
+            "package ghost version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit=forbid policy=runtime owner=franken_lean upgrade=workspace reason=fixture\n",
         );
     });
     assert_eq!(codes(&out), vec!["FLN-STRUCT-019"]);
@@ -303,6 +513,38 @@ fn version_mismatch_is_flagged() {
 }
 
 #[test]
+fn checksum_and_every_allowlist_policy_field_are_semantic() {
+    let zero_checksum = "0".repeat(64);
+    let checksum_after = format!("checksum={zero_checksum}");
+    let mutations = [
+        ("checksum", "checksum=-", checksum_after.as_str()),
+        ("license", "license=MIT", "license=Apache-2.0"),
+        ("build-script", "build-script=no", "build-script=yes"),
+        ("proc-macro", "proc-macro=no", "proc-macro=yes"),
+        ("native-link", "native-link=no", "native-link=yes"),
+        (
+            "unsafe-audit",
+            "unsafe-audit=forbid",
+            "unsafe-audit=external",
+        ),
+        ("policy", "policy=runtime", "policy=dev"),
+        ("owner", "owner=franken_lean", "owner=another_team"),
+        ("upgrade", "upgrade=workspace", "upgrade=suite-lock"),
+    ];
+    for (tag, before, after) in mutations {
+        let out = run_with(tag, |files| {
+            replace_fragment(files, "ci/CLOSURE_ALLOWLIST.txt", before, after);
+        });
+        assert_eq!(
+            codes(&out),
+            vec!["FLN-STRUCT-018"],
+            "{tag} drift was not a single typed policy finding: {:?}",
+            out.findings
+        );
+    }
+}
+
+#[test]
 fn nightly_pin_mismatch_is_flagged() {
     let out = run_with("nightly-mismatch", |files| {
         replace(
@@ -312,6 +554,44 @@ fn nightly_pin_mismatch_is_flagged() {
         );
     });
     assert_eq!(codes(&out), vec!["FLN-STRUCT-020"]);
+}
+
+#[test]
+fn suite_dependency_path_and_checkout_commit_are_authoritative() {
+    let clean = run_with("suite-path-clean", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/asupersync");
+    });
+    assert!(
+        clean.findings.is_empty(),
+        "exact suite binding must recover: {:?}",
+        clean.findings
+    );
+
+    let wrong_path = run_with("suite-path-drift", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/not-pinned");
+        files.push((
+            "suite/not-pinned/Cargo.toml".to_string(),
+            "[package]\nname = \"asupersync\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\n"
+                .to_string(),
+        ));
+    });
+    assert_eq!(codes(&wrong_path), vec!["FLN-STRUCT-020"]);
+    assert!(
+        wrong_path.findings[0]
+            .detail
+            .contains("package→repo→SUITE.lock")
+    );
+
+    let wrong_commit = run_with("suite-commit-drift", |files| {
+        add_asupersync_dependency(files, "@FIXTURE_ROOT@/suite/asupersync");
+        replace(
+            files,
+            "suite/asupersync/.git/HEAD",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+    });
+    assert_eq!(codes(&wrong_commit), vec!["FLN-STRUCT-020"]);
+    assert!(wrong_commit.findings[0].detail.contains("checkout HEAD"));
 }
 
 #[test]

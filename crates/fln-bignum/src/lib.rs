@@ -7,12 +7,21 @@
 //! subtraction, `x / 0 = 0`, `x % 0 = x`. Ground truth is the generated golden
 //! corpus (`fixtures/nat_vectors.txt`, 5 725 vectors from CPython bignums via
 //! `scripts/extract/gen_bignum_vectors.py` — derived, never remembered).
+//! Large operands dispatch through corpus-pinned schoolbook/Karatsuba/Toom-3
+//! crossovers; division is normalized Knuth-D and gcd uses Stein's binary
+//! algorithm. `fixtures/kernel_reduction_profile.tsv` binds those crossover
+//! decisions to the real KR-313/C4 bootstrap fixtures and a reproducible
+//! release calibration. PG-K remains the separate end-to-end ratio gate against
+//! the GMP-backed Reference; this crate does not promote a performance claim
+//! from its focused profile.
 //!
 //! Layout note: [`nat::BigNat`] stores little-endian, normalized `u64` limbs —
-//! deliberately identical to `fln_core::expr::NatLit`, so [`interop`] conversions
-//! are loss-free and O(n) copies. The ABI-facing limb layout (the `lean_object`
-//! scalar/bignum boundary) is a separate obligation pinned to the extracted ABI
-//! contract (bead franken_lean-53v) and is NOT provided here yet.
+//! deliberately identical to `fln_core::expr::NatLit`. [`nat::BigNatView`]
+//! borrows that representation without allocation, and Marrow's `Obj::mpz_view`
+//! binds the same view to the lifetime of the ABI object. Arithmetic therefore
+//! reads ABI operands in place and allocates only results; the runtime-private
+//! mpz layout remains pinned by the G0-1/C4 evidence rather than by the public
+//! `lean.h` tables.
 
 #![forbid(unsafe_code)]
 

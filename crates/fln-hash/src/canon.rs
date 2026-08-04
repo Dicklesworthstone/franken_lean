@@ -11,11 +11,12 @@
 //! Decoding is total over arbitrary bytes: every failure is a typed [`CanonError`],
 //! never a panic (D8 taxonomy).
 
-use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity};
+use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 use fln_core::pos::Position;
 
 /// A frozen schema identity: name + version. Bumping the version is the only legal
@@ -42,6 +43,231 @@ pub const SCHEMA_KVMAP: SchemaId = SchemaId {
     name: "fln.canon.kvmap",
     version: 1,
 };
+/// The order-independent projection of a `KVMap` — a *set* view, distinct from the
+/// ordered encoding above. See [`kvmap_canonical_set_bytes`].
+pub const SCHEMA_KVMAP_SET: SchemaId = SchemaId {
+    name: "fln.canon.kvmap-set",
+    version: 1,
+};
+/// Durable snapshot of one generic shadow-run promotion cell.
+pub const SCHEMA_SHADOW_CELL: SchemaId = SchemaId {
+    name: "fln.canon.shadow-cell",
+    version: 1,
+};
+/// Canonical semantic NDJSON projection of a shadow publication.
+pub const SCHEMA_SHADOW_SEMANTIC_NDJSON: SchemaId = SchemaId {
+    name: "fln.canon.shadow-semantic-ndjson",
+    version: 1,
+};
+/// Canonical operational NDJSON projection carried beside, never inside, semantic
+/// shadow authority.
+pub const SCHEMA_SHADOW_TELEMETRY_NDJSON: SchemaId = SchemaId {
+    name: "fln.canon.shadow-telemetry-ndjson",
+    version: 1,
+};
+/// Candidate-only declaration certificate envelope (plan §8.6; OQ-8).
+pub const SCHEMA_DECLARATION_CERTIFICATE: SchemaId = SchemaId {
+    name: "fln.canon.declaration-certificate",
+    version: 1,
+};
+/// Optional receipt-attached warm definitional-equality replay hints (plan §8.6;
+/// OQ-13). The cache is candidate data and never an authority surface.
+pub const SCHEMA_WARM_DEFEQ_CACHE: SchemaId = SchemaId {
+    name: "fln.canon.warm-defeq-cache",
+    version: 1,
+};
+/// Logical identity of a certificate cartridge, shared by thin and sealed transport.
+pub const SCHEMA_CARTRIDGE_MANIFEST: SchemaId = SchemaId {
+    name: "fln.canon.cartridge-manifest",
+    version: 1,
+};
+/// Canonical transport envelope carrying a cartridge manifest and any staged frames.
+pub const SCHEMA_CARTRIDGE_ARCHIVE: SchemaId = SchemaId {
+    name: "fln.canon.cartridge-archive",
+    version: 1,
+};
+
+/// The crate that defines a durable format's codec.
+///
+/// Formats live in the crate that encodes them — the registry does not centralize the
+/// *codecs*, only the *identities*. That is forced by the crate map (§21): dependency
+/// edges point strictly downward and fln-hash sits below fln-env and fln-verdict, so
+/// this crate cannot import their constants even to compare them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SchemaOwner {
+    /// `fln-hash` — the term plane and the diagnostic taxonomy (this module).
+    Hash,
+    /// `fln-env` — Grimoire's module and provenance identities.
+    Env,
+    /// `fln-verdict` — the CNF / model / proof wire formats.
+    Verdict,
+}
+
+impl SchemaOwner {
+    pub const fn crate_name(self) -> &'static str {
+        match self {
+            SchemaOwner::Hash => "fln-hash",
+            SchemaOwner::Env => "fln-env",
+            SchemaOwner::Verdict => "fln-verdict",
+        }
+    }
+
+    /// The source file whose `SchemaId` constants define this owner's formats. This is
+    /// the join target: the registry is checked against these files in both directions,
+    /// so a format cannot be added, moved, or version-bumped without the registry
+    /// agreeing.
+    pub const fn declaration_file(self) -> &'static str {
+        match self {
+            SchemaOwner::Hash => "crates/fln-hash/src/canon.rs",
+            SchemaOwner::Env => "crates/fln-env/src/provenance.rs",
+            SchemaOwner::Verdict => "crates/fln-verdict/src/lib.rs",
+        }
+    }
+
+    pub const ALL: [SchemaOwner; 3] = [SchemaOwner::Hash, SchemaOwner::Env, SchemaOwner::Verdict];
+}
+
+/// One durable format of the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaRow {
+    pub id: SchemaId,
+    pub owner: SchemaOwner,
+    /// What the format serializes — the reviewable half of the row.
+    pub covers: &'static str,
+}
+
+/// **The registry of every durable format in the program** (bead franken_lean-rps
+/// requirement b; plan §7.3 and Appendix B: "every durable format specified once").
+///
+/// Before this existed, three crates declared `SchemaId` constants independently and
+/// nothing joined them: two formats could claim one name, a version could move on one
+/// side of a codec, or a format could be introduced with no published identity, and no
+/// artifact would disagree. Prose in a module header cannot be joined against a
+/// decoder; a table can.
+///
+/// The rows are checked, not asserted:
+/// * names are unique and shaped `fln.<subsystem>.<format>`, lowercase (`schema_names_
+///   are_unique_and_well_shaped`);
+/// * fln-hash's own rows are joined against the real constants at compile time, so this
+///   table and the codec cannot drift (`registry_rows_match_the_constants_they_name`);
+/// * every owner's declaration file is scanned and joined **in both directions** — an
+///   unregistered format and a row whose codec has vanished both fail
+///   (`tests/schema_registry.rs`).
+///
+/// Adding a durable format means adding a row here. That is the point: the registry is
+/// the reviewed inventory the conformance corpus is meant to be a projection of.
+pub const SCHEMA_REGISTRY: [SchemaRow; 18] = [
+    SchemaRow {
+        id: SCHEMA_NAME,
+        owner: SchemaOwner::Hash,
+        covers: "a hierarchical Lean name (string/numeric components)",
+    },
+    SchemaRow {
+        id: SCHEMA_LEVEL,
+        owner: SchemaOwner::Hash,
+        covers: "a universe level term",
+    },
+    SchemaRow {
+        id: SCHEMA_EXPR,
+        owner: SchemaOwner::Hash,
+        covers: "a term-plane expression",
+    },
+    SchemaRow {
+        id: SCHEMA_KVMAP,
+        owner: SchemaOwner::Hash,
+        covers: "an options / key-value map, insertion order significant",
+    },
+    SchemaRow {
+        id: SCHEMA_KVMAP_SET,
+        owner: SchemaOwner::Hash,
+        covers: "the same map as an order-independent set (logical-root input)",
+    },
+    SchemaRow {
+        id: SCHEMA_DIAG,
+        owner: SchemaOwner::Hash,
+        covers: "a diagnostic under the D8 typed error taxonomy",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_CELL,
+        owner: SchemaOwner::Hash,
+        covers: "one versioned generic shadow-run promotion authority cell",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_SEMANTIC_NDJSON,
+        owner: SchemaOwner::Hash,
+        covers: "the canonical semantic NDJSON projection of a shadow publication",
+    },
+    SchemaRow {
+        id: SCHEMA_SHADOW_TELEMETRY_NDJSON,
+        owner: SchemaOwner::Hash,
+        covers: "the separate canonical operational NDJSON projection of a shadow publication",
+    },
+    SchemaRow {
+        id: SCHEMA_DECLARATION_CERTIFICATE,
+        owner: SchemaOwner::Hash,
+        covers: "a bounded, candidate-only declaration certificate with a shared term DAG",
+    },
+    SchemaRow {
+        id: SCHEMA_WARM_DEFEQ_CACHE,
+        owner: SchemaOwner::Hash,
+        covers: "optional receipt-attached definitional-equality replay hints",
+    },
+    SchemaRow {
+        id: SCHEMA_CARTRIDGE_MANIFEST,
+        owner: SchemaOwner::Hash,
+        covers: "the transport-independent logical manifest of a certificate cartridge",
+    },
+    SchemaRow {
+        id: SCHEMA_CARTRIDGE_ARCHIVE,
+        owner: SchemaOwner::Hash,
+        covers: "a canonical thin, partial, sealed, or complete cartridge transport",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.env.module-provenance",
+            version: 1,
+        },
+        owner: SchemaOwner::Env,
+        covers: "the module topology + contribution provenance manifest",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.env.module-provenance.entry-id",
+            version: 1,
+        },
+        owner: SchemaOwner::Env,
+        covers: "content identity of one extension journal entry",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.cnf",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "a CNF formula on the wire",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.sat-model",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "a satisfying assignment on the wire",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.verdict.unsat-proof",
+            version: 1,
+        },
+        owner: SchemaOwner::Verdict,
+        covers: "an unsatisfiability proof on the wire",
+    },
+];
+
+/// The registry row for a schema, if it is registered.
+pub fn registered(name: &str) -> Option<&'static SchemaRow> {
+    SCHEMA_REGISTRY.iter().find(|row| row.id.name == name)
+}
 
 /// Typed decode failure. `at` is the byte offset of the failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,20 +342,207 @@ impl CanonWriter {
     }
 }
 
+/// Which caller-supplied limit stopped a decode (bead fln-4zk8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetLimit {
+    /// Bytes consumed from the input.
+    InputBytes,
+    /// Values built from it — `Expr` and `Level` nodes, `Name` components, `KVMap`
+    /// entries. Deliberately a count of *work*, not of nesting: a depth cap would
+    /// refuse legitimately deep terms, which is exactly what the decoder contract
+    /// forbids (bead franken_lean-fnj).
+    ProducedNodes,
+}
+
+/// The limits a caller is willing to spend on one decode.
+///
+/// Caller-supplied and passed by value into the decode call — not a global, not a
+/// compile-time constant, and not a property of the artifact. Two callers with
+/// different appetites decode the same bytes under different budgets in the same
+/// process, and neither can change the other's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeBudget {
+    max_input_bytes: u64,
+    max_produced_nodes: u64,
+}
+
+impl DecodeBudget {
+    pub const fn new(max_input_bytes: u64, max_produced_nodes: u64) -> DecodeBudget {
+        DecodeBudget {
+            max_input_bytes,
+            max_produced_nodes,
+        }
+    }
+
+    /// The budget the unbudgeted entry point runs under, so that
+    /// [`Canonical::from_canonical_bytes`] and
+    /// [`Canonical::from_canonical_bytes_budgeted`] are the same code path.
+    pub const fn unlimited() -> DecodeBudget {
+        DecodeBudget::new(u64::MAX, u64::MAX)
+    }
+
+    pub const fn max_input_bytes(self) -> u64 {
+        self.max_input_bytes
+    }
+
+    pub const fn max_produced_nodes(self) -> u64 {
+        self.max_produced_nodes
+    }
+}
+
+/// A decode that stopped because the caller's budget ran out.
+///
+/// It records which limit fired, what the caller allowed, and what had been spent
+/// when the meter tripped — enough to raise the budget and retry deliberately
+/// rather than by guesswork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exhausted {
+    pub limit: BudgetLimit,
+    pub allowed: u64,
+    pub observed: u64,
+    /// Byte offset the decode had reached.
+    pub at: usize,
+}
+
+/// The outcome of a budgeted decode: `Outcome<Result<T, CanonError>>` (bead fln-8gz3).
+///
+/// This replaces the hand-rolled three-valued `Decoded` enum that lived here. The shape
+/// is the same three claims, said in the program's one vocabulary
+/// ([`fln_core::outcome`]) instead of a fourth private lattice:
+///
+/// | was | is | why |
+/// |---|---|---|
+/// | `Value(v)` | `Complete(Ok(v))` | ran to completion, domain answer is "these bytes are this value" |
+/// | `Malformed(e)` | `Complete(Err(e))` | ran to completion; "not a well-formed artifact" is a real verdict ABOUT the bytes, so it belongs inside the authoritative arm |
+/// | `Inconclusive(Exhausted)` | `Inconclusive(ResourceExhausted{..})` | did not complete; nothing was learned |
+///
+/// The property the old type was protecting is preserved and now enforced further out:
+/// `Outcome` has no `From<Outcome<T>> for Result<T, E>`, no `Option` accessor and no
+/// `unwrap_or`, so a caller still cannot `?` a resource stop into a rejection. What it
+/// gains is a fourth claim the old enum could not make — see
+/// [`Canonical::from_canonical_bytes_budgeted`] on the accounting fault.
+pub type DecodeOutcome<T> = Outcome<Result<T, CanonError>>;
+
+impl Exhausted {
+    /// The structural unit this stop bounded.
+    ///
+    /// Total and injective, and asserted so in
+    /// `every_decode_budget_limit_maps_to_exactly_one_structural_unit`: two limits must
+    /// never collapse onto one unit, or a caller cannot tell which allowance to raise.
+    pub const fn unit(self) -> StructuralUnit {
+        match self.limit {
+            BudgetLimit::InputBytes => StructuralUnit::InputBytes,
+            BudgetLimit::ProducedNodes => StructuralUnit::ProducedNodes,
+        }
+    }
+
+    /// This stop as the program's typed non-answer (bead franken_lean-vui8's axis).
+    ///
+    /// `allowed`/`observed` become the [`ResourceUsage`] a caller sizes a retry from, and
+    /// `at` — which has no field in `ResourceUsage`, deliberately — is recorded through
+    /// `with_progress`, where it is diagnostic only and cannot be mistaken for a budget.
+    ///
+    /// This is the reusable half for any adopter with a structural budget: build a
+    /// `ResourceUsage` naming the unit, put the numbers in it, and localize with
+    /// `with_progress`. The term store (bead fln-49c) wants the same shape with
+    /// [`StructuralUnit::ExpandedWeight`].
+    pub fn into_inconclusive(self) -> Inconclusive {
+        Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::StructuralBudget { unit: self.unit() },
+            allowed: self.allowed,
+            observed: self.observed,
+        })
+        .with_progress(format!("byte {}", self.at))
+    }
+}
+
 /// Canonical byte reader.
 #[derive(Debug)]
 pub struct CanonReader<'a> {
     bytes: &'a [u8],
     at: usize,
+    budget: DecodeBudget,
+    produced_nodes: u64,
+    /// Set by the first trip, and never cleared: once the meter has fired, the rest
+    /// of this decode is unwinding, and whatever `CanonError` surfaces from that
+    /// unwinding describes the stop, not the bytes.
+    exhausted: Option<Exhausted>,
 }
 
 impl<'a> CanonReader<'a> {
     pub fn new(bytes: &'a [u8]) -> CanonReader<'a> {
-        CanonReader { bytes, at: 0 }
+        CanonReader::with_budget(bytes, DecodeBudget::unlimited())
+    }
+
+    pub fn with_budget(bytes: &'a [u8], budget: DecodeBudget) -> CanonReader<'a> {
+        CanonReader {
+            bytes,
+            at: 0,
+            budget,
+            produced_nodes: 0,
+            exhausted: None,
+        }
+    }
+
+    /// The stop record, if this reader's budget ran out.
+    pub fn exhausted(&self) -> Option<Exhausted> {
+        self.exhausted
+    }
+
+    /// Current byte offset for sibling codecs that derive random-access locators from
+    /// validated canonical framing. Kept crate-private so external codecs cannot use
+    /// the cursor to bypass their schema boundary.
+    pub(crate) const fn offset(&self) -> usize {
+        self.at
     }
 
     fn err(&self, what: &'static str) -> CanonError {
         CanonError { at: self.at, what }
+    }
+
+    /// Build a codec-local refusal at the current byte offset.
+    ///
+    /// Durable formats implemented beside this module need to reject semantic tag
+    /// combinations without exposing the reader's cursor or manufacturing a false
+    /// offset. The method stays crate-private so external codecs cannot bypass their
+    /// own schema boundary.
+    pub(crate) fn reject(&self, what: &'static str) -> CanonError {
+        self.err(what)
+    }
+
+    /// Record the first trip and return the sentinel that unwinds the decode. The
+    /// caller-facing outcome is decided from [`CanonReader::exhausted`], never from
+    /// this error — it exists only to stop the readers through the same `?` path
+    /// they already use, without threading a second error type through every
+    /// signature.
+    fn trip(&mut self, limit: BudgetLimit, allowed: u64, observed: u64) -> CanonError {
+        if self.exhausted.is_none() {
+            self.exhausted = Some(Exhausted {
+                limit,
+                allowed,
+                observed,
+                at: self.at,
+            });
+        }
+        self.err("decode budget exhausted")
+    }
+
+    /// Charge one produced value against the budget. Called where values are built,
+    /// so the count is work actually done rather than bytes that might be skipped.
+    pub(crate) fn charge_node(&mut self) -> Result<(), CanonError> {
+        // Saturating rather than `+ 1`: reaching `u64::MAX` nodes would need more
+        // input bytes than an address space holds, but a counter that can only
+        // saturate cannot overflow into a wrap on any build profile.
+        let produced = self.produced_nodes.saturating_add(1);
+        if produced > self.budget.max_produced_nodes {
+            return Err(self.trip(
+                BudgetLimit::ProducedNodes,
+                self.budget.max_produced_nodes,
+                produced,
+            ));
+        }
+        self.produced_nodes = produced;
+        Ok(())
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], CanonError> {
@@ -138,6 +551,16 @@ impl<'a> CanonReader<'a> {
             .checked_add(n)
             .filter(|end| *end <= self.bytes.len())
             .ok_or_else(|| self.err("input truncated"))?;
+        // Charged on consumption, not on the artifact's total size: bytes never read
+        // are never spent, so a malformed prefix under a small budget still gets its
+        // rejection instead of being reported as "too expensive to judge".
+        if end as u64 > self.budget.max_input_bytes {
+            return Err(self.trip(
+                BudgetLimit::InputBytes,
+                self.budget.max_input_bytes,
+                end as u64,
+            ));
+        }
         let slice = &self.bytes[self.at..end];
         self.at = end;
         Ok(slice)
@@ -220,12 +643,103 @@ pub trait Canonical: Sized {
     }
 
     /// Total inverse of [`Canonical::to_canonical_bytes`].
+    ///
+    /// Runs under [`DecodeBudget::unlimited`], so it is two-valued by construction:
+    /// an unlimited budget cannot trip, and this signature therefore never has to
+    /// represent an inconclusive outcome. Callers decoding untrusted artifacts under
+    /// a resource contract want [`Canonical::from_canonical_bytes_budgeted`].
     fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonError> {
-        let mut r = CanonReader::new(bytes);
-        r.expect_schema(Self::SCHEMA)?;
-        let value = Self::read_body(&mut r)?;
-        r.finish()?;
-        Ok(value)
+        match Self::from_canonical_bytes_budgeted(bytes, DecodeBudget::unlimited()) {
+            Outcome::Complete(result) => result,
+            // Both non-answers are unreachable under an unlimited budget: nothing can
+            // trip, so no stop can be recorded and no accounting fault can be detected.
+            // A panic is the right encoding rather than a lie: this signature cannot
+            // carry a non-answer, and reaching here would mean an invariant broke, which
+            // is never a user diagnostic (FL-INV-07). Budgeted callers get the typed
+            // outcome instead.
+            Outcome::Inconclusive(inconclusive) => unreachable!(
+                "an unlimited budget cannot be exhausted, yet a stop was reported: {:?}",
+                inconclusive.cause
+            ),
+            Outcome::InternalFault(fault) => unreachable!(
+                "an unlimited budget cannot record a stop, so no accounting fault is \
+                 possible, yet one was reported: {fault:?}"
+            ),
+        }
+    }
+
+    /// Decode under a caller-supplied budget (bead fln-4zk8).
+    ///
+    /// Exhaustion is reported as [`Outcome::Inconclusive`] and is never rendered as
+    /// acceptance or rejection: the meter is consulted *before* the error that
+    /// unwound the decode is interpreted, so a stop can never be mistaken for a
+    /// well-formedness verdict about the bytes (FL-INV-07). Decoding an artifact
+    /// that fits inside the budget is byte-for-byte the same computation as the
+    /// unbudgeted call.
+    ///
+    /// **Budget and malformedness are not conflated, and the fold is what made that
+    /// checkable rather than argued.** A trip records itself in the reader and returns a
+    /// sentinel error purely to unwind through the `?` path the readers already use, so
+    /// every failure arrives through one channel and is separated afterwards by consulting
+    /// the meter. That separation was correct but rested on a *non-local* property — that
+    /// no reader anywhere swallows an error — and the old three-arm enum had no way to say
+    /// otherwise: with a stop recorded and a successful parse it could only return
+    /// `Value`, silently accepting an over-budget decode. There is no such swallow today
+    /// (checked, not assumed: every read path uses `?`), which is exactly why the case
+    /// deserves a typed refusal rather than a comment. `Outcome::InternalFault` is that
+    /// refusal — our accounting contradicting itself is an invariant failure, not a
+    /// verdict about anyone's bytes, and it is never cacheable.
+    fn from_canonical_bytes_budgeted(bytes: &[u8], budget: DecodeBudget) -> DecodeOutcome<Self> {
+        let mut r = CanonReader::with_budget(bytes, budget);
+        // Every step is checked the same way: if the meter tripped, the outcome is
+        // inconclusive regardless of which error surfaced.
+        macro_rules! step {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return match r.exhausted() {
+                            Some(exhausted) => Outcome::Inconclusive(exhausted.into_inconclusive()),
+                            // A completed run whose domain answer is "not a well-formed
+                            // artifact" — a real verdict about the bytes, so it belongs
+                            // inside the authoritative arm.
+                            None => Outcome::Complete(Err(error)),
+                        };
+                    }
+                }
+            };
+        }
+        step!(r.expect_schema(Self::SCHEMA));
+        let value = step!(Self::read_body(&mut r));
+        // `finish` consumes the reader and reads nothing, so it cannot trip the
+        // meter; the stop record is captured first and stays authoritative.
+        let exhausted = r.exhausted();
+        match r.finish() {
+            Ok(()) => match exhausted {
+                None => Outcome::Complete(Ok(value)),
+                // Parsed cleanly *and* a stop was recorded. Unreachable while no reader
+                // swallows a trip, and refused rather than trusted precisely because that
+                // premise lives in every reader rather than here.
+                Some(exhausted) => Outcome::InternalFault(
+                    InternalFault::new(
+                        "FL-INV-07",
+                        format!(
+                            "decode completed while a {} budget stop was recorded at byte {}: \
+                             allowed={}, observed={}",
+                            exhausted.unit().as_str(),
+                            exhausted.at,
+                            exhausted.allowed,
+                            exhausted.observed
+                        ),
+                    )
+                    .with_evidence("fln_hash::canon::from_canonical_bytes_budgeted"),
+                ),
+            },
+            Err(error) => match exhausted {
+                Some(exhausted) => Outcome::Inconclusive(exhausted.into_inconclusive()),
+                None => Outcome::Complete(Err(error)),
+            },
+        }
     }
 }
 
@@ -271,6 +785,9 @@ impl Canonical for Name {
         let count = r.u64()?;
         let mut name = Name::anonymous();
         for _ in 0..count {
+            // One component is one produced value: a hostile count field spends the
+            // caller's budget rather than the machine's memory.
+            r.charge_node()?;
             name = match r.u8()? {
                 NAME_STR => Name::str(name, r.str()?),
                 NAME_NUM => Name::num(name, r.u64()?),
@@ -383,29 +900,32 @@ fn read_level_iter(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
     let mut values: Vec<Level> = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            LevelTask::Read => match r.u8()? {
-                LEVEL_ZERO => values.push(Level::zero()),
-                LEVEL_SUCC => {
-                    tasks.push(LevelTask::BuildSucc);
-                    tasks.push(LevelTask::Read);
+            LevelTask::Read => {
+                r.charge_node()?;
+                match r.u8()? {
+                    LEVEL_ZERO => values.push(Level::zero()),
+                    LEVEL_SUCC => {
+                        tasks.push(LevelTask::BuildSucc);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_MAX => {
+                        // Push the builder first (runs last), then the two child reads;
+                        // the LIFO order reads child `a` before child `b`, matching the
+                        // encoder's left-to-right emission.
+                        tasks.push(LevelTask::BuildMax);
+                        tasks.push(LevelTask::Read);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_IMAX => {
+                        tasks.push(LevelTask::BuildIMax);
+                        tasks.push(LevelTask::Read);
+                        tasks.push(LevelTask::Read);
+                    }
+                    LEVEL_PARAM => values.push(Level::param(Name::read_body(r)?)),
+                    LEVEL_MVAR => values.push(Level::mvar(LMVarId(Name::read_body(r)?))),
+                    _ => return Err(r.err_public("unknown level tag")),
                 }
-                LEVEL_MAX => {
-                    // Push the builder first (runs last), then the two child reads;
-                    // the LIFO order reads child `a` before child `b`, matching the
-                    // encoder's left-to-right emission.
-                    tasks.push(LevelTask::BuildMax);
-                    tasks.push(LevelTask::Read);
-                    tasks.push(LevelTask::Read);
-                }
-                LEVEL_IMAX => {
-                    tasks.push(LevelTask::BuildIMax);
-                    tasks.push(LevelTask::Read);
-                    tasks.push(LevelTask::Read);
-                }
-                LEVEL_PARAM => values.push(Level::param(Name::read_body(r)?)),
-                LEVEL_MVAR => values.push(Level::mvar(LMVarId(Name::read_body(r)?))),
-                _ => return Err(r.err_public("unknown level tag")),
-            },
+            }
             LevelTask::BuildSucc => {
                 let u = values.pop().ok_or_else(|| underflow(r))?;
                 values.push(u.succ().map_err(|_| too_deep(r))?);
@@ -438,47 +958,131 @@ const DV_NAT: u8 = 3;
 const DV_INT: u8 = 4;
 const DV_SYNTAX: u8 = 5;
 
+/// The one `DataValue` byte grammar, shared by the ordered encoding and the
+/// order-independent projection so the two can never disagree about a value.
+fn write_data_value(value: &DataValue, w: &mut CanonWriter) {
+    match value {
+        DataValue::OfString(v) => {
+            w.u8(DV_STRING);
+            w.str(v);
+        }
+        DataValue::OfBool(v) => {
+            w.u8(DV_BOOL);
+            w.bool(*v);
+        }
+        DataValue::OfName(v) => {
+            w.u8(DV_NAME);
+            v.write_body(w);
+        }
+        DataValue::OfNat(v) => {
+            w.u8(DV_NAT);
+            w.u64(*v);
+        }
+        DataValue::OfInt(v) => {
+            w.u8(DV_INT);
+            w.i64(*v);
+        }
+        DataValue::OfSyntax(v) => {
+            w.u8(DV_SYNTAX);
+            w.u64(v.0);
+        }
+    }
+}
+
+/// The **order-independent** view of a `KVMap`: entries sorted by canonical key bytes.
+///
+/// Two encodings of one map exist on purpose, and conflating them was a real defect.
+/// The [`Canonical`] impl is order-*sensitive*, correctly: upstream `KVMap` is an
+/// ordered assoc list, so insertion order is part of the value and the encoding must be
+/// injective on it. But a *set* consumer — the logical root of plan §7.1 — needs the
+/// opposite property. `KVMap::insert` replaces a key in place and `find` returns the
+/// first match, so with the unique keys the type guarantees, insertion order is not
+/// observable through any lookup: two differently-ordered maps with the same pairs agree
+/// on every `find`, `contains`, and `get_*`. Digesting the ordered bytes therefore gave
+/// one environment two logical roots depending on the order options happened to be set
+/// in — spurious cache misses, and two identities for one environment in receipts and
+/// the transparency log.
+///
+/// Sorting by canonical key bytes rather than by `Name`'s `Ord` keeps the order fixed by
+/// the wire format instead of by a trait impl that could be changed, and matches how
+/// [`LogicalRootBuilder`](crate::root::LogicalRootBuilder) already keys declarations.
+///
+/// This is a distinct schema, so its preimages can never be confused with the ordered
+/// encoding's — order-independence is a property of the projection, never something the
+/// canonical encoding quietly acquired.
+///
+/// **Returns `None` for a map with duplicate keys**, which are representable and
+/// preserved since bead franken_lean-l84f. A set view of something that is not a set has
+/// no honest definition: sorting by key alone would leave the order of two same-key
+/// entries unpinned, and any first-match-wins rule would drop the shadowed value, so two
+/// maps upstream separates (its own `eqv` does) would project to identical bytes. That is
+/// a collision in a function whose entire purpose is identity — the defect class of bead
+/// franken_lean-f6br, where a lossy projection of `Name` made distinct finding sets share
+/// a witness. Refusing is the only answer that cannot lie; a caller that wants a set out
+/// of a duplicate-keyed map has to say which value wins, and that is its decision to
+/// make and to record, not this function's to guess.
+pub fn kvmap_canonical_set_bytes(map: &KVMap) -> Option<Vec<u8>> {
+    let mut sorted: Vec<(Vec<u8>, &DataValue)> = map
+        .entries()
+        .iter()
+        .map(|(key, value)| (key.to_canonical_bytes(), value))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    // Sorted, so duplicates are adjacent.
+    if sorted.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
+    let mut w = CanonWriter::new();
+    w.schema(SCHEMA_KVMAP_SET);
+    w.u64(sorted.len() as u64);
+    for (key_bytes, value) in sorted {
+        // Length-prefixed, so a key's bytes can never run into the next field.
+        w.bytes(&key_bytes);
+        write_data_value(value, &mut w);
+    }
+    Some(w.into_bytes())
+}
+
 impl Canonical for KVMap {
     const SCHEMA: SchemaId = SCHEMA_KVMAP;
 
     fn write_body(&self, w: &mut CanonWriter) {
-        // Insertion order IS the value (upstream KVMap is an ordered assoc list).
+        // Insertion order IS the value (upstream KVMap is an ordered assoc list), so
+        // this encoding is deliberately order-SENSITIVE and a test asserts that
+        // permuting entries changes the bytes. The order-independent view a *set*
+        // consumer needs is a separate projection — see [`kvmap_canonical_set_bytes`].
         w.u64(self.entries().len() as u64);
         for (key, value) in self.entries() {
             key.write_body(w);
-            match value {
-                DataValue::OfString(v) => {
-                    w.u8(DV_STRING);
-                    w.str(v);
-                }
-                DataValue::OfBool(v) => {
-                    w.u8(DV_BOOL);
-                    w.bool(*v);
-                }
-                DataValue::OfName(v) => {
-                    w.u8(DV_NAME);
-                    v.write_body(w);
-                }
-                DataValue::OfNat(v) => {
-                    w.u8(DV_NAT);
-                    w.u64(*v);
-                }
-                DataValue::OfInt(v) => {
-                    w.u8(DV_INT);
-                    w.i64(*v);
-                }
-                DataValue::OfSyntax(v) => {
-                    w.u8(DV_SYNTAX);
-                    w.u64(v.0);
-                }
-            }
+            write_data_value(value, w);
         }
     }
 
     fn read_body(r: &mut CanonReader<'_>) -> Result<KVMap, CanonError> {
         let count = r.u64()?;
-        let mut map = KVMap::new();
+        // Entries are collected POSITIONALLY and handed to `KVMap::from_entries`, never
+        // replayed through `KVMap::insert` (bead franken_lean-l84f).
+        //
+        // The distinction is the whole bug that used to live here. `insert` mirrors
+        // `insertCore` and replaces the first match, so building the map with it FOLDS a
+        // duplicate-keyed stream: two distinct encodings collapsed onto one value, and
+        // that value re-encoded shorter than the bytes it came from. Bead fln-1f8v caught
+        // that and refused duplicate keys outright, which was right about the symptom —
+        // one value may have exactly one encoding, or every decl hash, logical root and
+        // cache key is built on sand — and wrong about the cause. The folding was the
+        // defect. Appending keeps the value/encoding correspondence injective over the
+        // larger value space, so canonicality holds *and* the input is representable.
+        //
+        // Refusing them was also a parity divergence on the artifact path, which is why
+        // it had to change rather than stay a convenient narrowing: `MData` *is* `KVMap`
+        // (`Lean/Expr.lean:116`), so a duplicate-keyed map rides inside any
+        // `Expr::MData`; the pin's module codec has no key-aware normalization anywhere,
+        // so upstream's loader materializes such a value from such bytes without
+        // complaint. We were rejecting an artifact the Reference can produce and read
+        // back — exactly the drift the Oracle-Only Law forbids.
+        let mut entries = Vec::with_capacity(count.min(1024) as usize);
         for _ in 0..count {
+            r.charge_node()?;
             let key = Name::read_body(r)?;
             let value = match r.u8()? {
                 DV_STRING => DataValue::OfString(r.str()?.to_string()),
@@ -489,9 +1093,9 @@ impl Canonical for KVMap {
                 DV_SYNTAX => DataValue::OfSyntax(SyntaxHandle(r.u64()?)),
                 _ => return Err(r.err_public("unknown data-value tag")),
             };
-            map.insert(key, value);
+            entries.push((key, value));
         }
-        Ok(map)
+        Ok(KVMap::from_entries(entries))
     }
 }
 
@@ -681,76 +1285,79 @@ fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
     let mut values: Vec<Expr> = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            ExprTask::Read => match r.u8()? {
-                EXPR_BVAR => values.push(
-                    Expr::bvar(r.u32()?)
-                        .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
-                ),
-                EXPR_FVAR => values.push(Expr::fvar(FVarId(Name::read_body(r)?))),
-                EXPR_MVAR => values.push(Expr::mvar(MVarId(Name::read_body(r)?))),
-                EXPR_SORT => values.push(Expr::sort(read_level_iter(r)?)),
-                EXPR_CONST => {
-                    let name = Name::read_body(r)?;
-                    let count = r.u64()?;
-                    let mut levels = Vec::new();
-                    for _ in 0..count {
-                        levels.push(read_level_iter(r)?);
+            ExprTask::Read => {
+                r.charge_node()?;
+                match r.u8()? {
+                    EXPR_BVAR => values.push(
+                        Expr::bvar(r.u32()?)
+                            .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
+                    ),
+                    EXPR_FVAR => values.push(Expr::fvar(FVarId(Name::read_body(r)?))),
+                    EXPR_MVAR => values.push(Expr::mvar(MVarId(Name::read_body(r)?))),
+                    EXPR_SORT => values.push(Expr::sort(read_level_iter(r)?)),
+                    EXPR_CONST => {
+                        let name = Name::read_body(r)?;
+                        let count = r.u64()?;
+                        let mut levels = Vec::new();
+                        for _ in 0..count {
+                            levels.push(read_level_iter(r)?);
+                        }
+                        values.push(Expr::const_(name, levels));
                     }
-                    values.push(Expr::const_(name, levels));
-                }
-                EXPR_APP => {
-                    // Builder first (runs last); the two child reads follow so LIFO
-                    // reads `f` before `a`, matching the encoder.
-                    tasks.push(ExprTask::BuildApp);
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LAM => {
-                    let binder_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildLam(binder_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_FORALL => {
-                    let binder_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildForall(binder_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LET => {
-                    let decl_name = Name::read_body(r)?;
-                    tasks.push(ExprTask::BuildLet(decl_name));
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_LIT_NAT => {
-                    let count = r.u64()?;
-                    let mut limbs = Vec::new();
-                    for _ in 0..count {
-                        limbs.push(r.u64()?);
+                    EXPR_APP => {
+                        // Builder first (runs last); the two child reads follow so LIFO
+                        // reads `f` before `a`, matching the encoder.
+                        tasks.push(ExprTask::BuildApp);
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
                     }
-                    let lit = NatLit::from_limbs_le(limbs.clone());
-                    if lit.limbs_le() != limbs.as_slice() {
-                        // Trailing zero limbs would give two encodings of one value.
-                        return Err(r.err_public("non-normalized nat literal limbs"));
+                    EXPR_LAM => {
+                        let binder_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildLam(binder_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
                     }
-                    values.push(Expr::lit(Literal::Nat(lit)));
+                    EXPR_FORALL => {
+                        let binder_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildForall(binder_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_LET => {
+                        let decl_name = Name::read_body(r)?;
+                        tasks.push(ExprTask::BuildLet(decl_name));
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_LIT_NAT => {
+                        let count = r.u64()?;
+                        let mut limbs = Vec::new();
+                        for _ in 0..count {
+                            limbs.push(r.u64()?);
+                        }
+                        let lit = NatLit::from_limbs_le(limbs.clone());
+                        if lit.limbs_le() != limbs.as_slice() {
+                            // Trailing zero limbs would give two encodings of one value.
+                            return Err(r.err_public("non-normalized nat literal limbs"));
+                        }
+                        values.push(Expr::lit(Literal::Nat(lit)));
+                    }
+                    EXPR_LIT_STR => values.push(Expr::lit(Literal::Str(r.str()?.to_string()))),
+                    EXPR_MDATA => {
+                        let data = KVMap::read_body(r)?;
+                        tasks.push(ExprTask::BuildMData(data));
+                        tasks.push(ExprTask::Read);
+                    }
+                    EXPR_PROJ => {
+                        let struct_name = Name::read_body(r)?;
+                        let idx = r.u64()?;
+                        tasks.push(ExprTask::BuildProj(struct_name, idx));
+                        tasks.push(ExprTask::Read);
+                    }
+                    _ => return Err(r.err_public("unknown expr tag")),
                 }
-                EXPR_LIT_STR => values.push(Expr::lit(Literal::Str(r.str()?.to_string()))),
-                EXPR_MDATA => {
-                    let data = KVMap::read_body(r)?;
-                    tasks.push(ExprTask::BuildMData(data));
-                    tasks.push(ExprTask::Read);
-                }
-                EXPR_PROJ => {
-                    let struct_name = Name::read_body(r)?;
-                    let idx = r.u64()?;
-                    tasks.push(ExprTask::BuildProj(struct_name, idx));
-                    tasks.push(ExprTask::Read);
-                }
-                _ => return Err(r.err_public("unknown expr tag")),
-            },
+            }
             ExprTask::BuildApp => {
                 let a = values.pop().ok_or_else(|| underflow(r))?;
                 let f = values.pop().ok_or_else(|| underflow(r))?;
@@ -795,9 +1402,22 @@ fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
 
 // ---- Diagnostic (the D8 typed error taxonomy, versioned on the wire) -------------------
 
+/// **Version 3** adds `ResourceReason::ExecutionSteps` (wire tag
+/// `RES_EXECUTION_STEPS`) so FrankenLean-owned kernel/VM work budgets cannot be
+/// serialized under the Reference's allocation-linked heartbeat vocabulary.
+///
+/// Version 2 was introduced by bead franken_lean-vui8 when
+/// `ResourceReason::StructuralBudget` added wire tag `RES_STRUCTURAL`.
+///
+/// Bumped even though no existing value's bytes moved. The reason is skew, not
+/// layout: a v2 reader meeting tag 5 fails closed with "unknown resource-reason
+/// tag", so retaining version 2 would create two incompatible languages both
+/// labelled `fln.canon.diag/2`. A version whose value does not identify the
+/// language it names invites exactly the confident misread it is supposed to
+/// prevent.
 pub const SCHEMA_DIAG: SchemaId = SchemaId {
     name: "fln.canon.diag",
-    version: 1,
+    version: 3,
 };
 
 const SEV_INFO: u8 = 0;
@@ -808,6 +1428,32 @@ const RES_HEARTBEATS: u8 = 0;
 const RES_REC_DEPTH: u8 = 1;
 const RES_CANCELLED: u8 = 2;
 const RES_MEMORY: u8 = 3;
+/// Added with the structural budget axis (bead franken_lean-vui8). Tags are permanent
+/// once published; a new reason takes the next free value and never reuses one.
+const RES_STRUCTURAL: u8 = 4;
+/// Native deterministic work, distinct from the pin's allocation heartbeat.
+const RES_EXECUTION_STEPS: u8 = 5;
+
+const SU_INPUT_BYTES: u8 = 0;
+const SU_PRODUCED_NODES: u8 = 1;
+const SU_EXPANDED_WEIGHT: u8 = 2;
+
+fn write_structural_unit(w: &mut CanonWriter, unit: StructuralUnit) {
+    w.u8(match unit {
+        StructuralUnit::InputBytes => SU_INPUT_BYTES,
+        StructuralUnit::ProducedNodes => SU_PRODUCED_NODES,
+        StructuralUnit::ExpandedWeight => SU_EXPANDED_WEIGHT,
+    });
+}
+
+fn read_structural_unit(r: &mut CanonReader<'_>) -> Result<StructuralUnit, CanonError> {
+    Ok(match r.u8()? {
+        SU_INPUT_BYTES => StructuralUnit::InputBytes,
+        SU_PRODUCED_NODES => StructuralUnit::ProducedNodes,
+        SU_EXPANDED_WEIGHT => StructuralUnit::ExpandedWeight,
+        _ => return Err(r.err_public("unknown structural-unit tag")),
+    })
+}
 
 fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
     match resource {
@@ -816,6 +1462,7 @@ fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
             w.u64(*consumed);
             w.u64(*limit);
         }
+        ResourceReason::ExecutionSteps => w.u8(RES_EXECUTION_STEPS),
         ResourceReason::RecursionDepth { limit } => {
             w.u8(RES_REC_DEPTH);
             w.u64(*limit);
@@ -824,6 +1471,12 @@ fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
         ResourceReason::Memory { limit_bytes } => {
             w.u8(RES_MEMORY);
             w.u64(*limit_bytes);
+        }
+        // No numbers: the variant carries only which quantity was bounded, because
+        // `allowed`/`observed` live in `ResourceUsage`.
+        ResourceReason::StructuralBudget { unit } => {
+            w.u8(RES_STRUCTURAL);
+            write_structural_unit(w, *unit);
         }
     }
 }
@@ -834,10 +1487,14 @@ fn read_resource(r: &mut CanonReader<'_>) -> Result<ResourceReason, CanonError> 
             consumed: r.u64()?,
             limit: r.u64()?,
         },
+        RES_EXECUTION_STEPS => ResourceReason::ExecutionSteps,
         RES_REC_DEPTH => ResourceReason::RecursionDepth { limit: r.u64()? },
         RES_CANCELLED => ResourceReason::Cancelled,
         RES_MEMORY => ResourceReason::Memory {
             limit_bytes: r.u64()?,
+        },
+        RES_STRUCTURAL => ResourceReason::StructuralBudget {
+            unit: read_structural_unit(r)?,
         },
         _ => return Err(r.err_public("unknown resource-reason tag")),
     })
@@ -1076,6 +1733,199 @@ mod tests {
     use super::*;
     use fln_core::level::Level;
 
+    use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause};
+
+    macro_rules! fixture_panic {
+        ($($arg:tt)*) => {
+            panic!(/* ubs:ignore — test-only diagnostic. */ $($arg)*)
+        };
+    }
+
+    /// The stop facts a budgeted decode records, so assertions that used to read
+    /// `Exhausted` fields directly keep asserting exactly the same things after the fold
+    /// to `Outcome` (bead fln-8gz3). Panics loudly on any other outcome shape, so a test
+    /// cannot pass by silently getting a different arm than it meant.
+    fn stop_of<T: std::fmt::Debug>(outcome: &DecodeOutcome<T>) -> (StructuralUnit, u64, u64) {
+        match outcome {
+            Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+                InconclusiveCause::ResourceExhausted { usage } => match usage.reason {
+                    ResourceReason::StructuralBudget { unit } => {
+                        (unit, usage.allowed, usage.observed)
+                    }
+                    ref other => fixture_panic!("expected a structural budget, got {other:?}"),
+                },
+                other => fixture_panic!("expected resource exhaustion, got {other:?}"),
+            },
+            other => fixture_panic!("expected an inconclusive outcome, got {other:?}"),
+        }
+    }
+
+    /// Where the stop was localized — the `at` offset the pre-fold `Exhausted` carried.
+    fn stop_progress<T: std::fmt::Debug>(outcome: &DecodeOutcome<T>) -> String {
+        match outcome {
+            Outcome::Inconclusive(inconclusive) => inconclusive
+                .progress
+                .as_deref()
+                .map(|text| text.text().to_string())
+                .expect("a budget stop records where it stopped"),
+            other => fixture_panic!("expected an inconclusive outcome, got {other:?}"),
+        }
+    }
+
+    fn is_inconclusive<T>(outcome: &DecodeOutcome<T>) -> bool {
+        matches!(outcome, Outcome::Inconclusive(_))
+    }
+
+    /// The decoded value if the run completed AND accepted — the pre-fold
+    /// `Decoded::value()`. Deliberately collapses only the two arms that were already
+    /// collapsed: a non-answer and a rejection both yield `None`, and callers that need to
+    /// tell them apart match the `Outcome` directly.
+    fn decoded_value<T>(outcome: DecodeOutcome<T>) -> Option<T> {
+        match outcome {
+            Outcome::Complete(Ok(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn schema_names_are_unique_and_well_shaped() {
+        let mut seen = std::collections::BTreeSet::new();
+        for row in SCHEMA_REGISTRY {
+            assert!(
+                seen.insert(row.id.name),
+                "two durable formats claim the schema name `{}` — a name is an identity, \
+                 and a collision means one decoder can be handed the other's bytes and \
+                 accept them",
+                row.id.name
+            );
+            assert!(
+                row.id.version >= 1,
+                "`{}` has no version; version 0 is not a published format",
+                row.id.name
+            );
+            assert!(
+                row.id.name.starts_with("fln."),
+                "`{}` is outside the `fln.` namespace",
+                row.id.name
+            );
+            // `fln.<subsystem>.<format>` at minimum, so a name says who owns it.
+            assert!(
+                row.id.name.split('.').count() >= 3,
+                "`{}` must be shaped fln.<subsystem>.<format>",
+                row.id.name
+            );
+            assert!(
+                row.id.name.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'.'
+                    || b == b'-'),
+                "`{}` must be lowercase ascii with `.`/`-` separators; a name that varies \
+                 by case is two names to a byte comparison",
+                row.id.name
+            );
+            assert!(
+                !row.covers.is_empty(),
+                "`{}` has no description; an unreviewable row is not a registration",
+                row.id.name
+            );
+        }
+        assert_eq!(seen.len(), SCHEMA_REGISTRY.len());
+    }
+
+    #[test]
+    fn registry_rows_match_the_constants_they_name() {
+        // fln-hash's own rows are joined against the real constants rather than
+        // transcribed beside them, so this table cannot drift from the codec it
+        // describes. The other owners' rows are joined against their sources in
+        // tests/schema_registry.rs, which is the closest this crate can get to the
+        // same check without depending upward.
+        for (constant, expected) in [
+            (SCHEMA_NAME, "fln.canon.name"),
+            (SCHEMA_LEVEL, "fln.canon.level"),
+            (SCHEMA_EXPR, "fln.canon.expr"),
+            (SCHEMA_KVMAP, "fln.canon.kvmap"),
+            (SCHEMA_KVMAP_SET, "fln.canon.kvmap-set"),
+            (SCHEMA_DIAG, "fln.canon.diag"),
+            (SCHEMA_SHADOW_CELL, "fln.canon.shadow-cell"),
+            (
+                SCHEMA_SHADOW_SEMANTIC_NDJSON,
+                "fln.canon.shadow-semantic-ndjson",
+            ),
+            (
+                SCHEMA_SHADOW_TELEMETRY_NDJSON,
+                "fln.canon.shadow-telemetry-ndjson",
+            ),
+            (
+                SCHEMA_DECLARATION_CERTIFICATE,
+                "fln.canon.declaration-certificate",
+            ),
+            (SCHEMA_WARM_DEFEQ_CACHE, "fln.canon.warm-defeq-cache"),
+            (SCHEMA_CARTRIDGE_MANIFEST, "fln.canon.cartridge-manifest"),
+            (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),
+        ] {
+            assert_eq!(constant.name, expected);
+            let row = registered(constant.name)
+                .unwrap_or_else(|| fixture_panic!("{expected} is not in SCHEMA_REGISTRY"));
+            assert_eq!(
+                row.id, constant,
+                "the row for {expected} is not the constant"
+            );
+            assert_eq!(row.owner, SchemaOwner::Hash);
+        }
+        // And every Hash-owned row is one of those constants: a row added here without a
+        // constant would otherwise pass the loop above by never being visited.
+        let hash_rows = SCHEMA_REGISTRY
+            .iter()
+            .filter(|row| row.owner == SchemaOwner::Hash)
+            .count();
+        assert_eq!(
+            hash_rows, 13,
+            "fln-hash owns a schema the constant join above does not cover"
+        );
+    }
+
+    #[test]
+    fn every_owner_is_represented_and_names_a_real_declaration_file() {
+        for owner in SchemaOwner::ALL {
+            let rows = SCHEMA_REGISTRY
+                .iter()
+                .filter(|row| row.owner == owner)
+                .count();
+            assert!(
+                rows > 0,
+                "{} is a registered owner with no formats — remove the owner or the \
+                 registry is incomplete",
+                owner.crate_name()
+            );
+            assert!(
+                owner
+                    .declaration_file()
+                    .starts_with(&format!("crates/{}/", owner.crate_name())),
+                "{}'s declaration file must live in its own crate, not {}",
+                owner.crate_name(),
+                owner.declaration_file()
+            );
+            // Every row's name must name its own subsystem, so the owner column and the
+            // name cannot disagree about who defines a format.
+            let subsystem = owner.crate_name().trim_start_matches("fln-");
+            let prefix = match owner {
+                // The term-plane formats predate the crate split and are named for the
+                // module (`canon`) rather than the crate; recorded here rather than
+                // renamed, because a schema name is frozen once published.
+                SchemaOwner::Hash => "fln.canon.".to_string(),
+                _ => format!("fln.{subsystem}."),
+            };
+            for row in SCHEMA_REGISTRY.iter().filter(|row| row.owner == owner) {
+                assert!(
+                    row.id.name.starts_with(&prefix),
+                    "`{}` is owned by {} but is not named `{prefix}*`",
+                    row.id.name,
+                    owner.crate_name()
+                );
+            }
+        }
+    }
+
     // Test-only mutations used by the no-mock E2E lane. They deliberately restore
     // the exact bug class: syntax-depth recursion on a bounded worker stack. The
     // parent process must observe their fatal exit instead of accepting them.
@@ -1101,7 +1951,7 @@ mod tests {
                 recurse.encode(inner, w);
                 std::hint::black_box(w.buf.len());
             }
-            _ => panic!("the level mutation probe expects a Succ chain"),
+            _ => fixture_panic!("the level mutation probe expects a Succ chain"),
         }
     }
 
@@ -1134,7 +1984,7 @@ mod tests {
                 recurse.encode(a, w);
                 std::hint::black_box(w.buf.len());
             }
-            _ => panic!("the expression mutation probe expects an App chain"),
+            _ => fixture_panic!("the expression mutation probe expects an App chain"),
         }
     }
 
@@ -1363,6 +2213,130 @@ mod tests {
         barrier.wait();
         left_thread.join().expect("left dropper completes");
         right_thread.join().expect("right dropper completes");
+    }
+
+    /// The recursive descent that [`read_level_iter`] replaced (bead
+    /// franken_lean-fnj). Test-only, and it exists for exactly one reason: a
+    /// bounded-stack decode test that passes proves nothing unless the same test
+    /// is known to FAIL against a recursive reader. The byte grammar is identical,
+    /// so the only difference under test is where the control stack lives.
+    fn recursive_level_decoder_mutant(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
+        match r.u8()? {
+            LEVEL_ZERO => Ok(Level::zero()),
+            LEVEL_SUCC => {
+                let u = recursive_level_decoder_mutant(r)?;
+                u.succ()
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_MAX => {
+                let a = recursive_level_decoder_mutant(r)?;
+                let b = recursive_level_decoder_mutant(r)?;
+                Level::max(a, b)
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_IMAX => {
+                let a = recursive_level_decoder_mutant(r)?;
+                let b = recursive_level_decoder_mutant(r)?;
+                Level::imax(a, b)
+                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))
+            }
+            LEVEL_PARAM => Ok(Level::param(Name::read_body(r)?)),
+            LEVEL_MVAR => Ok(Level::mvar(LMVarId(Name::read_body(r)?))),
+            _ => Err(r.err_public("unknown level tag")),
+        }
+    }
+
+    /// The recursive descent that [`read_expr_iter`] replaced (bead
+    /// franken_lean-fnj); see [`recursive_level_decoder_mutant`].
+    fn recursive_expr_decoder_mutant(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
+        match r.u8()? {
+            EXPR_BVAR => Expr::bvar(r.u32()?)
+                .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant")),
+            EXPR_FVAR => Ok(Expr::fvar(FVarId(Name::read_body(r)?))),
+            EXPR_MVAR => Ok(Expr::mvar(MVarId(Name::read_body(r)?))),
+            EXPR_SORT => Ok(Expr::sort(recursive_level_decoder_mutant(r)?)),
+            EXPR_CONST => {
+                let name = Name::read_body(r)?;
+                let count = r.u64()?;
+                let mut levels = Vec::new();
+                for _ in 0..count {
+                    levels.push(recursive_level_decoder_mutant(r)?);
+                }
+                Ok(Expr::const_(name, levels))
+            }
+            EXPR_APP => {
+                let f = recursive_expr_decoder_mutant(r)?;
+                let a = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::app(f, a))
+            }
+            EXPR_LAM => {
+                let binder_name = Name::read_body(r)?;
+                let binder_type = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let bi = binder_info_from_tag(r.u8()?)
+                    .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
+                Ok(Expr::lam(binder_name, binder_type, body, bi))
+            }
+            EXPR_FORALL => {
+                let binder_name = Name::read_body(r)?;
+                let binder_type = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let bi = binder_info_from_tag(r.u8()?)
+                    .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
+                Ok(Expr::forall_e(binder_name, binder_type, body, bi))
+            }
+            EXPR_LET => {
+                let decl_name = Name::read_body(r)?;
+                let type_ = recursive_expr_decoder_mutant(r)?;
+                let value = recursive_expr_decoder_mutant(r)?;
+                let body = recursive_expr_decoder_mutant(r)?;
+                let non_dep = r.bool()?;
+                Ok(Expr::let_e(decl_name, type_, value, body, non_dep))
+            }
+            EXPR_LIT_NAT => {
+                let count = r.u64()?;
+                let mut limbs = Vec::new();
+                for _ in 0..count {
+                    limbs.push(r.u64()?);
+                }
+                let lit = NatLit::from_limbs_le(limbs.clone());
+                if lit.limbs_le() != limbs.as_slice() {
+                    return Err(r.err_public("non-normalized nat literal limbs"));
+                }
+                Ok(Expr::lit(Literal::Nat(lit)))
+            }
+            EXPR_LIT_STR => Ok(Expr::lit(Literal::Str(r.str()?.to_string()))),
+            EXPR_MDATA => {
+                let data = KVMap::read_body(r)?;
+                let expr = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::mdata(data, expr))
+            }
+            EXPR_PROJ => {
+                let struct_name = Name::read_body(r)?;
+                let idx = r.u64()?;
+                let expr = recursive_expr_decoder_mutant(r)?;
+                Ok(Expr::proj(struct_name, idx, expr))
+            }
+            _ => Err(r.err_public("unknown expr tag")),
+        }
+    }
+
+    /// Decode a schema-headed artifact with one of the recursive mutants, mirroring
+    /// [`Canonical::from_canonical_bytes`] exactly apart from the reader it calls.
+    fn decode_with_mutant_level(bytes: &[u8]) -> Result<Level, CanonError> {
+        let mut r = CanonReader::new(bytes);
+        r.expect_schema(SCHEMA_LEVEL)?;
+        let value = recursive_level_decoder_mutant(&mut r)?;
+        r.finish()?;
+        Ok(value)
+    }
+
+    fn decode_with_mutant_expr(bytes: &[u8]) -> Result<Expr, CanonError> {
+        let mut r = CanonReader::new(bytes);
+        r.expect_schema(SCHEMA_EXPR)?;
+        let value = recursive_expr_decoder_mutant(&mut r)?;
+        r.finish()?;
+        Ok(value)
     }
 
     /// Deterministic value generator (LCG — no external randomness, D1).
@@ -1662,7 +2636,201 @@ mod tests {
         let bytes = map.to_canonical_bytes();
         let back = KVMap::from_canonical_bytes(&bytes).expect("round-trip");
         assert_eq!(back, map);
-        assert_eq!(back.entries()[0].0, map.entries()[0].0);
+        // Exact order, every position — not just the first entry.
+        assert_eq!(
+            back.entries()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+            map.entries()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The two KVMap views, asserted in **both** directions. Checking only the
+    /// permissive side of an ordering claim proves nothing: a codec that sorted its
+    /// entries would still round-trip, and a "set" digest that ignored content would
+    /// still be order-independent.
+    #[test]
+    fn the_ordered_encoding_is_order_sensitive_and_the_set_projection_is_not() {
+        let pairs = [
+            (Name::str(Name::anonymous(), "b"), DataValue::OfNat(2)),
+            (Name::str(Name::anonymous(), "a"), DataValue::OfBool(true)),
+            (
+                Name::str(Name::anonymous(), "s"),
+                DataValue::OfSyntax(SyntaxHandle(7)),
+            ),
+        ];
+        let build = |order: [usize; 3]| {
+            let mut map = KVMap::new();
+            for i in order {
+                map.insert(pairs[i].0.clone(), pairs[i].1.clone());
+            }
+            map
+        };
+        let forward = build([0, 1, 2]);
+        let permutations = [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+
+        for order in permutations {
+            let other = build(order);
+            // Same options by every observable lookup — this is what makes the two
+            // requirements below a genuine tension rather than a distinction on paper.
+            for (key, _) in &pairs {
+                assert_eq!(
+                    forward.find(key),
+                    other.find(key),
+                    "{order:?} changed a lookup"
+                );
+            }
+
+            // SEQUENCE DIRECTION: insertion order IS the value for an ordered assoc
+            // list, so the canonical encoding must separate permutations. If this ever
+            // passes by accident, someone has "canonicalized" the codec by sorting and
+            // silently merged two distinct upstream KVMap values into one encoding.
+            assert_ne!(
+                forward.to_canonical_bytes(),
+                other.to_canonical_bytes(),
+                "the ordered encoding lost order under {order:?}"
+            );
+
+            // SET DIRECTION: the projection must NOT separate them.
+            assert_eq!(
+                kvmap_canonical_set_bytes(&forward),
+                kvmap_canonical_set_bytes(&other),
+                "the set projection kept order under {order:?}"
+            );
+        }
+
+        // The projection still separates genuinely different sets — order-independence
+        // must not be bought by dropping content.
+        let mut different_value = KVMap::new();
+        different_value.insert(pairs[0].0.clone(), DataValue::OfNat(3));
+        different_value.insert(pairs[1].0.clone(), pairs[1].1.clone());
+        different_value.insert(pairs[2].0.clone(), pairs[2].1.clone());
+        assert_ne!(
+            kvmap_canonical_set_bytes(&forward),
+            kvmap_canonical_set_bytes(&different_value)
+        );
+
+        // And the two views are never the same bytes, so a preimage under one can never
+        // be replayed as a preimage under the other.
+        let projected = kvmap_canonical_set_bytes(&forward).expect("unique keys project");
+        assert_ne!(forward.to_canonical_bytes(), projected);
+        assert!(
+            projected.starts_with(&{
+                let mut w = CanonWriter::new();
+                w.schema(SCHEMA_KVMAP_SET);
+                w.into_bytes()
+            }),
+            "the projection must carry its own schema header"
+        );
+
+        // A DUPLICATE-KEYED MAP HAS NO SET VIEW, and the projection must say so rather
+        // than answer. Two maps that upstream's own `eqv` separates would otherwise land
+        // on identical bytes under any first-match-wins rule — a collision inside an
+        // identity function, which is the franken_lean-f6br defect class.
+        let shadowed = KVMap::from_entries(vec![
+            (pairs[0].0.clone(), pairs[0].1.clone()),
+            (pairs[0].0.clone(), DataValue::OfNat(99)),
+        ]);
+        let visible_only = KVMap::from_entries(vec![(pairs[0].0.clone(), pairs[0].1.clone())]);
+        assert_eq!(
+            shadowed.find(&pairs[0].0),
+            visible_only.find(&pairs[0].0),
+            "the two differ only in an entry that lookup cannot reach"
+        );
+        assert_ne!(
+            shadowed.to_canonical_bytes(),
+            visible_only.to_canonical_bytes(),
+            "the ordered encoding must keep them apart"
+        );
+        assert_eq!(
+            kvmap_canonical_set_bytes(&shadowed),
+            None,
+            "a map with duplicate keys must be refused a set view, not silently collapsed \
+             onto the projection of the map without the shadowed entry"
+        );
+        assert!(kvmap_canonical_set_bytes(&visible_only).is_some());
+    }
+
+    /// Duplicate keys are representable, preserved, and round-trip exactly (bead
+    /// franken_lean-l84f). This replaces the old refusal from bead fln-1f8v rather than
+    /// deleting its case: fln-1f8v was right that one value may have exactly one
+    /// encoding, and wrong that duplicates were the cause — the decoder folding them
+    /// through `insert` was. So the canonicality law it defended is asserted here on the
+    /// larger value space, which is the part that must not regress.
+    #[test]
+    fn duplicate_kvmap_keys_round_trip_exactly_and_stay_canonical() {
+        let key = Name::str(Name::anonymous(), "k");
+        let other = Name::str(Name::anonymous(), "other");
+        // The exact fixture measured against the pinned toolchain, so our behaviour is
+        // pinned to observed Reference behaviour rather than to my reading of it.
+        let dup = KVMap::from_entries(vec![
+            (key.clone(), DataValue::OfNat(1)),
+            (key.clone(), DataValue::OfNat(2)),
+            (other.clone(), DataValue::OfBool(true)),
+        ]);
+
+        // Round-trip preserves both entries, in order, byte-for-byte.
+        let bytes = dup.to_canonical_bytes();
+        let back = KVMap::from_canonical_bytes(&bytes).expect("duplicates are legal input");
+        assert_eq!(back, dup, "the shadowed entry did not survive the decode");
+        assert_eq!(back.entries(), dup.entries());
+        assert_eq!(back.to_canonical_bytes(), bytes, "re-encode drifted");
+
+        // Reference-observed semantics (pin v4.32.0): first match wins, size counts
+        // entries, erase removes every entry for the key, insert replaces the FIRST match
+        // in place and leaves the shadowed one.
+        assert_eq!(back.find(&key), Some(&DataValue::OfNat(1)));
+        assert_eq!(back.len(), 3);
+        let mut erased = back.clone();
+        erased.erase(&key);
+        assert_eq!(erased.entries(), &[(other, DataValue::OfBool(true))]);
+        let mut inserted = back.clone();
+        inserted.insert(key.clone(), DataValue::OfNat(9));
+        assert_eq!(
+            inserted.entries()[0].1,
+            DataValue::OfNat(9),
+            "insert must replace the first match"
+        );
+        assert_eq!(
+            inserted.entries()[1].1,
+            DataValue::OfNat(2),
+            "insert must not fold the shadowed entry"
+        );
+
+        // CANONICALITY ON THE LARGER SPACE — the law fln-1f8v was protecting. Distinct
+        // entry lists must not share an encoding, including lists that differ only in a
+        // shadowed value or in the order of two same-key entries.
+        let variants = [
+            vec![
+                (key.clone(), DataValue::OfNat(1)),
+                (key.clone(), DataValue::OfNat(2)),
+            ],
+            vec![
+                (key.clone(), DataValue::OfNat(2)),
+                (key.clone(), DataValue::OfNat(1)),
+            ],
+            vec![
+                (key.clone(), DataValue::OfNat(1)),
+                (key.clone(), DataValue::OfNat(3)),
+            ],
+            vec![(key.clone(), DataValue::OfNat(1))],
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for entries in variants {
+            let map = KVMap::from_entries(entries);
+            let encoded = map.to_canonical_bytes();
+            assert_eq!(
+                KVMap::from_canonical_bytes(&encoded).expect("round-trip"),
+                map
+            );
+            if let Some(previous) = seen.insert(encoded, map.clone()) {
+                fixture_panic!("two distinct maps share an encoding: {previous:?} and {map:?}");
+            }
+        }
     }
 
     #[test]
@@ -1804,9 +2972,13 @@ mod tests {
                     }
                     if mutant.as_deref() == Some("recursive-level-encoder") {
                         recursive_level_encoder_mutant(&level, &mut CanonWriter::new());
-                        panic!("recursive Level encoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Level encoder mutation unexpectedly survived");
                     }
                     let level_bytes = level.to_canonical_bytes();
+                    if mutant.as_deref() == Some("recursive-level-decoder") {
+                        let _ = decode_with_mutant_level(&level_bytes);
+                        fixture_panic!("recursive Level decoder mutation unexpectedly survived");
+                    }
                     let decoded_level = Level::from_canonical_bytes(&level_bytes)
                         .expect("deep valid level decodes");
                     assert_eq!(decoded_level.to_canonical_bytes(), level_bytes);
@@ -1821,9 +2993,13 @@ mod tests {
                     }
                     if mutant.as_deref() == Some("recursive-expr-encoder") {
                         recursive_expr_encoder_mutant(&expr, &mut CanonWriter::new());
-                        panic!("recursive Expr encoder mutation unexpectedly survived");
+                        fixture_panic!("recursive Expr encoder mutation unexpectedly survived");
                     }
                     let expr_bytes = expr.to_canonical_bytes();
+                    if mutant.as_deref() == Some("recursive-expr-decoder") {
+                        let _ = decode_with_mutant_expr(&expr_bytes);
+                        fixture_panic!("recursive Expr decoder mutation unexpectedly survived");
+                    }
                     let decoded_expr = Expr::from_canonical_bytes(&expr_bytes)
                         .expect("deep valid expression decodes");
                     assert_eq!(decoded_expr.to_canonical_bytes(), expr_bytes);
@@ -1938,6 +3114,710 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr),
             );
             print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+    }
+
+    /// Mutation kill for the DECODE side (bead franken_lean-fnj).
+    ///
+    /// `deeply_nested_input_is_a_typed_error_not_a_stack_overflow` and the deep
+    /// valid-lifecycle probe both pass today, but a passing test proves nothing
+    /// about a hazard unless it is known to fail when the hazard returns. These
+    /// children run the byte-identical RECURSIVE readers over the same deep valid
+    /// artifacts; each must die of a stack overflow in its own process. A control
+    /// child with no mutation must succeed on identical input, so a failure here
+    /// cannot be blamed on the harness.
+    ///
+    /// The encoder mutants (`recursive-{level,expr}-encoder`) are killed by
+    /// `scripts/e2e/canon_lifecycle.sh`; these decoder mutants are killed here as
+    /// well so the guard is part of the `cargo test` gate rather than only the lane.
+    #[test]
+    fn recursive_decoder_mutants_die_where_the_iterative_readers_survive() {
+        // Deep enough that a recursive reader cannot fit in the probe's 1 MiB
+        // worker stack, small enough to keep three child processes quick.
+        const DEPTH: &str = "50000";
+        let executable = std::env::current_exe().expect("locate current test binary");
+        let run = |mutant: Option<&str>| {
+            let mut command = std::process::Command::new(&executable);
+            command
+                .arg("--exact")
+                .arg("canon::tests::deep_valid_lifecycle_is_stack_safe_in_subprocess")
+                .arg("--nocapture")
+                .env("FLN_CANON_LIFECYCLE_CHILD", "1")
+                .env("FLN_CANON_LIFECYCLE_DEPTH", DEPTH)
+                .env("FLN_CANON_LIFECYCLE_NAME_DEPTH", "1024");
+            if let Some(mutant) = mutant {
+                command.env("FLN_CANON_LIFECYCLE_MUTANT", mutant);
+            }
+            command
+                .output()
+                .expect("launch sacrificial decoder process")
+        };
+
+        let control = run(None);
+        assert!(
+            control.status.success(),
+            "control child failed on unmutated input: status={:?}\nstderr={}",
+            control.status,
+            String::from_utf8_lossy(&control.stderr),
+        );
+
+        for mutant in ["recursive-level-decoder", "recursive-expr-decoder"] {
+            let killed = run(Some(mutant));
+            assert!(
+                !killed.status.success(),
+                "{mutant} survived: a recursive decoder must not decode a deep artifact"
+            );
+            // The kill must be the intended one. A panic from the "unexpectedly
+            // survived" guard, an unrelated assertion, or an early exit would also
+            // be non-success, and none of those prove stack exhaustion.
+            let stderr = String::from_utf8_lossy(&killed.stderr);
+            assert!(
+                stderr.contains("stack overflow"),
+                "{mutant} died for the wrong reason: status={:?}\nstderr={stderr}",
+                killed.status,
+            );
+        }
+    }
+
+    /// Every prefix of a valid artifact is malformed input, and malformed input is
+    /// a typed error — never a panic, an abort, or a silent success (D8, FL-INV-07,
+    /// bead franken_lean-fnj). A panic anywhere in the sweep fails this test by
+    /// propagating, so "does not panic" needs no separate assertion.
+    #[test]
+    fn every_truncation_of_a_valid_artifact_is_a_typed_error() {
+        let mut generator = Gen(0x5eed_1234);
+        let mut checked = 0usize;
+        for _ in 0..24 {
+            let name = generator.name(4);
+            let level = generator.level(3);
+            let expr = generator.expr(3);
+
+            for (label, bytes, decode_artifact) in [
+                (
+                    "name",
+                    name.to_canonical_bytes(),
+                    (|b: &[u8]| Name::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+                (
+                    "level",
+                    level.to_canonical_bytes(),
+                    (|b: &[u8]| Level::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+                (
+                    "expr",
+                    expr.to_canonical_bytes(),
+                    (|b: &[u8]| Expr::from_canonical_bytes(b).map(|_| ()))
+                        as fn(&[u8]) -> Result<(), CanonError>,
+                ),
+            ] {
+                assert!(
+                    decode_artifact(&bytes).is_ok(),
+                    "{label} fixture must decode intact"
+                );
+                for cut in 0..bytes.len() {
+                    let error = decode_artifact(&bytes[..cut])
+                        .expect_err("a truncated artifact must never decode as a value");
+                    assert!(
+                        !error.what.is_empty(),
+                        "{label} truncated at {cut} produced an unlabelled error"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000, "the sweep must cover every field boundary");
+    }
+
+    /// Build a well-formed artifact big enough to outrun a small budget: a right
+    /// spine of `depth` applications over a shared leaf.
+    fn app_spine(depth: usize) -> Expr {
+        let leaf = Expr::bvar(0).expect("small");
+        let mut expr = leaf.clone();
+        for _ in 0..depth {
+            expr = Expr::app(expr, leaf.clone());
+        }
+        expr
+    }
+
+    /// The criterion franken_lean-fnj could not close until fln-4zk8 existed:
+    /// resource exhaustion surfaces through the typed inconclusive path, and never
+    /// as acceptance or rejection (FL-INV-07).
+    ///
+    /// The artifact here is **valid** — the same bytes decode cleanly with room to
+    /// work — so an outcome of `Malformed` would be a lie about the bytes, and an
+    /// outcome of `Value` would mean the budget was not honoured.
+    #[test]
+    fn budget_exhaustion_on_a_valid_artifact_is_inconclusive_never_a_verdict() {
+        let bytes = app_spine(5_000).to_canonical_bytes();
+
+        let stopped = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 64));
+        match stopped {
+            Outcome::Inconclusive(_) => {
+                assert_eq!(
+                    stop_of(&stopped),
+                    (StructuralUnit::ProducedNodes, 64, 65),
+                    "the trip reports its unit and what was spent"
+                );
+                assert_ne!(
+                    stop_progress(&stopped),
+                    "byte 0",
+                    "the stop records where decoding reached"
+                );
+            }
+            Outcome::Complete(Err(error)) => {
+                fixture_panic!(
+                    "a budget stop was rendered as a rejection about the bytes: {error:?}"
+                )
+            }
+            Outcome::Complete(Ok(_)) => fixture_panic!("the budget was not honoured"),
+            Outcome::InternalFault(fault) => {
+                fixture_panic!("the decoder's own budget accounting broke: {fault:?}")
+            }
+        }
+
+        // Same bytes, room to work: a real acceptance. The inconclusive outcome
+        // above therefore said nothing about the artifact, which is the point.
+        let allowed = decoded_value(Expr::from_canonical_bytes_budgeted(
+            &bytes,
+            DecodeBudget::unlimited(),
+        ));
+        assert_eq!(
+            allowed.expect("the artifact is valid").to_canonical_bytes(),
+            bytes
+        );
+    }
+
+    /// The byte limit is charged on consumption, so it stops a large artifact part
+    /// way through rather than pre-judging it by its length.
+    #[test]
+    fn the_input_byte_limit_stops_consumption_and_reports_the_offset() {
+        let bytes = app_spine(2_000).to_canonical_bytes();
+        let cap = 128;
+        match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(cap, u64::MAX)) {
+            ref stopped @ Outcome::Inconclusive(_) => {
+                let (unit, allowed, observed) = stop_of(stopped);
+                assert_eq!(unit, StructuralUnit::InputBytes);
+                assert_eq!(allowed, cap);
+                assert!(observed > cap);
+                let at: u64 = stop_progress(stopped)
+                    .trim_start_matches("byte ")
+                    .parse()
+                    .expect("progress localizes to a byte offset");
+                assert!(at <= cap, "no byte beyond the cap was consumed");
+            }
+            other => fixture_panic!("expected an inconclusive stop, got {other:?}"),
+        }
+    }
+
+    /// The two outcomes must not collapse into each other. Malformed input under a
+    /// generous budget is a rejection — a real verdict — and stays one.
+    #[test]
+    fn malformed_input_under_a_generous_budget_is_still_a_rejection() {
+        let mut truncated = app_spine(4).to_canonical_bytes();
+        truncated.truncate(truncated.len() - 1);
+        match Expr::from_canonical_bytes_budgeted(&truncated, DecodeBudget::unlimited()) {
+            Outcome::Complete(Err(error)) => assert_eq!(error.what, "input truncated"),
+            other => fixture_panic!("a malformed artifact must be rejected, got {other:?}"),
+        }
+
+        // And a malformed prefix under a *tiny* byte budget is still a rejection if
+        // the malformation is reached first: bytes never read are never spent.
+        let mut w = CanonWriter::new();
+        w.schema(SCHEMA_EXPR);
+        w.u8(0xfe);
+        let unknown_tag = w.into_bytes();
+        match Expr::from_canonical_bytes_budgeted(&unknown_tag, DecodeBudget::new(u64::MAX, 8)) {
+            Outcome::Complete(Err(error)) => assert_eq!(error.what, "unknown expr tag"),
+            other => fixture_panic!("the malformation is reached first, got {other:?}"),
+        }
+    }
+
+    /// A budget that fits changes nothing: same value, same bytes, same hash, same
+    /// code path as the unbudgeted call.
+    #[test]
+    fn a_fitting_budget_decodes_identically_to_no_budget() {
+        for depth in [0usize, 1, 7, 64] {
+            let bytes = app_spine(depth).to_canonical_bytes();
+            let unbudgeted = Expr::from_canonical_bytes(&bytes).expect("valid artifact");
+            let budgeted = decoded_value(Expr::from_canonical_bytes_budgeted(
+                &bytes,
+                DecodeBudget::new(u64::MAX, u64::MAX),
+            ))
+            .expect("a fitting budget accepts");
+            assert_eq!(unbudgeted, budgeted);
+            assert_eq!(unbudgeted.hash(), budgeted.hash());
+            assert_eq!(budgeted.to_canonical_bytes(), bytes);
+        }
+    }
+
+    /// The budget reaches the payloads decoded by their own readers, not just the
+    /// top-level term walk — otherwise a hostile `Name` chain or `KVMap` inside an
+    /// otherwise small artifact would be unmetered.
+    /// **The fln-8gz3 blocker is CLEARED** — this is the positive statement of the
+    /// mapping it was waiting for (bead franken_lean-vui8).
+    ///
+    /// This test used to be a trigger: it matched `ResourceReason` and `BudgetLimit`
+    /// exhaustively so that adding a variant to either would fail to compile here, with
+    /// the reasoning attached, and tell whoever did it whether the blocker was cleared.
+    /// It fired exactly as designed when `StructuralBudget` landed. What replaces it is
+    /// the correspondence itself, kept as a total function so the taxonomy and the
+    /// decoder's limits cannot drift apart again in either direction.
+    ///
+    /// The fold `Decoded<T>` -> `Outcome<Result<T, CanonError>>` is now expressible:
+    /// `Value` to `Complete(Ok(..))`, `Malformed` to `Complete(Err(..))` — a real domain
+    /// verdict about bytes, so it belongs inside the authoritative arm — and
+    /// `Inconclusive(Exhausted)` to `Inconclusive(ResourceExhausted{ usage })` with the
+    /// reason below, `allowed`/`observed` from the `Exhausted`, and `at` recorded through
+    /// `Inconclusive::with_progress`. fln-8gz3 does that adoption; this only proves the
+    /// vocabulary is there and says exactly one thing per limit.
+    #[test]
+    fn every_decode_budget_limit_maps_to_exactly_one_structural_unit() {
+        // Total and exhaustive both ways: a new BudgetLimit must be given a unit here, and
+        // a StructuralUnit that stops being reachable shows up in the coverage check below.
+        fn unit_for(limit: BudgetLimit) -> StructuralUnit {
+            match limit {
+                BudgetLimit::InputBytes => StructuralUnit::InputBytes,
+                BudgetLimit::ProducedNodes => StructuralUnit::ProducedNodes,
+            }
+        }
+
+        let limits = [BudgetLimit::InputBytes, BudgetLimit::ProducedNodes];
+
+        // Injective: two limits must never collapse onto one unit, or a caller cannot tell
+        // which allowance to raise.
+        let mut mapped = std::collections::BTreeSet::new();
+        for limit in limits {
+            let unit = unit_for(limit);
+            assert!(
+                mapped.insert(unit.as_str()),
+                "two decode limits map onto {} — the distinction a retry needs is gone",
+                unit.as_str()
+            );
+        }
+        assert_eq!(mapped.len(), limits.len());
+
+        // The units a decoder uses are a strict subset of the axis: ExpandedWeight belongs
+        // to the term store (fln-49c), not to a byte decoder, and must NOT be reachable
+        // from a BudgetLimit. Asserting the gap keeps the two adopters from quietly
+        // borrowing each other's unit.
+        assert!(!mapped.contains(StructuralUnit::ExpandedWeight.as_str()));
+        assert_eq!(StructuralUnit::ALL.len(), 3);
+
+        // Each unit renders as itself and nothing else, so a diagnostic cannot say
+        // "memory" or "heartbeats" for a structural stop — the false-diagnostic problem
+        // that made this bead necessary.
+        for unit in StructuralUnit::ALL {
+            let rendered = ResourceReason::StructuralBudget { unit };
+            let mut writer = CanonWriter::new();
+            write_resource(&mut writer, &rendered);
+            let encoded = writer.into_bytes();
+            let mut reader = CanonReader::new(&encoded);
+            assert_eq!(
+                read_resource(&mut reader).expect("round-trip"),
+                rendered,
+                "the {} reason did not survive the wire",
+                unit.as_str()
+            );
+            assert!(!unit.as_str().contains("memory"));
+            assert!(!unit.as_str().contains("heartbeat"));
+        }
+
+        // And the arm that never needed a taxonomy change still behaves: a malformed
+        // decode is an authoritative domain rejection, not an inconclusive.
+        let malformed: DecodeOutcome<Level> = Level::from_canonical_bytes_budgeted(
+            b"not a canonical level",
+            DecodeBudget::unlimited(),
+        );
+        assert!(matches!(malformed, Outcome::Complete(Err(_))));
+        assert!(!is_inconclusive(&malformed));
+    }
+
+    #[test]
+    fn the_budget_is_honoured_inside_nested_name_and_kvmap_payloads() {
+        let mut deep_name = Name::anonymous();
+        for index in 0..512 {
+            deep_name = Name::num(deep_name, index);
+        }
+        let named = Expr::const_(deep_name.clone(), Vec::new()).to_canonical_bytes();
+        assert!(
+            is_inconclusive(&Expr::from_canonical_bytes_budgeted(
+                &named,
+                DecodeBudget::new(u64::MAX, 16)
+            )),
+            "a deep Name payload must be charged"
+        );
+
+        let mut map = KVMap::new();
+        for index in 0..64 {
+            map.insert(Name::num(Name::anonymous(), index), DataValue::OfNat(index));
+        }
+        let mdata = Expr::mdata(map, Expr::bvar(0).expect("small")).to_canonical_bytes();
+        assert!(
+            is_inconclusive(&Expr::from_canonical_bytes_budgeted(
+                &mdata,
+                DecodeBudget::new(u64::MAX, 16)
+            )),
+            "a KVMap payload must be charged"
+        );
+
+        // Both artifacts are valid: with room, they decode.
+        assert!(Expr::from_canonical_bytes(&named).is_ok());
+        assert!(Expr::from_canonical_bytes(&mdata).is_ok());
+    }
+
+    /// **The fold is behaviour-preserving at the boundary** (bead fln-8gz3): each of the
+    /// three outcomes the old `Decoded` enum could report maps to exactly one `Outcome`
+    /// arm with the same observable meaning, and the FL-INV-07 properties are now
+    /// enforced by the shared type rather than restated here.
+    ///
+    /// What the fold *adds* is the cacheability axis, which `Decoded` had no way to
+    /// express: a completed run is admissible whether its domain answer was acceptance or
+    /// rejection, because "these bytes are not a well-formed artifact" is a durable fact
+    /// about those bytes; a stop is refused, because nothing was learned.
+    #[test]
+    fn each_decoded_outcome_folds_to_one_outcome_arm_with_the_same_meaning() {
+        let bytes = app_spine(200).to_canonical_bytes();
+
+        // ACCEPTANCE -> Complete(Ok): authoritative, and cacheable.
+        let accepted = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::unlimited());
+        assert!(matches!(accepted, Outcome::Complete(Ok(_))));
+        assert_eq!(accepted.authority(), Authority::Authoritative);
+        assert_eq!(accepted.cache_admission(), CacheAdmission::Admissible);
+
+        // REJECTION -> Complete(Err): also authoritative and cacheable. A malformed
+        // verdict is a real answer about the bytes, which is exactly why it belongs
+        // inside the Complete arm rather than beside it.
+        let rejected =
+            Expr::from_canonical_bytes_budgeted(b"not an expr", DecodeBudget::unlimited());
+        assert!(matches!(rejected, Outcome::Complete(Err(_))));
+        assert_eq!(rejected.authority(), Authority::Authoritative);
+        assert_eq!(rejected.cache_admission(), CacheAdmission::Admissible);
+
+        // STOP -> Inconclusive: non-authoritative, NEVER cacheable, and unable to
+        // masquerade as either of the two above.
+        let stopped = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32));
+        assert!(matches!(stopped, Outcome::Inconclusive(_)));
+        assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+        assert_eq!(
+            stopped.cache_admission(),
+            CacheAdmission::Refused {
+                authority: Authority::NonAuthoritative
+            }
+        );
+        assert!(
+            stopped.as_complete().is_none(),
+            "a stop must not yield a domain result of either polarity"
+        );
+        assert_eq!(stop_of(&stopped).0, StructuralUnit::ProducedNodes);
+
+        // The three are genuinely distinct outcomes over the SAME artifact, separated
+        // only by the budget — so a caller can tell "invalid" from "too expensive to
+        // judge", which is the distinction the whole three-valued design exists for.
+        assert_ne!(
+            std::mem::discriminant(&accepted),
+            std::mem::discriminant(&stopped)
+        );
+        assert!(matches!(
+            (&accepted, &rejected),
+            (Outcome::Complete(Ok(_)), Outcome::Complete(Err(_)))
+        ));
+    }
+
+    /// An exhausted decode must not be retryable into a verdict by accident: the
+    /// stop carries what it cost, so a caller raises the budget deliberately.
+    #[test]
+    fn a_stop_reports_enough_to_retry_deliberately() {
+        let bytes = app_spine(200).to_canonical_bytes();
+        let first = Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, 32));
+        let (_, first_allowed, first_observed) = stop_of(&first);
+        assert!(first_observed > first_allowed);
+
+        // Raising the limit past what the first attempt reported is not enough by
+        // itself — the stop reports the point of the trip, not the total cost — but
+        // the artifact must eventually decode as the limit grows, and never flip to
+        // a rejection on the way.
+        let mut limit = first_allowed;
+        let mut attempts = 0;
+        loop {
+            limit = limit.saturating_mul(4).max(4);
+            attempts += 1;
+            match Expr::from_canonical_bytes_budgeted(&bytes, DecodeBudget::new(u64::MAX, limit)) {
+                Outcome::Complete(Ok(value)) => {
+                    assert_eq!(value.to_canonical_bytes(), bytes);
+                    break;
+                }
+                Outcome::Inconclusive(_) => {
+                    assert!(attempts < 32, "budget growth did not converge")
+                }
+                Outcome::Complete(Err(error)) => {
+                    fixture_panic!(
+                        "raising a budget turned a valid artifact into a rejection: {error:?}"
+                    )
+                }
+                Outcome::InternalFault(fault) => {
+                    fixture_panic!("raising a budget broke the decoder's own accounting: {fault:?}")
+                }
+            }
+        }
+    }
+
+    /// The last criterion of franken_lean-fnj, discharged against the budget surface
+    /// built under fln-4zk8: **resource exhaustion on deep untrusted input surfaces
+    /// only through the typed inconclusive path.**
+    ///
+    /// This could not be tested when fnj was written, because there was nothing to
+    /// exhaust — every refusal the decoders could produce was a well-formedness
+    /// rejection. All four prohibitions are checked, not just the happy one:
+    ///
+    /// * never a SIGABRT — the whole thing runs on a 1 MiB worker, and `.join()`
+    ///   returning `Ok` is what proves no abort happened;
+    /// * never a panic — a panic inside the worker fails the join;
+    /// * never a rejection — the outcome is `Inconclusive`, and the SAME bytes under
+    ///   an unlimited budget produce `Malformed` instead, so the two are genuinely
+    ///   different answers rather than one relabelled;
+    /// * never cacheable — an inconclusive outcome yields no value to cache, and
+    ///   there is no conversion that could turn it into a verdict.
+    ///
+    /// And the constraint fnj sets: **no hard nesting cap**. A budget is a resource
+    /// contract, not a depth limit, so a legitimately deep artifact still decodes
+    /// when the caller is willing to pay for it — asserted here at depth 100_000,
+    /// which a cap would have refused.
+    #[test]
+    fn deep_hostile_input_over_budget_is_inconclusive_never_a_verdict() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                // The hostile shape: a compact stream of nesting tags with no
+                // operands. 1e6 tags is far past any recursive decoder's stack and
+                // far past a small budget.
+                let mut hostile = CanonWriter::new();
+                hostile.schema(SCHEMA_EXPR);
+                let mut hostile = hostile.into_bytes();
+                hostile.extend(std::iter::repeat_n(EXPR_APP, 1_000_000));
+
+                // Under a tight budget the caller's limit is reached first.
+                let stopped = Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(u64::MAX, 1_000),
+                );
+                match stopped {
+                    Outcome::Inconclusive(_) => {
+                        let (unit, allowed, observed) = stop_of(&stopped);
+                        assert_eq!(unit, StructuralUnit::ProducedNodes);
+                        assert_eq!(allowed, 1_000);
+                        assert!(observed > allowed, "a stop reports what it cost");
+                    }
+                    Outcome::Complete(Err(error)) => fixture_panic!(
+                        "budget exhaustion was reported as a claim about the bytes: {error:?}"
+                    ),
+                    Outcome::Complete(Ok(_)) => fixture_panic!("the budget was not honoured"),
+                    Outcome::InternalFault(fault) => {
+                        fixture_panic!("the decoder's own budget accounting broke: {fault:?}")
+                    }
+                }
+
+                // Nothing to cache: an inconclusive outcome carries no value, so a
+                // caller cannot store it as either verdict.
+                let stopped = Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(u64::MAX, 1_000),
+                );
+                assert!(is_inconclusive(&stopped));
+                assert!(
+                    stopped.as_complete().is_none(),
+                    "an inconclusive decode must not yield a value"
+                );
+
+                // The SAME bytes with room to work are a rejection — a real verdict
+                // about the input, and a different answer from the stop above.
+                match Expr::from_canonical_bytes_budgeted(&hostile, DecodeBudget::unlimited()) {
+                    Outcome::Complete(Err(error)) => assert_eq!(
+                        error.what, "input truncated",
+                        "the operands never arrive, and that is a well-formedness fact"
+                    ),
+                    other => fixture_panic!("expected a typed rejection, got {other:?}"),
+                }
+
+                // The byte limit is the other half of the contract, on the same input.
+                match Expr::from_canonical_bytes_budgeted(
+                    &hostile,
+                    DecodeBudget::new(512, u64::MAX),
+                ) {
+                    ref stopped @ Outcome::Inconclusive(_) => {
+                        assert_eq!(stop_of(stopped).0, StructuralUnit::InputBytes);
+                        let at: u64 = stop_progress(stopped)
+                            .trim_start_matches("byte ")
+                            .parse()
+                            .expect("progress localizes to a byte offset");
+                        assert!(at <= 512);
+                    }
+                    other => fixture_panic!("expected a byte-budget stop, got {other:?}"),
+                }
+
+                // NO NESTING CAP: a legitimately deep VALID artifact still decodes
+                // when the caller pays for it. A depth limit would refuse this, and
+                // refusing valid deep mathlib terms is what fnj rules out.
+                let leaf = Expr::bvar(0).expect("small");
+                let mut deep = leaf.clone();
+                for _ in 0..100_000 {
+                    deep = Expr::app(deep, leaf.clone());
+                }
+                let deep_bytes = deep.to_canonical_bytes();
+                let decoded = decoded_value(Expr::from_canonical_bytes_budgeted(
+                    &deep_bytes,
+                    DecodeBudget::new(u64::MAX, u64::MAX),
+                ))
+                .expect("a valid deep artifact decodes when the budget allows it");
+                assert_eq!(decoded.to_canonical_bytes(), deep_bytes);
+
+                // And the same artifact under a budget it does not fit is a stop, not
+                // a rejection: the artifact is fine, the caller was not willing to pay.
+                assert!(
+                    is_inconclusive(&Expr::from_canonical_bytes_budgeted(
+                        &deep_bytes,
+                        DecodeBudget::new(u64::MAX, 64)
+                    )),
+                    "a valid artifact over budget is inconclusive, never rejected"
+                );
+            })
+            .expect("spawn bounded-stack budget worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "decoding deep hostile input under a budget aborted or panicked instead of \
+             producing a typed outcome"
+        );
+    }
+
+    /// Regression for the first finding of the seeded codec campaign (bead
+    /// fln-1f8v, found at `flip/KVMap/seed=452821e638d01377/iter=6669`,
+    /// minimized to the two-entry shape below).
+    ///
+    /// A bit flip made one key equal to an earlier key. `KVMap::insert` replaced in
+    /// place, so a 2-entry stream decoded to a 1-entry map that re-encoded 27 bytes
+    /// shorter: **one value, two encodings.**
+    ///
+    /// fln-1f8v fixed that by refusing duplicate keys, which cured the symptom and
+    /// misplaced the cause: the folding was the defect. Bead franken_lean-l84f showed the
+    /// refusal was also a parity divergence — `MData` is `KVMap`, so the Reference can
+    /// build and serialize exactly this value — so the decoder now appends positionally
+    /// and the input is accepted.
+    ///
+    /// This test is therefore **retargeted, not deleted**, and it is the more direct
+    /// statement of what fln-1f8v was protecting: the original stream must now decode to
+    /// a 2-entry map that re-encodes to the *same* bytes. If anyone reintroduces folding,
+    /// the re-encode shortens and this fails on the exact fixture that found it.
+    #[test]
+    fn the_fln_1f8v_duplicate_stream_round_trips_instead_of_folding() {
+        let key = Name::str(Name::anonymous(), "a");
+
+        let mut honest = CanonWriter::new();
+        honest.schema(SCHEMA_KVMAP);
+        honest.u64(2);
+        key.write_body(&mut honest);
+        honest.u8(DV_NAT);
+        honest.u64(1);
+        Name::str(Name::anonymous(), "b").write_body(&mut honest);
+        honest.u8(DV_NAT);
+        honest.u64(2);
+        let honest = honest.into_bytes();
+        let decoded = KVMap::from_canonical_bytes(&honest).expect("distinct keys decode");
+        assert_eq!(decoded.entries().len(), 2);
+        assert_eq!(decoded.to_canonical_bytes(), honest, "canonical round trip");
+
+        let mut duplicate = CanonWriter::new();
+        duplicate.schema(SCHEMA_KVMAP);
+        duplicate.u64(2);
+        key.write_body(&mut duplicate);
+        duplicate.u8(DV_NAT);
+        duplicate.u64(1);
+        key.write_body(&mut duplicate);
+        duplicate.u8(DV_NAT);
+        duplicate.u64(2);
+        let duplicate = duplicate.into_bytes();
+        let decoded = KVMap::from_canonical_bytes(&duplicate)
+            .expect("a duplicate-keyed stream is legal input the Reference can produce");
+        // THE ANTI-FOLD ASSERTION: two entries in, two entries out, same bytes back. The
+        // original defect was exactly the failure of this equality.
+        assert_eq!(
+            decoded.entries().len(),
+            2,
+            "the decoder folded the duplicate"
+        );
+        assert_eq!(
+            decoded.to_canonical_bytes(),
+            duplicate,
+            "re-encode drifted from the bytes that were decoded — the fln-1f8v defect"
+        );
+        assert_eq!(
+            decoded.find(&key),
+            Some(&DataValue::OfNat(1)),
+            "first match"
+        );
+        // Distinct from the folded value it used to decode to, so the two are not
+        // confusable by any consumer that hashes the canonical bytes.
+        let folded = KVMap::from_entries(vec![(key.clone(), DataValue::OfNat(2))]);
+        assert_ne!(decoded.to_canonical_bytes(), folded.to_canonical_bytes());
+
+        // MData embeds a KVMap, so the same stream must decode inside an Expr too —
+        // that is the artifact path a decl hash travels, and the reason refusing it was
+        // a parity divergence rather than a safe narrowing.
+        let mut mdata = CanonWriter::new();
+        mdata.schema(SCHEMA_EXPR);
+        mdata.u8(EXPR_MDATA);
+        mdata.u64(2);
+        key.write_body(&mut mdata);
+        mdata.u8(DV_NAT);
+        mdata.u64(1);
+        key.write_body(&mut mdata);
+        mdata.u8(DV_NAT);
+        mdata.u64(2);
+        mdata.u8(EXPR_BVAR);
+        mdata.u32(0);
+        let mdata = mdata.into_bytes();
+        let expr = Expr::from_canonical_bytes(&mdata)
+            .expect("a duplicate key inside MData is a value the Reference can serialize");
+        assert_eq!(
+            expr.to_canonical_bytes(),
+            mdata,
+            "the Expr round trip must be byte-exact through a duplicate-keyed MData"
+        );
+        match expr.node() {
+            ExprNode::MData { data, .. } => {
+                assert_eq!(data.entries().len(), 2, "MData folded the duplicate");
+                assert_eq!(data.find(&key), Some(&DataValue::OfNat(1)));
+            }
+            other => fixture_panic!("expected an MData node, got {other:?}"),
+        }
+    }
+
+    /// Arbitrary bytes are not a crash: corrupting a valid artifact may decode to
+    /// some other value, or fail with a typed error, and nothing else. Seeded, so a
+    /// failure replays exactly.
+    #[test]
+    fn corrupted_artifacts_never_panic_and_always_type_their_errors() {
+        let mut generator = Gen(0xc0ff_ee01);
+        for _ in 0..400 {
+            let expr = generator.expr(3);
+            let mut bytes = expr.to_canonical_bytes();
+            if bytes.is_empty() {
+                continue;
+            }
+            let flips = 1 + generator.range(3) as usize;
+            for _ in 0..flips {
+                let index = generator.range(bytes.len() as u64) as usize;
+                bytes[index] = generator.range(256) as u8;
+            }
+            // Either outcome is legal; the point is that neither aborts, and that a
+            // refusal is always a labelled, public error rather than a bare panic.
+            if let Err(error) = Expr::from_canonical_bytes(&bytes) {
+                assert!(
+                    !error.what.is_empty(),
+                    "corruption produced an empty reason"
+                );
+            }
         }
     }
 }

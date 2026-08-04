@@ -1,0 +1,343 @@
+[Meta.isDefEq] ✅️ Sort ?u.1 =?= Type
+[Meta.isDefEq] ✅️ Sort ?u.2 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Type ?u.8 =?= Type
+[Meta.isDefEq] ✅️ Type ?u.9 =?= Type
+[Meta.isDefEq] ✅️ outParam (Type ?u.10) =?= Type
+  [Meta.isDefEq] ✅️ Type ?u.10 =?= Type
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.3 =?= HAdd ?m.5 ?m.5 ?m.5
+  [Meta.isDefEq] ✅️ Nat =?= ?m.5
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.5 [assignable]
+    [Meta.isDefEq] ✅️ Type ?u.9 =?= Type
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.3 =?= Nat
+    [Meta.isDefEq] ?m.3 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ outParam (Type ?u.8) =?= Type
+      [Meta.isDefEq] ✅️ Type ?u.8 =?= Type
+[Meta.isDefEq] ✅️ ?m.4 =?= instHAdd
+  [Meta.isDefEq] ?m.4 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.6 =?= instAddNat
+  [Meta.isDefEq] ?m.6 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.6 =?= instAddNat
+  [Meta.isDefEq] ?m.6 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+[Meta.isDefEq] ✅️ Type =?= Type
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.1
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.1 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.7 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= ?m.3
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.3 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.5 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= ?m.4
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.4 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.4 =?= Type
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.7 =?= HAdd ?m.9 ?m.9 ?m.9
+  [Meta.isDefEq] ✅️ Nat =?= ?m.9
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.9 [assignable]
+    [Meta.isDefEq] ✅️ Type ?u.9 =?= Type
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.7 =?= Nat
+    [Meta.isDefEq] ?m.7 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ outParam (Type ?u.8) =?= Type
+      [Meta.isDefEq] ✅️ Type ?u.8 =?= Type
+[Meta.isDefEq] ✅️ ?m.8 =?= instHAdd
+  [Meta.isDefEq] ?m.8 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.10 =?= instAddNat
+  [Meta.isDefEq] ?m.10 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.10 =?= instAddNat
+  [Meta.isDefEq] ?m.10 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.5 =?= HAdd Nat Nat Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.5 =?= Nat
+    [Meta.isDefEq] ?m.5 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ Type ?u.3 =?= Type
+[Meta.isDefEq] ✅️ Type =?= Type
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+[Meta.isDefEq] ✅️ ?m.6 =?= instHAdd
+  [Meta.isDefEq] ?m.6 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] 💥️ OfNat ?m.1 1 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.4) ?m.6
+  [Meta.isDefEq] 💥️ ?m.1 =?= Lean.Grind.Ring.OfSemiring.Q ?m.4
+    [Meta.isDefEq] ?m.1 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.4 [nonassignable]
+[Meta.isDefEq] 💥️ OfNat ?m.1 1 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.4) ?m.6
+  [Meta.isDefEq] 💥️ ?m.1 =?= Lean.Grind.Ring.OfSemiring.Q ?m.4
+    [Meta.isDefEq] ?m.1 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.4 [nonassignable]
+[Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat ?m.8
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ 1 =?= ?m.8
+    [Meta.isDefEq] 1 [nonassignable] =?= ?m.8 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.7 =?= instOfNatNat 1
+  [Meta.isDefEq] ?m.7 [assignable] =?= instOfNatNat 1 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+[Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.2 =?= instOfNatNat 1
+  [Meta.isDefEq] ?m.2 [assignable] =?= instOfNatNat 1 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ 1 =?= 1
+[Meta.isDefEq] ✅️ wrapped 3 =?= 3 + 1
+  [Meta.isDefEq] ✅️ 3 + 1 =?= 3 + 1
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.11
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.11 [assignable]
+  [Meta.isDefEq] ✅️ Sort ?u.2 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.1
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.1 [assignable]
+  [Meta.isDefEq] ✅️ Sort ?u.3 =?= Type
+[Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat ?m.4
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ 3 =?= ?m.4
+    [Meta.isDefEq] 3 [nonassignable] =?= ?m.4 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.3 =?= instOfNatNat 3
+  [Meta.isDefEq] ?m.3 [assignable] =?= instOfNatNat 3 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat 3
+[Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat 3
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.2 =?= instOfNatNat 3
+  [Meta.isDefEq] ?m.2 [assignable] =?= instOfNatNat 3 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat 3
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ 3 =?= 3
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] 💥️ OfNat ?m.3 3 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.6) ?m.8
+  [Meta.isDefEq] 💥️ ?m.3 =?= Lean.Grind.Ring.OfSemiring.Q ?m.6
+    [Meta.isDefEq] ?m.3 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.6 [nonassignable]
+[Meta.isDefEq] 💥️ OfNat ?m.3 3 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.8) ?m.10
+  [Meta.isDefEq] 💥️ ?m.3 =?= Lean.Grind.Ring.OfSemiring.Q ?m.8
+    [Meta.isDefEq] ?m.3 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.8 [nonassignable]
+[Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat 3
+[Meta.isDefEq] ✅️ ?m.4 =?= instOfNatNat 3
+  [Meta.isDefEq] ?m.4 [assignable] =?= instOfNatNat 3 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 3 =?= OfNat Nat 3
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ 3 =?= 3
+[Meta.isDefEq] ✅️ Type ?u.11 =?= Type
+[Meta.isDefEq] ✅️ Type ?u.12 =?= Type
+[Meta.isDefEq] ✅️ outParam (Type ?u.13) =?= Type
+  [Meta.isDefEq] ✅️ Type ?u.13 =?= Type
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.7 =?= HAdd ?m.9 ?m.9 ?m.9
+  [Meta.isDefEq] ✅️ Nat =?= ?m.9
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.9 [assignable]
+    [Meta.isDefEq] ✅️ Type ?u.12 =?= Type
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.7 =?= Nat
+    [Meta.isDefEq] ?m.7 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ outParam (Type ?u.11) =?= Type
+      [Meta.isDefEq] ✅️ Type ?u.11 =?= Type
+[Meta.isDefEq] ✅️ ?m.8 =?= instHAdd
+  [Meta.isDefEq] ?m.8 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.10 =?= instAddNat
+  [Meta.isDefEq] ?m.10 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.10 =?= instAddNat
+  [Meta.isDefEq] ?m.10 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+[Meta.isDefEq] ✅️ Type =?= Type
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.3
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.3 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.8 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= ?m.5
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.5 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.10 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= ?m.7
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.7 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.6 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= ?m.8
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.8 [assignable]
+  [Meta.isDefEq] ✅️ Type ?u.5 =?= Type
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.11 =?= HAdd ?m.13 ?m.13 ?m.13
+  [Meta.isDefEq] ✅️ Nat =?= ?m.13
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.13 [assignable]
+    [Meta.isDefEq] ✅️ Type ?u.12 =?= Type
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.11 =?= Nat
+    [Meta.isDefEq] ?m.11 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ outParam (Type ?u.11) =?= Type
+      [Meta.isDefEq] ✅️ Type ?u.11 =?= Type
+[Meta.isDefEq] ✅️ ?m.12 =?= instHAdd
+  [Meta.isDefEq] ?m.12 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.14 =?= instAddNat
+  [Meta.isDefEq] ?m.14 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.14 =?= instAddNat
+  [Meta.isDefEq] ?m.14 [assignable] =?= instAddNat [nonassignable]
+  [Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ HAdd Nat Nat ?m.9 =?= HAdd Nat Nat Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ ?m.9 =?= Nat
+    [Meta.isDefEq] ?m.9 [assignable] =?= Nat [nonassignable]
+    [Meta.isDefEq] ✅️ Type ?u.4 =?= Type
+[Meta.isDefEq] ✅️ Type =?= Type
+[Meta.isDefEq] ✅️ Add Nat =?= Add Nat
+[Meta.isDefEq] ✅️ ?m.10 =?= instHAdd
+  [Meta.isDefEq] ?m.10 [assignable] =?= instHAdd [nonassignable]
+  [Meta.isDefEq] ✅️ HAdd Nat Nat Nat =?= HAdd Nat Nat Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] 💥️ OfNat ?m.5 1 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.8) ?m.10
+  [Meta.isDefEq] 💥️ ?m.5 =?= Lean.Grind.Ring.OfSemiring.Q ?m.8
+    [Meta.isDefEq] ?m.5 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.8 [nonassignable]
+[Meta.isDefEq] 💥️ OfNat ?m.5 1 =?= OfNat (Lean.Grind.Ring.OfSemiring.Q ?m.8) ?m.10
+  [Meta.isDefEq] 💥️ ?m.5 =?= Lean.Grind.Ring.OfSemiring.Q ?m.8
+    [Meta.isDefEq] ?m.5 [nonassignable] =?= Lean.Grind.Ring.OfSemiring.Q ?m.8 [nonassignable]
+[Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat ?m.13
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ 1 =?= ?m.13
+    [Meta.isDefEq] 1 [nonassignable] =?= ?m.13 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.12 =?= instOfNatNat 1
+  [Meta.isDefEq] ?m.12 [assignable] =?= instOfNatNat 1 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+[Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.6 =?= instOfNatNat 1
+  [Meta.isDefEq] ?m.6 [assignable] =?= instOfNatNat 1 [nonassignable]
+  [Meta.isDefEq] ✅️ OfNat Nat 1 =?= OfNat Nat 1
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+    [Meta.isDefEq] ✅️ 1 =?= 1
+[Meta.isDefEq] ✅️ wrapped 3 = 3 + 1 =?= ?m.13 = ?m.13
+  [Meta.isDefEq] ✅️ Nat =?= ?m.12
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.12 [assignable]
+    [Meta.isDefEq] ✅️ Sort ?u.11 =?= Type
+  [Meta.isDefEq] ✅️ wrapped 3 =?= ?m.13
+    [Meta.isDefEq] wrapped 3 [nonassignable] =?= ?m.13 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ 3 + 1 =?= wrapped 3
+    [Meta.isDefEq] ✅️ 3 + 1 =?= wrapped 3
+      [Meta.isDefEq] ✅️ instHAdd =?= instHAdd
+      [Meta.isDefEq] ✅️ 3 + 1 =?= 3 + 1
+[Meta.isDefEq] ✅️ wrapped 3 = wrapped 3 =?= wrapped 3 = 3 + 1
+  [Meta.isDefEq] ✅️ wrapped 3 =?= wrapped 3
+  [Meta.isDefEq] ✅️ wrapped 3 =?= 3 + 1
+    [Meta.isDefEq] ✅️ 3 + 1 =?= 3 + 1
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ n =?= n
+[Meta.isDefEq] ✅️ Sort ?u.1 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.1
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.1 [assignable]
+  [Meta.isDefEq] ✅️ Sort ?u.3 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ n = n =?= ?m.3 = ?m.3
+  [Meta.isDefEq] ✅️ Nat =?= ?m.2
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.2 [assignable]
+    [Meta.isDefEq] ✅️ Sort ?u.4 =?= Type
+  [Meta.isDefEq] ✅️ n =?= ?m.3
+    [Meta.isDefEq] n [nonassignable] =?= ?m.3 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ n =?= n
+[Meta.isDefEq] ✅️ n = n =?= n = n
+  [Meta.isDefEq] ✅️ n =?= n
+  [Meta.isDefEq] ✅️ n =?= n
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Sort ?u.1 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ Nat =?= ?m.2
+  [Meta.isDefEq] Nat [nonassignable] =?= ?m.2 [assignable]
+  [Meta.isDefEq] ✅️ Sort ?u.3 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.1 =?= Nat
+  [Meta.isDefEq] ?m.1 [assignable] =?= Nat [nonassignable]
+  [Meta.isDefEq] ✅️ Sort ?u.4 =?= Type
+[Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ id a = a =?= ?m.7 ?m.5 = ?m.7 ?m.6
+  [Meta.isDefEq] ✅️ Nat =?= ?m.4
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.4 [assignable]
+    [Meta.isDefEq] ✅️ Sort ?u.5 =?= Type
+  [Meta.isDefEq] ✅️ id a =?= ?m.7 ?m.5
+    [Meta.isDefEq] id a [nonassignable] =?= ?m.7 ?m.5 [assignable]
+    [Meta.isDefEq.foApprox] ?m.7 [?m.5] := id a
+    [Meta.isDefEq] ✅️ ?m.5 =?= a
+      [Meta.isDefEq] ?m.5 [assignable] =?= a [nonassignable]
+      [Meta.isDefEq] ✅️ ?m.3 =?= Nat
+        [Meta.isDefEq] ?m.3 [assignable] =?= Nat [nonassignable]
+        [Meta.isDefEq] ✅️ Sort ?u.6 =?= Type
+    [Meta.isDefEq] ✅️ ?m.7 =?= id
+      [Meta.isDefEq] ?m.7 [assignable] =?= id [nonassignable]
+      [Meta.isDefEq] ✅️ Nat → Nat =?= Nat → Nat
+        [Meta.isDefEq] ✅️ Nat =?= Nat
+        [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ a =?= id ?m.6
+    [Meta.isDefEq] ✅️ a =?= id ?m.6
+      [Meta.isDefEq] ✅️ a =?= ?m.6
+        [Meta.isDefEq] a [nonassignable] =?= ?m.6 [assignable]
+        [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ id a = a =?= id a = id a
+  [Meta.isDefEq] ✅️ id a =?= id a
+  [Meta.isDefEq] ✅️ a =?= id a
+    [Meta.isDefEq] ✅️ a =?= a
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ id a = id a =?= id a = a
+  [Meta.isDefEq] ✅️ id a =?= id a
+  [Meta.isDefEq] ✅️ id a =?= a
+    [Meta.isDefEq] ✅️ a =?= a
+  [Meta.isDefEq] ✅️ Nat =?= Nat
+[Meta.isDefEq] ✅️ ?m.3 → ?m.4 =?= ?m.3 → ?m.4
+[Meta.isDefEq] ✅️ a = a =?= ?m.9 = ?m.9
+  [Meta.isDefEq] ✅️ Nat =?= ?m.8
+    [Meta.isDefEq] Nat [nonassignable] =?= ?m.8 [assignable]
+    [Meta.isDefEq] ✅️ Sort ?u.7 =?= Type
+  [Meta.isDefEq] ✅️ a =?= ?m.9
+    [Meta.isDefEq] a [nonassignable] =?= ?m.9 [assignable]
+    [Meta.isDefEq] ✅️ Nat =?= Nat
+  [Meta.isDefEq] ✅️ a =?= a
+[Meta.isDefEq] ✅️ a = a =?= a = a
+  [Meta.isDefEq] ✅️ a =?= a
+  [Meta.isDefEq] ✅️ a =?= a
+  [Meta.isDefEq] ✅️ Nat =?= Nat

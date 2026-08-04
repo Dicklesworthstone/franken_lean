@@ -19,6 +19,9 @@ const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
 const ROOT: u32 = 1 << 3;
+/// Reached only through `Hasher::new_keyed`; see the note there for why the mode is
+/// retained even though the program's own hashing never selects it.
+#[cfg_attr(not(test), allow(dead_code))]
 const KEYED_HASH: u32 = 1 << 4;
 const DERIVE_KEY_CONTEXT: u32 = 1 << 5;
 const DERIVE_KEY_MATERIAL: u32 = 1 << 6;
@@ -322,6 +325,15 @@ impl Hasher {
 
     /// Keyed hash mode: the 32-byte key supplies the key words, KEYED_HASH
     /// flag on every compression (spec §2.5).
+    ///
+    /// The registry never selects this mode — domain separation goes through
+    /// `derive_key` — so nothing outside `mod tests` calls it. It is retained
+    /// deliberately: the official vector suite checks all three modes on every row,
+    /// and `ci/PARITY_LEDGER.txt` carries an L2 `BLAKE3.keyed_hash` row that those
+    /// vectors are the evidence for. Dropping it would retire a ledger row, which is
+    /// not a refactor. The allow is scoped to non-test builds so that if the vector
+    /// suite ever stops exercising it, the warning comes back.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_keyed(key: &[u8; KEY_LEN]) -> Hasher {
         Hasher::new_internal(words_from_le_key(key), KEYED_HASH)
     }
@@ -414,6 +426,14 @@ impl Default for Hasher {
 }
 
 /// One-shot regular BLAKE3 hash of `input` (spec §2.4).
+///
+/// Unkeyed hashing is not something the program does — every digest names a domain —
+/// so this has no caller outside `mod tests`. Retained for the same reason as
+/// [`Hasher::new_keyed`]: the official vectors check the one-shot result against the
+/// incremental one on every row (a digest that agreed with itself under one path only
+/// would hide a chunk-boundary bug), and `ci/PARITY_LEDGER.txt` has an L2
+/// `BLAKE3.hash` row resting on that.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn hash(input: &[u8]) -> [u8; OUT_LEN] {
     Hasher::new().update(input).finalize()
 }
@@ -442,7 +462,8 @@ mod tests {
         s
     }
 
-    /// The official vectors' input: the repeating byte pattern 0,1,...,249.
+    /// The official vectors' input: the repeating byte pattern 0,1,...,250,
+    /// modulus 251 (prime, so it never aligns with a block boundary).
     fn test_input(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -455,9 +476,13 @@ mod tests {
     }
 
     fn parse_fixture() -> Vec<Vector> {
+        parse_text(FIXTURE)
+    }
+
+    fn parse_text(text: &str) -> Vec<Vector> {
         let mut vectors = Vec::new();
         let mut saw_schema = false;
-        for line in FIXTURE.lines() {
+        for line in text.lines() {
             let line = line.trim();
             if line == "# schema fln-blake3-vectors/1" {
                 saw_schema = true;
@@ -472,23 +497,43 @@ mod tests {
                 .parse::<usize>()
                 .expect("fixture input_len parses");
             let mut hex = || fields.next().expect("fixture row has 4 fields").to_owned();
-            vectors.push(Vector {
+            let vector = Vector {
                 input_len,
                 hash_hex: hex(),
                 keyed_hash_hex: hex(),
                 derive_key_hex: hex(),
-            });
+            };
+            // A fifth field is not a longer row, it is an unreviewed edit: the row
+            // grammar is exactly four fields, so trailing content must not be dropped
+            // on the floor.
+            assert!(
+                fields.next().is_none(),
+                "fixture row for len {} has trailing fields",
+                vector.input_len
+            );
+            vectors.push(vector);
         }
         assert!(saw_schema, "fixture missing schema line");
         assert!(!vectors.is_empty(), "fixture has no vector rows");
         vectors
     }
 
-    #[test]
-    fn official_vectors_all_modes() {
-        let vectors = parse_fixture();
-        assert_eq!(vectors.len(), 35, "official set has 35 cases");
-        for v in &vectors {
+    /// Verify our implementation against a fixture's expectations, returning every
+    /// disagreement rather than panicking on the first.
+    ///
+    /// The real suite calls this on the checked-in fixture and requires the result to
+    /// be empty. `the_vector_checker_catches_planted_drift` calls it on deliberately
+    /// damaged copies and requires the result to be non-empty — which is the only way
+    /// to know that a green run here means anything at all (bead franken_lean-rps; the
+    /// unverified-checker gap cod_3 flagged on qm13).
+    fn verify_against(vectors: &[Vector]) -> Vec<String> {
+        let mut mismatches = Vec::new();
+        let mut check = |what: &str, len: usize, ours: String, expected: &str| {
+            if ours != expected {
+                mismatches.push(format!("{what} mismatch at len {len}"));
+            }
+        };
+        for v in vectors {
             let input = test_input(v.input_len);
             let mut xof = [0u8; XOF_LEN];
 
@@ -498,23 +543,18 @@ mod tests {
                 h
             };
             hasher.finalize_xof(&mut xof);
-            assert_eq!(
-                hex_encode(&xof),
-                v.hash_hex,
-                "hash xof mismatch at len {}",
-                v.input_len
-            );
-            assert_eq!(
+            check("hash xof", v.input_len, hex_encode(&xof), &v.hash_hex);
+            check(
+                "hash prefix",
+                v.input_len,
                 hex_encode(&hasher.finalize()),
-                v.hash_hex[..OUT_LEN * 2],
-                "hash prefix mismatch at len {}",
-                v.input_len
+                &v.hash_hex[..OUT_LEN * 2],
             );
-            assert_eq!(
+            check(
+                "one-shot hash",
+                v.input_len,
                 hex_encode(&hash(&input)),
-                v.hash_hex[..OUT_LEN * 2],
-                "one-shot hash mismatch at len {}",
-                v.input_len
+                &v.hash_hex[..OUT_LEN * 2],
             );
 
             let keyed = {
@@ -523,17 +563,17 @@ mod tests {
                 h
             };
             keyed.finalize_xof(&mut xof);
-            assert_eq!(
+            check(
+                "keyed xof",
+                v.input_len,
                 hex_encode(&xof),
-                v.keyed_hash_hex,
-                "keyed xof mismatch at len {}",
-                v.input_len
+                &v.keyed_hash_hex,
             );
-            assert_eq!(
+            check(
+                "keyed prefix",
+                v.input_len,
                 hex_encode(&keyed.finalize()),
-                v.keyed_hash_hex[..OUT_LEN * 2],
-                "keyed prefix mismatch at len {}",
-                v.input_len
+                &v.keyed_hash_hex[..OUT_LEN * 2],
             );
 
             let derive = {
@@ -542,19 +582,310 @@ mod tests {
                 h
             };
             derive.finalize_xof(&mut xof);
-            assert_eq!(
+            check(
+                "derive_key xof",
+                v.input_len,
                 hex_encode(&xof),
-                v.derive_key_hex,
-                "derive_key xof mismatch at len {}",
-                v.input_len
+                &v.derive_key_hex,
             );
-            assert_eq!(
+            check(
+                "derive_key prefix",
+                v.input_len,
                 hex_encode(&derive.finalize()),
-                v.derive_key_hex[..OUT_LEN * 2],
-                "derive_key prefix mismatch at len {}",
-                v.input_len
+                &v.derive_key_hex[..OUT_LEN * 2],
             );
         }
+        mismatches
+    }
+
+    /// The vectors are only meaningful for the input they were generated over, so the
+    /// input convention is pinned against the fixture's own header rather than left as
+    /// two independent statements that can drift.
+    ///
+    /// They had already drifted: the header read `0,1,...,249` while the code uses
+    /// modulus 251, i.e. `0,1,...,250`. The code is right — all 35 vectors match, and
+    /// the official BLAKE3 set is defined over a repeating sequence of 251 bytes — so
+    /// the header was corrected. The generator that emits that header,
+    /// `scripts/extract/convert_blake3_vectors.py`, carried the same wrong text until
+    /// bead `franken_lean-vv0r`; regenerating the fixture would have put it back, and
+    /// this test would have caught it while pointing at the wrong file. The generator
+    /// is now checked directly by
+    /// [`the_generator_emits_the_header_this_test_pins`], so the artifact and the
+    /// thing that produces it are both guarded.
+    #[test]
+    fn the_input_pattern_matches_the_fixtures_own_header() {
+        let header = FIXTURE
+            .lines()
+            .find(|line| line.contains("repeating pattern"))
+            .expect("the fixture documents its input pattern");
+        let highest: usize = header
+            .split("0,1,...,")
+            .nth(1)
+            .and_then(|rest| rest.split(&[',', ' '][..]).next())
+            .and_then(|value| value.parse().ok())
+            .expect("the header names the highest byte value");
+        let modulus = highest + 1;
+        assert_eq!(modulus, 251, "the official set repeats every 251 bytes");
+
+        let input = test_input(modulus + 3);
+        assert_eq!(input[0], 0);
+        assert_eq!(
+            input[highest], highest as u8,
+            "the pattern reaches its highest byte"
+        );
+        assert_eq!(input[modulus], 0, "and wraps immediately after it");
+        assert_eq!(input[modulus + 1], 1);
+    }
+
+    /// The GENERATOR must emit the header the test above pins, not merely the
+    /// checked-in artifact.
+    ///
+    /// `the_input_pattern_matches_the_fixtures_own_header` guards the fixture. That is
+    /// one join; the other is the script that writes the fixture, and it was wrong for
+    /// as long as the fixture was — the artifact got repaired and the thing that
+    /// produces it did not (bead `franken_lean-vv0r`). A regeneration would have
+    /// silently restored the drift, the artifact-side test would have gone red, and it
+    /// would have named the fixture rather than the script that broke it.
+    ///
+    /// So this reads the generator's own emitted string. It fails at the source, and it
+    /// fails BEFORE anyone regenerates rather than after.
+    #[test]
+    fn the_generator_emits_the_header_this_test_pins() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root is two levels above the crate manifest");
+        const GENERATOR: &str = "scripts/extract/convert_blake3_vectors.py";
+        let script = std::fs::read_to_string(root.join(GENERATOR))
+            .map_err(|error| format!("cannot read {GENERATOR}: {error}"))
+            .expect("the generator that produces the fixture is readable");
+
+        assert!(
+            script.contains("0,1,...,250,0,1,..."),
+            "{GENERATOR} does not emit the input pattern the fixture header states and \
+             this module's test_input implements. Regenerating the fixture would put \
+             the wrong convention back into the artifact every other check trusts."
+        );
+        assert!(
+            !script.contains("0,1,...,249"),
+            "{GENERATOR} still carries the pre-vv0r pattern text somewhere; the \
+             convention is one fact and every statement of it must agree"
+        );
+
+        // Negative control: a `contains` that matches anything proves nothing, and this
+        // whole module exists because a check can look like verification without being
+        // one.
+        assert!(
+            !script.contains("0,1,...,we-never-wrote-this"),
+            "the containment check matches text that was never written, so it cannot \
+             distinguish a correct generator from any other file"
+        );
+    }
+
+    /// Prove the goldens are load-bearing rather than decorative.
+    ///
+    /// A checked-in vector file and a passing suite are not the same claim: the suite
+    /// could be comparing a field it never reads, or the file could drift and nothing
+    /// would notice. So every plant below damages a copy of the real fixture by the
+    /// smallest edit that matters — one hex digit, which is one bit of one digest —
+    /// and requires the checker to report it, naming the field it belongs to.
+    ///
+    /// The checked-in file is never touched: the plants run on in-memory copies.
+    #[test]
+    fn the_vector_checker_catches_planted_drift() {
+        let vectors = parse_fixture();
+        assert!(
+            verify_against(&vectors).is_empty(),
+            "the unmutated fixture must be clean before planting anything"
+        );
+
+        // One bit of one digest, in each of the three modes, on a mid-corpus row so
+        // the plant is not special-cased by an empty or single-block input.
+        let row = vectors
+            .iter()
+            .position(|v| v.input_len == 1024)
+            .expect("the official set has a 1024-byte case");
+
+        for (field, mutate) in [
+            (
+                "hash xof",
+                (|v: &mut Vector| v.hash_hex = flip_one_bit(&v.hash_hex)) as fn(&mut Vector),
+            ),
+            ("keyed xof", |v: &mut Vector| {
+                v.keyed_hash_hex = flip_one_bit(&v.keyed_hash_hex)
+            }),
+            ("derive_key xof", |v: &mut Vector| {
+                v.derive_key_hex = flip_one_bit(&v.derive_key_hex)
+            }),
+        ] {
+            let mut planted = clone_vectors(&vectors);
+            mutate(&mut planted[row]);
+            let caught = verify_against(&planted);
+            assert!(
+                caught.iter().any(|m| m.starts_with(field)),
+                "a one-bit change to {field} at len 1024 was NOT caught; the golden is \
+                 decorative. Reported: {caught:?}"
+            );
+        }
+
+        // The prefix comparisons are separate assertions from the xof ones, so a plant
+        // inside the first OUT_LEN bytes must be caught twice — once as the extended
+        // output and once as the 32-byte digest. If only one fires, one of the two
+        // comparisons is not reading what it claims to.
+        let mut planted = clone_vectors(&vectors);
+        planted[row].hash_hex = flip_one_bit_at(&planted[row].hash_hex, 0);
+        let caught = verify_against(&planted);
+        assert!(
+            caught.iter().any(|m| m.starts_with("hash xof")),
+            "leading-byte plant escaped the xof comparison: {caught:?}"
+        );
+        assert!(
+            caught.iter().any(|m| m.starts_with("hash prefix")),
+            "leading-byte plant escaped the 32-byte digest comparison: {caught:?}"
+        );
+        assert!(
+            caught.iter().any(|m| m.starts_with("one-shot hash")),
+            "leading-byte plant escaped the one-shot comparison: {caught:?}"
+        );
+
+        // A plant BEYOND the 32-byte digest must be caught by the xof comparison only:
+        // this is what proves the extended output is genuinely checked rather than the
+        // digest being compared twice under two names.
+        let mut planted = clone_vectors(&vectors);
+        planted[row].hash_hex = flip_one_bit_at(&planted[row].hash_hex, OUT_LEN * 2 + 4);
+        let caught = verify_against(&planted);
+        assert!(
+            caught.iter().any(|m| m.starts_with("hash xof")),
+            "a plant past the digest escaped the xof comparison entirely: {caught:?}"
+        );
+        assert!(
+            !caught.iter().any(|m| m.starts_with("hash prefix")),
+            "a plant past the digest was reported against the digest: {caught:?}"
+        );
+
+        // Every row is checked, not just the first: plant in the last row too.
+        let last = vectors.len() - 1;
+        let mut planted = clone_vectors(&vectors);
+        planted[last].keyed_hash_hex = flip_one_bit(&planted[last].keyed_hash_hex);
+        assert!(
+            !verify_against(&planted).is_empty(),
+            "a plant in the final row was not checked at all"
+        );
+    }
+
+    /// Structural damage to the fixture is caught by the parser, not silently
+    /// tolerated: a dropped row, an extra row, a short row, a trailing field, or a
+    /// missing schema line all fail. Each plant runs in its own process because the
+    /// parser's contract is to panic, and a panic is the observable being tested.
+    #[test]
+    fn the_fixture_parser_rejects_structural_damage() {
+        const CHILD: &str = "FLN_BLAKE3_FIXTURE_PLANT";
+        if let Ok(plant) = std::env::var(CHILD) {
+            let mut text = FIXTURE.to_string();
+            match plant.as_str() {
+                "drop-row" => {
+                    let at = text.rfind("\n1024|").expect("the 1024 row exists");
+                    let end = text[at + 1..].find('\n').expect("row ends") + at + 1;
+                    text.replace_range(at..end, "");
+                }
+                "short-row" => {
+                    let at = text.rfind("\n1024|").expect("the 1024 row exists") + 1;
+                    let end = text[at..].find('\n').expect("row ends") + at;
+                    let row = text[at..end].to_string();
+                    let trimmed = row.rsplit_once('|').expect("row has fields").0.to_string();
+                    text.replace_range(at..end, &trimmed);
+                }
+                "trailing-field" => {
+                    let at = text.rfind("\n1024|").expect("the 1024 row exists") + 1;
+                    let end = text[at..].find('\n').expect("row ends") + at;
+                    text.insert_str(end, "|deadbeef");
+                }
+                "no-schema" => {
+                    text = text.replace("# schema fln-blake3-vectors/1", "# schema wrong/1");
+                }
+                "extra-row" => {
+                    let at = text.rfind("\n1024|").expect("the 1024 row exists") + 1;
+                    let end = text[at..].find('\n').expect("row ends") + at;
+                    let row = text[at..=end].to_string();
+                    text.insert_str(end + 1, &row);
+                }
+                other => panic!("unknown plant {other}"),
+            }
+            // Re-run the FULL contract over the damaged text, exactly as the suite
+            // runs it over the real fixture.
+            check_fixture_contract(&text);
+            println!("PLANT SURVIVED: {plant}");
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("locate the test binary");
+        for plant in [
+            "drop-row",
+            "extra-row",
+            "short-row",
+            "trailing-field",
+            "no-schema",
+        ] {
+            let output = std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("blake3::tests::the_fixture_parser_rejects_structural_damage")
+                .arg("--nocapture")
+                .env(CHILD, plant)
+                .output()
+                .expect("launch fixture-plant child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !output.status.success() && !stdout.contains("PLANT SURVIVED"),
+                "the `{plant}` plant survived the parser — the fixture's shape is not \
+                 actually enforced.\nstdout={stdout}\nstderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn clone_vectors(vectors: &[Vector]) -> Vec<Vector> {
+        vectors
+            .iter()
+            .map(|v| Vector {
+                input_len: v.input_len,
+                hash_hex: v.hash_hex.clone(),
+                keyed_hash_hex: v.keyed_hash_hex.clone(),
+                derive_key_hex: v.derive_key_hex.clone(),
+            })
+            .collect()
+    }
+
+    /// Flip the low bit of the first hex digit — one bit of the digest.
+    fn flip_one_bit(hex: &str) -> String {
+        flip_one_bit_at(hex, 0)
+    }
+
+    fn flip_one_bit_at(hex: &str, index: usize) -> String {
+        let mut bytes = hex.as_bytes().to_vec();
+        let digit = bytes[index] as char;
+        let value = digit.to_digit(16).expect("fixture digits are hex");
+        let flipped = value ^ 1;
+        bytes[index] = std::char::from_digit(flipped, 16).expect("still hex") as u8;
+        String::from_utf8(bytes).expect("ascii hex")
+    }
+
+    /// The whole contract the checked-in fixture must satisfy, in one place so the
+    /// plants below exercise exactly what the suite enforces — not a subset of it.
+    /// The first plant written here escaped by driving only the parser, which does
+    /// not know how many rows the official set has.
+    fn check_fixture_contract(text: &str) {
+        let vectors = parse_text(text);
+        assert_eq!(vectors.len(), 35, "official set has 35 cases");
+        let mismatches = verify_against(&vectors);
+        assert!(
+            mismatches.is_empty(),
+            "implementation disagrees with the official vectors: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn official_vectors_all_modes() {
+        check_fixture_contract(FIXTURE);
     }
 
     #[test]

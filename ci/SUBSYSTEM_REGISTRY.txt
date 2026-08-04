@@ -1,0 +1,46 @@
+# SUBSYSTEM_REGISTRY.txt — the suite-wide subsystem-name registry (bead fln-7gr6).
+#
+# Load-bearing subsystem codenames are reserved here across the FrankenSuite so a
+# future plan cannot silently reuse one. Every row names the project/repository that
+# owns the codename, its scope, the crates it governs in THIS workspace (if any),
+# reserved aliases, and its status. The registry is the single current-vocabulary
+# authority: prose, contracts, schemas, dashboards, and bead fields must use the
+# canonical spelling of an `active` row, and a `reserved` row's name may appear in
+# current FrankenLean vocabulary only when explicitly citing its owning project.
+# Immutable historical records (bead comments, published receipts, .br_history
+# snapshots) retain their original text and never define current vocabulary.
+#
+# Collision law (enforced by crates/fln-conformance/tests/subsystem_name_registry.rs
+# and reserved_name_collision_model.rs): names and aliases are unique
+# case-insensitively across the whole file; a crate may be claimed by at most one
+# row; unknown statuses and unknown schema versions fail typed; verdicts are
+# independent of row order.
+#
+# Publication law: regeneration writes `SUBSYSTEM_REGISTRY.txt.candidate` and
+# atomically renames it over this file. A left-over `.candidate` sibling is an
+# interrupted publication: the registry gate fails typed (stale_candidate) until
+# the candidate is explicitly removed or promoted — never silently adopted.
+#
+# Row grammar (seven '|'-separated fields on one line):
+#   row <canonical-name> | <owner-repo> | <scope> | <crates: comma-list|-> \
+#       | <aliases: comma-list|-> | <status: active|reserved|historical> | <reason>
+schema fln-subsystem-registry/1
+row Marrow | franken_lean | runtime and ABI twin | fln-rt,fln-unsafe-abi | - | active | plan §6: lean_object model, regions, allocator, membrane
+row Grimoire | franken_lean | environment and module codec | fln-env,fln-olean | - | active | plan §7: persistent env, O(1) snapshots, .olean read/write
+row Crucible | franken_lean | trusted kernel | fln-kernel,fln-bignum,fln-checker | - | active | plan §8: dual-engine checker, receipts, consensus (fln-checker is the independent council member)
+row Vellum | franken_lean | parser, syntax, hygiene, macros | fln-parse,fln-syntax | - | active | plan §9: Pratt engine, SourceInfo, GrammarEpoch, recovery; renamed from the reserved name by fln-7gr6
+row Athanor | franken_lean | elaborator | fln-elab | - | active | plan §10: monadic tower, unifier ladder, dataflow scheduler
+row Synod | franken_lean | instance engine (within Athanor) | - | - | active | plan §10: instance resolution, deterministic search order
+row Golem | franken_lean | metaprogram compiler and VM | fln-comp,fln-vm,fln-unsafe-jit | - | active | plan §11: FIR/FLBC pipeline, register VM, ABI-valued execution
+row Iron | franken_lean | native JIT backend (within Golem) | - | - | active | plan §11: Iron-JIT, the native backend needing no C compiler
+row Anvil | franken_lean | rewriting and tactic engines | fln-anvil | - | active | plan §12: simp indexes, e-graph lane, norm_num/omega cores
+row Verdict | franken_lean | owned CDCL SAT solver | fln-verdict | - | active | plan §12: bv_decide solver, proof logging, owned checker
+row Ledger | franken_lean | build fabric | fln-ledger,fln-lake | - | active | plan §13: content-addressed builds, true-cone invalidation, Lake surface
+row Lantern | franken_lean | language server | fln-server | - | active | plan §14: one daemon, shared import heap, LSP + $/lean/*
+row Palimpsest | franken_lean | provenance and traces | fln-trace | - | active | plan §15: causal proof graph, time-travel replay
+row Bloodhound | franken_lean | search and repair surface | fln-hound | - | active | plan §16.1: premise retrieval, proof repair, frankensearch-backed
+row Folio | franken_lean | documentation surface | fln-doc | - | active | plan §16.2: doc-gen4-compatible native HTML/PDF docs
+row Envoy | franken_lean | MCP door | fln-mcp | - | active | plan §17: budgeted, capability-scoped agent tools
+row WASM Judge | franken_lean | browser verification artifact | fln-wasm | - | active | plan §16.3: certified kernel in a browser tab
+row Tribunal | franken_lean | conformance apparatus | fln-conformance | - | active | plan §18: Parity Ledger, differential rigs, gates
+row Quill | frankensearch | lexical engine (two-tier search) | - | - | reserved | fln-7gr6: reserved for the Frankensearch lexical engine; formerly drafted as the FrankenLean parser/macro codename, renamed to Vellum — immutable history retains the old text

@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 /// SHA-256 of `contracts/olean_inventory.json` this partition was rendered from.
-pub(crate) const INVENTORY_DIGEST: &str = "901a2970a31a945a05bbf5e6f3bcb13fe01016a16930bcd654879403076437f8";
+pub(crate) const INVENTORY_DIGEST: &str = "ecd0f18e64358bb69d1ce3e2880d08f5553d2f3789df46d531988cbfe7b577dc";
 pub(crate) const PIN_TAG: &str = "v4.32.0";
 pub(crate) const PIN_COMMIT: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
 

@@ -29,7 +29,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="marrow-stage0-gauntlet-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
-mkdir -p "$ART_DIR"
+mkdir -p "$(dirname "$ART_DIR")"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[marrow_stage0_gauntlet] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 
 BUILD_TARGET="${FLN_E2E_CARGO_TARGET_DIR:-$ROOT/target_local}"
 BEAD="franken_lean-83r"
@@ -120,6 +124,29 @@ fi
 # ecosystem ships), the pin's shipped config.h. Every demanded lean_*/mi_*
 # symbol must be classified by the status ledger; unknown symbols fail.
 STAGE0_TUS=("Init/Prelude.c" "Init/SizeOf.c" "Init/Data/Nat/Basic.c")
+# Slice 5: Init/SizeOf's initializer-import closure, so lane 6c can link and
+# execute the full module DAG (SizeOf -> {Notation, Tactics} -> Notation ->
+# Coe -> Prelude). Measured before landing: their union demands 13 lean_*/mi_*
+# symbols, every one already exported.
+STAGE0_TUS+=("Init/Coe.c" "Init/Notation.c" "Init/Tactics.c")
+# fln-3gv slice 1: the effect plane's pure-substrate TUs — their demands
+# are fully exported as of the ST-ref/platform/utf8 slice.
+STAGE0_TUS+=("Init/System/ST.c" "Init/System/IOError.c" "Init/System/Platform.c")
+# fln-3gv slice 2: the promise/task-state TUs. Measured before landing
+# (D2 gcc, stage0 lean.h): their union adds 8 lean_* demands — the promise
+# trio, io_get_task_state, option_get_or_block, task_map_core, task_pure,
+# task_get — every one exported by the slice-2 family; CancelToken.c's
+# l_BaseIO_chainTask___redArg is a stage0-TU symbol, not a runtime demand.
+STAGE0_TUS+=("Init/System/Promise.c" "Init/System/CancelToken.c")
+# fln-3gv slice 3: the task plane's own TU. Measured before landing: it
+# adds task_spawn_core and task_bind_core (its map/get/pure demands are
+# already in the union) — both exported by the manager slice.
+STAGE0_TUS+=("Init/Task.c")
+# fln-3gv slice 5a: the stdio/fs/process/env demand surface — every one of
+# IO.c's 105 lean_* demands is now classified in the status ledger (11 stdio
+# symbols live, the fs/process/env families declared Unsupported), so the
+# audit holds the whole surface without linking the TU anywhere.
+STAGE0_TUS+=("Init/System/IO.c")
 if [ "${FLN_E2E_DEEP:-0}" = "1" ]; then
     STAGE0_TUS+=("Init/Core.c")
 fi
@@ -241,13 +268,54 @@ else
     fail stage0_exec_differential "\"artifact\":\"stage0_facts.diff\""
 fi
 
+# ---- lane 6c: stage0 module-DAG EXECUTION (slice 5) ----------------------------
+# Five real translation units — Init/SizeOf's full initializer-import closure
+# (a diamond: SizeOf -> {Notation, Tactics}, Tactics -> Notation, Notation ->
+# Coe -> Prelude) — linked together against Marrow and EXECUTED: the chain
+# driver initializes the DAG root, re-initializes both the root and a leaf
+# (the generated once-guards must short-circuit), applies a SizeOf-instance
+# closure over scalar and bignum operands, and feeds the result to Prelude's
+# generated decidable equality. The same driver + the SAME five .o files
+# against libleanshared must emit byte-identical facts.
+note "lane 6c: stage0 module DAG (5 TUs) EXECUTES against Marrow (and the Reference)"
+CHAIN_DRIVER_SRC="$ROOT/tribunal/fixtures/c4/stage0_chain_driver.c"
+chain_driver_sha=$(sha256sum "$CHAIN_DRIVER_SRC" | cut -d' ' -f1)
+CHAIN_OBJS=("$ART_DIR/Init_Prelude.c.o" "$ART_DIR/Init_Coe.c.o" \
+    "$ART_DIR/Init_Notation.c.o" "$ART_DIR/Init_Tactics.c.o" \
+    "$ART_DIR/Init_SizeOf.c.o")
+for obj in "${CHAIN_OBJS[@]}"; do
+    [ -f "$obj" ] || fail chain_exec_setup "\"detail\":\"lane-4 object missing: $(basename "$obj")\""
+done
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" "$STATICLIB" -lpthread -ldl -lm \
+    -o "$ART_DIR/chain_marrow" >"$ART_DIR/gcc_chain_marrow.log" 2>&1; then
+    fail chain_exec_link "\"artifact\":\"gcc_chain_marrow.log\""
+fi
+if ! "$ART_DIR/chain_marrow" >"$ART_DIR/facts_chain_marrow.ndjson" 2>"$ART_DIR/chain_marrow.err"; then
+    fail chain_exec_run "\"artifact\":\"chain_marrow.err\""
+fi
+emit chain_exec_marrow passed "\"facts\":$(wc -l <"$ART_DIR/facts_chain_marrow.ndjson"),\"driver_sha256\":\"$chain_driver_sha\",\"objects\":${#CHAIN_OBJS[@]}"
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" -L "$ELAN_TC/lib/lean" -lleanshared -Wl,-rpath,"$ELAN_TC/lib/lean" \
+    -o "$ART_DIR/chain_reference" >"$ART_DIR/gcc_chain_reference.log" 2>&1; then
+    fail chain_exec_ref_link "\"artifact\":\"gcc_chain_reference.log\""
+fi
+if ! "$ART_DIR/chain_reference" >"$ART_DIR/facts_chain_reference.ndjson" 2>"$ART_DIR/chain_reference.err"; then
+    fail chain_exec_ref_run "\"artifact\":\"chain_reference.err\""
+fi
+if diff -u "$ART_DIR/facts_chain_reference.ndjson" "$ART_DIR/facts_chain_marrow.ndjson" >"$ART_DIR/chain_facts.diff"; then
+    emit chain_exec_differential passed "\"facts\":$(wc -l <"$ART_DIR/facts_chain_marrow.ndjson"),\"artifact\":\"chain_facts.diff\""
+else
+    fail chain_exec_differential "\"artifact\":\"chain_facts.diff\""
+fi
+
 # ---- lane 7: panic parity ------------------------------------------------------
 # Exit codes and the message line must match. The Reference appends an
 # address-nondeterministic backtrace block on the panic_fn path (varies
 # between its own runs), so the comparison is rc + first stderr line — the
 # deterministic contract; the restriction is typed in ABI_EXPORT_STATUS.txt.
 note "lane 7: panic parity (exit codes + message lines)"
-for mode in panic-internal panic-fn; do
+for mode in panic-internal panic-fn panic-promise-new panic-get-or-block-none; do
     set +e
     "$ART_DIR/probe_marrow" "$mode" >/dev/null 2>"$ART_DIR/${mode}_marrow.err"; rc_m=$?
     "$ART_DIR/probe_reference" "$mode" >/dev/null 2>"$ART_DIR/${mode}_reference.err"; rc_r=$?
@@ -264,7 +332,12 @@ done
 # Ownership-convention perturbation per §18.2: the exported lean_dec_ref_cold
 # drops the release. Planted in a COPY of the crate; the differential must
 # catch it (rc.child.after_parent_death flips 1 -> 2) and the REAL tree must
-# stay byte-identical.
+# stay byte-identical. Since fln-3gv slice 3 this mutant also DEADLOCKS the
+# manager section (a dropped release never runs deactivate_promise, so the
+# drop-to-none cell blocks in task_get forever) — the probes are
+# line-buffered and every mutant run is under `timeout 120`, so a hang is
+# caught as truncated-output divergence with the flushed discriminator
+# intact, never a wedged lane.
 note "lane 8: mutant drill 83r-M1 (lean_dec_ref_cold dropped in a copy)"
 MUT_WS="$ART_DIR/mutant-ws"
 mkdir -p "$MUT_WS"
@@ -288,7 +361,7 @@ if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
     fail mutant_link "\"artifact\":\"gcc_mutant.log\""
 fi
 set +e
-"$ART_DIR/probe_mutant" >"$ART_DIR/facts_mutant.ndjson" 2>"$ART_DIR/probe_mutant.err"
+timeout 120 "$ART_DIR/probe_mutant" >"$ART_DIR/facts_mutant.ndjson" 2>"$ART_DIR/probe_mutant.err"
 set -e
 if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant.ndjson" >/dev/null 2>&1; then
     fail mutant_drill "\"detail\":\"83r-M1 SURVIVED — the gauntlet does not discriminate ownership-convention drift\""
@@ -301,6 +374,89 @@ if [ "$real_sha_before" != "$real_sha_after" ]; then
     fail mutant_isolation "\"detail\":\"the REAL tree changed during the drill\""
 fi
 emit mutant_drill passed "\"mutant\":\"83r-M1\",\"discriminator\":\"rc.child.after_parent_death\",\"real_tree_sha_stable\":true"
+
+# ---- lane 8b: named mutant 3gv-M2 ---------------------------------------------
+# Ownership-convention perturbation through the slice-2 task plane:
+# task_map_core's eager arm stops releasing its consumed task. Planted in a
+# SECOND copy; the differential must catch it (task.map.shared_src_rc flips
+# 1 -> 2) and the REAL tree must stay byte-identical.
+note "lane 8b: mutant drill 3gv-M2 (map_core's task release dropped in a copy)"
+MUT2_WS="$ART_DIR/mutant-ws-m2"
+mkdir -p "$MUT2_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT2_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT2_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT2_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT2_WS/"
+printf '\n[workspace]\n' >>"$MUT2_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m2=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if ! sed -i 's|rc::dec_ref(t); // 3gv-M2 anchor: map_core releases its consumed task|let _ = t; // 3gv-M2: task release dropped|' "$MUT2_WS/fln-unsafe-abi/src/export.rs" \
+    || ! grep -q "3gv-M2: task release dropped" "$MUT2_WS/fln-unsafe-abi/src/export.rs"; then
+    fail mutant_plant_m2 "\"detail\":\"mutation did not apply to the copy\""
+fi
+if ! (cd "$MUT2_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT2_WS/target" cargo rustc --offline -q --crate-type staticlib --release) >"$ART_DIR/mutant2_build.log" 2>&1; then
+    fail mutant_build_m2 "\"artifact\":\"mutant2_build.log\""
+fi
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$MUT2_WS/target/release/libfln_unsafe_abi.a" -lpthread -ldl -lm \
+    -o "$ART_DIR/probe_mutant2" >"$ART_DIR/gcc_mutant2.log" 2>&1; then
+    fail mutant_link_m2 "\"artifact\":\"gcc_mutant2.log\""
+fi
+set +e
+timeout 120 "$ART_DIR/probe_mutant2" >"$ART_DIR/facts_mutant2.ndjson" 2>"$ART_DIR/probe_mutant2.err"
+set -e
+if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant2.ndjson" >/dev/null 2>&1; then
+    fail mutant_drill_m2 "\"detail\":\"3gv-M2 SURVIVED — the gauntlet does not discriminate the task plane's ownership convention\""
+fi
+if ! grep -q '"probe":"task.map.shared_src_rc","value":2' "$ART_DIR/facts_mutant2.ndjson"; then
+    fail mutant_drill_m2 "\"detail\":\"mutant diverged but not on the designed discriminator\",\"artifact\":\"facts_mutant2.ndjson\""
+fi
+real_sha_after_m2=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m2" != "$real_sha_after_m2" ]; then
+    fail mutant_isolation_m2 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"3gv-M2\",\"discriminator\":\"task.map.shared_src_rc\",\"real_tree_sha_stable\":true"
+
+# ---- lane 8c: named mutant 3gv-M3 ---------------------------------------------
+# Publication-discipline perturbation through the manager: resolve_core stops
+# marking the published value multi-threaded (the single mark_mt choke point,
+# object.cpp:892-902). Planted in a THIRD copy; the differential must catch
+# it (mgr.promise.resolved_value_is_mt flips 1 -> 0) and the REAL tree must
+# stay byte-identical.
+note "lane 8c: mutant drill 3gv-M3 (resolve_core's mark_mt dropped in a copy)"
+MUT3_WS="$ART_DIR/mutant-ws-m3"
+mkdir -p "$MUT3_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT3_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT3_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT3_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT3_WS/"
+printf '\n[workspace]\n' >>"$MUT3_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m3=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/task_manager.rs" | cut -d' ' -f1)
+if ! sed -i 's|unsafe { rc::mark_mt(v) };|let _ = \&v; // 3gv-M3: publication marking dropped|' "$MUT3_WS/fln-unsafe-abi/src/task_manager.rs" \
+    || ! grep -q "3gv-M3: publication marking dropped" "$MUT3_WS/fln-unsafe-abi/src/task_manager.rs"; then
+    fail mutant_plant_m3 "\"detail\":\"mutation did not apply to the copy\""
+fi
+if ! (cd "$MUT3_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT3_WS/target" cargo rustc --offline -q --crate-type staticlib --release) >"$ART_DIR/mutant3_build.log" 2>&1; then
+    fail mutant_build_m3 "\"artifact\":\"mutant3_build.log\""
+fi
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$MUT3_WS/target/release/libfln_unsafe_abi.a" -lpthread -ldl -lm \
+    -o "$ART_DIR/probe_mutant3" >"$ART_DIR/gcc_mutant3.log" 2>&1; then
+    fail mutant_link_m3 "\"artifact\":\"gcc_mutant3.log\""
+fi
+set +e
+timeout 120 "$ART_DIR/probe_mutant3" >"$ART_DIR/facts_mutant3.ndjson" 2>"$ART_DIR/probe_mutant3.err"
+set -e
+if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant3.ndjson" >/dev/null 2>&1; then
+    fail mutant_drill_m3 "\"detail\":\"3gv-M3 SURVIVED — the gauntlet does not discriminate the publication discipline\""
+fi
+if ! grep -q '"probe":"mgr.promise.resolved_value_is_mt","value":0' "$ART_DIR/facts_mutant3.ndjson"; then
+    fail mutant_drill_m3 "\"detail\":\"mutant diverged but not on the designed discriminator\",\"artifact\":\"facts_mutant3.ndjson\""
+fi
+real_sha_after_m3=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/task_manager.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m3" != "$real_sha_after_m3" ]; then
+    fail mutant_isolation_m3 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"3gv-M3\",\"discriminator\":\"mgr.promise.resolved_value_is_mt\",\"real_tree_sha_stable\":true"
 
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"

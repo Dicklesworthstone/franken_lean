@@ -574,10 +574,14 @@ An axiom is its checked type; no body, no defeq obligation.
 
 ### KR-974 · Definitions, theorems, opaques
 anchor: vendor/lean4-src/src/kernel/environment.cpp:160 (add_definition) expect="add_definition"
-fixtures: stub owner=franken_lean-z6c
+anchor: vendor/lean4-src/src/kernel/environment.cpp:192 (add_theorem) expect="add_theorem"
+anchor: vendor/lean4-src/src/kernel/environment.cpp:211 (add_opaque) expect="add_opaque"
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
 The body's inferred type must be defeq to the declared type; theorems additionally
 require a Prop-valued type; unsafe definitions check header-first to permit
-recursion.
+recursion. Opaques are checked with the ordinary safe checker even when their
+`isUnsafe` metadata bit is set; an accepted opaque publishes as opaque and its body
+never becomes a delta-reduction rule.
 
 ### KR-975 · The unsafe quarantine
 anchor: vendor/lean4-src/src/kernel/type_checker.cpp:101 (infer_constant) expect="is_unsafe"
@@ -592,17 +596,128 @@ Safe definitions may not reference partial definitions.
 
 ### KR-977 · Mutual definitions are unsafe-only
 anchor: vendor/lean4-src/src/kernel/environment.cpp:224 (add_mutual) expect="add_mutual"
-fixtures: stub owner=franken_lean-z6c
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
 A mutual definition block must be non-empty, must not be tagged safe, and all
-members must share one safety annotation; headers first, then each body defeq to
-its type.
+members must share one safety annotation. Every header checks against the original
+environment, every member is then visible in one private scratch environment, and
+only then is each body checked defeq to its type under one shared budget. Failure
+publishes no prefix. FrankenLean additionally applies KR-970 inside the private
+scratch block and refuses a duplicate member name; the pin's unchecked `add_core`
+loop would overwrite that malformed raw block member.
 
 ### KR-978 · The unchecked door is not a rule
 anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
-fixtures: stub owner=franken_lean-z6c
+fixtures: crates/fln-kernel/tests/checked_declaration_capability.rs, crates/fln-kernel/tests/consensus_seat.rs, crates/fln-kernel/tests/k1_judgments.rs
 The Reference exposes an add-without-checking entry point. In FrankenLean nothing
 outside `fln-kernel` can admit a constant (FL-INV-02); trust-level bypasses are
-journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row).
+journaled and surfaced in receipts, never silent (plan §4.1 wire/CLI row). An
+acceptance mints a private, non-serializable, single-use capability bound to the
+exact declaration and immutable base environment; council agreement is the only
+transition to publication. Multi-constant declarations stage their checked rows in
+private persistent environments and expose only the complete final environment.
+A duplicate, resource stop, cancellation, or internal fault at any member exposes
+no accepted prefix.
+
+---
+
+## 12. The admission state machine (KR-98x) — FL-INV-02
+
+Sections 1–11 decide what is *true*. This section decides **who may admit**. One
+authority, one capability, one transition to publication. The state machine is
+typed, and every edge not named here is mechanically absent, not merely unwise.
+
+### KR-980 · The state machine
+anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs, crates/fln-kernel/tests/consensus_seat.rs
+States: `Untrusted(Declaration)`, `Checking(Declaration)`, `Reviewed(Reviewable)`,
+`Published(Environment)`. Edges: `Untrusted → Checking` by submission;
+`Checking → Reviewed` by exactly one mechanism, an `Accepted` verdict from
+`fln_kernel::check`; `Checking → Rejected` (a complete terminal verdict);
+`Checking → Inconclusive | InternalFault` (non-answers, terminal, minting
+nothing); `Reviewed → Published` by exactly one mechanism, council `convene`.
+There is no edge `Untrusted → Published` and no edge into `Reviewed` except the
+kernel's own acceptance. The Reference's add-without-checking entry
+(`lean_add_decl`) is the counterexample this machine exists to exclude.
+
+### KR-981 · Untrusted at the boundary
+anchor: vendor/lean4-src/src/kernel/environment.cpp:152 (add_axiom) expect="add_axiom"
+fixtures: crates/fln-kernel/tests/checked_declaration_capability.rs
+Every declaration and environment arriving at the admission boundary is untrusted
+data: decoded from an `.olean`, deserialized from a cache, produced by a plugin,
+or handed in by an engine. Deserialization yields declarations, never verdicts;
+a cache entry is an environment value whose admissions were each checked at mint
+time, never an acceptance.
+
+### KR-982 · One check transition
+anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
+fixtures: crates/fln-kernel/tests/k1_judgments.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
+`check : Environment × Declaration → Verdict` is the only admission authority
+(FL-INV-02). Nothing outside `fln-kernel` can admit a constant — not the
+elaborator, not the build fabric, not a council seat, not a receipt, not another
+kernel engine, not a cache, not a certificate.
+
+### KR-983 · The opaque capability
+anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
+fixtures: crates/fln-kernel/tests/admission_laundering.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
+A kernel acceptance exists as exactly one value: `CheckedDecl`, minted only by
+`admit`, carrying the accepted declaration taken by value (so no caller copy can
+be substituted for it later) and the immutable base environment captured at
+check time, sealed by a private `Seal` type. It is not `Clone`, not `Copy`, not
+serializable, and not constructible outside `fln-kernel` — inexpressibility is
+proven by compile failure (KR-986), never asserted by convention.
+
+### KR-984 · Publication is a council transition
+anchor: vendor/lean4-src/src/kernel/environment.cpp:160 (add_definition) expect="add_definition"
+fixtures: crates/fln-kernel/tests/consensus_seat.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
+The only edge from `Reviewed` to `Published` is a council `convene` agreement;
+the capability is consumed by the move, and disagreement halts rather than
+outvotes. Publication writes into the exact base the kernel checked against —
+substitution and replay are inexpressible because there is no environment
+argument to get wrong. Multi-constant declarations stage in private persistent
+environments and expose only the complete block; a duplicate, resource stop,
+cancellation, or internal fault at any member exposes no accepted prefix.
+
+### KR-985 · The consumer inventory
+anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
+fixtures: crates/fln-kernel/tests/admission_laundering.rs, crates/fln-kernel/tests/checked_declaration_capability.rs, crates/fln-kernel/tests/consensus_seat.rs
+**Allowed** consumers of a kernel acceptance: fln-env's plan/commit publication
+path (which revalidates the base immediately before every write), council seats
+(which re-derive comparability from the capability's calibrated budget), and
+receipts (records downstream of publication, never inputs to it). Every other
+named consumer class is **forbidden**, with its refusal mechanism:
+
+* receipts and certificates — records, not authorities; a receipt carries no
+  capability, and no deserializable capability exists;
+* checker verdicts (fln-checker or foreign) — a second opinion; consensus joins
+  seats, but no seat alone admits, and disagreement halts (KR-984);
+* deserialization of any acceptance token — no serialization path exists for
+  the capability, by construction (KR-983);
+* cache hits — a cache entry is an environment value; publication through it
+  re-runs plan/commit revalidation, and acceptance is never read out of a cache;
+* plugins — native code yields declarations, admitted exactly as any untrusted
+  input (KR-981);
+* frontier engines — outputs are untrusted artifacts and enter an environment
+  only through a kernel-checked artifact (FL-INV-06);
+* unsafe boundary crates — no transitive dependency path to the kernel exists
+  (D3, FLN-STRUCT-008), and no boundary export can launder an acceptance (the
+  boundary API covenant).
+
+### KR-986 · The launder-refusal fixtures
+anchor: vendor/lean4-src/src/kernel/environment.cpp:275 (lean_add_decl) expect="lean_add_decl"
+fixtures: crates/fln-kernel/tests/admission_laundering.rs
+Every forbidden class of KR-985 carries a mechanical proof, not an argument:
+compile-fail probes (a `CheckedDecl` forge outside the kernel crate does not
+compile), source censuses (no serialization path exists in the capability or
+its crate), and mutation cells proving each refusal fires with its reason. The
+fixtures live in `crates/fln-kernel/tests/admission_laundering.rs`.
+
+### KR-987 · Non-promotion (FL-INV-07)
+anchor: vendor/lean4-src/src/kernel/type_checker.cpp:274 (infer_type_core) expect="check_system"
+fixtures: crates/fln-kernel/tests/admission_laundering.rs, crates/fln-kernel/tests/checked_declaration_capability.rs
+`Inconclusive` and `InternalFault` mint nothing and promote to nothing: never
+`Accepted`, never `Rejected`, never a capability, never published, never cached
+as a verdict. A resource stop is a fact about a run (KR-4xx), recorded as
+itself, never as a judgment about the term.
 
 ---
 

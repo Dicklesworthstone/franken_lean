@@ -2,10 +2,25 @@
 //!
 //! A logical root digests **declarations + extension deltas + options** and nothing
 //! else. Exclusion of the operational world is structural: this API has no parameter
-//! through which wall-clock, paths, host names, or scheduler traces could enter, and
-//! the digest is insertion-order independent, so two hosts (or two thread counts)
-//! producing the same trusted environment produce the same root — the cache key the
-//! Ledger, receipts, and Envoy all speak.
+//! through which wall-clock, paths, host names, or scheduler traces could enter — it is
+//! the cache key the Ledger, receipts, and Envoy all speak.
+//!
+//! **Declarations and extension deltas are insertion-order independent**, so any number
+//! of hosts or thread counts that accumulate the same ones produce the same root.
+//!
+//! **Options are not**, and this doc claimed they were until bead franken_lean-rps
+//! checked it. Options go through `KVMap`'s order-sensitive canonical encoding, because
+//! upstream `KVMap` is an ordered association list and the Tribunal's exclusive
+//! metamorphic law requires a permutation to move the root. So two hosts that set the
+//! same options in a different order get different roots even though every option lookup
+//! agrees. [`set_options`] states the consequence and names the projection a caller uses
+//! when it wants set identity instead.
+//!
+//! Every one of the three inputs is now pinned in **both** directions — permuting must
+//! (or must not) move the root, *and* distinct inputs must still separate — so whichever
+//! way the options question is finally settled, it cannot change by accident.
+//!
+//! [`set_options`]: LogicalRootBuilder::set_options
 
 use std::collections::BTreeMap;
 
@@ -60,8 +75,64 @@ impl LogicalRootBuilder {
         self
     }
 
-    /// Record the elaboration-relevant options set. The KVMap is digested via its
-    /// canonical encoding under [`Domain::OptionsSet`].
+    /// Record the elaboration-relevant options, digested under [`Domain::OptionsSet`]
+    /// via `KVMap`'s canonical encoding — which is **order-sensitive**.
+    ///
+    /// So options are the one input to this root that a permutation moves, and that is
+    /// deliberate: the Tribunal's exclusive metamorphic law
+    /// (`fln-conformance/tests/metamorphic_laws.rs::canonical_ordered_rows_are_order_sensitive`)
+    /// requires every non-identity permutation of unique rows to change both the
+    /// canonical bytes and the options-bearing root, on the ground that upstream `KVMap`
+    /// is an ordered association list and therefore an ordering IS part of the value.
+    ///
+    /// **Know what it costs**, because the module doc used to claim the opposite. Order is
+    /// unobservable through *our* lookups: with the unique keys `KVMap` guarantees, two
+    /// differently-ordered maps carrying the same pairs agree on every `find`, `contains`,
+    /// and `get_*`. So two hosts that set the same options in a different order get
+    /// different roots while behaving identically here — a spurious cache miss. A caller
+    /// that wants set identity canonicalizes first;
+    /// [`kvmap_canonical_set_bytes`](crate::canon::kvmap_canonical_set_bytes) is that
+    /// projection, under its own schema so the choice is explicit at the call site rather
+    /// than smuggled into this digest.
+    ///
+    /// **This is settled, not pending** (decided 2026-07-25 on bead franken_lean-rps).
+    /// Requirement (d)'s "two hosts producing the same trusted environment share a logical
+    /// root" is read with option order *inside* the environment, on two grounds:
+    ///
+    /// * **The Reference distinguishes them, so they are not one environment.** `Options`
+    ///   is a `KVMap` — an ordered association list — so order is observable upstream.
+    ///   Under the Oracle-Only Law our encoding mirrors what the pin actually
+    ///   distinguishes; we do not get to decide the semantics are cleaner than they are,
+    ///   and faithful mode requires bug-for-bug observational parity. "We normalized away
+    ///   a distinction upstream preserves" is revert-class drift. Note the phrasing above
+    ///   carefully: the cost is a redundant distinction *by our lookups*, not two
+    ///   identities for one environment.
+    /// * **False identity is the strictly more dangerous error.** A redundant distinction
+    ///   costs a cache miss. A collision means a cached or replayed result can be
+    ///   attributed to the wrong closure, silently, with nothing detecting it — and this
+    ///   digest is what the Ledger, receipts, and the transparency log key on. That is the
+    ///   defect class of bead franken_lean-f6br, where `witness_digest` bound a lossy
+    ///   display projection of `Name` and distinct finding sets shared a witness. Not to
+    ///   be reintroduced one layer up.
+    ///
+    /// So the behaviour above is correct and **is not a bug to fix**. Changing it fails
+    /// `options_are_identified_as_an_ordered_list_not_a_set` here and the Tribunal's
+    /// exclusive MR in fln-conformance; `option_identity_does_not_collapse_distinct_option_sets`
+    /// pins the other direction, so it cannot quietly become a digest that varies with
+    /// everything either.
+    ///
+    /// **The reopen condition has since been answered, in the negative — so this is now
+    /// closed more firmly, not still pending.** It was: Tribunal evidence that the
+    /// Reference cannot observe option order or duplicate keys in any surface we mirror.
+    /// Bead franken_lean-l84f went and looked, by running the pinned toolchain rather
+    /// than reading it: the Reference observes a duplicate key through `size`, `entries`,
+    /// `ToString`, `Repr`, the shape `insert` leaves behind, and — the one I had guessed
+    /// wrong — its own semantic `eqv`, which returns false for two maps that agree on
+    /// every `find`. Order is likewise visible through `entries` and rendering, though
+    /// not through `find`, `size`, or `eqv`. So the Reference can observe both, the
+    /// evidence that would have reopened this does not exist, and mirroring what the pin
+    /// distinguishes is the only reading left. Reopening now needs new evidence, on the
+    /// bead, not here.
     pub fn set_options(&mut self, options: &KVMap) -> &mut LogicalRootBuilder {
         self.options = Some(hash(Domain::OptionsSet, &options.to_canonical_bytes()));
         self
@@ -139,37 +210,117 @@ mod tests {
         assert_eq!(forward.finalize(), reverse.finalize());
     }
 
+    /// Accumulate a commit with declarations added in `order`.
+    fn accumulate(entries: &[(Name, Digest)], order: &[usize]) -> LogicalRoot {
+        let mut builder = LogicalRootBuilder::new();
+        for &index in order {
+            let (name, digest) = &entries[index];
+            builder.add_decl(name, *digest);
+        }
+        builder.finalize()
+    }
+
+    /// The full input closure of a commit, rendered for diagnosis.
+    ///
+    /// The acceptance criterion asks for this by name — "the full input closure logged in
+    /// the test output for diagnosis on mismatch" — because a bare "roots differ" tells
+    /// whoever is paged nothing about *which* input moved. Declarations are listed in
+    /// canonical-byte order so two reports diff cleanly regardless of accumulation order,
+    /// and the accumulation order is printed separately since that is the variable under
+    /// test.
+    fn closure_report(label: &str, entries: &[(Name, Digest)], order: &[usize]) -> String {
+        let mut out = format!(
+            "input closure [{label}]: {} declarations, accumulated in order [{}]\n",
+            entries.len(),
+            order
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut sorted: Vec<&(Name, Digest)> = entries.iter().collect();
+        sorted.sort_by_key(|(name, _)| name.to_canonical_bytes());
+        for (name, digest) in sorted {
+            out.push_str(&format!(
+                "  decl {} -> {}\n",
+                name.to_display_string(),
+                digest.to_hex()
+            ));
+        }
+        out
+    }
+
     #[test]
-    fn root_is_schedule_independent_across_thread_counts() {
-        // The FL-INV-01 posture at this layer: {1, 8} threads, arbitrary interleaving,
-        // same commit ⇒ same root.
+    fn root_is_schedule_independent_across_the_thread_matrix() {
         let entries = sample_entries();
-        let sequential = {
-            let mut b = LogicalRootBuilder::new();
-            for (n, d) in &entries {
-                b.add_decl(n, *d);
-            }
-            b.finalize()
-        };
-        for threads in [2usize, 8] {
-            let chunks: Vec<Vec<(Name, Digest)>> = entries
-                .chunks(entries.len().div_ceil(threads))
-                .map(<[(Name, Digest)]>::to_vec)
-                .collect();
-            let collected = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunks
-                    .iter()
-                    .map(|chunk| scope.spawn(move || chunk.clone()))
-                    .collect();
-                let mut b = LogicalRootBuilder::new();
-                for handle in handles {
-                    for (n, d) in handle.join().expect("worker") {
-                        b.add_decl(&n, d);
-                    }
+        let canonical: Vec<usize> = (0..entries.len()).collect();
+        let baseline = accumulate(&entries, &canonical);
+
+        // DETERMINISTIC ADVERSARIAL ORDERS FIRST. The previous version of this test
+        // joined worker handles in spawn order, so the builder always received entries
+        // in the same sequence no matter how many threads produced them — it could not
+        // have detected an order-dependent accumulator, which is the only thing it
+        // claimed to test. These orders cover non-identity schedules without depending
+        // on the scheduler doing anything interesting.
+        let reversed: Vec<usize> = canonical.iter().rev().copied().collect();
+        let rotated: Vec<usize> = canonical[7..]
+            .iter()
+            .chain(&canonical[..7])
+            .copied()
+            .collect();
+        let swapped_pairs: Vec<usize> = canonical
+            .chunks(2)
+            .flat_map(|pair| pair.iter().rev().copied())
+            .collect();
+        for (label, order) in [
+            ("reversed", &reversed),
+            ("rotated", &rotated),
+            ("adjacent-swaps", &swapped_pairs),
+        ] {
+            assert_eq!(
+                accumulate(&entries, order),
+                baseline,
+                "{label} accumulation moved the root\n{}{}",
+                closure_report("baseline", &entries, &canonical),
+                closure_report(label, &entries, order)
+            );
+        }
+
+        // THEN REAL CONCURRENCY, at the project's thread matrix {1, 8, 32} (PG-5 /
+        // FL-INV-01 — the old [2, 8] matched neither the doctrine nor its own comment).
+        // Arrival order is decided by lock contention rather than by join order, so the
+        // accumulation sequence genuinely varies run to run.
+        for threads in [1usize, 8, 32] {
+            let arrived: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let chunk_size = entries.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for chunk in canonical.chunks(chunk_size) {
+                    let arrived = &arrived;
+                    scope.spawn(move || {
+                        for &index in chunk {
+                            arrived.lock().expect("not poisoned").push(index);
+                        }
+                    });
                 }
-                b.finalize()
             });
-            assert_eq!(collected, sequential, "{threads} threads diverged");
+            let order = arrived.into_inner().expect("not poisoned");
+            assert_eq!(
+                order.len(),
+                entries.len(),
+                "{threads} workers dropped or duplicated an entry: [{}]",
+                order
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            assert_eq!(
+                accumulate(&entries, &order),
+                baseline,
+                "{threads} threads diverged\n{}{}",
+                closure_report("baseline", &entries, &canonical),
+                closure_report(&format!("{threads}-threads"), &entries, &order)
+            );
         }
     }
 
@@ -210,6 +361,197 @@ mod tests {
         twice.add_decl(&name("a"), decl_content_digest(b"old"));
         twice.add_decl(&name("a"), decl_content_digest(b"new"));
         assert_eq!(once.finalize(), twice.finalize());
+    }
+
+    fn option_pairs() -> Vec<(Name, DataValue)> {
+        vec![
+            (name("pp.all"), DataValue::OfBool(true)),
+            (name("maxHeartbeats"), DataValue::OfNat(200)),
+            (name("trace.simp"), DataValue::OfString("on".to_string())),
+            (name("weight"), DataValue::OfInt(-3)),
+        ]
+    }
+
+    fn map_of(pairs: &[(Name, DataValue)]) -> KVMap {
+        let mut map = KVMap::new();
+        for (key, value) in pairs {
+            map.insert(key.clone(), value.clone());
+        }
+        map
+    }
+
+    fn root_with_options(options: &KVMap) -> LogicalRoot {
+        let mut b = LogicalRootBuilder::new();
+        b.add_decl(&name("Nat.add"), decl_content_digest(b"body"));
+        b.set_options(options);
+        b.finalize()
+    }
+
+    /// Options are the one input a permutation moves, and the exact boundary is worth
+    /// pinning rather than inferring: EVERY non-identity permutation must move the root
+    /// (matching the Tribunal's exclusive MR), while the identity permutation must not,
+    /// and the two maps must remain indistinguishable by lookup throughout — which is
+    /// what makes this a deliberate choice about identity rather than an accident.
+    ///
+    /// The module doc used to claim unqualified insertion-order independence, so a reader
+    /// had no way to learn this from either the doc or a test. Whichever way the question
+    /// on franken_lean-rps is settled, flipping this behaviour now requires editing a
+    /// test that says why.
+    #[test]
+    fn options_are_identified_as_an_ordered_list_not_a_set() {
+        let pairs = option_pairs();
+        let baseline = root_with_options(&map_of(&pairs));
+        let reference = map_of(&pairs);
+
+        // All 24 permutations of four entries, so the claim covers adjacent swaps and
+        // full reversals alike rather than one convenient shuffle.
+        let mut indices: Vec<usize> = (0..pairs.len()).collect();
+        let mut seen = 0usize;
+        let identity: Vec<usize> = (0..pairs.len()).collect();
+        permute(&mut indices, 0, &mut |order| {
+            let shuffled: Vec<(Name, DataValue)> =
+                order.iter().map(|&i| pairs[i].clone()).collect();
+            let map = map_of(&shuffled);
+
+            // Indistinguishable by every observable lookup: this is the cost being
+            // accepted, stated as an assertion so it cannot be forgotten.
+            for (key, _) in &pairs {
+                assert_eq!(
+                    map.find(key),
+                    reference.find(key),
+                    "{order:?} changed a lookup"
+                );
+            }
+            assert_eq!(map.len(), reference.len());
+
+            if order == identity.as_slice() {
+                assert_eq!(
+                    root_with_options(&map),
+                    baseline,
+                    "the identity permutation moved the root"
+                );
+            } else {
+                assert_ne!(
+                    root_with_options(&map),
+                    baseline,
+                    "permutation {order:?} did NOT move the root — options would be a set, \
+                     contradicting the Tribunal's exclusive MR"
+                );
+            }
+            seen += 1;
+        });
+        assert_eq!(seen, 24, "the permutation walk is incomplete");
+
+        // The set projection is the escape hatch, and it must genuinely be one: over the
+        // same permutations it must NOT vary. A caller who wants set identity has a
+        // supported way to get it.
+        let projections: std::collections::BTreeSet<Vec<u8>> = {
+            let mut indices: Vec<usize> = (0..pairs.len()).collect();
+            let mut set = std::collections::BTreeSet::new();
+            permute(&mut indices, 0, &mut |order| {
+                let shuffled: Vec<(Name, DataValue)> =
+                    order.iter().map(|&i| pairs[i].clone()).collect();
+                set.insert(
+                    crate::canon::kvmap_canonical_set_bytes(&map_of(&shuffled))
+                        .expect("these option keys are unique, so a set view exists"),
+                );
+            });
+            set
+        };
+        assert_eq!(
+            projections.len(),
+            1,
+            "the set projection varied across permutations, so it is not a set view"
+        );
+    }
+
+    /// The other direction, which is what keeps the test above from being satisfiable by
+    /// a digest that simply varies with everything: distinct option content must separate,
+    /// and it must separate for the right reasons.
+    #[test]
+    fn option_identity_does_not_collapse_distinct_option_sets() {
+        let pairs = option_pairs();
+        let base = root_with_options(&map_of(&pairs));
+
+        // A different value under the same key.
+        let mut changed = pairs.clone();
+        changed[1].1 = DataValue::OfNat(201);
+        assert_ne!(root_with_options(&map_of(&changed)), base, "value ignored");
+
+        // A different key carrying the same value.
+        let mut renamed = pairs.clone();
+        renamed[0].0 = name("pp.raw");
+        assert_ne!(root_with_options(&map_of(&renamed)), base, "key ignored");
+
+        // Same multiset of values, swapped between two keys — the case a digest that
+        // hashed keys and values in separate streams would miss.
+        let mut swapped = pairs.clone();
+        swapped[0].1 = DataValue::OfBool(false);
+        let mut also_swapped = swapped.clone();
+        also_swapped.swap(0, 3);
+        also_swapped[0].0 = pairs[0].0.clone();
+        also_swapped[3].0 = pairs[3].0.clone();
+        assert_ne!(
+            root_with_options(&map_of(&swapped)),
+            base,
+            "a changed boolean was ignored"
+        );
+
+        // A dropped entry and an added entry.
+        assert_ne!(
+            root_with_options(&map_of(&pairs[..3])),
+            base,
+            "a dropped option was ignored"
+        );
+        let mut extra = pairs.clone();
+        extra.push((name("extra"), DataValue::OfBool(false)));
+        assert_ne!(
+            root_with_options(&map_of(&extra)),
+            base,
+            "an added option was ignored"
+        );
+
+        // Same type, different DataValue constructor: OfNat(1) is not OfInt(1) and not
+        // OfBool(true), so the value tag must reach the root.
+        for value in [
+            DataValue::OfNat(1),
+            DataValue::OfInt(1),
+            DataValue::OfString("1".to_string()),
+        ] {
+            let mut typed = pairs.clone();
+            typed[1].1 = value.clone();
+            let mut other = pairs.clone();
+            other[1].1 = DataValue::OfBool(true);
+            assert_ne!(
+                root_with_options(&map_of(&typed)),
+                root_with_options(&map_of(&other)),
+                "the value constructor {value:?} did not reach the root"
+            );
+        }
+
+        // No options at all is distinct from an empty set of options, which is distinct
+        // from a populated one: absence and emptiness are different facts.
+        let no_options = {
+            let mut b = LogicalRootBuilder::new();
+            b.add_decl(&name("Nat.add"), decl_content_digest(b"body"));
+            b.finalize()
+        };
+        let empty_options = root_with_options(&KVMap::new());
+        assert_ne!(no_options, empty_options, "absent options == empty options");
+        assert_ne!(empty_options, base);
+    }
+
+    /// Generate every permutation of `slice`, calling `visit` on each.
+    fn permute(slice: &mut Vec<usize>, at: usize, visit: &mut impl FnMut(&[usize])) {
+        if at == slice.len() {
+            visit(slice);
+            return;
+        }
+        for i in at..slice.len() {
+            slice.swap(at, i);
+            permute(slice, at + 1, visit);
+            slice.swap(at, i);
+        }
     }
 
     #[test]

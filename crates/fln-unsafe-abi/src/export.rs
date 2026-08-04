@@ -26,8 +26,12 @@
 //! `RawPlatform` in the export-status ledger).
 //!
 //! Slice-1 typed restrictions (tracked in `ci/ABI_EXPORT_STATUS.txt`, never
-//! silent): closure application (`lean_apply_*`) — franken_lean-7xe; tasks /
-//! IO (`lean_io_*`, `lean_task_*`) — fln-3gv; bignum arithmetic
+//! silent): closure application (`lean_apply_*`) — franken_lean-7xe; the
+//! task plane is LIVE (fln-3gv slices 2-3: the state family, the promise
+//! family, and the manager — `task_manager.rs`), with the `io.cpp` wrapper
+//! family (as_task/map_task/bind_task/wait/wait_any + the cancel wrappers)
+//! and `wait_any_core` still fln-3gv's next slice; general IO
+//! (`lean_io_*` beyond those) — fln-3gv; bignum arithmetic
 //! (`lean_nat_big_*`, `lean_int_big_*`) — the fln-bignum shim; panic-path
 //! Lean-buffered stderr and backtrace printing — fln-3gv (messages go to the
 //! process stderr until the IO plane exists).
@@ -40,7 +44,6 @@ use crate::rc;
 use crate::tagged::is_scalar;
 use core::ffi::{c_char, c_uint, c_void};
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::cell::Cell;
 use std::io::Write;
 
 // ---------------------------------------------------------------- panic core
@@ -58,7 +61,7 @@ fn should_abort_on_panic() -> bool {
 
 /// `lean_internal_panic`'s body (`object.cpp:91-95`): message to the process
 /// stderr, then abort (env) or `exit(1)`.
-fn internal_panic_impl(msg: &str) -> ! {
+pub(crate) fn internal_panic_impl(msg: &str) -> ! {
     let mut err = std::io::stderr().lock();
     let _ = writeln!(err, "INTERNAL PANIC: {msg}");
     let _ = err.flush();
@@ -73,7 +76,7 @@ fn internal_panic_impl(msg: &str) -> ! {
 /// routes non-fatal messages through the Lean IO stderr buffer
 /// (`io_eprintln`) and can print a backtrace; both need the fln-3gv IO
 /// plane, so every message goes to the process stderr here.
-fn panic_impl(msg: &[u8]) {
+pub(crate) fn panic_impl(msg: &[u8]) {
     if PANIC_MESSAGES.load(Ordering::Relaxed) {
         let mut err = std::io::stderr().lock();
         let _ = err.write_all(msg);
@@ -86,20 +89,6 @@ fn panic_impl(msg: &[u8]) {
     if should_abort_on_panic() {
         std::process::abort();
     }
-}
-
-thread_local! {
-    /// `g_heartbeat` (`interrupt.cpp:18`): thread-local allocation/progress
-    /// counter. The calibrated heartbeat *law* (fuel parity) is bead
-    /// fln-8w8/G0-6; the counting twin lives here so the exported symbol has
-    /// the pin's exact storage discipline from day one.
-    static HEARTBEAT: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Test hook: current thread's heartbeat count.
-#[cfg(test)]
-pub(crate) fn heartbeat_value() -> usize {
-    HEARTBEAT.with(Cell::get)
 }
 
 // ---------------------------------------------------------------- UTF-8 core
@@ -243,6 +232,9 @@ unsafe fn mk_string_from_bytes_impl(s: *const c_char, sz: usize) -> *mut LeanObj
     let bytes = if sz == 0 {
         &[][..]
     } else {
+        // SAFETY: the note above, stated where a mechanical reader looks for
+        // it. `sz > 0` in this arm and the caller's C contract vouches for `sz`
+        // readable bytes at `s`; the slice only borrows them for this call.
         unsafe { core::slice::from_raw_parts(s.cast::<u8>(), sz) }
     };
     let mut pos = 0usize;
@@ -299,6 +291,7 @@ pub(crate) extern "C" fn export_lean_alloc_small(sz: c_uint, slot_idx: c_uint) -
     debug_assert!(sz > 0 && sz.is_multiple_of(8));
     debug_assert!(slot_idx == sz / 8 - 1, "lean_get_slot_idx law (lean.h:394)");
     let _ = slot_idx;
+    membrane::charge_small_allocation();
     // SAFETY: sz > 0 per the inline callers' contract (asserted upstream).
     let p = unsafe { membrane::small_alloc_raw(sz as usize) };
     if p.is_null() {
@@ -393,12 +386,46 @@ pub(crate) extern "C" fn export_lean_free_object(o: *mut LeanObject) {
 
 // ---- heartbeat ---------------------------------------------------------------
 
-/// `lean_inc_heartbeat` (`interrupt.cpp:28`): thread-local counter.
+/// `lean_inc_heartbeat` (`alloc.cpp:493-496`): allocation-linked thread-local
+/// counter, distinct from `interrupt.cpp`'s `check_system` poll counter.
 // UNSAFE-LEDGER: FLN-UL-0079
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_inc_heartbeat")]
 pub(crate) extern "C" fn export_lean_inc_heartbeat() {
-    HEARTBEAT.with(|h| h.set(h.get().wrapping_add(1)));
+    membrane::add_heartbeats(1);
+}
+
+/// `IO.getNumHeartbeats` (`io.cpp:952-955`): snapshot the allocation-linked
+/// counter and return it as an owned Lean `Nat`.
+// UNSAFE-LEDGER: FLN-UL-0200
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_num_heartbeats")]
+pub(crate) extern "C" fn export_lean_io_get_num_heartbeats() -> *mut LeanObject {
+    let count = membrane::get_num_heartbeats();
+    if count <= crate::tagged::MAX_SMALL_NAT as u64 {
+        crate::tagged::boxi(count as usize)
+    } else {
+        export_lean_big_uint64_to_nat(count)
+    }
+}
+
+/// `IO.setNumHeartbeats` (`io.cpp:957-962`): consume a Lean `Nat`, install its
+/// low 64 bits as this runtime thread's allocation-linked counter, and return
+/// `Unit`.
+// UNSAFE-LEDGER: FLN-UL-0201
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_set_heartbeats")]
+pub(crate) extern "C" fn export_lean_io_set_heartbeats(count: *mut LeanObject) -> *mut LeanObject {
+    let value = if is_scalar(count) {
+        crate::tagged::unbox(count) as u64
+    } else {
+        export_lean_uint64_of_big_nat(count)
+    };
+    membrane::set_heartbeats(value);
+    // SAFETY: `count` is an owned `Nat` by the generated extern contract;
+    // conversion above only borrowed it, so the wrapper now consumes it.
+    unsafe { dec(count) };
+    crate::tagged::boxi(0)
 }
 
 // ---- reference counting ------------------------------------------------------
@@ -1205,22 +1232,41 @@ pub(crate) extern "C" fn export_lean_string_hash(s: *mut LeanObject) -> u64 {
 // truncations read low bits exactly as the pin's `mpz_fdiv_r_2exp` /
 // lowest-limb accessors do for non-negative values.
 
-use fln_bignum::nat::BigNat;
+use fln_bignum::nat::{BigNat, BigNatView};
 
-/// Borrowed Nat operand → owned `BigNat` value copy.
+/// Run `f` with a zero-copy view of a borrowed Nat operand.
+///
+/// Scalars use one stack limb for the callback invocation. Heap Nats borrow
+/// the mpz object's immutable ABI limb buffer directly. Because the callback's
+/// result type is independent of that borrow, the view cannot escape.
 ///
 /// # Safety
 /// `o` is a live boxed scalar or mpz Nat object.
 // UNSAFE-LEDGER: FLN-UL-0134
 #[allow(unsafe_code)]
-unsafe fn nat_as_bignat(o: *mut LeanObject) -> BigNat {
+unsafe fn with_nat_view<R>(o: *mut LeanObject, f: impl FnOnce(BigNatView<'_>) -> R) -> R {
     if is_scalar(o) {
-        BigNat::from_u64(crate::tagged::unbox(o) as u64)
+        let word = [crate::tagged::unbox(o) as u64];
+        let limbs = if word[0] == 0 { &[] } else { &word[..] };
+        f(BigNatView::from_limbs_le(limbs))
     } else {
         // SAFETY: live mpz object; |m_size| limbs are salient (Nat: >= 0).
-        let (_, size, limbs) = unsafe { object::mpz_fields(o) };
-        debug_assert!(size >= 0, "Nat mpz objects are non-negative");
-        BigNat::from_limbs_le(limbs)
+        let (alloc, size, pointer, live) = unsafe { object::mpz_fields(o) };
+        assert!(size >= 0, "Nat mpz objects are non-negative");
+        assert!(alloc >= 0, "mpz allocation count is negative");
+        assert!(
+            live <= alloc as usize,
+            "mpz live limb count exceeds its allocation"
+        );
+        let limbs = if live == 0 {
+            &[]
+        } else {
+            assert!(!pointer.is_null(), "nonempty mpz has a null limb buffer");
+            // SAFETY: live <= allocation was checked above; the borrowed Nat
+            // remains live for the duration of this non-escaping callback.
+            unsafe { core::slice::from_raw_parts(pointer, live) }
+        };
+        f(BigNatView::from_limbs_le(limbs))
     }
 }
 
@@ -1266,8 +1312,7 @@ unsafe fn nat_obj_from_bignat_core(n: &BigNat) -> *mut LeanObject {
 #[allow(unsafe_code)]
 unsafe fn big_nat_limb0(a: *mut LeanObject) -> u64 {
     // SAFETY: live mpz per the contract.
-    let (_, _, limbs) = unsafe { object::mpz_fields(a) };
-    limbs.first().copied().unwrap_or(0)
+    unsafe { with_nat_view(a, |value| value.limbs_le().first().copied().unwrap_or(0)) }
 }
 
 /// `lean_nat_big_add` (`object.cpp:1383-1391`): every arm is `_core` — a
@@ -1281,7 +1326,7 @@ pub(crate) extern "C" fn export_lean_nat_big_add(
 ) -> *mut LeanObject {
     // SAFETY: borrowed live Nat operands.
     unsafe {
-        let r = nat_as_bignat(a1).add(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.add(n2)));
         nat_obj_from_bignat_core(&r)
     }
 }
@@ -1300,12 +1345,19 @@ pub(crate) extern "C" fn export_lean_nat_big_sub(
         if is_scalar(a1) {
             return crate::tagged::boxi(0);
         }
-        let n1 = nat_as_bignat(a1);
-        let n2 = nat_as_bignat(a2);
-        if !is_scalar(a2) && n1.ble(&n2) && !n2.ble(&n1) {
+        let r = with_nat_view(a1, |n1| {
+            with_nat_view(a2, |n2| {
+                if !is_scalar(a2) && n1.ble(n2) && !n2.ble(n1) {
+                    None
+                } else {
+                    Some(n1.sub(n2))
+                }
+            })
+        });
+        let Some(r) = r else {
             return crate::tagged::boxi(0);
-        }
-        nat_obj_from_bignat(&n1.sub(&n2))
+        };
+        nat_obj_from_bignat(&r)
     }
 }
 
@@ -1320,7 +1372,7 @@ pub(crate) extern "C" fn export_lean_nat_big_mul(
 ) -> *mut LeanObject {
     // SAFETY: borrowed live Nat operands.
     unsafe {
-        let r = nat_as_bignat(a1).mul(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.mul(n2)));
         if is_scalar(a1) || is_scalar(a2) {
             nat_obj_from_bignat(&r)
         } else {
@@ -1358,7 +1410,7 @@ pub(crate) extern "C" fn export_lean_nat_big_div(
         if is_scalar(a2) && crate::tagged::unbox(a2) == 0 {
             return a2;
         }
-        let r = nat_as_bignat(a1).div(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.div(n2)));
         nat_obj_from_bignat(&r)
     }
 }
@@ -1383,7 +1435,7 @@ pub(crate) extern "C" fn export_lean_nat_big_mod(
             inc(a1);
             return a1;
         }
-        let r = nat_as_bignat(a1).rem(&nat_as_bignat(a2));
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.rem(n2)));
         nat_obj_from_bignat(&r)
     }
 }
@@ -1399,7 +1451,7 @@ pub(crate) extern "C" fn export_lean_nat_big_eq(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a1) || is_scalar(a2) {
             return false;
         }
-        nat_as_bignat(a1).beq(&nat_as_bignat(a2))
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.beq(n2)))
     }
 }
 
@@ -1417,7 +1469,7 @@ pub(crate) extern "C" fn export_lean_nat_big_le(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a2) {
             return false;
         }
-        nat_as_bignat(a1).ble(&nat_as_bignat(a2))
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.ble(n2)))
     }
 }
 
@@ -1434,9 +1486,7 @@ pub(crate) extern "C" fn export_lean_nat_big_lt(a1: *mut LeanObject, a2: *mut Le
         if is_scalar(a2) {
             return false;
         }
-        let n1 = nat_as_bignat(a1);
-        let n2 = nat_as_bignat(a2);
-        n1.ble(&n2) && !n1.beq(&n2)
+        with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.ble(n2) && !n1.beq(n2)))
     }
 }
 
@@ -1454,7 +1504,7 @@ pub(crate) extern "C" fn export_lean_nat_pow(
         if !is_scalar(a2) || crate::tagged::unbox(a2) > u32::MAX as usize {
             internal_panic_impl("Nat.pow exponent is too big");
         }
-        let r = nat_as_bignat(a1).pow(crate::tagged::unbox(a2) as u32);
+        let r = with_nat_view(a1, |n| n.pow(crate::tagged::unbox(a2) as u32));
         nat_obj_from_bignat(&r)
     }
 }
@@ -1786,7 +1836,7 @@ unsafe fn fix_args(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObjec
 /// references are yielded to the application.
 // UNSAFE-LEDGER: FLN-UL-0164
 #[allow(unsafe_code)]
-unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObject {
+pub(crate) unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObject {
     // SAFETY: mirrors the generated arms; every branch settles ownership
     // exactly as annotated inline.
     unsafe {
@@ -1837,6 +1887,69 @@ unsafe fn apply_core(f: *mut LeanObject, an: &[*mut LeanObject]) -> *mut LeanObj
         } else {
             fix_args(f, an)
         }
+    }
+}
+
+/// The exact 4-line violation block `notify_assertion_violation` prints
+/// (`debug.cpp:48-55`), factored pure so the byte layout is testable without
+/// crossing the crash path.
+pub(crate) fn format_assert_violation(file: &str, line: i32, condition: &str) -> String {
+    format!("LEAN ASSERTION VIOLATION\nFile: {file}\nLine: {line}\n{condition}\n")
+}
+
+/// `lean_notify_assert` (`debug.cpp:144-147`; declared at `lean.h:66` WITHOUT
+/// the `LEAN_EXPORT` token — the census-hole symbol the G0-3 plugin demand
+/// list surfaced). Prints upstream's exact violation block to stderr, then
+/// ABORTS. Documented divergence, crash-path only: upstream follows the print
+/// with `invoke_debugger()`, which by default throws a C++ exception
+/// reachable only by a C++ host; a Rust wrapper cannot throw one, and an
+/// assert violation is an invariant failure either way (FL-INV-07: never a
+/// user diagnostic, never a silent continue).
+// UNSAFE-LEDGER: FLN-UL-0186
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_notify_assert")]
+pub(crate) extern "C" fn export_lean_notify_assert(
+    file_name: *const core::ffi::c_char,
+    line: core::ffi::c_int,
+    condition: *const core::ffi::c_char,
+) -> ! {
+    // SAFETY: census-signatured entry; callers hand NUL-terminated C strings
+    // per the assert macro's expansion (`lean.h:67`). A null pointer is
+    // rendered as a placeholder rather than dereferenced.
+    let render = |p: *const core::ffi::c_char| -> String {
+        if p.is_null() {
+            "<null>".to_string()
+        } else {
+            // SAFETY: non-null per the branch; NUL-terminated per the assert
+            // macro's expansion (`lean.h:67` hands string literals).
+            unsafe { core::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    eprint!(
+        "{}",
+        format_assert_violation(&render(file_name), line, &render(condition))
+    );
+    std::process::abort()
+}
+
+/// `lean_string_append` (`object.cpp:2084-2105`): `s1` owned, `s2` borrowed
+/// (`lean.h:1225`); arms ported in [`object::string_append_core`], with the
+/// exclusivity verdict taken here exactly as upstream takes it.
+// UNSAFE-LEDGER: FLN-UL-0184
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_append")]
+pub(crate) extern "C" fn export_lean_string_append(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: census-signatured entry — callers hand live string objects under
+    // the lean.h ownership convention; the exclusivity read and the core's
+    // arms settle s1 in every path, s2 is never consumed.
+    unsafe {
+        let exclusive = is_exclusive(s1);
+        object::string_append_core(s1, s2, exclusive)
     }
 }
 
@@ -2095,4 +2208,1033 @@ pub(crate) extern "C" fn export_lean_string_to_utf8(s: *mut LeanObject) -> *mut 
         core::ptr::copy_nonoverlapping(data, dst, sz);
         r
     }
+}
+
+// ===================================================================
+// fln-3gv slice 1: the ST ref-cell plane + platform/error-string leaves.
+//
+// The effect plane's pure substrate — no threads, no event loop. The ST ref
+// family is `IO.Ref`'s carrier: the pin serves every access through a
+// single-threaded plain path unless the cell is multi-threaded or persistent
+// (`ref_maybe_mt`, io.cpp:1445), in which case the value slot is an atomic
+// with exchange discipline and stored values are marked multi-threaded.
+// Deviation disclosed in mechanism, not observables: the ST branches below go
+// through the same `AtomicPtr` slot with `Relaxed` ordering instead of plain
+// loads/stores — indistinguishable single-threaded, and it keeps one access
+// path per slot (`AtomicPtr<T>` is layout-identical to `*mut T`, the same
+// fact the thunk/task layouts already rely on).
+// ===================================================================
+
+/// `ref_maybe_mt` (`io.cpp:1445`): the cell is multi-threaded (`m_rc < 0`) or
+/// persistent (`m_rc == 0`); mirrors `lean_is_mt` / `lean_is_persistent`'s
+/// own plain header reads (`lean.h`).
+// UNSAFE-LEDGER: FLN-UL-0203
+#[allow(unsafe_code)]
+unsafe fn ref_maybe_mt(r: *mut LeanObject) -> bool {
+    // SAFETY: r is a live object per every caller's contract; the rc word is
+    // read plainly exactly as the pin's own inline predicates read it.
+    unsafe { (&raw const (*r).m_rc).read() <= 0 }
+}
+
+/// The ref value slot viewed atomically (`mt_ref_val_addr`, io.cpp:1430-1432).
+// UNSAFE-LEDGER: FLN-UL-0204
+#[allow(unsafe_code)]
+unsafe fn ref_val_slot<'a>(r: *mut LeanObject) -> &'a core::sync::atomic::AtomicPtr<LeanObject> {
+    // SAFETY: r is a live ref object; `AtomicPtr<LeanObject>` is
+    // layout-identical to the `*mut LeanObject` slot it overlays.
+    unsafe {
+        &*(&raw mut (*r.cast::<crate::layout::LeanRefObject>()).m_value)
+            .cast::<core::sync::atomic::AtomicPtr<LeanObject>>()
+    }
+}
+
+/// `lean_st_mk_ref` (`io.cpp:1423-1428`): a fresh single-threaded ref cell
+/// owning `a`.
+// UNSAFE-LEDGER: FLN-UL-0205
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_mk_ref")]
+pub(crate) extern "C" fn export_lean_st_mk_ref(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: `a` is consumed into the cell; alloc_ref owns header init.
+    unsafe { object::alloc_ref(a) }
+}
+
+/// `lean_st_ref_get` (`io.cpp:1447-1472`): borrowed cell, owned value out.
+/// The MT arm takes the RC token by exchange, duplicates it, and puts one
+/// token back, decrementing any value another thread wrote in the window.
+// UNSAFE-LEDGER: FLN-UL-0206
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_get")]
+pub(crate) extern "C" fn export_lean_st_ref_get(r: *mut LeanObject) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r is a live ref (borrowed); values leaving the slot follow the
+    // pin's exchange discipline exactly, so ownership is balanced on every
+    // path including the racing-writer arm.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            loop {
+                let val = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !val.is_null() {
+                    if !crate::tagged::is_scalar(val) {
+                        rc::inc_ref_n(val, 1);
+                    }
+                    let tmp = slot.swap(val, Ordering::SeqCst);
+                    if !tmp.is_null() && !crate::tagged::is_scalar(tmp) {
+                        rc::dec_ref(tmp);
+                    }
+                    return val;
+                }
+            }
+        } else {
+            let val = slot.load(Ordering::Relaxed);
+            if !crate::tagged::is_scalar(val) {
+                rc::inc_ref_n(val, 1);
+            }
+            val
+        }
+    }
+}
+
+/// `lean_st_ref_take` (`io.cpp:1474-1488`): borrowed cell, the value moves
+/// out and the slot is left null until the paired `set`.
+// UNSAFE-LEDGER: FLN-UL-0207
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_take")]
+pub(crate) extern "C" fn export_lean_st_ref_take(r: *mut LeanObject) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref; ownership of the slot's token transfers to the
+    // caller on both arms.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            loop {
+                let val = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !val.is_null() {
+                    return val;
+                }
+            }
+        } else {
+            let val = slot.load(Ordering::Relaxed);
+            slot.store(core::ptr::null_mut(), Ordering::Relaxed);
+            val
+        }
+    }
+}
+
+/// `lean_st_ref_set` (`io.cpp:1492-1510`): consumes `a`; the MT arm marks the
+/// stored value multi-threaded first (an ST graph must never be reachable
+/// from an MT object); returns the unit `box(0)`.
+// UNSAFE-LEDGER: FLN-UL-0208
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_set")]
+pub(crate) extern "C" fn export_lean_st_ref_set(
+    r: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref (borrowed), a consumed; the displaced value's token
+    // is released on both arms exactly as the pin does.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            if !crate::tagged::is_scalar(a) {
+                rc::mark_mt(a);
+            }
+            let old = slot.swap(a, Ordering::SeqCst);
+            if !old.is_null() && !crate::tagged::is_scalar(old) {
+                rc::dec_ref(old);
+            }
+        } else {
+            let old = slot.load(Ordering::Relaxed);
+            if !old.is_null() && !crate::tagged::is_scalar(old) {
+                rc::dec_ref(old);
+            }
+            slot.store(a, Ordering::Relaxed);
+        }
+    }
+    crate::tagged::boxi(0)
+}
+
+/// `lean_st_ref_swap` (`io.cpp:1512-1527`): consumes `a`, returns the old
+/// value; a null ST slot is the pin's `lean_internal_panic("null reference
+/// read")`, reproduced verbatim.
+// UNSAFE-LEDGER: FLN-UL-0209
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_swap")]
+pub(crate) extern "C" fn export_lean_st_ref_swap(
+    r: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    use core::sync::atomic::Ordering;
+    // SAFETY: r live ref (borrowed), a consumed, old token returned owned.
+    unsafe {
+        let slot = ref_val_slot(r);
+        if ref_maybe_mt(r) {
+            if !crate::tagged::is_scalar(a) {
+                rc::mark_mt(a);
+            }
+            loop {
+                let old = slot.swap(a, Ordering::SeqCst);
+                if !old.is_null() {
+                    return old;
+                }
+            }
+        } else {
+            let old = slot.load(Ordering::Relaxed);
+            if old.is_null() {
+                internal_panic_impl("null reference read");
+            }
+            slot.store(a, Ordering::Relaxed);
+            old
+        }
+    }
+}
+
+/// `lean_st_ref_ptr_eq` (`io.cpp:1530-1532`): cell identity, not value
+/// equality.
+// UNSAFE-LEDGER: FLN-UL-0212
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_st_ref_ptr_eq")]
+pub(crate) extern "C" fn export_lean_st_ref_ptr_eq(r1: *mut LeanObject, r2: *mut LeanObject) -> u8 {
+    u8::from(core::ptr::eq(r1, r2))
+}
+
+/// `lean_string_utf8_get` (`object.cpp:2219-2245` + `_fast_cold`): decode the
+/// scalar at byte position `i`; every out-of-range, non-scalar-index or
+/// invalid-encoding case is the pin's `lean_char_default_value()` = `'A'`.
+// UNSAFE-LEDGER: FLN-UL-0210
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_get")]
+pub(crate) extern "C" fn export_lean_string_utf8_get(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+) -> u32 {
+    const DEFAULT: u32 = 'A' as u32;
+    if !crate::tagged::is_scalar(i0) {
+        return DEFAULT;
+    }
+    let i = crate::tagged::unbox(i0);
+    // SAFETY: s is a live (borrowed) string; reads below stay inside the
+    // m_size-bounded content prefix.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let size = size.saturating_sub(1);
+        if i >= size {
+            return DEFAULT;
+        }
+        let bytes = core::slice::from_raw_parts(data, size);
+        let c = u32::from(bytes[i]);
+        if c < 0x80 {
+            return c;
+        }
+        if (c & 0xe0) == 0xc0 && i + 1 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let r = ((c & 0x1f) << 6) | (c1 & 0x3f);
+            if r >= 0x80 {
+                return r;
+            }
+        }
+        if (c & 0xf0) == 0xe0 && i + 2 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let r = ((c & 0x0f) << 12) | ((c1 & 0x3f) << 6) | (c2 & 0x3f);
+            if r >= 0x800 && !(0xD800..=0xDFFF).contains(&r) {
+                return r;
+            }
+        }
+        if (c & 0xf8) == 0xf0 && i + 3 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let c3 = u32::from(bytes[i + 3]);
+            let r = ((c & 0x07) << 18) | ((c1 & 0x3f) << 12) | ((c2 & 0x3f) << 6) | (c3 & 0x3f);
+            if (0x10000..=0x10FFFF).contains(&r) {
+                return r;
+            }
+        }
+        DEFAULT
+    }
+}
+
+/// `lean_string_utf8_set` (`object.cpp:2423-2448`): out-of-range or
+/// non-scalar index returns `s` unchanged; exclusive ASCII-over-ASCII writes
+/// in place; a non-first-byte position returns `s`; otherwise rebuild with
+/// the replacement scalar, codepoint length unchanged.
+// UNSAFE-LEDGER: FLN-UL-0211
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_set")]
+pub(crate) extern "C" fn export_lean_string_utf8_set(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+    c: u32,
+) -> *mut LeanObject {
+    if !crate::tagged::is_scalar(i0) {
+        return s;
+    }
+    let i = crate::tagged::unbox(i0);
+    // SAFETY: s owned by this call; all reads/writes stay inside its content
+    // bytes; the rebuild path releases s exactly once.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let sz = size.saturating_sub(1);
+        if i >= sz {
+            return s;
+        }
+        let first = *data.add(i);
+        if is_exclusive(s) && first < 128 && c < 128 {
+            let w = data as *mut u8;
+            w.add(i).write(c as u8);
+            return s;
+        }
+        if (first & 0xC0) == 0x80 {
+            return s;
+        }
+        let bytes = core::slice::from_raw_parts(data, sz);
+        let old_char_size = match bytes[i] {
+            b if b < 0x80 => 1,
+            b if (b & 0xe0) == 0xc0 => 2,
+            b if (b & 0xf0) == 0xe0 => 3,
+            b if (b & 0xf8) == 0xf0 => 4,
+            _ => 1,
+        };
+        let mut rebuilt = Vec::with_capacity(sz + 4);
+        rebuilt.extend_from_slice(&bytes[..i]);
+        push_unicode_scalar(&mut rebuilt, c);
+        rebuilt.extend_from_slice(&bytes[(i + old_char_size).min(sz)..]);
+        let (_, _, len, _) = object::string_fields(s);
+        rc::dec_ref(s);
+        object::mk_string_unchecked(&rebuilt, len)
+    }
+}
+
+/// `lean_system_platform_windows` (`platform.cpp:20-26`).
+// UNSAFE-LEDGER: FLN-UL-0213
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_windows")]
+pub(crate) extern "C" fn export_lean_system_platform_windows(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "windows"))
+}
+
+/// `lean_system_platform_osx` (`platform.cpp:28-34`).
+// UNSAFE-LEDGER: FLN-UL-0214
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_osx")]
+pub(crate) extern "C" fn export_lean_system_platform_osx(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "macos"))
+}
+
+/// `lean_system_platform_emscripten` (`platform.cpp:36-42`).
+// UNSAFE-LEDGER: FLN-UL-0215
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_system_platform_emscripten")]
+pub(crate) extern "C" fn export_lean_system_platform_emscripten(_w: *mut LeanObject) -> u8 {
+    u8::from(cfg!(target_os = "emscripten"))
+}
+
+// ===================================================================
+// fln-3gv slice 2: the promise/task-state family — the pin's managerless
+// envelope, ported arm-for-arm.
+//
+// The pin DEFINES `g_task_manager == NULL` behavior rather than leaving it
+// undefined: spawn/map/bind take an explicit eager arm (object.cpp:
+// 1153/1176/1237), `task_pure`/`task_get` are pure data over Finished
+// tasks, `io_get_task_state_core` answers 2 before consulting the manager
+// (object.cpp:1260-1265), `option_get_or_block` is Option-unwrap with the
+// pin's own panic (io.cpp:1627-1639), and `io_promise_new` REFUSES with a
+// named internal panic (object.cpp:1272-1278) — the mode every compiled
+// Lean binary runs its `initialize` blocks in (EmitC.lean:1112-1128).
+// Marrow serves exactly that envelope — and, as of slice 3, the manager
+// arms beside it (`task_manager.rs`): each function below branches on the
+// live manager exactly where the pin branches on `g_task_manager`.
+// Deviation disclosed: where the pin's managerless arm is a null-deref on
+// `g_task_manager` (`task_get` on an unfinished task, `get_task_state`
+// with `m_imp != NULL`, promise resolve / result_opt), Marrow refuses
+// typed per the §6.5 panic law instead of reproducing UB — unreachable
+// through conforming managerless code, since no unfinished task and no
+// promise is constructible without the manager.
+// ===================================================================
+
+/// Typed refusal for the arms the pin serves through `g_task_manager` —
+/// and null-derefs when it is absent (`object.cpp:1191/1265/1294`).
+/// Managerless Marrow constructs no unfinished task and no promise, so
+/// these arms are unreachable through conforming code; refusing typed is
+/// the §6.5 panic law, never a fabricated result.
+fn task_manager_refusal(what: &str) -> ! {
+    let text = format!(
+        "task plane: {what} requires the task manager, which is not running \
+         (managerless membrane, bead fln-3gv; the manager plane is the next slice)"
+    );
+    internal_panic_impl(&text)
+}
+
+/// `lean_task_pure` (`object.cpp:1162-1164`): a Finished task owning `a`,
+/// born single-threaded (`alloc_task(obj_arg v)` uses `lean_set_st_header`,
+/// object.cpp:1136-1142) — and the pin deliberately does NOT mark the value
+/// multi-threaded on this path.
+// UNSAFE-LEDGER: FLN-UL-0218
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_pure")]
+pub(crate) extern "C" fn export_lean_task_pure(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: `a` is consumed into the task; alloc_task_pure owns header init.
+    unsafe { object::alloc_task_pure(a) }
+}
+
+/// `lean_task_get` (`object.cpp:1187-1203`): borrowed task in, BORROWED
+/// value out (`b_lean_obj_res`, census). The unfinished arm blocks through
+/// the manager's `wait_for` (slice 3); without a manager — where the pin
+/// null-derefs — it refuses typed (see the banner).
+// UNSAFE-LEDGER: FLN-UL-0219
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_get")]
+pub(crate) extern "C" fn export_lean_task_get(t: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: t is a live (borrowed) task; the Acquire value load mirrors
+    // the pin's `_Atomic` read, and the returned reference stays borrowed.
+    unsafe {
+        let (v, _) = object::task_fields(t);
+        if !v.is_null() {
+            return v;
+        }
+        if let Some(mgr) = crate::task_manager::manager() {
+            mgr.wait_for(crate::task_manager::TaskPtr(t.cast()));
+            let (v, _) = object::task_fields(t);
+            debug_assert!(!v.is_null());
+            return v;
+        }
+        task_manager_refusal("`Task.get` on an unfinished task");
+    }
+}
+
+/// `lean_task_map_core` (`object.cpp:1166-1185`): eager when there is no
+/// manager OR when `sync` finds the input already finished — the pin's
+/// exact condition — with `prio`/`keep_alive` silently ignored on that arm;
+/// otherwise a Waiting task carrying `task_map_fn` joins the dependency
+/// graph via `add_dep`. `lean_task_get_own` is the lean.h inline
+/// (get, then inc, then dec; lean.h:1328-1334), expanded here with the
+/// pin's scalar-checked inc/dec.
+// UNSAFE-LEDGER: FLN-UL-0220
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_map_core")]
+pub(crate) extern "C" fn export_lean_task_map_core(
+    f: *mut LeanObject,
+    t: *mut LeanObject,
+    prio: c_uint,
+    sync: bool,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    use crate::task_manager::{self, LEAN_SYNC_PRIO, TaskPtr};
+    // SAFETY: f and t are consumed on both arms; the eager arm follows the
+    // pin's scalar-checked get_own discipline, the manager arm hands both
+    // references to the mark_mt'd map closure.
+    unsafe {
+        let (v, _) = object::task_fields(t);
+        let mgr = task_manager::manager();
+        if mgr.is_none() || (sync && !v.is_null()) {
+            if v.is_null() {
+                task_manager_refusal("`Task.map` on an unfinished task");
+            }
+            if !is_scalar(v) {
+                rc::inc_ref_n(v, 1);
+            }
+            if !is_scalar(t) {
+                rc::dec_ref(t); // 3gv-M2 anchor: map_core releases its consumed task
+            }
+            let r = apply_core(f, &[v]);
+            return object::alloc_task_pure(r);
+        }
+        let mgr = mgr.expect("manager arm");
+        let c = object::alloc_closure(task_manager::task_map_fn as *mut c_void, 3, 2);
+        object::closure_set(c, 0, f);
+        object::closure_set(c, 1, t);
+        let new_task =
+            object::alloc_task_scheduled(c, if sync { LEAN_SYNC_PRIO } else { prio }, keep_alive);
+        mgr.add_dep(TaskPtr(t.cast()), TaskPtr(new_task.cast()));
+        new_task
+    }
+}
+
+/// `lean_io_get_task_state` (`io.cpp:1579-1581` over `_core`,
+/// `object.cpp:1260-1265`; extern census `IO.getTaskState`): Finished
+/// (`m_imp == NULL`) answers 2 before the manager is ever consulted; the
+/// `m_imp != NULL` arm takes the manager's locked read (0 waiting/queued,
+/// 1 running/promised), and without a manager — where the pin null-derefs —
+/// refuses typed. The `_core` census symbol itself stays Unsupported —
+/// nothing in stage0 demands it; this wrapper inlines its body.
+// UNSAFE-LEDGER: FLN-UL-0221
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_task_state")]
+pub(crate) extern "C" fn export_lean_io_get_task_state(t: *mut LeanObject) -> u8 {
+    // SAFETY: t is a live (borrowed) task; only its header-adjacent fields
+    // are read.
+    unsafe {
+        let (_, imp) = object::task_fields(t);
+        if imp.is_null() {
+            return 2; // finished — the pin's pre-manager fast path
+        }
+    }
+    if let Some(mgr) = crate::task_manager::manager() {
+        return mgr.get_task_state(crate::task_manager::TaskPtr(t.cast()));
+    }
+    task_manager_refusal("`IO.getTaskState` on an unfinished task")
+}
+
+/// `lean_io_promise_new` (`object.cpp:1271-1292, 1298-1301`; extern census
+/// `IO.Promise.new`): with the manager running, an ST promise object owning
+/// one Promised task; before it runs, the pin REFUSES with this exact
+/// internal panic — reproduced verbatim, message and exit path.
+// UNSAFE-LEDGER: FLN-UL-0222
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_promise_new")]
+pub(crate) extern "C" fn export_lean_io_promise_new() -> *mut LeanObject {
+    if crate::task_manager::manager().is_some() {
+        // SAFETY: the allocator owns header/field init for both objects.
+        return unsafe { object::alloc_promise() };
+    }
+    internal_panic_impl(concat!(
+        "`IO.Promise.new` called before the task manager is running; this typically ",
+        "happens when called (directly or transitively, e.g. via `IO.CancelToken.new`) ",
+        "from an `initialize` block. Construct lazily on first use instead."
+    ))
+}
+
+/// `lean_io_promise_resolve` (`object.cpp:1294-1296, 1303-1306`; extern
+/// census `IO.Promise.resolve`): resolve the promise's task to
+/// `some value` — first call wins, the second value is silently dropped —
+/// returning unit. Without a manager — where the pin null-derefs — a typed
+/// refusal (no promise is constructible there anyway).
+// UNSAFE-LEDGER: FLN-UL-0223
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_promise_resolve")]
+pub(crate) extern "C" fn export_lean_io_promise_resolve(
+    value: *mut LeanObject,
+    promise: *mut LeanObject,
+) -> *mut LeanObject {
+    if let Some(mgr) = crate::task_manager::manager() {
+        // SAFETY: promise is a live (borrowed) promise object; the value is
+        // consumed into the `some` cell exactly as mk_option_some does.
+        unsafe {
+            let some = object::alloc_ctor(1, 1, 0);
+            object::ctor_set(some, 0, value);
+            let r =
+                (&raw const (*promise.cast::<crate::layout::LeanPromiseObject>()).m_result).read();
+            mgr.resolve(crate::task_manager::TaskPtr(r), some);
+        }
+        return crate::tagged::boxi(0);
+    }
+    task_manager_refusal("`IO.Promise.resolve`")
+}
+
+/// `lean_io_promise_result_opt` (`object.cpp:1308-1312`; extern census
+/// `IO.Promise.result?`): one `inc_ref` of the promise's result task —
+/// pure, exactly the pin's body. Without a manager — where no promise can
+/// exist — a typed refusal rather than a read of a nonexistent object.
+// UNSAFE-LEDGER: FLN-UL-0224
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_promise_result_opt")]
+pub(crate) extern "C" fn export_lean_io_promise_result_opt(
+    promise: *mut LeanObject,
+) -> *mut LeanObject {
+    if crate::task_manager::manager().is_some() {
+        // SAFETY: promise is a live (borrowed) promise; the task's MT rc
+        // takes one more token.
+        unsafe {
+            let r =
+                (&raw const (*promise.cast::<crate::layout::LeanPromiseObject>()).m_result).read();
+            let t = r.cast::<LeanObject>();
+            rc::inc_ref_n(t, 1);
+            return t;
+        }
+    }
+    task_manager_refusal("`IO.Promise.result?`")
+}
+
+/// `lean_option_get_or_block` (`io.cpp:1627-1639`; extern census
+/// `Option.getOrBlock!`): despite the name it never blocks on a task — it
+/// unwraps an already-materialized `Option`. `some v` steals the value out
+/// of the consumed option cell; `none` is the pin's
+/// `lean_panic(..., force_stderr)` followed by the non-fatal-panic arm's
+/// deliberate sleep-forever loop (io.cpp:1633-1638), arm-for-arm.
+// UNSAFE-LEDGER: FLN-UL-0225
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_option_get_or_block")]
+pub(crate) extern "C" fn export_lean_option_get_or_block(o: *mut LeanObject) -> *mut LeanObject {
+    if is_scalar(o) {
+        // `none` (`box(0)`): the pin's panic; then, when panics are
+        // non-fatal, its forever-sleep rather than a fabricated value.
+        panic_impl(b"PANIC: Promise.result!: promise has been dropped without ever being resolved");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(86_400));
+        }
+    }
+    // SAFETY: o is a live owned `some` cell; the value is duplicated before
+    // the cell's release, so the steal is ownership-balanced
+    // (`option_ref::steal`'s discipline).
+    unsafe {
+        let v = object::ctor_get(o, 0);
+        if !is_scalar(v) {
+            rc::inc_ref_n(v, 1);
+        }
+        rc::dec_ref(o);
+        v
+    }
+}
+
+// ===================================================================
+// fln-3gv slice 3: the task manager goes live — init/finalize, spawn and
+// bind cores, cancellation. The manager itself is `task_manager.rs` (the
+// literal object.cpp:727-1113 port; design + asupersync pricing in
+// bead-comments fln-3gv:1847/:1852). The slice-2 state family above gained
+// its manager arms in place; the pre-manager else-arms are unchanged and
+// remain the pin's own managerless behavior.
+// ===================================================================
+
+/// `lean_init_task_manager` (`object.cpp:1083-1085`): `LEAN_NUM_THREADS`
+/// else hardware concurrency.
+// UNSAFE-LEDGER: FLN-UL-0244
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_init_task_manager")]
+pub(crate) extern "C" fn export_lean_init_task_manager() {
+    crate::task_manager::init_using(crate::task_manager::default_num_workers());
+}
+
+/// `lean_init_task_manager_using` (`object.cpp:1065-1072`): zero workers
+/// installs NO manager, exactly as upstream.
+// UNSAFE-LEDGER: FLN-UL-0245
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_init_task_manager_using")]
+pub(crate) extern "C" fn export_lean_init_task_manager_using(num_workers: c_uint) {
+    crate::task_manager::init_using(num_workers);
+}
+
+/// `lean_finalize_task_manager` (`object.cpp:1092-1097`): drain, join, drop.
+// UNSAFE-LEDGER: FLN-UL-0246
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_finalize_task_manager")]
+pub(crate) extern "C" fn export_lean_finalize_task_manager() {
+    crate::task_manager::finalize();
+}
+
+/// `lean_task_spawn_core` (`object.cpp:1152-1160`): enqueue a Queued task
+/// through the manager; without one, the pin's eager arm verbatim.
+// UNSAFE-LEDGER: FLN-UL-0247
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_spawn_core")]
+pub(crate) extern "C" fn export_lean_task_spawn_core(
+    c: *mut LeanObject,
+    prio: c_uint,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    use crate::task_manager::{self, TaskPtr};
+    // SAFETY: c is consumed on both arms — into the scheduled task, or by
+    // the eager apply.
+    unsafe {
+        if let Some(mgr) = task_manager::manager() {
+            let t = object::alloc_task_scheduled(c, prio, keep_alive);
+            mgr.enqueue(TaskPtr(t.cast()));
+            t
+        } else {
+            let r = apply_core(c, &[crate::tagged::boxi(0)]);
+            object::alloc_task_pure(r)
+        }
+    }
+}
+
+/// `lean_task_bind_core` (`object.cpp:1234-1244`): a Waiting task carrying
+/// `task_bind_fn1` joins the graph; the eager arm — no manager, or `sync`
+/// with a finished input — is `apply_1(f, get_own(x))` returning whatever
+/// task `f` made, exactly as the pin (no re-wrap).
+// UNSAFE-LEDGER: FLN-UL-0248
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_task_bind_core")]
+pub(crate) extern "C" fn export_lean_task_bind_core(
+    x: *mut LeanObject,
+    f: *mut LeanObject,
+    prio: c_uint,
+    sync: bool,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    use crate::task_manager::{self, LEAN_SYNC_PRIO, TaskPtr};
+    // SAFETY: x and f are consumed on both arms; the manager arm hands both
+    // to the mark_mt'd bind closure.
+    unsafe {
+        let (v, _) = object::task_fields(x);
+        let mgr = task_manager::manager();
+        if mgr.is_none() || (sync && !v.is_null()) {
+            if v.is_null() {
+                task_manager_refusal("`Task.bind` on an unfinished task");
+            }
+            if !is_scalar(v) {
+                rc::inc_ref_n(v, 1);
+            }
+            if !is_scalar(x) {
+                rc::dec_ref(x);
+            }
+            return apply_core(f, &[v]);
+        }
+        let mgr = mgr.expect("manager arm");
+        let c = object::alloc_closure(task_manager::task_bind_fn1 as *mut c_void, 3, 2);
+        object::closure_set(c, 0, x);
+        object::closure_set(c, 1, f);
+        let new_task =
+            object::alloc_task_scheduled(c, if sync { LEAN_SYNC_PRIO } else { prio }, keep_alive);
+        mgr.add_dep(TaskPtr(x.cast()), TaskPtr(new_task.cast()));
+        new_task
+    }
+}
+
+/// `lean_io_check_canceled_core` (`object.cpp:1246-1252`): the current
+/// task's cancellation flag, or the manager's shutdown; `false` off-worker
+/// and managerless — the pin's own answers.
+// UNSAFE-LEDGER: FLN-UL-0249
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_check_canceled_core")]
+pub(crate) extern "C" fn export_lean_io_check_canceled_core() -> bool {
+    crate::task_manager::manager().is_some_and(crate::task_manager::Manager::check_canceled_current)
+}
+
+/// `lean_io_cancel_core` (`object.cpp:1254-1258`): finished tasks are a
+/// no-op before the manager is consulted; unfinished ones set the flag
+/// under the lock. Managerless — where the pin null-derefs — the finished
+/// arm still answers and the unreachable arm refuses typed.
+// UNSAFE-LEDGER: FLN-UL-0250
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_cancel_core")]
+pub(crate) extern "C" fn export_lean_io_cancel_core(t: *mut LeanObject) {
+    // SAFETY: t is a live (borrowed) task.
+    unsafe {
+        let (v, _) = object::task_fields(t);
+        if !v.is_null() {
+            return;
+        }
+    }
+    if let Some(mgr) = crate::task_manager::manager() {
+        mgr.cancel(crate::task_manager::TaskPtr(t.cast()));
+        return;
+    }
+    task_manager_refusal("`IO.cancel` on an unfinished task")
+}
+
+// ===================================================================
+// fln-3gv slice 3b: the io.cpp wrapper family over the live cores
+// (io.cpp:1534-1592). At this pin a compiled BaseIO result IS the bare
+// value (the world is erased and the error arm is impossible), so the
+// task-body closures apply the action/function to the world token and
+// return the result unchanged — exactly what the pin's object_ref dance
+// nets to. All three task builders pass keep_alive = true, the pin's own
+// IO-vs-Task distinction.
+// ===================================================================
+
+/// `lean_io_as_task_fn` (`io.cpp:1535-1538`): apply the BaseIO action to
+/// the world token; the bare result is the task's value.
+// UNSAFE-LEDGER: FLN-UL-0254
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn io_as_task_fn(
+    act: *mut LeanObject,
+    _w: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: act is the owned BaseIO action; apply consumes it and yields
+    // the owned bare result.
+    unsafe { apply_core(act, &[crate::tagged::boxi(0)]) }
+}
+
+/// `lean_io_bind_task_fn` (`io.cpp:1548-1551`): apply `f` to the task's
+/// value and the world token; serves both mapTask (bare β out) and
+/// bindTask (a Task β out), exactly as the pin reuses it.
+// UNSAFE-LEDGER: FLN-UL-0255
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn io_bind_task_fn(
+    f: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: f and a are owned; apply consumes both and yields the owned
+    // result.
+    unsafe { apply_core(f, &[a, crate::tagged::boxi(0)]) }
+}
+
+/// `lean_io_as_task` (`io.cpp:1541-1546`; extern census `BaseIO.asTask`):
+/// spawn the action's closure with `keep_alive = true` — an IO task runs
+/// even if its last reference is dropped.
+// UNSAFE-LEDGER: FLN-UL-0256
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_as_task")]
+pub(crate) extern "C" fn export_lean_io_as_task(
+    act: *mut LeanObject,
+    prio: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: act is consumed into the closure; the boxed prio is unboxed
+    // exactly as the pin does.
+    unsafe {
+        let c = object::alloc_closure(io_as_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, act);
+        export_lean_task_spawn_core(c, crate::tagged::unbox(prio) as c_uint, true)
+    }
+}
+
+/// `lean_io_map_task` (`io.cpp:1554-1559`; extern census `BaseIO.mapTask`).
+// UNSAFE-LEDGER: FLN-UL-0257
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_map_task")]
+pub(crate) extern "C" fn export_lean_io_map_task(
+    f: *mut LeanObject,
+    t: *mut LeanObject,
+    prio: *mut LeanObject,
+    sync: u8,
+) -> *mut LeanObject {
+    // SAFETY: f is consumed into the closure, t into map_core.
+    unsafe {
+        let c = object::alloc_closure(io_bind_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, f);
+        export_lean_task_map_core(c, t, crate::tagged::unbox(prio) as c_uint, sync != 0, true)
+    }
+}
+
+/// `lean_io_bind_task` (`io.cpp:1562-1567`; extern census
+/// `BaseIO.bindTask`).
+// UNSAFE-LEDGER: FLN-UL-0258
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_bind_task")]
+pub(crate) extern "C" fn export_lean_io_bind_task(
+    t: *mut LeanObject,
+    f: *mut LeanObject,
+    prio: *mut LeanObject,
+    sync: u8,
+) -> *mut LeanObject {
+    // SAFETY: f is consumed into the closure, t into bind_core.
+    unsafe {
+        let c = object::alloc_closure(io_bind_task_fn as *mut c_void, 2, 1);
+        object::closure_set(c, 0, f);
+        export_lean_task_bind_core(t, c, crate::tagged::unbox(prio) as c_uint, sync != 0, true)
+    }
+}
+
+/// `lean_io_check_canceled` (`io.cpp:1570-1572`; extern census
+/// `IO.checkCanceled`).
+// UNSAFE-LEDGER: FLN-UL-0259
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_check_canceled")]
+pub(crate) extern "C" fn export_lean_io_check_canceled() -> u8 {
+    u8::from(export_lean_io_check_canceled_core())
+}
+
+/// `lean_io_cancel` (`io.cpp:1574-1577`; extern census `IO.cancel`).
+// UNSAFE-LEDGER: FLN-UL-0260
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_cancel")]
+pub(crate) extern "C" fn export_lean_io_cancel(t: *mut LeanObject) -> *mut LeanObject {
+    export_lean_io_cancel_core(t);
+    crate::tagged::boxi(0)
+}
+
+/// `lean_io_wait` (`io.cpp:1583-1585`; extern census `IO.wait`):
+/// `lean_task_get_own` — get (blocking through the manager where needed),
+/// then the scalar-checked inc/dec of the lean.h inline.
+// UNSAFE-LEDGER: FLN-UL-0261
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait")]
+pub(crate) extern "C" fn export_lean_io_wait(t: *mut LeanObject) -> *mut LeanObject {
+    let v = export_lean_task_get(t);
+    // SAFETY: v is the borrowed published value; t is the consumed task.
+    unsafe {
+        if !is_scalar(v) {
+            rc::inc_ref_n(v, 1);
+        }
+        if !is_scalar(t) {
+            rc::dec_ref(t);
+        }
+    }
+    v
+}
+
+/// `lean_io_wait_any_core` (`object.cpp:1267-1269` over `wait_any`,
+/// `object.cpp:919-929, 1014-1023`): the first FINISHED member in list
+/// order, borrowed; block-and-rescan through the manager until one
+/// appears. Managerless — where the pin null-derefs unconditionally — the
+/// finished-scan still answers and the empty-handed arm refuses typed.
+// UNSAFE-LEDGER: FLN-UL-0262
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait_any_core")]
+pub(crate) extern "C" fn export_lean_io_wait_any_core(
+    task_list: *mut LeanObject,
+) -> *mut LeanObject {
+    if let Some(mgr) = crate::task_manager::manager() {
+        return mgr
+            .wait_any(task_list)
+            .expect("wait_any blocks until a member finishes");
+    }
+    if let Some(t) = crate::task_manager::wait_any_check(task_list) {
+        return t;
+    }
+    task_manager_refusal("`IO.waitAny` with no finished member")
+}
+
+/// `lean_io_wait_any` (`io.cpp:1587-1592`; extern census `IO.waitAny`):
+/// wait_any_core, then the winner's value duplicated out.
+// UNSAFE-LEDGER: FLN-UL-0263
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_wait_any")]
+pub(crate) extern "C" fn export_lean_io_wait_any(task_list: *mut LeanObject) -> *mut LeanObject {
+    let t = export_lean_io_wait_any_core(task_list);
+    let v = export_lean_task_get(t);
+    // SAFETY: v is the borrowed published value of a finished task; one
+    // token is minted for the caller (the pin's lean_inc).
+    unsafe {
+        if !is_scalar(v) {
+            rc::inc_ref_n(v, 1);
+        }
+    }
+    v
+}
+
+// ================================================================ stdio
+// fln-3gv slice 5a (design comment 1856): the stdio plane — the
+// thread-current stream trio, the Handle prims the println path drives,
+// and the native Stream.ofHandle. Signatures match io.cpp exactly; the
+// mechanism deviations are disclosed in stdio.rs's module doc.
+
+/// `lean_get_stdin` (`io.cpp:119-121`; extern census `IO.getStdin`).
+// UNSAFE-LEDGER: FLN-UL-0304
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stdin")]
+pub(crate) extern "C" fn export_lean_get_stdin() -> *mut LeanObject {
+    crate::stdio::get_stdin()
+}
+
+/// `lean_get_stdout` (`io.cpp:124-126`; extern census `IO.getStdout`).
+// UNSAFE-LEDGER: FLN-UL-0305
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stdout")]
+pub(crate) extern "C" fn export_lean_get_stdout() -> *mut LeanObject {
+    crate::stdio::get_stdout()
+}
+
+/// `lean_get_stderr` (`io.cpp:129-131`; extern census `IO.getStderr`).
+// UNSAFE-LEDGER: FLN-UL-0306
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_stderr")]
+pub(crate) extern "C" fn export_lean_get_stderr() -> *mut LeanObject {
+    crate::stdio::get_stderr()
+}
+
+/// `lean_get_set_stdin` (`io.cpp:134-139`; extern census `IO.setStdin`).
+// UNSAFE-LEDGER: FLN-UL-0307
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stdin")]
+pub(crate) extern "C" fn export_lean_get_set_stdin(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stdin(h)
+}
+
+/// `lean_get_set_stdout` (`io.cpp:142-147`; extern census `IO.setStdout`).
+// UNSAFE-LEDGER: FLN-UL-0308
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stdout")]
+pub(crate) extern "C" fn export_lean_get_set_stdout(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stdout(h)
+}
+
+/// `lean_get_set_stderr` (`io.cpp:150-155`; extern census `IO.setStderr`).
+// UNSAFE-LEDGER: FLN-UL-0309
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_get_set_stderr")]
+pub(crate) extern "C" fn export_lean_get_set_stderr(h: *mut LeanObject) -> *mut LeanObject {
+    crate::stdio::get_set_stderr(h)
+}
+
+/// `lean_io_prim_handle_mk` (`io.cpp:385-418`; extern census
+/// `IO.FS.Handle.mk`): borrowed filename + mode byte to an io_result
+/// Handle.
+// UNSAFE-LEDGER: FLN-UL-0299
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_mk")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_mk(
+    filename: *mut LeanObject,
+    mode: u8,
+) -> *mut LeanObject {
+    // SAFETY: filename is borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_mk(filename, mode) }
+}
+
+/// `lean_io_prim_handle_put_str` (`io.cpp:661-670`; extern census
+/// `IO.FS.Handle.putStr`).
+// UNSAFE-LEDGER: FLN-UL-0300
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_put_str")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_put_str(
+    h: *mut LeanObject,
+    s: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_put_str(h, s) }
+}
+
+/// `lean_io_prim_handle_flush` (`io.cpp:550-556`; extern census
+/// `IO.FS.Handle.flush`).
+// UNSAFE-LEDGER: FLN-UL-0301
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_flush")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_flush(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_flush(h) }
+}
+
+/// `lean_io_prim_handle_read` (`io.cpp:584-607`; extern census
+/// `IO.FS.Handle.read`): borrowed handle + byte count to an io_result
+/// ByteArray, with the pin's EOF and zero-read arms.
+// UNSAFE-LEDGER: FLN-UL-0318
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_read")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_read(
+    h: *mut LeanObject,
+    nbytes: usize,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_read(h, nbytes) }
+}
+
+/// `lean_io_prim_handle_write` (`io.cpp:609-618`; extern census
+/// `IO.FS.Handle.write`).
+// UNSAFE-LEDGER: FLN-UL-0319
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_write")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_write(
+    h: *mut LeanObject,
+    buf: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_write(h, buf) }
+}
+
+/// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
+/// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
+// UNSAFE-LEDGER: FLN-UL-0302
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_is_tty")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_is_tty(h: *mut LeanObject) -> u8 {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_is_tty(h) }
+}
+
+/// `lean_stream_of_handle` (`Init/System/IO.lean:1683`,
+/// `@[export lean_stream_of_handle]`; consumed by the pin's own
+/// `initialize_io`, io.cpp:109/1647-1652): the six-field `FS.Stream` over a
+/// consumed Handle — served NATIVELY here because the pin's definition is
+/// compiled Lean the staticlib does not carry (the B2 Native-Mirror arm at
+/// spike depth, disclosed in stdio.rs).
+// UNSAFE-LEDGER: FLN-UL-0303
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_stream_of_handle")]
+pub(crate) extern "C" fn export_lean_stream_of_handle(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: h is consumed into the stream's closures.
+    unsafe { crate::stdio::stream_of_handle(h) }
+}
+
+/// `lean_initialize_runtime_module` (`init_module.cpp:19-29`; the entry
+/// every generated main stub calls before module initializers): the pin
+/// initializes alloc/debug/object/io/thread/mutex/process/stack/libuv; in
+/// Marrow every one of those planes is static or lazily seeded, so the
+/// twin's eager half is exactly the io stream trio — the one plane whose
+/// pin-side init has an observable (the SIGPIPE disposition and the
+/// process-initial streams).
+// UNSAFE-LEDGER: FLN-UL-0310
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_initialize_runtime_module")]
+pub(crate) extern "C" fn export_lean_initialize_runtime_module() {
+    crate::stdio::initialize_streams();
 }

@@ -24,12 +24,17 @@
 
 pub mod boundary_api;
 pub mod checks;
+pub mod contract_handoff;
+pub mod contract_inventory;
 pub mod export_status;
 pub mod graph;
 pub mod ledger;
 pub mod lockfile;
 pub mod manifest;
+pub mod mode_closure;
+pub mod ownership_publication;
 pub mod report;
+pub mod scratch;
 
 /// Workspace-relative path of the reviewed graph acknowledgment file.
 pub const GRAPH_FILE: &str = "ci/WORKSPACE_GRAPH.txt";
@@ -51,5 +56,58 @@ pub const SUITE_LOCK_FILE: &str = "SUITE.lock";
 pub const LOCK_FILE: &str = "Cargo.lock";
 /// Workspace-relative path of the toolchain pin that must agree with SUITE.lock.
 pub const TOOLCHAIN_FILE: &str = "rust-toolchain.toml";
+/// Workspace-relative path of the normative pin/target inventory schema.
+pub const CONTRACT_INVENTORY_SCHEMA_FILE: &str = "contracts/CONTRACT_INVENTORY_V1.txt";
+/// Workspace-relative path of the reviewed policy joined bijectively to raw pin rows.
+pub const CONTRACT_INVENTORY_POLICY_FILE: &str = "ci/PIN_TARGET_POLICY.txt";
+/// Target-indexed ABI layouts mechanically extracted from the pinned Reference header.
+pub const ABI_TARGET_LAYOUT_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt";
+/// Interrupted ABI-layout publication. Its presence makes layout authority inconclusive.
+pub const ABI_TARGET_LAYOUT_CANDIDATE_FILE: &str = "contracts/ABI_TARGET_LAYOUT.txt.candidate";
+/// Exact OLEAN/ILEAN facts mechanically extracted from pinned source and artifacts.
+pub const OLEAN_ILEAN_FORMAT_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt";
+/// Interrupted exact-format publication. Presence makes format authority inconclusive.
+pub const OLEAN_ILEAN_FORMAT_CANDIDATE_FILE: &str = "contracts/OLEAN_ILEAN_FORMAT.txt.candidate";
+/// Rooted publication envelope for the exact extern and builtin environment walks.
+pub const EXTERN_BUILTIN_ENVIRONMENT_FILE: &str = "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt";
+/// Interrupted legacy extern projection publication.
+pub const EXTERN_CENSUS_CANDIDATE_FILE: &str = "contracts/extern_census.tsv.candidate";
+/// Interrupted builtin observation publication.
+pub const BUILTIN_ENVIRONMENT_CANDIDATE_FILE: &str = "contracts/builtin_environment.tsv.candidate";
+/// Interrupted second builtin observation shard publication.
+pub const BUILTIN_ENVIRONMENT_001_CANDIDATE_FILE: &str =
+    "contracts/builtin_environment.001.tsv.candidate";
+/// Interrupted third builtin observation shard publication.
+pub const BUILTIN_ENVIRONMENT_002_CANDIDATE_FILE: &str =
+    "contracts/builtin_environment.002.tsv.candidate";
+/// Interrupted builtin policy projection publication.
+pub const BUILTIN_PARTITION_CANDIDATE_FILE: &str = "contracts/builtin_partition.tsv.candidate";
+/// Interrupted extern/builtin envelope publication.
+pub const EXTERN_BUILTIN_ENVIRONMENT_CANDIDATE_FILE: &str =
+    "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt.candidate";
+/// Workspace-relative path of the atomically published derived pin/target inventory.
+pub const CONTRACT_INVENTORY_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt";
+/// Interrupted-publication sibling. Its presence makes inventory authority inconclusive.
+pub const CONTRACT_INVENTORY_CANDIDATE_FILE: &str = "contracts/PIN_TARGET_INVENTORY.txt.candidate";
+/// Normative schema for the terminal W1 cross-surface handoff.
+pub const CONTRACT_HANDOFF_SCHEMA_FILE: &str = "contracts/CONTRACT_HANDOFF_V1.txt";
+/// Reviewed exact list of generated outputs bound by the terminal handoff.
+pub const CONTRACT_HANDOFF_POLICY_FILE: &str = "ci/CONTRACT_HANDOFF_POLICY.txt";
+/// Atomically published terminal W1 handoff over every generated contract surface.
+pub const CONTRACT_HANDOFF_FILE: &str = "contracts/CONTRACT_HANDOFF.txt";
+/// Interrupted handoff publication. Its presence makes consumption inconclusive.
+pub const CONTRACT_HANDOFF_CANDIDATE_FILE: &str = "contracts/CONTRACT_HANDOFF.txt.candidate";
+/// Interrupted kernel-ownership publication. Presence makes evidence authority inconclusive.
+pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate";
 /// NDJSON schema identifier for robot output.
-pub const NDJSON_SCHEMA: &str = "structure-guard/2";
+///
+/// `/4` adds the terminal `mode_closure` object (bead `fln-q8qt`). The version moves
+/// because the contract is an EXACT key set — `evidence.py:require_guard_keys` compares
+/// `set(record) != expected` — so a consumer pinned to `/3` is broken by an added key
+/// exactly as it is by a removed one. A schema id that stayed put while its exact key set
+/// moved would be a version claiming to describe a shape it no longer describes.
+///
+/// `/5` adds terminal `data_grade` and `unestablished` fields (bead
+/// `fln-census-empty-referent-no-mock-krb0`). They distinguish an audited handoff root from
+/// an audit that established no evidence without promoting the latter to a failure.
+pub const NDJSON_SCHEMA: &str = "structure-guard/5";

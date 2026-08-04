@@ -21,6 +21,9 @@
 
 use std::sync::Arc;
 
+use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+
 /// Keys carry their own 64-bit hash and a canonical total order.
 ///
 /// The hash must be a pure function of the key's `Eq` identity: equal keys
@@ -43,20 +46,32 @@ pub trait PKey: Clone + Eq + Ord {
 /// boundary because a generic map cannot infer the expanded semantic weight of
 /// an opaque key/value pair. `max_fresh_nodes` is checked against a
 /// schedule-independent upper bound, not the history-dependent number of AVL
-/// rotations an individual insertion happened to need. Total weight is `u128`,
-/// so the unbounded envelope exactly represents the sum of `u64` entry weights
-/// across every family cardinality possible on the certified 64-bit platforms.
+/// rotations an individual insertion happened to need.
+///
+/// The measured family total is `u128` while the limit is `u64`: the candidate total is
+/// aggregated without wrapping so a refusal is REACHED, and the limit is widened for the
+/// comparison so a refusal's numbers fit the shared authority type without conversion.
+/// [`CollisionBudget::UNBOUNDED`] is therefore the widest REPRESENTABLE envelope, not the
+/// absence of a bound — a family heavier than `u64::MAX` is refused under it, typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollisionBudget {
     pub max_collision_entries: usize,
-    pub max_expanded_weight: u128,
+    /// Denoted expanded weight allowed for one collision family.
+    ///
+    /// `u64`, matching [`WeightBudget`](crate::terms::WeightBudget), so a refusal's reported
+    /// numbers fit the shared authority type by CONSTRUCTION rather than by conversion. The
+    /// measured total stays `u128` — two entries near `u64::MAX` overflow a `u64` — and the
+    /// limit is widened for the comparison. A `u128` limit above `u64::MAX` was only ever
+    /// decorative: it can still be exceeded, so it never meant unbounded
+    /// (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`).
+    pub max_expanded_weight: u64,
     pub max_fresh_nodes: usize,
 }
 
 impl CollisionBudget {
     pub const UNBOUNDED: CollisionBudget = CollisionBudget {
         max_collision_entries: usize::MAX,
-        max_expanded_weight: u128::MAX,
+        max_expanded_weight: u64::MAX,
         max_fresh_nodes: usize::MAX,
     };
 }
@@ -75,30 +90,87 @@ pub enum CollisionResource {
     FreshNodes,
 }
 
-/// Typed, atomic resource exhaustion from [`PMap::try_insert_with_budget`].
-///
-/// Limits and attempts use `u128` so expanded-weight totals and
-/// platform-sized entry-count overages are reported exactly instead of wrapping
-/// or producing a self-contradictory `attempted == limit` value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollisionExhausted {
-    pub resource: CollisionResource,
-    pub limit: u128,
-    pub attempted: u128,
-    pub collision_hash: u64,
-}
+impl CollisionResource {
+    /// The D8 unit a refusal on this resource reports.
+    ///
+    /// Non-uniform on purpose. Entries and FreshNodes are both `ProducedNodes` — a caller
+    /// reacts to either by storing fewer things — so the finer distinction stays on the
+    /// report rather than growing the closed taxonomy, which is the convention
+    /// `franken_lean-j8h` and `fln-extension-history-checkpoint-identity-41s` established.
+    /// ExpandedWeight has its own existing unit because it is reacted to differently: a
+    /// denoted-size bound is reduced by removing sharing-amplifying structure, not by
+    /// storing fewer entries.
+    const fn unit(self) -> StructuralUnit {
+        match self {
+            CollisionResource::Entries | CollisionResource::FreshNodes => {
+                StructuralUnit::ProducedNodes
+            }
+            CollisionResource::ExpandedWeight => StructuralUnit::ExpandedWeight,
+        }
+    }
 
-impl std::fmt::Display for CollisionExhausted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "collision-family {:?} budget exhausted for hash {:016x}: attempted {}, limit {}",
-            self.resource, self.collision_hash, self.attempted, self.limit
-        )
+    /// The label a refusal carries in `progress`. Public to the crate's tests so an
+    /// assertion is written in terms of the typed value rather than a duplicated string.
+    #[cfg(test)]
+    pub(crate) const fn as_str_for_test(self) -> &'static str {
+        self.as_str()
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            CollisionResource::Entries => "collision_entries",
+            CollisionResource::ExpandedWeight => "collision_expanded_weight",
+            CollisionResource::FreshNodes => "collision_fresh_nodes",
+        }
     }
 }
 
-impl std::error::Error for CollisionExhausted {}
+/// A collision-budget stop, in the shared FL-INV-07 vocabulary
+/// (bead `franken_lean-pmap-refusal-outcome-taxonomy-i1z9`).
+///
+/// This replaced a bespoke `CollisionExhausted` error type. The old shape was a
+/// `std::error::Error`, which meant an INCONCLUSIVE could be `?`-propagated into an
+/// ordinary error path and reported as a failure — the FL-INV-07 collapse, one refactor
+/// away at all times. It also carried its own `u128` numbers, which no shared consumer
+/// could read without a lossy conversion.
+///
+/// Now: `allowed` and `observed` fit `u64` by construction, because
+/// [`CollisionBudget::max_expanded_weight`] is a `u64` limit even though the measured
+/// total is `u128`. The `observed` figure is a witnessed floor rather than an exact total,
+/// which is what the shared type documents and what every other bounded path in this crate
+/// already reports.
+///
+/// The finer facts — which resource, and which collision family — live on `progress`
+/// rather than in new [`StructuralUnit`] variants, because a caller reacts to an entry
+/// bound and a fresh-node bound the same way. `ExpandedWeight` is the exception and maps to
+/// its own existing unit, because a denoted-size bound is reduced by removing
+/// sharing-amplifying structure while a stored-count bound is reduced by storing fewer
+/// things — genuinely different reactions.
+fn collision_stop(
+    resource: CollisionResource,
+    allowed: u128,
+    attempted: u128,
+    collision_hash: u64,
+) -> Inconclusive {
+    let allowed_u64 = u64::try_from(allowed).unwrap_or(u64::MAX);
+    Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget {
+            unit: resource.unit(),
+        },
+        allowed: allowed_u64,
+        // A stop must report spending past its allowance or it is not a stop;
+        // `is_genuine_exhaustion` depends on it. The floor is exact whenever the attempt
+        // fits `u64`, and a witnessed lower bound otherwise — never a clamp that could
+        // equal `allowed`.
+        observed: u64::try_from(attempted)
+            .unwrap_or(u64::MAX)
+            .max(allowed_u64.saturating_add(1)),
+    })
+    .with_progress(format!(
+        "{}@collision-family/{collision_hash:016x}",
+        resource.as_str()
+    ))
+}
 
 /// Bits of hash consumed per branch level.
 const BITS: u32 = 5;
@@ -576,7 +648,7 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         key: &K,
         expanded_weight: u64,
         facts: &mut MutationFacts,
-    ) -> Result<(bool, usize, u128), CollisionExhausted> {
+    ) -> Result<(bool, usize, u128), Inconclusive> {
         let previous_weight = match self {
             CollisionBucket::Inline(entries) => {
                 let result = entries.binary_search_by(|entry| {
@@ -596,12 +668,12 @@ impl<K: Clone + Eq + Ord, V: Clone> CollisionBucket<K, V> {
         let new_len = match self.len().checked_add(usize::from(added)) {
             Some(len) => len,
             None => {
-                return Err(CollisionExhausted {
-                    resource: CollisionResource::Entries,
-                    limit: usize_as_u128(usize::MAX),
-                    attempted: usize_as_u128(usize::MAX).saturating_add(1),
-                    collision_hash: 0,
-                });
+                return Err(collision_stop(
+                    CollisionResource::Entries,
+                    usize_as_u128(usize::MAX),
+                    usize_as_u128(usize::MAX).saturating_add(1),
+                    0,
+                ));
             }
         };
         let new_weight = self.expanded_weight() - u128::from(previous_weight.unwrap_or(0))
@@ -776,6 +848,27 @@ impl<K: PKey, V: Clone> PMap<K, V> {
         self.len == 0
     }
 
+    /// Whether these are the same map **by construction** — the same root node, not
+    /// merely equal contents.
+    ///
+    /// `O(1)`, and deliberately conservative in one direction: two independently built
+    /// maps with identical contents answer `false`. That asymmetry is the point when
+    /// this is used to ask whether a decision made against one snapshot is still
+    /// meaningful against another. A false negative costs a redecision, which is
+    /// inconclusive and recoverable; a false positive would publish work facts
+    /// measured against a different trie shape, which is a silent wrong value.
+    ///
+    /// The pointer is **compared, never recorded**. No address enters a digest, a
+    /// canonical encoding, or any evidence record — those are content-addressed, and an
+    /// allocation address is not content.
+    pub fn is_same_structure(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
     pub fn get(&self, key: &K) -> Option<&V> {
         let hash = key.key_hash();
         let mut node = self.root.as_ref()?;
@@ -828,36 +921,39 @@ impl<K: PKey, V: Clone> PMap<K, V> {
         value: V,
         expanded_weight: u64,
         budget: CollisionBudget,
-    ) -> Result<Self, CollisionExhausted> {
+    ) -> Outcome<Self> {
         let hash = key.key_hash();
         let mut preflight = MutationFacts::default();
         let (entries, total_weight, required_fresh_nodes) =
-            self.insertion_preflight(hash, &key, expanded_weight, &mut preflight)?;
+            match self.insertion_preflight(hash, &key, expanded_weight, &mut preflight) {
+                Ok(facts) => facts,
+                Err(stop) => return Outcome::Inconclusive(stop),
+            };
         if entries > budget.max_collision_entries {
-            return Err(CollisionExhausted {
-                resource: CollisionResource::Entries,
-                limit: usize_as_u128(budget.max_collision_entries),
-                attempted: usize_as_u128(entries),
-                collision_hash: hash,
-            });
+            return Outcome::Inconclusive(collision_stop(
+                CollisionResource::Entries,
+                usize_as_u128(budget.max_collision_entries),
+                usize_as_u128(entries),
+                hash,
+            ));
         }
-        if total_weight > budget.max_expanded_weight {
-            return Err(CollisionExhausted {
-                resource: CollisionResource::ExpandedWeight,
-                limit: budget.max_expanded_weight,
-                attempted: total_weight,
-                collision_hash: hash,
-            });
+        if total_weight > u128::from(budget.max_expanded_weight) {
+            return Outcome::Inconclusive(collision_stop(
+                CollisionResource::ExpandedWeight,
+                u128::from(budget.max_expanded_weight),
+                total_weight,
+                hash,
+            ));
         }
         if required_fresh_nodes > budget.max_fresh_nodes {
-            return Err(CollisionExhausted {
-                resource: CollisionResource::FreshNodes,
-                limit: usize_as_u128(budget.max_fresh_nodes),
-                attempted: usize_as_u128(required_fresh_nodes),
-                collision_hash: hash,
-            });
+            return Outcome::Inconclusive(collision_stop(
+                CollisionResource::FreshNodes,
+                usize_as_u128(budget.max_fresh_nodes),
+                usize_as_u128(required_fresh_nodes),
+                hash,
+            ));
         }
-        Ok(self.insert_profiled_internal(key, value, expanded_weight).0)
+        Outcome::complete(self.insert_profiled_internal(key, value, expanded_weight).0)
     }
 
     fn insertion_preflight(
@@ -866,7 +962,7 @@ impl<K: PKey, V: Clone> PMap<K, V> {
         key: &K,
         expanded_weight: u64,
         facts: &mut MutationFacts,
-    ) -> Result<(usize, u128, usize), CollisionExhausted> {
+    ) -> Result<(usize, u128, usize), Inconclusive> {
         let Some(mut node) = self.root.as_ref() else {
             return Ok((1, u128::from(expanded_weight), 1));
         };
@@ -878,11 +974,13 @@ impl<K: PKey, V: Clone> PMap<K, V> {
                     hash: leaf_hash,
                     bucket,
                 } if *leaf_hash == hash => {
+                    // The family hash is a diagnostic fact, so it is appended to
+                    // `progress` rather than mutated into a field the shared type does not
+                    // have.
                     let (_added, entries, total_weight) = bucket
                         .insertion_shape(key, expanded_weight, facts)
-                        .map_err(|mut error| {
-                            error.collision_hash = hash;
-                            error
+                        .map_err(|stop| {
+                            stop.with_progress(format!("collision-family/{hash:016x}"))
                         })?;
                     let collision_bound = match bucket {
                         CollisionBucket::Inline(_) if entries > INLINE_COLLISION_MAX => entries,
@@ -1410,6 +1508,7 @@ mod tests {
     use fln_core::level::Level;
     use fln_core::name::{LeafView, Name};
     use fln_core::options::KVMap;
+    use fln_core::outcome::InconclusiveCause;
     use fln_hash::domain::{Domain, hash};
     use fln_hash::root::LogicalRoot;
     use std::collections::BTreeMap;
@@ -1429,6 +1528,96 @@ mod tests {
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^ (x >> 31)
+    }
+
+    /// Fold a bounded-insert outcome the way these fixtures expect: a completed map.
+    ///
+    /// Restores the pre-migration call shape so the 27 existing sites keep their meaning
+    /// rather than each growing an `Outcome` match. A non-answer here is surfaced as a test
+    /// bug instead of becoming a value.
+    #[track_caller]
+    fn admitted<K: PKey + std::fmt::Debug, V: Clone + std::fmt::Debug>(
+        outcome: Outcome<PMap<K, V>>,
+        why: &str,
+    ) -> PMap<K, V> {
+        match outcome {
+            Outcome::Complete(map) => map,
+            other => unreachable!("{why}: expected an admitted map, got {other:?}"),
+        }
+    }
+
+    /// `Outcome`'s test-side ergonomics, as an extension trait.
+    ///
+    /// `Outcome` is `fln-core`'s type, so fln-env cannot give it inherent methods — the
+    /// orphan rule. A trait implemented here restores the `.expect(..)` call shape the
+    /// pre-migration fixtures used, so each migrated site changes by one word instead of
+    /// being restructured. That matters on this bead specifically: the first attempt at
+    /// this migration was reverted because a bulk rewrite of the test half went wrong.
+    trait OutcomeTestExt<T> {
+        /// The completed value, or a test failure naming the non-answer.
+        fn expect_admitted(self, why: &str) -> T;
+        /// The completed value as an `Option`, for the model-based fixtures that
+        /// short-circuit with `?` rather than assert.
+        fn admitted_opt(self) -> Option<T>;
+        /// The stop, for the same fixtures. `None` when the outcome was an answer.
+        fn stop_opt(self) -> Option<Inconclusive>;
+    }
+
+    impl<T: std::fmt::Debug> OutcomeTestExt<T> for Outcome<T> {
+        #[track_caller]
+        fn expect_admitted(self, why: &str) -> T {
+            match self {
+                Outcome::Complete(value) => value,
+                other => unreachable!("{why}: expected an admitted value, got {other:?}"),
+            }
+        }
+
+        fn admitted_opt(self) -> Option<T> {
+            match self {
+                Outcome::Complete(value) => Some(value),
+                _ => None,
+            }
+        }
+
+        fn stop_opt(self) -> Option<Inconclusive> {
+            match self {
+                Outcome::Inconclusive(inconclusive) => Some(inconclusive),
+                _ => None,
+            }
+        }
+    }
+
+    /// The resource facts of a bounded-insert stop: unit, allowed, observed, progress.
+    ///
+    /// `CollisionResource` is no longer a typed field on the outcome — it is the `progress`
+    /// label, exactly as `DeclarationDimension` and `ProofDimension` are on their own
+    /// bounded paths. Tests compare against `CollisionResource::as_str_for_test`, so the
+    /// typed value is still what the assertion is written in terms of.
+    #[track_caller]
+    fn stop_facts<T: std::fmt::Debug>(
+        outcome: &Outcome<T>,
+        why: &str,
+    ) -> (StructuralUnit, u64, u64, String) {
+        let Outcome::Inconclusive(inconclusive) = outcome else {
+            unreachable!("{why}: expected an inconclusive stop, got {outcome:?}")
+        };
+        let InconclusiveCause::ResourceExhausted { usage } = &inconclusive.cause else {
+            unreachable!("{why}: a budget stop must be ResourceExhausted")
+        };
+        let unit = match &usage.reason {
+            ResourceReason::StructuralBudget { unit } => *unit,
+            other => unreachable!("{why}: expected a structural budget, got {other:?}"),
+        };
+        (
+            unit,
+            usage.allowed,
+            usage.observed,
+            inconclusive
+                .progress
+                .as_ref()
+                .map(|p| p.text().to_owned())
+                .unwrap_or_default(),
+        )
     }
 
     /// Well-distributed test key.
@@ -1953,24 +2142,28 @@ mod tests {
     #[test]
     fn collision_resource_budgets_are_typed_atomic_and_recoverable() {
         let empty = PMap::<CollKey, u64>::new();
-        let empty_error = empty
-            .try_insert_with_budget(
-                CollKey(0),
-                0,
-                1,
-                CollisionBudget {
-                    max_collision_entries: 1,
-                    max_expanded_weight: 1,
-                    max_fresh_nodes: 0,
-                },
-            )
-            .expect_err("an empty-map insert still allocates its leaf");
-        assert_eq!(empty_error.resource, CollisionResource::FreshNodes);
-        assert_eq!(empty_error.attempted, 1);
+        let empty_error = empty.try_insert_with_budget(
+            CollKey(0),
+            0,
+            1,
+            CollisionBudget {
+                max_collision_entries: 1,
+                max_expanded_weight: 1,
+                max_fresh_nodes: 0,
+            },
+        );
+        let (unit, _allowed, observed, progress) =
+            stop_facts(&empty_error, "empty-map fresh-node bound");
+        assert_eq!(unit, StructuralUnit::ProducedNodes);
+        assert_eq!(observed, 1);
+        assert!(
+            progress.contains(CollisionResource::FreshNodes.as_str_for_test()),
+            "the refused resource must still be identifiable: {progress}"
+        );
         assert_eq!(empty.len(), 0);
         assert_eq!(
-            empty
-                .try_insert_with_budget(
+            admitted(
+                empty.try_insert_with_budget(
                     CollKey(0),
                     0,
                     1,
@@ -1979,9 +2172,10 @@ mod tests {
                         max_expanded_weight: 1,
                         max_fresh_nodes: 1,
                     },
-                )
-                .expect("the exact empty-map allocation boundary is admitted")
-                .len(),
+                ),
+                "the exact empty-map allocation boundary is admitted"
+            )
+            .len(),
             1
         );
 
@@ -1997,55 +2191,61 @@ mod tests {
             .expect("promotion preflight succeeds");
         assert_eq!(promotion_bound, INLINE_COLLISION_MAX + 2);
 
-        let entries_error = map
-            .try_insert_with_budget(
-                CollKey(8),
-                8,
-                1,
-                CollisionBudget {
-                    max_collision_entries: INLINE_COLLISION_MAX,
-                    max_expanded_weight: u128::MAX,
-                    max_fresh_nodes: usize::MAX,
-                },
-            )
-            .expect_err("ninth entry exceeds the eight-entry envelope");
-        assert_eq!(entries_error.resource, CollisionResource::Entries);
-        assert_eq!(entries_error.limit, INLINE_COLLISION_MAX as u128);
-        assert_eq!(entries_error.attempted, 9);
+        let entries_error = map.try_insert_with_budget(
+            CollKey(8),
+            8,
+            1,
+            CollisionBudget {
+                max_collision_entries: INLINE_COLLISION_MAX,
+                max_expanded_weight: u64::MAX,
+                max_fresh_nodes: usize::MAX,
+            },
+        );
+        let (unit, allowed, observed, progress) = stop_facts(&entries_error, "entries bound");
+        assert_eq!(unit, StructuralUnit::ProducedNodes);
+        assert_eq!(allowed, INLINE_COLLISION_MAX as u64);
+        assert_eq!(observed, 9);
+        assert!(progress.contains(CollisionResource::Entries.as_str_for_test()));
         assert_eq!(collision_contents(&map), before);
 
-        let weight_error = map
-            .try_insert_with_budget(
-                CollKey(8),
-                8,
-                5,
-                CollisionBudget {
-                    max_collision_entries: 9,
-                    max_expanded_weight: 12,
-                    max_fresh_nodes: usize::MAX,
-                },
-            )
-            .expect_err("eight existing units plus five exceeds twelve");
-        assert_eq!(weight_error.resource, CollisionResource::ExpandedWeight);
-        assert_eq!(weight_error.limit, 12);
-        assert_eq!(weight_error.attempted, 13);
+        let weight_error = map.try_insert_with_budget(
+            CollKey(8),
+            8,
+            5,
+            CollisionBudget {
+                max_collision_entries: 9,
+                max_expanded_weight: 12,
+                max_fresh_nodes: usize::MAX,
+            },
+        );
+        let (unit, allowed, observed, progress) =
+            stop_facts(&weight_error, "expanded-weight bound");
+        assert_eq!(
+            unit,
+            StructuralUnit::ExpandedWeight,
+            "a denoted-size bound has its own unit: it is reduced by removing \
+             sharing-amplifying structure, not by storing fewer entries"
+        );
+        assert_eq!(allowed, 12);
+        assert_eq!(observed, 13);
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
         assert_eq!(collision_contents(&map), before);
 
-        let allocation_error = map
-            .try_insert_with_budget(
-                CollKey(8),
-                8,
-                1,
-                CollisionBudget {
-                    max_collision_entries: 9,
-                    max_expanded_weight: 9,
-                    max_fresh_nodes: promotion_bound - 1,
-                },
-            )
-            .expect_err("promotion requires the declared deterministic bound");
-        assert_eq!(allocation_error.resource, CollisionResource::FreshNodes);
-        assert_eq!(allocation_error.limit, (promotion_bound - 1) as u128);
-        assert_eq!(allocation_error.attempted, promotion_bound as u128);
+        let allocation_error = map.try_insert_with_budget(
+            CollKey(8),
+            8,
+            1,
+            CollisionBudget {
+                max_collision_entries: 9,
+                max_expanded_weight: 9,
+                max_fresh_nodes: promotion_bound - 1,
+            },
+        );
+        let (unit, allowed, observed, progress) = stop_facts(&allocation_error, "fresh-node bound");
+        assert_eq!(unit, StructuralUnit::ProducedNodes);
+        assert_eq!(allowed, (promotion_bound - 1) as u64);
+        assert_eq!(observed, promotion_bound as u64);
+        assert!(progress.contains(CollisionResource::FreshNodes.as_str_for_test()));
         assert_eq!(collision_contents(&map), before);
         assert!(Arc::ptr_eq(
             map.root.as_ref().expect("refused map retains its root"),
@@ -2063,7 +2263,7 @@ mod tests {
                     max_fresh_nodes: promotion_bound,
                 },
             )
-            .expect("the exact boundary is admitted");
+            .expect_admitted("the exact boundary is admitted");
         assert_eq!(exact.len(), 9);
         assert_eq!(exact.get(&CollKey(8)), Some(&8));
         let (_, promotion_facts) = map.insert_profiled(CollKey(8), 8, 1);
@@ -2082,21 +2282,22 @@ mod tests {
             .expect("tree overwrite preflight succeeds");
         assert_eq!(overwrite_entries, 9);
         assert_eq!(overwrite_weight, 108);
-        let overwrite_error = exact
-            .try_insert_with_budget(
-                CollKey(4),
-                4_444,
-                100,
-                CollisionBudget {
-                    max_collision_entries: overwrite_entries,
-                    max_expanded_weight: 107,
-                    max_fresh_nodes: overwrite_fresh_bound,
-                },
-            )
-            .expect_err("replacement weight is charged after subtracting the old entry");
-        assert_eq!(overwrite_error.resource, CollisionResource::ExpandedWeight);
-        assert_eq!(overwrite_error.limit, 107);
-        assert_eq!(overwrite_error.attempted, 108);
+        let overwrite_error = exact.try_insert_with_budget(
+            CollKey(4),
+            4_444,
+            100,
+            CollisionBudget {
+                max_collision_entries: overwrite_entries,
+                max_expanded_weight: 107,
+                max_fresh_nodes: overwrite_fresh_bound,
+            },
+        );
+        let (unit, allowed, observed, progress) =
+            stop_facts(&overwrite_error, "tree-overwrite expanded-weight bound");
+        assert_eq!(unit, StructuralUnit::ExpandedWeight);
+        assert_eq!(allowed, 107);
+        assert_eq!(observed, 108);
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
         assert_eq!(collision_contents(&exact), exact_before);
         assert!(Arc::ptr_eq(
             exact.root.as_ref().expect("refused overwrite retains root"),
@@ -2113,32 +2314,77 @@ mod tests {
                     max_fresh_nodes: overwrite_fresh_bound,
                 },
             )
-            .expect("exact tree-overwrite boundaries are admitted");
+            .expect_admitted("exact tree-overwrite boundaries are admitted");
         assert_eq!(overwritten.len(), exact.len());
         assert_eq!(overwritten.get(&CollKey(4)), Some(&4_444));
         assert_eq!(exact.get(&CollKey(4)), Some(&4));
 
         let wide_base = PMap::new()
             .try_insert_with_budget(CollKey(0), 0, u64::MAX, CollisionBudget::UNBOUNDED)
-            .expect("one maximum-weight entry is representable");
-        let capped = wide_base
-            .try_insert_with_budget(
-                CollKey(1),
-                1,
-                1,
-                CollisionBudget {
-                    max_expanded_weight: u128::from(u64::MAX),
-                    ..CollisionBudget::UNBOUNDED
-                },
-            )
-            .expect_err("an explicit expanded-weight ceiling is enforced exactly");
-        assert_eq!(capped.resource, CollisionResource::ExpandedWeight);
-        assert_eq!(capped.limit, u128::from(u64::MAX));
-        assert_eq!(capped.attempted, u128::from(u64::MAX) + 1);
+            .expect_admitted("one maximum-weight entry is representable");
+        let capped = wide_base.try_insert_with_budget(
+            CollKey(1),
+            1,
+            1,
+            CollisionBudget {
+                max_expanded_weight: u64::MAX,
+                ..CollisionBudget::UNBOUNDED
+            },
+        );
+        // THE SATURATION BOUNDARY OF THE u64 NARROWING, asserted rather than left to be
+        // discovered. The measured total is `u128` while `allowed`/`observed` are `u64`,
+        // so the true attempt here (u64::MAX + 1) is not representable. The library
+        // reports a WITNESSED FLOOR — `min(attempted, u64::MAX).max(allowed + 1)` — which
+        // normally guarantees `observed > allowed`. At `allowed == u64::MAX` that
+        // guarantee cannot hold and the pair degenerates to equal.
+        //
+        // That is a wart, and it is the honest one to have: the AUTHORITY is still a
+        // refusal, which is the load-bearing fact, and only the reported pair is
+        // degenerate. The alternative — widening the shared `ResourceUsage` to `u128` for
+        // one caller's extreme — was rejected on this bead.
+        let (unit, allowed, observed, progress) =
+            stop_facts(&capped, "expanded-weight at the representable ceiling");
+        assert_eq!(unit, StructuralUnit::ExpandedWeight);
+        assert_eq!(allowed, u64::MAX);
+        assert_eq!(
+            observed,
+            u64::MAX,
+            "the observed floor saturates at the ceiling; it cannot exceed `allowed` here"
+        );
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
+        assert!(
+            matches!(capped, Outcome::Inconclusive(_)),
+            "the degenerate number pair must not weaken the refusal itself"
+        );
         assert_eq!(wide_base.len(), 1);
-        let wide = wide_base
-            .try_insert_with_budget(CollKey(1), 1, u64::MAX, CollisionBudget::UNBOUNDED)
-            .expect("the unbounded envelope admits every representable family weight");
+
+        // THE WRAP THAT THE `u128` TOTAL PREVENTS, which is a different hazard from the
+        // saturation wart just above and is why both are asserted. A second maximum-weight
+        // entry makes the family total `2 * u64::MAX`. Accumulated in `u64` that sum WRAPS
+        // to `u64::MAX - 1` — strictly BELOW the limit — so a narrower accumulator would
+        // ADMIT it; a saturating one would report exactly `u64::MAX`, which is not greater
+        // than the limit either, so it would admit it too. Only the `u128` measurement
+        // refuses. That is the asymmetry the narrowing decision deliberately kept: the
+        // LIMIT is `u64` so a stop's numbers fit the shared authority type, while the
+        // MEASURED total stays `u128` so a stop is reached at all.
+        let wide_overflow =
+            wide_base.try_insert_with_budget(CollKey(1), 1, u64::MAX, CollisionBudget::UNBOUNDED);
+        let (unit, allowed, observed, progress) = stop_facts(
+            &wide_overflow,
+            "a family total past the representable ceiling must refuse, not wrap into admission",
+        );
+        assert_eq!(unit, StructuralUnit::ExpandedWeight);
+        assert_eq!(allowed, u64::MAX);
+        assert_eq!(observed, u64::MAX);
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
+        assert_eq!(wide_base.len(), 1, "a refused insertion is atomic");
+
+        // ABOVE the widest admissible envelope the MEASUREMENT is still exact, which is
+        // what makes the refusal above correct rather than lucky. Reached through the
+        // unbudgeted profiled path because, by construction since `max_expanded_weight`
+        // became a `u64`, NO budget can admit a family this heavy — `CollisionBudget` is
+        // the widest representable envelope, not the absence of one.
+        let wide = wide_base.insert_profiled(CollKey(1), 1, u64::MAX).0;
         assert_eq!(wide.len(), 2);
         let mut wide_preflight = MutationFacts::default();
         let (_, wide_weight, _) = wide
@@ -2152,9 +2398,10 @@ mod tests {
         assert_eq!(wide_weight, 2 * u128::from(u64::MAX));
         let mut wide_tree = PMap::new();
         for key in 0..=INLINE_COLLISION_MAX as u64 {
-            wide_tree = wide_tree
-                .try_insert_with_budget(CollKey(key), key, u64::MAX, CollisionBudget::UNBOUNDED)
-                .expect("tree-tier weight aggregation remains exact above u64");
+            // Unbudgeted for the same reason: tree-tier aggregation must stay exact above
+            // `u64` even though no envelope admits the result, because the candidate total
+            // a refusal is computed FROM is aggregated by this same arithmetic.
+            wide_tree = wide_tree.insert_profiled(CollKey(key), key, u64::MAX).0;
         }
         let wide_tree_weight = collision_bucket_for(&wide_tree, &CollKey(0))
             .and_then(|bucket| match bucket {
@@ -2207,20 +2454,21 @@ mod tests {
                 ),
             }
 
-            let refused = map
-                .try_insert_with_budget(
-                    key.clone(),
-                    CARDINALITY as u64,
-                    1,
-                    CollisionBudget {
-                        max_collision_entries: CARDINALITY + 1,
-                        max_expanded_weight: (CARDINALITY + 1) as u128,
-                        max_fresh_nodes: required - 1,
-                    },
-                )
-                .expect_err("one node below the declared bound is refused atomically");
-            assert_eq!(refused.resource, CollisionResource::FreshNodes);
-            assert_eq!(refused.attempted, required as u128);
+            let refused = map.try_insert_with_budget(
+                key.clone(),
+                CARDINALITY as u64,
+                1,
+                CollisionBudget {
+                    max_collision_entries: CARDINALITY + 1,
+                    max_expanded_weight: (CARDINALITY + 1) as u64,
+                    max_fresh_nodes: required - 1,
+                },
+            );
+            let (unit, _allowed, observed, progress) =
+                stop_facts(&refused, "schedule-independent fresh-node bound");
+            assert_eq!(unit, StructuralUnit::ProducedNodes);
+            assert_eq!(observed, required as u64);
+            assert!(progress.contains(CollisionResource::FreshNodes.as_str_for_test()));
             assert_eq!(map.len(), CARDINALITY);
             assert_eq!(map.get(&key), None);
 
@@ -2238,11 +2486,11 @@ mod tests {
                     1,
                     CollisionBudget {
                         max_collision_entries: CARDINALITY + 1,
-                        max_expanded_weight: (CARDINALITY + 1) as u128,
+                        max_expanded_weight: (CARDINALITY + 1) as u64,
                         max_fresh_nodes: required,
                     },
                 )
-                .expect("the schedule-independent declared boundary is admitted");
+                .expect_admitted("the schedule-independent declared boundary is admitted");
             assert_eq!(collision_contents(&admitted), collision_contents(&profiled));
         }
     }
@@ -2316,6 +2564,143 @@ mod tests {
             map = next;
         }
         (map, total)
+    }
+
+    /// The adversarial case this bead exists for: an attacker who can choose keys
+    /// crafts a family that all hashes to one 64-bit value, then keeps pushing.
+    ///
+    /// `CollKey` is not a mock — its keys genuinely share a `key_hash`, and the code
+    /// under test is the production bucket, preflight, and budget. It models an
+    /// attacker who has *found* collisions; finding them is assumed, not performed.
+    ///
+    /// Two properties have to hold together, and only the pair defends the boundary:
+    /// the budget must actually bind (a refusal happens), and the refusal must be
+    /// CHEAP. A bound that costs O(n) per refused attempt is not a defence — an
+    /// attacker sending n requests still extracts O(n^2) work while being told "no"
+    /// every time.
+    #[test]
+    fn an_adversarial_collision_family_binds_the_budget_with_bounded_refusal_work() {
+        const ADMITTED: usize = 512;
+
+        let mut map = PMap::new();
+        for key in 0..ADMITTED as u64 {
+            map = map
+                .try_insert_with_budget(CollKey(key), key, 1, CollisionBudget::UNBOUNDED)
+                .expect_admitted("the unbounded envelope admits the whole family");
+        }
+        assert_eq!(map.len(), ADMITTED);
+
+        // Every entry shares one hash, so this is a single full-hash family in the
+        // tree tier — the shape the attacker is trying to weaponize.
+        let (_, len) = collision_bucket_for(&map, &CollKey(0))
+            .and_then(|bucket| match bucket {
+                CollisionBucket::Tree { root, len, .. } => Some((root, len)),
+                CollisionBucket::Inline(_) => None,
+            })
+            .expect("an adversarial family must be in the tree tier");
+        assert_eq!(*len, ADMITTED);
+
+        // Exact boundary: a budget of exactly the resulting cardinality admits, and
+        // one less refuses. `entries` counts the family AFTER the insertion, so
+        // admitting the (ADMITTED+1)-th needs a budget of ADMITTED + 1.
+        let at_limit = CollisionBudget {
+            max_collision_entries: ADMITTED + 1,
+            ..CollisionBudget::UNBOUNDED
+        };
+        let one_under = CollisionBudget {
+            max_collision_entries: ADMITTED,
+            ..CollisionBudget::UNBOUNDED
+        };
+        let grown = map
+            .try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, at_limit)
+            .expect_admitted("the exact budget admits");
+        assert_eq!(grown.len(), ADMITTED + 1);
+
+        let exhausted = map.try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, one_under);
+        let (unit, allowed, observed, progress) = stop_facts(&exhausted, "entries one-under");
+        assert_eq!(unit, StructuralUnit::ProducedNodes);
+        assert_eq!(allowed, ADMITTED as u64);
+        assert_eq!(observed, ADMITTED as u64 + 1);
+        // Both finer facts survive the fold, on `progress`: which resource, and which
+        // collision family. They are no longer typed fields, so this is what keeps them
+        // asserted rather than merely present.
+        assert!(progress.contains(CollisionResource::Entries.as_str_for_test()));
+        assert!(
+            progress.contains(&format!("{:016x}", CollKey(0).key_hash())),
+            "the collision family must remain identifiable: {progress}"
+        );
+
+        // Atomic: a refused attempt leaves the receiver untouched. Not "mostly
+        // unchanged" — the same length, and every prior key still resolves.
+        assert_eq!(map.len(), ADMITTED);
+        assert_eq!(map.get(&CollKey(ADMITTED as u64)), None);
+        for probe in [0u64, (ADMITTED / 2) as u64, ADMITTED as u64 - 1] {
+            assert_eq!(map.get(&CollKey(probe)), Some(&probe));
+        }
+
+        // The anti-DoS property: refusal cost is logarithmic in family size, not
+        // linear. Measured as the comparisons the preflight actually charged.
+        let log = ceil_log2(ADMITTED + 1);
+        let refusal_bound = 2 * log + 2;
+        let mut refusal_facts = MutationFacts::default();
+        let hash = CollKey(0).key_hash();
+        let bucket = collision_bucket_for(&map, &CollKey(0)).expect("family is present");
+        let shape = bucket.insertion_shape(&CollKey(ADMITTED as u64), 1, &mut refusal_facts);
+        assert!(shape.is_ok(), "the preflight itself must not fail");
+        assert!(
+            refusal_facts.comparisons <= refusal_bound,
+            "refusing one adversarial insert cost {} comparisons, bound {refusal_bound} \
+             for cardinality {ADMITTED}; a linear refusal path is an amplification vector",
+            refusal_facts.comparisons
+        );
+        assert!(
+            refusal_facts.comparisons < ADMITTED,
+            "refusal work must be sublinear in the family the attacker built"
+        );
+
+        // Each dimension binds independently, so a budget cannot be evaded by
+        // trading one resource against another.
+        let weight_bound = map.try_insert_with_budget(
+            CollKey(ADMITTED as u64),
+            0,
+            1,
+            CollisionBudget {
+                max_expanded_weight: ADMITTED as u64,
+                ..CollisionBudget::UNBOUNDED
+            },
+        );
+        let (unit, _, _, progress) = stop_facts(&weight_bound, "weight bound");
+        assert_eq!(unit, StructuralUnit::ExpandedWeight);
+        assert!(progress.contains(CollisionResource::ExpandedWeight.as_str_for_test()));
+        assert!(progress.contains(&format!("{hash:016x}")));
+
+        let node_bound = map.try_insert_with_budget(
+            CollKey(ADMITTED as u64),
+            0,
+            1,
+            CollisionBudget {
+                max_fresh_nodes: 0,
+                ..CollisionBudget::UNBOUNDED
+            },
+        );
+        let (unit, _, _, progress) = stop_facts(&node_bound, "fresh-node bound");
+        assert_eq!(unit, StructuralUnit::ProducedNodes);
+        assert!(progress.contains(CollisionResource::FreshNodes.as_str_for_test()));
+
+        // Recovery: the refusal is about the envelope, never about the key. Raising
+        // the budget admits the very entry that was just refused, which is what makes
+        // this inconclusive rather than a rejection.
+        let recovered = map
+            .try_insert_with_budget(CollKey(ADMITTED as u64), 0, 1, CollisionBudget::UNBOUNDED)
+            .expect_admitted("a valid key is never rejected merely for colliding");
+        assert_eq!(recovered.len(), ADMITTED + 1);
+        assert_eq!(recovered.get(&CollKey(ADMITTED as u64)), Some(&0));
+
+        println!(
+            "adversarial collision evidence: cardinality={ADMITTED} \
+             refusal_comparisons={} refusal_bound={refusal_bound} hash={hash:016x}",
+            refusal_facts.comparisons
+        );
     }
 
     #[test]
@@ -2540,28 +2925,23 @@ mod tests {
                 required_fresh_nodes,
                 "shift={shift}"
             );
-            let refused = singleton
-                .try_insert_with_budget(
-                    high.clone(),
-                    1,
-                    1,
-                    CollisionBudget {
-                        max_collision_entries: 1,
-                        max_expanded_weight: 1,
-                        max_fresh_nodes: required_fresh_nodes.saturating_sub(1),
-                    },
-                )
-                .expect_err("one below the exact split-path bound is refused");
-            assert_eq!(
-                refused.resource,
-                CollisionResource::FreshNodes,
+            let refused = singleton.try_insert_with_budget(
+                high.clone(),
+                1,
+                1,
+                CollisionBudget {
+                    max_collision_entries: 1,
+                    max_expanded_weight: 1,
+                    max_fresh_nodes: required_fresh_nodes.saturating_sub(1),
+                },
+            );
+            let (unit, _, observed, progress) = stop_facts(&refused, "shaped-key fresh-node bound");
+            assert_eq!(unit, StructuralUnit::ProducedNodes, "shift={shift}");
+            assert!(
+                progress.contains(CollisionResource::FreshNodes.as_str_for_test()),
                 "shift={shift}"
             );
-            assert_eq!(
-                refused.attempted,
-                usize_as_u128(required_fresh_nodes),
-                "shift={shift}"
-            );
+            assert_eq!(observed, required_fresh_nodes as u64, "shift={shift}");
             let reverse = PMap::new().insert(high, 1).insert(low, 0);
             let expected_nodes = (shift / BITS) as usize + 3;
             assert_eq!(forward.node_count(), expected_nodes, "shift={shift}");
@@ -2895,7 +3275,10 @@ mod tests {
             .ok()?;
         let exact_budget = CollisionBudget {
             max_collision_entries: next_len,
-            max_expanded_weight: next_weight,
+            // The measured total is `u128`; the budget is `u64` after the narrowing. A
+            // model input that does not fit is out of this model's domain, so it declines
+            // rather than clamping to a budget it did not mean.
+            max_expanded_weight: u64::try_from(next_weight).ok()?,
             max_fresh_nodes: required_fresh_nodes,
         };
         let refusal = enumeration
@@ -2908,10 +3291,18 @@ mod tests {
                     ..exact_budget
                 },
             )
-            .err()?;
-        if refusal.resource != CollisionResource::FreshNodes
-            || refusal.limit != usize_as_u128(required_fresh_nodes.saturating_sub(1))
-            || refusal.attempted != usize_as_u128(required_fresh_nodes)
+            .stop_opt()?;
+        let InconclusiveCause::ResourceExhausted { usage } = &refusal.cause else {
+            return None;
+        };
+        let progress = refusal.progress.as_ref().map(|p| p.text()).unwrap_or("");
+        if usage.reason
+            != (ResourceReason::StructuralBudget {
+                unit: StructuralUnit::ProducedNodes,
+            })
+            || !progress.contains(CollisionResource::FreshNodes.as_str_for_test())
+            || usage.allowed != required_fresh_nodes.saturating_sub(1) as u64
+            || usage.observed != required_fresh_nodes as u64
             || enumeration.get(&next_name).is_some()
         {
             return None;
@@ -2919,7 +3310,7 @@ mod tests {
 
         let admitted = enumeration
             .try_insert_with_budget(next_name.clone(), next_component, 1, exact_budget)
-            .ok()?;
+            .admitted_opt()?;
         let (profiled, append_facts) =
             enumeration.insert_profiled(next_name.clone(), next_component, 1);
         if admitted != profiled || append_facts.actual_fresh_nodes() > required_fresh_nodes {
@@ -2974,9 +3365,9 @@ mod tests {
             append_fresh_nodes: append_facts.actual_fresh_nodes(),
             max_lookup_comparisons,
             required_fresh_nodes,
-            refusal_resource: refusal.resource,
-            refusal_limit: refusal.limit,
-            refusal_attempted: refusal.attempted,
+            refusal_resource: CollisionResource::FreshNodes,
+            refusal_limit: u128::from(usage.allowed),
+            refusal_attempted: u128::from(usage.observed),
         };
         drop(snapshot);
         Some(result)

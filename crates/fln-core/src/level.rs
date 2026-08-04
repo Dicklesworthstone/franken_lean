@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::debug_walk::FlatDebug;
 use crate::lean_hash::mix_hash;
 use crate::name::Name;
 
@@ -97,7 +98,11 @@ impl std::fmt::Display for LevelTooDeep {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// Deliberately **not** `PartialEq`/`Eq`/`Hash`: each derived traversal descends
+/// one stack frame per child and overflows on deep input.  Equality and hashing
+/// are properties of [`Level`] — the former walks a heap worklist, the latter is
+/// the O(1) data word.
+#[derive(Debug)]
 enum Node {
     Zero,
     Succ(Level),
@@ -118,11 +123,73 @@ pub struct Level {
 }
 
 impl std::fmt::Debug for Level {
+    /// Byte-identical to the derived rendering, walked on an explicit task stack:
+    /// `debug_struct` would descend one frame per level and overflow on deep input
+    /// (bead franken_lean-canon-stack-safe-drop-6gy).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Level")
-            .field("node", self.node())
-            .field("data", &self.data)
-            .finish()
+        enum Task<'a> {
+            Level(&'a Level),
+            Node(&'a Node),
+            Field(&'static str),
+            Entry,
+            Leaf(&'a dyn std::fmt::Debug),
+            Close,
+        }
+
+        let mut out = FlatDebug::new(f);
+        let mut tasks = vec![Task::Level(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Level(level) => {
+                    out.open_struct("Level")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Leaf(&level.data));
+                    tasks.push(Task::Field("data"));
+                    tasks.push(Task::Node(level.node()));
+                    tasks.push(Task::Field("node"));
+                }
+                Task::Node(Node::Zero) => out.unit("Zero")?,
+                Task::Node(Node::Succ(inner)) => {
+                    out.open_tuple("Succ")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(inner));
+                    out.entry()?;
+                }
+                Task::Node(Node::Max(left, right)) => {
+                    out.open_tuple("Max")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(right));
+                    tasks.push(Task::Entry);
+                    tasks.push(Task::Level(left));
+                    out.entry()?;
+                }
+                Task::Node(Node::IMax(left, right)) => {
+                    out.open_tuple("IMax")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Level(right));
+                    tasks.push(Task::Entry);
+                    tasks.push(Task::Level(left));
+                    out.entry()?;
+                }
+                Task::Node(Node::Param(name)) => {
+                    out.open_tuple("Param")?;
+                    out.entry()?;
+                    out.leaf(name)?;
+                    out.close()?;
+                }
+                Task::Node(Node::MVar(id)) => {
+                    out.open_tuple("MVar")?;
+                    out.entry()?;
+                    out.leaf(id)?;
+                    out.close()?;
+                }
+                Task::Field(name) => out.field(name)?,
+                Task::Entry => out.entry()?,
+                Task::Leaf(value) => out.leaf(value)?,
+                Task::Close => out.close()?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -130,8 +197,46 @@ impl PartialEq for Level {
     fn eq(&self, other: &Level) -> bool {
         // Data word first (hash/depth/flags reject fast), then structure — the same
         // discipline as lean_level_eq (kernel/level.cpp:125-150).
-        self.data == other.data
-            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
+        //
+        // The comparison walks an explicit heap worklist rather than descending
+        // through one `Level::eq` frame per input level: two independently built
+        // deep-but-equal levels agree on every data word, so the structural arm is
+        // reached at every node and a recursive comparison would consume the stack
+        // in proportion to input depth.  Equality is a pure predicate, so visiting
+        // the pending pairs in any order yields the same verdict.
+        let mut pending: Vec<(&Level, &Level)> = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            match (left.node(), right.node()) {
+                (Node::Zero, Node::Zero) => {}
+                (Node::Succ(a), Node::Succ(b)) => pending.push((a, b)),
+                // Distinct constructors never compare equal, so `Max`/`IMax` may not
+                // share an arm with each other.
+                (Node::Max(a1, a2), Node::Max(b1, b2))
+                | (Node::IMax(a1, a2), Node::IMax(b1, b2)) => {
+                    pending.push((a2, b2));
+                    pending.push((a1, b1));
+                }
+                (Node::Param(a), Node::Param(b)) => {
+                    // `Name` compares iteratively (bead franken_lean-p8a.1).
+                    if a != b {
+                        return false;
+                    }
+                }
+                (Node::MVar(a), Node::MVar(b)) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 impl Eq for Level {}
@@ -547,7 +652,52 @@ impl Level {
             .any(|l| l.get_offset() >= max_explicit)
     }
 
+    /// A normalization fixpoint: apply [`Level::normalize`] until it stops changing.
+    ///
+    /// **This is not `Lean.Level.normalize` and must never be used where the pin's
+    /// output is the observable** — not for `faithful`-mode artifacts, not for the
+    /// `core_observables` oracle rows, not for anything a user metaprogram reads.
+    /// Upstream's `normalize` is not idempotent and neither is ours (bead fln-0uvk,
+    /// and `normalize_is_not_idempotent_and_the_pin_agrees` pins both steps against
+    /// the pinned binary), so matching it means reproducing that.
+    ///
+    /// It exists for the consumers that non-idempotence actually endangers: anything
+    /// that **stores, keys, digests, or caches** a normalized level and compares it
+    /// later. For those, one-pass output is not canonical — `is_equiv(x, y)` and
+    /// `is_equiv(x.normalize(), y)` can disagree (see
+    /// `pre_normalization_changes_an_is_equiv_verdict`), which makes a verdict depend
+    /// on how many times someone happened to normalize. That is the FL-INV-01 failure
+    /// mode: same inputs, different answer, decided by history rather than by content.
+    ///
+    /// The loop is bounded because a fixpoint that fails to converge must be a typed
+    /// outcome rather than a hang (FL-INV-07). Convergence within
+    /// [`Level::NORMALIZE_FIXPOINT_PASSES`] is asserted over the generated corpus by
+    /// `normalize_fixpoint_converges_and_is_idempotent`; the bound returns the last
+    /// form reached rather than looping forever, so the worst case is a value that is
+    /// merely normalized rather than canonical.
+    pub fn normalize_fixpoint(&self) -> Level {
+        let mut current = self.normalize();
+        for _ in 1..Level::NORMALIZE_FIXPOINT_PASSES {
+            let next = current.normalize();
+            if next == current {
+                return current;
+            }
+            current = next;
+        }
+        current
+    }
+
+    /// Passes [`Level::normalize_fixpoint`] will make before returning what it has.
+    /// Two suffice for every shape observed so far — the extra headroom is so that a
+    /// future normalization rule cannot turn a slow fixpoint into an unbounded loop.
+    pub const NORMALIZE_FIXPOINT_PASSES: usize = 8;
+
     /// `Level.normalize` (Level.lean:379-401).
+    ///
+    /// Bit-faithful to the pin, **including its non-idempotence**: for
+    /// `succ^k(imax a (succ b))` with `k ≥ 1` this collapses the `imax` to a `max`
+    /// but leaves the offset outside, and a second pass distributes it. Use
+    /// [`Level::normalize_fixpoint`] when a canonical form is what you need.
     pub fn normalize(&self) -> Level {
         if self.is_already_normalized_cheap() {
             return self.clone();
@@ -622,45 +772,46 @@ impl Level {
     /// normalized forms exactly as the pin does. Used by KR-604 (constructor
     /// field universes) and KR-602/700 machinery.
     pub fn is_geq(&self, other: &Level) -> bool {
-        fn to_offset(l: &Level) -> (Level, u32) {
-            let mut base = l.clone();
-            let mut k = 0u32;
-            while let LevelView::Succ(inner) = base.view() {
-                let inner = inner.clone();
-                base = inner;
-                k += 1;
-            }
-            (base, k)
-        }
-        fn core(l1: &Level, l2: &Level) -> bool {
-            if l1 == l2 || l2.is_zero() {
+        /// `Level.geq.go` (Level.lean:620-638), transcribed arm for arm.
+        ///
+        /// Two things here are load-bearing and were wrong in the previous
+        /// re-derivation, which disagreed with the pinned binary on 5 of 196
+        /// generated pairs (all of them `succ^k(imax _ (succ _))`, caught by
+        /// crates/fln-core/tests/pin_ext_observables.rs):
+        ///
+        /// * the recursion is on `go`, **not** back through `is_geq`. Re-entering
+        ///   `is_geq` normalizes again at every step, and `normalize` is not
+        ///   idempotent (bead fln-0uvk), so the operands drifted mid-comparison.
+        /// * the arm ORDER decides the answer. `imax` on the LEFT is consumed by
+        ///   its own arm before `k` ever runs, and `k` is what handles `imax` on
+        ///   the right. Testing the right-hand `imax` first — as the old code did —
+        ///   answers a different question.
+        fn go(u: &Level, v: &Level) -> bool {
+            if u == v {
                 return true;
             }
-            if let LevelView::Max(a, b) = l2.view() {
-                return l1.is_geq(a) && l1.is_geq(b);
+            // `k` in the pin: the offset comparison, with the right-hand `imax`
+            // decomposed here rather than in the match.
+            let k = |u: &Level, v: &Level| -> bool {
+                match v.view() {
+                    LevelView::IMax(v1, v2) => go(u, v1) && go(u, v2),
+                    _ => {
+                        let v_base = v.get_level_offset();
+                        (u.get_level_offset() == v_base || v_base.is_zero())
+                            && u.get_offset() >= v.get_offset()
+                    }
+                }
+            };
+            match (u.view(), v.view()) {
+                (_, LevelView::Zero) => true,
+                (_, LevelView::Max(v1, v2)) => go(u, v1) && go(u, v2),
+                (LevelView::Max(u1, u2), _) => go(u1, v) || go(u2, v) || k(u, v),
+                (LevelView::IMax(_, u2), _) => go(u2, v),
+                (LevelView::Succ(u1), LevelView::Succ(v1)) => go(u1, v1),
+                _ => k(u, v),
             }
-            if let LevelView::Max(a, b) = l1.view()
-                && (a.is_geq(l2) || b.is_geq(l2))
-            {
-                return true;
-            }
-            if let LevelView::IMax(a, b) = l2.view() {
-                return l1.is_geq(a) && l1.is_geq(b);
-            }
-            if let LevelView::IMax(_, b) = l1.view() {
-                return b.is_geq(l2);
-            }
-            let (base1, k1) = to_offset(l1);
-            let (base2, k2) = to_offset(l2);
-            if base1 == base2 || base2.is_zero() {
-                return k1 >= k2;
-            }
-            if k1 == k2 && k1 > 0 {
-                return base1.is_geq(&base2);
-            }
-            false
         }
-        core(&self.normalize(), &other.normalize())
+        go(&self.normalize(), &other.normalize())
     }
 
     // ---- cheap smart constructors ------------------------------------------------------
@@ -1015,6 +1166,940 @@ mod tests {
             Arc::strong_count(leaf.node_arc()),
             1,
             "no shared internal node may retain either leaf edge"
+        );
+    }
+
+    /// Seeded property test for the normalization laws (bead franken_lean-p8a).
+    ///
+    /// These are laws of the universe algebra, written from the algebra and not read
+    /// off `normalize`: if the implementation and the law disagree, the law wins and
+    /// the failure is a finding. `imax u 0 ≡ 0` is the load-bearing one — Prop
+    /// impredicativity depends on it, and it is the reason `imax` cannot simply be
+    /// `max`.
+    #[test]
+    fn normalization_laws_hold_over_generated_levels() {
+        struct Gen(u64);
+        impl Gen {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn level(&mut self, depth: u32) -> Level {
+                if depth == 0 {
+                    return match self.next() % 4 {
+                        0 => Level::zero(),
+                        1 => p("u"),
+                        2 => p("v"),
+                        _ => Level::mvar(LMVarId(Name::str(Name::anonymous(), "m"))),
+                    };
+                }
+                match self.next() % 5 {
+                    0 => self.level(depth - 1).succ().expect("shallow"),
+                    1 => Level::max(self.level(depth - 1), self.level(depth - 1)).expect("shallow"),
+                    2 => {
+                        Level::imax(self.level(depth - 1), self.level(depth - 1)).expect("shallow")
+                    }
+                    3 => self
+                        .level(depth - 1)
+                        .add_offset(self.next() as u32 % 3)
+                        .expect("shallow"),
+                    _ => self.level(0),
+                }
+            }
+        }
+
+        let zero = Level::zero();
+        let mut generator = Gen(0x9e37_79b9_7f4a_7c15);
+        for round in 0..400 {
+            let u = generator.level(3);
+            let v = generator.level(3);
+            let w = generator.level(2);
+            let at = |law: &str| format!("round {round}: {law}");
+
+            // NB: `normalize` is NOT idempotent, and the pin's is not either — see
+            // `normalize_is_not_idempotent_and_the_pin_agrees`. Asserting idempotence
+            // here, the obvious law for anything called a normal form, would assert
+            // something upstream does not hold to.
+
+            // isEquiv is an equivalence relation.
+            assert!(u.is_equiv(&u), "{}", at("isEquiv is reflexive"));
+            assert_eq!(
+                u.is_equiv(&v),
+                v.is_equiv(&u),
+                "{}",
+                at("isEquiv is symmetric")
+            );
+            if u.is_equiv(&v) && v.is_equiv(&w) {
+                assert!(u.is_equiv(&w), "{}", at("isEquiv is transitive"));
+            }
+
+            // The impredicativity law: `imax u 0` collapses to `0`, whatever `u` is.
+            let imax_zero = Level::imax(u.clone(), zero.clone()).expect("shallow");
+            assert!(
+                imax_zero.is_equiv(&zero),
+                "{}",
+                at("imax u 0 ≡ 0 — Prop impredicativity")
+            );
+
+            // `imax` above a successor is just `max`: the right side cannot be Prop.
+            let succ_v = v.clone().succ().expect("shallow");
+            assert!(
+                Level::imax(u.clone(), succ_v.clone())
+                    .expect("shallow")
+                    .is_equiv(&Level::max(u.clone(), succ_v.clone()).expect("shallow")),
+                "{}",
+                at("imax u (succ v) ≡ max u (succ v)")
+            );
+
+            // max is idempotent, commutative and associative, with zero as unit.
+            assert!(
+                Level::max(u.clone(), u.clone())
+                    .expect("shallow")
+                    .is_equiv(&u),
+                "{}",
+                at("max u u ≡ u")
+            );
+            assert!(
+                Level::max(u.clone(), v.clone())
+                    .expect("shallow")
+                    .is_equiv(&Level::max(v.clone(), u.clone()).expect("shallow")),
+                "{}",
+                at("max is commutative")
+            );
+            let left = Level::max(
+                Level::max(u.clone(), v.clone()).expect("shallow"),
+                w.clone(),
+            )
+            .expect("shallow");
+            let right = Level::max(
+                u.clone(),
+                Level::max(v.clone(), w.clone()).expect("shallow"),
+            )
+            .expect("shallow");
+            assert!(left.is_equiv(&right), "{}", at("max is associative"));
+            assert!(
+                Level::max(u.clone(), zero.clone())
+                    .expect("shallow")
+                    .is_equiv(&u),
+                "{}",
+                at("max u 0 ≡ u")
+            );
+
+            // NB: `succ (max u v)` vs `max (succ u) (succ v)` is deliberately NOT
+            // asserted here. The two are semantically equal but `isEquiv` compares
+            // NORMAL FORMS, and normalization is not complete for semantic equality
+            // — see `is_equiv_compares_normal_forms_not_semantic_equality`, whose
+            // counterexample was checked against the pinned Reference.
+
+            // An offset is iterated succ, and normalization preserves that.
+            let k = (round % 4) as u32;
+            let by_offset = u.clone().add_offset(k).expect("shallow");
+            let mut by_succ = u.clone();
+            for _ in 0..k {
+                by_succ = by_succ.succ().expect("shallow");
+            }
+            assert!(
+                by_offset.is_equiv(&by_succ),
+                "{}",
+                at("addOffset k ≡ succ^k")
+            );
+
+            // The smart constructors agree with the plain ones up to equivalence —
+            // they exist to avoid building nodes, not to change meaning.
+            assert!(
+                Level::smart_max(u.clone(), v.clone())
+                    .is_equiv(&Level::max(u.clone(), v.clone()).expect("shallow")),
+                "{}",
+                at("mkLevelMax' agrees with max")
+            );
+            assert!(
+                Level::smart_imax(u.clone(), v.clone())
+                    .is_equiv(&Level::imax(u.clone(), v.clone()).expect("shallow")),
+                "{}",
+                at("mkLevelIMax' agrees with imax")
+            );
+        }
+    }
+
+    /// `Level.isEquiv` is `u == v || u.normalize == v.normalize` — equality of
+    /// NORMAL FORMS, not of meanings. Normalization is incomplete for semantic
+    /// equality, so two levels that denote the same universe under every assignment
+    /// can still compare unequal.
+    ///
+    /// This is not our approximation: the counterexample below was run through the
+    /// PINNED Reference binary (v4.32.0, commit 8c9756b2), which produces the same
+    /// two normal forms and the same `false`:
+    ///
+    /// ```text
+    /// lhs.normalize = max (u + 3) (v + 3)
+    /// rhs.normalize = max (max (u + 3) (v + 1)) ((max (u + 2) (v + 2)) + 1)
+    /// isEquiv       = false
+    /// ```
+    ///
+    /// `faithful` mode means matching that, incompleteness included. The test exists
+    /// so a future "improvement" to normalize that closes this gap is caught as the
+    /// fidelity change it is, rather than landing silently.
+    ///
+    /// Found by the property test above, which asserted succ/max distributivity and
+    /// was wrong to.
+    #[test]
+    fn is_equiv_compares_normal_forms_not_semantic_equality() {
+        let u = p("u");
+        let v = p("v");
+
+        // Distributivity DOES hold for atoms, which is why the general law looked
+        // plausible.
+        let simple_lhs = Level::max(u.clone(), v.clone())
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let simple_rhs = Level::max(
+            u.clone().succ().expect("shallow"),
+            v.clone().succ().expect("shallow"),
+        )
+        .expect("shallow");
+        assert!(simple_lhs.is_equiv(&simple_rhs), "atoms distribute");
+
+        // The Reference-checked counterexample: both sides denote max(u,v)+3.
+        let left = Level::imax(
+            u.clone(),
+            Level::max(v.clone(), u.clone())
+                .expect("shallow")
+                .add_offset(2)
+                .expect("shallow"),
+        )
+        .expect("shallow");
+        let right = Level::max(
+            Level::max(Level::zero(), u.clone().add_offset(2).expect("shallow")).expect("shallow"),
+            v.clone(),
+        )
+        .expect("shallow");
+
+        let lhs = Level::max(left.clone(), right.clone())
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let rhs = Level::max(
+            left.succ().expect("shallow"),
+            right.succ().expect("shallow"),
+        )
+        .expect("shallow");
+
+        assert!(
+            !lhs.is_equiv(&rhs),
+            "normalization is incomplete here and the pin agrees; closing this gap \
+             would be a deliberate fidelity change, not a bug fix"
+        );
+    }
+
+    /// The consumer hazard fln-0uvk was filed for, demonstrated with parameters only
+    /// — no metavariable, so this shape occurs in ordinary kernel-checked universes,
+    /// not just mid-elaboration.
+    ///
+    /// Two callers holding the same universe get different answers because one of
+    /// them normalized first. Nothing in the workspace does this today (the analysis
+    /// on the bead maps every caller), which is why this is a latent hazard rather
+    /// than a live bug — but it is the reason `normalize_fixpoint` exists and the
+    /// reason no cache key may be taken over `normalize` output.
+    #[test]
+    fn pre_normalization_changes_an_is_equiv_verdict() {
+        let u = p("u");
+        let v = p("v");
+        // succ(imax v (succ u)) — the non-idempotent class.
+        let x = Level::imax(v, u.succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        let y = x.normalize().normalize();
+
+        assert!(!x.is_equiv(&y), "one-pass forms differ, so isEquiv says no");
+        assert!(
+            x.normalize().is_equiv(&y),
+            "after a pre-normalization the very same pair says yes"
+        );
+
+        // The fixpoint form is stable under exactly that difference.
+        assert_eq!(x.normalize_fixpoint(), y.normalize_fixpoint());
+        assert_eq!(
+            x.normalize_fixpoint(),
+            x.normalize().normalize_fixpoint(),
+            "a canonical form cannot depend on how many times the caller normalized"
+        );
+    }
+
+    /// `normalize_fixpoint` is the true normal form the one-pass function is not.
+    ///
+    /// The generator deliberately emits `succ^k(imax(a, succ b))`, the only shape
+    /// class that is non-idempotent. An earlier version of this search covered 80,000
+    /// generated pairs and found zero — because it never built that shape. A search
+    /// whose zeros are not validated against a known positive is worth nothing, so
+    /// the known counterexample is checked first, here, every run.
+    #[test]
+    fn normalize_fixpoint_converges_and_is_idempotent() {
+        struct Gen(u64);
+        impl Gen {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn atom(&mut self) -> Level {
+                match self.next() % 4 {
+                    0 => Level::zero(),
+                    1 => p("u"),
+                    2 => p("v"),
+                    _ => Level::mvar(LMVarId(Name::str(Name::anonymous(), "m"))),
+                }
+            }
+            fn level(&mut self, depth: u32) -> Level {
+                if depth == 0 {
+                    return self.atom();
+                }
+                match self.next() % 7 {
+                    0 => self.level(depth - 1).succ().expect("shallow"),
+                    1 => Level::max(self.level(depth - 1), self.level(depth - 1)).expect("shallow"),
+                    2 => {
+                        Level::imax(self.level(depth - 1), self.level(depth - 1)).expect("shallow")
+                    }
+                    3 => Level::imax(self.level(depth - 1), Level::zero()).expect("shallow"),
+                    // The non-idempotent class, emitted on purpose.
+                    4 => Level::imax(
+                        self.level(depth - 1),
+                        self.level(depth - 1).succ().expect("shallow"),
+                    )
+                    .expect("shallow")
+                    .succ()
+                    .expect("shallow"),
+                    5 => self
+                        .level(depth - 1)
+                        .add_offset((self.next() % 3) as u32)
+                        .expect("shallow"),
+                    _ => self.atom(),
+                }
+            }
+        }
+
+        // Validate the search before trusting it: the known counterexample must be
+        // non-idempotent under `normalize` and stable under `normalize_fixpoint`.
+        let known = Level::imax(p("v"), p("u").succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        assert_ne!(
+            known.normalize(),
+            known.normalize().normalize(),
+            "the harness cannot see the known non-idempotent case"
+        );
+        assert_eq!(
+            known.normalize_fixpoint(),
+            known.normalize_fixpoint().normalize()
+        );
+
+        let mut generator = Gen(0x5eed_0a1b_2c3d_4e5f);
+        let mut saw_non_idempotent = 0usize;
+        for round in 0..600 {
+            let x = generator.level(4);
+            let fixed = x.normalize_fixpoint();
+
+            if x.normalize() != x.normalize().normalize() {
+                saw_non_idempotent += 1;
+            }
+
+            // The fixpoint is a fixpoint.
+            assert_eq!(
+                fixed.normalize(),
+                fixed,
+                "round {round}: normalize_fixpoint output is not stable"
+            );
+            assert_eq!(
+                fixed.normalize_fixpoint(),
+                fixed,
+                "round {round}: normalize_fixpoint is not idempotent"
+            );
+
+            // And it is reached regardless of how many times the caller normalized
+            // first — the property the one-pass function does not have.
+            assert_eq!(
+                x.normalize().normalize_fixpoint(),
+                fixed,
+                "round {round}: pre-normalizing changed the canonical form"
+            );
+            assert_eq!(
+                x.normalize().normalize().normalize_fixpoint(),
+                fixed,
+                "round {round}: pre-normalizing twice changed the canonical form"
+            );
+
+            // Two passes are enough for every shape seen so far; if that ever stops
+            // holding, the bound is what keeps it from becoming a hang.
+            assert_eq!(
+                x.normalize().normalize(),
+                fixed,
+                "round {round}: the fixpoint took more than two passes"
+            );
+
+            // isEquiv agreeing implies the canonical forms agree. The converse does
+            // not hold, and must not be asserted: canonical comparison is coarser
+            // than the pin's isEquiv, which is exactly the difference this bead is
+            // about.
+            let y = generator.level(3);
+            if x.is_equiv(&y) {
+                assert_eq!(
+                    fixed,
+                    y.normalize_fixpoint(),
+                    "round {round}: isEquiv said yes but the canonical forms differ"
+                );
+            }
+        }
+        assert!(
+            saw_non_idempotent > 0,
+            "the generator never produced a non-idempotent level, so this search \
+             proved nothing — the same false negative an earlier version shipped"
+        );
+    }
+
+    /// `Level.normalize` is **not** idempotent, and neither is the pin's.
+    ///
+    /// Found by the property test above, which asserted idempotence — the obvious law
+    /// for anything called a normal form — and was wrong to. The counterexample was
+    /// run through the PINNED Reference binary (v4.32.0, commit 8c9756b2), which
+    /// produces the same two forms and the same verdict:
+    ///
+    /// ```text
+    /// u             = (imax v (m + 1)) + 1
+    /// u.normalize   = (max v (m + 1)) + 1
+    /// u.normalize^2 = max (v + 1) (m + 2)
+    /// idempotent    = false
+    /// ```
+    ///
+    /// The first pass turns `imax` into `max` — the right side is a `succ`, so it
+    /// cannot be zero — but leaves the outer offset outside; the second pass then
+    /// distributes it. `faithful` mode means reproducing that, so both steps are
+    /// pinned here. Making normalization reach its fixpoint in one pass would be a
+    /// deliberate fidelity decision with a Behavior Note, not a tidy-up.
+    #[test]
+    fn normalize_is_not_idempotent_and_the_pin_agrees() {
+        let v = p("v");
+        let m = Level::mvar(LMVarId(Name::str(Name::anonymous(), "m")));
+
+        let u = Level::imax(v.clone(), m.clone().succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+
+        // First pass: imax collapses to max, the outer succ stays where it was.
+        let once = u.normalize();
+        let expected_once = Level::max(v.clone(), m.clone().succ().expect("shallow"))
+            .expect("shallow")
+            .succ()
+            .expect("shallow");
+        assert_eq!(once, expected_once, "first pass diverged from the pin");
+
+        // Second pass: the offset distributes into the max arguments.
+        let twice = once.normalize();
+        let expected_twice = Level::max(
+            v.succ().expect("shallow"),
+            m.succ().expect("shallow").succ().expect("shallow"),
+        )
+        .expect("shallow");
+        assert_eq!(twice, expected_twice, "second pass diverged from the pin");
+        assert_ne!(once, twice, "the pin's normalize is not a fixpoint here");
+
+        // Non-idempotence is one step, not an oscillation.
+        assert_eq!(
+            twice.normalize(),
+            twice,
+            "normalization settles after the second pass"
+        );
+    }
+
+    /// `Level.geq` had no test anywhere in the workspace — found while auditing what
+    /// ci/PARITY_LEDGER.txt could honestly claim. It decides "≥ under every parameter
+    /// assignment" for KR-604 constructor-field universes, so it is load-bearing for
+    /// the kernel even though nothing calls it yet.
+    ///
+    /// The properties below are stated from the relation's meaning, not read off the
+    /// implementation: `u ≥ 0` for every `u`, reflexivity, `succ u ≥ u` strictly one
+    /// way, `max` above both arms, and the two cases where a parameter cannot be
+    /// ordered against another parameter at all.
+    #[test]
+    fn geq_orders_universes_by_meaning_not_by_syntax() {
+        let zero = Level::zero();
+        let u = p("u");
+        let v = p("v");
+
+        for level in [
+            zero.clone(),
+            u.clone(),
+            nat(3),
+            Level::max(u.clone(), v.clone()).expect("shallow"),
+        ] {
+            assert!(level.is_geq(&zero), "every universe is at least zero");
+            assert!(level.is_geq(&level), "geq is reflexive");
+        }
+
+        let succ_u = u.clone().succ().expect("shallow");
+        assert!(succ_u.is_geq(&u), "succ u ≥ u");
+        assert!(!u.is_geq(&succ_u), "u is not ≥ succ u");
+        assert!(!zero.is_geq(&u), "zero is not ≥ a parameter");
+
+        // Distinct parameters are incomparable in both directions: neither dominates
+        // under every assignment.
+        assert!(!u.is_geq(&v));
+        assert!(!v.is_geq(&u));
+
+        // max is above both arms, and dominates a parameter only through an arm.
+        let max_uv = Level::max(u.clone(), v.clone()).expect("shallow");
+        assert!(max_uv.is_geq(&u));
+        assert!(max_uv.is_geq(&v));
+        assert!(!u.is_geq(&max_uv));
+
+        // Offsets compose with the base: u+2 ≥ u+1, and not the reverse.
+        let u1 = u.clone().add_offset(1).expect("shallow");
+        let u2 = u.clone().add_offset(2).expect("shallow");
+        assert!(u2.is_geq(&u1));
+        assert!(!u1.is_geq(&u2));
+
+        // Explicit levels compare by value, and syntax that normalizes to the same
+        // level compares equal in both directions.
+        assert!(nat(5).is_geq(&nat(5)));
+        assert!(nat(5).is_geq(&nat(4)));
+        assert!(!nat(4).is_geq(&nat(5)));
+        let max_u_u = Level::max(u.clone(), u.clone()).expect("shallow");
+        assert!(max_u_u.is_geq(&u) && u.is_geq(&max_u_u), "max u u ≡ u");
+    }
+
+    /// The recursive comparison this type deliberately no longer derives. Kept as a
+    /// test-only oracle: on shallow values recursion is safe, so it pins the exact
+    /// verdict the iterative predicate must reproduce.
+    fn recursive_level_eq(left: &Level, right: &Level) -> bool {
+        if left.data != right.data {
+            return false;
+        }
+        if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+            return true;
+        }
+        match (left.node(), right.node()) {
+            (Node::Zero, Node::Zero) => true,
+            (Node::Succ(a), Node::Succ(b)) => recursive_level_eq(a, b),
+            (Node::Max(a1, a2), Node::Max(b1, b2)) | (Node::IMax(a1, a2), Node::IMax(b1, b2)) => {
+                recursive_level_eq(a1, b1) && recursive_level_eq(a2, b2)
+            }
+            (Node::Param(a), Node::Param(b)) => a == b,
+            (Node::MVar(a), Node::MVar(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Every constructor, against every other, in both directions: the iterative
+    /// predicate agrees with the recursive oracle on shallow values.
+    fn shallow_equality_matrix() -> Vec<Level> {
+        let mvar = Level::mvar(LMVarId(Name::str(Name::anonymous(), "m")));
+        let other_mvar = Level::mvar(LMVarId(Name::str(Name::anonymous(), "n")));
+        let shared = Level::max(p("a"), nat(1)).expect("shallow");
+        vec![
+            Level::zero(),
+            nat(1),
+            nat(2),
+            p("a"),
+            p("b"),
+            mvar,
+            other_mvar,
+            Level::succ(p("a")).expect("shallow"),
+            Level::max(p("a"), p("b")).expect("shallow"),
+            Level::max(p("b"), p("a")).expect("shallow"),
+            Level::imax(p("a"), p("b")).expect("shallow"),
+            Level::imax(p("b"), p("a")).expect("shallow"),
+            Level::max(p("a"), nat(1)).expect("shallow"),
+            shared.clone(),
+            shared,
+            Level::max(Level::max(p("a"), p("b")).expect("shallow"), nat(3)).expect("shallow"),
+        ]
+    }
+
+    #[test]
+    fn iterative_equality_matches_the_recursive_oracle_on_every_constructor() {
+        let values = shallow_equality_matrix();
+        for (left_index, left) in values.iter().enumerate() {
+            for (right_index, right) in values.iter().enumerate() {
+                assert_eq!(
+                    left == right,
+                    recursive_level_eq(left, right),
+                    "verdict changed at ({left_index}, {right_index})"
+                );
+                assert_eq!(
+                    left == right,
+                    right == left,
+                    "equality is symmetric at ({left_index}, {right_index})"
+                );
+            }
+            assert!(left == left, "equality is reflexive at {left_index}");
+            assert!(
+                *left == left.clone(),
+                "a clone shares its node and stays equal at {left_index}"
+            );
+        }
+    }
+
+    /// Independently built deep-but-equal levels agree on every data word, so the
+    /// structural arm is reached at every node — the exact shape that overflowed
+    /// while the comparison recursed. A 1 MiB worker is far below what one frame
+    /// per level would need at this depth.
+    #[test]
+    fn deep_structural_equality_is_stack_bounded() {
+        const DEPTH: usize = 100_000;
+
+        fn deep_succ_over(base: Level, depth: usize) -> Level {
+            let mut level = base;
+            for _ in 0..depth {
+                level = Level::succ(level).expect("depth is inside the 24-bit packing");
+            }
+            level
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let left = deep_succ_over(p("a"), DEPTH);
+                let right = deep_succ_over(p("a"), DEPTH);
+                assert!(
+                    left == right,
+                    "independently built deep levels must compare equal"
+                );
+
+                // A mismatch buried under the whole chain: the walk must reach it
+                // rather than stop at the roots' data words.
+                let deep_other = deep_succ_over(p("b"), DEPTH);
+                assert!(left != deep_other, "a deep leaf mismatch must be observed");
+
+                // Alternating Max/IMax spines exercise the two-child arms.
+                let mut left_spine = Level::zero();
+                let mut right_spine = Level::zero();
+                for index in 0..DEPTH {
+                    let (l, r) = (left_spine.clone(), right_spine.clone());
+                    if index.is_multiple_of(2) {
+                        left_spine = Level::max(l, p("a")).expect("shallow width");
+                        right_spine = Level::max(r, p("a")).expect("shallow width");
+                    } else {
+                        left_spine = Level::imax(l, p("a")).expect("shallow width");
+                        right_spine = Level::imax(r, p("a")).expect("shallow width");
+                    }
+                }
+                assert!(left_spine == right_spine, "deep max/imax spines must agree");
+            })
+            .expect("spawn bounded-stack Level comparison worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Level equality exhausted the bounded worker stack"
+        );
+    }
+    /// Byte-for-byte `Debug` vectors captured from the recursive implementation
+    /// this walk replaces (bead franken_lean-canon-stack-safe-drop-6gy). Rendering
+    /// is a compatibility surface: consumers, goldens, and diagnostics read it, so
+    /// the stack-safety fix must be invisible in both `{:?}` and `{:#?}`.
+    #[test]
+    fn debug_rendering_is_byte_identical_to_the_recursive_goldens() {
+        let x = || Name::str(Name::anonymous(), "x");
+        let values: Vec<(&str, Level)> = vec![
+            ("zero", Level::zero()),
+            ("succ", Level::zero().succ().expect("small")),
+            ("param", Level::param(x())),
+            (
+                "mvar",
+                Level::mvar(LMVarId(Name::num(Name::anonymous(), 4))),
+            ),
+            (
+                "max",
+                Level::max(Level::zero(), Level::param(x())).expect("small"),
+            ),
+            (
+                "imax",
+                Level::imax(Level::param(x()), Level::zero()).expect("small"),
+            ),
+            (
+                "nested",
+                Level::max(
+                    Level::zero().succ().expect("small"),
+                    Level::imax(Level::param(x()), Level::zero()).expect("small"),
+                )
+                .expect("small"),
+            ),
+        ];
+        const GOLDENS: [(&str, &str, &str); 7] = [
+            (
+                "zero",
+                "Level { node: Zero, data: LevelData(2221) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Zero,\n",
+                    "    data: LevelData(\n",
+                    "        2221,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "succ",
+                "Level { node: Succ(Level { node: Zero, data: LevelData(2221) }), data: LevelData(1101033050548) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Succ(\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1101033050548,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "param",
+                "Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Param(\n",
+                    "        Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        10400061217,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "mvar",
+                "Level { node: MVar(LMVarId(Name(Num(NumNode { pre: Name(Anonymous), component: 4, overflowed: false, hash: 5025098885263514187 })))), data: LevelData(6529228386) }",
+                concat!(
+                    "Level {\n",
+                    "    node: MVar(\n",
+                    "        LMVarId(\n",
+                    "            Name(\n",
+                    "                Num(\n",
+                    "                    NumNode {\n",
+                    "                        pre: Name(\n",
+                    "                            Anonymous,\n",
+                    "                        ),\n",
+                    "                        component: 4,\n",
+                    "                        overflowed: false,\n",
+                    "                        hash: 5025098885263514187,\n",
+                    "                    },\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        6529228386,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "max",
+                "Level { node: Max(Level { node: Zero, data: LevelData(2221) }, Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }), data: LevelData(1111868905434) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Max(\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: Param(\n",
+                    "                Name(\n",
+                    "                    Str(\n",
+                    "                        StrNode {\n",
+                    "                            pre: Name(\n",
+                    "                                Anonymous,\n",
+                    "                            ),\n",
+                    "                            component: \"x\",\n",
+                    "                            hash: 13655884332201764339,\n",
+                    "                        },\n",
+                    "                    ),\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                10400061217,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1111868905434,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "imax",
+                "Level { node: IMax(Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }, Level { node: Zero, data: LevelData(2221) }), data: LevelData(1111737256431) }",
+                concat!(
+                    "Level {\n",
+                    "    node: IMax(\n",
+                    "        Level {\n",
+                    "            node: Param(\n",
+                    "                Name(\n",
+                    "                    Str(\n",
+                    "                        StrNode {\n",
+                    "                            pre: Name(\n",
+                    "                                Anonymous,\n",
+                    "                            ),\n",
+                    "                            component: \"x\",\n",
+                    "                            hash: 13655884332201764339,\n",
+                    "                        },\n",
+                    "                    ),\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                10400061217,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        1111737256431,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "nested",
+                "Level { node: Max(Level { node: Succ(Level { node: Zero, data: LevelData(2221) }), data: LevelData(1101033050548) }, Level { node: IMax(Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }, Level { node: Zero, data: LevelData(2221) }), data: LevelData(1111737256431) }), data: LevelData(2211360343728) }",
+                concat!(
+                    "Level {\n",
+                    "    node: Max(\n",
+                    "        Level {\n",
+                    "            node: Succ(\n",
+                    "                Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                1101033050548,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        Level {\n",
+                    "            node: IMax(\n",
+                    "                Level {\n",
+                    "                    node: Param(\n",
+                    "                        Name(\n",
+                    "                            Str(\n",
+                    "                                StrNode {\n",
+                    "                                    pre: Name(\n",
+                    "                                        Anonymous,\n",
+                    "                                    ),\n",
+                    "                                    component: \"x\",\n",
+                    "                                    hash: 13655884332201764339,\n",
+                    "                                },\n",
+                    "                            ),\n",
+                    "                        ),\n",
+                    "                    ),\n",
+                    "                    data: LevelData(\n",
+                    "                        10400061217,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "                Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            ),\n",
+                    "            data: LevelData(\n",
+                    "                1111737256431,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    ),\n",
+                    "    data: LevelData(\n",
+                    "        2211360343728,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+        ];
+        assert_eq!(values.len(), GOLDENS.len());
+        for ((label, value), (golden_label, plain, alternate)) in values.iter().zip(GOLDENS) {
+            assert_eq!(*label, golden_label, "vector order drifted");
+            assert_eq!(
+                format!("{value:?}"),
+                plain,
+                "plain Debug changed for `{label}`"
+            );
+            assert_eq!(
+                format!("{value:#?}"),
+                alternate,
+                "pretty Debug changed for `{label}`"
+            );
+        }
+    }
+
+    /// Formatting is the other structural traversal: it must be depth-independent
+    /// in both modes, and every level must still appear in the output.
+    ///
+    /// The two modes run at different depths on purpose. Plain rendering is linear
+    /// in the input, so it runs deep. Pretty rendering indents each nesting level
+    /// by four spaces, which makes its *output* quadratic in depth — a property of
+    /// `{:#?}` itself, unchanged by this walk — so it runs at a depth whose output
+    /// stays a few megabytes. Both are far past the recursion threshold: the
+    /// recursive renderer this replaces aborted at depth 2000 on this stack.
+    #[test]
+    fn deep_debug_rendering_is_stack_bounded() {
+        const PLAIN_DEPTH: usize = 100_000;
+        const PRETTY_DEPTH: usize = 2_000;
+
+        fn succ_chain(depth: usize) -> Level {
+            let mut level = Level::zero();
+            for _ in 0..depth {
+                level = level.succ().expect("depth is inside the 24-bit packing");
+            }
+            level
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deep = succ_chain(PLAIN_DEPTH);
+                let plain = format!("{deep:?}");
+                assert_eq!(plain.matches("Succ(").count(), PLAIN_DEPTH);
+
+                let shallower = succ_chain(PRETTY_DEPTH);
+                let pretty = format!("{shallower:#?}");
+                assert_eq!(pretty.matches("Succ(").count(), PRETTY_DEPTH);
+            })
+            .expect("spawn bounded-stack Level formatter")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Level formatting exhausted the bounded worker stack"
         );
     }
 }

@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use crate::debug_walk::FlatDebug;
 use crate::lean_hash::{mix_hash, string_hash};
 use crate::level::Level;
 use crate::name::Name;
@@ -269,7 +270,11 @@ impl std::fmt::Display for TooManyBoundVars {
 }
 
 /// The constructor inventory (plan §1.1). Field order follows the pin.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Deliberately **not** `PartialEq`/`Eq`: a derived node comparison descends one
+/// stack frame per child and overflows on deep input.  Structural equality is a
+/// property of [`Expr`], whose `PartialEq` walks a heap worklist instead.
+#[derive(Debug)]
 pub enum ExprNode {
     /// de Bruijn bound variable.
     BVar {
@@ -337,18 +342,332 @@ pub struct Expr {
 }
 
 impl std::fmt::Debug for Expr {
+    /// Byte-identical to the derived rendering, walked on an explicit task stack:
+    /// `debug_struct` would descend one frame per node and overflow on deep input
+    /// (bead franken_lean-canon-stack-safe-drop-6gy).
+    ///
+    /// Only child `Expr`s become tasks. Every other payload — `Name`, `Level`,
+    /// `Vec<Level>`, `KVMap`, `Literal`, the scalars — is a leaf, because none of
+    /// them re-enters this walk and each is depth-independent in its own right.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Expr")
-            .field("node", self.node())
-            .field("data", &self.data)
-            .finish()
+        enum Task<'a> {
+            Expr(&'a Expr),
+            Node(&'a ExprNode),
+            Field(&'static str),
+            Leaf(&'a dyn std::fmt::Debug),
+            Close,
+        }
+
+        let mut out = FlatDebug::new(f);
+        let mut tasks = vec![Task::Expr(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Expr(expr) => {
+                    out.open_struct("Expr")?;
+                    tasks.push(Task::Close);
+                    tasks.push(Task::Leaf(&expr.data));
+                    tasks.push(Task::Field("data"));
+                    tasks.push(Task::Node(expr.node()));
+                    tasks.push(Task::Field("node"));
+                }
+                Task::Node(node) => {
+                    // Field order follows the declaration order the derived
+                    // implementation used; tasks are pushed in reverse.
+                    match node {
+                        ExprNode::BVar { idx } => {
+                            out.open_struct("BVar")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(idx));
+                            tasks.push(Task::Field("idx"));
+                        }
+                        ExprNode::FVar { id } => {
+                            out.open_struct("FVar")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(id));
+                            tasks.push(Task::Field("id"));
+                        }
+                        ExprNode::MVar { id } => {
+                            out.open_struct("MVar")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(id));
+                            tasks.push(Task::Field("id"));
+                        }
+                        ExprNode::Sort { level } => {
+                            out.open_struct("Sort")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(level));
+                            tasks.push(Task::Field("level"));
+                        }
+                        ExprNode::Const { name, levels } => {
+                            out.open_struct("Const")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(levels));
+                            tasks.push(Task::Field("levels"));
+                            tasks.push(Task::Leaf(name));
+                            tasks.push(Task::Field("name"));
+                        }
+                        ExprNode::App { f, a } => {
+                            out.open_struct("App")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Expr(a));
+                            tasks.push(Task::Field("a"));
+                            tasks.push(Task::Expr(f));
+                            tasks.push(Task::Field("f"));
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            out.open_struct("Lam")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(binder_info));
+                            tasks.push(Task::Field("binder_info"));
+                            tasks.push(Task::Expr(body));
+                            tasks.push(Task::Field("body"));
+                            tasks.push(Task::Expr(binder_type));
+                            tasks.push(Task::Field("binder_type"));
+                            tasks.push(Task::Leaf(binder_name));
+                            tasks.push(Task::Field("binder_name"));
+                        }
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            out.open_struct("ForallE")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(binder_info));
+                            tasks.push(Task::Field("binder_info"));
+                            tasks.push(Task::Expr(body));
+                            tasks.push(Task::Field("body"));
+                            tasks.push(Task::Expr(binder_type));
+                            tasks.push(Task::Field("binder_type"));
+                            tasks.push(Task::Leaf(binder_name));
+                            tasks.push(Task::Field("binder_name"));
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            out.open_struct("LetE")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(non_dep));
+                            tasks.push(Task::Field("non_dep"));
+                            tasks.push(Task::Expr(body));
+                            tasks.push(Task::Field("body"));
+                            tasks.push(Task::Expr(value));
+                            tasks.push(Task::Field("value"));
+                            tasks.push(Task::Expr(type_));
+                            tasks.push(Task::Field("type_"));
+                            tasks.push(Task::Leaf(decl_name));
+                            tasks.push(Task::Field("decl_name"));
+                        }
+                        ExprNode::Lit { literal } => {
+                            out.open_struct("Lit")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Leaf(literal));
+                            tasks.push(Task::Field("literal"));
+                        }
+                        ExprNode::MData { data, expr } => {
+                            out.open_struct("MData")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Expr(expr));
+                            tasks.push(Task::Field("expr"));
+                            tasks.push(Task::Leaf(data));
+                            tasks.push(Task::Field("data"));
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            out.open_struct("Proj")?;
+                            tasks.push(Task::Close);
+                            tasks.push(Task::Expr(expr));
+                            tasks.push(Task::Field("expr"));
+                            tasks.push(Task::Leaf(idx));
+                            tasks.push(Task::Field("idx"));
+                            tasks.push(Task::Leaf(struct_name));
+                            tasks.push(Task::Field("struct_name"));
+                        }
+                    }
+                }
+                Task::Field(name) => out.field(name)?,
+                Task::Leaf(value) => out.leaf(value)?,
+                Task::Close => out.close()?,
+            }
+        }
+        Ok(())
     }
 }
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Expr) -> bool {
-        self.data == other.data
-            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
+        // Data word first (hash and packed flags reject fast), then structure.
+        //
+        // The structural arm walks an explicit heap worklist instead of recursing
+        // through one `Expr::eq` frame per constructor: two independently built
+        // deep-but-equal terms agree on every data word, so the fast rejections
+        // never fire and a recursive comparison would consume the stack in
+        // proportion to input depth (the term-plane analogue of the `Name` fix in
+        // bead franken_lean-p8a.1).  Equality is a pure predicate, so the order in
+        // which pending pairs are visited does not change the verdict.
+        let mut pending: Vec<(&Expr, &Expr)> = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            if left.data != right.data {
+                return false;
+            }
+            if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+                continue;
+            }
+            match (left.node(), right.node()) {
+                (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                // `Level`, `Name`, `Literal` and `KVMap` payloads all compare without
+                // recursion over *this* term's depth: the first two are iterative in
+                // their own right and the last two are flat.
+                (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::Const {
+                        name: a,
+                        levels: a_levels,
+                    },
+                    ExprNode::Const {
+                        name: b,
+                        levels: b_levels,
+                    },
+                ) => {
+                    if a != b || a_levels != b_levels {
+                        return false;
+                    }
+                }
+                (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                    pending.push((aa, ba));
+                    pending.push((af, bf));
+                }
+                // `Lam` and `ForallE` share a shape but are distinct constructors, so
+                // each needs its own arm: an or-pattern here would equate them.
+                (
+                    ExprNode::Lam {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::Lam {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                )
+                | (
+                    ExprNode::ForallE {
+                        binder_name: a_name,
+                        binder_type: a_type,
+                        body: a_body,
+                        binder_info: a_info,
+                    },
+                    ExprNode::ForallE {
+                        binder_name: b_name,
+                        binder_type: b_type,
+                        body: b_body,
+                        binder_info: b_info,
+                    },
+                ) => {
+                    if a_name != b_name || a_info != b_info {
+                        return false;
+                    }
+                    pending.push((a_body, b_body));
+                    pending.push((a_type, b_type));
+                }
+                (
+                    ExprNode::LetE {
+                        decl_name: a_name,
+                        type_: a_type,
+                        value: a_value,
+                        body: a_body,
+                        non_dep: a_non_dep,
+                    },
+                    ExprNode::LetE {
+                        decl_name: b_name,
+                        type_: b_type,
+                        value: b_value,
+                        body: b_body,
+                        non_dep: b_non_dep,
+                    },
+                ) => {
+                    if a_name != b_name || a_non_dep != b_non_dep {
+                        return false;
+                    }
+                    pending.push((a_body, b_body));
+                    pending.push((a_value, b_value));
+                    pending.push((a_type, b_type));
+                }
+                (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => {
+                    if a != b {
+                        return false;
+                    }
+                }
+                (
+                    ExprNode::MData {
+                        data: a_data,
+                        expr: a_expr,
+                    },
+                    ExprNode::MData {
+                        data: b_data,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_data != b_data {
+                        return false;
+                    }
+                    pending.push((a_expr, b_expr));
+                }
+                (
+                    ExprNode::Proj {
+                        struct_name: a_name,
+                        idx: a_idx,
+                        expr: a_expr,
+                    },
+                    ExprNode::Proj {
+                        struct_name: b_name,
+                        idx: b_idx,
+                        expr: b_expr,
+                    },
+                ) => {
+                    if a_name != b_name || a_idx != b_idx {
+                        return false;
+                    }
+                    pending.push((a_expr, b_expr));
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 impl Eq for Expr {}
@@ -1036,6 +1355,809 @@ mod tests {
             Arc::strong_count(leaf.node_arc()),
             1,
             "no shared internal node may retain either leaf edge"
+        );
+    }
+
+    /// The recursive comparison this type deliberately no longer derives. Kept as a
+    /// test-only oracle: on shallow terms recursion is safe, so it pins the exact
+    /// verdict the iterative predicate must reproduce.
+    fn recursive_expr_eq(left: &Expr, right: &Expr) -> bool {
+        if left.data != right.data {
+            return false;
+        }
+        if Arc::ptr_eq(left.node_arc(), right.node_arc()) {
+            return true;
+        }
+        match (left.node(), right.node()) {
+            (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) => a == b,
+            (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) => a == b,
+            (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) => a == b,
+            (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => a == b,
+            (
+                ExprNode::Const {
+                    name: a,
+                    levels: a_levels,
+                },
+                ExprNode::Const {
+                    name: b,
+                    levels: b_levels,
+                },
+            ) => a == b && a_levels == b_levels,
+            (ExprNode::App { f: af, a: aa }, ExprNode::App { f: bf, a: ba }) => {
+                recursive_expr_eq(af, bf) && recursive_expr_eq(aa, ba)
+            }
+            (
+                ExprNode::Lam {
+                    binder_name: a_name,
+                    binder_type: a_type,
+                    body: a_body,
+                    binder_info: a_info,
+                },
+                ExprNode::Lam {
+                    binder_name: b_name,
+                    binder_type: b_type,
+                    body: b_body,
+                    binder_info: b_info,
+                },
+            )
+            | (
+                ExprNode::ForallE {
+                    binder_name: a_name,
+                    binder_type: a_type,
+                    body: a_body,
+                    binder_info: a_info,
+                },
+                ExprNode::ForallE {
+                    binder_name: b_name,
+                    binder_type: b_type,
+                    body: b_body,
+                    binder_info: b_info,
+                },
+            ) => {
+                a_name == b_name
+                    && a_info == b_info
+                    && recursive_expr_eq(a_type, b_type)
+                    && recursive_expr_eq(a_body, b_body)
+            }
+            (
+                ExprNode::LetE {
+                    decl_name: a_name,
+                    type_: a_type,
+                    value: a_value,
+                    body: a_body,
+                    non_dep: a_non_dep,
+                },
+                ExprNode::LetE {
+                    decl_name: b_name,
+                    type_: b_type,
+                    value: b_value,
+                    body: b_body,
+                    non_dep: b_non_dep,
+                },
+            ) => {
+                a_name == b_name
+                    && a_non_dep == b_non_dep
+                    && recursive_expr_eq(a_type, b_type)
+                    && recursive_expr_eq(a_value, b_value)
+                    && recursive_expr_eq(a_body, b_body)
+            }
+            (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) => a == b,
+            (
+                ExprNode::MData {
+                    data: a_data,
+                    expr: a_expr,
+                },
+                ExprNode::MData {
+                    data: b_data,
+                    expr: b_expr,
+                },
+            ) => a_data == b_data && recursive_expr_eq(a_expr, b_expr),
+            (
+                ExprNode::Proj {
+                    struct_name: a_name,
+                    idx: a_idx,
+                    expr: a_expr,
+                },
+                ExprNode::Proj {
+                    struct_name: b_name,
+                    idx: b_idx,
+                    expr: b_expr,
+                },
+            ) => a_name == b_name && a_idx == b_idx && recursive_expr_eq(a_expr, b_expr),
+            _ => false,
+        }
+    }
+
+    /// One value per constructor, plus the pairs that must NOT collapse: same shape
+    /// under a different constructor (`Lam` vs `ForallE`), differing binder metadata,
+    /// differing literals, and a shared node reached two ways.
+    fn shallow_equality_matrix() -> Vec<Expr> {
+        let x = Name::str(Name::anonymous(), "x");
+        let y = Name::str(Name::anonymous(), "y");
+        let bvar = Expr::bvar(0).expect("small");
+        let sort = Expr::sort(Level::zero());
+        let shared = Expr::app(bvar.clone(), sort.clone());
+        vec![
+            bvar.clone(),
+            Expr::bvar(1).expect("small"),
+            Expr::fvar(FVarId(x.clone())),
+            Expr::fvar(FVarId(y.clone())),
+            Expr::mvar(MVarId(x.clone())),
+            sort.clone(),
+            Expr::sort(Level::zero().add_offset(1).expect("small")),
+            Expr::const_(x.clone(), Vec::new()),
+            Expr::const_(x.clone(), vec![Level::zero()]),
+            Expr::const_(y.clone(), Vec::new()),
+            Expr::app(bvar.clone(), sort.clone()),
+            Expr::app(sort.clone(), bvar.clone()),
+            shared.clone(),
+            shared,
+            Expr::lam(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::lam(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Implicit),
+            Expr::lam(y.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::forall_e(x.clone(), sort.clone(), bvar.clone(), BinderInfo::Default),
+            Expr::let_e(x.clone(), sort.clone(), bvar.clone(), bvar.clone(), false),
+            Expr::let_e(x.clone(), sort.clone(), bvar.clone(), bvar.clone(), true),
+            Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+            Expr::lit(Literal::Nat(NatLit::from_u64(1))),
+            Expr::lit(Literal::Str("s".to_string())),
+            Expr::mdata(KVMap::default(), bvar.clone()),
+            Expr::proj(x.clone(), 0, bvar.clone()),
+            Expr::proj(x, 1, bvar.clone()),
+            Expr::proj(y, 0, bvar),
+        ]
+    }
+
+    #[test]
+    fn iterative_equality_matches_the_recursive_oracle_on_every_constructor() {
+        let values = shallow_equality_matrix();
+        for (left_index, left) in values.iter().enumerate() {
+            for (right_index, right) in values.iter().enumerate() {
+                assert_eq!(
+                    left == right,
+                    recursive_expr_eq(left, right),
+                    "verdict changed at ({left_index}, {right_index})"
+                );
+                assert_eq!(
+                    left == right,
+                    right == left,
+                    "equality is symmetric at ({left_index}, {right_index})"
+                );
+            }
+            assert!(left == left, "equality is reflexive at {left_index}");
+            assert!(
+                *left == left.clone(),
+                "a clone shares its node and stays equal at {left_index}"
+            );
+        }
+    }
+
+    /// A `Lam` and a `ForallE` with identical payloads are distinct terms. The data
+    /// word already separates them, but the structural arms must not merge either.
+    #[test]
+    fn binder_constructors_never_compare_equal() {
+        let name = Name::str(Name::anonymous(), "x");
+        let body = Expr::bvar(0).expect("small");
+        let type_ = Expr::sort(Level::zero());
+        let lam = Expr::lam(
+            name.clone(),
+            type_.clone(),
+            body.clone(),
+            BinderInfo::Default,
+        );
+        let forall = Expr::forall_e(name, type_, body, BinderInfo::Default);
+        assert!(lam != forall);
+        assert!(!recursive_expr_eq(&lam, &forall));
+    }
+
+    /// Independently built deep-but-equal terms agree on every data word, so the
+    /// structural arm is reached at every node — the exact shape that overflowed
+    /// while the comparison recursed. A 1 MiB worker is far below what one frame
+    /// per node would need at this depth.
+    #[test]
+    fn deep_structural_equality_is_stack_bounded() {
+        const DEPTH: usize = 100_000;
+
+        fn deep_app_spine(leaf: Expr, depth: usize) -> Expr {
+            let mut expr = leaf;
+            for _ in 0..depth {
+                expr = Expr::app(expr, Expr::bvar(0).expect("small"));
+            }
+            expr
+        }
+
+        fn deep_binder_spine(leaf: Expr, depth: usize) -> Expr {
+            let name = Name::str(Name::anonymous(), "x");
+            let type_ = Expr::sort(Level::zero());
+            let mut expr = leaf;
+            for index in 0..depth {
+                expr = if index.is_multiple_of(2) {
+                    Expr::lam(name.clone(), type_.clone(), expr, BinderInfo::Default)
+                } else {
+                    Expr::forall_e(name.clone(), type_.clone(), expr, BinderInfo::Default)
+                };
+            }
+            expr
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let leaf = || Expr::sort(Level::zero());
+                let left = deep_app_spine(leaf(), DEPTH);
+                let right = deep_app_spine(leaf(), DEPTH);
+                assert!(
+                    left == right,
+                    "independently built deep terms must compare equal"
+                );
+
+                // A mismatch buried under the whole spine: the walk must reach it
+                // rather than stop at the roots' data words.
+                let other = deep_app_spine(Expr::bvar(0).expect("small"), DEPTH);
+                assert!(left != other, "a deep leaf mismatch must be observed");
+
+                let left_binders = deep_binder_spine(leaf(), DEPTH);
+                let right_binders = deep_binder_spine(leaf(), DEPTH);
+                assert!(
+                    left_binders == right_binders,
+                    "deep alternating binder spines must agree"
+                );
+            })
+            .expect("spawn bounded-stack Expr comparison worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Expr equality exhausted the bounded worker stack"
+        );
+    }
+    /// Byte-for-byte `Debug` vectors captured from the recursive implementation
+    /// this walk replaces (bead franken_lean-canon-stack-safe-drop-6gy). Rendering
+    /// is a compatibility surface: consumers, goldens, and diagnostics read it, so
+    /// the stack-safety fix must be invisible in both `{:?}` and `{:#?}`.
+    #[test]
+    fn debug_rendering_is_byte_identical_to_the_recursive_goldens() {
+        let x = || Name::str(Name::anonymous(), "x");
+        let bvar = Expr::bvar(0).expect("small");
+        let sort = Expr::sort(Level::zero());
+        let levels = vec![Level::zero(), Level::param(x())];
+        let values: Vec<(&str, Expr)> = vec![
+            ("bvar", bvar.clone()),
+            ("fvar", Expr::fvar(FVarId(x()))),
+            ("mvar", Expr::mvar(MVarId(x()))),
+            ("sort", sort.clone()),
+            ("const", Expr::const_(x(), levels)),
+            ("app", Expr::app(bvar.clone(), sort.clone())),
+            (
+                "lam",
+                Expr::lam(x(), sort.clone(), bvar.clone(), BinderInfo::Implicit),
+            ),
+            (
+                "forall",
+                Expr::forall_e(x(), sort.clone(), bvar.clone(), BinderInfo::StrictImplicit),
+            ),
+            (
+                "let",
+                Expr::let_e(x(), sort.clone(), bvar.clone(), bvar.clone(), true),
+            ),
+            ("lit_nat", Expr::lit(Literal::Nat(NatLit::from_u64(7)))),
+            ("lit_str", Expr::lit(Literal::Str("s".to_string()))),
+            ("mdata", Expr::mdata(KVMap::default(), bvar.clone())),
+            ("proj", Expr::proj(x(), 3, bvar.clone())),
+            ("nested", Expr::app(Expr::app(bvar.clone(), sort), bvar)),
+        ];
+        const GOLDENS: [(&str, &str, &str); 14] = [
+            (
+                "bvar",
+                "Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: BVar {\n",
+                    "        idx: 0,\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17592537633786,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "fvar",
+                "Expr { node: FVar { id: FVarId(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))) }, data: ExprData(1101888168254) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: FVar {\n",
+                    "        id: FVarId(\n",
+                    "            Name(\n",
+                    "                Str(\n",
+                    "                    StrNode {\n",
+                    "                        pre: Name(\n",
+                    "                            Anonymous,\n",
+                    "                        ),\n",
+                    "                        component: \"x\",\n",
+                    "                        hash: 13655884332201764339,\n",
+                    "                    },\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        1101888168254,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "mvar",
+                "Expr { node: MVar { id: MVarId(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))) }, data: ExprData(2202144694498) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: MVar {\n",
+                    "        id: MVarId(\n",
+                    "            Name(\n",
+                    "                Str(\n",
+                    "                    StrNode {\n",
+                    "                        pre: Name(\n",
+                    "                            Anonymous,\n",
+                    "                        ),\n",
+                    "                        component: \"x\",\n",
+                    "                        hash: 13655884332201764339,\n",
+                    "                    },\n",
+                    "                ),\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        2202144694498,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "sort",
+                "Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Sort {\n",
+                    "        level: Level {\n",
+                    "            node: Zero,\n",
+                    "            data: LevelData(\n",
+                    "                2221,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        3944470172,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "const",
+                "Expr { node: Const { name: Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 })), levels: [Level { node: Zero, data: LevelData(2221) }, Level { node: Param(Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 }))), data: LevelData(10400061217) }] }, data: ExprData(8796919455285) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Const {\n",
+                    "        name: Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "        levels: [\n",
+                    "            Level {\n",
+                    "                node: Zero,\n",
+                    "                data: LevelData(\n",
+                    "                    2221,\n",
+                    "                ),\n",
+                    "            },\n",
+                    "            Level {\n",
+                    "                node: Param(\n",
+                    "                    Name(\n",
+                    "                        Str(\n",
+                    "                            StrNode {\n",
+                    "                                pre: Name(\n",
+                    "                                    Anonymous,\n",
+                    "                                ),\n",
+                    "                                component: \"x\",\n",
+                    "                                hash: 13655884332201764339,\n",
+                    "                            },\n",
+                    "                        ),\n",
+                    "                    ),\n",
+                    "                ),\n",
+                    "                data: LevelData(\n",
+                    "                    10400061217,\n",
+                    "                ),\n",
+                    "            },\n",
+                    "        ],\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        8796919455285,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "app",
+                "Expr { node: App { f: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, a: Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) } }, data: ExprData(17599949397516) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: App {\n",
+                    "        f: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        a: Expr {\n",
+                    "            node: Sort {\n",
+                    "                level: Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                3944470172,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17599949397516,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "lam",
+                "Expr { node: Lam { binder_name: Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 })), binder_type: Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) }, body: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, binder_info: Implicit }, data: ExprData(8115984807) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Lam {\n",
+                    "        binder_name: Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "        binder_type: Expr {\n",
+                    "            node: Sort {\n",
+                    "                level: Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                3944470172,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        body: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        binder_info: Implicit,\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        8115984807,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "forall",
+                "Expr { node: ForallE { binder_name: Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 })), binder_type: Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) }, body: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, binder_info: StrictImplicit }, data: ExprData(8115984807) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: ForallE {\n",
+                    "        binder_name: Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "        binder_type: Expr {\n",
+                    "            node: Sort {\n",
+                    "                level: Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                3944470172,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        body: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        binder_info: StrictImplicit,\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        8115984807,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "let",
+                "Expr { node: LetE { decl_name: Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 })), type_: Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) }, value: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, body: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, non_dep: true }, data: ExprData(17600335613723) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: LetE {\n",
+                    "        decl_name: Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "        type_: Expr {\n",
+                    "            node: Sort {\n",
+                    "                level: Level {\n",
+                    "                    node: Zero,\n",
+                    "                    data: LevelData(\n",
+                    "                        2221,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                3944470172,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        value: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        body: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        non_dep: true,\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17600335613723,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "lit_nat",
+                "Expr { node: Lit { literal: Nat(NatLit { limbs: [7] }) }, data: ExprData(2256147412) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Lit {\n",
+                    "        literal: Nat(\n",
+                    "            NatLit {\n",
+                    "                limbs: [\n",
+                    "                    7,\n",
+                    "                ],\n",
+                    "            },\n",
+                    "        ),\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        2256147412,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "lit_str",
+                "Expr { node: Lit { literal: Str(\"s\") }, data: ExprData(357756915) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Lit {\n",
+                    "        literal: Str(\n",
+                    "            \"s\",\n",
+                    "        ),\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        357756915,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "mdata",
+                "Expr { node: MData { data: KVMap { entries: [] }, expr: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) } }, data: ExprData(17600722897194) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: MData {\n",
+                    "        data: KVMap {\n",
+                    "            entries: [],\n",
+                    "        },\n",
+                    "        expr: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17600722897194,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "proj",
+                "Expr { node: Proj { struct_name: Name(Str(StrNode { pre: Name(Anonymous), component: \"x\", hash: 13655884332201764339 })), idx: 3, expr: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) } }, data: ExprData(17599591845530) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: Proj {\n",
+                    "        struct_name: Name(\n",
+                    "            Str(\n",
+                    "                StrNode {\n",
+                    "                    pre: Name(\n",
+                    "                        Anonymous,\n",
+                    "                    ),\n",
+                    "                    component: \"x\",\n",
+                    "                    hash: 13655884332201764339,\n",
+                    "                },\n",
+                    "            ),\n",
+                    "        ),\n",
+                    "        idx: 3,\n",
+                    "        expr: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17599591845530,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+            (
+                "nested",
+                "Expr { node: App { f: Expr { node: App { f: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) }, a: Expr { node: Sort { level: Level { node: Zero, data: LevelData(2221) } }, data: ExprData(3944470172) } }, data: ExprData(17599949397516) }, a: Expr { node: BVar { idx: 0 }, data: ExprData(17592537633786) } }, data: ExprData(17601966845473) }",
+                concat!(
+                    "Expr {\n",
+                    "    node: App {\n",
+                    "        f: Expr {\n",
+                    "            node: App {\n",
+                    "                f: Expr {\n",
+                    "                    node: BVar {\n",
+                    "                        idx: 0,\n",
+                    "                    },\n",
+                    "                    data: ExprData(\n",
+                    "                        17592537633786,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "                a: Expr {\n",
+                    "                    node: Sort {\n",
+                    "                        level: Level {\n",
+                    "                            node: Zero,\n",
+                    "                            data: LevelData(\n",
+                    "                                2221,\n",
+                    "                            ),\n",
+                    "                        },\n",
+                    "                    },\n",
+                    "                    data: ExprData(\n",
+                    "                        3944470172,\n",
+                    "                    ),\n",
+                    "                },\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17599949397516,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "        a: Expr {\n",
+                    "            node: BVar {\n",
+                    "                idx: 0,\n",
+                    "            },\n",
+                    "            data: ExprData(\n",
+                    "                17592537633786,\n",
+                    "            ),\n",
+                    "        },\n",
+                    "    },\n",
+                    "    data: ExprData(\n",
+                    "        17601966845473,\n",
+                    "    ),\n",
+                    "}",
+                ),
+            ),
+        ];
+        assert_eq!(values.len(), GOLDENS.len());
+        for ((label, value), (golden_label, plain, alternate)) in values.iter().zip(GOLDENS) {
+            assert_eq!(*label, golden_label, "vector order drifted");
+            assert_eq!(
+                format!("{value:?}"),
+                plain,
+                "plain Debug changed for `{label}`"
+            );
+            assert_eq!(
+                format!("{value:#?}"),
+                alternate,
+                "pretty Debug changed for `{label}`"
+            );
+        }
+    }
+
+    /// Formatting is the other structural traversal: it must be depth-independent
+    /// in both modes, and every node must still appear in the output.
+    ///
+    /// The two modes run at different depths on purpose. Plain rendering is linear
+    /// in the input, so it runs deep. Pretty rendering indents each nesting level
+    /// by four spaces, which makes its *output* quadratic in depth — a property of
+    /// `{:#?}` itself, unchanged by this walk — so it runs at a depth whose output
+    /// stays a few megabytes. Both are far past the recursion threshold: the
+    /// recursive renderer this replaces aborted at depth 2000 on this stack.
+    #[test]
+    fn deep_debug_rendering_is_stack_bounded() {
+        const PLAIN_DEPTH: usize = 100_000;
+        const PRETTY_DEPTH: usize = 1_000;
+
+        fn app_spine(depth: usize) -> Expr {
+            let mut expr = Expr::sort(Level::zero());
+            for _ in 0..depth {
+                expr = Expr::app(expr, Expr::bvar(0).expect("small"));
+            }
+            expr
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deep = app_spine(PLAIN_DEPTH);
+                let plain = format!("{deep:?}");
+                assert_eq!(plain.matches("App {").count(), PLAIN_DEPTH);
+
+                let shallower = app_spine(PRETTY_DEPTH);
+                let pretty = format!("{shallower:#?}");
+                assert_eq!(pretty.matches("App {").count(), PRETTY_DEPTH);
+            })
+            .expect("spawn bounded-stack Expr formatter")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Expr formatting exhausted the bounded worker stack"
         );
     }
 }

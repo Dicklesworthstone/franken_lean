@@ -32,6 +32,7 @@ crate fln-core          rank=0  kind=ordinary
 crate fln-hash          rank=1  kind=ordinary
 crate fln-bignum        rank=1  kind=ordinary
 crate fln-libm          rank=1  kind=ordinary
+crate fln-bench         rank=2  kind=ordinary
 crate fln-unsafe-abi    rank=2  kind=unsafe-boundary
 crate fln-unsafe-region rank=2  kind=unsafe-boundary
 crate fln-rt            rank=3  kind=ordinary
@@ -64,25 +65,59 @@ crate structure-guard   kind=tool
 # ---- acknowledged dependency edges ----------------------------------------------------
 # every future edge lands here in the same change as its Cargo.toml counterpart
 edge fln-conformance -> fln-core   # C0 core-observable fixture diff harness (franken_lean-p8a)
+edge fln-conformance -> fln        # diagnostic library projection conformance (franken_lean-wlan)
+edge fln-conformance -> fln-cli    # diagnostic CLI/JSON projection conformance (franken_lean-wlan)
+edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Pratt and grammar-epoch surfaces (franken_lean-hly)
+edge fln-conformance -> fln-server # diagnostic LSP projection conformance (franken_lean-wlan)
+edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
+edge fln -> fln-core               # embeddable typed diagnostic projection (franken_lean-wlan)
+edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)
+edge fln-server -> fln-core        # LSP diagnostic adapter (franken_lean-wlan)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)
+edge fln-bench -> fln-hash         # canonical benchmark evidence records and roots (franken_lean-oy62)
 edge fln-env -> fln-core           # environment holds term-plane constants (fln-amv)
 edge fln-env -> fln-hash           # logical + operational roots over the identity layer (fln-amv)
 edge fln-bignum -> fln-core        # loss-free NatLit interop, shared limb layout (franken_lean-npl)
+edge fln-checker -> fln-core       # dev-only differential witnesses; production checker code cannot import primary term values (franken_lean-gii.1)
+edge fln-checker -> fln-hash       # shared canonical schema identifiers and test-only primary writers (franken_lean-gii.1)
 edge fln-kernel -> fln-core        # kernel terms are term-plane values (franken_lean-zht)
 edge fln-kernel -> fln-env         # check consults the environment read-only (franken_lean-zht)
 edge fln-kernel -> fln-bignum      # owned kernel-grade bignum for literal reduction (§8; already in the allow-direct covenant)
+edge fln-verdict -> fln-core       # reflected theorem expressions use the canonical term plane (franken_lean-08lb)
+edge fln-verdict -> fln-env        # checked reflected theorems publish through bounded environment admission (franken_lean-08lb)
+edge fln-verdict -> fln-hash       # certificate-fallback identities use the canonical domain hasher (franken_lean-workspace-graph-producer-edge-drift-8o3o)
+edge fln-verdict -> fln-kernel     # reflected theorem artifacts cross the sole kernel check authority (franken_lean-08lb)
 edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
 edge fln-olean -> fln-unsafe-region # mmap-backed codec load over the shared region machinery, sealed (fln-20n/fln-wgp seam)
+edge fln-rt -> fln-core            # Compat/native conversion projects canonical term-plane values (fln-lld; §6.1b; commit 3b34d5c5)
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
 edge fln-unsafe-abi -> fln-bignum  # exported lean_nat_big_* family over the owned bignum (franken_lean-83r; §8.4 shim)
 edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
+edge fln-syntax -> fln-core        # SyntaxNodeKind and identifiers are Name (franken_lean-vrmi; §21, AGENTS.md crate map)
+edge fln-parse -> fln-syntax       # the Pratt engine consumes lexer tokens and builds Syntax (fln-ffam; §9, ranks 8 -> 7)
+edge fln-parse -> fln-core         # SyntaxNodeKind, category names and precedences are Name (fln-ffam; §21, AGENTS.md crate map)
+edge fln-parse -> fln-hash         # grammar identity embeds the canonical Name codec (franken_lean-9km; §9.1, ranks 8 -> 1)
+edge fln-elab -> fln-bignum        # loss-free arbitrary-precision natural literal elaboration (fln-5720; §10)
+edge fln-elab -> fln-core          # parsed names and expressions become term-plane declarations (fln-5720; §10)
+edge fln-elab -> fln-env           # declaration values and the caller-owned checking environment (fln-5720; §10)
+edge fln-elab -> fln-kernel        # every elaborated declaration crosses Crucible's sole authority (fln-5720; FL-INV-02)
+edge fln-elab -> fln-parse         # first source-to-Syntax command seam for Athanor (fln-5720; §9-§10)
+edge fln-elab -> fln-syntax        # Athanor consumes the canonical lossless Syntax tree (fln-5720; §10)
 edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
 edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
-edge fln-verdict -> fln-hash       # canonical CNF/model/proof identities and codecs (§12.5)
+edge fln-conformance -> fln-verdict # corpus schema projection exercises the CNF/model/proof wire formats (franken_lean-dgxa)
+edge structure-guard -> fln-core   # observes the authoritative D18 scanner; never reimplements or controls product semantics (franken_lean-r2st)
+edge structure-guard -> fln-conformance # dev-dependency only: its rigs resolve the repository through fln_conformance::checked_workspace_root!() so a cross-tree test binary refuses instead of reporting a verdict about the checkout that compiled it (fln-cross-tree-baked-root-k60n). FLN-STRUCT-007 exempts kind=tool from layering (checks.rs:1863); a second copy of the predicate in this crate is the defect that bead is an instance of
+edge fln-comp -> fln-core          # bounded post-elaboration Expr ingress to validated FIR (fln-8m1z prototype handoff)
+edge fln-comp -> fln-rt            # FLBC validation binds constructor limits to the generated Marrow ABI contract (franken_lean-o6bl prototype handoff)
+edge fln-vm -> fln-comp            # interpreter accepts only the compiler-owned validated FLBC wrapper (franken_lean-zoe prototype handoff)
+edge fln-vm -> fln-core            # shared FL-INV-07 outcomes plus the extern-dispatch e2e scratch fence (franken_lean-zoe/franken_lean-pw6t)
+edge fln-vm -> fln-hash            # inline-cache namespaces bind canonical FLBC and every semantic execution coordinate (franken_lean-zoe)
+edge fln-vm -> fln-rt              # every live FLBC register is an owned Marrow Obj handle (franken_lean-zoe prototype handoff)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.
@@ -99,7 +134,9 @@ prohibit fln-checker ->* fln-unsafe-*
 
 # ---- trust-base direct-dependency covenants (dependency-closure-on-one-page, §8) ------
 allow-direct fln-kernel  = fln-core, fln-hash, fln-bignum, fln-env
-allow-direct fln-checker = fln-core, fln-hash, fln-bignum
+# fln-hash stays so both engines speak one canonical wire schema and domain-tag
+# vocabulary; semantic readers remain checker-owned (franken_lean-r0xu, a873e73c).
+allow-direct fln-checker = fln-core, fln-hash
 
 # ---- the ≤ 12 KLOC kernel covenant (plan §8, D6) --------------------------------------
 covenant fln-kernel max-loc=12000

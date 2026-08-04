@@ -9269,6 +9269,30 @@
    "ret_ownership": "owned_res"
   },
   {
+   "line": 66,
+   "linkage": "export",
+   "name": "lean_notify_assert",
+   "params": [
+    {
+     "c_type": "const char *",
+     "name": "fileName",
+     "ownership": "value"
+    },
+    {
+     "c_type": "int",
+     "name": "line",
+     "ownership": "value"
+    },
+    {
+     "c_type": "const char *",
+     "name": "condition",
+     "ownership": "value"
+    }
+   ],
+   "ret_c_type": "void",
+   "ret_ownership": "value"
+  },
+  {
    "line": 3278,
    "linkage": "inline",
    "name": "lean_obj_once",

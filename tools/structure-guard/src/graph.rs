@@ -203,12 +203,21 @@ pub fn parse(text: &str) -> Result<GraphFile, String> {
                 if !valid_name(name) {
                     return Err(err("invalid crate name"));
                 }
-                let deps: Vec<String> = list
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
+                // The empty allowlist is expressed by an empty right-hand side and by
+                // nothing else. Filtering empty fields out would silently normalise a
+                // leading, doubled, or trailing comma, so the reviewed text and the
+                // parsed covenant could disagree about what was acknowledged.
+                let deps: Vec<String> = if list.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    let fields: Vec<&str> = list.split(',').map(str::trim).collect();
+                    if fields.iter().any(|field| field.is_empty()) {
+                        return Err(err(
+                            "allow-direct list has an empty entry; leading, doubled, and trailing commas are not accepted (write `= ` for the empty allowlist)",
+                        ));
+                    }
+                    fields.iter().map(|field| field.to_string()).collect()
+                };
                 if deps.iter().any(|dep| !valid_name(dep)) {
                     return Err(err("allow-direct entries must be valid crate names"));
                 }
@@ -335,5 +344,34 @@ mod tests {
         )
         .expect("parses");
         assert!(g.allow_direct["a"].is_empty());
+    }
+
+    /// An empty field inside an `allow-direct` list is ambiguous reviewed text: the
+    /// covenant is exhaustive, so a comma that acknowledges nothing must fail the parse
+    /// rather than be normalised away.
+    #[test]
+    fn rejects_empty_allow_direct_entries_but_keeps_the_empty_list() {
+        let schema = "schema fln-workspace-graph/1\ncrate a rank=0 kind=ordinary\n";
+        for ambiguous in [
+            "allow-direct a = , b",    // leading comma
+            "allow-direct a = b,, c",  // doubled comma
+            "allow-direct a = b,",     // trailing comma
+            "allow-direct a = ,",      // comma-only list
+            "allow-direct a = b, , c", // whitespace-only field
+            "allow-direct a = ,,",     // repeated empty fields
+        ] {
+            assert!(
+                parse(&format!("{schema}{ambiguous}\n")).is_err(),
+                "accepted ambiguous allow-direct list: {ambiguous}"
+            );
+        }
+
+        // Recovery: the legal forms still parse, and whitespace around real entries is
+        // still insignificant.
+        let empty = parse(&format!("{schema}allow-direct a =   \n")).expect("empty list parses");
+        assert!(empty.allow_direct["a"].is_empty());
+        let listed =
+            parse(&format!("{schema}allow-direct a =  b ,  c \n")).expect("spaced list parses");
+        assert_eq!(listed.allow_direct["a"], vec!["b", "c"]);
     }
 }

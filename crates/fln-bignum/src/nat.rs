@@ -6,10 +6,22 @@
 //!
 //! Representation invariant: little-endian `u64` limbs, normalized — no
 //! trailing zero limbs; the empty limb vector is zero. This is deliberately
-//! identical to `fln_core::expr::NatLit`'s representation (interop is wired
-//! elsewhere; this crate does not depend on `fln-core`).
+//! identical to `fln_core::expr::NatLit`'s representation, which is what lets
+//! `interop` move values across the term-plane boundary without reshaping them.
+//! [`BigNatView`] applies the same invariant to borrowed storage by shortening
+//! a slice only, so the ABI boundary can consume limbs without first copying
+//! them into an owned value.
 //!
-//! No code path in this module panics on any input, and no hot path recurses.
+//! Division and gcd are iterative. Karatsuba/Toom multiplication has only
+//! logarithmic, size-decreasing recursion: [`MAX_LIMBS`] and the
+//! [`KARATSUBA_THRESHOLD`] schoolbook floor cap its host-stack depth below 23
+//! even at the allocation ceiling. The two operations whose *result* grows
+//! without bound in their argument — [`BigNat::shl`] and [`BigNat::pow`] —
+//! size that result before allocating it and refuse through
+//! [`BigNat::checked_shl`] / [`BigNat::checked_pow`] when it would exceed
+//! [`MAX_LIMBS`]. Refusal is what FL-INV-07 requires: resource exhaustion is a
+//! typed outcome the caller can see, never an allocator abort that takes the
+//! process with it.
 
 use std::cmp::Ordering;
 
@@ -21,15 +33,71 @@ pub struct BigNat {
     limbs: Vec<u64>,
 }
 
+/// Immutable, zero-copy view of a natural-number magnitude.
+///
+/// The view borrows normalized little-endian limbs. Construction trims only
+/// trailing zero limbs by shortening the slice; it never allocates or rewrites
+/// the borrowed storage. This is the Marrow bridge: an ABI `mpz` limb buffer can
+/// participate in arithmetic directly, with allocations reserved for results.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BigNatView<'a> {
+    limbs: &'a [u64],
+}
+
 /// `10^19`: the largest power of ten with `10^k - 1` representable in `u64`.
 const DECIMAL_CHUNK_BASE: u128 = 10_000_000_000_000_000_000;
 /// Digits per decimal chunk (`log10(DECIMAL_CHUNK_BASE)`).
 const DECIMAL_CHUNK_DIGITS: usize = 19;
 
+/// The widest single value this crate will allocate: `2^28` limbs, or 2 GiB.
+///
+/// A *policy* bound, not a mathematical one — `Nat` is unbounded. It exists so
+/// that an absurd growth request is answered rather than attempted: `x << 2^58`
+/// names a number needing two exabytes of limbs, and asking the allocator for
+/// that aborts the process instead of returning a verdict. The bound is far
+/// above anything a kernel-accepted proof reaches (the pinned `pow` exponent cap
+/// is `2^24`, and every kernel growth path charges its result size against a
+/// budget first — see `fln_kernel::tc`), so refusing past it costs no reachable
+/// arithmetic.
+///
+/// It is also what makes the sizing portable: the limb count is computed in
+/// `u128` and compared here, so a 32-bit `usize` cannot truncate a large shift
+/// into a small, silently *wrong* allocation.
+pub const MAX_LIMBS: usize = 1 << 28;
+
+/// Operand-width crossover from schoolbook to Karatsuba multiplication.
+///
+/// The value is pinned by the kernel-reduction profile and the boundary tests
+/// below. The dispatcher also keeps strongly unbalanced products on the
+/// schoolbook path, where splitting the wider operand adds work without
+/// reducing the shorter dimension.
+pub const KARATSUBA_THRESHOLD: usize = 80;
+
+/// Operand-width crossover from Karatsuba to three-way Toom-Cook.
+pub const TOOM3_THRESHOLD: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MulAlgorithm {
+    Schoolbook,
+    Karatsuba,
+    Toom3,
+}
+
 fn normalize(limbs: &mut Vec<u64>) {
     while limbs.last() == Some(&0) {
         limbs.pop();
     }
+}
+
+fn normalized_len(limbs: &[u64]) -> usize {
+    limbs
+        .iter()
+        .rposition(|limb| *limb != 0)
+        .map_or(0, |index| index + 1)
+}
+
+fn normalized_slice(limbs: &[u64]) -> &[u64] {
+    &limbs[..normalized_len(limbs)]
 }
 
 fn cmp_limbs(a: &[u64], b: &[u64]) -> Ordering {
@@ -59,6 +127,7 @@ fn sub_in_place(a: &mut Vec<u64>, b: &[u64]) {
 }
 
 /// In-place `r <<= 1`. Preserves normalization.
+#[cfg(test)]
 fn shl1_in_place(r: &mut Vec<u64>) {
     let mut carry = 0u64;
     for limb in r.iter_mut() {
@@ -68,6 +137,649 @@ fn shl1_in_place(r: &mut Vec<u64>) {
     }
     if carry != 0 {
         r.push(carry);
+    }
+}
+
+fn bit_length_limbs(limbs: &[u64]) -> u64 {
+    match limbs.last() {
+        None => 0,
+        Some(&top) => (limbs.len() as u64 - 1) * 64 + u64::from(64 - top.leading_zeros()),
+    }
+}
+
+fn add_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let mut out = Vec::with_capacity(longer.len() + 1);
+    let mut carry = 0u128;
+    let mut short_iter = shorter.iter();
+    for &a in longer {
+        let b = short_iter.next().copied().unwrap_or(0);
+        let sum = u128::from(a) + u128::from(b) + carry;
+        out.push(sum as u64);
+        carry = sum >> 64;
+    }
+    if carry != 0 {
+        out.push(carry as u64);
+    }
+    BigNat { limbs: out }
+}
+
+fn sub_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if cmp_limbs(a, b) != Ordering::Greater {
+        return BigNat::zero();
+    }
+    let mut out = a.to_vec();
+    sub_in_place(&mut out, b);
+    BigNat { limbs: out }
+}
+
+fn schoolbook_mul_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if a.is_empty() || b.is_empty() {
+        return BigNat::zero();
+    }
+    let mut out = vec![0u64; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate() {
+        let mut carry = 0u128;
+        for (j, &y) in b.iter().enumerate() {
+            if let Some(slot) = out.get_mut(i + j) {
+                let cur = u128::from(*slot) + u128::from(x) * u128::from(y) + carry;
+                *slot = cur as u64;
+                carry = cur >> 64;
+            }
+        }
+        if let Some(slot) = out.get_mut(i + b.len()) {
+            *slot = (u128::from(*slot) + carry) as u64;
+        }
+    }
+    BigNat::from_limbs_le(out)
+}
+
+fn mul_algorithm(a_len: usize, b_len: usize) -> MulAlgorithm {
+    let shorter = a_len.min(b_len);
+    let longer = a_len.max(b_len);
+    if shorter < KARATSUBA_THRESHOLD || longer > shorter.saturating_mul(2) {
+        MulAlgorithm::Schoolbook
+    } else if shorter < TOOM3_THRESHOLD {
+        MulAlgorithm::Karatsuba
+    } else {
+        MulAlgorithm::Toom3
+    }
+}
+
+fn add_shifted_limbs(out: &mut Vec<u64>, addend: &[u64], shift: usize) {
+    if addend.is_empty() {
+        return;
+    }
+    let needed = shift
+        .checked_add(addend.len())
+        .and_then(|len| len.checked_add(1))
+        .expect("bignum product length overflow");
+    if out.len() < needed {
+        out.resize(needed, 0);
+    }
+    let mut carry = 0u128;
+    for (index, &limb) in addend.iter().enumerate() {
+        let slot = shift + index;
+        let sum = u128::from(out[slot]) + u128::from(limb) + carry;
+        out[slot] = sum as u64;
+        carry = sum >> 64;
+    }
+    let mut slot = shift + addend.len();
+    while carry != 0 {
+        if slot == out.len() {
+            out.push(0);
+        }
+        let sum = u128::from(out[slot]) + carry;
+        out[slot] = sum as u64;
+        carry = sum >> 64;
+        slot += 1;
+    }
+}
+
+fn karatsuba_mul_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if a.is_empty() || b.is_empty() {
+        return BigNat::zero();
+    }
+    if mul_algorithm(a.len(), b.len()) == MulAlgorithm::Schoolbook {
+        return schoolbook_mul_limbs(a, b);
+    }
+    karatsuba_mul_balanced(a, b)
+}
+
+fn karatsuba_mul_balanced(a: &[u64], b: &[u64]) -> BigNat {
+    let split = a.len().max(b.len()).div_ceil(2);
+    let a_split = split.min(a.len());
+    let b_split = split.min(b.len());
+    let (a0, a1) = a.split_at(a_split);
+    let (b0, b1) = b.split_at(b_split);
+
+    let z0 = mul_limbs(a0, b0);
+    let z2 = mul_limbs(a1, b1);
+    let a_sum = add_limbs(a0, a1);
+    let b_sum = add_limbs(b0, b1);
+    let middle_total = mul_limbs(a_sum.limbs_le(), b_sum.limbs_le());
+    assert!(
+        middle_total >= z0,
+        "Karatsuba interpolation underflowed at z0"
+    );
+    let middle_without_z0 = middle_total.sub(&z0);
+    assert!(
+        middle_without_z0 >= z2,
+        "Karatsuba interpolation underflowed at z2"
+    );
+    let middle = middle_without_z0.sub(&z2);
+
+    let mut out = Vec::with_capacity(a.len() + b.len() + 1);
+    add_shifted_limbs(&mut out, z0.limbs_le(), 0);
+    add_shifted_limbs(&mut out, middle.limbs_le(), split);
+    add_shifted_limbs(&mut out, z2.limbs_le(), split * 2);
+    BigNat::from_limbs_le(out)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedLimbs {
+    negative: bool,
+    magnitude: BigNat,
+}
+
+impl SignedLimbs {
+    fn from_magnitude(magnitude: BigNat) -> Self {
+        SignedLimbs {
+            negative: false,
+            magnitude,
+        }
+    }
+
+    fn from_limbs(limbs: &[u64]) -> Self {
+        Self::from_magnitude(BigNat::from_limbs_le(limbs.to_vec()))
+    }
+
+    fn normalized(mut self) -> Self {
+        if self.magnitude.is_zero() {
+            self.negative = false;
+        }
+        self
+    }
+
+    fn negated(mut self) -> Self {
+        if !self.magnitude.is_zero() {
+            self.negative = !self.negative;
+        }
+        self
+    }
+
+    fn add(&self, other: &SignedLimbs) -> SignedLimbs {
+        if self.negative == other.negative {
+            return SignedLimbs {
+                negative: self.negative,
+                magnitude: self.magnitude.add(&other.magnitude),
+            }
+            .normalized();
+        }
+        match cmp_limbs(self.magnitude.limbs_le(), other.magnitude.limbs_le()) {
+            Ordering::Greater => SignedLimbs {
+                negative: self.negative,
+                magnitude: self.magnitude.sub(&other.magnitude),
+            },
+            Ordering::Less => SignedLimbs {
+                negative: other.negative,
+                magnitude: other.magnitude.sub(&self.magnitude),
+            },
+            Ordering::Equal => SignedLimbs::from_magnitude(BigNat::zero()),
+        }
+        .normalized()
+    }
+
+    fn sub(&self, other: &SignedLimbs) -> SignedLimbs {
+        self.add(&other.clone().negated())
+    }
+
+    fn mul(&self, other: &SignedLimbs) -> SignedLimbs {
+        SignedLimbs {
+            negative: self.negative ^ other.negative,
+            magnitude: mul_limbs(self.magnitude.limbs_le(), other.magnitude.limbs_le()),
+        }
+        .normalized()
+    }
+
+    fn mul_small(&self, factor: u64) -> SignedLimbs {
+        SignedLimbs {
+            negative: self.negative,
+            magnitude: self.magnitude.mul_small(factor),
+        }
+        .normalized()
+    }
+
+    fn div_exact_small(&self, divisor: u64) -> SignedLimbs {
+        assert!(divisor != 0, "exact small division by zero");
+        let mut quotient = vec![0; self.magnitude.limbs_le().len()];
+        let mut remainder = 0u128;
+        for (index, &limb) in self.magnitude.limbs_le().iter().enumerate().rev() {
+            let value = (remainder << 64) | u128::from(limb);
+            quotient[index] = (value / u128::from(divisor)) as u64;
+            remainder = value % u128::from(divisor);
+        }
+        assert_eq!(remainder, 0, "Toom interpolation division must be exact");
+        SignedLimbs {
+            negative: self.negative,
+            magnitude: BigNat::from_limbs_le(quotient),
+        }
+        .normalized()
+    }
+
+    fn into_nonnegative(self, coefficient: &str) -> BigNat {
+        assert!(
+            !self.negative,
+            "Toom interpolation produced a negative {coefficient} coefficient"
+        );
+        self.magnitude
+    }
+}
+
+fn split_three(limbs: &[u64], width: usize) -> (&[u64], &[u64], &[u64]) {
+    let first = width.min(limbs.len());
+    let second = width.saturating_mul(2).min(limbs.len());
+    (
+        normalized_slice(&limbs[..first]),
+        normalized_slice(&limbs[first..second]),
+        normalized_slice(&limbs[second..]),
+    )
+}
+
+fn eval_toom_at_one(parts: (&[u64], &[u64], &[u64])) -> BigNat {
+    add_limbs(add_limbs(parts.0, parts.1).limbs_le(), parts.2)
+}
+
+fn eval_toom_at_minus_one(parts: (&[u64], &[u64], &[u64])) -> SignedLimbs {
+    SignedLimbs::from_limbs(parts.0)
+        .sub(&SignedLimbs::from_limbs(parts.1))
+        .add(&SignedLimbs::from_limbs(parts.2))
+}
+
+fn eval_toom_at_two(parts: (&[u64], &[u64], &[u64])) -> BigNat {
+    let p0 = BigNat::from_limbs_le(parts.0.to_vec());
+    let p1 = BigNat::from_limbs_le(parts.1.to_vec()).mul_small(2);
+    let p2 = BigNat::from_limbs_le(parts.2.to_vec()).mul_small(4);
+    p0.add(&p1).add(&p2)
+}
+
+fn toom3_mul_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if a.is_empty() || b.is_empty() {
+        return BigNat::zero();
+    }
+    if a.len().min(b.len()) < TOOM3_THRESHOLD
+        || a.len().max(b.len()) > a.len().min(b.len()).saturating_mul(2)
+    {
+        return karatsuba_mul_limbs(a, b);
+    }
+    toom3_mul_balanced(a, b)
+}
+
+fn toom3_mul_balanced(a: &[u64], b: &[u64]) -> BigNat {
+    let width = a.len().max(b.len()).div_ceil(3);
+    let a_parts = split_three(a, width);
+    let b_parts = split_three(b, width);
+
+    let c0 = mul_limbs(a_parts.0, b_parts.0);
+    let c4 = mul_limbs(a_parts.2, b_parts.2);
+    let at_one_a = eval_toom_at_one(a_parts);
+    let at_one_b = eval_toom_at_one(b_parts);
+    let v1 = SignedLimbs::from_magnitude(mul_limbs(at_one_a.limbs_le(), at_one_b.limbs_le()));
+    let vm1 = eval_toom_at_minus_one(a_parts).mul(&eval_toom_at_minus_one(b_parts));
+    let at_two_a = eval_toom_at_two(a_parts);
+    let at_two_b = eval_toom_at_two(b_parts);
+    let v2 = SignedLimbs::from_magnitude(mul_limbs(at_two_a.limbs_le(), at_two_b.limbs_le()));
+    let c0_signed = SignedLimbs::from_magnitude(c0.clone());
+    let c4_signed = SignedLimbs::from_magnitude(c4.clone());
+
+    let c1_plus_c3 = v1.sub(&vm1).div_exact_small(2);
+    let c2 = v1
+        .add(&vm1)
+        .div_exact_small(2)
+        .sub(&c0_signed)
+        .sub(&c4_signed);
+    let c1_plus_four_c3 = v2
+        .sub(&c0_signed)
+        .sub(&c2.mul_small(4))
+        .sub(&c4_signed.mul_small(16))
+        .div_exact_small(2);
+    let c3 = c1_plus_four_c3.sub(&c1_plus_c3).div_exact_small(3);
+    let c1 = c1_plus_c3.sub(&c3);
+
+    let c1 = c1.into_nonnegative("x");
+    let c2 = c2.into_nonnegative("x^2");
+    let c3 = c3.into_nonnegative("x^3");
+    let mut out = Vec::with_capacity(a.len() + b.len() + 1);
+    add_shifted_limbs(&mut out, c0.limbs_le(), 0);
+    add_shifted_limbs(&mut out, c1.limbs_le(), width);
+    add_shifted_limbs(&mut out, c2.limbs_le(), width * 2);
+    add_shifted_limbs(&mut out, c3.limbs_le(), width * 3);
+    add_shifted_limbs(&mut out, c4.limbs_le(), width * 4);
+    BigNat::from_limbs_le(out)
+}
+
+fn mul_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    let a = normalized_slice(a);
+    let b = normalized_slice(b);
+    match mul_algorithm(a.len(), b.len()) {
+        MulAlgorithm::Schoolbook => schoolbook_mul_limbs(a, b),
+        MulAlgorithm::Karatsuba => karatsuba_mul_limbs(a, b),
+        MulAlgorithm::Toom3 => toom3_mul_limbs(a, b),
+    }
+}
+
+#[cfg(test)]
+fn bitwise_div_rem_limbs(dividend: &[u64], divisor: &[u64]) -> (BigNat, BigNat) {
+    if divisor.is_empty() || cmp_limbs(dividend, divisor) == Ordering::Less {
+        return (BigNat::zero(), BigNat::from_limbs_le(dividend.to_vec()));
+    }
+    let bits = bit_length_limbs(dividend);
+    let mut quotient = vec![0u64; dividend.len()];
+    let mut remainder: Vec<u64> = Vec::with_capacity(divisor.len() + 1);
+    for i in (0..bits).rev() {
+        shl1_in_place(&mut remainder);
+        let limb_idx = (i / 64) as usize;
+        let bit = dividend
+            .get(limb_idx)
+            .map_or(0, |&limb| (limb >> (i % 64)) & 1);
+        if bit == 1 {
+            if let Some(first) = remainder.first_mut() {
+                *first |= 1;
+            } else {
+                remainder.push(1);
+            }
+        }
+        if cmp_limbs(&remainder, divisor) != Ordering::Less {
+            sub_in_place(&mut remainder, divisor);
+            if let Some(slot) = quotient.get_mut(limb_idx) {
+                *slot |= 1u64 << (i % 64);
+            }
+        }
+    }
+    (
+        BigNat::from_limbs_le(quotient),
+        BigNat::from_limbs_le(remainder),
+    )
+}
+
+fn shift_left_bits(limbs: &[u64], shift: u32) -> Vec<u64> {
+    if shift == 0 || limbs.is_empty() {
+        return limbs.to_vec();
+    }
+    let mut out = Vec::with_capacity(limbs.len() + 1);
+    let mut carry = 0u64;
+    for &limb in limbs {
+        out.push((limb << shift) | carry);
+        carry = limb >> (64 - shift);
+    }
+    if carry != 0 {
+        out.push(carry);
+    }
+    out
+}
+
+fn shift_right_bits(limbs: &[u64], shift: u32) -> Vec<u64> {
+    if shift == 0 || limbs.is_empty() {
+        return limbs.to_vec();
+    }
+    let mut out = vec![0; limbs.len()];
+    let mut carry = 0u64;
+    for (index, &limb) in limbs.iter().enumerate().rev() {
+        out[index] = (limb >> shift) | carry;
+        carry = limb << (64 - shift);
+    }
+    normalize(&mut out);
+    out
+}
+
+fn div_rem_single_limb(dividend: &[u64], divisor: u64) -> (BigNat, BigNat) {
+    let mut quotient = vec![0; dividend.len()];
+    let mut remainder = 0u128;
+    for (index, &limb) in dividend.iter().enumerate().rev() {
+        let value = (remainder << 64) | u128::from(limb);
+        quotient[index] = (value / u128::from(divisor)) as u64;
+        remainder = value % u128::from(divisor);
+    }
+    (
+        BigNat::from_limbs_le(quotient),
+        BigNat::from_u64(remainder as u64),
+    )
+}
+
+fn knuth_div_rem_limbs(dividend: &[u64], divisor: &[u64]) -> (BigNat, BigNat) {
+    debug_assert!(divisor.len() >= 2);
+    debug_assert!(cmp_limbs(dividend, divisor) != Ordering::Less);
+
+    const BASE: u128 = 1u128 << 64;
+    let n = divisor.len();
+    let m = dividend.len() - n;
+    let shift = divisor[n - 1].leading_zeros();
+    let normalized_divisor = shift_left_bits(divisor, shift);
+    assert_eq!(
+        normalized_divisor.len(),
+        n,
+        "normalizing a divisor must not add a limb"
+    );
+    let mut normalized_dividend = shift_left_bits(dividend, shift);
+    normalized_dividend.resize(dividend.len() + 1, 0);
+    let mut quotient = vec![0u64; m + 1];
+
+    for j in (0..=m).rev() {
+        let top = normalized_dividend[j + n];
+        let next = normalized_dividend[j + n - 1];
+        let divisor_top = normalized_divisor[n - 1];
+        assert!(
+            top <= divisor_top,
+            "Knuth-D quotient estimate exceeds one radix digit"
+        );
+        let (mut qhat, mut rhat) = if top == divisor_top {
+            (u64::MAX, u128::from(next) + u128::from(divisor_top))
+        } else {
+            let numerator = (u128::from(top) << 64) | u128::from(next);
+            (
+                (numerator / u128::from(divisor_top)) as u64,
+                numerator % u128::from(divisor_top),
+            )
+        };
+        let next_divisor = normalized_divisor[n - 2];
+        let next_dividend = normalized_dividend[j + n - 2];
+        while rhat < BASE
+            && u128::from(qhat) * u128::from(next_divisor)
+                > (rhat << 64) | u128::from(next_dividend)
+        {
+            qhat -= 1;
+            rhat += u128::from(divisor_top);
+        }
+
+        let mut borrow = 0u128;
+        for (index, &divisor_limb) in normalized_divisor.iter().enumerate() {
+            let product = u128::from(qhat) * u128::from(divisor_limb) + borrow;
+            let (difference, underflow) =
+                normalized_dividend[j + index].overflowing_sub(product as u64);
+            normalized_dividend[j + index] = difference;
+            borrow = (product >> 64) + u128::from(underflow);
+        }
+        let high = normalized_dividend[j + n];
+        let negative = u128::from(high) < borrow;
+        normalized_dividend[j + n] = high.wrapping_sub(borrow as u64);
+        if negative {
+            qhat -= 1;
+            let mut carry = 0u128;
+            for (index, &divisor_limb) in normalized_divisor.iter().enumerate() {
+                let sum =
+                    u128::from(normalized_dividend[j + index]) + u128::from(divisor_limb) + carry;
+                normalized_dividend[j + index] = sum as u64;
+                carry = sum >> 64;
+            }
+            normalized_dividend[j + n] = normalized_dividend[j + n].wrapping_add(carry as u64);
+        }
+        quotient[j] = qhat;
+    }
+
+    let remainder = shift_right_bits(&normalized_dividend[..n], shift);
+    (
+        BigNat::from_limbs_le(quotient),
+        BigNat::from_limbs_le(remainder),
+    )
+}
+
+fn div_rem_limbs(dividend: &[u64], divisor: &[u64]) -> (BigNat, BigNat) {
+    let dividend = normalized_slice(dividend);
+    let divisor = normalized_slice(divisor);
+    if divisor.is_empty() || cmp_limbs(dividend, divisor) == Ordering::Less {
+        return (BigNat::zero(), BigNat::from_limbs_le(dividend.to_vec()));
+    }
+    if divisor.len() == 1 {
+        return div_rem_single_limb(dividend, divisor[0]);
+    }
+    knuth_div_rem_limbs(dividend, divisor)
+}
+
+fn trailing_zero_bits_limbs(limbs: &[u64]) -> u64 {
+    for (index, &limb) in limbs.iter().enumerate() {
+        if limb != 0 {
+            return index as u64 * 64 + u64::from(limb.trailing_zeros());
+        }
+    }
+    0
+}
+
+fn binary_gcd_limbs(a: &[u64], b: &[u64]) -> BigNat {
+    if a.is_empty() {
+        return BigNat::from_limbs_le(b.to_vec());
+    }
+    if b.is_empty() {
+        return BigNat::from_limbs_le(a.to_vec());
+    }
+
+    let common_shift = trailing_zero_bits_limbs(a).min(trailing_zero_bits_limbs(b));
+    let mut a = BigNat::from_limbs_le(a.to_vec()).shr(trailing_zero_bits_limbs(a));
+    let mut b = BigNat::from_limbs_le(b.to_vec()).shr(trailing_zero_bits_limbs(b));
+    while !b.is_zero() {
+        if cmp_limbs(a.limbs_le(), b.limbs_le()) == Ordering::Greater {
+            std::mem::swap(&mut a, &mut b);
+        }
+        b = b.sub(&a);
+        if !b.is_zero() {
+            b = b.shr(trailing_zero_bits_limbs(b.limbs_le()));
+        }
+    }
+    a.shl(common_shift)
+}
+
+fn checked_pow_limbs(limbs: &[u64], exp: u32) -> Option<BigNat> {
+    let result_bits = u128::from(bit_length_limbs(limbs)) * u128::from(exp);
+    if result_bits / 64 + 1 > MAX_LIMBS as u128 {
+        return None;
+    }
+    let source = BigNatView::from_limbs_le(limbs);
+    let mut result = BigNat::from_u64(1);
+    let mut squared: Option<BigNat> = None;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = match squared.as_ref() {
+                Some(base) => mul_limbs(result.limbs_le(), base.limbs_le()),
+                None => mul_limbs(result.limbs_le(), source.limbs_le()),
+            };
+        }
+        e >>= 1;
+        if e > 0 {
+            squared = Some(match squared.as_ref() {
+                Some(base) => mul_limbs(base.limbs_le(), base.limbs_le()),
+                None => mul_limbs(source.limbs_le(), source.limbs_le()),
+            });
+        }
+    }
+    Some(result)
+}
+
+impl<'a> BigNatView<'a> {
+    /// Borrow little-endian limbs, normalizing by shortening the view only.
+    pub fn from_limbs_le(mut limbs: &'a [u64]) -> Self {
+        while limbs.last() == Some(&0) {
+            limbs = &limbs[..limbs.len() - 1];
+        }
+        Self { limbs }
+    }
+
+    /// The borrowed normalized little-endian limbs.
+    pub fn limbs_le(self) -> &'a [u64] {
+        self.limbs
+    }
+
+    /// Materialize an owned value when ownership is explicitly required.
+    pub fn to_owned(self) -> BigNat {
+        BigNat::from_limbs_le(self.limbs.to_vec())
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.limbs.is_empty()
+    }
+
+    pub fn bit_length(self) -> u64 {
+        bit_length_limbs(self.limbs)
+    }
+
+    pub fn to_u64(self) -> Option<u64> {
+        match self.limbs {
+            [] => Some(0),
+            [value] => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn beq(self, other: BigNatView<'_>) -> bool {
+        cmp_limbs(self.limbs, other.limbs) == Ordering::Equal
+    }
+
+    pub fn ble(self, other: BigNatView<'_>) -> bool {
+        cmp_limbs(self.limbs, other.limbs) != Ordering::Greater
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, other: BigNatView<'_>) -> BigNat {
+        add_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(self, other: BigNatView<'_>) -> BigNat {
+        sub_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(self, other: BigNatView<'_>) -> BigNat {
+        mul_limbs(self.limbs, other.limbs)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, other: BigNatView<'_>) -> BigNat {
+        self.div_rem(other).0
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn rem(self, other: BigNatView<'_>) -> BigNat {
+        self.div_rem(other).1
+    }
+
+    pub fn div_rem(self, other: BigNatView<'_>) -> (BigNat, BigNat) {
+        div_rem_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn checked_pow(self, exp: u32) -> Option<BigNat> {
+        checked_pow_limbs(self.limbs, exp)
+    }
+
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs.
+    pub fn pow(self, exp: u32) -> BigNat {
+        self.checked_pow(exp).unwrap_or_else(|| {
+            panic!(
+                "BigNatView::pow: raising a {}-bit value to {exp} exceeds MAX_LIMBS \
+                 ({MAX_LIMBS}); the caller must charge the result size before exponentiating",
+                self.bit_length()
+            )
+        })
     }
 }
 
@@ -90,6 +802,11 @@ impl BigNat {
     pub fn from_limbs_le(mut limbs: Vec<u64>) -> BigNat {
         normalize(&mut limbs);
         BigNat { limbs }
+    }
+
+    /// Borrow this value without copying its limb storage.
+    pub fn as_view(&self) -> BigNatView<'_> {
+        BigNatView { limbs: &self.limbs }
     }
 
     /// Parses a decimal string. `None` on empty input or any non-digit byte;
@@ -163,79 +880,37 @@ impl BigNat {
 
     /// Number of significant bits; `bit_length(0) = 0`.
     pub fn bit_length(&self) -> u64 {
-        match self.limbs.last() {
-            None => 0,
-            Some(&top) => (self.limbs.len() as u64 - 1) * 64 + u64::from(64 - top.leading_zeros()),
-        }
+        bit_length_limbs(&self.limbs)
     }
 
     /// Kernel-facing `Nat.beq` (KR-313).
     pub fn beq(&self, other: &BigNat) -> bool {
-        self == other
+        self.as_view().beq(other.as_view())
     }
 
     /// Kernel-facing `Nat.ble` (KR-313).
     pub fn ble(&self, other: &BigNat) -> bool {
-        self <= other
+        self.as_view().ble(other.as_view())
     }
 
     /// `self + other`.
     #[allow(clippy::should_implement_trait)]
     pub fn add(&self, other: &BigNat) -> BigNat {
-        let (longer, shorter) = if self.limbs.len() >= other.limbs.len() {
-            (&self.limbs, &other.limbs)
-        } else {
-            (&other.limbs, &self.limbs)
-        };
-        let mut out = Vec::with_capacity(longer.len() + 1);
-        let mut carry = 0u128;
-        let mut short_iter = shorter.iter();
-        for &a in longer {
-            let b = short_iter.next().copied().unwrap_or(0);
-            let sum = u128::from(a) + u128::from(b) + carry;
-            out.push(sum as u64);
-            carry = sum >> 64;
-        }
-        if carry != 0 {
-            out.push(carry as u64);
-        }
-        BigNat { limbs: out }
+        add_limbs(&self.limbs, &other.limbs)
     }
 
     /// Truncated subtraction, Lean `Nat.sub` semantics: `self - other`, floored
     /// at zero (KR-313).
     #[allow(clippy::should_implement_trait)]
     pub fn sub(&self, other: &BigNat) -> BigNat {
-        if self <= other {
-            return BigNat::zero();
-        }
-        let mut out = self.limbs.clone();
-        sub_in_place(&mut out, &other.limbs);
-        BigNat { limbs: out }
+        sub_limbs(&self.limbs, &other.limbs)
     }
 
-    /// `self * other`, schoolbook with `u128` intermediates (KR-313;
-    /// performance is gated later, PG-K).
+    /// `self * other`, selecting schoolbook, Karatsuba, or three-way Toom-Cook
+    /// by the corpus-pinned operand-width thresholds.
     #[allow(clippy::should_implement_trait)]
     pub fn mul(&self, other: &BigNat) -> BigNat {
-        if self.is_zero() || other.is_zero() {
-            return BigNat::zero();
-        }
-        let mut out = vec![0u64; self.limbs.len() + other.limbs.len()];
-        for (i, &x) in self.limbs.iter().enumerate() {
-            let mut carry = 0u128;
-            for (j, &y) in other.limbs.iter().enumerate() {
-                if let Some(slot) = out.get_mut(i + j) {
-                    let cur = u128::from(*slot) + u128::from(x) * u128::from(y) + carry;
-                    *slot = cur as u64;
-                    carry = cur >> 64;
-                }
-            }
-            if let Some(slot) = out.get_mut(i + other.limbs.len()) {
-                *slot = (u128::from(*slot) + carry) as u64;
-            }
-        }
-        BigNat::from_limbs_le(out)
+        mul_limbs(&self.limbs, &other.limbs)
     }
 
     /// Euclidean quotient with Lean semantics: `x / 0 = 0` (KR-313).
@@ -249,73 +924,45 @@ impl BigNat {
         self.div_rem(other).1
     }
 
-    /// Quotient and remainder by shift-subtract long division.
+    /// Quotient and remainder by one-limb division or normalized Knuth-D.
     /// Lean laws: `(x, 0) -> (0, x)`. Invariant on exit for nonzero divisor:
     /// `self = q * other + r` with `r < other`.
     pub fn div_rem(&self, other: &BigNat) -> (BigNat, BigNat) {
-        if other.is_zero() || self < other {
-            return (BigNat::zero(), self.clone());
-        }
-        let bits = self.bit_length();
-        let mut quotient = vec![0u64; self.limbs.len()];
-        let mut remainder: Vec<u64> = Vec::with_capacity(other.limbs.len() + 1);
-        for i in (0..bits).rev() {
-            shl1_in_place(&mut remainder);
-            let limb_idx = (i / 64) as usize;
-            let bit = self
-                .limbs
-                .get(limb_idx)
-                .map_or(0, |&limb| (limb >> (i % 64)) & 1);
-            if bit == 1 {
-                if let Some(first) = remainder.first_mut() {
-                    *first |= 1;
-                } else {
-                    remainder.push(1);
-                }
-            }
-            if cmp_limbs(&remainder, &other.limbs) != Ordering::Less {
-                sub_in_place(&mut remainder, &other.limbs);
-                if let Some(slot) = quotient.get_mut(limb_idx) {
-                    *slot |= 1u64 << (i % 64);
-                }
-            }
-        }
-        (
-            BigNat::from_limbs_le(quotient),
-            BigNat::from_limbs_le(remainder),
-        )
+        div_rem_limbs(&self.limbs, &other.limbs)
     }
 
     /// `self ^ exp` by iterative square-and-multiply; `x ^ 0 = 1` (KR-313
     /// caps the accelerated exponent at `2^24`; the cap is enforced by the
     /// kernel caller, not here).
+    ///
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs. As with
+    /// [`BigNat::shl`], the kernel charges the result size first; callers that
+    /// cannot use [`BigNat::checked_pow`].
     pub fn pow(&self, exp: u32) -> BigNat {
-        let mut result = BigNat::from_u64(1);
-        let mut base = self.clone();
-        let mut e = exp;
-        while e > 0 {
-            if e & 1 == 1 {
-                result = result.mul(&base);
-            }
-            e >>= 1;
-            if e > 0 {
-                base = base.mul(&base);
-            }
-        }
-        result
+        self.checked_pow(exp).unwrap_or_else(|| {
+            panic!(
+                "BigNat::pow: raising a {}-bit value to {exp} exceeds MAX_LIMBS ({MAX_LIMBS}); \
+                 the caller must charge the result size before exponentiating",
+                self.bit_length()
+            )
+        })
     }
 
-    /// Greatest common divisor, iterative Euclid via `rem`; `gcd(0, x) = x`
+    /// `self ^ exp`, or `None` when the result would exceed [`MAX_LIMBS`].
+    ///
+    /// The bound is decided from `bit_length · exp` before any multiplication
+    /// runs. Square-and-multiply never builds a value wider than the result it
+    /// is heading for — the loop stops squaring once the exponent is exhausted
+    /// — so bounding the result bounds every intermediate too.
+    pub fn checked_pow(&self, exp: u32) -> Option<BigNat> {
+        checked_pow_limbs(&self.limbs, exp)
+    }
+
+    /// Greatest common divisor by Stein's binary algorithm; `gcd(0, x) = x`
     /// (KR-313).
     pub fn gcd(&self, other: &BigNat) -> BigNat {
-        let mut a = self.clone();
-        let mut b = other.clone();
-        while !b.is_zero() {
-            let r = a.rem(&b);
-            a = b;
-            b = r;
-        }
-        a
+        binary_gcd_limbs(&self.limbs, &other.limbs)
     }
 
     /// Bitwise AND (KR-313 `Nat.land`).
@@ -360,12 +1007,46 @@ impl BigNat {
     }
 
     /// `self << bits` (KR-313 `Nat.shiftLeft`).
+    ///
+    /// The caller must already have established that the result fits — as the
+    /// kernel does, by charging `bits / 64` against its budget before reducing a
+    /// `Nat.shiftLeft` application. Violating that is an invariant failure, not
+    /// a user diagnostic, so it panics here; callers that cannot make the
+    /// guarantee use [`BigNat::checked_shl`] and handle the refusal.
+    ///
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs.
     pub fn shl(&self, bits: u64) -> BigNat {
+        self.checked_shl(bits).unwrap_or_else(|| {
+            panic!(
+                "BigNat::shl: {bits}-bit shift of a {}-limb value exceeds MAX_LIMBS ({MAX_LIMBS}); \
+                 the caller must charge the result size before shifting",
+                self.limbs.len()
+            )
+        })
+    }
+
+    /// `self << bits`, or `None` when the result would exceed [`MAX_LIMBS`].
+    ///
+    /// The refusal is decided from the operand sizes alone, before a single
+    /// limb is allocated, so an unrepresentable request costs nothing and never
+    /// reaches the allocator.
+    pub fn checked_shl(&self, bits: u64) -> Option<BigNat> {
         if self.is_zero() {
-            return BigNat::zero();
+            return Some(BigNat::zero());
         }
-        let limb_shift = (bits / 64) as usize;
+        // Sized in u128: on a 32-bit target `(bits / 64) as usize` truncates,
+        // which would allocate a small buffer and return a wrong value rather
+        // than refusing.
+        let limb_shift = u128::from(bits / 64);
         let bit_shift = (bits % 64) as u32;
+        let possible_carry = u128::from(bit_shift != 0);
+        let needed = limb_shift + self.limbs.len() as u128 + possible_carry;
+        if needed > MAX_LIMBS as u128 {
+            return None;
+        }
+        // In range by the check above, so this conversion cannot truncate.
+        let limb_shift = limb_shift as usize;
         let mut out = vec![0u64; limb_shift];
         out.reserve(self.limbs.len() + 1);
         if bit_shift == 0 {
@@ -380,7 +1061,7 @@ impl BigNat {
                 out.push(carry);
             }
         }
-        BigNat::from_limbs_le(out)
+        Some(BigNat::from_limbs_le(out))
     }
 
     /// `self >> bits` (KR-313 `Nat.shiftRight`); shifts past the top yield 0.
@@ -456,10 +1137,139 @@ impl PartialOrd for BigNat {
 
 #[cfg(test)]
 mod tests {
-    use super::BigNat;
+    use super::{
+        BigNat, KARATSUBA_THRESHOLD, MulAlgorithm, TOOM3_THRESHOLD, bitwise_div_rem_limbs,
+        div_rem_limbs, karatsuba_mul_balanced, mul_algorithm, mul_limbs, schoolbook_mul_limbs,
+        toom3_mul_balanced,
+    };
 
     const VECTORS: &str = include_str!("../fixtures/nat_vectors.txt");
+    const KERNEL_REDUCTION_PROFILE: &str = include_str!("../fixtures/kernel_reduction_profile.tsv");
     const EXPECTED_VECTOR_COUNT: usize = 5725;
+
+    #[test]
+    fn kernel_reduction_profile_binds_thresholds_and_crossover_samples() {
+        use std::collections::BTreeMap;
+
+        let mut source_projections = BTreeMap::new();
+        let mut decisions = BTreeMap::new();
+        let mut samples = BTreeMap::new();
+        let mut saw_schema = false;
+        let mut saw_population = false;
+        let mut saw_limitation = false;
+        for line in KERNEL_REDUCTION_PROFILE.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["schema", "fln.bignum-kernel-reduction-profile/2"] => {
+                    saw_schema = true;
+                }
+                [
+                    "source",
+                    source,
+                    measured_sha,
+                    projection_sha,
+                    projection_kind,
+                ] => {
+                    assert!(
+                        measured_sha.len() == 64
+                            && measured_sha
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                        "measured source digest is not lowercase SHA-256"
+                    );
+                    assert!(
+                        projection_sha.len() == 64
+                            && projection_sha
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                        "semantic projection digest is not lowercase SHA-256"
+                    );
+                    assert!(
+                        source_projections
+                            .insert(*source, *projection_kind)
+                            .is_none(),
+                        "duplicate profile source"
+                    );
+                }
+                ["population", "bounded-bootstrap-kernel-and-C4-fixtures"] => {
+                    saw_population = true;
+                }
+                ["limitation", "not-a-mathlib-wide-operation-frequency-claim"] => {
+                    saw_limitation = true;
+                }
+                [
+                    "sample",
+                    "width",
+                    "rounds",
+                    "schoolbook_ns",
+                    "karatsuba_ns",
+                    "toom3_ns",
+                ] => {}
+                ["sample", width, rounds, schoolbook, karatsuba, toom3] => {
+                    let parsed = (
+                        rounds.parse::<usize>().expect("sample rounds"),
+                        schoolbook.parse::<u128>().expect("schoolbook sample"),
+                        karatsuba.parse::<u128>().expect("Karatsuba sample"),
+                        toom3.parse::<u128>().expect("Toom-3 sample"),
+                    );
+                    assert!(
+                        samples
+                            .insert(width.parse::<usize>().expect("sample width"), parsed)
+                            .is_none(),
+                        "duplicate sample width"
+                    );
+                }
+                ["decision", name, value, _] => {
+                    assert!(
+                        decisions
+                            .insert(*name, value.parse::<usize>().expect("decision value"))
+                            .is_none(),
+                        "duplicate threshold decision"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_schema && saw_population && saw_limitation);
+        assert_eq!(
+            source_projections,
+            BTreeMap::from([
+                (
+                    "crates/fln-kernel/tests/k1_judgments.rs",
+                    "kr313-operation-test-body-v1"
+                ),
+                ("tribunal/fixtures/c4/probe_export.c", "c4-nat-slice-v1"),
+            ]),
+            "profile source projections"
+        );
+        assert_eq!(
+            decisions.get("karatsuba-threshold-limbs"),
+            Some(&KARATSUBA_THRESHOLD)
+        );
+        assert_eq!(
+            decisions.get("toom3-threshold-limbs"),
+            Some(&TOOM3_THRESHOLD)
+        );
+        assert!(samples.len() >= 14, "profile sample floor");
+        assert!(
+            samples[&KARATSUBA_THRESHOLD].2 < samples[&KARATSUBA_THRESHOLD].1,
+            "Karatsuba must beat schoolbook at its selected crossover"
+        );
+        assert!(
+            samples[&(TOOM3_THRESHOLD - 512)].3 > samples[&(TOOM3_THRESHOLD - 512)].2,
+            "the pre-threshold regression must remain represented"
+        );
+        for (_, schoolbook, karatsuba, toom3) in
+            samples.range(TOOM3_THRESHOLD..).map(|(_, sample)| *sample)
+        {
+            assert!(karatsuba < schoolbook, "Karatsuba high-width sample");
+            assert!(toom3 < karatsuba, "Toom-3 high-width sample");
+        }
+    }
 
     fn parse(s: &str) -> BigNat {
         // A malformed fixture operand is a corrupt-corpus finding, surfaced via the
@@ -579,6 +1389,200 @@ mod tests {
 
     fn big(v: u128) -> BigNat {
         BigNat::from_limbs_le(vec![v as u64, (v >> 64) as u64])
+    }
+
+    fn wide(state: &mut u64, limbs: usize) -> BigNat {
+        let mut value: Vec<u64> = (0..limbs).map(|_| lcg_next(state)).collect();
+        if let Some(top) = value.last_mut() {
+            *top |= 1 << 63;
+        }
+        BigNat::from_limbs_le(value)
+    }
+
+    #[test]
+    fn multiplication_crossovers_are_pinned_and_both_sides_are_equivalent() {
+        assert_eq!(
+            mul_algorithm(KARATSUBA_THRESHOLD - 1, KARATSUBA_THRESHOLD),
+            MulAlgorithm::Schoolbook
+        );
+        assert_eq!(
+            mul_algorithm(KARATSUBA_THRESHOLD, KARATSUBA_THRESHOLD),
+            MulAlgorithm::Karatsuba
+        );
+        assert_eq!(
+            mul_algorithm(TOOM3_THRESHOLD - 1, TOOM3_THRESHOLD - 1),
+            MulAlgorithm::Karatsuba
+        );
+        assert_eq!(
+            mul_algorithm(TOOM3_THRESHOLD, TOOM3_THRESHOLD),
+            MulAlgorithm::Toom3
+        );
+        assert_eq!(
+            mul_algorithm(KARATSUBA_THRESHOLD, KARATSUBA_THRESHOLD * 2 + 1),
+            MulAlgorithm::Schoolbook,
+            "strongly unbalanced products stay on the linear-short-side path"
+        );
+
+        let mut state = 0x4D53_4F55_4D55_4C31;
+        for width in [
+            KARATSUBA_THRESHOLD - 1,
+            KARATSUBA_THRESHOLD,
+            KARATSUBA_THRESHOLD + 1,
+            TOOM3_THRESHOLD - 1,
+            TOOM3_THRESHOLD,
+            TOOM3_THRESHOLD + 1,
+        ] {
+            let a = wide(&mut state, width);
+            let b = wide(&mut state, width);
+            let schoolbook = schoolbook_mul_limbs(a.limbs_le(), b.limbs_le());
+            assert_eq!(
+                mul_limbs(a.limbs_le(), b.limbs_le()),
+                schoolbook,
+                "dispatcher differs from schoolbook at width {width}"
+            );
+            if width + 1 >= KARATSUBA_THRESHOLD {
+                assert_eq!(
+                    karatsuba_mul_balanced(a.limbs_le(), b.limbs_le()),
+                    schoolbook,
+                    "Karatsuba differs at width {width}"
+                );
+            }
+            if width + 1 >= TOOM3_THRESHOLD {
+                assert_eq!(
+                    toom3_mul_balanced(a.limbs_le(), b.limbs_le()),
+                    schoolbook,
+                    "Toom-3 differs at width {width}"
+                );
+            }
+        }
+        if std::env::var("FLN_BIGNUM_CALIBRATE").as_deref() == Ok("1") {
+            threshold_calibration_report();
+        }
+    }
+
+    #[test]
+    fn toom3_signed_evaluations_and_carry_chains_match_schoolbook() {
+        let mut negative_at_minus_one = vec![1, 0, 0, 0];
+        negative_at_minus_one.extend([u64::MAX; 4]);
+        negative_at_minus_one.extend([2, 0, 0, 1]);
+        let mut positive_at_minus_one = vec![u64::MAX; 4];
+        positive_at_minus_one.extend([1, 0, 0, 0]);
+        positive_at_minus_one.extend([u64::MAX; 4]);
+        for (a, b, label) in [
+            (
+                negative_at_minus_one,
+                positive_at_minus_one,
+                "opposite-signed evaluation",
+            ),
+            (
+                vec![u64::MAX; 12],
+                vec![u64::MAX; 12],
+                "max-limb carry chain",
+            ),
+        ] {
+            assert_eq!(
+                toom3_mul_balanced(&a, &b),
+                schoolbook_mul_limbs(&a, &b),
+                "{label}"
+            );
+        }
+    }
+
+    fn threshold_calibration_report() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut state = 0x4D53_4F55_4245_4E43;
+        for width in [
+            48usize, 64, 72, 80, 88, 96, 112, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896,
+            1024, 1280, 1536, 2048, 2560, 3072, 4096, 5120, 6144, 8192, 12288,
+        ] {
+            let rounds = (8192 / width).max(1);
+            let mut elapsed = [0u128; 3];
+            for _ in 0..5 {
+                let a = wide(&mut state, width);
+                let b = wide(&mut state, width);
+                for _ in 0..rounds {
+                    let started = Instant::now();
+                    black_box(schoolbook_mul_limbs(
+                        black_box(a.limbs_le()),
+                        black_box(b.limbs_le()),
+                    ));
+                    elapsed[0] += started.elapsed().as_nanos();
+
+                    let started = Instant::now();
+                    black_box(karatsuba_mul_balanced(
+                        black_box(a.limbs_le()),
+                        black_box(b.limbs_le()),
+                    ));
+                    elapsed[1] += started.elapsed().as_nanos();
+
+                    let started = Instant::now();
+                    black_box(toom3_mul_balanced(
+                        black_box(a.limbs_le()),
+                        black_box(b.limbs_le()),
+                    ));
+                    elapsed[2] += started.elapsed().as_nanos();
+                }
+            }
+            let observations = u128::from(rounds as u64) * 5;
+            eprintln!(
+                "width={width} rounds={rounds} schoolbook_ns={} karatsuba_ns={} toom3_ns={}",
+                elapsed[0] / observations,
+                elapsed[1] / observations,
+                elapsed[2] / observations
+            );
+        }
+    }
+
+    #[test]
+    fn knuth_d_matches_the_bitwise_model_and_reconstructs_the_dividend() {
+        let mut state = 0x4D53_4F55_4449_5631;
+        for trial in 0..2_000 {
+            let dividend_len = 1 + (lcg_next(&mut state) as usize % 12);
+            let divisor_len = 1 + (lcg_next(&mut state) as usize % 8);
+            let dividend = wide(&mut state, dividend_len);
+            let divisor = wide(&mut state, divisor_len);
+            let expected = bitwise_div_rem_limbs(dividend.limbs_le(), divisor.limbs_le());
+            let actual = div_rem_limbs(dividend.limbs_le(), divisor.limbs_le());
+            assert_eq!(actual, expected, "division model mismatch at trial {trial}");
+            let rebuilt = actual.0.mul(&divisor).add(&actual.1);
+            assert_eq!(rebuilt, dividend, "q*d+r mismatch at trial {trial}");
+            assert!(
+                actual.1 < divisor,
+                "remainder is not below the divisor at trial {trial}"
+            );
+        }
+
+        let dividend = wide(&mut state, 9);
+        assert_eq!(
+            div_rem_limbs(dividend.limbs_le(), &[]),
+            (BigNat::zero(), dividend),
+            "Lean division-by-zero law"
+        );
+    }
+
+    #[test]
+    fn binary_gcd_matches_an_independent_euclidean_loop() {
+        let mut state = 0x4D53_4F55_4743_4431;
+        for trial in 0..120 {
+            let a_len = 1 + (lcg_next(&mut state) as usize % 8);
+            let b_len = 1 + (lcg_next(&mut state) as usize % 8);
+            let a = wide(&mut state, a_len);
+            let b = wide(&mut state, b_len);
+            let mut model_a = a.clone();
+            let mut model_b = b.clone();
+            while !model_b.is_zero() {
+                let (_, remainder) = bitwise_div_rem_limbs(model_a.limbs_le(), model_b.limbs_le());
+                model_a = model_b;
+                model_b = remainder;
+            }
+            assert_eq!(
+                a.gcd(&b),
+                model_a,
+                "binary and Euclidean gcd differ at trial {trial}"
+            );
+        }
     }
 
     fn model_mul_256(a: u128, b: u128) -> BigNat {
@@ -723,5 +1727,82 @@ mod tests {
         assert_eq!(x.to_u64(), None);
         assert_eq!(BigNat::from_u64(9).to_u64(), Some(9));
         assert_eq!(zero.to_u64(), Some(0));
+    }
+
+    /// FL-INV-07 at the crate boundary: a result too large to represent is
+    /// refused from the operand sizes alone, before the allocator is asked for
+    /// anything. `shl` previously computed `(bits / 64) as usize` and handed it
+    /// straight to `vec![0u64; n]`, so these inputs aborted the process — an
+    /// exhaustion the caller could neither see nor survive.
+    #[test]
+    fn oversized_growth_is_refused_before_allocating() {
+        let one = BigNat::from_u64(1);
+        let wide = BigNat::from_limbs_le(vec![u64::MAX; 4]);
+
+        // 2^58 limbs is two exabytes. Refused, and cheaply — if this test ever
+        // takes measurable time, the refusal moved after the allocation.
+        assert_eq!(one.checked_shl(u64::MAX), None);
+        assert_eq!(one.checked_shl(1 << 40), None);
+        assert_eq!(wide.checked_shl(u64::MAX), None);
+
+        // The 32-bit case, which failed differently and worse: this shift needs
+        // 2^32 limbs, and `as usize` on a 32-bit target truncates that to 0 —
+        // a small buffer and a silently *wrong* answer rather than a crash.
+        // Sizing in u128 refuses it on every target.
+        assert_eq!(one.checked_shl(1 << 38), None);
+
+        // pow is bounded by `bit_length · exp` the same way.
+        assert_eq!(BigNat::from_u64(u64::MAX).checked_pow(u32::MAX), None);
+        assert_eq!(wide.checked_pow(1 << 27), None);
+
+        // Operations that cannot grow stay total, so the bound costs no
+        // reachable arithmetic: 0 << n, 1^n, and x^0 all still answer.
+        assert_eq!(BigNat::zero().checked_shl(u64::MAX), Some(BigNat::zero()));
+        assert_eq!(one.checked_pow(u32::MAX), Some(one.clone()));
+        assert_eq!(wide.checked_pow(0), Some(one.clone()));
+    }
+
+    /// Below the cap the checked spelling is the infallible one — refusal is the
+    /// only behavior that was added, not a change of results.
+    #[test]
+    fn checked_growth_agrees_with_the_infallible_spelling_below_the_cap() {
+        let values = [
+            BigNat::zero(),
+            BigNat::from_u64(1),
+            BigNat::from_u64(u64::MAX),
+            BigNat::from_limbs_le(vec![u64::MAX, 0, 1]),
+        ];
+        for value in &values {
+            for bits in [0u64, 1, 63, 64, 65, 127, 128, 1000] {
+                assert_eq!(
+                    value.checked_shl(bits),
+                    Some(value.shl(bits)),
+                    "checked_shl disagrees at {bits} bits"
+                );
+            }
+            for exp in [0u32, 1, 2, 5, 17] {
+                assert_eq!(
+                    value.checked_pow(exp),
+                    Some(value.pow(exp)),
+                    "checked_pow disagrees at exponent {exp}"
+                );
+            }
+        }
+    }
+
+    /// The infallible spelling is for callers that have already charged the
+    /// result size, as `fln-kernel` does before reducing `Nat.shiftLeft`.
+    /// Breaking that contract is an invariant failure with an attributable
+    /// message, never an allocator abort that takes the process down anonymously.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_LIMBS")]
+    fn shl_past_the_cap_is_an_attributable_invariant_failure() {
+        let _ = BigNat::from_u64(1).shl(u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_LIMBS")]
+    fn pow_past_the_cap_is_an_attributable_invariant_failure() {
+        let _ = BigNat::from_u64(u64::MAX).pow(u32::MAX);
     }
 }

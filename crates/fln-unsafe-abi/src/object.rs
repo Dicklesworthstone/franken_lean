@@ -18,9 +18,9 @@ use crate::layout::{
     LeanThunkObject,
 };
 use crate::membrane;
-use crate::rc::init_st_header;
+use crate::rc::{self, init_mt_header, init_st_header};
 use core::ffi::c_void;
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
 // ---------------------------------------------------------------- ctor
@@ -40,6 +40,10 @@ pub(crate) unsafe fn alloc_ctor(tag: u8, num_objs: usize, scalar_sz: usize) -> *
     // SAFETY: sz is bounded by the contract maxima (< 8 + 256*8 + 1024), well
     // inside the small-object range; header initialized before return.
     let o = unsafe { membrane::alloc_ctor_memory(sz) };
+    // SAFETY: this is the "header initialized before return" the note above
+    // promises. `alloc_ctor_memory` diverges through `handle_alloc_error` on
+    // exhaustion rather than returning null, so `o` is a live, exclusively
+    // owned block of at least `sz` bytes and the header write is in bounds.
     unsafe { init_st_header(o, tag, num_objs as u8) };
     membrane::note_alloc(o, membrane::align_obj_size(sz), tag);
     o
@@ -181,6 +185,10 @@ pub(crate) unsafe fn alloc_array(size: usize, capacity: usize) -> *mut LeanObjec
     // SAFETY: overflow-checked size; header + salient fields initialized
     // before return.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "header + salient fields initialized before return" the note
+    // above defers to. `alloc_big` diverges through `handle_alloc_error` on
+    // exhaustion rather than returning null, so `o` is a live, exclusively
+    // owned block of `bytes`, and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_ARRAY, 0);
         let a = o.cast::<LeanArrayObject>();
@@ -263,6 +271,10 @@ pub(crate) unsafe fn alloc_sarray(elem_size: u8, size: usize, capacity: usize) -
         .expect("sarray size overflow");
     // SAFETY: overflow-checked; header + salient fields initialized here.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "header + salient fields initialized here" the note above
+    // defers to. `alloc_big` diverges through `handle_alloc_error` rather than
+    // returning null, so `o` is a live, exclusively owned block of `bytes`,
+    // and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_SCALAR_ARRAY, elem_size);
         let a = o.cast::<LeanSarrayObject>();
@@ -310,6 +322,10 @@ pub(crate) unsafe fn mk_string_unchecked(bytes: &[u8], len: usize) -> *mut LeanO
         .expect("string size overflow");
     // SAFETY: overflow-checked; all salient bytes (data + NUL) written below.
     let o = unsafe { membrane::alloc_big(total) };
+    // SAFETY: the "all salient bytes (data + NUL) written below" the note above
+    // defers to. `alloc_big` diverges through `handle_alloc_error` rather than
+    // returning null, so `o` is a live, exclusively owned block of `total`
+    // bytes, and every write below lies inside it.
     unsafe {
         init_st_header(o, TAG_STRING, 0);
         let s = o.cast::<LeanStringObject>();
@@ -322,6 +338,108 @@ pub(crate) unsafe fn mk_string_unchecked(bytes: &[u8], len: usize) -> *mut LeanO
     }
     membrane::note_alloc(o, total, TAG_STRING);
     o
+}
+
+/// `alloc_string` with an explicit capacity (`object.cpp` at the pin): the
+/// data area beyond the fields is salient only up to what the caller writes;
+/// header/size/capacity/length are set here.
+///
+/// # Safety
+/// Caller owns the result and must write `size` data bytes (including the
+/// terminating NUL) before the object is read as a string.
+// UNSAFE-LEDGER: FLN-UL-0182
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_string_cap(size: usize, capacity: usize, len: usize) -> *mut LeanObject {
+    let total = size_of::<LeanStringObject>()
+        .checked_add(capacity)
+        .expect("string capacity overflow");
+    // SAFETY: overflow-checked; fields written below; data bytes are the
+    // caller's declared obligation per the doc contract.
+    let o = unsafe { membrane::alloc_big(total) };
+    // SAFETY: `alloc_big` diverges rather than returning null, so `o` is a
+    // live exclusively owned block of `total` bytes; every field write below
+    // lies inside it.
+    unsafe {
+        init_st_header(o, TAG_STRING, 0);
+        let s = o.cast::<LeanStringObject>();
+        (&raw mut (*s).m_size).write(size);
+        (&raw mut (*s).m_capacity).write(capacity);
+        (&raw mut (*s).m_length).write(len);
+    }
+    membrane::note_alloc(o, total, TAG_STRING);
+    o
+}
+
+/// `lean_string_append`'s object-model core (`object.cpp:2084-2105`), ported
+/// arm-for-arm. `exclusive` is the caller's `lean_is_exclusive(s1)` verdict:
+/// the SHARED arm allocates fresh at `mk_capacity(new_sz) == 2 * new_sz` and
+/// `dec_ref`s `s1`; the EXCLUSIVE arm reuses `s1` in place when capacity
+/// suffices and otherwise reallocates at `cap + sz1 + (sz2 - 1)` with a raw
+/// dealloc of the old block (`string_ensure_capacity`, `object.cpp:1966`).
+/// `s2` is borrowed and never consumed, exactly as the `b_lean_obj_arg`
+/// signature states.
+///
+/// # Safety
+/// `s1` and `s2` live string objects; `s1` owned by the caller (consumed in
+/// every arm), `s2` borrowed; `exclusive` truthful for `s1`.
+// UNSAFE-LEDGER: FLN-UL-0183
+#[allow(unsafe_code)]
+pub(crate) unsafe fn string_append_core(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+    exclusive: bool,
+) -> *mut LeanObject {
+    // SAFETY: live strings per the contract; every read/write below is within
+    // the objects' declared salient bytes, and each arm settles s1's
+    // ownership exactly as annotated.
+    unsafe {
+        let a = s1.cast::<LeanStringObject>();
+        let b = s2.cast::<LeanStringObject>();
+        let sz1 = (&raw const (*a).m_size).read();
+        let sz2 = (&raw const (*b).m_size).read();
+        let len1 = (&raw const (*a).m_length).read();
+        let len2 = (&raw const (*b).m_length).read();
+        let new_len = len1.checked_add(len2).expect("string length overflow");
+        let new_sz = sz1
+            .checked_add(sz2)
+            .and_then(|s| s.checked_sub(1))
+            .expect("string size overflow");
+        let r = if !exclusive {
+            let cap = new_sz.checked_mul(2).expect("capacity overflow");
+            let r = alloc_string_cap(new_sz, cap, new_len);
+            let dst = (&raw mut (*r.cast::<LeanStringObject>()).m_data).cast::<u8>();
+            let src = (&raw const (*a).m_data).cast::<u8>();
+            core::ptr::copy_nonoverlapping(src, dst, sz1 - 1);
+            crate::rc::dec_ref(s1);
+            r
+        } else {
+            let cap = (&raw const (*a).m_capacity).read();
+            let extra = sz2 - 1;
+            if sz1 + extra > cap {
+                let grown_cap = cap
+                    .checked_add(sz1)
+                    .and_then(|c| c.checked_add(extra))
+                    .expect("capacity overflow");
+                let r = alloc_string_cap(sz1, grown_cap, len1);
+                let dst = (&raw mut (*r.cast::<LeanStringObject>()).m_data).cast::<u8>();
+                let src = (&raw const (*a).m_data).cast::<u8>();
+                core::ptr::copy_nonoverlapping(src, dst, sz1);
+                let old_bytes = size_of::<LeanStringObject>() + cap;
+                membrane::release_with_size(s1, old_bytes, "object.string_append.grow");
+                r
+            } else {
+                s1
+            }
+        };
+        let rs = r.cast::<LeanStringObject>();
+        let dst = (&raw mut (*rs).m_data).cast::<u8>();
+        let src2 = (&raw const (*b).m_data).cast::<u8>();
+        core::ptr::copy_nonoverlapping(src2, dst.add(sz1 - 1), sz2 - 1);
+        (&raw mut (*rs).m_size).write(new_sz);
+        (&raw mut (*rs).m_length).write(new_len);
+        dst.add(new_sz - 1).write(0);
+        r
+    }
 }
 
 /// String salient fields `(m_size, m_capacity, m_length)` plus a copy of the
@@ -363,6 +481,10 @@ pub(crate) unsafe fn alloc_closure(
         size_of::<LeanClosureObject>() + size_of::<*mut LeanObject>() * usize::from(num_fixed);
     // SAFETY: bounded by CLOSURE_MAX_ARGS * 8 + fixed part; fields set below.
     let o = unsafe { membrane::alloc_big(bytes) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_big`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `bytes`, and every write below lies
+    // inside it.
     unsafe {
         init_st_header(o, TAG_CLOSURE, 0);
         let c = o.cast::<LeanClosureObject>();
@@ -424,6 +546,10 @@ pub(crate) unsafe fn alloc_ref(value: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanRefObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_REF, 0);
         (&raw mut (*o.cast::<LeanRefObject>()).m_value).write(value);
@@ -443,6 +569,135 @@ pub(crate) unsafe fn ref_value(o: *mut LeanObject) -> *mut LeanObject {
     unsafe { (&raw const (*o.cast::<LeanRefObject>()).m_value).read() }
 }
 
+/// Owned `lean_st_ref_get` result. The MT/persistent arm temporarily claims
+/// the cell's RC token before retaining it, exactly as the pinned runtime.
+///
+/// # Safety
+/// `o` live ref object whose cell is non-null.
+// UNSAFE-LEDGER: FLN-UL-0193
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_get_owned(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref per caller contract. A non-positive header count selects
+    // the atomic cell protocol; a positive count carries ST exclusivity.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let value = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if value.is_null() {
+                    continue;
+                }
+                if !crate::tagged::is_scalar(value) {
+                    rc::inc_ref_n(value, 1);
+                }
+                let displaced = slot.swap(value, Ordering::SeqCst);
+                if !displaced.is_null() && !crate::tagged::is_scalar(displaced) {
+                    rc::dec_ref(displaced);
+                }
+                return value;
+            }
+        }
+
+        let value = (&raw const (*o.cast::<LeanRefObject>()).m_value).read();
+        assert!(!value.is_null(), "null reference read");
+        if !crate::tagged::is_scalar(value) {
+            rc::inc_ref_n(value, 1);
+        }
+        value
+    }
+}
+
+/// `lean_st_ref_take`: transfer the cell's owned value to the caller and
+/// leave the slot null until a later set. The MT/persistent arm retries a
+/// transient null exactly as the pinned runtime.
+///
+/// # Safety
+/// `o` live ref object whose cell is non-null.
+// UNSAFE-LEDGER: FLN-UL-0199
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_take(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref per caller contract. A shared ref uses the pinned
+    // atomic exchange loop; an ST-exclusive ref transfers its slot directly.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let value = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if !value.is_null() {
+                    return value;
+                }
+            }
+        }
+
+        let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+        let value = slot.read();
+        assert!(!value.is_null(), "null reference take");
+        slot.write(core::ptr::null_mut());
+        value
+    }
+}
+
+/// `lean_st_ref_set`: consume `value`, replace the cell, release any old
+/// occupant, and preserve the Reference's MT reachability invariant.
+///
+/// # Safety
+/// `o` live ref object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0194
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_set(o: *mut LeanObject, value: *mut LeanObject) {
+    // SAFETY: live ref and owned value per caller contract. A shared ref uses
+    // the atomic slot and requires every reachable heap object to be MT.
+    unsafe {
+        let old = if rc::read_header(o).rc <= 0 {
+            if !crate::tagged::is_scalar(value) {
+                rc::mark_mt(value);
+            }
+            AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value)
+                .swap(value, Ordering::SeqCst)
+        } else {
+            let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+            let old = slot.read();
+            slot.write(value);
+            old
+        };
+        if !old.is_null() && !crate::tagged::is_scalar(old) {
+            rc::dec_ref(old);
+        }
+    }
+}
+
+/// `lean_st_ref_swap`: consume `value` and return the previous owned cell
+/// value. The transient-null retry matches the pinned MT protocol.
+///
+/// # Safety
+/// `o` live ref object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0195
+#[allow(unsafe_code)]
+pub(crate) unsafe fn ref_swap(o: *mut LeanObject, value: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live ref and owned value per caller contract. Shared cells use
+    // the same exchange loop as runtime/io.cpp.
+    unsafe {
+        if rc::read_header(o).rc <= 0 {
+            if !crate::tagged::is_scalar(value) {
+                rc::mark_mt(value);
+            }
+            let slot = AtomicPtr::from_ptr(&raw mut (*o.cast::<LeanRefObject>()).m_value);
+            loop {
+                let old = slot.swap(value, Ordering::SeqCst);
+                if !old.is_null() {
+                    return old;
+                }
+            }
+        }
+
+        let slot = &raw mut (*o.cast::<LeanRefObject>()).m_value;
+        let old = slot.read();
+        assert!(!old.is_null(), "null reference read");
+        slot.write(value);
+        old
+    }
+}
+
 /// Evaluated-thunk constructor (`lean_thunk_pure` shape, `lean.h` thunk
 /// family): `m_value = v`, `m_closure = NULL`. Both fields legally nullable
 /// (G0-1 item 10); forcing unevaluated thunks needs the apply machinery
@@ -456,6 +711,10 @@ pub(crate) unsafe fn alloc_thunk_value(v: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanThunkObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_THUNK, 0);
         let t = o.cast::<LeanThunkObject>();
@@ -466,9 +725,33 @@ pub(crate) unsafe fn alloc_thunk_value(v: *mut LeanObject) -> *mut LeanObject {
     o
 }
 
+/// Delayed-thunk constructor (`lean_mk_thunk`): `m_value = NULL` and
+/// `m_closure = closure`.
+///
+/// # Safety
+/// Caller owns the result; `closure` reference is consumed.
+// UNSAFE-LEDGER: FLN-UL-0196
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_thunk_closure(closure: *mut LeanObject) -> *mut LeanObject {
+    let sz = size_of::<LeanThunkObject>();
+    // SAFETY: fixed small size; every field is initialized before publication.
+    let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: fresh exclusively owned block of at least sz bytes.
+    unsafe {
+        init_st_header(o, TAG_THUNK, 0);
+        let thunk = o.cast::<LeanThunkObject>();
+        (&raw mut (*thunk).m_value).write(AtomicPtr::new(core::ptr::null_mut()));
+        (&raw mut (*thunk).m_closure).write(AtomicPtr::new(closure));
+    }
+    membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_THUNK);
+    o
+}
+
 /// Finished-task constructor (`Task.pure` state machine entry,
-/// `lean.h:250-295`): `m_value = v`, `m_imp = NULL`. Live scheduled tasks
-/// arrive with the asupersync effects bead (fln-3gv).
+/// `lean.h:250-295`): `m_value = v`, `m_imp = NULL`. Carries the exported
+/// `lean_task_pure` and every managerless-eager `task_map_core` result
+/// (fln-3gv slice 2); scheduled tasks are `alloc_task_scheduled` below
+/// (fln-3gv slice 3).
 ///
 /// # Safety
 /// Caller owns the result; `v` reference is consumed.
@@ -478,6 +761,10 @@ pub(crate) unsafe fn alloc_task_pure(v: *mut LeanObject) -> *mut LeanObject {
     let sz = size_of::<LeanTaskObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it.
     unsafe {
         init_st_header(o, TAG_TASK, 0);
         let t = o.cast::<LeanTaskObject>();
@@ -486,6 +773,81 @@ pub(crate) unsafe fn alloc_task_pure(v: *mut LeanObject) -> *mut LeanObject {
     }
     membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_TASK);
     o
+}
+
+/// Scheduled-task constructor (`alloc_task(c, prio, keep_alive)`,
+/// `object.cpp:1132-1146` + `lean_set_task_header`): the closure is marked
+/// multi-threaded FIRST, the header is born MT (`m_rc = -1`), and
+/// `keep_alive` mints the self-referencing token. The imp block lives on the
+/// Rust heap (`Box`) — a disclosed mechanism deviation (task_manager.rs
+/// module doc): it never crosses the membrane as an object. `m_cs_sz` keeps
+/// the membrane's size prefix (deviation from the pin's zeroing, unread by
+/// conforming code).
+///
+/// # Safety
+/// Caller owns the result token(s); `closure` reference is consumed.
+// UNSAFE-LEDGER: FLN-UL-0241
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_task_scheduled(
+    closure: *mut LeanObject,
+    prio: u32,
+    keep_alive: bool,
+) -> *mut LeanObject {
+    // SAFETY: fresh exclusive block; every field initialized before any
+    // publication; mark_mt precedes reachability from the task exactly as
+    // the pin's alloc_task does.
+    unsafe {
+        if !closure.is_null() && !crate::tagged::is_scalar(closure) {
+            rc::mark_mt(closure);
+        }
+        let sz = size_of::<LeanTaskObject>();
+        let o = membrane::alloc_small(sz);
+        init_mt_header(o, TAG_TASK, 0);
+        let t = o.cast::<LeanTaskObject>();
+        (&raw mut (*t).m_value).write(AtomicPtr::new(core::ptr::null_mut()));
+        let imp = Box::into_raw(Box::new(crate::layout::LeanTaskImp {
+            m_closure: closure,
+            m_head_dep: core::ptr::null_mut(),
+            m_next_dep: core::ptr::null_mut(),
+            m_prio: prio,
+            m_canceled: 0,
+            m_keep_alive: u8::from(keep_alive),
+            m_deleted: 0,
+        }));
+        (&raw mut (*t).m_imp).write(imp);
+        membrane::note_alloc(o, membrane::align_obj_size(sz), TAG_TASK);
+        if keep_alive {
+            rc::inc_ref_n(o, 1);
+        }
+        o
+    }
+}
+
+/// Promise constructor (`lean_promise_new`'s allocation half,
+/// `object.cpp:1280-1291`): an ST promise object owning one Promised task
+/// (MT header, `m_value = NULL`, imp with a null closure — state 1).
+///
+/// # Safety
+/// Caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0242
+#[allow(unsafe_code)]
+pub(crate) unsafe fn alloc_promise() -> *mut LeanObject {
+    // SAFETY: two fresh exclusive blocks, fields initialized before
+    // publication; the promise takes ownership of the task's one token.
+    unsafe {
+        let task = alloc_task_scheduled(core::ptr::null_mut(), 0, false);
+        let sz = size_of::<crate::layout::LeanPromiseObject>();
+        let o = membrane::alloc_small(sz);
+        init_st_header(o, crate::contract::TAG_PROMISE, 0);
+        let p = o.cast::<crate::layout::LeanPromiseObject>();
+        (&raw mut (*p).m_result).write(task.cast::<crate::layout::LeanTaskObject>());
+        membrane::note_alloc(
+            o,
+            membrane::align_obj_size(sz),
+            crate::contract::TAG_PROMISE,
+        );
+        o
+    }
 }
 
 /// Task salient fields `(m_value, m_imp)`.
@@ -525,6 +887,49 @@ pub(crate) unsafe fn thunk_fields(o: *mut LeanObject) -> (*mut LeanObject, *mut 
     }
 }
 
+/// Claim an unevaluated thunk's owned closure exactly once.
+///
+/// # Safety
+/// `o` live thunk object.
+// UNSAFE-LEDGER: FLN-UL-0197
+#[allow(unsafe_code)]
+pub(crate) unsafe fn thunk_take_closure(o: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live thunk per caller contract; AcqRel transfers the stored
+    // closure's ownership token to the successful claimant.
+    unsafe {
+        (*o.cast::<LeanThunkObject>())
+            .m_closure
+            .swap(core::ptr::null_mut(), Ordering::AcqRel)
+    }
+}
+
+/// Complete a claimed thunk by installing one owned value if its value slot is
+/// still empty. Returns false without consuming `value` if another value won.
+///
+/// # Safety
+/// `o` live thunk object; `value` is one owned ABI reference.
+// UNSAFE-LEDGER: FLN-UL-0198
+#[allow(unsafe_code)]
+pub(crate) unsafe fn thunk_try_set_value(o: *mut LeanObject, value: *mut LeanObject) -> bool {
+    // SAFETY: live thunk per caller contract. A non-null closure means no
+    // claimant owns the computation yet, so completion must refuse.
+    unsafe {
+        let thunk = o.cast::<LeanThunkObject>();
+        if !(*thunk).m_closure.load(Ordering::Acquire).is_null() {
+            return false;
+        }
+        (*thunk)
+            .m_value
+            .compare_exchange(
+                core::ptr::null_mut(),
+                value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 // ---------------------------------------------------------------- external
 
 /// `lean_register_external_class` (`lean.h:315`): classes are immortal
@@ -554,6 +959,11 @@ pub(crate) unsafe fn alloc_external(
     let sz = size_of::<LeanExternalObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it. `class` and `data` are stored verbatim; their validity is
+    // the caller's obligation, recorded in this function's `# Safety` clause.
     unsafe {
         init_st_header(o, TAG_EXTERNAL, 0);
         let e = o.cast::<LeanExternalObject>();
@@ -593,11 +1003,16 @@ fn limb_layout(count: usize) -> Layout {
 /// fln-bignum shim; this slice owns allocation, view, and teardown.
 ///
 /// # Safety
-/// Caller owns the result. `limbs` must be normalized (no leading zero limb)
-/// for value-semantics comparisons to match upstream.
+/// Caller owns the result. Redundant high zero limbs are trimmed before
+/// allocation, and a zero magnitude cannot retain a negative sign.
 // UNSAFE-LEDGER: FLN-UL-0032
 #[allow(unsafe_code)]
 pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject {
+    let live = limbs
+        .iter()
+        .rposition(|limb| *limb != 0)
+        .map_or(0, |index| index + 1);
+    let limbs = &limbs[..live];
     let n = limbs.len();
     assert!(i32::try_from(n).is_ok(), "mpz limb count exceeds i32");
     let buf = if n == 0 {
@@ -608,12 +1023,21 @@ pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject
         if p.is_null() {
             handle_alloc_error(limb_layout(n));
         }
+        // SAFETY: the "buffer fully initialized by the copy" the note above
+        // promises. `p` is non-null (null aborts two lines up) and was laid out
+        // for exactly `n` u64s, `limbs` holds `n` initialized u64s, and a fresh
+        // allocation cannot overlap the caller's slice.
         unsafe { core::ptr::copy_nonoverlapping(limbs.as_ptr(), p, n) };
         p
     };
     let sz = size_of::<LeanMpzObject>();
     // SAFETY: fixed small size; fields set below.
     let o = unsafe { membrane::alloc_small(sz) };
+    // SAFETY: the "fields set below" the note above defers to. `alloc_small`
+    // diverges through `handle_alloc_error` rather than returning null, so `o`
+    // is a live, exclusively owned block of `sz` bytes, and every write below
+    // lies inside it. `buf` is either null (n == 0) or the limb buffer this
+    // function allocated and fully initialized above; the object owns it now.
     unsafe {
         init_st_header(o, TAG_MPZ, 0);
         let m = o.cast::<LeanMpzObject>();
@@ -625,26 +1049,27 @@ pub(crate) unsafe fn alloc_mpz(limbs: &[u64], negative: bool) -> *mut LeanObject
     o
 }
 
-/// Mpz salient view `(m_alloc, m_size, limb copy)`.
+/// Raw mpz salient fields `(m_alloc, m_size, limb pointer, live count)`.
+///
+/// This function deliberately does not turn the pointer into either an owned
+/// allocation or a reference with an unconstrained lifetime. The safe
+/// [`crate::handle::Obj`] observer binds the immutable slice to `&self`; the C
+/// export bridge binds it to a non-escaping callback invocation.
 ///
 /// # Safety
 /// `o` live mpz object.
 // UNSAFE-LEDGER: FLN-UL-0033
 #[allow(unsafe_code)]
-pub(crate) unsafe fn mpz_fields(o: *mut LeanObject) -> (i32, i32, Vec<u64>) {
-    // SAFETY: live mpz; |m_size| limbs are salient per the G0-1 law.
+pub(crate) unsafe fn mpz_fields(o: *mut LeanObject) -> (i32, i32, *const u64, usize) {
+    // SAFETY: live mpz; these are fixed-size field reads. The pointer is not
+    // dereferenced here.
     unsafe {
         let m = o.cast::<LeanMpzObject>();
         let alloc_ct = (&raw const (*m).m_alloc).read();
         let size = (&raw const (*m).m_size).read();
         let p = (&raw const (*m).m_limbs).read();
         let live = usize::try_from(size.unsigned_abs()).expect("mpz size");
-        let copy = if p.is_null() {
-            Vec::new()
-        } else {
-            core::slice::from_raw_parts(p, live).to_vec()
-        };
-        (alloc_ct, size, copy)
+        (alloc_ct, size, p.cast_const(), live)
     }
 }
 

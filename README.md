@@ -14,10 +14,6 @@
 
 </div>
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_lean/main/scripts/install.sh | bash
-```
-
 > **A note on tense (read this first).** This README is written in the **present tense, as if the entire design in [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`](./COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md) is fully realized**: the 1.0 target state where every performance gate is green and every subsystem is live. This is a deliberate choice. It lets the document describe the *finished* system so it gets **trued-up in place as milestones land** (§22's gates G0→G6) rather than rewritten from scratch later. Where the plan itself stages something as genuinely future work or a frontier lane, the README says so plainly. Everything else below is the spec of the system this repository builds.
 
 ---
@@ -35,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_lean/main
 | Compatibility | Drop-in at six binary surfaces: source language, `.olean` (read *and* byte-compatible write), the `lean_object` C ABI (`lean.h` twin — existing native plugins load), `.ilean`/artifact chain, the `Lean.*` Meta API, and LSP + `$/lean/*` (vscode-lean4 connects unmodified). |
 | Kernel | ≤ 12 KLOC `forbid(unsafe)` dual-engine checker (certified small-step + NbE accelerator, cross-checked), plus an independent in-repo checker and foreign witnesses. Disagreement halts; it never outvotes. |
 | Receipts | Every checked declaration can emit a compressed proof certificate; attested checks append to a transparency log; `fln check-olean` re-checks all of mathlib in minutes on a kernel sharing no code with the thing it checks. |
-| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit. `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
+| Determinism | Same input closure ⇒ same environment, same diagnostics, same artifacts, at any thread count — an invariant, tested at {1, 8, 32} threads on every commit **over the Prelude**; the corpus-scale comparison is a separate on-demand lane run at the pin (corpus matrix observations recorded: 1, latest observed 2026-07-26), so corpus schedule-independence is one observation rather than a measured invariant (beads `fln-8zsq`, `fln-corpus-thread-matrix-93te`). `--reproducible` yields bit-identical artifacts across the certified platform matrix. |
 | Incrementality | The environment is a Merkle DAG of content-addressed declarations. A leaf edit re-elaborates its *true dependency cone* (seconds), not its file cone (hours). Whitespace, comments, and reordering invalidate nothing. |
 | Server | One daemon, one shared immutable import heap. The ≈60 s × N workers × GBs × N multiplication becomes once-per-daemon; warm attach ≤ 2 s; thousands of O(1) proof-state forks per daemon. |
 | Metaprogramming | The entire tactic ecosystem (mathlib, aesop, downstream) runs unmodified on Golem, our register VM whose values *are* ABI objects — one calling convention across interpreted code, JIT'd code, Reference-built plugins, and native builtins. |
@@ -128,7 +124,7 @@ These are the constitutional, non-negotiable constraints the whole system is bui
       └──────────────┬─────────────────┘  └──────────────┬───────────────────┘
                      ▼                                    ▼
       ┌────────────────── the elaboration pipeline ─────────────────────────┐
-      │  QUILL: parser & macros  →  ATHANOR: elaborator (Synod instances)   │
+      │  VELLUM: parser & macros →  ATHANOR: elaborator (Synod instances)   │
       │                │                    │            ▲                  │
       │                │                    ▼            │ tactics          │
       │                │            GOLEM: user-metaprogram    ⇄  ANVIL:    │
@@ -150,7 +146,7 @@ These are the constitutional, non-negotiable constraints the whole system is bui
 - **Marrow** (`fln-rt`, `fln-unsafe-abi`): the runtime and ABI twin. The Reference's object model — headers, tags, scalar packing, tagged-pointer `Nat`s, tri-state reference counting, compacted regions — implemented exactly, with layout constants *mechanically extracted* from the pinned `lean.h` into generated contract tables. Reference-built native plugins `dlopen` into FrankenLean and vice versa; the strongest standing rig compiles upstream's own stage0-generated C against Marrow's exports and runs the upstream runtime suite through the membrane.
 - **Grimoire** (`fln-env`, `fln-olean`): the environment (persistent maps with O(1) snapshots — the primitive under speculative parallelism, per-request server views, and agent search trees) and the module codec: byte-compatible `.olean` read *and write*, `.ilean`, plus **olean-next**, a content-addressed, mergeable, diffable frontier format with inline certificates.
 - **Crucible** (`fln-kernel`, `fln-bignum`): the trusted kernel. Engine K1 is the certified evaluator a skeptical logician reads in an afternoon; K2 is the NbE accelerator that makes `decide` and mathlib's defeq-heavy corners fast; both implement the same judgment inventory (written down first as `KERNEL_CONTRACT.md`, rule-anchored to Reference source lines), continuously cross-checked, joined by `fln-checker` — a deliberately *different* second implementation on its own decoder — under a consensus policy where disagreement halts. Owned bignum replaces GMP; typed resource budgets make exhaustion a value (`Inconclusive`), never a hang and never a rejection.
-- **Quill** (`fln-parse`, `fln-syntax`): the extensible Pratt parser and hygiene-exact macro engine, preserving the parse/elaborate interleaving (commands install syntax used three lines later), byte-exact positions, and macro-scope observables — with lossless trees, grammar epochs for precise incremental reparse, and error recovery that never changes acceptance.
+- **Vellum** (`fln-parse`, `fln-syntax`): the extensible Pratt parser and hygiene-exact macro engine, preserving the parse/elaborate interleaving (commands install syntax used three lines later), byte-exact positions, and macro-scope observables — with lossless trees, grammar epochs for precise incremental reparse, and error recovery that never changes acceptance.
 - **Athanor** (`fln-elab`, with **Synod**, the instance engine): the elaborator — the monadic tower's semantics, the unifier's exact approximation ladder (implemented against golden decision traces mined from an instrumented oracle at Corpus scale), match compilation, the native tactic framework, and the deterministic dataflow scheduler: speculative parallel elaboration with canonical-order commit, so the result is the sequential result, bit-for-bit, at any thread count.
 - **Golem** (`fln-comp`, `fln-vm`, `fln-unsafe-jit`): the metaprogram compiler and VM. Elaborated terms → FIR (LCNF-class IR with borrow inference and constructor reuse) → FLBC, a register bytecode whose values *are* Marrow ABI objects — so interpreted code, Iron-JIT'd code, Reference-built plugins, and native builtins share one calling convention with zero conversion. `lakefile.lean`, `#eval`, and every user tactic run here.
 - **Anvil** (`fln-anvil`) & **Verdict** (`fln-verdict`): simp with compiled per-library rewrite indexes, an e-graph lane with kernel-checked extraction, `norm_num`/`omega` cores, native `grind` machinery, and an owned CDCL SAT solver with owned proof logging and an owned checker behind `bv_decide`. Every engine is untrusted; every output enters the environment through a kernel-checked artifact.
@@ -216,11 +212,7 @@ fln identity --json                # implementation commit, epoch, profile, TCB 
 
 ## Installation
 
-**1. Install script (recommended).** Detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_lean/main/scripts/install.sh | bash
-```
+**1. Install script — *not yet available*.** The planned script detects your platform, fetches the signed release binaries (`lean`, `leanc`, `lake`, `fln`), and installs an elan-compatible toolchain. It is deliberately not shown as a runnable command here: `scripts/install.sh` does not exist yet, and there are no release binaries for it to install. This section becomes a command again when distribution ships one (bead `franken_lean-readme-install-oneliner-wao6`).
 
 Because the release layout is elan-compatible, a project's `lean-toolchain` file can simply name a FrankenLean toolchain and everything downstream — `lake`, the editor extension, CI — just works.
 
@@ -287,7 +279,7 @@ Numbers below are the provisional CI **gates** (§19 of the plan) — the target
 | PG-2 · Cold Corpus | Full mathlib elaboration wall-clock ≤ 0.5× Reference at G4, ≤ 0.35× at G6 |
 | PG-3 · The Cone | Leaf-edit incremental rebuild = true-cone only; representative leaf edits p50 ≤ 15 s, p95 ≤ 90 s from a warm Ledger |
 | PG-4 · Attach | Daemon warm attach of a mathlib file ≤ 2 s p50; cold first-attach ≤ 1.2× Reference worker import |
-| PG-5 · Determinism | Bit-identical environments/diagnostics/artifacts across {1, 8, 32} threads per commit; {96}+ weekly; certified matrix under `--reproducible` |
+| PG-5 · Determinism | Bit-identical environments/diagnostics/artifacts across {1, 8, 32} threads per commit — Prelude-scope per commit today; the corpus-scale lane runs **on demand** and has been run once (`fln-corpus-thread-matrix-93te`), a documented shortfall against the per-commit gate rather than compliance with it. Per-commit corpus coverage is **waived on measured cost** (32.1 min/run; CI installs no Reference toolchain), with the run retained as a per-pin receipt and the waiver expiring — mechanically, not by a date — the moment the Reference pin moves (`franken_lean-p6x1`); {96}+ weekly; certified matrix under `--reproducible` |
 | PG-6 · Memory | Daemon steady RSS serving ≥ 8 open mathlib files ≤ 1.3× one Reference worker; zero leaks over a 4 h soak |
 | PG-7 · Golem | Interpreter ≥ 3× Reference interpreter on the tactic micro-corpus; Iron-JIT ≥ 0.5× Reference-precompiled |
 | PG-8 · Codec | olean read ≥ Reference load throughput; write round-trip bit-stable at 100% of the Corpus set |
@@ -298,7 +290,7 @@ Numbers below are the provisional CI **gates** (§19 of the plan) — the target
 | PG-1b · Consensus tax | Checker sampling ≤ 3% end-to-end overhead; full-closure release checking ≤ 10%; receipts ≤ 1 ms/decl amortized |
 | PG-M · The Mirror | The metaprogram corpus (real ecosystem tactic code) ≤ 1.25× Reference wall at G4, ≤ 0.9× at G6 |
 
-Every gate has a bench binary, a committed baseline, a variance budget, and a flame artifact on regression; regressions gate on tails as well as medians.
+**No gate above has been measured, and the apparatus that would measure one has no instances yet: 0 bench targets, 0 committed baselines and 0 flame artifacts across the workspace.** Every number in the table is therefore `TARGETED`, none is `OBSERVED`, and none has been produced by anything — quoting one as a result would be an overstatement this README cannot support. The rule those measurements will be held to is the plan's (§19.2), and it constrains *bundles* rather than asserting an inventory of them: every benchmark bundle records host facts, isolation checks, cache state, sample counts and raw samples, regressions gate on tails as well as medians, and a flame artifact identifies the bottleneck. `crates/fln-bench` is the substrate those bundles will be built from — host-profile capture, retained invalid attempts, exact regenerable statistics, and publication authority obtainable only from an independent validator — and it is finished and waiting for its first consumer. What is missing is the measurement, not the machinery that would record it (bead `fln-bench-apparatus-empty-referent-bkw6`).
 
 ## Determinism, trust & verification
 
@@ -347,5 +339,5 @@ The `franken_lean` source code is licensed under the **MIT License with an OpenA
 
 ## See also
 
-- [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`](./COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md), the master plan: the eight bets, the Reference anatomy and weakness census, the foundation audit, the dependency & safety doctrine, the four-surface/three-mode product contract, the Native Mirror, every subsystem (Marrow, Grimoire, Crucible, Quill, Athanor/Synod, Golem, Anvil/Verdict, Ledger, Lantern, Palimpsest, Bloodhound, Folio, Envoy, the WASM Judge), the Tribunal, the performance gates, the workstreams and convergence gates, the risk register, and the normative appendices.
+- [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md`](./COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md), the master plan: the eight bets, the Reference anatomy and weakness census, the foundation audit, the dependency & safety doctrine, the four-surface/three-mode product contract, the Native Mirror, every subsystem (Marrow, Grimoire, Crucible, Vellum, Athanor/Synod, Golem, Anvil/Verdict, Ledger, Lantern, Palimpsest, Bloodhound, Folio, Envoy, the WASM Judge), the Tribunal, the performance gates, the workstreams and convergence gates, the risk register, and the normative appendices.
 - [`AGENTS.md`](./AGENTS.md), conventions for human and AI agents working in this codebase, including the engineering doctrine and the testing policy.

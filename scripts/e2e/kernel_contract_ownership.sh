@@ -1479,7 +1479,10 @@ MAX_STREAM_BYTES=262144
 MAX_DIAGNOSTIC_BYTES="$DEFAULT_MAX_DIAGNOSTIC_BYTES"
 
 mkdir -p "$ART_ROOT"
-mkdir "$ART_DIR"
+if ! mkdir "$ART_DIR" 2>/dev/null; then
+  echo "[kernel_contract_ownership] setup failure: evidence directory already claimed: $ART_DIR" >&2
+  exit 2
+fi
 mkdir "$CASES_DIR"
 
 note() {

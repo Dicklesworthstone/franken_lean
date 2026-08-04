@@ -1,0 +1,39 @@
+# schema fln-host-attestations/1
+# format: platform|host|fixture_digest|logical_root
+#
+# WHAT THIS EARNS, AND WHAT IT DOES NOT (bead fln-laxj). Read both halves before citing
+# this file, because the difference is the entire point of the bead that produced it.
+#
+# EARNED — multi-HOST identity on the certified target. Every row below was produced by
+# running domain::tests::emit_host_attestation on a distinct physical machine, and all
+# rows agree on both digests. `fixture_digest` covers the whole of domain_vectors.txt, so
+# it carries all sixteen domain tags and all sixty-four frozen vectors in one field: if any
+# domain's tag or any vector differed on another host, that host's digest would differ.
+# `logical_root` is a LogicalRoot over a fixed closure of eight declarations and one
+# extension delta, built from constants so it depends on nothing but the code.
+#
+# NOT EARNED — cross-PLATFORM identity. Every row has the same `platform`, so nothing here
+# says anything whatsoever about a different architecture, OS, or pointer width. This is
+# not a gap that more runs on these machines can close: SUITE.lock line 26 declares exactly
+# ONE certified target, `x86_64-unknown-linux-gnu`, so the "certified platform matrix" is
+# currently a single platform and cross-platform identity is not merely untested but
+# undefined — there is no second member to be identical to.
+#
+# WHAT WOULD RAISE IT: a second `target` line in SUITE.lock, then a row here from that
+# target that agrees. Until then the ledger carries the cross-platform claim as BLOCKED and
+# the multi-host claim as OBSERVED, and neither may be cited as the other. The guard in
+# domain.rs asserts the platform set here has exactly one member precisely so that the day
+# a second platform DOES agree, the test fails and forces the ledger row to be raised
+# deliberately rather than letting new evidence sit unclaimed.
+#
+# HOW A ROW IS ADDED: run `cargo test -p fln-hash --lib domain::tests::emit_host_attestation
+# -- --nocapture` on the new machine and copy its `fln-host-attestation/1` line. A row can
+# only be produced by actually running there, which is what keeps this from being a
+# single-host test that reads as multi-host evidence. A host that could not be reached is
+# not a host that agreed, and is simply absent.
+#
+# PROVENANCE: hetzner2 and ns3365308 are distinct RCH remote build workers. Distinct
+# physical machines, same target triple, same pinned nightly from SUITE.lock. Re-recorded
+# 2026-07-29 after the shadow authority added four registered domains to the fixture.
+x86_64-linux-unix-64bit-le|hetzner2|d9944947994da9f94581a28e3a32799f3989da006a000e2f9f6ced619a4eeea3|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a
+x86_64-linux-unix-64bit-le|ns3365308|d9944947994da9f94581a28e3a32799f3989da006a000e2f9f6ced619a4eeea3|17a64c7e4c8b7b806883641ee907c36a7156e90598d95e4bf5a1197b66ee559a

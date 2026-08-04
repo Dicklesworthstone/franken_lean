@@ -1,0 +1,8 @@
+# exit=0 paths_normalized=false backtrace_lines_dropped=0
+5
+"frankenlean"
+"4 and 2"
+strings.lean:4:27: warning: `List.asString` has been deprecated: Use `String.ofList` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.asString` to `String.ofList x`).
+"cba"

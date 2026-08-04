@@ -23,10 +23,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attribute;
 pub mod constants;
+pub mod decl_closure;
 pub mod effective_imports;
 pub mod environment;
 pub mod extensions;
+pub mod intern;
 pub mod modules;
 pub mod pmap;
 pub mod provenance;
+pub mod terms;

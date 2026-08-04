@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Fail-closed evidence utilities for FrankenLean's shell quality gates.
 
 This is test/CI apparatus, not a FrankenLean runtime component.  It centralizes the
@@ -26,15 +26,18 @@ import platform
 import re
 import resource
 import select
+import shlex
 import signal
 import stat
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
+import tomllib
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 PASS = 0
@@ -44,19 +47,366 @@ INCONCLUSIVE = 3
 CANCELLED = 4
 
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
+PRODUCER_BINDING_SCHEMA = "fln.producer-binding/1"
+EVIDENCE_MANIFEST_SCHEMA = "fln.evidence-manifest/2"
+LEGACY_EVIDENCE_MANIFEST_SCHEMA = "fln.evidence-manifest/1"
+EVIDENCE_BUNDLE_COMMIT_SCHEMA = "fln.evidence-bundle-commit/2"
+LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA = "fln.evidence-bundle-commit/1"
+VERIFICATION_MANIFEST_SCHEMA = "fln.verification-manifest/2"
+VERIFICATION_MANIFEST_PATH = "ci/VERIFICATION_MANIFEST.jsonl"
+VERIFICATION_EVIDENCE_REGISTRY_SCHEMA = "fln.verification-evidence-registry/1"
+VERIFICATION_EVIDENCE_RECEIPT_SCHEMA = "fln.verification-evidence-receipt/1"
+VERIFICATION_EVIDENCE_REGISTRY_PATH = (
+    "ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl"
+)
+VERIFICATION_RECEIPT_REFERENCE_PREFIX = "receipt:sha256:"
+# None means that the optional registry has not been adopted yet. A missing
+# registry is then a typed, visible absence when no manifest row cites a
+# receipt. If a registry appears before this authority is frozen, validation
+# refuses it rather than trusting a self-described migration boundary.
+VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH: str | None = None
+VERIFICATION_LEGACY_TRACKING_BEAD = (
+    "franken_lean-ephemeral-manifest-artifact-povo"
+)
+VERIFICATION_LEGACY_CLASSIFICATIONS = frozenset(
+    {
+        "absolute_path",
+        "directory",
+        "glob",
+        "ignored",
+        "invalid_bead",
+        "invalid_comment",
+        "missing",
+        "short_commit",
+        "special",
+        "symlink",
+        "traversal_path",
+        "unknown_structured",
+        "unreachable_commit",
+        "untracked",
+    }
+)
+CHECK_HUMAN_SCHEMA = "fln.check-human/1"
+CHECK_HUMAN_LOG = "human.semantic.log"
+CENSUS_AVAILABILITY_SCHEMA = "fln.census-availability/1"
+STRUCTURE_GUARD_SCHEMA = "structure-guard/5"
+CENSUS_AVAILABILITY_STAGE = "contract-handoff-no-mock"
+CENSUS_AVAILABILITY_RECEIPT = f"{CENSUS_AVAILABILITY_STAGE}.availability.json"
+CENSUS_SKIP_LIMITATION_SUFFIX = (
+    "the three named contract-handoff no-mock tests are typed skipped"
+)
+CENSUS_REQUIRED_OUTPUTS = (
+    "contracts/builtin_environment.tsv",
+    "contracts/builtin_environment.001.tsv",
+    "contracts/builtin_environment.002.tsv",
+    "contracts/builtin_partition.tsv",
+)
+CENSUS_PIN_INPUTS = (
+    "contracts/CONTRACT_HANDOFF.txt",
+    "contracts/EXTERN_BUILTIN_ENVIRONMENT.txt",
+    "SUITE.lock",
+)
+CENSUS_NO_MOCK_TESTS = (
+    "contract_handoff::tests::contract_handoff_no_mock_e2e",
+    "real_workspace_is_structurally_clean",
+    "robot_real_workspace_binds_complete_authority_evidence",
+)
+# Frozen with the migration commit. This binds both the complete adopted ID set
+# and which adopted beads were still open at adoption time. Expanding or
+# weakening the grandfathered set therefore requires an explicit validator
+# change, not merely recomputing a self-described manifest hash.
+VERIFICATION_ADOPTION_AUTHORITY_HASH = (
+    "sha256:30b15f035857461b2798c624c2e35f52dba0626af0667c9a2f845c074729cbbc"
+)
+VERIFICATION_CLAIM_TYPES = frozenset(
+    {"invariant", "proof", "bounded_model", "statistical", "slo", "benchmark"}
+)
+VERIFICATION_EVIDENCE_KINDS = frozenset(
+    {
+        "unit",
+        "property",
+        "metamorphic",
+        "fuzz",
+        "mutation",
+        "fault",
+        "mock",
+        "no_mock_e2e",
+        "proof",
+        "benchmark",
+    }
+)
+VERIFICATION_COVERAGE_ARRAY_FIELDS = (
+    "requirement_ids",
+    "claim_ids",
+    "invariant_ids",
+    "parity_rows",
+    "behavior_notes",
+    "gate_ids",
+    "unit",
+    "boundary",
+    "error",
+    "resource",
+    "cancellation",
+    "failure_atomicity",
+    "property",
+    "metamorphic",
+    "fuzz",
+    "mutation",
+    "fault",
+    "scenarios",
+    "negative_recovery",
+    "artifacts",
+)
+VERIFICATION_COVERAGE_REQUIRED_FIELDS = frozenset(
+    {
+        "requirement_ids",
+        "claim_ids",
+        "gate_ids",
+        "unit",
+        "boundary",
+        "error",
+        "resource",
+        "cancellation",
+        "failure_atomicity",
+        "scenarios",
+        "negative_recovery",
+        "artifacts",
+    }
+)
+
+# --- The judgement row must judge the closure it is filed for ----------------
+# (bead fln-judgement-row-not-bound-to-its-closure-iumd)
+#
+# Non-emptiness of the arrays above says a row EXISTS. It does not say the row
+# judges THIS closure: an identical row authored weeks earlier, for different
+# work on the same bead, satisfies every check in the `complete` branch. That is
+# not hypothetical — at b2ee77cd `fln-lyc8` went in_progress -> closed in a
+# commit that did not carry its updated row, and the validator returned
+# valid=true, exit 0, against that exact tree. cod_3 caught it by reading and
+# repaired it by hand in 6ad070b6, adding post-close bead comments and citing
+# them. This law mechanises that repair.
+#
+# THE FORM IS FORCED BY WHAT IS AUTHORABLE IN ONE PASS. A row must be IN the
+# commit that closes its bead, so it cannot cite that commit's own sha — a rule
+# nobody can satisfy is a rule people bypass with --no-verify (franken_lean-e5k7
+# on this very surface). What a closer CAN produce before writing the commit is a
+# bead comment: `br close` stamps `closed_at`, `br comments add` stamps a comment
+# after it, and the row cites that comment's id. The citation form already exists
+# in `artifacts` ("bead-comment:<bead>:<id>") and comments are immutable, so the
+# row points at a record that could not have preceded the closure.
+#
+# WHAT IT EARNS: structural, not behavioural. It proves the row was authored
+# after the close and names an immutable post-close record. It does not read the
+# comment, so it cannot prove the row's prose describes the work.
+#
+# THE BOUNDARY IS DERIVED, NOT HAND-LISTED, and it is pinned from both sides.
+# 107 complete rows predate this law and exactly one of them (`fln-lyc8`, by
+# cod_3's hand repair) satisfies it, so a law binding all of them would be a wall
+# and a hand-list of 106 exemptions would rot silently. Instead each row is
+# judged against its own `closed_at`: closes at or after the instant below are
+# bound, earlier ones are exempt by their own data, and the exempt set can only
+# shrink because `closed_at` is history. The instant IS `fln-lyc8`'s close — the
+# first close the law binds is the one that revealed the gap. Moving it earlier
+# binds `fln-env-merge-resource-envelope-9m74` (closed 2026-07-26T20:28:07Z, no
+# post-close citation) and reddens the real manifest; moving it later exempts the
+# self-test's planted historical case (closed 2026-07-26T21:00:00Z) and that
+# mutant survives, which the mutation matrix reports as a failure. Neither wall
+# is written down; both are measured.
+CLOSURE_BINDING_EFFECTIVE_FROM = "2026-07-26T20:50:06.900870108Z"
+CLOSURE_CITATION_PREFIX = "bead-comment"
+UTC_INSTANT_PATTERN = re.compile(
+    r"\A(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\Z"
+)
+
+# --- Sealed compiler environment (bead fln-evidence-runner-bootstrap-btk) ----
+# Ambient channels that can alter what the pinned compiler does (cap-lints
+# injection, wrapper substitution, alternate-toolchain selection, rustflags in
+# every spelling). Presence of ANY of these when the sealed-cargo lane is
+# requested is a typed setup fault — rejected before any repo-controlled
+# compilation, never silently scrubbed.
+HOSTILE_COMPILER_ENV_EXACT = frozenset(
+    {
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_TARGET",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO",
+    }
+)
+HOSTILE_COMPILER_ENV_PREFIXES = (
+    "CARGO_TARGET_",  # CARGO_TARGET_<TRIPLE>_RUSTFLAGS / _LINKER / _RUNNER …
+    "CARGO_ALIAS_",
+    "CARGO_UNSTABLE_",
+    "CARGO_REGISTRIES_",
+    "CARGO_PROFILE_",
+)
+# Python's isolated mode ignores every interpreter configuration channel in
+# this family. Record the names that were present so isolation never becomes
+# silent environment scrubbing.
+PYTHON_CONFIGURATION_ENV_EXACT = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+    }
+)
+PYTHON_CONFIGURATION_ENV_PREFIXES = ("PYTHON",)
+# Compiler state intentionally replaced by the sealed-cargo lane. Python
+# configuration is not in this set: the interpreter envelope rejects it
+# before target spawn instead of silently sanitizing it.
+SEALED_ENV_OVERRIDDEN = frozenset({"CARGO_HOME", "CARGO_TARGET_DIR"})
+# Ambient variables admitted into the sealed child environment as-is. PATH is
+# REBUILT (pinned toolchain bin first), never inherited.
+SEALED_ENV_ALLOWLIST = frozenset(
+    {"HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "TMPDIR"}
+)
+SEALED_PATH_TAIL = "/usr/local/bin:/usr/bin:/bin"
+SEALED_HOST_TRIPLES = {
+    "x86_64": "x86_64-unknown-linux-gnu",
+    "aarch64": "aarch64-unknown-linux-gnu",
+}
+SEALED_RUSTC_PROBE_TIMEOUT_S = 30
 CHECK_STAGE_ORDER = [
     "evidence-self-test",
+    "verification-manifest",
     "shellcheck",
+    "ubs-gate-classifier",
+    "projection-guard-harness",
     "fmt",
     "check",
     "clippy",
+    CENSUS_AVAILABILITY_STAGE,
     "test",
+    "tribunal-manifest-inventory",
+    "epoch-lab-test",
+    "epoch-lab-live-verify",
     "structure-guard",
     "vendor-tree",
     "ubs",
 ]
 CHECK_SELF_TEST_ORDER = [*CHECK_STAGE_ORDER, "cancel-term"]
+# Registration fixes the validator's accepted identity and exact step order. It is
+# not execution evidence: a scenario earns that only from a committed bundle
+# retained by a reachable dispatcher. `ci_execution_join.rs` binds governed
+# producers under both `scripts/e2e` and `scripts/tribunal` to configured
+# dispatch, and `contract_roots.rs` binds the pin-dependent lanes to the
+# scheduled/on-demand pin-bearing workflow.
 E2E_STEP_ORDERS = {
+    "attribute_state_census": [
+        "regenerate_and_check",
+        "guard_suite",
+        "substrate_registry",
+        "pin_drift_refused",
+        "malformed_row_refused",
+        "budget_refusal",
+        "pristine_recovery",
+    ],
+    "certificate_format_no_mock_e2e": [
+        "bind_external_tools",
+        "compile_witness",
+        "export_positive",
+        "check_positive",
+        "check_failure",
+        "check_recovery",
+        "codec_suites",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "cartridge_no_mock_e2e": [
+        "bind_external_tools",
+        "compile_witness",
+        "export_positive",
+        "check_positive",
+        "build_handoff",
+        "transport_states",
+        "verify_positive",
+        "extract_positive",
+        "extract_failure",
+        "verify_recovery",
+        "extract_recovery",
+        "codec_suites",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "bignum_vectors": [
+        "bignum_lane",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "campaign_frameworks": [
+        "suite_campaign_owner_matrix",
+        "suite_mutation_kill_ledger_model",
+        "suite_fuzz_seed_replay",
+        "suite_fault_boundary_registry",
+        "suite_shrink_signature_preservation",
+        "suite_no_mock_attestation",
+        "suite_productive_thread_matrix",
+        "conservation",
+        "planted_duplicate_row_refused",
+        "pristine_recovery",
+    ],
+    "unsafe_note_clippy": [
+        "clippy_report",
+        "baseline_match",
+        "undeclared_site_mutant",
+        "undeclared_site_recovery",
+        "stale_declaration_mutant",
+        "stale_declaration_recovery",
+    ],
+    "diagnostic_projection_no_mock_e2e": [
+        "diagnostic_projection_contract",
+    ],
+    "contract_handoff": [
+        "cold_regeneration_a",
+        "cold_regeneration_b",
+        "canonical_join",
+        "generated_compile",
+        "markdown_only_mutant",
+        "markdown_only_recovery",
+        "constants_only_mutant",
+        "constants_only_recovery",
+        "policy_omission_mutant",
+        "policy_omission_recovery",
+        "stale_policy_mutant",
+        "stale_policy_recovery",
+        "duplicate_policy_mutant",
+        "duplicate_policy_recovery",
+        "incompatible_schema_mutant",
+        "incompatible_schema_recovery",
+        "mixed_pin_mutant",
+        "mixed_pin_recovery",
+        "mixed_reference_mutant",
+        "mixed_reference_recovery",
+        "host_target_substitution_mutant",
+        "host_target_substitution_recovery",
+        "partial_publication_mutant",
+        "partial_publication_recovery",
+        "cancelled_publication_mutant",
+        "cancelled_publication_recovery",
+        "resource_exhaustion_mutant",
+        "resource_exhaustion_recovery",
+        "suppressed_drift_mutant",
+        "suppressed_drift_recovery",
+        "reference_path_mutant",
+        "reference_path_recovery",
+        "mock_consumer_mutant",
+        "mock_consumer_recovery",
+        "final_handoff",
+    ],
     "closure_audit": [
         "build_guard",
         "freeze_guard",
@@ -88,6 +438,16 @@ E2E_STEP_ORDERS = {
         "seeded_export",
         "copy_export_recovery",
         "export_recovery",
+        "copy_nested_cargo_config",
+        "seeded_nested_cargo_config",
+        "copy_legacy_toolchain",
+        "seeded_legacy_toolchain",
+        "copy_decoy_toolchain",
+        "seeded_decoy_toolchain",
+        "copy_config_recovery",
+        "config_recovery",
+        "crate_dir_invocation",
+        "tool_dir_invocation",
         "resource_exhaustion",
         "resource_recovery",
         "cancellation",
@@ -98,6 +458,74 @@ E2E_STEP_ORDERS = {
         "collision_positive",
         "collision_mutant",
         "collision_recovery",
+    ],
+    "environment_resource_collision": [
+        "resource_positive",
+        "resource_mutant",
+        "resource_recovery",
+    ],
+    "declaration_tag_matrix": [
+        "declaration_tag_matrix",
+    ],
+    "declaration_membership": [
+        "declaration_membership",
+    ],
+    "extension_descriptor_matrix": [
+        "extension_descriptor_matrix",
+    ],
+    "env_snapshots": [
+        "environment_suite",
+        "environment_state",
+        "declaration_admission",
+        "extension_merge_refusals",
+        "set_union",
+        "extension_state_mutant",
+        "extension_state_recovery",
+        "set_union_mutant",
+        "set_union_recovery",
+        "extension_descriptor_stop_as_conflict_mutant",
+        "extension_descriptor_stop_as_conflict_recovery",
+        "declaration_membership_mutant",
+        "declaration_membership_recovery",
+        "declaration_tag_mutant",
+        "declaration_tag_recovery",
+        "extension_descriptor_mutant",
+        "extension_descriptor_recovery",
+        "extension_descriptor_validation_deferred_mutant",
+        "extension_descriptor_validation_deferred_recovery",
+        "extension_policy_order_mutant",
+        "extension_policy_order_recovery",
+        "extension_ancestry_only_length_mutant",
+        "extension_ancestry_only_length_recovery",
+        "declaration_budget_check_omission_mutant",
+        "declaration_budget_check_omission_recovery",
+        "declaration_cancellation_as_resource_mutant",
+        "declaration_cancellation_as_resource_recovery",
+        "declaration_plan_base_binding_omission_mutant",
+        "declaration_plan_base_binding_omission_recovery",
+        "declaration_bytes_unit_hardcoded_mutant",
+        "declaration_bytes_unit_hardcoded_recovery",
+        "checkpoint_base_digest_collision_mutant",
+        "checkpoint_base_digest_collision_recovery",
+        "checkpoint_prefix_digest_collision_mutant",
+        "checkpoint_prefix_digest_collision_recovery",
+        "checkpoint_schema_omission_mutant",
+        "checkpoint_schema_omission_recovery",
+        "checkpoint_cumulative_facts_omission_mutant",
+        "checkpoint_cumulative_facts_omission_recovery",
+        "checkpoint_entry_identity_omission_mutant",
+        "checkpoint_entry_identity_omission_recovery",
+        "declaration_tag_matrix",
+        "declaration_membership",
+        "extension_descriptor_matrix",
+        "environment_collision",
+        "environment_resource_collision",
+    ],
+    "verdict_schema": [
+        "positive",
+        "failure",
+        "recovery",
+        "final_real_recheck",
     ],
     "kernel_replay": [
         "decoder_suite",
@@ -112,8 +540,344 @@ E2E_STEP_ORDERS = {
         "internal_fault_probe",
         "final_real_recheck",
     ],
+    "lexer_no_mock_e2e": [
+        "lexer_state_model",
+        "lexer_fuzz",
+        "lexer_thread_matrix",
+        "lexer_resource_bounds",
+        "token_table_totality",
+        "incremental_lex_property",
+        "golden_vellum",
+        "syntax_lib",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "parser_corpus_no_mock_e2e": [
+        "parser_category_inventory",
+        "pratt_precedence_model",
+        "parse_roundtrip_property",
+        "parser_fuzz",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "reference_reference_no_mock_e2e": [
+        "oracle_binding",
+        "reference_run_a",
+        "reference_run_b",
+        "determinism",
+        "baseline",
+        "seeded_divergence_artifact",
+        "seeded_divergence_line",
+        "seeded_divergence_subline",
+        "seeded_divergence_diagnostic",
+        "seeded_divergence_exit",
+        "non_authoritative_outcome",
+        "recovery",
+        "bundle_validation",
+    ],
+    "dynamic_parser_no_mock_e2e": [
+        "registration_state_model",
+        "grammar_effect_totality",
+        "parser_interleaving_dpor",
+        "dynamic_parser_mutations",
+        "source_recovery_model",
+        "build_real_file_driver",
+        "positive_file",
+        "failure_file",
+        "recovery_file",
+        "incremental_file",
+        "source_recovery_file",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "hygiene_no_mock_e2e": [
+        "hygiene_targets",
+        "internal_fault_nonpublication",
+        "reference_version",
+        "reference_scope_oracle",
+        "semantic_validation",
+    ],
+    "macro_txn_no_mock_e2e": [
+        "macro_txn_targets",
+        "semantic_validation",
+        "final_real_recheck",
+    ],
+    "g0_4_no_mock_e2e": [
+        "syntax_hygiene_contract",
+        "pratt_precedence_contract",
+        "terminal_trivia_contract",
+    ],
+    "vellum_naming_no_mock_e2e": [
+        "registry_gate",
+        "collision_model",
+        "drift_guard",
+        "surface_scan",
+        "copy_fixture",
+        "scratch_baseline",
+        "seeded_stale_doc",
+        "restore_stale_doc",
+        "recovery_stale_doc",
+        "seeded_registry_conflict",
+        "restore_registry_conflict",
+        "recovery_registry_conflict",
+        "seeded_generated_drift",
+        "restore_generated_drift",
+        "recovery_generated_drift",
+        "seeded_stale_candidate",
+        "quarantine_candidate",
+        "verify_publication_intact",
+        "recovery_stale_candidate",
+        "determinism_scan_a",
+        "determinism_scan_b",
+        "determinism_byte_compare",
+        "final_real_recheck",
+    ],
 }
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+VERDICT_SEMANTIC_SCHEMA = "fln.e2e.verdict-semantic"
+VERDICT_TELEMETRY_SCHEMA = "fln.e2e.verdict-telemetry"
+VERDICT_SCHEMA_VERSION = 1
+VERDICT_WIRE_MAGIC = b"FLNVRDCT"
+VERDICT_WIRE_HEADER_BYTES = 13
+VERDICT_MAX_SEMANTIC_BYTES = 65_536
+VERDICT_MAX_TELEMETRY_BYTES = 4_096
+VERDICT_MAX_ENCODED_BYTES = 256 * 1024 * 1024
+VERDICT_MAX_WORKERS = 41
+VERDICT_FAILURE_MARKER = (
+    "FLN_VERDICT_E2E_EXPECTED_FAILURE: unknown proof opcode 255 at byte 21"
+)
+
+LEXER_SEMANTIC_SCHEMA = "fln.e2e.lexer-semantic"
+LEXER_TELEMETRY_SCHEMA = "fln.e2e.lexer-telemetry"
+LEXER_VALIDATION_SCHEMA = "fln.e2e.lexer-validation/1"
+LEXER_SCHEMA_VERSION = 1
+LEXER_MAX_INPUT_BYTES = 4_096
+LEXER_MAX_DIAGNOSTICS = 8
+LEXER_TAB_DIAGNOSTIC = (
+    "tabs are not allowed; please configure your editor to expand them"
+)
+LEXER_CASE_INPUTS = {
+    "positive": ("inputs/positive.lean", b"def answer := 42\n"),
+    "failure": ("inputs/failure.lean", b"def bad :=\t42\n"),
+    "recovery": ("inputs/recovery.lean", b"def bad :=\t42\n#check\tbad\n"),
+}
+
+DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA = (
+    "fln.diagnostic-projection.semantic/1"
+)
+DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA = (
+    "fln.diagnostic-projection.telemetry/1"
+)
+DIAGNOSTIC_PROJECTION_VALIDATION_SCHEMA = (
+    "fln.diagnostic-projection.validation/1"
+)
+DIAGNOSTIC_PROJECTION_CASES = (
+    "reference",
+    "corrupt",
+    "malformed",
+    "aged_epoch",
+    "mock_substitution",
+    "resource",
+    "cancelled",
+    "internal_fault",
+    "recovery",
+)
+DIAGNOSTIC_PROJECTION_MAX_SEMANTIC_BYTES = 65_536
+DIAGNOSTIC_PROJECTION_MAX_TELEMETRY_BYTES = 8_192
+
+PARSER_CORPUS_SEMANTIC_SCHEMA = "fln.e2e.parser-corpus-semantic"
+PARSER_CORPUS_TELEMETRY_SCHEMA = "fln.e2e.parser-corpus-telemetry"
+PARSER_CORPUS_VALIDATION_SCHEMA = "fln.e2e.parser-corpus-validation/1"
+PARSER_CORPUS_SCHEMA_VERSION = 1
+PARSER_CORPUS_MAX_INPUT_BYTES = 4_096
+PARSER_CORPUS_MAX_TOKENS = 32
+PARSER_CORPUS_MAX_DIAGNOSTICS = 4
+PARSER_CORPUS_LEFTOVER_DIAGNOSTIC = "unexpected token '='; expected command"
+PARSER_CORPUS_CASE_INPUTS = {
+    "positive": ("inputs/positive.lean", b"1 + 2 * 3\n"),
+    "failure": ("inputs/failure.lean", b"1 = 2 = 3\n"),
+    "recovery": ("inputs/recovery.lean", b"1 = 2 = 3\n"),
+}
+
+DYNAMIC_PARSER_SEMANTIC_SCHEMA = "fln.e2e.dynamic-parser-semantic"
+DYNAMIC_PARSER_TELEMETRY_SCHEMA = "fln.e2e.dynamic-parser-telemetry"
+DYNAMIC_PARSER_VALIDATION_SCHEMA = "fln.e2e.dynamic-parser-validation/1"
+DYNAMIC_PARSER_SCHEMA_VERSION = 2
+DYNAMIC_PARSER_MAX_INPUT_BYTES = 4_096
+DYNAMIC_PARSER_MAX_COMMANDS = 16
+DYNAMIC_PARSER_MAX_REQUESTS = 32
+DYNAMIC_PARSER_MAX_DIAGNOSTICS = 4
+DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC = (
+    "unknown category `nosuchcategory`"
+)
+DYNAMIC_PARSER_INTERLEAVING_CLAIM = (
+    "self_differential_support_only_not_FL_INV_01_proof"
+)
+DYNAMIC_PARSER_CASE_INPUTS = {
+    "positive": (
+        "inputs/positive.registry",
+        (
+            b"category term\n"
+            b"register term tok dynamicTerm\n"
+            b"lookup term tok\n"
+        ),
+    ),
+    "failure": (
+        "inputs/failure.registry",
+        b"register nosuchcategory zz zz\n",
+    ),
+    "recovery": (
+        "inputs/recovery.registry",
+        (
+            b"category term\n"
+            b"register term existing existing\n"
+            b"budget 3\n"
+            b"batch term tok k0 k1 k2 k3\n"
+        ),
+    ),
+    "incremental": (
+        "inputs/incremental.registry",
+        (
+            b"category-at 0 term\n"
+            b"register-at 0 term x x-base\n"
+            b"register-at 0 term y y-base\n"
+            b"memo 5 term x\n"
+            b"memo 15 term x\n"
+            b"memo 25 term y\n"
+            b"memo 35 term y\n"
+            b"memo 45 term z\n"
+            b"register-at 10 term x x-new\n"
+            b"opaque-at 20 unknown-parser-callback\n"
+            b"remove-at 30 term missing missing\n"
+            b"register-at 30 term z z-new\n"
+        ),
+    ),
+}
+MACRO_TXN_SEMANTIC_SCHEMA = "fln.e2e.macro-txn-semantic/1"
+MACRO_TXN_TELEMETRY_SCHEMA = "fln.e2e.macro-txn-telemetry/1"
+MACRO_TXN_VALIDATION_SCHEMA = "fln.e2e.macro-txn-validation/1"
+MACRO_TXN_SCENARIOS = (
+    "positive",
+    "memoization",
+    "opaque_reads",
+    "failure",
+    "cancellation",
+    "resource",
+    "internal_fault",
+    "recovery",
+    "quotation_seam",
+    "thread_matrix",
+)
+MACRO_TXN_THREAD_COUNTS = [1, 8, 32]
+MACRO_TXN_PRODUCTIVE_RUNS = sum(MACRO_TXN_THREAD_COUNTS)
+CERTIFICATE_FORMAT_SEMANTIC_SCHEMA = "fln.e2e.certificate-format-semantic/1"
+CERTIFICATE_FORMAT_TELEMETRY_SCHEMA = "fln.e2e.certificate-format-telemetry/1"
+CERTIFICATE_FORMAT_VALIDATION_SCHEMA = "fln.e2e.certificate-format-validation/1"
+CERTIFICATE_FORMAT_SCENARIOS = (
+    "pin_binding",
+    "positive",
+    "failure",
+    "recovery",
+    "codec",
+    "nonpublication",
+)
+CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION = "4e7915201d3f9f04470d9eae002fa695f7cdc589"
+CERTIFICATE_FORMAT_NANODA_REVISION = "ddfac2bf5a7b56cb46e141494427ff3dd55963c7"
+CERTIFICATE_FORMAT_REFERENCE_REVISION = "8c9756b28d64dab099da31a4c09229a9e6a2ef35"
+CERTIFICATE_FORMAT_EXPORT_VERSION = "3.1.0"
+CERTIFICATE_FORMAT_EXPORT_ROWS = 642
+CERTIFICATE_FORMAT_CHECKED_DECLARATIONS = 39
+CERTIFICATE_FORMAT_MAX_EXPORT_BYTES = 1_048_576
+CERTIFICATE_FORMAT_MAX_SEMANTIC_BYTES = 65_536
+CERTIFICATE_FORMAT_MAX_TELEMETRY_BYTES = 8_192
+CARTRIDGE_SEMANTIC_SCHEMA = "fln.e2e.cartridge-semantic/1"
+CARTRIDGE_TELEMETRY_SCHEMA = "fln.e2e.cartridge-telemetry/1"
+CARTRIDGE_VALIDATION_SCHEMA = "fln.e2e.cartridge-validation/1"
+CARTRIDGE_SCENARIOS = (
+    "pin_binding",
+    "positive",
+    "populations",
+    "failure",
+    "recovery",
+    "codec",
+    "nonpublication",
+)
+CARTRIDGE_OBJECTS = 9
+CARTRIDGE_NAMED_TESTS = 24
+CARTRIDGE_ARBITRARY_CASES = 10_000
+CARTRIDGE_VERSION_CASES = 65_536
+CARTRIDGE_THREAD_COUNTS = [1, 8, 32]
+CARTRIDGE_PRODUCTIVE_WORKERS = sum(CARTRIDGE_THREAD_COUNTS)
+CARTRIDGE_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+CARTRIDGE_MAX_SEMANTIC_BYTES = 65_536
+CARTRIDGE_MAX_TELEMETRY_BYTES = 8_192
+CARTRIDGE_MAX_EXTRACTED_FILES = 16
+CARTRIDGE_MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
+BIGNUM_SEMANTIC_SCHEMA = "fln.e2e.bignum-semantic/1"
+BIGNUM_TELEMETRY_SCHEMA = "fln.e2e.bignum-telemetry/1"
+BIGNUM_VALIDATION_SCHEMA = "fln.e2e.bignum-validation/1"
+BIGNUM_VECTOR_COUNT = 5_725
+BIGNUM_C4_NAT_FACTS = 28
+BIGNUM_MUTATIONS = (
+    ("carry_drop", "nat::tests::u128_model_agreement"),
+    (
+        "borrow_drop",
+        "truncated_subtraction_saturates_at_zero_and_never_wraps",
+    ),
+    ("normalization_single_pop", "nat::tests::edge_laws"),
+    (
+        "division_zero_guard_drop",
+        "nat::tests::knuth_d_matches_the_bitwise_model_and_reconstructs_the_dividend",
+    ),
+    (
+        "threshold_off_by_one",
+        "nat::tests::multiplication_crossovers_are_pinned_and_both_sides_are_equivalent",
+    ),
+    (
+        "signed_product_flip",
+        "nat::tests::toom3_signed_evaluations_and_carry_chains_match_schoolbook",
+    ),
+    (
+        "abi_view_origin_shift",
+        "borrowed_limb_views_alias_storage_and_match_owned_arithmetic",
+    ),
+    ("decimal_validation_drop", "nat::tests::edge_laws"),
+    ("shift_limb_boundary", "nat::tests::edge_laws"),
+)
+BIGNUM_PROFILE_SOURCES = (
+    (
+        "crates/fln-kernel/tests/k1_judgments.rs",
+        "kr313-operation-test-body-v1",
+        b"fn kr313_the_pin_operation_table_computes_literal_results() {",
+        b"#[test]\nfn kr313_comparisons_produce_bool_constants()",
+    ),
+    (
+        "tribunal/fixtures/c4/probe_export.c",
+        "c4-nat-slice-v1",
+        b"/* ---- slice 3: bignum-backed Nat families */",
+        b"/* ---- slice 3: Name equality",
+    ),
+)
+BIGNUM_MAX_SEMANTIC_BYTES = 65_536
+BIGNUM_MAX_TELEMETRY_BYTES = 16_384
+BIGNUM_MAX_FIXTURE_BYTES = 32 * 1024 * 1024
+SOURCE_RECOVERY_SEMANTIC_SCHEMA = "fln.e2e.source-recovery-semantic"
+SOURCE_RECOVERY_TELEMETRY_SCHEMA = "fln.e2e.source-recovery-telemetry"
+SOURCE_RECOVERY_INPUT = (
+    "inputs/source_recovery.lean",
+    b"def good := 1\ndef broken :=",
+)
+SOURCE_RECOVERY_MAX_BOUNDARIES = 8
+SOURCE_RECOVERY_MAX_THREADS = 32
 
 ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
 ENVIRONMENT_COLLISION_VERSION = 2
@@ -188,14 +952,430 @@ ENVIRONMENT_COLLISION_FIELDS = {
     "final_state",
 }
 
+ENVIRONMENT_RESOURCE_COLLISION_SCHEMA = "fln.e2e.environment-resource-collision"
+ENVIRONMENT_RESOURCE_COLLISION_VERSION = 1
+ENVIRONMENT_RESOURCE_COLLISION_THREADS = (1, 8, 32)
+ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY = 1_000
+ENVIRONMENT_RESOURCE_COLLISION_TEST = (
+    "pmap::tests::environment_collision_resource_e2e_emits_detailed_evidence"
+)
+DECLARATION_TAG_MATRIX_SCHEMA = "fln.e2e.declaration-tag-matrix"
+DECLARATION_TAG_MATRIX_TEST = (
+    "environment::tests::"
+    "declaration_tag_matrix_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_MEMBERSHIP_SCHEMA = "fln.e2e.declaration-membership"
+DECLARATION_MEMBERSHIP_TEST = (
+    "environment::tests::"
+    "declaration_membership_matrix_e2e_emits_detailed_real_path_evidence"
+)
+EXTENSION_DESCRIPTOR_MATRIX_SCHEMA = "fln.e2e.extension-descriptor-matrix"
+EXTENSION_DESCRIPTOR_MATRIX_TEST = (
+    "extensions::tests::"
+    "extension_descriptor_matrix_e2e_emits_detailed_real_path_evidence"
+)
+ENVIRONMENT_STATE_SCHEMA = "fln.e2e.environment-state"
+ENVIRONMENT_STATE_TEST = (
+    "extensions::tests::environment_state_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_ADMISSION_SCHEMA = "fln.e2e.declaration-admission"
+DECLARATION_ADMISSION_SUMMARY_SCHEMA = "fln.e2e.declaration-admission-summary"
+DECLARATION_ADMISSION_TEST = (
+    "environment::tests::"
+    "declaration_admission_e2e_emits_detailed_real_path_evidence"
+)
+DECLARATION_ADMISSION_ARGV = (
+    "cargo test --locked -q -p fln-env "
+    "environment::tests::"
+    "declaration_admission_e2e_emits_detailed_real_path_evidence "
+    "-- --exact --nocapture"
+)
+DECLARATION_ADMISSION_INPUT_ROOT = (
+    "2c9b97e5b882fa9495b69e462c8fbf2d"
+    "b35a1e4cb0ea3953a357a6549756e388"
+)
+DECLARATION_ADMISSION_BASE_ROOT = (
+    "36c2a8439e46a92cdd1ed0e0eebaa5ff"
+    "16728730342e5f13a4994eb199392b04"
+)
+DECLARATION_ADMISSION_UNBOUNDED_BUDGET = {
+    "max_level_params": (1 << 64) - 1,
+    "max_mutual_rows": (1 << 64) - 1,
+    "max_constructor_rows": (1 << 64) - 1,
+    "max_recursor_rules": (1 << 64) - 1,
+    "max_canonical_bytes": (1 << 64) - 1,
+    "max_expr_nodes": (1 << 64) - 1,
+    "max_expanded_weight": (1 << 64) - 1,
+}
+DECLARATION_ADMISSION_REFUSALS = (
+    (
+        "level_params",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "level_params",
+    ),
+    (
+        "mutual_rows",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "mutual_rows",
+    ),
+    (
+        "constructor_rows",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "constructor_rows",
+    ),
+    (
+        "recursor_rules",
+        True,
+        "declaration-preflight",
+        3,
+        "produced nodes",
+        "recursor_rules",
+    ),
+    (
+        "canonical_bytes",
+        True,
+        "declaration-preflight",
+        49,
+        "input bytes",
+        "canonical_bytes",
+    ),
+    (
+        "expr_nodes",
+        False,
+        "term-weight-preflight",
+        1,
+        "produced nodes",
+        "produced nodes",
+    ),
+    (
+        "expanded_weight",
+        False,
+        "term-weight-preflight",
+        1,
+        "expanded weight",
+        "expanded weight",
+    ),
+)
+DECLARATION_ADMISSION_RECOVERIES = (
+    (
+        "level_params",
+        {
+            "level_params": 3,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 108,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "e943a96e436d76198c42827054fb8cfe0330eb32b2d7a414e94c0e58f84b0610",
+        "7d7a4b653fc6472bd51122d6b0cbc61122290f6f445a55f2b0372e198f0de4a6",
+    ),
+    (
+        "mutual_rows",
+        {
+            "level_params": 0,
+            "mutual_rows": 3,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 119,
+            "expressions": 2,
+            "expr_nodes": 2,
+            "expanded_weight": 2,
+            "max_logical_depth": 1,
+        },
+        "72dc754d4e3c0b612fd6ba8f95ade80ca32218b25d1ff59826bffa311a9c52cb",
+        "9317645e979403f913e9a970aaed3267003d2caad9a12281c81464c9c0b5c720",
+    ),
+    (
+        "constructor_rows",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 3,
+            "recursor_rules": 0,
+            "canonical_bytes": 142,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "89625df1d9a219a607e34fd5d104dd2772a3b548a382e7d1b0fbb534c171bf58",
+        "b5a9f4ac94ec73b878077be1d6d8f056cf6ec73f5a07a7ee554975604dea1ac5",
+    ),
+    (
+        "recursor_rules",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 3,
+            "canonical_bytes": 162,
+            "expressions": 4,
+            "expr_nodes": 4,
+            "expanded_weight": 4,
+            "max_logical_depth": 1,
+        },
+        "fca53bc92f871456aae85b68feae2cda602bbed512bf85398782ebf1b0c10ecb",
+        "cc710f134162ab3a2b81dda84207de356e5951a41e9714284caa1f040fd613ef",
+    ),
+    (
+        "canonical_bytes",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "d5394a6026d58bbdab954a26875bc0d638d900b2684ce6577285c7d4207ba16f",
+        "87ecc4a3c635622312e76fe052d3fdddd1317b9f08d429f318140eaf7986562f",
+    ),
+    (
+        "expr_nodes",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "5be901abbb47830e0e9012425f3a884496396ad6f07e737f6e35c8ba3cf497cf",
+        "6571f8d9c64ec46adb0c37087013877154b93eed6119a95fc7e8a6f95e072680",
+    ),
+    (
+        "expanded_weight",
+        {
+            "level_params": 0,
+            "mutual_rows": 0,
+            "constructor_rows": 0,
+            "recursor_rules": 0,
+            "canonical_bytes": 51,
+            "expressions": 1,
+            "expr_nodes": 1,
+            "expanded_weight": 1,
+            "max_logical_depth": 1,
+        },
+        "bf7355fea0d48ce916cd0902653737891fa9679c7b6715bf35a7c9e6daf5129d",
+        "99eaf30ea59a11de8559ed638cfa14f3383546f2c450b2e841c5fd568967cbdb",
+    ),
+)
+ENVIRONMENT_IDENTITY_VERSION = 1
+DECLARATION_TAG_GOLDENS = {
+    ("definition_safety", "unsafe"): (
+        "definition",
+        0,
+        286,
+        "157d1d61733828db775de4ee898c84ab608f57ca609965b7d8aba3ef9e3a1a5e",
+        "e6e48d3267b42c87425ac704373120f0c4624c591f6c3218412cdfd5464443ab",
+    ),
+    ("definition_safety", "safe"): (
+        "definition",
+        1,
+        286,
+        "e3a242872a3ffd8c515331f5821c1b42f81780060413feb33f2d63ca8aeb697d",
+        "5995ca5cc9f678192cb1700abb6bc18a87af673a6f3285cc9d55caa9b20bb6b0",
+    ),
+    ("definition_safety", "partial"): (
+        "definition",
+        2,
+        286,
+        "00a37c5b26ce2df45b79a0e5ddc0b32fe7ba3fd16e2267a8b199a3a2a5421f52",
+        "5a313316b29da1dab36b88cd02d1d52b96b025a3cb6b9682d0ba10eb59ae76d1",
+    ),
+    ("quot_kind", "type"): (
+        "quotient",
+        0,
+        157,
+        "d85f3e7116bf264784bad45e2d9a9acc9ad69ca15c2387f73d390b51c1a52674",
+        "64a010c5b799b51b464f4394db8f06a4d7f0c8f98a89bc634cddf3936f3a431f",
+    ),
+    ("quot_kind", "ctor"): (
+        "quotient",
+        1,
+        157,
+        "7a209bee80a459d0eddd0e82ced0b96345895dfdf11cb420729783eff42fe0a0",
+        "d8fc3394629ba859ee37b56dd6d937d787aa86b607b02941091a8699983e0589",
+    ),
+    ("quot_kind", "lift"): (
+        "quotient",
+        2,
+        157,
+        "706326aa022cfa4b76f80ea32c04ad0aef70d796da8762b86771b3b4d42937ad",
+        "804e0ddc5baea6f095d63662b95d303a11c7f33cc92c8d5c77efeb96df021706",
+    ),
+    ("quot_kind", "ind"): (
+        "quotient",
+        3,
+        157,
+        "32cecea0df45330f5ea249486eb8c0dd4ff236dc27ca90e79122de9f7e3d365a",
+        "7e0d5346e053845bda23a4fb2f3edf80f7daa3f86898a129d66d0531e0e22066",
+    ),
+}
+ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT = (
+    "fln-fixture:fe1a2f87707d8edea65e8d4d61db5a1882c838b3e1975ec55b136af78f154dfe"
+)
+ENVIRONMENT_RESOURCE_COLLISION_HASH = "955ee3fb336886cc"
+ENVIRONMENT_RESOURCE_COLLISION_ROOT = (
+    "0da9877d9661335524ca1609c621ea2f422477497f686f85192276e1eb05cee7"
+)
+ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT = (
+    "e4e233d685c5ee4e14cd844d572b2edf4e9d06c866725687ea420328acccdea1"
+)
+ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER = (
+    "assertion `left == right` failed\n  left: 28\n right: 36"
+)
+ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS = {
+    1: (
+        "fln-fixture:08b7f939ec36c28d93fed144bb9a730d2503ec099edf0bb96a2721bdfc60e325",
+    ),
+    8: (
+        "fln-fixture:99505071fe809c63f3697903ffec2eda89e6c01863753411d836949edbc7a2e6",
+        "fln-fixture:8b04654a127358f5e2c8eb41f6b1cc7c13dc8b446158aa38d8aa1f9183865de5",
+        "fln-fixture:bc8b3d07a5bc1aac1d29cecbae910d3038d8513cc1ff82d45ffb825cdc0eeb03",
+        "fln-fixture:42f2d932971f941232fa0816cd9f98b5d904f8e204d39ee9f094d5fbc16d9fd7",
+        "fln-fixture:1fbe351925b9c7471949e52d40348549e32b9693940ebc053e119abb079cfdcc",
+        "fln-fixture:83cfa2c1a11bacabe8c9a7db97d3dd8feff2337d682f09e44a878c4307783409",
+        "fln-fixture:758772e6db8c89facab28fa52f2438b06d12bb1f87eb67c3ec3334484fdb36ea",
+        "fln-fixture:347431134d05dfe0684f987276f9ea0af399fdd8cda5908f7be63f1b27679a0a",
+    ),
+    32: (
+        "fln-fixture:dc8dfffd8012c09e9ce97bff90702d1dc0bd3f23b005086126c2e0e669df821a",
+        "fln-fixture:8851bb87719923be75013cff4ef4732c27b1ad6a82315e2f54e6268aa2f498cc",
+        "fln-fixture:fd3712db2016ece30d8475037e1229f560bb485d3038a21988099612d8ae3413",
+        "fln-fixture:c25f4e4895ec135269205442c0f598a76cd6d7dcb461c82caa3a841ccae2fe42",
+        "fln-fixture:75c3b37eb151113836a8185f0242a50d9a290574f7f6553b845d52b68d11d90a",
+        "fln-fixture:d5b92dcbe784c645232d77e9f7f970143e8c9eab45d29bdff3dcaf510b55f78d",
+        "fln-fixture:a5889ad8e06e4adc20cb5295e4586ea53c3287bba0027131ae2c38d657397cf3",
+        "fln-fixture:c835c428ac132b9aa01a612b95c72205f194392707184c5cf084888ab2782a08",
+        "fln-fixture:a2b3bdd0e6a2faac7afa1228cadf7f5d1b78b4b38e75aa8a583adfdf8fa4bfc0",
+        "fln-fixture:7f97ee3ac100deee413ad5b2be458fbe58e7ffe72f44075e524100fcceb09dd7",
+        "fln-fixture:fa7efe8ab864ea61ca56f6a9a8dbe710aab8cc28631599d23f13bdf7eafb622e",
+        "fln-fixture:2f2792a3cc195756d88edd8591a905a2f17ea7b709369069ada462d1ad0236cd",
+        "fln-fixture:845b34ac7ca419fc02974b6ecfb524de75b61b7bb4c96839c2aab506bc3636db",
+        "fln-fixture:bf437a9fc884c07f167dc1c1a319c5cd62f2ef3889f4b476c7f98657b79f821c",
+        "fln-fixture:35d9052b65b94ae647d57af45a275df3e8d0c4c0bc47d2075503360da781907a",
+        "fln-fixture:b436bdbb426509d697ed7553a624d2d02444ac27144bf961926b28618cbdb54d",
+        "fln-fixture:2d967bc6d3f7b5d9a60b5491f85c6d8947e51b350566e5fe48aeb48ec5ff0ef6",
+        "fln-fixture:15e7bf1d442d3efa38ffa2101f57317ce3d238c740c3309f69c3bbcf7374d619",
+        "fln-fixture:812e68d06a379f613d766067e62dc2b7372250ac3c457cb0b388fd8f01953121",
+        "fln-fixture:eef976e9839c50a6287ac3882ad0f1e42a5e6dae2d5fd634880eabb17465a664",
+        "fln-fixture:f129e4e550b451ffa6e304a2482ff09b82200f4f69d4736fd17d7cf60081f5c5",
+        "fln-fixture:c921b3088bce5c6a6389f02ace3a6fe2fde45d74de5d1236a60423d3c74a725c",
+        "fln-fixture:efd74cfe56fc7b3c9249b88d5a24bf7dd3cd746150ef5fdb284cea69139ef45f",
+        "fln-fixture:a918832f110875da273bac6892cfe0442bcc562504643bed55e6eadf70e5ef31",
+        "fln-fixture:22603dbfa9666ee2c1fd9e6f054aa61b81262458fec4f18c22e4400f8394e64a",
+        "fln-fixture:8b203ad6ccc731d032c23568280c3aa210dffffbdde97f13787df711d4c476c6",
+        "fln-fixture:7c98700104a2894bbd06b7caff021252fe24d53b73fd6db8247df57731e65d02",
+        "fln-fixture:d6deb752327aac38c2bd8d7a5f729e454a861b67cb24c1deb1b491f57875c0fd",
+        "fln-fixture:ca0a0d538ebcc735c82df9f0a3402d4c9678926954368b7c2e463b48afcffab1",
+        "fln-fixture:fef909b8b7aed09f264d00a87c263db945590bce848429488901d0f6e07336f2",
+        "fln-fixture:4749f2b23180c6a7ba4bab54cfe4f7fa6eff17be58af01d6102ac85710bf57aa",
+        "fln-fixture:c436f1f87725a813b5bc206d23e260a9fd3559006d8535556a92f28492ebbc2f",
+    ),
+}
+ENVIRONMENT_RESOURCE_COLLISION_FIELDS = {
+    "schema",
+    "version",
+    "run_id",
+    "bead",
+    "claim_id",
+    "claim_type",
+    "invariant_id",
+    "invariant_relation",
+    "gate_id",
+    "gate_relation",
+    "parity_ledger_row",
+    "data_grade",
+    "epoch",
+    "mode",
+    "profile",
+    "platform",
+    "seed",
+    "cache_state",
+    "canonical_input_root",
+    "scenario",
+    "schedule_id",
+    "status",
+    "cwd",
+    "argv",
+    "stdout_artifact",
+    "stderr_artifact",
+    "collision_cardinality",
+    "collision_hash",
+    "threads",
+    "workers_built",
+    "distinct_insertion_orders",
+    "representative_insertion_order",
+    "worker_insertion_order_roots",
+    "expected_order",
+    "actual_order",
+    "worker_enumeration_roots",
+    "expected_root",
+    "actual_root",
+    "worker_roots",
+    "expected_recovery_root",
+    "actual_recovery_root",
+    "worker_recovery_roots",
+    "representation_tier",
+    "secondary_identity",
+    "secondary_hashing",
+    "secondary_identity_collision_behavior",
+    "promotion_cardinality",
+    "demotion_cardinality",
+    "comparisons",
+    "fresh_map_nodes",
+    "fresh_collision_nodes",
+    "cloned_inline_entries",
+    "final_collision_nodes",
+    "snapshot_root_arc_bumps",
+    "snapshot_shared_collision_nodes",
+    "append_shared_collision_nodes",
+    "append_fresh_nodes",
+    "max_lookup_comparisons",
+    "budget",
+    "bounds",
+    "resources",
+    "monotonic_start_us",
+    "monotonic_end_us",
+    "duration_us",
+    "timing_used_as_gate",
+    "process_exit",
+    "signal",
+    "first_divergence",
+    "cleanup_status",
+    "final_state",
+}
+
 KERNEL_ADMISSION_SCHEMA = "fln.e2e.kernel-admission"
 KERNEL_ADMISSION_FAULT_SCHEMA = "fln.e2e.kernel-admission-fault"
-KERNEL_ADMISSION_VERSION = 1
+KERNEL_ADMISSION_VERSION = 2
 KERNEL_ADMISSION_THREADS = (1, 8, 32)
 KERNEL_ADMISSION_TESTS = (
     "prelude_replays_through_the_kernel",
     "admission_fault_matrix_is_typed_and_atomic",
 )
+KERNEL_ADMISSION_TARGET_PASSED = 14
+KERNEL_ADMISSION_TARGET_IGNORED = 3
 KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
 KERNEL_ADMISSION_BUDGET_DEPTH = 4_096
 # The pinned Init.Prelude verdict census (beads franken_lean-irm +
@@ -206,10 +1386,55 @@ KERNEL_ADMISSION_CENSUS = {
     "accepted": 2198,
     "rejected_total": 0,
     "inconclusive": 0,
-    "unchecked_nonsafe_with_unserialized_refs": 6,
+    "artifact_incomplete": 6,
     "nested_partial_blocks": 0,
     "nested_full_blocks": 1,
 }
+# The typed artifact-incomplete census at the pin (bead
+# franken_lean-artifact-incomplete-private-refs-sgt): six non-safe
+# implementation helpers whose private auxiliaries the pin's serializer
+# discarded. Each row is (declaration, safety, missing references) in
+# canonical order; the witness digest binds the exact finding set
+# (fln-env decl_closure, tag fln.artifact-incomplete-witness/2 — version 2
+# binds the structural Name rather than its display form, which was not
+# injective; bead franken_lean-f6br). These rows
+# are inconclusive-family outcomes: never checked, never cacheable, never
+# environment-admissible — and never folded into a success total.
+KERNEL_ADMISSION_ARTIFACT_WITNESS = (
+    "c7fa135fc4f85a21488bfc2393cbe4f7fa81b13205dbf18023ced322b829e015"
+)
+KERNEL_ADMISSION_ARTIFACT_ROWS = (
+    (
+        "Lean.Name.hash._override",
+        "unsafe",
+        ("_private.Init.Prelude.0.Lean.Name.hash._proof_1",),
+    ),
+    (
+        "Lean.Name.num._override",
+        "unsafe",
+        ("_private.Init.Prelude.0.Lean.Name.hash._proof_2",),
+    ),
+    (
+        "Lean.Syntax.getHeadInfo?._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",),
+    ),
+    (
+        "Lean.Syntax.getTailPos?._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",),
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",),
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1",),
+    ),
+)
 # The named single-defect admission mutants (bead franken_lean-ap6): every
 # one must be killed by a typed rejection in the fault matrix.
 KERNEL_ADMISSION_MUTANTS = (
@@ -276,13 +1501,45 @@ KERNEL_ADMISSION_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
     "accepted",
     "rejected_total",
     "inconclusive",
-    "unchecked_nonsafe_with_unserialized_refs",
+    "artifact_incomplete",
+    "artifact_incomplete_witness",
     "nested_partial_blocks",
     "nested_full_blocks",
     "verdict_stream_digest",
     "final_logical_root",
     "steps_used_total",
     "max_depth_seen",
+}
+# The per-declaration artifact-incomplete rows carry the shared governance
+# prefix (no supervisor/timing tail — they are census rows, not phases) plus
+# the finding facts and the authority denials.
+KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS = (
+    _KERNEL_ADMISSION_COMMON_FIELDS
+    - {
+        "status",
+        "budget_steps",
+        "budget_depth",
+        "monotonic_start_us",
+        "monotonic_end_us",
+        "duration_us",
+        "timing_used_as_gate",
+        "process_exit",
+        "signal",
+        "first_divergence",
+        "cleanup_status",
+        "final_state",
+    }
+) | {
+    "declaration",
+    "safety",
+    "missing_references",
+    "witness",
+    "outcome",
+    "authority",
+    "kernel_checked",
+    "cacheable",
+    "environment_admissible",
+    "evidence_grade",
 }
 KERNEL_ADMISSION_FAULT_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
     "mutant_id",
@@ -302,10 +1559,25 @@ KERNEL_ADMISSION_FAULT_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
 MAX_RECORD_BYTES = 1_048_576
 MAX_LOG_BYTES = 67_108_864
 MAX_EXEC_STATUS_BYTES = 4096
+PARITY_LEDGER_SCHEMA = "fln-parity-ledger/1"
+PARITY_LEDGER_RELATIVE_PATH = Path("ci/PARITY_LEDGER.txt")
+PARITY_LEDGER_MAX_BYTES = 1_048_576
+PARITY_LEDGER_MAX_REFERENCE_BYTES = 512
+PARITY_LEDGER_SENTINEL_PREFIX = "not_applicable_"
+PARITY_LEDGER_SENTINEL_PATTERN = re.compile(
+    r"\Anot_applicable_[a-z0-9]+(?:_[a-z0-9]+)*\Z"
+)
+PARITY_LEDGER_DIRECT_EMITTER_PATTERN = re.compile(
+    r"--string[ \t]+parity_ledger_row[ \t]+([^\s\\]+)"
+)
+PARITY_LEDGER_JSON_EMITTER_PATTERN = re.compile(
+    r'\\"parity_ledger_row\\":\\"([^"\\]*)\\"'
+)
 STOPPED_GATE_READY_TOKEN = b"fln-private-ready-v1\n"
 STOPPED_GATE_RELEASE_TOKEN = b"fln-private-release-v1\n"
 SUPERVISOR_TEST_FAULT_POINTS = {
     "none",
+    "admission_fd_exhaustion",
     "capture_stdout",
     "capture_stderr",
     "metadata_parent_open",
@@ -331,6 +1603,10 @@ class EvidenceError(RuntimeError):
     """A fail-closed evidence production or validation error."""
 
 
+class VerificationEvidenceRegistryAbsent(EvidenceError):
+    """A manifest claim needs the optional receipt authority, but it is absent."""
+
+
 class SetupTimeoutError(EvidenceError):
     """The target never reached its inert admission state within setup budget."""
 
@@ -339,8 +1615,110 @@ class SetupCancelledError(EvidenceError):
     """Cancellation won before the target was released to execute."""
 
 
+class SealedCompilerRejection(EvidenceError):
+    """The sealed-cargo lane refused to run: hostile or unverifiable ambient
+    compiler environment. Carries the typed reason token for the terminal
+    envelope and the partial sealing facts gathered before rejection."""
+
+    def __init__(
+        self, reason_token: str, detail: str, facts: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(detail)
+        self.reason_token = reason_token
+        self.facts = facts
+
+
+class SealedInterpreterRejection(EvidenceError):
+    """The evidence supervisor refused to run under an unsealed or hostile
+    Python configuration. The trusted interpreter still publishes a typed
+    terminal envelope, but the target is never spawned."""
+
+    def __init__(
+        self, reason_token: str, detail: str, facts: dict[str, Any]
+    ) -> None:
+        super().__init__(detail)
+        self.reason_token = reason_token
+        self.facts = facts
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def overridden_python_environment(environ: Mapping[str, str]) -> list[str]:
+    """Return ambient Python configuration names ignored by ``-I`` and refused.
+
+    Values are deliberately never copied into evidence: names prove the
+    attempted channel was classified, while values may contain host data.
+    """
+
+    return sorted(
+        name
+        for name in environ
+        if name in PYTHON_CONFIGURATION_ENV_EXACT
+        or any(
+            name.startswith(prefix)
+            for prefix in PYTHON_CONFIGURATION_ENV_PREFIXES
+        )
+    )
+
+
+def effective_interpreter_identity(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Bind the Python authority that computes hashes and verdicts."""
+
+    source_environment = os.environ if environ is None else environ
+    stdlib_prefix = Path(sysconfig.get_path("stdlib")).resolve()
+    return {
+        "executable": str(Path(sys.executable).resolve()),
+        "version": platform.python_version(),
+        "stdlib_prefix": str(stdlib_prefix),
+        "base_prefix": str(Path(sys.base_prefix).resolve()),
+        "exec_prefix": str(Path(sys.exec_prefix).resolve()),
+        "flags": {
+            "isolated": bool(sys.flags.isolated),
+            "ignore_environment": bool(sys.flags.ignore_environment),
+            "no_site": bool(sys.flags.no_site),
+            "no_user_site": bool(sys.flags.no_user_site),
+            "safe_path": bool(sys.flags.safe_path),
+        },
+        "overridden_env": overridden_python_environment(source_environment),
+    }
+
+
+def prepare_sealed_interpreter(
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """Prove the interpreter authority before any supervised target starts.
+
+    ``-I -S`` is structural authority, not an environment sanitizer. Python
+    configuration variables remain visible so their attempted use can be
+    rejected and recorded by name without retaining their values.
+    """
+
+    facts = effective_interpreter_identity(environ)
+    expected_flags = {
+        "isolated": True,
+        "ignore_environment": True,
+        "no_site": True,
+        "no_user_site": True,
+        "safe_path": True,
+    }
+    if facts["flags"] != expected_flags:
+        raise SealedInterpreterRejection(
+            "sealed_interpreter_unsealed_startup",
+            "evidence interpreter requires isolated no-site startup",
+            facts,
+        )
+    if facts["overridden_env"]:
+        raise SealedInterpreterRejection(
+            "sealed_interpreter_hostile_environment",
+            "hostile Python configuration channels present: "
+            + ",".join(facts["overridden_env"]),
+            facts,
+        )
+    return facts
 
 
 def canonical_json(value: Any) -> bytes:
@@ -454,10 +1832,14 @@ def open_regular_nofollow(path: Path) -> tuple[Path, int]:
     return absolute, descriptor
 
 
+_TEST_MUTATE_DURING_READ: Path | None = None
+
+
 def stable_file_facts(
     path: Path, *, max_bytes: int | None = None
 ) -> tuple[bytes, int, str]:
     """Read one immutable snapshot and reject concurrent mutation."""
+    global _TEST_MUTATE_DURING_READ
     absolute, descriptor = open_regular_nofollow(path)
     try:
         before = os.fstat(descriptor)
@@ -475,6 +1857,18 @@ def stable_file_facts(
                 raise EvidenceError(f"file exceeds {max_bytes} bytes: {absolute}")
             digest.update(block)
             chunks.append(block)
+        if (
+            _TEST_MUTATE_DURING_READ is not None
+            and absolute == _TEST_MUTATE_DURING_READ
+        ):
+            # Planted REAL mutation for the mutation-during-initial-hashing
+            # scenario (bead fln-evidence-runner-bootstrap-btk): one byte is
+            # appended through an independent descriptor while this snapshot
+            # is still open, so the ordinary stability law below must fire on
+            # genuinely changed kernel metadata — nothing here is simulated.
+            _TEST_MUTATE_DURING_READ = None
+            with open(absolute, "ab") as mutator:
+                mutator.write(b"\n")
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -484,6 +1878,212 @@ def stable_file_facts(
     if total != before.st_size:
         raise EvidenceError(f"file size changed while being read: {absolute}")
     return b"".join(chunks), total, digest.hexdigest()
+
+
+def load_parity_ledger_symbols(path: Path | None = None) -> frozenset[str]:
+    """Load the unambiguous symbol namespace referenced by evidence records."""
+
+    ledger_path = (
+        Path(__file__).resolve().parent.parent / PARITY_LEDGER_RELATIVE_PATH
+        if path is None
+        else path
+    )
+    data, _size, _digest = stable_file_facts(
+        ledger_path, max_bytes=PARITY_LEDGER_MAX_BYTES
+    )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"parity ledger is not UTF-8: {ledger_path}") from error
+
+    schema_seen = False
+    symbols: set[str] = set()
+    for number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if not schema_seen:
+            expected = f"schema {PARITY_LEDGER_SCHEMA}"
+            if line != expected:
+                raise EvidenceError(
+                    f"{ledger_path}:{number}: expected {expected!r}"
+                )
+            schema_seen = True
+            continue
+        if not line.startswith("row "):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: expected a parity ledger row"
+            )
+        fields = [field.strip() for field in line[4:].split("|")]
+        if len(fields) != 12 or any(not field for field in fields):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger row must have "
+                "12 non-empty fields"
+            )
+        if fields[4] not in {"L0", "L1", "L2", "L3", "L4"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger L-level must be L0..L4"
+            )
+        if fields[5] not in {"faithful", "sound", "frontier"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger mode is invalid"
+            )
+        if fields[9] not in {"D0", "D1", "D2", "D3", "D4"}:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger determinism class is invalid"
+            )
+        if fields[10] not in {
+            "OBSERVED",
+            "TARGETED",
+            "HYPOTHESIS",
+            "PROVEN",
+            "BLOCKED",
+        }:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger claim state is invalid"
+            )
+        fixtures = [fixture.strip() for fixture in fields[8].split(",")]
+        if fields[4] != "L0" and not any(fixtures):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger row above L0 "
+                "must cite a fixture"
+            )
+        symbol = fields[1]
+        if len(symbol.encode("utf-8")) > PARITY_LEDGER_MAX_REFERENCE_BYTES:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: parity ledger symbol is too large"
+            )
+        if symbol.startswith(PARITY_LEDGER_SENTINEL_PREFIX):
+            raise EvidenceError(
+                f"{ledger_path}:{number}: ledger symbol uses the reserved "
+                f"{PARITY_LEDGER_SENTINEL_PREFIX!r} namespace"
+            )
+        if symbol in symbols:
+            raise EvidenceError(
+                f"{ledger_path}:{number}: duplicate parity ledger symbol {symbol!r}"
+            )
+        symbols.add(symbol)
+
+    if not schema_seen:
+        raise EvidenceError(f"parity ledger has no schema directive: {ledger_path}")
+    if not symbols:
+        raise EvidenceError(f"parity ledger has no symbol rows: {ledger_path}")
+    return frozenset(symbols)
+
+
+def validate_parity_ledger_reference(
+    value: Any,
+    *,
+    subject: str,
+    symbols: frozenset[str],
+) -> None:
+    """Require one exact live symbol or a canonical non-applicability reason."""
+
+    if not isinstance(value, str) or not value:
+        raise EvidenceError(f"{subject}: parity_ledger_row must be a string")
+    if len(value.encode("utf-8")) > PARITY_LEDGER_MAX_REFERENCE_BYTES:
+        raise EvidenceError(f"{subject}: parity_ledger_row is too large")
+    if value.startswith(PARITY_LEDGER_SENTINEL_PREFIX):
+        if PARITY_LEDGER_SENTINEL_PATTERN.fullmatch(value) is None:
+            raise EvidenceError(
+                f"{subject}: malformed parity ledger non-applicability sentinel"
+            )
+        return
+    if value not in symbols:
+        raise EvidenceError(
+            f"{subject}: dangling parity ledger symbol reference {value!r}"
+        )
+
+
+def validate_parity_ledger_source(
+    data: bytes,
+    *,
+    subject: str,
+    symbols: frozenset[str],
+) -> int:
+    """Resolve every statically classifiable shell emission in one source."""
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{subject}: emitter source is not UTF-8") from error
+    active_text = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    occurrence_count = active_text.count("parity_ledger_row")
+    references = [
+        *PARITY_LEDGER_DIRECT_EMITTER_PATTERN.findall(active_text),
+        *PARITY_LEDGER_JSON_EMITTER_PATTERN.findall(active_text),
+    ]
+    if len(references) != occurrence_count:
+        raise EvidenceError(
+            f"{subject}: found {occurrence_count} parity_ledger_row emissions "
+            f"but classified {len(references)}"
+        )
+    for index, reference in enumerate(references, 1):
+        validate_parity_ledger_reference(
+            reference,
+            subject=f"{subject}:parity_ledger_row:{index}",
+            symbols=symbols,
+        )
+    return len(references)
+
+
+def validate_parity_ledger_emitters(
+    repository_root: Path | None = None,
+) -> dict[str, int]:
+    """Scan every governed shell emitter, including legacy direct publishers."""
+
+    root = lexical_absolute(
+        Path(__file__).resolve().parent.parent
+        if repository_root is None
+        else repository_root
+    )
+    symbols = load_parity_ledger_symbols(root / PARITY_LEDGER_RELATIVE_PATH)
+    emitter_files: list[Path] = []
+    for relative in (Path("scripts/e2e"), Path("scripts/tribunal")):
+        emitter_root = root / relative
+        try:
+            root_facts = emitter_root.lstat()
+        except OSError as error:
+            raise EvidenceError(
+                f"parity ledger emitter root is unavailable: {emitter_root}: {error}"
+            ) from error
+        if not stat.S_ISDIR(root_facts.st_mode):
+            raise EvidenceError(
+                f"parity ledger emitter root is not a directory: {emitter_root}"
+            )
+        emitter_files.extend(sorted(emitter_root.rglob("*.sh")))
+    if not emitter_files:
+        raise EvidenceError("parity ledger emitter scan is empty")
+
+    references = 0
+    for emitter in emitter_files:
+        try:
+            emitter_facts = emitter.lstat()
+        except OSError as error:
+            raise EvidenceError(
+                f"parity ledger emitter is unavailable: {emitter}: {error}"
+            ) from error
+        if not stat.S_ISREG(emitter_facts.st_mode):
+            raise EvidenceError(
+                f"parity ledger emitter is not a regular file: {emitter}"
+            )
+        data, _size, _digest = stable_file_facts(
+            emitter, max_bytes=PARITY_LEDGER_MAX_BYTES
+        )
+        references += validate_parity_ledger_source(
+            data,
+            subject=str(emitter),
+            symbols=symbols,
+        )
+    if references == 0:
+        raise EvidenceError("parity ledger emitter reference scan is empty")
+    return {
+        "files": len(emitter_files),
+        "references": references,
+        "symbols": len(symbols),
+    }
 
 
 def stable_symlink_facts(path: Path) -> tuple[bytes, int, str]:
@@ -599,6 +2199,7 @@ def write_signal_committed_atomic_new(
     decision_path: Path | None = None,
     restore_signal_state: bool = True,
     test_fail_after_link: bool = False,
+    test_marker_pause: tuple[Path, Path] | None = None,
 ) -> None:
     """Race cancellation and commit on one write-once cross-process decision."""
     absolute = lexical_absolute(path)
@@ -648,6 +2249,32 @@ def write_signal_committed_atomic_new(
                 decision_data, _size, _digest = stable_file_facts(decision_absolute)
                 if not hmac.compare_digest(decision_data, data):
                     raise EvidenceError("cancellation won the bundle decision race")
+            if test_marker_pause is not None:
+                # Boundary-injection hook (bead fln-evidence-runner-bootstrap-btk):
+                # hold the window between the linked decision and the canonical
+                # marker open so a deterministic signal can be delivered to the
+                # supervising shell. Watched signals are already ignored here, so
+                # the pause cannot be interrupted; the decision has already won,
+                # so the signal must lose and the bundle must still commit.
+                pause_ready, pause_release = test_marker_pause
+                write_new(lexical_absolute(pause_ready), b"0 0\n")
+                pause_deadline = time.monotonic() + 180.0
+                while True:
+                    try:
+                        release_data, _release_size, _release_digest = (
+                            stable_file_facts(
+                                lexical_absolute(pause_release), max_bytes=64
+                            )
+                        )
+                    except (EvidenceError, FileNotFoundError):
+                        release_data = b""
+                    if release_data:
+                        break
+                    if time.monotonic() >= pause_deadline:
+                        raise EvidenceError(
+                            "marker-link pause release timed out"
+                        )
+                    time.sleep(0.005)
             try:
                 os.link(
                     decision_absolute.name,
@@ -887,6 +2514,7 @@ def spawn_stopped_exec(
     target_signal_mask: set[signal.Signals],
     test_before_stop_delay_ms: int = 0,
     test_gate_mode: str = "normal",
+    env: dict[str, str] | None = None,
 ) -> tuple[StoppedExecProcess, int, int, int]:
     """Fork an inert future target with no intervening interpreter or user exec."""
     try:
@@ -983,10 +2611,13 @@ def spawn_stopped_exec(
                     break
                 release.extend(block)
             os.close(gate_release_read)
-            if bytes(release) != STOPPED_GATE_RELEASE_TOKEN:
+            if not hmac.compare_digest(bytes(release), STOPPED_GATE_RELEASE_TOKEN):
                 raise EvidenceError("private stopped-target release token mismatch")
             signal.pthread_sigmask(signal.SIG_SETMASK, target_signal_mask)
-            os.execvp(argv[0], list(argv))
+            if env is not None:
+                os.execvpe(argv[0], list(argv), env)
+            else:
+                os.execvp(argv[0], list(argv))
             raise EvidenceError("stopped target exec unexpectedly returned")
         except BaseException as error:
             try:
@@ -1341,7 +2972,9 @@ def admit_stopped_session_leader_until(
                 gate_ready.extend(block)
                 if len(gate_ready) > len(STOPPED_GATE_READY_TOKEN):
                     raise EvidenceError("private gate readiness token exceeded bound")
-            if gate_ready_eof and bytes(gate_ready) != STOPPED_GATE_READY_TOKEN:
+            if gate_ready_eof and not hmac.compare_digest(
+                bytes(gate_ready), STOPPED_GATE_READY_TOKEN
+            ):
                 raise EvidenceError("private gate readiness token mismatch")
             facts = proc_stat_facts(pid)
             if (
@@ -1579,9 +3212,16 @@ def _run_supervised_impl(
     test_before_release_delay_ms: int = 0,
     test_gate_mode: str = "normal",
     test_fault_point: str = "none",
+    sealed_cargo: bool = False,
+    suite_lock_path: Path | None = None,
+    sealed_build_root: Path | None = None,
 ) -> int:
     if not argv:
         raise EvidenceError("supervisor requires a non-empty argv")
+    if sealed_cargo and (suite_lock_path is None or sealed_build_root is None):
+        raise EvidenceError(
+            "sealed-cargo supervision requires --suite-lock and --sealed-build-root"
+        )
     for label, value in (
         ("capture-bytes", capture_bytes),
         ("output-budget-bytes", output_budget_bytes),
@@ -1683,6 +3323,11 @@ def _run_supervised_impl(
     exec_status_complete = False
     exec_success_observed_live = False
     target_exec_failure: dict[str, Any] | None = None
+    sealed_rejection: str | None = None
+    sealed_interpreter_rejection: str | None = None
+    sealed_compiler_facts: dict[str, Any] | None = None
+    sealed_interpreter_facts: dict[str, Any] | None = None
+    child_env: dict[str, str] | None = None
     child_exit: int | None = None
     child_signal: str | None = None
     readiness_ns: int | None = None
@@ -1872,6 +3517,22 @@ def _run_supervised_impl(
         for signum in watched_signals:
             signal.signal(signum, remember_signal)
         setup_deadline = setup_deadline_ns / 1_000_000_000
+        sealed_interpreter_facts = prepare_sealed_interpreter(os.environ)
+        if sealed_cargo:
+            # The compiler-environment sealing step of the evidence envelope:
+            # a rejection here is a typed setup fault recorded in the terminal
+            # envelope — the target is never spawned.
+            assert suite_lock_path is not None and sealed_build_root is not None
+            sealed = prepare_sealed_cargo(
+                argv=argv,
+                cwd=cwd,
+                suite_lock_path=suite_lock_path,
+                sealed_build_root=sealed_build_root,
+                environ=os.environ,
+            )
+            argv = sealed["argv"]
+            child_env = sealed["env"]
+            sealed_compiler_facts = sealed["facts"]
         (
             proc,
             exec_status_read,
@@ -1884,6 +3545,7 @@ def _run_supervised_impl(
             target_signal_mask=initial_signal_mask,
             test_before_stop_delay_ms=test_before_stop_delay_ms,
             test_gate_mode=test_gate_mode,
+            env=child_env,
         )
         os.set_blocking(exec_status_read, False)
         os.set_blocking(gate_ready_read, False)
@@ -1910,13 +3572,41 @@ def _run_supervised_impl(
             raise EvidenceError("injected stderr drainer start failure")
         err_thread.start()
         err_thread_started = True
-        child_handle = admit_stopped_session_leader_until(
-            proc.pid,
-            supervisor_pid,
-            setup_deadline,
-            gate_ready_descriptor=gate_ready_read,
-            cancelled=lambda: cancel_signal is not None,
-        )
+        admission_fd_hoard: list[int] = []
+        admission_fd_limit: tuple[int, int] | None = None
+        if test_fault_point == "admission_fd_exhaustion":
+            # Real resource exhaustion behind a planted trigger: clamp the soft
+            # descriptor limit onto the live table and hoard the remainder, so
+            # the admission /proc and pidfd binds hit genuine kernel EMFILE.
+            # The clamp and hoard are both released before terminal publication
+            # needs descriptors again.
+            admission_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            probe_descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+            admission_fd_hoard.append(probe_descriptor)
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (probe_descriptor + 4, admission_fd_limit[1]),
+            )
+            try:
+                while True:
+                    admission_fd_hoard.append(
+                        os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                    )
+            except OSError:
+                pass
+        try:
+            child_handle = admit_stopped_session_leader_until(
+                proc.pid,
+                supervisor_pid,
+                setup_deadline,
+                gate_ready_descriptor=gate_ready_read,
+                cancelled=lambda: cancel_signal is not None,
+            )
+        finally:
+            if admission_fd_limit is not None:
+                resource.setrlimit(resource.RLIMIT_NOFILE, admission_fd_limit)
+            while admission_fd_hoard:
+                os.close(admission_fd_hoard.pop())
         known_descendants[proc.pid] = child_handle
         os.close(gate_ready_read)
         gate_ready_read = None
@@ -2193,6 +3883,19 @@ def _run_supervised_impl(
         )
         termination_reason = "setup_timeout"
         cleanup_failed_child(signal.SIGTERM)
+    except SealedCompilerRejection as error:
+        setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        sealed_rejection = error.reason_token
+        if error.facts is not None and sealed_compiler_facts is None:
+            sealed_compiler_facts = error.facts
+        errors.append(f"sealed compiler rejection: {error}")
+        cleanup_failed_child(signal.SIGTERM)
+    except SealedInterpreterRejection as error:
+        setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        sealed_interpreter_rejection = error.reason_token
+        sealed_interpreter_facts = error.facts
+        errors.append(f"sealed interpreter rejection: {error}")
+        cleanup_failed_child(signal.SIGTERM)
     except BaseException as error:
         setup_finished_ns = setup_finished_ns or time.monotonic_ns()
         errors.append(f"supervisor failure: {type(error).__name__}: {error}")
@@ -2314,6 +4017,10 @@ def _run_supervised_impl(
     def classify_terminal(observed_cancel: int | None) -> tuple[str, str, int]:
         if capture_publication_failed:
             return "internal_fault", "artifact_publication_failure", SETUP_FAILURE
+        if sealed_interpreter_rejection is not None:
+            return "internal_fault", sealed_interpreter_rejection, SETUP_FAILURE
+        if sealed_rejection is not None:
+            return "internal_fault", sealed_rejection, SETUP_FAILURE
         if errors:
             return "internal_fault", "supervisor_or_capture_failure", SETUP_FAILURE
         if observed_cancel is not None:
@@ -2359,13 +4066,15 @@ def _run_supervised_impl(
     )
 
     metadata: dict[str, Any] = {
-        "schema": "fln.supervisor/3",
+        "schema": "fln.supervisor/5",
         "stage_id": stage_id,
         "argv": rendered_argv,
         "argv_redacted": had_redaction,
         "cwd": str(cwd),
         "classification": classification,
         "reason_code": reason_code,
+        "sealed_compiler": sealed_compiler_facts,
+        "sealed_interpreter": sealed_interpreter_facts,
         "wrapper_exit": wrapper_exit,
         "child_exit": child_exit,
         "child_signal": child_signal,
@@ -2525,7 +4234,7 @@ def _run_supervised_impl(
         wrapper_exit = int(selected["wrapper_exit"])
     except BaseException as error:
         fallback = {
-            "schema": "fln.supervisor/3",
+            "schema": "fln.supervisor/5",
             "classification": "internal_fault",
             "reason_code": "metadata_publication_failure",
             "metadata_path": str(metadata_path),
@@ -2562,6 +4271,293 @@ def _run_supervised_impl(
     return wrapper_exit
 
 
+def parse_rust_lock(lock_path: Path) -> dict[str, Any]:
+    """Read the pinned Rust rows and the toolchain manifest they govern.
+
+    The channel must agree in both files, and the declared component array is
+    retained for command-specific admission checks. An unreadable component
+    declaration is a setup fault rather than an empty component set.
+    """
+    try:
+        lock_text = lock_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_lock_unreadable", f"cannot read {lock_path}: {error}"
+        ) from error
+    rows: dict[str, str] = {}
+    for line in lock_text.splitlines():
+        line = line.strip()
+        for key in ("rust-nightly", "rust-release", "rust-commit"):
+            prefix = f"{key} "
+            if line.startswith(prefix):
+                rows[key] = line[len(prefix) :].strip()
+    missing = sorted(
+        key for key in ("rust-nightly", "rust-release", "rust-commit") if key not in rows
+    )
+    if missing:
+        raise SealedCompilerRejection(
+            "sealed_compiler_lock_incomplete",
+            f"{lock_path} lacks pinned rust rows: {missing}",
+        )
+    toolchain_toml = lock_path.parent / "rust-toolchain.toml"
+    try:
+        toml_text = toolchain_toml.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_toolchain_toml_unreadable",
+            f"cannot read {toolchain_toml}: {error}",
+        ) from error
+    channel_match = re.search(
+        r'^\s*channel\s*=\s*"([^"]+)"', toml_text, flags=re.MULTILINE
+    )
+    if channel_match is None or channel_match.group(1) != rows["rust-nightly"]:
+        raise SealedCompilerRejection(
+            "sealed_compiler_channel_disagreement",
+            f"rust-toolchain.toml channel {channel_match.group(1) if channel_match else None!r} "
+            f"!= SUITE.lock rust-nightly {rows['rust-nightly']!r}",
+        )
+    try:
+        toolchain_document = tomllib.loads(toml_text)
+    except tomllib.TOMLDecodeError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_components_unreadable",
+            f"rust-toolchain.toml is not valid TOML: {error}",
+        ) from error
+    toolchain_table = toolchain_document.get("toolchain")
+    components = (
+        toolchain_table.get("components")
+        if isinstance(toolchain_table, dict)
+        else None
+    )
+    if (
+        not isinstance(components, list)
+        or not components
+        or not all(isinstance(item, str) and item for item in components)
+        or len(components) != len(set(components))
+    ):
+        raise SealedCompilerRejection(
+            "sealed_compiler_components_unreadable",
+            "rust-toolchain.toml components must be unique non-empty quoted names",
+        )
+    rows["rust-components"] = components
+    return rows
+
+
+def scan_hostile_compiler_env(environ: Mapping[str, str]) -> list[str]:
+    offenders = [name for name in environ if name in HOSTILE_COMPILER_ENV_EXACT]
+    offenders.extend(
+        name
+        for name in environ
+        if name not in SEALED_ENV_OVERRIDDEN
+        and name not in HOSTILE_COMPILER_ENV_EXACT
+        and any(name.startswith(prefix) for prefix in HOSTILE_COMPILER_ENV_PREFIXES)
+    )
+    return sorted(set(offenders))
+
+
+def scan_ancestor_cargo_config(cwd: Path) -> list[str]:
+    """Cargo discovers `.cargo/config{,.toml}` in cwd and every ancestor; any
+    such file would inject configuration beneath the sealed environment."""
+    offenders: list[str] = []
+    node = cwd
+    while True:
+        for name in ("config.toml", "config"):
+            candidate = node / ".cargo" / name
+            if candidate.is_file():
+                offenders.append(str(candidate))
+        if node.parent == node:
+            break
+        node = node.parent
+    return sorted(offenders)
+
+
+def resolve_sealed_toolchain(lock_rows: Mapping[str, Any]) -> dict[str, Any]:
+    """Locate the pinned rustup toolchain and prove its identity: the resolved
+    rustc must report exactly the locked release and commit hash."""
+    machine = platform.machine()
+    triple = SEALED_HOST_TRIPLES.get(machine)
+    if triple is None:
+        raise SealedCompilerRejection(
+            "sealed_compiler_unsupported_host",
+            f"no sealed host triple registered for machine {machine!r}",
+        )
+    rustup_home = Path(os.environ.get("RUSTUP_HOME", "") or Path.home() / ".rustup")
+    toolchain_root = rustup_home / "toolchains" / f"{lock_rows['rust-nightly']}-{triple}"
+    rustc_path = toolchain_root / "bin" / "rustc"
+    cargo_path = toolchain_root / "bin" / "cargo"
+    if not rustc_path.is_file() or not cargo_path.is_file():
+        raise SealedCompilerRejection(
+            "sealed_compiler_toolchain_unresolved",
+            f"pinned toolchain binaries absent under {toolchain_root}",
+        )
+    probe_env = {"PATH": SEALED_PATH_TAIL, "HOME": str(Path.home())}
+    try:
+        probe = subprocess.run(  # ubs:ignore — argv is the SUITE.lock-resolved pinned rustc with a fixed flag, never user input.
+            [str(rustc_path), "-vV"],
+            capture_output=True,
+            text=True,
+            timeout=SEALED_RUSTC_PROBE_TIMEOUT_S,
+            env=probe_env,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_probe_failure", f"rustc -vV probe failed: {error}"
+        ) from error
+    facts = {
+        key.strip(): value.strip()
+        for key, _, value in (
+            line.partition(":") for line in probe.stdout.splitlines() if ":" in line
+        )
+    }
+    release = facts.get("release", "")
+    commit = facts.get("commit-hash", "")
+    if (
+        probe.returncode != 0
+        or release != lock_rows["rust-release"]  # ubs:ignore — public compiler identity, not a secret.
+        or commit != lock_rows["rust-commit"]  # ubs:ignore — public content-integrity digest, not authentication material.
+    ):
+        raise SealedCompilerRejection(
+            "sealed_compiler_identity_mismatch",
+            f"resolved rustc identity release={release!r} commit={commit!r} "
+            f"does not match SUITE.lock release={lock_rows['rust-release']!r} "
+            f"commit={lock_rows['rust-commit']!r} (probe exit {probe.returncode})",
+        )
+    return {
+        "channel": lock_rows["rust-nightly"],
+        "release": release,
+        "commit": commit,
+        "toolchain_root": str(toolchain_root),
+        "rustc_path": str(rustc_path),
+        "cargo_path": str(cargo_path),
+    }
+
+
+def prepare_sealed_cargo(
+    *,
+    argv: Sequence[str],
+    cwd: Path,
+    suite_lock_path: Path,
+    sealed_build_root: Path,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """The compiler-environment sealing step of the evidence envelope: reject
+    hostile channels, prove the pinned toolchain's identity, isolate Cargo
+    home/target for this attempt, rebuild PATH, and rewrite `cargo` to the
+    pinned absolute binary. Returns {argv, env, facts}."""
+    hostile = scan_hostile_compiler_env(environ)
+    if hostile:
+        raise SealedCompilerRejection(
+            "sealed_compiler_hostile_environment",
+            f"hostile compiler channels present: {','.join(hostile)}",
+            facts={"rejected_env": hostile},
+        )
+    ambient_configs = scan_ancestor_cargo_config(cwd)
+    if ambient_configs:
+        raise SealedCompilerRejection(
+            "sealed_compiler_ambient_config",
+            f"cargo config discovery would inject: {','.join(ambient_configs)}",
+            facts={"rejected_configs": ambient_configs},
+        )
+    lock_rows = parse_rust_lock(suite_lock_path)
+    toolchain = resolve_sealed_toolchain(lock_rows)
+    declared_components = list(lock_rows["rust-components"])
+    component_requirement = (
+        ("rustfmt", ("cargo-fmt", "rustfmt"))
+        if len(argv) >= 2 and argv[0] == "cargo" and argv[1] == "fmt"
+        else None
+    )
+    if component_requirement is not None:
+        component, executables = component_requirement
+        component_facts: dict[str, Any] = {
+            **toolchain,
+            "declared_components": declared_components,
+            "required_component": component,
+            "required_component_executables": list(executables),
+        }
+        if component not in declared_components:
+            raise SealedCompilerRejection(
+                "sealed_compiler_component_undeclared",
+                f"cargo fmt requires {component}, which rust-toolchain.toml does not declare",
+                facts=component_facts,
+            )
+        executable_paths = [
+            Path(toolchain["toolchain_root"]) / "bin" / executable
+            for executable in executables
+        ]
+        component_facts["required_executable_paths"] = [
+            str(path) for path in executable_paths
+        ]
+        missing_executables = [
+            path.name
+            for path in executable_paths
+            if not path.is_file() or not os.access(path, os.X_OK)
+        ]
+        if missing_executables:
+            raise SealedCompilerRejection(
+                "sealed_compiler_component_absent",
+                f"declared component {component} lacks executable(s) "
+                f"{','.join(missing_executables)} under {toolchain['toolchain_root']}/bin",
+                facts=component_facts,
+            )
+        toolchain.update(
+            {
+                "required_component": component,
+                "required_component_executables": list(executables),
+                "required_executable_paths": [
+                    str(path) for path in executable_paths
+                ],
+            }
+        )
+    cargo_home = sealed_build_root / "cargo-home"
+    target_dir = sealed_build_root / "target"
+    try:
+        cargo_home.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_build_root_unavailable",
+            f"cannot create sealed build state under {sealed_build_root}: {error}",
+        ) from error
+    for name in ("config.toml", "config"):
+        if (cargo_home / name).exists():
+            raise SealedCompilerRejection(
+                "sealed_compiler_ambient_config",
+                f"sealed cargo home unexpectedly carries {name}",
+            )
+    sealed_env: dict[str, str] = {
+        name: environ[name]
+        for name in environ
+        if name in SEALED_ENV_ALLOWLIST or name.startswith("LC_")
+    }
+    sealed_env["PATH"] = f"{toolchain['toolchain_root']}/bin:{SEALED_PATH_TAIL}"
+    sealed_env["CARGO_HOME"] = str(cargo_home)
+    sealed_env["CARGO_TARGET_DIR"] = str(target_dir)
+    sealed_env["RUSTC"] = toolchain["rustc_path"]
+    argv = list(argv)
+    original_argv0 = argv[0] if argv else ""
+    if argv and argv[0] == "cargo":
+        argv[0] = toolchain["cargo_path"]
+    facts = {
+        **toolchain,
+        "declared_components": declared_components,
+        "cargo_home": str(cargo_home),
+        "target_dir": str(target_dir),
+        "admitted_env": sorted(sealed_env),
+        "overridden_env": sorted(
+            {
+                name
+                for name in environ
+                if name in SEALED_ENV_OVERRIDDEN
+            }
+        ),
+        "rejected_env": [],
+        "original_argv0": original_argv0,
+        "effective_argv0": argv[0] if argv else "",
+    }
+    return {"argv": argv, "env": sealed_env, "facts": facts}
+
+
 def run_supervised(
     *,
     argv: Sequence[str],
@@ -2589,6 +4585,9 @@ def run_supervised(
     test_before_release_delay_ms: int = 0,
     test_gate_mode: str = "normal",
     test_fault_point: str = "none",
+    sealed_cargo: bool = False,
+    suite_lock_path: Path | None = None,
+    sealed_build_root: Path | None = None,
 ) -> int:
     """Run one isolated supervisor while restoring all caller process state."""
     watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
@@ -2645,6 +4644,9 @@ def run_supervised(
             test_before_release_delay_ms=test_before_release_delay_ms,
             test_gate_mode=test_gate_mode,
             test_fault_point=test_fault_point,
+            sealed_cargo=sealed_cargo,
+            suite_lock_path=suite_lock_path,
+            sealed_build_root=sealed_build_root,
         )
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -2662,6 +4664,7 @@ def run_supervised(
 def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
     data, _size, digest = stable_file_facts(path, max_bytes=MAX_LOG_BYTES)
     records: list[dict[str, Any]] = []
+    parity_symbols: frozenset[str] | None = None
     for number, raw in enumerate(data.splitlines(keepends=True), 1):
         if len(raw) > MAX_RECORD_BYTES:
             raise EvidenceError(f"{path}:{number}: record too large")
@@ -2670,6 +4673,14 @@ def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
         value = parse_json(raw, subject=f"{path}:{number}")
         if not isinstance(value, dict):
             raise EvidenceError(f"{path}:{number}: record is not an object")
+        if "parity_ledger_row" in value:
+            if parity_symbols is None:
+                parity_symbols = load_parity_ledger_symbols()
+            validate_parity_ledger_reference(
+                value["parity_ledger_row"],
+                subject=f"{path}:{number}",
+                symbols=parity_symbols,
+            )
         records.append(value)
     if not records:
         raise EvidenceError(f"NDJSON is empty: {path}")
@@ -2679,6 +4690,1987 @@ def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
 def load_ndjson(path: Path) -> list[dict[str, Any]]:
     records, _digest = load_ndjson_snapshot(path)
     return records
+
+
+def render_check_human(records: Sequence[Mapping[str, Any]]) -> bytes:
+    if not records:
+        raise EvidenceError("cannot render an empty check run")
+    if any(record.get("schema") != "fln.check/2" for record in records):
+        raise EvidenceError("human renderer accepts only fln.check/2 records")
+    lines = [f"{CHECK_HUMAN_SCHEMA} records={len(records)}\n"]
+    for record in records:
+        event = record.get("event")
+        if event == "run_start":
+            subject = record.get("scenario")
+            outcome = "started"
+            reason = "none"
+        elif event == "stage":
+            subject = record.get("stage")
+            outcome = record.get("outcome")
+            reason = record.get("reason_code")
+        elif event == "self_test":
+            subject = record.get("stage")
+            outcome = "pass" if record.get("ok") is True else "fail"
+            reason = "self_test_result"
+        elif event == "run_end":
+            subject = record.get("scenario")
+            outcome = record.get("verdict")
+            reason = record.get("reason_code")
+        else:
+            raise EvidenceError(f"human renderer rejects event {event!r}")
+        values = {
+            "event": event,
+            "outcome": outcome,
+            "reason": reason,
+            "subject": subject,
+        }
+        if not all(isinstance(value, str) and value for value in values.values()):
+            raise EvidenceError("human renderer received an incomplete event")
+        record_digest = hashlib.sha256(canonical_json(record)).hexdigest()
+        lines.append(
+            " ".join(
+                (
+                    f"sequence={record.get('sequence')}",
+                    *(
+                        f"{key}={json.dumps(value, ensure_ascii=True)}"
+                        for key, value in values.items()
+                    ),
+                    f"record_sha256={record_digest}",
+                )
+            )
+            + "\n"
+        )
+    return "".join(lines).encode("utf-8")
+
+
+def validate_check_human(run_path: Path, human_path: Path) -> dict[str, Any]:
+    run_path = lexical_absolute(run_path)
+    human_path = lexical_absolute(human_path)
+    records, run_digest = load_ndjson_snapshot(run_path)
+    expected = render_check_human(records)
+    actual, size, digest = stable_file_facts(human_path, max_bytes=MAX_LOG_BYTES)
+    if not hmac.compare_digest(actual, expected):
+        raise EvidenceError(f"{human_path}: human/NDJSON event rendering differs")
+    return {
+        "schema": "fln.validation/1",
+        "validator": CHECK_HUMAN_SCHEMA,
+        "subject": human_path.name,
+        "valid": True,
+        "records": len(records),
+        "bytes": size,
+        "sha256": digest,
+        "run_sha256": run_digest,
+    }
+
+
+def verification_adoption_hash(ids: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-manifest.adoption.ids/1")
+    digest.update(b"\0")
+    for bead_id in ids:
+        encoded = bead_id.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_adoption_authority_hash(
+    ids: Sequence[str], open_ids: Sequence[str]
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-manifest.adoption-authority/1")
+    digest.update(b"\0")
+    for label, values in ((b"ids", ids), (b"open", open_ids)):
+        digest.update(len(label).to_bytes(8, "little"))
+        digest.update(label)
+        digest.update(len(values).to_bytes(8, "little"))
+        for bead_id in values:
+            encoded = bead_id.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def require_manifest_string_array(
+    path: Path,
+    record_number: int,
+    record: Mapping[str, Any],
+    field: str,
+    *,
+    nonempty: bool,
+) -> list[str]:
+    value = record.get(field)
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: {field} must be a string array"
+        )
+    if len(value) != len(set(value)) or value != sorted(value):
+        raise EvidenceError(
+            f"{path}:{record_number}: {field} must be sorted and duplicate-free"
+        )
+    if nonempty and not value:
+        raise EvidenceError(f"{path}:{record_number}: {field} must not be empty")
+    return value
+
+
+def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
+    """Status, closure instant, and comment instants — the tracker facts a row is judged against.
+
+    Comment timestamps are carried raw and validated only where a row cites them:
+    a malformed instant on a comment nobody cites is not this validator's
+    question, and refusing on it would make an unrelated tracker anomaly block
+    every gate.
+    """
+    records, _digest = load_ndjson_snapshot(path)
+    beads: dict[str, dict[str, Any]] = {}
+    for number, record in enumerate(records, 1):
+        bead_id = record.get("id")
+        status = record.get("status")
+        if not isinstance(bead_id, str) or not bead_id:
+            raise EvidenceError(f"{path}:{number}: bead id is missing")
+        if status not in {"open", "in_progress", "closed", "tombstone"}:
+            raise EvidenceError(
+                f"{path}:{number}: bead {bead_id!r} has unsupported status {status!r}"
+            )
+        if bead_id in beads:
+            raise EvidenceError(f"{path}:{number}: duplicate bead id {bead_id!r}")
+        raw_comments = record.get("comments")
+        if raw_comments is None:
+            raw_comments = []
+        if not isinstance(raw_comments, list):
+            raise EvidenceError(
+                f"{path}:{number}: bead {bead_id!r} has a non-list comments field"
+            )
+        comments: dict[int, Any] = {}
+        for comment in raw_comments:
+            if not isinstance(comment, dict):
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has a non-object comment"
+                )
+            comment_id = comment.get("id")
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool):
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has a comment without an "
+                    f"integer id"
+                )
+            if comment_id in comments:
+                raise EvidenceError(
+                    f"{path}:{number}: bead {bead_id!r} has duplicate comment id "
+                    f"{comment_id}"
+                )
+            comments[comment_id] = comment.get("created_at")
+        beads[bead_id] = {
+            "status": status,
+            "closed_at": record.get("closed_at"),
+            "comments": comments,
+        }
+    return beads
+
+
+def utc_second_prefix(label: str, value: Any) -> str:
+    """The whole-second UTC prefix of an instant, which orders chronologically as a string.
+
+    Closures carry nanoseconds (`...T20:50:06.900870108Z`) and bead comments carry
+    whole seconds (`...T20:50:06Z`), so the two are comparable only at second
+    granularity. Comparing the raw strings is NOT chronological — `'Z' > '.'`, so a
+    coarse instant sorts after a finer one inside the same second — while comparing
+    fixed-width `YYYY-MM-DDTHH:MM:SS` prefixes is. Truncation also decides the
+    boundary case in the only direction that is not a wall: a comment written in
+    the same second as the close counts as after it, because refusing it would
+    redden a correct one-pass close on a one-second race.
+    """
+    if not isinstance(value, str):
+        raise EvidenceError(f"{label} is missing")
+    match = UTC_INSTANT_PATTERN.match(value)
+    if match is None:
+        raise EvidenceError(f"{label} is not a UTC instant: {value!r}")
+    return match.group(1)
+
+
+def closure_citation_diagnosis(
+    bead_id: str,
+    bead: Mapping[str, Any],
+    closed_second: str,
+    artifacts: Iterable[str],
+    label: str,
+) -> tuple[int | None, list[str]]:
+    """The cited comment that postdates this closure, else why each citation cannot bind it.
+
+    Comments are resolved inside the cited bead's own record, never against a
+    global id space: comment ids are globally monotonic here, so a lookup that
+    ignored the bead would let one bead's post-close comment certify another
+    bead's closure.
+    """
+    comments: Mapping[int, Any] = bead["comments"]
+    rejected: list[str] = []
+    for artifact in artifacts:
+        parts = artifact.split(":")
+        if len(parts) != 3 or parts[0] != CLOSURE_CITATION_PREFIX:
+            continue
+        _, cited_bead, cited_id = parts
+        if cited_bead != bead_id:
+            rejected.append(
+                f"{artifact} (cites bead {cited_bead!r}, not this row's bead)"
+            )
+            continue
+        if not re.fullmatch(r"[0-9]+", cited_id):
+            rejected.append(f"{artifact} (comment id is not an integer)")
+            continue
+        comment_id = int(cited_id)
+        if comment_id not in comments:
+            rejected.append(
+                f"{artifact} (no such comment on {bead_id} in the tracker)"
+            )
+            continue
+        created_second = utc_second_prefix(
+            f"{label}: bead {bead_id!r} comment {comment_id} created_at",
+            comments[comment_id],
+        )
+        if created_second < closed_second:
+            rejected.append(
+                f"{artifact} (created {created_second}Z, before the close)"
+            )
+            continue
+        return comment_id, rejected
+    return None, rejected
+
+
+def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
+    """Derive lifecycle state from the tracker; coverage rows never declare it."""
+    if bead_status == "open":
+        return "blocked" if skip == "blocked" else "planned"
+    if bead_status == "in_progress":
+        return "active"
+    if bead_status in {"closed", "tombstone"}:
+        return "complete"
+    raise EvidenceError(
+        f"cannot derive verification coverage from bead status {bead_status!r}"
+    )
+
+
+def verification_legacy_pair_id(bead_id: str, artifact: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-pair/1")
+    digest.update(b"\0")
+    for value in (bead_id, artifact):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_legacy_adoption_projection_hash(
+    pair_ids: Sequence[str],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-adoption.ids/1")
+    digest.update(b"\0")
+    for pair_id in pair_ids:
+        encoded = pair_id.encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_legacy_adoption_authority_hash(
+    migration_commit: str, pair_ids: Sequence[str]
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.legacy-adoption-authority/1")
+    digest.update(b"\0")
+    commit_bytes = migration_commit.encode("ascii")
+    digest.update(len(commit_bytes).to_bytes(8, "little"))
+    digest.update(commit_bytes)
+    for pair_id in pair_ids:
+        encoded = pair_id.encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def verification_receipt_content_address(record: Mapping[str, Any]) -> str:
+    payload = dict(record)
+    payload.pop("receipt", None)
+    digest = hashlib.sha256()
+    digest.update(b"fln.verification-evidence.receipt/1")
+    digest.update(b"\0")
+    digest.update(canonical_json(payload))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def require_sha256_identity(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value
+    ) is None:
+        raise EvidenceError(f"{label} is not a canonical SHA-256 identity")
+    return value
+
+
+def require_exact_object_keys(
+    path: Path,
+    number: int,
+    value: Any,
+    expected: set[str],
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{path}:{number}: {label} must be an object")
+    if set(value) != expected:
+        raise EvidenceError(
+            f"{path}:{number}: {label} shape differs: "
+            f"missing={sorted(expected - set(value))!r} "
+            f"extra={sorted(set(value) - expected)!r}"
+        )
+    return value
+
+
+def verification_receipt_execution_identity_kind(identity: str) -> str | None:
+    """Classify the only execution identities a receipt may carry.
+
+    ``stage``, ``step``, and ``self_test`` identities are emitted as distinct
+    events by the structured runner.  A ``test`` identity names a libtest
+    function, whose ``ok`` line proves only that it returned.  The latter may
+    therefore be retained by a bundle-only inventory but cannot inherit
+    structured-run-log execution authority.
+    """
+    for kind in ("stage", "step", "self_test"):
+        if identity.startswith(f"{kind}:") and identity.removeprefix(
+            f"{kind}:"
+        ):
+            return kind
+    if verification_test_function_claim(identity) is not None:
+        return "test"
+    return None
+
+
+def validate_verification_receipt_record(
+    path: Path,
+    number: int,
+    record: Mapping[str, Any],
+    bead_states: Mapping[str, Mapping[str, Any]],
+) -> str:
+    expected_keys = {
+        "schema",
+        "kind",
+        "receipt",
+        "producer",
+        "outcome",
+        "source",
+        "execution",
+        "reference",
+    }
+    if set(record) != expected_keys:
+        raise EvidenceError(
+            f"{path}:{number}: receipt shape differs: "
+            f"missing={sorted(expected_keys - set(record))!r} "
+            f"extra={sorted(set(record) - expected_keys)!r}"
+        )
+    if (
+        record.get("schema") != VERIFICATION_EVIDENCE_RECEIPT_SCHEMA
+        or record.get("kind") != "receipt"
+    ):
+        raise EvidenceError(f"{path}:{number}: invalid receipt identity")
+    receipt_id = require_sha256_identity(
+        record.get("receipt"), label=f"{path}:{number}: receipt"
+    )
+
+    producer = require_exact_object_keys(
+        path,
+        number,
+        record.get("producer"),
+        {
+            "tool",
+            "run_schema",
+            "run_id",
+            "bead",
+            "scenario",
+            "producing_commit",
+            "commit_binding",
+        },
+        label="receipt producer",
+    )
+    if producer.get("tool") != (
+        "scripts/evidence.py:promote-verification-receipt/1"
+    ):
+        raise EvidenceError(f"{path}:{number}: receipt producer tool differs")
+    if producer.get("run_schema") not in RUN_SCHEMAS:
+        raise EvidenceError(f"{path}:{number}: receipt run schema is unsupported")
+    for field in ("run_id", "bead", "scenario"):
+        if not isinstance(producer.get(field), str) or not producer[field]:
+            raise EvidenceError(
+                f"{path}:{number}: receipt producer {field} is missing"
+            )
+    if producer["bead"] not in bead_states:
+        raise EvidenceError(
+            f"{path}:{number}: receipt has orphan bead {producer['bead']!r}"
+        )
+    commit_binding = producer.get("commit_binding")
+    producing_commit = producer.get("producing_commit")
+    if commit_binding not in {
+        "recorded",
+        "operator_attested_legacy",
+        "unbound",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt commit binding is unsupported"
+        )
+    if commit_binding == "unbound":
+        if producing_commit != "unavailable":
+            raise EvidenceError(
+                f"{path}:{number}: unbound receipt claims a producing commit"
+            )
+    elif not isinstance(producing_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}", producing_commit
+    ) is None:
+        raise EvidenceError(
+            f"{path}:{number}: bound receipt lacks a full producing commit"
+        )
+
+    outcome = require_exact_object_keys(
+        path,
+        number,
+        record.get("outcome"),
+        {
+            "verdict",
+            "process_exit",
+            "reason_code",
+            "input_root",
+            "final_root",
+            "governed_state_static",
+            "governed_scope",
+            "governed_set",
+        },
+        label="receipt outcome",
+    )
+    if outcome.get("verdict") not in {
+        "pass",
+        "fail",
+        "inconclusive",
+        "internal_fault",
+        "cancelled",
+    }:
+        raise EvidenceError(f"{path}:{number}: receipt verdict is unsupported")
+    process_exit = outcome.get("process_exit")
+    if (
+        not isinstance(process_exit, int)
+        or isinstance(process_exit, bool)
+        or process_exit < 0
+        or process_exit > 255
+    ):
+        raise EvidenceError(
+            f"{path}:{number}: receipt process_exit must be an exit byte"
+        )
+    if not isinstance(outcome.get("reason_code"), str) or not outcome[
+        "reason_code"
+    ]:
+        raise EvidenceError(f"{path}:{number}: receipt reason_code is missing")
+    input_root = require_sha256_identity(
+        outcome.get("input_root"),
+        label=f"{path}:{number}: receipt input_root",
+    )
+    final_root = require_sha256_identity(
+        outcome.get("final_root"),
+        label=f"{path}:{number}: receipt final_root",
+    )
+    if not isinstance(outcome.get("governed_state_static"), bool):
+        raise EvidenceError(
+            f"{path}:{number}: receipt governed_state_static must be boolean"
+        )
+    # ubs:ignore — public state Boolean and public content roots, not secrets.
+    if outcome["governed_state_static"] != hmac.compare_digest(input_root, final_root):
+        raise EvidenceError(
+            f"{path}:{number}: receipt static-state claim disagrees with roots"
+        )
+    if outcome.get("governed_scope") not in {
+        "full_repository",
+        "lane_declared_subset",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt governed scope is untyped"
+        )
+    governed_set = outcome.get("governed_set")
+    if commit_binding == "recorded":
+        require_sha256_identity(
+            governed_set,
+            label=f"{path}:{number}: recorded governed set",
+        )
+    elif governed_set != "unavailable":
+        require_sha256_identity(
+            governed_set,
+            label=f"{path}:{number}: legacy governed set",
+        )
+    if outcome["verdict"] == "pass":
+        if process_exit != PASS or not outcome["governed_state_static"]:
+            raise EvidenceError(
+                f"{path}:{number}: passing receipt lacks a static successful run"
+            )
+
+    source = require_exact_object_keys(
+        path,
+        number,
+        record.get("source"),
+        {
+            "bundle_commit_sha256",
+            "manifest_sha256",
+            "manifest_digest_sha256",
+            "run_log_sha256",
+        },
+        label="receipt source",
+    )
+    for field in source:
+        require_sha256_identity(
+            source[field], label=f"{path}:{number}: receipt source {field}"
+        )
+
+    execution = require_exact_object_keys(
+        path,
+        number,
+        record.get("execution"),
+        {
+            "authority",
+            "executed",
+            "expected_failure",
+            "typed_skip",
+            "not_run",
+        },
+        label="receipt execution",
+    )
+    if execution.get("authority") not in {
+        "structured_run_log",
+        "bundle_only",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt execution authority is unsupported"
+        )
+    disposition_fields = (
+        "executed",
+        "expected_failure",
+        "typed_skip",
+        "not_run",
+    )
+    dispositions = {
+        field: require_manifest_string_array(
+            path, number, execution, field, nonempty=False
+        )
+        for field in disposition_fields
+    }
+    seen_dispositions: dict[str, str] = {}
+    for field, identities in dispositions.items():
+        for identity in identities:
+            identity_kind = verification_receipt_execution_identity_kind(
+                identity
+            )
+            if identity_kind is None:
+                raise EvidenceError(
+                    f"{path}:{number}: execution identity {identity!r} "
+                    "has an unsupported kind"
+                )
+            if (
+                # ubs:ignore — public evidence-authority enum, not secret material.
+                execution["authority"]
+                == "structured_run_log"
+                and identity_kind == "test"
+            ):
+                raise EvidenceError(
+                    f"{path}:{number}: libtest identity {identity!r} cannot "
+                    "carry structured-run-log execution authority; a passing "
+                    "libtest disposition does not prove the function reached "
+                    "its assertion-bearing end"
+                )
+            prior = seen_dispositions.setdefault(identity, field)
+            if prior != field:
+                raise EvidenceError(
+                    f"{path}:{number}: execution identity {identity!r} has "
+                    f"both {prior} and {field} dispositions"
+                )
+    if not seen_dispositions:
+        raise EvidenceError(f"{path}:{number}: receipt execution inventory is empty")
+    # ubs:ignore — public evidence-authority enum, not secret material.
+    if execution["authority"] == "bundle_only" and (
+        execution["executed"] or execution["expected_failure"]
+    ):
+        raise EvidenceError(
+            f"{path}:{number}: bundle-only receipt claims per-unit execution"
+        )
+
+    reference = require_exact_object_keys(
+        path,
+        number,
+        record.get("reference"),
+        {"status", "binding_sha256"},
+        label="receipt reference",
+    )
+    if reference.get("status") not in {
+        "installed_and_bound",
+        "absent",
+        "not_applicable",
+        "unobserved",
+    }:
+        raise EvidenceError(
+            f"{path}:{number}: receipt Reference status is unsupported"
+        )
+    if reference["status"] == "installed_and_bound":
+        require_sha256_identity(
+            reference.get("binding_sha256"),
+            label=f"{path}:{number}: receipt Reference binding",
+        )
+    elif reference.get("binding_sha256") != "not_applicable":
+        raise EvidenceError(
+            f"{path}:{number}: unbound Reference status claims a binding"
+        )
+
+    expected_receipt = verification_receipt_content_address(record)
+    if not hmac.compare_digest(receipt_id, expected_receipt):
+        raise EvidenceError(
+            f"{path}:{number}: receipt content address differs"
+        )
+    return receipt_id
+
+
+def self_test_verification_receipt_execution_authority() -> dict[str, str]:
+    """Exercise the libtest disposition boundary without a filesystem fixture."""
+    sha256 = f"sha256:{'1' * 64}"
+    bead = "fln-log-derived-disposition-not-execution-xes2"
+    path = Path("verification-receipt-execution-authority-self-test")
+    base: dict[str, Any] = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "receipt": f"sha256:{'0' * 64}",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": "fln.check/2",
+            "run_id": "xes2-focused",
+            "bead": bead,
+            "scenario": "quality_gate",
+            "producing_commit": "1" * 40,
+            "commit_binding": "recorded",
+        },
+        "outcome": {
+            "verdict": "pass",
+            "process_exit": PASS,
+            "reason_code": "all_obligations_passed",
+            "input_root": sha256,
+            "final_root": sha256,
+            "governed_state_static": True,
+            "governed_scope": "lane_declared_subset",
+            "governed_set": sha256,
+        },
+        "source": {
+            "bundle_commit_sha256": sha256,
+            "manifest_sha256": sha256,
+            "manifest_digest_sha256": sha256,
+            "run_log_sha256": sha256,
+        },
+        "execution": {
+            "authority": "structured_run_log",
+            "executed": ["stage:cargo-test"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "reference": {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        },
+    }
+    bead_states = {bead: {}}
+
+    def sealed(record: dict[str, Any]) -> dict[str, Any]:
+        record["receipt"] = verification_receipt_content_address(record)
+        return record
+
+    validate_verification_receipt_record(
+        path, 1, sealed(base), bead_states
+    )
+
+    libtest_identity = (
+        "test:fln-conformance::kernel_replay::"
+        "prelude_replays_through_the_kernel"
+    )
+    log_derived_test_mutant = parse_json(
+        canonical_json(base),
+        subject="log-derived libtest execution mutant",
+    )
+    log_derived_test_mutant["execution"]["executed"] = [libtest_identity]
+    try:
+        validate_verification_receipt_record(
+            path,
+            2,
+            sealed(log_derived_test_mutant),
+            bead_states,
+        )
+    except EvidenceError as error:
+        if (
+            "cannot carry structured-run-log execution authority"
+            not in str(error)
+        ):
+            raise EvidenceError(
+                "log-derived libtest mutant produced the wrong failure"
+            ) from error
+    else:
+        raise EvidenceError(
+            "a passing libtest disposition acquired execution authority"
+        )
+
+    bundle_only_test_inventory = parse_json(
+        canonical_json(base),
+        subject="bundle-only libtest inventory control",
+    )
+    bundle_only_test_inventory["execution"] = {
+        "authority": "bundle_only",
+        "executed": [],
+        "expected_failure": [],
+        "typed_skip": [],
+        "not_run": [libtest_identity],
+    }
+    validate_verification_receipt_record(
+        path,
+        3,
+        sealed(bundle_only_test_inventory),
+        bead_states,
+    )
+    return {
+        "bundle_only_test_inventory": "accepted",
+        "log_derived_libtest_execution": "refused",
+        "structured_stage_execution": "accepted",
+    }
+
+
+def load_verification_evidence_registry(
+    path: Path,
+    bead_states: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_legacy_authority_hash: str | None = (
+        VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH
+    ),
+) -> dict[str, Any]:
+    path = lexical_absolute(path)
+    if expected_legacy_authority_hash is None:
+        raise EvidenceError(
+            f"{path}: verification evidence registry exists before its "
+            "legacy adoption authority is frozen"
+        )
+    records, digest = load_ndjson_snapshot(path)
+    header = records[0]
+    header_keys = {
+        "schema",
+        "kind",
+        "source",
+        "projection",
+        "hash_algorithm",
+        "hash_preimage",
+        "migration_commit",
+        "adoption_record_count",
+        "adoption_projection_hash",
+        "adoption_pair_ids",
+        "record_count",
+        "receipt_count",
+        "target_artifact_ceiling",
+    }
+    if set(header) != header_keys:
+        raise EvidenceError(
+            f"{path}: registry header shape differs: "
+            f"missing={sorted(header_keys - set(header))!r} "
+            f"extra={sorted(set(header) - header_keys)!r}"
+        )
+    if (
+        header.get("schema") != VERIFICATION_EVIDENCE_REGISTRY_SCHEMA
+        or header.get("kind") != "registry"
+        or header.get("source") != VERIFICATION_MANIFEST_PATH
+        or header.get("projection") != "exact-terminal-artifact-pairs-v1"
+        or header.get("hash_algorithm") != "sha256"
+        or header.get("hash_preimage")
+        != "fln.verification-evidence.legacy-pair/1+nul+"
+        "u64le-length-prefixed-bead+artifact"
+    ):
+        raise EvidenceError(f"{path}: invalid registry authority header")
+    migration_commit = header.get("migration_commit")
+    if not isinstance(migration_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}", migration_commit
+    ) is None:
+        raise EvidenceError(f"{path}: migration commit is not a full object id")
+    adoption_pair_ids = require_manifest_string_array(
+        path, 1, header, "adoption_pair_ids", nonempty=False
+    )
+    if any(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", pair_id) is None
+        for pair_id in adoption_pair_ids
+    ):
+        raise EvidenceError(f"{path}: adoption pair id is malformed")
+    if (
+        not isinstance(header.get("adoption_record_count"), int)
+        or isinstance(header["adoption_record_count"], bool)
+        or header["adoption_record_count"] != len(adoption_pair_ids)
+    ):
+        raise EvidenceError(f"{path}: adoption record count is stale")
+    expected_projection_hash = (
+        verification_legacy_adoption_projection_hash(adoption_pair_ids)
+    )
+    if not hmac.compare_digest(
+        str(header.get("adoption_projection_hash")),
+        expected_projection_hash,
+    ):
+        raise EvidenceError(f"{path}: adoption projection hash is stale")
+    authority_hash = verification_legacy_adoption_authority_hash(
+        migration_commit, adoption_pair_ids
+    )
+    if not hmac.compare_digest(
+        authority_hash, expected_legacy_authority_hash
+    ):
+        raise EvidenceError(
+            f"{path}: legacy adoption authority differs from the frozen migration"
+        )
+    if (
+        not isinstance(header.get("record_count"), int)
+        or isinstance(header["record_count"], bool)
+        or header["record_count"] != len(records) - 1
+    ):
+        raise EvidenceError(f"{path}: registry record count is stale")
+    if header.get("target_artifact_ceiling") != 0:
+        raise EvidenceError(f"{path}: target artifact ceiling must remain zero")
+
+    adopted = set(adoption_pair_ids)
+    legacy_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    legacy_pair_ids: set[str] = set()
+    receipts: dict[str, Mapping[str, Any]] = {}
+    order: list[tuple[int, str, str]] = []
+    receipt_count = 0
+    for number, record in enumerate(records[1:], 2):
+        kind = record.get("kind")
+        if kind == "legacy-artifact":
+            expected_keys = {
+                "schema",
+                "kind",
+                "pair_id",
+                "bead",
+                "artifact",
+                "classification",
+                "tracking_bead",
+            }
+            if set(record) != expected_keys:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row shape differs"
+                )
+            if record.get("schema") != VERIFICATION_EVIDENCE_REGISTRY_SCHEMA:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row schema differs"
+                )
+            bead_id = record.get("bead")
+            artifact = record.get("artifact")
+            if (
+                not isinstance(bead_id, str)
+                or not bead_id
+                or not isinstance(artifact, str)
+                or not artifact
+            ):
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair identity is missing"
+                )
+            pair_id = verification_legacy_pair_id(bead_id, artifact)
+            if not hmac.compare_digest(str(record.get("pair_id")), pair_id):
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair content address differs"
+                )
+            if pair_id not in adopted:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy pair was not present at migration"
+                )
+            classification = record.get("classification")
+            if classification not in VERIFICATION_LEGACY_CLASSIFICATIONS:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy classification is unsupported"
+                )
+            if record.get("tracking_bead") != VERIFICATION_LEGACY_TRACKING_BEAD:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy debt has the wrong tracking bead"
+                )
+            state = bead_states.get(bead_id)
+            if state is None:
+                raise EvidenceError(
+                    f"{path}:{number}: legacy row has orphan bead {bead_id!r}"
+                )
+            if state["status"] not in {"closed", "tombstone"}:
+                raise EvidenceError(
+                    f"{path}:{number}: nonterminal bead consumes legacy debt"
+                )
+            pair = (bead_id, artifact)
+            if pair in legacy_by_pair or pair_id in legacy_pair_ids:
+                raise EvidenceError(
+                    f"{path}:{number}: duplicate legacy artifact pair"
+                )
+            legacy_by_pair[pair] = dict(record)
+            legacy_pair_ids.add(pair_id)
+            order.append((0, bead_id, artifact))
+        elif kind == "receipt":
+            receipt_id = validate_verification_receipt_record(
+                path, number, record, bead_states
+            )
+            if receipt_id in receipts:
+                raise EvidenceError(
+                    f"{path}:{number}: duplicate verification receipt"
+                )
+            receipts[receipt_id] = record
+            receipt_count += 1
+            order.append((1, receipt_id, ""))
+        else:
+            raise EvidenceError(
+                f"{path}:{number}: unknown registry row kind {kind!r}"
+            )
+    if order != sorted(order):
+        raise EvidenceError(
+            f"{path}: rows must be legacy-then-receipt canonical order"
+        )
+    if (
+        not isinstance(header.get("receipt_count"), int)
+        or isinstance(header["receipt_count"], bool)
+        or header["receipt_count"] != receipt_count
+    ):
+        raise EvidenceError(f"{path}: receipt count is stale")
+    return {
+        "path": path,
+        "sha256": digest,
+        "migration_commit": migration_commit,
+        "adoption_pair_ids": adopted,
+        "legacy_by_pair": legacy_by_pair,
+        "receipts": receipts,
+    }
+
+
+def verification_git_index_snapshot(
+    root: Path,
+) -> tuple[str, dict[str, str]]:
+    data = run_git(
+        root,
+        ["ls-files", "--stage", "-z"],
+        subject="verification artifact tracked-file inventory",
+    )
+    digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+    entries = split_git_nul(
+        data, subject="verification artifact tracked-file inventory"
+    )
+    modes: dict[str, str] = {}
+    for entry in entries:
+        metadata, separator, path = entry.partition("\t")
+        parts = metadata.split(" ")
+        if separator != "\t" or len(parts) != 3 or not path:
+            raise EvidenceError(
+                "verification artifact tracked-file inventory is malformed"
+            )
+        mode, _object_id, stage = parts
+        if stage != "0":
+            raise EvidenceError(
+                f"verification artifact path {path!r} is unmerged"
+            )
+        if path in modes:
+            raise EvidenceError(
+                f"verification artifact inventory repeats {path!r}"
+            )
+        modes[path] = mode
+    return digest, modes
+
+
+def verification_git_path_is_ignored(root: Path, path: str) -> bool:
+    data = run_git(
+        root,
+        ["check-ignore", "--no-index", "--", path],
+        subject=f"verification artifact ignore classification for {path!r}",
+        accepted_exits={0, 1},
+    )
+    if not data:
+        return False
+    try:
+        ignored = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"verification artifact ignore classification for {path!r} "
+            "returned non-UTF-8 output"
+        ) from error
+    if ignored != f"{path}\n":
+        raise EvidenceError(
+            f"verification artifact ignore classification for {path!r} "
+            "returned a different path"
+        )
+    return True
+
+
+def verification_artifact_path_token(artifact: str) -> str | None:
+    if artifact.startswith("repo-file:"):
+        return artifact.removeprefix("repo-file:")
+    if ":" in artifact:
+        return None
+    return artifact
+
+
+def verification_test_function_claim(
+    artifact: str,
+) -> tuple[str, str, str] | None:
+    """Parse the stable join key resolved by fln-conformance's execution guard.
+
+    This parser establishes syntax, not execution.  The Rust-side join remains
+    authoritative for resolving the package, target, and exact libtest
+    function and for deciding whether CI runs it.  ``split(..., 2)`` is
+    deliberate: a lib-target test path may itself contain ``::`` components.
+    """
+    if not artifact.startswith("test:"):
+        return None
+    parts = artifact.removeprefix("test:").split("::", 2)
+    if (
+        len(parts) != 3
+        or any(not part for part in parts)
+        or parts[2].startswith("::")
+    ):
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def verification_path_lexical_classification(path: str) -> str | None:
+    if Path(path).is_absolute():
+        return "absolute_path"
+    if (
+        not path
+        or "\\" in path
+        or path.startswith("./")
+        or "//" in path
+        or any(component in {"", ".", ".."} for component in path.split("/"))
+    ):
+        return "traversal_path"
+    if any(character in path for character in "*?["):
+        return "glob"
+    if path == "target" or path.startswith("target/"):
+        return "target_path"
+    return None
+
+
+def verification_path_object_classification(
+    root: Path,
+    path: str,
+    *,
+    tracked_modes: Mapping[str, str],
+    ignored_paths: set[str],
+) -> str:
+    mode = tracked_modes.get(path)
+    current = root
+    components = path.split("/")
+    for index, component in enumerate(components):
+        current /= component
+        try:
+            object_mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return "ignored" if path in ignored_paths else "missing"
+        if stat.S_ISLNK(object_mode):
+            return "symlink"
+        if index != len(components) - 1:
+            if not stat.S_ISDIR(object_mode):
+                return "special"
+            continue
+        if stat.S_ISDIR(object_mode):
+            return "directory"
+        if not stat.S_ISREG(object_mode):
+            return "special"
+    if mode in {"100644", "100755"}:
+        return "tracked_file"
+    if mode == "120000":
+        return "symlink"
+    if mode is not None:
+        return "special"
+    if path in ignored_paths:
+        return "ignored"
+    return "untracked"
+
+
+def build_verification_artifact_authority(
+    manifest_path: Path, artifacts: Iterable[str]
+) -> dict[str, Any]:
+    if (
+        manifest_path.name != Path(VERIFICATION_MANIFEST_PATH).name
+        or manifest_path.parent.name != "ci"
+    ):
+        raise EvidenceError(
+            "production verification artifact authority requires the canonical "
+            "ci/VERIFICATION_MANIFEST.jsonl path"
+        )
+    root = manifest_path.parent.parent
+    head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject="verification artifact repository HEAD",
+    )
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise EvidenceError("verification artifact repository HEAD is malformed")
+    index_digest, tracked_modes = verification_git_index_snapshot(root)
+    ignored_paths: set[str] = set()
+    reachable_commits: set[str] = set()
+    for artifact in sorted(set(artifacts)):
+        path = verification_artifact_path_token(artifact)
+        if (
+            path is not None
+            and verification_path_lexical_classification(path) is None
+            and path not in tracked_modes
+            and verification_git_path_is_ignored(root, path)
+        ):
+            ignored_paths.add(path)
+        if artifact.startswith("commit:"):
+            commit = artifact.removeprefix("commit:")
+            if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                continue
+            object_type = run_git(
+                root,
+                ["cat-file", "-t", commit],
+                subject=f"verification artifact commit {commit}",
+                accepted_exits={0, 128},
+            ).decode("ascii", errors="strict").strip()
+            if object_type != "commit":
+                continue
+            merge_base = run_git(
+                root,
+                ["merge-base", commit, "HEAD"],
+                subject=f"verification artifact reachability for {commit}",
+                accepted_exits={0, 1},
+            ).decode("ascii", errors="strict").strip()
+            if hmac.compare_digest(merge_base, commit):
+                reachable_commits.add(commit)
+    repeated_head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject="repeated verification artifact repository HEAD",
+    )
+    repeated_index_digest, repeated_modes = (
+        verification_git_index_snapshot(root)
+    )
+    if (
+        not hmac.compare_digest(head, repeated_head)
+        or not hmac.compare_digest(index_digest, repeated_index_digest)
+        or tracked_modes != repeated_modes
+    ):
+        raise EvidenceError(
+            "verification artifact repository authority changed during census"
+        )
+    return {
+        "root": root,
+        "head": head,
+        "index_digest": index_digest,
+        "tracked_modes": tracked_modes,
+        "ignored_paths": ignored_paths,
+        "reachable_commits": reachable_commits,
+        "live_git": True,
+    }
+
+
+def verification_artifact_classification(
+    bead_id: str,
+    artifact: str,
+    *,
+    bead_states: Mapping[str, Mapping[str, Any]],
+    authority: Mapping[str, Any],
+    receipts: Mapping[str, Mapping[str, Any]],
+) -> str:
+    if artifact.startswith("test:"):
+        return (
+            "test_function_claim"
+            if verification_test_function_claim(artifact) is not None
+            else "malformed_test_function_claim"
+        )
+    if artifact.startswith(VERIFICATION_RECEIPT_REFERENCE_PREFIX):
+        receipt_id = artifact.removeprefix("receipt:")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_id) is None:
+            return "unknown_receipt"
+        return "receipt" if receipt_id in receipts else "unknown_receipt"
+    if artifact.startswith("commit:"):
+        commit = artifact.removeprefix("commit:")
+        if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            return "short_commit"
+        return (
+            "commit"
+            if commit in authority["reachable_commits"]
+            else "unreachable_commit"
+        )
+    if artifact.startswith(f"{CLOSURE_CITATION_PREFIX}:"):
+        parts = artifact.split(":")
+        if (
+            len(parts) != 3
+            or parts[1] != bead_id
+            or re.fullmatch(r"[0-9]+", parts[2]) is None
+            or int(parts[2]) not in bead_states[bead_id]["comments"]
+        ):
+            return "invalid_comment"
+        return "bead_comment"
+    if artifact.startswith("bead:"):
+        parts = artifact.split(":", 2)
+        if (
+            len(parts) != 3
+            or parts[1] != bead_id
+            or not parts[2]
+            or parts[1] not in bead_states
+        ):
+            return "invalid_bead"
+        return "bead"
+    path = verification_artifact_path_token(artifact)
+    if path is None:
+        return "unknown_structured"
+    lexical_classification = verification_path_lexical_classification(path)
+    if lexical_classification is not None:
+        return lexical_classification
+    return verification_path_object_classification(
+        authority["root"],
+        path,
+        tracked_modes=authority["tracked_modes"],
+        ignored_paths=authority["ignored_paths"],
+    )
+
+
+def validate_verification_artifact_references(
+    manifest_path: Path,
+    coverage: Mapping[str, Mapping[str, Any]],
+    coverage_numbers: Mapping[str, int],
+    derived_states: Mapping[str, str],
+    bead_states: Mapping[str, Mapping[str, Any]],
+    registry: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    durable_classes = {
+        "tracked_file",
+        "bead_comment",
+        "bead",
+        "commit",
+        "receipt",
+        "test_function_claim",
+    }
+    used_legacy: set[tuple[str, str]] = set()
+    artifact_pairs_scanned = 0
+    durable_pairs = 0
+    receipt_references = 0
+    for bead_id, record in coverage.items():
+        number = coverage_numbers[bead_id]
+        for artifact in record["artifacts"]:
+            artifact_pairs_scanned += 1
+            pair = (bead_id, artifact)
+            classification = verification_artifact_classification(
+                bead_id,
+                artifact,
+                bead_states=bead_states,
+                authority=authority,
+                receipts=registry["receipts"],
+            )
+            legacy = registry["legacy_by_pair"].get(pair)
+            if classification == "target_path":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: {bead_id!r} cites transient "
+                    f"target artifact {artifact!r}; target evidence must be "
+                    "promoted before citation"
+                )
+            if classification in durable_classes:
+                if legacy is not None:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: repaired artifact {artifact!r} "
+                        "still has a stale legacy allowance"
+                    )
+                durable_pairs += 1
+                if classification == "receipt":
+                    receipt_references += 1
+                continue
+            if derived_states[bead_id] != "complete":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: nonterminal coverage cannot "
+                    f"consume legacy artifact debt: {artifact!r} is "
+                    f"{classification}"
+                )
+            if classification == "unknown_receipt":
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: receipt reference {artifact!r} "
+                    "does not resolve through the tracked registry"
+                )
+            if legacy is None:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: non-durable artifact "
+                    f"{artifact!r} on {bead_id!r} has typed classification "
+                    f"{classification!r} and no exact migration allowance"
+                )
+            if legacy["classification"] != classification:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: legacy artifact {artifact!r} "
+                    f"changed class from {legacy['classification']!r} to "
+                    f"{classification!r}"
+                )
+            used_legacy.add(pair)
+    stale_legacy = sorted(set(registry["legacy_by_pair"]) - used_legacy)
+    if stale_legacy:
+        raise EvidenceError(
+            f"{registry['path']}: legacy allowances outlived their exact "
+            f"non-durable pairs: {stale_legacy!r}"
+        )
+    if artifact_pairs_scanned == 0:
+        raise EvidenceError(
+            f"{manifest_path}: artifact collector scanned zero pairs"
+        )
+    if authority.get("live_git"):
+        repeated_head = git_text(
+            authority["root"],
+            ["rev-parse", "--verify", "HEAD"],
+            subject="final verification artifact repository HEAD",
+        )
+        repeated_index_digest, _repeated_modes = (
+            verification_git_index_snapshot(authority["root"])
+        )
+        if (
+            not hmac.compare_digest(authority["head"], repeated_head)
+            or not hmac.compare_digest(
+                authority["index_digest"], repeated_index_digest
+            )
+        ):
+            raise EvidenceError(
+                "verification artifact repository authority changed during "
+                "validation"
+            )
+    return {
+        "artifact_pairs_scanned": artifact_pairs_scanned,
+        "durable_artifact_pairs": durable_pairs,
+        "legacy_artifact_pairs": len(used_legacy),
+        "receipt_references": receipt_references,
+        "legacy_pair_ids": sorted(
+            verification_legacy_pair_id(*pair) for pair in used_legacy
+        ),
+        "registry_sha256": registry["sha256"],
+    }
+
+
+def validate_verification_manifest(
+    manifest_path: Path,
+    beads_path: Path,
+    *,
+    expected_adoption_authority_hash: str = VERIFICATION_ADOPTION_AUTHORITY_HASH,
+    receipt_registry_path: Path | None = None,
+    artifact_authority: Mapping[str, Any] | None = None,
+    expected_legacy_authority_hash: str | None = (
+        VERIFICATION_LEGACY_ADOPTION_AUTHORITY_HASH
+    ),
+) -> dict[str, Any]:
+    manifest_path = lexical_absolute(manifest_path)
+    beads_path = lexical_absolute(beads_path)
+    records, manifest_digest = load_ndjson_snapshot(manifest_path)
+    header = records[0]
+    header_keys = {
+        "schema",
+        "kind",
+        "source",
+        "projection",
+        "hash_algorithm",
+        "hash_preimage",
+        "record_count",
+        "projection_hash",
+        "adoption_ids",
+        "adoption_open_ids",
+    }
+    if set(header) != header_keys:
+        raise EvidenceError(
+            f"{manifest_path}: adoption header shape differs: "
+            f"missing={sorted(header_keys - set(header))!r} "
+            f"extra={sorted(set(header) - header_keys)!r}"
+        )
+    if (
+        header.get("schema") != VERIFICATION_MANIFEST_SCHEMA
+        or header.get("kind") != "adoption"
+        or header.get("source") != ".beads/issues.jsonl"
+        or header.get("projection") != "sorted-canonical-bead-ids-v1"
+        or header.get("hash_algorithm") != "sha256"
+        or header.get("hash_preimage")
+        != "fln.verification-manifest.adoption.ids/1+nul+u64le-length-prefixed-utf8"
+    ):
+        raise EvidenceError(f"{manifest_path}: invalid adoption authority header")
+    adoption_ids = require_manifest_string_array(
+        manifest_path, 1, header, "adoption_ids", nonempty=True
+    )
+    adoption_open_ids = require_manifest_string_array(
+        manifest_path, 1, header, "adoption_open_ids", nonempty=False
+    )
+    if not set(adoption_open_ids).issubset(adoption_ids):
+        raise EvidenceError(
+            f"{manifest_path}: adoption_open_ids is not a subset of adoption_ids"
+        )
+    if (
+        not isinstance(header.get("record_count"), int)
+        or isinstance(header["record_count"], bool)
+        or header["record_count"] != len(adoption_ids)
+    ):
+        raise EvidenceError(f"{manifest_path}: adoption record_count is stale")
+    expected_projection_hash = verification_adoption_hash(adoption_ids)
+    if not hmac.compare_digest(
+        str(header.get("projection_hash")), expected_projection_hash
+    ):
+        raise EvidenceError(f"{manifest_path}: adoption projection hash is stale")
+    actual_adoption_authority_hash = verification_adoption_authority_hash(
+        adoption_ids, adoption_open_ids
+    )
+    if not hmac.compare_digest(
+        actual_adoption_authority_hash, expected_adoption_authority_hash
+    ):
+        raise EvidenceError(
+            f"{manifest_path}: adoption authority differs from the frozen migration"
+        )
+
+    coverage_keys = {
+        "schema",
+        "kind",
+        "bead",
+        "owner",
+        "workstream",
+        "claim_type",
+        "evidence_kind",
+        "mock_only",
+        "skip",
+        *VERIFICATION_COVERAGE_ARRAY_FIELDS,
+    }
+    scenario_keys = {
+        "schema",
+        "kind",
+        "scenario",
+        "owner",
+        "activation",
+        "claim_type",
+        "evidence_kind",
+        "gate_ids",
+        "ci_required",
+        "ci_root",
+        "artifact_kind",
+        "artifact_name",
+    }
+    bead_states = bead_tracker_projection(beads_path)
+    coverage: dict[str, dict[str, Any]] = {}
+    coverage_numbers: dict[str, int] = {}
+    scenarios: dict[str, dict[str, Any]] = {}
+    order: list[tuple[int, str]] = []
+    for number, record in enumerate(records[1:], 2):
+        if record.get("schema") != VERIFICATION_MANIFEST_SCHEMA:
+            raise EvidenceError(f"{manifest_path}:{number}: wrong manifest schema")
+        kind = record.get("kind")
+        if kind == "coverage":
+            if set(record) != coverage_keys:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: coverage shape differs: "
+                    f"missing={sorted(coverage_keys - set(record))!r} "
+                    f"extra={sorted(set(record) - coverage_keys)!r}"
+                )
+            bead_id = record.get("bead")
+            if not isinstance(bead_id, str) or not bead_id:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: coverage bead is missing"
+                )
+            if bead_id in coverage:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: duplicate coverage row for {bead_id}"
+                )
+            order.append((0, bead_id))
+            coverage[bead_id] = record
+            coverage_numbers[bead_id] = number
+            for field in ("owner", "workstream"):
+                if not isinstance(record.get(field), str) or not record[field]:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: coverage {field} is missing"
+                    )
+            if not re.fullmatch(r"W[0-9]+", record["workstream"]):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid workstream identity"
+                )
+            claim_type = record.get("claim_type")
+            evidence_kind = record.get("evidence_kind")
+            if claim_type not in VERIFICATION_CLAIM_TYPES:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid claim_type {claim_type!r}"
+                )
+            if evidence_kind not in VERIFICATION_EVIDENCE_KINDS:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid evidence_kind {evidence_kind!r}"
+                )
+            if not isinstance(record.get("mock_only"), bool):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: mock_only must be boolean"
+                )
+            skip = record.get("skip")
+            if skip not in {"none", "typed_limitation", "blocked"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: unclassified skip {skip!r}"
+                )
+            for field in VERIFICATION_COVERAGE_ARRAY_FIELDS:
+                require_manifest_string_array(
+                    manifest_path,
+                    number,
+                    record,
+                    field,
+                    nonempty=False,
+                )
+            if claim_type in {"invariant", "proof"}:
+                if record["mock_only"] or evidence_kind not in {
+                    "no_mock_e2e",
+                    "proof",
+                }:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: {claim_type} claim has "
+                        f"insufficient {evidence_kind} evidence"
+                    )
+                if not record["invariant_ids"]:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: authoritative claim lacks invariant ids"
+                    )
+        elif kind == "scenario":
+            if set(record) != scenario_keys:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario shape differs: "
+                    f"missing={sorted(scenario_keys - set(record))!r} "
+                    f"extra={sorted(set(record) - scenario_keys)!r}"
+                )
+            scenario = record.get("scenario")
+            if not isinstance(scenario, str) or not scenario:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario identity is missing"
+                )
+            if scenario in scenarios:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: duplicate scenario {scenario!r}"
+                )
+            order.append((1, scenario))
+            scenarios[scenario] = record
+            if not isinstance(record.get("owner"), str) or not record["owner"]:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: scenario owner is missing"
+                )
+            activation = record.get("activation")
+            if activation not in {"planned", "active", "blocked"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario activation"
+                )
+            if record.get("claim_type") not in VERIFICATION_CLAIM_TYPES:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario claim_type"
+                )
+            if record.get("evidence_kind") not in VERIFICATION_EVIDENCE_KINDS:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: invalid scenario evidence_kind"
+                )
+            if record["claim_type"] in {"invariant", "proof"} and record[
+                "evidence_kind"
+            ] not in {"no_mock_e2e", "proof"}:
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: {record['claim_type']} scenario has "
+                    f"insufficient {record['evidence_kind']} evidence"
+                )
+            require_manifest_string_array(
+                manifest_path, number, record, "gate_ids", nonempty=True
+            )
+            if not isinstance(record.get("ci_required"), bool):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: ci_required must be boolean"
+                )
+            if activation != "active":
+                if (
+                    record["ci_required"]
+                    or record.get("ci_root") != "-"
+                    or record.get("artifact_kind") != "none"
+                    or record.get("artifact_name") != "-"
+                ):
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: planned/blocked scenario "
+                        "cannot count as executed"
+                    )
+            elif record["ci_required"]:
+                if (
+                    not isinstance(record.get("ci_root"), str)
+                    or not re.fullmatch(
+                        r"(?:check|e2e)/[a-z0-9][a-z0-9-]*", record["ci_root"]
+                    )
+                    or record.get("artifact_kind")
+                    not in {"direct", "single-bundle", "named-child"}
+                ):
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: active CI scenario lacks "
+                        "an exact artifact contract"
+                    )
+                if record["artifact_kind"] == "named-child":
+                    if (
+                        not isinstance(record.get("artifact_name"), str)
+                        or record["artifact_name"] in {"", "-"}
+                    ):
+                        raise EvidenceError(
+                            f"{manifest_path}:{number}: named child is missing"
+                        )
+                elif record.get("artifact_name") != "-":
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: non-named artifact has a child name"
+                    )
+            elif (
+                record.get("ci_root") != "-"
+                or record.get("artifact_kind") != "none"
+                or record.get("artifact_name") != "-"
+            ):
+                raise EvidenceError(
+                    f"{manifest_path}:{number}: non-CI scenario claims CI artifacts"
+                )
+        else:
+            raise EvidenceError(
+                f"{manifest_path}:{number}: unknown manifest row kind {kind!r}"
+            )
+    if order != sorted(order):
+        raise EvidenceError(
+            f"{manifest_path}: rows must be coverage-then-scenario canonical order"
+        )
+
+    current_ids = set(bead_states)
+    adopted = set(adoption_ids)
+    missing_adopted = sorted(adopted - current_ids)
+    if missing_adopted:
+        raise EvidenceError(
+            f"{manifest_path}: adopted beads disappeared: {missing_adopted!r}"
+        )
+    derived_state_counts = {
+        "planned": 0,
+        "active": 0,
+        "complete": 0,
+        "blocked": 0,
+    }
+    derived_states: dict[str, str] = {}
+    closure_bound_rows = 0
+    closure_exempt_rows = 0
+    # Validated here rather than trusted: a malformed boundary must refuse, not
+    # silently compare against garbage. There is deliberately no parameter to
+    # override it — the self-test's planted cases carry closure instants either
+    # side of this constant, so an edit that moves it is what makes a mutant
+    # survive, and the mutation matrix reports that as a failure.
+    closure_binding_effective_from = utc_second_prefix(
+        "CLOSURE_BINDING_EFFECTIVE_FROM", CLOSURE_BINDING_EFFECTIVE_FROM
+    )
+    for bead_id, record in coverage.items():
+        if bead_id not in bead_states:
+            raise EvidenceError(
+                f"{manifest_path}: orphan coverage row for {bead_id!r}"
+            )
+        derived_state = derived_verification_coverage_state(
+            bead_states[bead_id]["status"], record["skip"]
+        )
+        derived_states[bead_id] = derived_state
+        derived_state_counts[derived_state] += 1
+        number = coverage_numbers[bead_id]
+        if derived_state in {"active", "complete"} and record["skip"] != "none":
+            raise EvidenceError(
+                f"{manifest_path}:{number}: {derived_state} coverage cannot be skipped"
+            )
+        if derived_state == "blocked" and record["skip"] != "blocked":
+            raise EvidenceError(
+                f"{manifest_path}:{number}: blocked coverage lacks blocked classification"
+            )
+        if derived_state == "complete":
+            for field in VERIFICATION_COVERAGE_ARRAY_FIELDS:
+                if field not in VERIFICATION_COVERAGE_REQUIRED_FIELDS:
+                    continue
+                require_manifest_string_array(
+                    manifest_path,
+                    number,
+                    record,
+                    field,
+                    nonempty=True,
+                )
+            # Non-emptiness above proves the row EXISTS. Bind it to the closure it
+            # claims to judge — see CLOSURE_BINDING_EFFECTIVE_FROM for why the form
+            # is a post-close comment citation and why the boundary is derived.
+            # A closed bead with no decidable `closed_at` is refused rather than
+            # exempted: exemption would make deleting the field the cheapest way
+            # to escape the law.
+            bead = bead_states[bead_id]
+            closed_second = utc_second_prefix(
+                f"{manifest_path}:{number}: bead {bead_id!r} is complete, so its "
+                f"closed_at",
+                bead["closed_at"],
+            )
+            if closed_second < closure_binding_effective_from:
+                closure_exempt_rows += 1
+            else:
+                closure_bound_rows += 1
+                citation, rejected = closure_citation_diagnosis(
+                    bead_id,
+                    bead,
+                    closed_second,
+                    record["artifacts"],
+                    f"{manifest_path}:{number}",
+                )
+                if citation is None:
+                    raise EvidenceError(
+                        f"{manifest_path}:{number}: the judgement row for "
+                        f"{bead_id!r} does not judge the closure it is filed for: "
+                        f"the bead closed at {bead['closed_at']} and the row cites "
+                        f"no bead comment created at or after that instant, so a "
+                        f"row authored before the close — for different work on the "
+                        f"same bead — satisfies it identically. Record the "
+                        f"judgement as a bead comment AFTER `br close`, then cite "
+                        f"it: artifacts must contain "
+                        f'"{CLOSURE_CITATION_PREFIX}:{bead_id}:<comment-id>". '
+                        f"(The closing commit's own sha cannot be cited from "
+                        f"inside that commit, which is why the citation is a "
+                        f"comment.) Citations that cannot bind this closure: "
+                        f"{rejected!r}"
+                    )
+    registry_path = (
+        lexical_absolute(receipt_registry_path)
+        if receipt_registry_path is not None
+        else manifest_path.with_name(
+            Path(VERIFICATION_EVIDENCE_REGISTRY_PATH).name
+        )
+    )
+    receipt_references = sorted(
+        (bead_id, artifact)
+        for bead_id, record in coverage.items()
+        for artifact in record["artifacts"]
+        if artifact.startswith(VERIFICATION_RECEIPT_REFERENCE_PREFIX)
+    )
+    try:
+        registry_mode = registry_path.lstat().st_mode
+    except FileNotFoundError:
+        registry_mode = None
+    if registry_mode is None:
+        if receipt_references:
+            raise VerificationEvidenceRegistryAbsent(
+                f"{registry_path}: verification evidence registry is absent "
+                f"but manifest receipt claims require it: {receipt_references!r}"
+            )
+        registry_status = "absent_no_receipt_claims"
+        artifact_report = {
+            "artifact_reference_validation": "not_adopted_registry_absent",
+            "artifact_pairs_scanned": sum(
+                len(record["artifacts"]) for record in coverage.values()
+            ),
+            "durable_artifact_pairs": None,
+            "legacy_artifact_pairs": None,
+            "receipt_references": 0,
+            "legacy_pair_ids": None,
+            "registry_sha256": None,
+        }
+        receipt_rows = 0
+        target_artifact_ceiling: int | None = None
+    else:
+        if not stat.S_ISREG(registry_mode):
+            raise EvidenceError(
+                f"{registry_path}: verification evidence registry must be a "
+                "regular file"
+            )
+        registry = load_verification_evidence_registry(
+            registry_path,
+            bead_states,
+            expected_legacy_authority_hash=expected_legacy_authority_hash,
+        )
+        if artifact_authority is None:
+            artifact_authority = build_verification_artifact_authority(
+                manifest_path,
+                (
+                    artifact
+                    for record in coverage.values()
+                    for artifact in record["artifacts"]
+                ),
+            )
+        artifact_report = {
+            "artifact_reference_validation": "enforced",
+            **validate_verification_artifact_references(
+                manifest_path,
+                coverage,
+                coverage_numbers,
+                derived_states,
+                bead_states,
+                registry,
+                artifact_authority,
+            ),
+        }
+        registry_status = "present_and_validated"
+        receipt_rows = len(registry["receipts"])
+        target_artifact_ceiling = 0
+    required_coverage = current_ids - adopted
+    required_coverage.update(
+        bead_id
+        for bead_id in adoption_open_ids
+        if bead_states.get(bead_id, {}).get("status") != "open"
+    )
+    missing_coverage = sorted(required_coverage - set(coverage))
+    if missing_coverage:
+        raise EvidenceError(
+            f"{manifest_path}: beads crossed the adoption boundary without "
+            f"coverage rows: {missing_coverage!r}"
+        )
+    for scenario, record in scenarios.items():
+        owner = record["owner"]
+        if owner not in bead_states:
+            raise EvidenceError(
+                f"{manifest_path}: scenario {scenario!r} has orphan owner {owner!r}"
+            )
+    for bead_id, record in coverage.items():
+        for scenario in record["scenarios"]:
+            registered = scenarios.get(scenario)
+            if registered is None:
+                raise EvidenceError(
+                    f"{manifest_path}: coverage {bead_id!r} names unregistered "
+                    f"scenario {scenario!r}"
+                )
+            # Scenario ownership names the bead responsible for maintaining the
+            # lane and its artifact contract. It is not an exclusive-consumer
+            # lock: several coverage rows may honestly rely on one active CI
+            # scenario without duplicating the same execution artifact.
+            if (
+                registered["activation"] != "active"
+                or registered["ci_required"] is not True
+            ):
+                raise EvidenceError(
+                    f"{manifest_path}: coverage {bead_id!r} cannot claim "
+                    f"unexecuted scenario {scenario!r}"
+                )
+    return {
+        "schema": "fln.validation/1",
+        "validator": VERIFICATION_MANIFEST_SCHEMA,
+        "subject": manifest_path.name,
+        "valid": True,
+        "sha256": manifest_digest,
+        "adoption_records": len(adoption_ids),
+        "current_beads": len(bead_states),
+        "coverage_rows": len(coverage),
+        "coverage_state_source": ".beads/issues.jsonl",
+        "derived_state_counts": derived_state_counts,
+        "closure_binding_effective_from": CLOSURE_BINDING_EFFECTIVE_FROM,
+        "closure_bound_rows": closure_bound_rows,
+        "closure_exempt_rows": closure_exempt_rows,
+        **artifact_report,
+        "receipt_registry": registry_path.name,
+        "receipt_registry_status": registry_status,
+        "receipt_rows": receipt_rows,
+        "target_artifact_ceiling": target_artifact_ceiling,
+        "scenario_rows": len(scenarios),
+        "ci_scenarios": sorted(
+            scenario
+            for scenario, record in scenarios.items()
+            if record["activation"] == "active" and record["ci_required"]
+        ),
+    }
+
+
+def require_guard_keys(
+    path: Path, record: Mapping[str, Any], expected: set[str], *, label: str
+) -> None:
+    actual = set(record)
+    if actual != expected:
+        raise EvidenceError(
+            f"{path}: {label} keys differ: "
+            f"missing={sorted(expected - actual)!r} extra={sorted(actual - expected)!r}"
+        )
+
+
+def require_guard_nat(path: Path, value: Any, *, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"{path}: {label} must be a nonnegative integer")
+    return value
+
+
+def require_guard_bool(path: Path, value: Any, *, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise EvidenceError(f"{path}: {label} must be a boolean")
+    return value
+
+
+def require_guard_fnv(path: Path, value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"fnv1a64:[0-9a-f]{16}", value) is None:
+        raise EvidenceError(f"{path}: {label} is not a canonical FNV-1a root")
+    return value
+
+
+def require_guard_name_list(path: Path, value: Any, *, label: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None
+            for name in value
+        )
+        or value != sorted(set(value))
+    ):
+        raise EvidenceError(f"{path}: {label} must be a sorted unique environment-name list")
+    return value
+
+
+def validate_guard_mode_closure(
+    path: Path, terminal: Mapping[str, Any], crate_count: int, expected_verdict: str
+) -> None:
+    """Check the terminal record's D18 mode-closure scope (bead ``fln-q8qt``).
+
+    The guard computed these counts from the day D18 was registered and emitted none of
+    them, so a reader of a run saw ``verdict=pass`` with no way to learn whether the D18
+    check had traversed a product closure or nothing at all. Requiring them here is the
+    half that makes the emission load-bearing: ``require_guard_keys`` compares an EXACT
+    key set, so the guard dropping the object fails this validator, and this validator
+    dropping the requirement fails against a guard that still emits it. Neither side can
+    go quiet alone.
+
+    Presence is the cheap half. The laws below are the half that refuses a hand-written
+    or half-derived object, because they are relations the derivation cannot violate:
+
+    * ``scan_class`` is derived from ``closures_scanned`` at the source, so a scope word
+      that disagrees with its own count is a fabricated disclosure;
+    * a mode is scanned only when some product declares a root for it;
+    * a scanned closure contains at least its own root, and an unscanned one submits
+      nothing — this is what refuses a "traversed" claim carrying an empty closure;
+    * the derivation builds exactly one node per crate in the reviewed graph, and a
+      PASSING run is one where that graph is an exact snapshot of the workspace the rest
+      of this record describes — so the node count and the crate count are the same
+      number seen twice, and a scope computed over some other workspace is refused.
+
+    That last one is scoped to ``pass`` deliberately, and the reason is the whole content
+    of ``FLN-STRUCT-005``/``-006``: a failing run may be failing precisely BECAUSE the
+    reviewed graph and the discovered workspace disagree. Demanding the counts match
+    there would refuse the evidence stream of the very violation the guard exists to
+    report, so the join is asserted exactly where it is a law and nowhere else.
+    """
+    facts = terminal.get("mode_closure")
+    if not isinstance(facts, dict):
+        raise EvidenceError(f"{path}: D18 mode-closure scope is missing")
+    require_guard_keys(
+        path,
+        facts,
+        {
+            "scan_class",
+            "frontier_surfaces",
+            "product_roots",
+            "closures_scanned",
+            "closure_nodes",
+            "nodes",
+            "edges",
+        },
+        label="mode_closure",
+    )
+    scan_class = facts.get("scan_class")
+    if scan_class not in {"vacuous", "traversed"}:
+        raise EvidenceError(f"{path}: D18 scan class {scan_class!r} is unregistered")
+    counts = {
+        key: require_guard_nat(path, facts.get(key), label=f"mode_closure.{key}")
+        for key in (
+            "frontier_surfaces",
+            "product_roots",
+            "closures_scanned",
+            "closure_nodes",
+            "nodes",
+            "edges",
+        )
+    }
+    if (scan_class == "vacuous") != (counts["closures_scanned"] == 0):
+        raise EvidenceError(
+            f"{path}: D18 scan class {scan_class!r} disagrees with "
+            f"closures_scanned={counts['closures_scanned']}"
+        )
+    if counts["closures_scanned"] > counts["product_roots"]:
+        raise EvidenceError(f"{path}: D18 scanned more closures than declared roots")
+    if counts["closures_scanned"] == 0:
+        if counts["closure_nodes"] != 0:
+            raise EvidenceError(f"{path}: D18 submitted nodes without scanning a closure")
+    elif counts["closure_nodes"] < counts["closures_scanned"]:
+        raise EvidenceError(f"{path}: D18 closure is smaller than its own root set")
+    if counts["product_roots"] > counts["nodes"] or counts["frontier_surfaces"] > counts["nodes"]:
+        raise EvidenceError(f"{path}: D18 counted a crate more than once on one axis")
+    if expected_verdict == "pass" and counts["nodes"] != crate_count:
+        raise EvidenceError(
+            f"{path}: D18 scope covers {counts['nodes']} nodes but the passing run "
+            f"covers {crate_count} crates"
+        )
 
 
 def validate_guard(
@@ -2692,13 +6684,31 @@ def validate_guard(
     path = lexical_absolute(path)
     records, digest = load_ndjson_snapshot(path)
     for index, record in enumerate(records):
-        if record.get("schema") != "structure-guard/2":
+        if record.get("schema") != STRUCTURE_GUARD_SCHEMA:
             raise EvidenceError(f"{path}:{index + 1}: wrong schema")
     if records[0].get("event") != "run_start":
         raise EvidenceError(f"{path}: first record is not run_start")
+    start = records[0]
+    require_guard_keys(
+        path,
+        start,
+        {
+            "schema",
+            "event",
+            "root",
+            "root_identity",
+            "graph_digest",
+            "crates",
+            "edges",
+            "authority_inventory",
+            "effective_compiler_identity",
+            "admitted_environment",
+        },
+        label="run_start",
+    )
     if records[0].get("root") != expected_root:
         raise EvidenceError(f"{path}: guard root does not match the invoked fixture")
-    if expected_verdict not in {"pass", "fail", "setup_error"}:
+    if expected_verdict not in {"pass", "fail", "inconclusive", "setup_error"}:
         raise EvidenceError(f"{path}: unsupported expected guard verdict")
     if observed_exit != expected_exit:
         raise EvidenceError(
@@ -2708,6 +6718,28 @@ def validate_guard(
     if len(terminals) != 1 or records[-1] is not terminals[0]:
         raise EvidenceError(f"{path}: expected exactly one final run_end")
     terminal = terminals[0]
+    terminal_keys = {
+        "schema",
+        "event",
+        "verdict",
+        "exit_code",
+        "findings",
+        "authority",
+        "data_grade",
+        "unestablished",
+        "contract_handoff_root",
+        "traversal",
+        "mode_closure",
+        "authority_count_rule",
+        "authority_count_rule_holds",
+        "governed_root_before",
+        "governed_root_after",
+        "governed_root_unchanged",
+        "duration_ms",
+    }
+    if expected_verdict == "setup_error":
+        terminal_keys.update({"reason_code", "detail"})
+    require_guard_keys(path, terminal, terminal_keys, label="run_end")
     if terminal.get("verdict") != expected_verdict:
         raise EvidenceError(
             f"{path}: verdict {terminal.get('verdict')!r}, expected {expected_verdict!r}"
@@ -2716,19 +6748,274 @@ def validate_guard(
         raise EvidenceError(
             f"{path}: terminal exit {terminal.get('exit_code')!r}, expected {expected_exit}"
         )
-    if expected_verdict in {"pass", "fail"}:
-        graph_digest = records[0].get("graph_digest")
-        if not isinstance(graph_digest, str) or not graph_digest.startswith("fnv1a64:"):
-            raise EvidenceError(f"{path}: guard graph digest is missing")
-        if not isinstance(records[0].get("crates"), int) or not isinstance(
-            records[0].get("edges"), int
+    require_guard_nat(path, terminal.get("duration_ms"), label="duration_ms")
+    if expected_verdict in {"pass", "fail", "inconclusive"}:
+        require_guard_fnv(path, start.get("graph_digest"), label="graph_digest")
+        crate_count = require_guard_nat(path, start.get("crates"), label="crates")
+        require_guard_nat(path, start.get("edges"), label="edges")
+        expected_identity = str(Path(expected_root).resolve(strict=True))
+        if start.get("root_identity") != expected_identity:
+            raise EvidenceError(
+                f"{path}: canonical root identity {start.get('root_identity')!r} "
+                f"does not match {expected_identity!r}"
+            )
+
+        inventory = start.get("authority_inventory")
+        if not isinstance(inventory, dict):
+            raise EvidenceError(f"{path}: authority inventory is missing")
+        require_guard_keys(
+            path,
+            inventory,
+            {
+                "package_class",
+                "packages",
+                "target_class",
+                "targets",
+                "feature_class",
+                "features",
+                "target_triple_class",
+                "target_triples",
+            },
+            label="authority_inventory",
+        )
+        expected_classes = {
+            "package_class": "workspace-graph-exact",
+            "target_class": "cargo-auto-discovery-closed",
+            "feature_class": "manifest-enumerated",
+            "target_triple_class": "suite-lock-declared",
+        }
+        for key, expected_class in expected_classes.items():
+            if inventory.get(key) != expected_class:
+                raise EvidenceError(f"{path}: {key} is not {expected_class!r}")
+        if require_guard_nat(path, inventory.get("packages"), label="packages") != crate_count:
+            raise EvidenceError(f"{path}: package inventory disagrees with crate count")
+        target_count = require_guard_nat(path, inventory.get("targets"), label="targets")
+        require_guard_nat(path, inventory.get("features"), label="features")
+        target_triples = require_guard_nat(
+            path, inventory.get("target_triples"), label="target_triples"
+        )
+        if expected_verdict == "pass" and (
+            target_count < crate_count or target_triples == 0
         ):
-            raise EvidenceError(f"{path}: guard graph counts are malformed")
+            raise EvidenceError(f"{path}: passing authority inventory is not closed")
+
+        contract_handoff_root = terminal.get("contract_handoff_root")
+        expected_data_grade = (
+            "verified" if contract_handoff_root is not None else "provisional"
+        )
+        expected_unestablished = (
+            [] if contract_handoff_root is not None else ["contract_handoff"]
+        )
+        if terminal.get("data_grade") != expected_data_grade:
+            raise EvidenceError(
+                f"{path}: data_grade {terminal.get('data_grade')!r} disagrees "
+                f"with contract_handoff_root"
+            )
+        if terminal.get("unestablished") != expected_unestablished:
+            raise EvidenceError(
+                f"{path}: unestablished {terminal.get('unestablished')!r} "
+                f"disagrees with contract_handoff_root"
+            )
+        if contract_handoff_root is None:
+            if expected_verdict == "pass":
+                raise EvidenceError(
+                    f"{path}: passing guard lacks a contract handoff root"
+                )
+        else:
+            require_guard_fnv(
+                path,
+                contract_handoff_root,
+                label="contract_handoff_root",
+            )
+
+        compiler = start.get("effective_compiler_identity")
+        if not isinstance(compiler, dict):
+            raise EvidenceError(f"{path}: effective compiler identity is missing")
+        require_guard_keys(
+            path,
+            compiler,
+            {
+                "source",
+                "channel",
+                "release",
+                "commit",
+                "host",
+                "contract_declared",
+                "configuration_match",
+                "contract_match",
+            },
+            label="effective_compiler_identity",
+        )
+        if compiler.get("source") not in {"PATH", "RUSTC"}:
+            raise EvidenceError(f"{path}: compiler identity source is unsupported")
+        if (
+            (
+                compiler.get("channel") is not None
+                and (
+                    not isinstance(compiler.get("channel"), str)
+                    or not compiler["channel"].startswith("nightly-")
+                )
+            )
+            or not isinstance(compiler.get("release"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", str(compiler.get("commit"))) is None
+            or not isinstance(compiler.get("host"), str)
+        ):
+            raise EvidenceError(f"{path}: effective compiler identity is malformed")
+        compiler_contract_declared = require_guard_bool(
+            path,
+            compiler.get("contract_declared"),
+            label="compiler contract_declared",
+        )
+        compiler_configuration_match = require_guard_bool(
+            path,
+            compiler.get("configuration_match"),
+            label="compiler configuration_match",
+        )
+        compiler_contract_match = require_guard_bool(
+            path, compiler.get("contract_match"), label="compiler contract_match"
+        )
+        if expected_verdict == "pass" and (
+            compiler.get("channel") is None
+            or not compiler_contract_declared
+            or not compiler_configuration_match
+            or not compiler_contract_match
+        ):
+            raise EvidenceError(f"{path}: passing compiler authority is not established")
+
+        environment = start.get("admitted_environment")
+        if not isinstance(environment, dict):
+            raise EvidenceError(f"{path}: admitted environment is missing")
+        require_guard_keys(
+            path,
+            environment,
+            {"policy", "admitted_names", "compiler_override_names"},
+            label="admitted_environment",
+        )
+        if environment.get("policy") != "names-only-no-values/1":
+            raise EvidenceError(f"{path}: admitted environment policy is unsupported")
+        require_guard_name_list(
+            path, environment.get("admitted_names"), label="admitted_names"
+        )
+        require_guard_name_list(
+            path,
+            environment.get("compiler_override_names"),
+            label="compiler_override_names",
+        )
+
+        traversal = terminal.get("traversal")
+        if not isinstance(traversal, dict):
+            raise EvidenceError(f"{path}: traversal facts are missing")
+        require_guard_keys(
+            path,
+            traversal,
+            {
+                "directories_visited",
+                "files_discovered",
+                "files_scanned",
+                "files_skipped_unreadable",
+            },
+            label="traversal",
+        )
+        require_guard_nat(
+            path, traversal.get("directories_visited"), label="directories_visited"
+        )
+        discovered = require_guard_nat(
+            path, traversal.get("files_discovered"), label="files_discovered"
+        )
+        scanned = require_guard_nat(path, traversal.get("files_scanned"), label="files_scanned")
+        skipped = require_guard_nat(
+            path,
+            traversal.get("files_skipped_unreadable"),
+            label="files_skipped_unreadable",
+        )
+        if scanned + skipped != discovered:
+            raise EvidenceError(f"{path}: authority count conservation failed")
+        validate_guard_mode_closure(path, terminal, crate_count, expected_verdict)
+        authority_count_rule_holds = require_guard_bool(
+            path,
+            terminal.get("authority_count_rule_holds"),
+            label="authority_count_rule_holds",
+        )
+        if (
+            terminal.get("authority_count_rule")
+            != "files_scanned+files_skipped_unreadable=files_discovered"
+            or not authority_count_rule_holds
+        ):
+            raise EvidenceError(f"{path}: authority count rule is not established")
+        root_before = require_guard_fnv(
+            path, terminal.get("governed_root_before"), label="governed_root_before"
+        )
+        root_after = require_guard_fnv(
+            path, terminal.get("governed_root_after"), label="governed_root_after"
+        )
+        governed_unchanged = require_guard_bool(
+            path,
+            terminal.get("governed_root_unchanged"),
+            label="governed_root_unchanged",
+        )
+        if governed_unchanged != (root_before == root_after):
+            raise EvidenceError(f"{path}: governed-root equality fact disagrees")
+        expected_authority = (
+            "incomplete" if expected_verdict == "inconclusive" else "complete"
+        )
+        if terminal.get("authority") != expected_authority:  # ubs:ignore — public verdict enum
+            raise EvidenceError(
+                f"{path}: authority {terminal.get('authority')!r}, "
+                f"expected {expected_authority!r}"
+            )
+        if expected_authority == "complete" and (  # ubs:ignore — public verdict enum
+            (
+                compiler_contract_declared
+                and (not compiler_configuration_match or not compiler_contract_match)
+            )
+            or not governed_unchanged
+        ):
+            raise EvidenceError(f"{path}: complete authority lacks identity closure")
     elif records[0].get("graph_digest") is not None:
         raise EvidenceError(f"{path}: setup failure claims a graph digest")
+    else:
+        if any(
+            start.get(key) is not None
+            for key in (
+                "root_identity",
+                "crates",
+                "edges",
+                "authority_inventory",
+                "effective_compiler_identity",
+                "admitted_environment",
+            )
+        ):
+            raise EvidenceError(f"{path}: setup failure claims structural authority")
+        if (
+            terminal.get("authority") != "not_established"
+            or terminal.get("data_grade") != "not_established"
+            or terminal.get("unestablished") != []
+            or terminal.get("contract_handoff_root") is not None
+            or terminal.get("traversal") is not None
+            or terminal.get("mode_closure") is not None
+            or terminal.get("governed_root_before") is not None
+            or terminal.get("governed_root_after") is not None
+        ):
+            raise EvidenceError(f"{path}: setup failure claims established authority")
+        if require_guard_bool(
+            path,
+            terminal.get("authority_count_rule_holds"),
+            label="setup authority_count_rule_holds",
+        ) or require_guard_bool(
+            path,
+            terminal.get("governed_root_unchanged"),
+            label="setup governed_root_unchanged",
+        ):
+            raise EvidenceError(f"{path}: setup failure claims established authority")
     actual_findings = []
     finding_records = records[1:-1]
     for index, record in enumerate(finding_records, 2):
+        require_guard_keys(
+            path,
+            record,
+            {"schema", "event", "code", "severity", "path", "detail"},
+            label=f"finding line {index}",
+        )
         if record.get("event") != "finding":
             raise EvidenceError(f"{path}:{index}: non-finding inside guard run")
         if record.get("severity") != "error":
@@ -2771,6 +7058,4082 @@ def validate_guard(
         "verdict": expected_verdict,
         "findings": actual_findings,
         "sha256": digest,
+    }
+
+
+class VerdictWireReader:
+    """Small independent reader for the frozen Verdict v1 evidence fixtures."""
+
+    def __init__(self, data: bytes, *, subject: str) -> None:
+        self.data = data
+        self.subject = subject
+        self.at = 0
+
+    def take(self, amount: int) -> bytes:
+        end = self.at + amount
+        if amount < 0 or end > len(self.data):
+            raise EvidenceError(
+                f"{self.subject}: truncated Verdict wire value at byte {self.at}"
+            )
+        value = self.data[self.at : end]
+        self.at = end
+        return value
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        return int.from_bytes(self.take(2), "little")
+
+    def u32(self) -> int:
+        return int.from_bytes(self.take(4), "little")
+
+    def u64(self) -> int:
+        return int.from_bytes(self.take(8), "little")
+
+    def header(self, expected_kind: int) -> None:
+        if self.take(len(VERDICT_WIRE_MAGIC)) != VERDICT_WIRE_MAGIC:
+            raise EvidenceError(f"{self.subject}: invalid Verdict wire magic")
+        kind = self.u8()
+        version = self.u16()
+        extensions = self.u16()
+        if kind != expected_kind:
+            raise EvidenceError(
+                f"{self.subject}: Verdict kind {kind}, expected {expected_kind}"
+            )
+        if version != VERDICT_SCHEMA_VERSION or extensions != 0:
+            raise EvidenceError(
+                f"{self.subject}: Verdict version/extensions are not frozen v1/0"
+            )
+
+    def finish(self) -> None:
+        if self.at != len(self.data):
+            raise EvidenceError(
+                f"{self.subject}: {len(self.data) - self.at} trailing Verdict bytes"
+            )
+
+
+def verdict_decode_hex(value: Any, *, label: str) -> bytes:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) % 2 != 0
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        raise EvidenceError(f"Verdict {label} is not canonical lowercase hex")
+    if len(value) // 2 > VERDICT_MAX_ENCODED_BYTES:
+        raise EvidenceError(f"Verdict {label} exceeds the encoded-byte bound")
+    return bytes.fromhex(value)
+
+
+def verdict_read_clause(reader: VerdictWireReader) -> list[int]:
+    count = reader.u64()
+    if count > 64:
+        raise EvidenceError(f"{reader.subject}: fixture literal count is unbounded")
+    literals: list[int] = []
+    identities: set[int] = set()
+    for _ in range(count):
+        variable = reader.u32()
+        polarity = reader.u8()
+        if variable == 0 or polarity not in {0, 1}:
+            raise EvidenceError(f"{reader.subject}: malformed Verdict literal")
+        if variable in identities:
+            raise EvidenceError(
+                f"{reader.subject}: duplicate or tautological Verdict variable"
+            )
+        identities.add(variable)
+        literals.append(variable if polarity == 1 else -variable)
+    if literals != sorted(literals, key=lambda literal: (abs(literal), literal > 0)):
+        raise EvidenceError(f"{reader.subject}: Verdict literals are not canonical")
+    return literals
+
+
+def verdict_parse_cnf(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(1)
+    variable_count = reader.u32()
+    count = reader.u64()
+    if variable_count > 64 or count > 64:
+        raise EvidenceError(f"{subject}: Verdict CNF fixture exceeds validator bounds")
+    clauses: list[dict[str, Any]] = []
+    previous_id = 0
+    for _ in range(count):
+        clause_id = reader.u64()
+        if clause_id <= previous_id:
+            raise EvidenceError(f"{subject}: Verdict clause ids are not canonical")
+        previous_id = clause_id
+        literals = verdict_read_clause(reader)
+        if any(abs(literal) > variable_count for literal in literals):
+            raise EvidenceError(f"{subject}: Verdict literal exceeds variable count")
+        clauses.append({"id": clause_id, "literals": literals})
+    reader.finish()
+    return {"variable_count": variable_count, "clauses": clauses}
+
+
+def verdict_parse_model(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(2)
+    variable_count = reader.u32()
+    count = reader.u64()
+    if variable_count > 64 or count > 64:
+        raise EvidenceError(f"{subject}: Verdict model fixture exceeds validator bounds")
+    assignments: list[tuple[int, bool]] = []
+    previous_variable = 0
+    for _ in range(count):
+        variable = reader.u32()
+        raw_value = reader.u8()
+        if variable <= previous_variable or raw_value not in {0, 1}:
+            raise EvidenceError(f"{subject}: Verdict assignments are not canonical")
+        previous_variable = variable
+        assignments.append((variable, raw_value == 1))
+    reader.finish()
+    if [variable for variable, _value in assignments] != list(
+        range(1, variable_count + 1)
+    ):
+        raise EvidenceError(f"{subject}: Verdict model is not complete")
+    return {"variable_count": variable_count, "assignments": assignments}
+
+
+def verdict_parse_proof(data: bytes, *, subject: str) -> dict[str, Any]:
+    reader = VerdictWireReader(data, subject=subject)
+    reader.header(3)
+    count = reader.u64()
+    if count > 64:
+        raise EvidenceError(f"{subject}: Verdict proof fixture exceeds validator bounds")
+    steps: list[dict[str, Any]] = []
+    for _ in range(count):
+        opcode_at = reader.at
+        opcode = reader.u8()
+        if opcode == 1:
+            clause_id = reader.u64()
+            clause = verdict_read_clause(reader)
+            rule_opcode = reader.u8()
+            if rule_opcode == 1:
+                rule = {
+                    "kind": "resolution",
+                    "pivot": reader.u32(),
+                    "positive_parent": reader.u64(),
+                    "negative_parent": reader.u64(),
+                }
+            elif rule_opcode == 2:
+                dependencies = reader.u64()
+                if dependencies > 64:
+                    raise EvidenceError(
+                        f"{subject}: Verdict proof dependency count is unbounded"
+                    )
+                antecedents = [reader.u64() for _ in range(dependencies)]
+                if antecedents != sorted(set(antecedents)):
+                    raise EvidenceError(
+                        f"{subject}: Verdict proof dependencies are not canonical"
+                    )
+                rule = {"kind": "rup", "antecedents": antecedents}
+            else:
+                raise EvidenceError(
+                    f"{subject}: unknown Verdict proof rule opcode {rule_opcode}"
+                )
+            steps.append(
+                {"kind": "derive", "id": clause_id, "clause": clause, "rule": rule}
+            )
+        elif opcode == 2:
+            deletion_count = reader.u64()
+            if deletion_count > 64:
+                raise EvidenceError(
+                    f"{subject}: Verdict deletion count is unbounded"
+                )
+            clauses = [reader.u64() for _ in range(deletion_count)]
+            if not clauses or clauses != sorted(set(clauses)):
+                raise EvidenceError(
+                    f"{subject}: Verdict deletion targets are not canonical"
+                )
+            steps.append({"kind": "delete", "clauses": clauses})
+        elif opcode == 3:
+            steps.append({"kind": "conclude", "empty_clause": reader.u64()})
+        else:
+            raise EvidenceError(
+                f"{subject}: unknown Verdict proof opcode {opcode} at byte {opcode_at}"
+            )
+    reader.finish()
+    return {"steps": steps}
+
+
+def verdict_read_canonical_record(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    record = parse_json(data, subject=label)
+    if not isinstance(record, dict):
+        raise EvidenceError(f"{label}: expected one JSON object")
+    if canonical_json(record) != data:
+        raise EvidenceError(f"{label}: record is not canonical single-row NDJSON")
+    return record, digest
+
+
+def read_canonical_record(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    record = parse_json(data, subject=label)
+    if not isinstance(record, dict):
+        raise EvidenceError(f"{label}: expected one JSON object")
+    if canonical_json(record) != data:
+        raise EvidenceError(f"{label}: record is not canonical single-row NDJSON")
+    return record, digest
+
+
+def exact_non_negative_integer(
+    record: Mapping[str, Any], key: str, *, label: str
+) -> int:
+    value = record.get(key)
+    if type(value) is not int or value < 0:
+        raise EvidenceError(f"{label} {key} is not a non-negative integer")
+    return value
+
+
+def validate_diagnostic_projection_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("diagnostic projection run id must be non-empty")
+
+    semantic_data, _semantic_size, semantic_digest = stable_file_facts(
+        semantic_path,
+        max_bytes=DIAGNOSTIC_PROJECTION_MAX_SEMANTIC_BYTES,
+    )
+    semantic_lines = semantic_data.splitlines(keepends=True)
+    if len(semantic_lines) != len(DIAGNOSTIC_PROJECTION_CASES):
+        raise EvidenceError(
+            "diagnostic projection semantic evidence must contain exactly "
+            f"{len(DIAGNOSTIC_PROJECTION_CASES)} records"
+        )
+
+    full_fields = {
+        "actual",
+        "actualExit",
+        "actualRoot",
+        "authority",
+        "case",
+        "channel",
+        "comparisonClass",
+        "epoch",
+        "expected",
+        "expectedExit",
+        "expectedRoot",
+        "format",
+        "frontend",
+        "mode",
+        "schema",
+        "sequence",
+    }
+    bounded_fields = {
+        "actual",
+        "actualExit",
+        "actualRoot",
+        "authority",
+        "case",
+        "expected",
+        "schema",
+        "sequence",
+    }
+    semantic_records: list[dict[str, Any]] = []
+    for sequence, (expected_case, line) in enumerate(
+        zip(DIAGNOSTIC_PROJECTION_CASES, semantic_lines, strict=True)
+    ):
+        record = parse_json(
+            line,
+            subject=f"diagnostic projection semantic record {sequence}",
+        )
+        if not isinstance(record, dict):
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} is not an object"
+            )
+        if canonical_json(record) != line:
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} is not canonical"
+            )
+        if record.get("schema") != DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA:
+            raise EvidenceError(
+                f"diagnostic projection semantic record {sequence} has unknown schema"
+            )
+        if (
+            type(record.get("sequence")) is not int
+            or record.get("sequence") != sequence
+            or record.get("case") != expected_case
+        ):
+            raise EvidenceError(
+                f"diagnostic projection semantic sequence {sequence} is malformed"
+            )
+        expected_fields = (
+            full_fields
+            if expected_case in {"reference", "corrupt", "recovery"}
+            else bounded_fields
+        )
+        if set(record) != expected_fields:
+            raise EvidenceError(
+                f"diagnostic projection {expected_case} fields differ "
+                "from the frozen schema"
+            )
+        semantic_records.append(record)
+
+    semantic_by_case = {
+        record["case"]: record for record in semantic_records
+    }
+
+    def require_root(value: Any, *, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"fnv1a64:[0-9a-f]{16}", value) is None
+        ):
+            raise EvidenceError(f"{label} is not a bounded semantic root")
+        return value
+
+    def require_full_case(
+        case: str,
+        *,
+        relation: str,
+        expected_root: str | None,
+    ) -> tuple[str, str]:
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != relation
+            or record.get("actualExit") != "user_error"
+            or record.get("authority") is not True
+            or record.get("channel") != "stdout"
+            or record.get("comparisonClass") != "exact"
+            or record.get("epoch") != "v4.32.0"
+            or record.get("expected") != relation
+            or record.get("expectedExit") != "user_error"
+            or record.get("format") != "human"
+            or record.get("frontend") != "cli"
+            or record.get("mode") != "faithful"
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} comparison contract changed"
+            )
+        actual = require_root(
+            record.get("actualRoot"),
+            label=f"diagnostic projection {case} actual root",
+        )
+        expected = require_root(
+            record.get("expectedRoot"),
+            label=f"diagnostic projection {case} expected root",
+        )
+        if expected_root is not None and expected != expected_root:
+            raise EvidenceError(
+                f"diagnostic projection {case} expected root drifted"
+            )
+        return actual, expected
+
+    reference_actual, reference_expected = require_full_case(
+        "reference",
+        relation="equal",
+        expected_root=None,
+    )
+    if not hmac.compare_digest(reference_actual, reference_expected):
+        raise EvidenceError(
+            "diagnostic projection reference roots are not equal"
+        )
+
+    corrupt_actual, corrupt_expected = require_full_case(
+        "corrupt",
+        relation="divergent",
+        expected_root=reference_actual,
+    )
+    if (
+        not hmac.compare_digest(corrupt_expected, reference_actual)
+        or hmac.compare_digest(corrupt_actual, reference_actual)
+    ):
+        raise EvidenceError(
+            "diagnostic projection corrupt control did not diverge"
+        )
+
+    for case in ("malformed", "aged_epoch", "mock_substitution"):
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != "typed_refusal"
+            or record.get("actualExit") != "refused"
+            or record.get("actualRoot") != "none"
+            or record.get("authority") is not False
+            or record.get("expected") != "typed_refusal"
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} was not a typed refusal"
+            )
+
+    for case, expected_outcome, expected_exit in (
+        ("resource", "inconclusive", "inconclusive"),
+        ("cancelled", "inconclusive", "inconclusive"),
+        ("internal_fault", "internal_fault", "internal_fault"),
+    ):
+        record = semantic_by_case[case]
+        if (
+            record.get("actual") != expected_outcome
+            or record.get("actualExit") != expected_exit
+            or record.get("authority") is not False
+            or record.get("expected") != expected_outcome
+        ):
+            raise EvidenceError(
+                f"diagnostic projection {case} changed outcome authority"
+            )
+        require_root(
+            record.get("actualRoot"),
+            label=f"diagnostic projection {case} actual root",
+        )
+
+    recovery_actual, recovery_expected = require_full_case(
+        "recovery",
+        relation="equal",
+        expected_root=reference_actual,
+    )
+    if (
+        not hmac.compare_digest(recovery_actual, reference_actual)
+        or not hmac.compare_digest(recovery_expected, reference_actual)
+    ):
+        raise EvidenceError(
+            "diagnostic projection recovery did not restore the reference root"
+        )
+
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="diagnostic projection telemetry",
+        max_bytes=DIAGNOSTIC_PROJECTION_MAX_TELEMETRY_BYTES,
+    )
+    telemetry_fields = {
+        "durationNs",
+        "pid",
+        "rawProcessExits",
+        "runId",
+        "schema",
+        "scratch",
+    }
+    if set(telemetry) != telemetry_fields:
+        raise EvidenceError(
+            "diagnostic projection telemetry fields differ from the frozen schema"
+        )
+    duration_ns = exact_non_negative_integer(
+        telemetry,
+        "durationNs",
+        label="diagnostic projection telemetry",
+    )
+    pid = exact_non_negative_integer(
+        telemetry,
+        "pid",
+        label="diagnostic projection telemetry",
+    )
+    scratch = telemetry.get("scratch")
+    if (
+        telemetry.get("schema") != DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA
+        or telemetry.get("runId") != expected_run_id
+        or duration_ns == 0
+        or pid == 0
+        or not isinstance(scratch, str)
+        or not scratch
+        or not Path(scratch).is_absolute()
+    ):
+        raise EvidenceError(
+            "diagnostic projection telemetry identity is malformed"
+        )
+
+    raw_exits = telemetry.get("rawProcessExits")
+    expected_exit_keys = {
+        "aged_epoch",
+        "cancelled",
+        "corrupt",
+        "internal-fault",
+        "malformed",
+        "mock_substitution",
+        "recovery",
+        "reference_oracle",
+        "reference_projection",
+        "resource",
+    }
+    if not isinstance(raw_exits, dict) or set(raw_exits) != expected_exit_keys:
+        raise EvidenceError(
+            "diagnostic projection raw process exit inventory changed"
+        )
+    for name, expected_code in {
+        "cancelled": 2,
+        "corrupt": 1,
+        "internal-fault": 3,
+        "recovery": 1,
+        "reference_oracle": 1,
+        "reference_projection": 1,
+        "resource": 2,
+    }.items():
+        if type(raw_exits.get(name)) is not int or raw_exits[name] != expected_code:
+            raise EvidenceError(
+                f"diagnostic projection {name} process exit changed"
+            )
+    for name in ("aged_epoch", "malformed", "mock_substitution"):
+        code = raw_exits.get(name)
+        if type(code) is not int or code <= 3:
+            raise EvidenceError(
+                f"diagnostic projection {name} did not refuse before projection"
+            )
+
+    return {
+        "case_count": len(semantic_records),
+        "recovery_root": reference_actual,
+        "run_id": expected_run_id,
+        "schema": DIAGNOSTIC_PROJECTION_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "separation_law": "semantic_records_exclude_host_process_telemetry",
+        "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
+
+
+def lexer_expected_diagnostics(
+    raw_input: bytes, *, recovering: bool
+) -> list[dict[str, Any]]:
+    tab_offsets = [offset for offset, byte in enumerate(raw_input) if byte == 0x09]
+    if not recovering:
+        tab_offsets = tab_offsets[:1]
+    return [
+        {"byte_offset": offset, "message": LEXER_TAB_DIAGNOSTIC}
+        for offset in tab_offsets
+    ]
+
+
+def validate_lexer_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("lexer expected run id must be non-empty")
+    expected_cases = set(LEXER_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                f"lexer {label} cases differ from the frozen positive/failure/recovery set"
+            )
+
+    semantic_fields = {
+        "acceptance_relation",
+        "case",
+        "data_grade",
+        "input_artifact",
+        "input_sha256",
+        "plain",
+        "recovering",
+        "run_id",
+        "schema",
+        "status",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_diagnostics",
+        "max_input_bytes",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    validation_cases: list[dict[str, Any]] = []
+    for case in ("positive", "failure", "recovery"):
+        expected_artifact, expected_input = LEXER_CASE_INPUTS[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"lexer {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"lexer {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=LEXER_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"lexer {case} real input bytes changed")
+
+        semantic, semantic_digest = read_canonical_record(
+            semantic_paths[case],
+            label=f"lexer {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = read_canonical_record(
+            telemetry_paths[case],
+            label=f"lexer {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != f"lexer-semantic case={case} status=pass\n".encode():
+            raise EvidenceError(f"lexer {case} producer stdout is not exact")
+        if stderr:
+            raise EvidenceError(f"lexer {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"lexer {case} semantic fields differ from the frozen schema"
+            )
+        if (
+            semantic.get("schema") != LEXER_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("input_artifact") != expected_artifact
+            # ubs:ignore — public fixture digest.
+            or semantic.get("input_sha256")
+            != input_digest
+            or semantic.get("acceptance_relation") != "equal"
+            or semantic.get("status") != "pass"
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != LEXER_SCHEMA_VERSION
+        ):
+            raise EvidenceError(f"lexer {case} semantic identity is malformed")
+
+        tab_count = expected_input.count(b"\t")
+        expected_accepted = tab_count == 0
+        expected_plain = {
+            "accepted": expected_accepted,
+            "diagnostics": lexer_expected_diagnostics(expected_input, recovering=False),
+        }
+        expected_recovering = {
+            "accepted": expected_accepted,
+            "diagnostics": lexer_expected_diagnostics(expected_input, recovering=True),
+        }
+        plain = semantic.get("plain")
+        recovering = semantic.get("recovering")
+        if not isinstance(plain, dict) or not isinstance(recovering, dict):
+            raise EvidenceError(f"lexer {case} result envelopes are not objects")
+        if (
+            plain.get("accepted") is not expected_accepted
+            or recovering.get("accepted") is not expected_accepted
+            or plain != expected_plain
+            or recovering != expected_recovering
+        ):
+            raise EvidenceError(
+                f"lexer {case} diagnostics or acceptance relation changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"lexer {case} telemetry fields differ from the frozen schema"
+            )
+        max_diagnostics = exact_non_negative_integer(
+            telemetry, "max_diagnostics", label=f"lexer {case} telemetry"
+        )
+        max_input_bytes = exact_non_negative_integer(
+            telemetry, "max_input_bytes", label=f"lexer {case} telemetry"
+        )
+        observed_diagnostics = exact_non_negative_integer(
+            telemetry, "observed_diagnostics", label=f"lexer {case} telemetry"
+        )
+        observed_input_bytes = exact_non_negative_integer(
+            telemetry, "observed_input_bytes", label=f"lexer {case} telemetry"
+        )
+        expected_diagnostics = len(expected_plain["diagnostics"]) + len(
+            expected_recovering["diagnostics"]
+        )
+        if (
+            telemetry.get("schema") != LEXER_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != LEXER_SCHEMA_VERSION
+            or max_diagnostics != LEXER_MAX_DIAGNOSTICS
+            or max_input_bytes != LEXER_MAX_INPUT_BYTES
+            or observed_diagnostics != expected_diagnostics
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+        ):
+            raise EvidenceError(f"lexer {case} telemetry is malformed or out of bounds")
+
+        validation_cases.append(
+            {
+                "case": case,
+                "input_sha256": input_digest,
+                "semantic_sha256": semantic_digest,
+                "stderr_sha256": stderr_digest,
+                "stdout_sha256": stdout_digest,
+                "telemetry_sha256": telemetry_digest,
+            }
+        )
+
+    return {
+        "acceptance_law": "plain.accepted == recovering.accepted",
+        "cases": validation_cases,
+        "diagnostic": LEXER_TAB_DIAGNOSTIC,
+        "run_id": expected_run_id,
+        "schema": LEXER_VALIDATION_SCHEMA,
+        "verdict": "pass",
+    }
+
+
+def validate_parser_corpus_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("parser corpus expected run id must be non-empty")
+    expected_cases = set(PARSER_CORPUS_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                "parser corpus "
+                f"{label} cases differ from the frozen positive/failure/recovery set"
+            )
+
+    semantic_fields = {
+        "accepted",
+        "boundary_diagnostics",
+        "case",
+        "data_grade",
+        "input_artifact",
+        "input_sha256",
+        "parse_stop_byte",
+        "parser_diagnostics",
+        "partial_tree",
+        "run_id",
+        "schema",
+        "status",
+        "trailing_refusal_discarded",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_diagnostics",
+        "max_input_bytes",
+        "max_tokens",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "observed_tokens",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    validation_cases: list[dict[str, Any]] = []
+    input_digests: dict[str, str] = {}
+    for case in ("positive", "failure", "recovery"):
+        expected_artifact, expected_input = PARSER_CORPUS_CASE_INPUTS[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"parser corpus {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"parser corpus {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=PARSER_CORPUS_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"parser corpus {case} real input bytes changed")
+        input_digests[case] = input_digest
+
+        semantic, semantic_digest = read_canonical_record(
+            semantic_paths[case],
+            label=f"parser corpus {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = read_canonical_record(
+            telemetry_paths[case],
+            label=f"parser corpus {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != (
+            f"parser-corpus-semantic case={case} status=pass\n".encode()
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} producer stdout is not exact"
+            )
+        if stderr:
+            raise EvidenceError(f"parser corpus {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"parser corpus {case} semantic fields differ from the frozen schema"
+        )
+        expected_accepted = case == "positive"
+        expected_tree = "(1 + (2 * 3))" if expected_accepted else "(1 = 2)"
+        expected_stop = 9 if expected_accepted else 5
+        expected_boundary = (
+            []
+            if expected_accepted
+            else [
+                {
+                    "byte_offset": 6,
+                    "message": PARSER_CORPUS_LEFTOVER_DIAGNOSTIC,
+                    "origin": "command_boundary",
+                }
+            ]
+        )
+        parse_stop = exact_non_negative_integer(
+            semantic, "parse_stop_byte", label=f"parser corpus {case} semantic"
+        )
+        if (
+            semantic.get("schema") != PARSER_CORPUS_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("input_artifact") != expected_artifact
+            # ubs:ignore — public fixture digest.
+            or semantic.get("input_sha256")
+            != input_digest
+            or semantic.get("accepted") is not expected_accepted
+            or semantic.get("partial_tree") != expected_tree
+            or parse_stop != expected_stop
+            or semantic.get("parser_diagnostics") != []
+            or semantic.get("boundary_diagnostics") != expected_boundary
+            or semantic.get("status") != "pass"
+            or semantic.get("trailing_refusal_discarded")
+            is not (not expected_accepted)
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != PARSER_CORPUS_SCHEMA_VERSION
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} semantics or diagnostic origin changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"parser corpus {case} telemetry fields differ from the frozen schema"
+            )
+        max_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "max_diagnostics",
+            label=f"parser corpus {case} telemetry",
+        )
+        max_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "max_input_bytes",
+            label=f"parser corpus {case} telemetry",
+        )
+        max_tokens = exact_non_negative_integer(
+            telemetry, "max_tokens", label=f"parser corpus {case} telemetry"
+        )
+        observed_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "observed_diagnostics",
+            label=f"parser corpus {case} telemetry",
+        )
+        observed_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "observed_input_bytes",
+            label=f"parser corpus {case} telemetry",
+        )
+        observed_tokens = exact_non_negative_integer(
+            telemetry,
+            "observed_tokens",
+            label=f"parser corpus {case} telemetry",
+        )
+        if (
+            telemetry.get("schema") != PARSER_CORPUS_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != PARSER_CORPUS_SCHEMA_VERSION
+            or max_diagnostics != PARSER_CORPUS_MAX_DIAGNOSTICS
+            or max_input_bytes != PARSER_CORPUS_MAX_INPUT_BYTES
+            # ubs:ignore — public resource bound.
+            or max_tokens
+            != PARSER_CORPUS_MAX_TOKENS
+            or observed_diagnostics != len(expected_boundary)
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+            or observed_tokens != 5
+            or observed_tokens > max_tokens
+        ):
+            raise EvidenceError(
+                f"parser corpus {case} telemetry is malformed or out of bounds"
+            )
+
+        validation_cases.append(
+            {
+                "accepted": expected_accepted,
+                "case": case,
+                "input_sha256": input_digest,
+                "semantic_sha256": semantic_digest,
+                "stderr_sha256": stderr_digest,
+                "stdout_sha256": stdout_digest,
+                "telemetry_sha256": telemetry_digest,
+            }
+        )
+
+    if not hmac.compare_digest(
+        input_digests["failure"], input_digests["recovery"]
+    ):
+        raise EvidenceError(
+            "parser failure and recovery did not use byte-identical real input"
+        )
+    return {
+        "acceptance_law": "failure.accepted == recovery.accepted == false",
+        "cases": validation_cases,
+        "diagnostic_law": (
+            "nonassociative trailing refusal is discarded; "
+            "the command boundary emits exactly one diagnostic"
+        ),
+        "run_id": expected_run_id,
+        "schema": PARSER_CORPUS_VALIDATION_SCHEMA,
+        "verdict": "pass",
+    }
+
+
+def validate_source_recovery_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    input_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    expected_artifact, expected_input = SOURCE_RECOVERY_INPUT
+    try:
+        actual_artifact = input_path.relative_to(artifact_root).as_posix()
+    except ValueError as error:
+        raise EvidenceError(
+            "source recovery input escapes the artifact root"
+        ) from error
+    if actual_artifact != expected_artifact:
+        raise EvidenceError(
+            f"source recovery input artifact {actual_artifact!r}, "
+            f"expected {expected_artifact!r}"
+        )
+    raw_input, input_size, input_digest = stable_file_facts(
+        input_path, max_bytes=DYNAMIC_PARSER_MAX_INPUT_BYTES
+    )
+    if raw_input != expected_input:
+        raise EvidenceError("source recovery real input bytes changed")
+
+    semantic, semantic_digest = read_canonical_record(
+        semantic_path,
+        label="source recovery semantic evidence",
+        max_bytes=65_536,
+    )
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="source recovery telemetry",
+        max_bytes=4_096,
+    )
+    stdout, _stdout_size, stdout_digest = stable_file_facts(
+        stdout_path, max_bytes=MAX_LOG_BYTES
+    )
+    stderr, _stderr_size, stderr_digest = stable_file_facts(
+        stderr_path, max_bytes=MAX_LOG_BYTES
+    )
+    if stdout != b"source-recovery-semantic status=pass\n":
+        raise EvidenceError("source recovery producer stdout is not exact")
+    if stderr:
+        raise EvidenceError("source recovery producer wrote stderr")
+
+    canonical_digest = semantic.get("canonical_digest")
+    if (
+        not isinstance(canonical_digest, str)
+        or SHA256_HEX.fullmatch(canonical_digest) is None
+    ):
+        raise EvidenceError(
+            "source recovery canonical digest is not lowercase SHA-256"
+        )
+    expected_thread_matrix = [
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 1,
+            "threads": 1,
+        },
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 8,
+            "threads": 8,
+        },
+        {
+            "canonical_digest": canonical_digest,
+            "productive": 32,
+            "threads": 32,
+        },
+    ]
+    expected_semantic = {
+        "acceptance_after_equal": True,
+        "acceptance_before_equal": True,
+        "after_authoritative": "rejected",
+        "after_boundaries": 2,
+        "after_journal": 1,
+        "after_markers": 0,
+        "after_observations": ["accepted", "accepted"],
+        "before_authoritative": "rejected",
+        "before_boundaries": 2,
+        "before_journal": 1,
+        "before_markers": 1,
+        "before_observations": ["accepted", "rejected"],
+        "boundary_reparsed": 1,
+        "boundary_reused_prefix": 1,
+        "cancellation_inconclusive": True,
+        "canonical_digest": canonical_digest,
+        "case": "source_recovery",
+        "catalog_categories": 35,
+        "data_grade": "verified",
+        "epoch_bound_markers": True,
+        "first_epoch_revision": 0,
+        "incremental_equals_full": True,
+        "input_artifact": expected_artifact,
+        "input_sha256": input_digest,
+        "invalid_utf8_restart": True,
+        "journal_complete": True,
+        "lexical_reused": True,
+        "publication_after": "authoritative_rejected",
+        "publication_before": "authoritative_rejected",
+        "resource_inconclusive": True,
+        "run_id": expected_run_id,
+        "schema": SOURCE_RECOVERY_SEMANTIC_SCHEMA,
+        "second_epoch_revision": 1,
+        "stale_generation_refused": True,
+        "status": "pass",
+        "thread_matrix": expected_thread_matrix,
+        "version": 1,
+    }
+    if canonical_json(semantic) != canonical_json(expected_semantic):
+        raise EvidenceError(
+            "source recovery semantics or outcome class changed"
+        )
+
+    expected_telemetry = {
+        "after_boundaries": 2,
+        "before_boundaries": 2,
+        "case": "source_recovery",
+        "event": "phase_resources",
+        "max_boundaries": SOURCE_RECOVERY_MAX_BOUNDARIES,
+        "max_input_bytes": DYNAMIC_PARSER_MAX_INPUT_BYTES,
+        "max_threads": SOURCE_RECOVERY_MAX_THREADS,
+        "observed_input_bytes": input_size,
+        "run_id": expected_run_id,
+        "schema": SOURCE_RECOVERY_TELEMETRY_SCHEMA,
+        "thread_runs": 41,
+        "timing_used_as_gate": False,
+        "version": 1,
+    }
+    if canonical_json(telemetry) != canonical_json(expected_telemetry):
+        raise EvidenceError(
+            "source recovery telemetry is malformed or out of bounds"
+        )
+    return {
+        "canonical_digest": canonical_digest,
+        "input_sha256": input_digest,
+        "semantic_sha256": semantic_digest,
+        "stderr_sha256": stderr_digest,
+        "stdout_sha256": stdout_digest,
+        "telemetry_sha256": telemetry_digest,
+    }
+
+
+def validate_dynamic_parser_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_paths: Mapping[str, Path],
+    telemetry_paths: Mapping[str, Path],
+    input_paths: Mapping[str, Path],
+    stdout_paths: Mapping[str, Path],
+    stderr_paths: Mapping[str, Path],
+    source_recovery_semantic_path: Path,
+    source_recovery_telemetry_path: Path,
+    source_recovery_input_path: Path,
+    source_recovery_stdout_path: Path,
+    source_recovery_stderr_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("dynamic parser expected run id must be non-empty")
+    expected_cases = set(DYNAMIC_PARSER_CASE_INPUTS)
+    for label, paths in (
+        ("semantic", semantic_paths),
+        ("telemetry", telemetry_paths),
+        ("input", input_paths),
+        ("stdout", stdout_paths),
+        ("stderr", stderr_paths),
+    ):
+        if set(paths) != expected_cases:
+            raise EvidenceError(
+                "dynamic parser "
+                f"{label} cases differ from the frozen governed case set"
+            )
+
+    semantic_fields = {
+        "case",
+        "categories",
+        "claim_grade",
+        "data_grade",
+        "diagnostics",
+        "epoch_after",
+        "epoch_before",
+        "epoch_digest_after",
+        "epoch_digest_before",
+        "grammar_root_after",
+        "grammar_root_before",
+        "input_artifact",
+        "input_sha256",
+        "incremental",
+        "interleaving_claim",
+        "lookup_kinds",
+        "outcome",
+        "production_count_after",
+        "production_count_before",
+        "resource_usage",
+        "retry_control_completed",
+        "run_id",
+        "schema",
+        "status",
+        "store_unchanged",
+        "version",
+    }
+    telemetry_fields = {
+        "case",
+        "event",
+        "max_commands",
+        "max_diagnostics",
+        "max_input_bytes",
+        "max_requests",
+        "observed_commands",
+        "observed_diagnostics",
+        "observed_input_bytes",
+        "observed_requests",
+        "run_id",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+    }
+    expectations = {
+        "positive": {
+            "categories": ["term"],
+            "claim_grade": "production_path",
+            "diagnostics": [],
+            "epoch_after": 2,
+            "epoch_before": 0,
+            "epoch_digest_after": (
+                "4db789c5b26d4dbaf56d600e2b8af11b"
+                "0967eff73030b8ff5cbae40750a69ce9"
+            ),
+            "epoch_digest_before": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "grammar_root_after_sha256": (
+                "cb8517a2bbd6c852378fbfd1ab8fec0f"
+                "d829d6953daafb4a30e5368f2d7d0eed"
+            ),
+            "grammar_root_before_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "incremental": None,
+            "lookup_kinds": ["dynamicTerm"],
+            "outcome": "accepted",
+            "production_count_after": 1,
+            "production_count_before": 0,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": False,
+            "observed_commands": 3,
+            "observed_requests": 0,
+        },
+        "failure": {
+            "categories": [],
+            "claim_grade": "production_path",
+            "diagnostics": [
+                {
+                    "message": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
+                    "origin": "register_error",
+                }
+            ],
+            "epoch_after": 0,
+            "epoch_before": 0,
+            "epoch_digest_after": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "epoch_digest_before": (
+                "47ddc174bcc029de96efe6e2d7546aa7"
+                "e8b9bce1c1ea36980b6900647ec49c17"
+            ),
+            "grammar_root_after_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "grammar_root_before_sha256": (
+                "4696d72c7a41fc7cb5b0b2f107173561"
+                "66a54f2cc29d56c300f397f78c2d6b5d"
+            ),
+            "incremental": None,
+            "lookup_kinds": [],
+            "outcome": "rejected",
+            "production_count_after": 0,
+            "production_count_before": 0,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": True,
+            "observed_commands": 1,
+            "observed_requests": 0,
+        },
+        "recovery": {
+            "categories": ["term"],
+            "claim_grade": "bounded_model",
+            "diagnostics": [],
+            "epoch_after": 2,
+            "epoch_before": 2,
+            "epoch_digest_after": (
+                "79d7d967378bb9e8f41ca9a2eaaf8a33"
+                "3782ffb0745d9015ee25747765991f08"
+            ),
+            "epoch_digest_before": (
+                "79d7d967378bb9e8f41ca9a2eaaf8a33"
+                "3782ffb0745d9015ee25747765991f08"
+            ),
+            "grammar_root_after_sha256": (
+                "7c6ef65637c6893d0f2c5fc690b9da0e"
+                "bee60128e162506632e70e77c0d6bdc6"
+            ),
+            "grammar_root_before_sha256": (
+                "7c6ef65637c6893d0f2c5fc690b9da0e"
+                "bee60128e162506632e70e77c0d6bdc6"
+            ),
+            "incremental": None,
+            "lookup_kinds": [],
+            "outcome": "inconclusive",
+            "production_count_after": 1,
+            "production_count_before": 1,
+            "resource_usage": {
+                "allowed": 3,
+                "observed": 5,
+                "unit": "produced_nodes",
+            },
+            "retry_control_completed": True,
+            "store_unchanged": True,
+            "observed_commands": 4,
+            "observed_requests": 4,
+        },
+        "incremental": {
+            "categories": ["term"],
+            "claim_grade": "bounded_model",
+            "diagnostics": [],
+            "epoch_after": 6,
+            "epoch_before": 3,
+            "epoch_digest_after": (
+                "930a66da82838cf4494a164e9519cb451"
+                "27899c8eb3ee2c5894d92e23ab00ebc"
+            ),
+            "epoch_digest_before": (
+                "2ed3015562cd2ebfd75a61669371c115"
+                "b6e8fe59cb56c231ce555361c0808e58"
+            ),
+            "grammar_root_after_sha256": (
+                "50abd66f14e0e6b850f2b57abb57de8e"
+                "6168ac9c4e20f7ff129d3bba634e3757"
+            ),
+            "grammar_root_before_sha256": (
+                "48498d3d88bd4b8efe602982aa1311e4"
+                "8883f0e5377f0b4a037db16bf448208b"
+            ),
+            "incremental": "strict",
+            "lookup_kinds": ["z-new"],
+            "outcome": "accepted",
+            "production_count_after": 4,
+            "production_count_before": 2,
+            "resource_usage": None,
+            "retry_control_completed": False,
+            "store_unchanged": False,
+            "observed_commands": 12,
+            "observed_requests": 0,
+        },
+    }
+
+    incremental_fields = {
+        "canonical_digest",
+        "cold_equal_after_opaque",
+        "cold_equal_after_recovery",
+        "cold_equal_after_typed",
+        "component_ids",
+        "distributed_at_barrier",
+        "distributed_before_barrier",
+        "final_values",
+        "initial_epoch",
+        "opaque_barrier",
+        "opaque_cache",
+        "opaque_epoch",
+        "production_count_initial",
+        "production_count_recovery",
+        "recovery_cache",
+        "recovery_epoch",
+        "recovery_succeeded",
+        "refusal_atomic",
+        "refusal_message",
+        "thread_matrix",
+        "typed_cache",
+        "typed_epoch",
+    }
+    epoch_fields = {"digest", "revision"}
+    cache_fields = {
+        "invalidated",
+        "prefix_reused",
+        "promoted",
+        "reasons",
+        "scanned",
+    }
+
+    def exact_epoch(record: Any, *, label: str) -> tuple[int, str]:
+        if not isinstance(record, dict) or set(record) != epoch_fields:
+            raise EvidenceError(f"{label} has a non-canonical epoch shape")
+        revision = exact_non_negative_integer(record, "revision", label=label)
+        digest = record.get("digest")
+        if not isinstance(digest, str) or SHA256_HEX.fullmatch(digest) is None:
+            raise EvidenceError(f"{label} digest is not canonical lowercase hex")
+        return revision, digest
+
+    def exact_cache(
+        record: Any,
+        *,
+        label: str,
+        expected_scanned: int,
+        expected_prefix: int,
+        expected_invalidated: int,
+        expected_promoted: int,
+        expected_reasons: list[str],
+    ) -> None:
+        if not isinstance(record, dict) or set(record) != cache_fields:
+            raise EvidenceError(f"{label} has a non-canonical cache shape")
+        if (
+            exact_non_negative_integer(record, "scanned", label=label)
+            != expected_scanned
+            or exact_non_negative_integer(record, "prefix_reused", label=label)
+            != expected_prefix
+            or exact_non_negative_integer(record, "invalidated", label=label)
+            != expected_invalidated
+            or exact_non_negative_integer(record, "promoted", label=label)
+            != expected_promoted
+            or record.get("reasons") != expected_reasons
+        ):
+            raise EvidenceError(f"{label} exact cone changed")
+
+    def validate_incremental(record: Any) -> dict[str, str]:
+        label = "dynamic parser incremental semantic"
+        expected_canonical_digest = (
+            "764c003accc3a52239b56d26ce2d0918"
+            "2b505589d68b1d19636eae6e7ee59acb"
+        )
+        expected_initial_digest = (
+            "2ed3015562cd2ebfd75a61669371c115"
+            "b6e8fe59cb56c231ce555361c0808e58"
+        )
+        expected_typed_digest = (
+            "4ee25b514e3b6cc1965f852dd920666b"
+            "c3fbdfab85ada378e7efb70b0cc5d373"
+        )
+        expected_recovery_digest = (
+            "930a66da82838cf4494a164e9519cb451"
+            "27899c8eb3ee2c5894d92e23ab00ebc"
+        )
+        if not isinstance(record, dict) or set(record) != incremental_fields:
+            raise EvidenceError(f"{label} has a non-canonical field set")
+        canonical_digest = record.get("canonical_digest")
+        if (
+            not isinstance(canonical_digest, str)
+            or SHA256_HEX.fullmatch(canonical_digest) is None
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental canonical digest is malformed"
+            )
+        initial_revision, initial_digest = exact_epoch(
+            record.get("initial_epoch"), label=f"{label} initial epoch"
+        )
+        typed_revision, typed_digest = exact_epoch(
+            record.get("typed_epoch"), label=f"{label} typed epoch"
+        )
+        opaque_revision, opaque_digest = exact_epoch(
+            record.get("opaque_epoch"), label=f"{label} opaque epoch"
+        )
+        recovery_revision, recovery_digest = exact_epoch(
+            record.get("recovery_epoch"), label=f"{label} recovery epoch"
+        )
+        if (
+            [initial_revision, typed_revision, opaque_revision, recovery_revision]
+            != [3, 4, 5, 6]
+            or canonical_digest != expected_canonical_digest  # ubs:ignore — public evidence digest.
+            or initial_digest != expected_initial_digest  # ubs:ignore — public evidence digest.
+            or typed_digest != expected_typed_digest  # ubs:ignore — public evidence digest.
+            or opaque_digest != expected_typed_digest  # ubs:ignore — public evidence digest.
+            or recovery_digest != expected_recovery_digest  # ubs:ignore — public evidence digest.
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental epoch identity law changed"
+            )
+        exact_cache(
+            record.get("typed_cache"),
+            label=f"{label} typed cache",
+            expected_scanned=5,
+            expected_prefix=1,
+            expected_invalidated=1,
+            expected_promoted=3,
+            expected_reasons=["15:changed:syntax:term:x:leading"],
+        )
+        exact_cache(
+            record.get("opaque_cache"),
+            label=f"{label} opaque cache",
+            expected_scanned=9,
+            expected_prefix=1,
+            expected_invalidated=3,
+            expected_promoted=0,
+            expected_reasons=[
+                "25:opaque-suffix-barrier",
+                "35:opaque-suffix-barrier",
+                "45:opaque-suffix-barrier",
+            ],
+        )
+        exact_cache(
+            record.get("recovery_cache"),
+            label=f"{label} recovery cache",
+            expected_scanned=12,
+            expected_prefix=1,
+            expected_invalidated=1,
+            expected_promoted=1,
+            expected_reasons=["45:changed:syntax:term:z:leading"],
+        )
+        if (
+            record.get("cold_equal_after_typed") is not True
+            or record.get("cold_equal_after_opaque") is not True
+            or record.get("cold_equal_after_recovery") is not True
+            or record.get("component_ids")
+            != [
+                "syntax:term:x:leading",
+                "syntax:term:y:leading",
+                "syntax:term:z:leading",
+                "whole-grammar:opaque",
+            ]
+            or record.get("distributed_before_barrier") is not True
+            or record.get("distributed_at_barrier") is not False
+            or exact_non_negative_integer(record, "opaque_barrier", label=label)
+            != 20
+            or exact_non_negative_integer(
+                record, "production_count_initial", label=label
+            )
+            != 2
+            or exact_non_negative_integer(
+                record, "production_count_recovery", label=label
+            )
+            != 4
+            or record.get("recovery_succeeded") is not True
+            or record.get("refusal_atomic") is not True
+            or record.get("refusal_message")
+            != (
+                "no live Leading production `missing` for token `missing` "
+                "in category `term`"
+            )
+            or record.get("final_values")
+            != [
+                {"position": 5, "token": "x", "values": ["x-base"]},
+                {
+                    "position": 15,
+                    "token": "x",
+                    "values": ["x-base", "x-new"],
+                },
+                {"position": 25, "token": "y", "values": ["y-base"]},
+                {"position": 35, "token": "y", "values": ["y-base"]},
+                {"position": 45, "token": "z", "values": ["z-new"]},
+            ]
+            or record.get("thread_matrix")
+            != [
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 1,
+                    "threads": 1,
+                },
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 8,
+                    "threads": 8,
+                },
+                {
+                    "canonical_digest": canonical_digest,
+                    "productive": 32,
+                    "threads": 32,
+                },
+            ]
+        ):
+            raise EvidenceError(
+                "dynamic parser incremental exact session or thread matrix changed"
+            )
+        return {
+            "canonical_digest": canonical_digest,
+            "initial_digest": initial_digest,
+            "recovery_digest": recovery_digest,
+        }
+
+    validation_cases: list[dict[str, Any]] = []
+    for case in DYNAMIC_PARSER_CASE_INPUTS:
+        expected_artifact, expected_input = DYNAMIC_PARSER_CASE_INPUTS[case]
+        expected = expectations[case]
+        input_path = input_paths[case]
+        try:
+            actual_artifact = input_path.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise EvidenceError(
+                f"dynamic parser {case} input escapes the artifact root"
+            ) from error
+        if actual_artifact != expected_artifact:
+            raise EvidenceError(
+                f"dynamic parser {case} input artifact {actual_artifact!r}, "
+                f"expected {expected_artifact!r}"
+            )
+        raw_input, input_size, input_digest = stable_file_facts(
+            input_path, max_bytes=DYNAMIC_PARSER_MAX_INPUT_BYTES
+        )
+        if raw_input != expected_input:
+            raise EvidenceError(f"dynamic parser {case} real input bytes changed")
+
+        semantic, semantic_digest = read_canonical_record(
+            semantic_paths[case],
+            label=f"dynamic parser {case} semantic evidence",
+            max_bytes=65_536,
+        )
+        telemetry, telemetry_digest = read_canonical_record(
+            telemetry_paths[case],
+            label=f"dynamic parser {case} telemetry",
+            max_bytes=4_096,
+        )
+        stdout, _stdout_size, stdout_digest = stable_file_facts(
+            stdout_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        stderr, _stderr_size, stderr_digest = stable_file_facts(
+            stderr_paths[case], max_bytes=MAX_LOG_BYTES
+        )
+        if stdout != (
+            f"dynamic-parser-semantic case={case} status=pass\n".encode()
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} producer stdout is not exact"
+            )
+        if stderr:
+            raise EvidenceError(f"dynamic parser {case} producer wrote stderr")
+
+        if set(semantic) != semantic_fields:
+            raise EvidenceError(
+                f"dynamic parser {case} semantic fields differ from the frozen schema"
+            )
+        epoch_after = exact_non_negative_integer(
+            semantic, "epoch_after", label=f"dynamic parser {case} semantic"
+        )
+        epoch_before = exact_non_negative_integer(
+            semantic, "epoch_before", label=f"dynamic parser {case} semantic"
+        )
+        epoch_digest_after = semantic.get("epoch_digest_after")
+        epoch_digest_before = semantic.get("epoch_digest_before")
+        if (
+            not isinstance(epoch_digest_after, str)
+            or SHA256_HEX.fullmatch(epoch_digest_after) is None
+            or not isinstance(epoch_digest_before, str)
+            or SHA256_HEX.fullmatch(epoch_digest_before) is None
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} epoch digest is not canonical lowercase hex"
+            )
+        production_count_after = exact_non_negative_integer(
+            semantic,
+            "production_count_after",
+            label=f"dynamic parser {case} semantic",
+        )
+        production_count_before = exact_non_negative_integer(
+            semantic,
+            "production_count_before",
+            label=f"dynamic parser {case} semantic",
+        )
+        resource_usage = semantic.get("resource_usage")
+        expected_resource_usage = expected["resource_usage"]
+        if resource_usage is not None:
+            if (
+                not isinstance(expected_resource_usage, dict)
+                or not isinstance(resource_usage, dict)
+                or set(resource_usage) != {"allowed", "observed", "unit"}
+                or exact_non_negative_integer(
+                    resource_usage,
+                    "allowed",
+                    label=f"dynamic parser {case} resource usage",
+                )
+                != expected_resource_usage["allowed"]
+                or exact_non_negative_integer(
+                    resource_usage,
+                    "observed",
+                    label=f"dynamic parser {case} resource usage",
+                )
+                != expected_resource_usage["observed"]
+                or resource_usage.get("unit")
+                != expected_resource_usage["unit"]
+            ):
+                raise EvidenceError(
+                    f"dynamic parser {case} resource usage changed"
+                )
+        incremental_details = None
+        if case == "incremental":
+            incremental_details = validate_incremental(
+                semantic.get("incremental")
+            )
+            if (
+                epoch_digest_before != incremental_details["initial_digest"]  # ubs:ignore — public epoch digest.
+                or epoch_digest_after  # ubs:ignore — public epoch digest.
+                != incremental_details["recovery_digest"]
+            ):
+                raise EvidenceError(
+                    "dynamic parser incremental top-level epochs do not bind "
+                    "the detailed session"
+                )
+        elif semantic.get("incremental") is not None:
+            raise EvidenceError(
+                f"dynamic parser {case} unexpectedly carries incremental details"
+            )
+        grammar_root_after = semantic.get("grammar_root_after")
+        grammar_root_before = semantic.get("grammar_root_before")
+        if (
+            not isinstance(grammar_root_after, str)
+            or not isinstance(grammar_root_before, str)
+            or len(grammar_root_after.encode()) > 65_536
+            or len(grammar_root_before.encode()) > 65_536
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} grammar root is malformed or unbounded"
+            )
+        roots_match = (
+            hashlib.sha256(grammar_root_after.encode()).hexdigest()  # ubs:ignore — public content digest.
+            == expected["grammar_root_after_sha256"]
+            and hashlib.sha256(grammar_root_before.encode()).hexdigest()  # ubs:ignore — public content digest.
+            == expected["grammar_root_before_sha256"]
+        )
+        epoch_digests_match = (
+            epoch_digest_after == expected["epoch_digest_after"]  # ubs:ignore — public epoch digest.
+            and epoch_digest_before == expected["epoch_digest_before"]  # ubs:ignore — public epoch digest.
+        )
+        if (
+            semantic.get("schema") != DYNAMIC_PARSER_SEMANTIC_SCHEMA
+            or semantic.get("run_id") != expected_run_id
+            or semantic.get("case") != case
+            or semantic.get("data_grade") != "verified"
+            or semantic.get("claim_grade") != expected["claim_grade"]
+            or semantic.get("input_artifact") != expected_artifact
+            # ubs:ignore — public fixture digest.
+            or semantic.get("input_sha256")
+            != input_digest
+            or semantic.get("interleaving_claim") != DYNAMIC_PARSER_INTERLEAVING_CLAIM
+            or semantic.get("categories") != expected["categories"]
+            or semantic.get("diagnostics") != expected["diagnostics"]
+            or epoch_after != expected["epoch_after"]
+            or epoch_before != expected["epoch_before"]
+            or not roots_match
+            or not epoch_digests_match
+            or (
+                case == "incremental"
+                and incremental_details is None
+            )
+            or semantic.get("lookup_kinds") != expected["lookup_kinds"]
+            or semantic.get("outcome") != expected["outcome"]
+            or production_count_after != expected["production_count_after"]
+            or production_count_before != expected["production_count_before"]
+            or resource_usage != expected_resource_usage
+            or semantic.get("retry_control_completed")
+            is not expected["retry_control_completed"]
+            or semantic.get("store_unchanged")
+            is not expected["store_unchanged"]
+            or semantic.get("status") != "pass"
+            or type(semantic.get("version")) is not int
+            or semantic.get("version") != DYNAMIC_PARSER_SCHEMA_VERSION
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} semantics or outcome class changed"
+            )
+
+        if set(telemetry) != telemetry_fields:
+            raise EvidenceError(
+                f"dynamic parser {case} telemetry fields differ from the frozen schema"
+            )
+        max_commands = exact_non_negative_integer(
+            telemetry,
+            "max_commands",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "max_diagnostics",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "max_input_bytes",
+            label=f"dynamic parser {case} telemetry",
+        )
+        max_requests = exact_non_negative_integer(
+            telemetry,
+            "max_requests",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_commands = exact_non_negative_integer(
+            telemetry,
+            "observed_commands",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_diagnostics = exact_non_negative_integer(
+            telemetry,
+            "observed_diagnostics",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_input_bytes = exact_non_negative_integer(
+            telemetry,
+            "observed_input_bytes",
+            label=f"dynamic parser {case} telemetry",
+        )
+        observed_requests = exact_non_negative_integer(
+            telemetry,
+            "observed_requests",
+            label=f"dynamic parser {case} telemetry",
+        )
+        if (
+            telemetry.get("schema") != DYNAMIC_PARSER_TELEMETRY_SCHEMA
+            or telemetry.get("run_id") != expected_run_id
+            or telemetry.get("case") != case
+            or telemetry.get("event") != "phase_resources"
+            or telemetry.get("timing_used_as_gate") is not False
+            or type(telemetry.get("version")) is not int
+            or telemetry.get("version") != DYNAMIC_PARSER_SCHEMA_VERSION
+            or max_commands != DYNAMIC_PARSER_MAX_COMMANDS
+            or max_diagnostics != DYNAMIC_PARSER_MAX_DIAGNOSTICS
+            or max_input_bytes != DYNAMIC_PARSER_MAX_INPUT_BYTES
+            or max_requests != DYNAMIC_PARSER_MAX_REQUESTS
+            or observed_commands != expected["observed_commands"]
+            or observed_commands > max_commands
+            or observed_diagnostics != len(expected["diagnostics"])
+            or observed_diagnostics > max_diagnostics
+            or observed_input_bytes != input_size
+            or observed_input_bytes > max_input_bytes
+            or observed_requests != expected["observed_requests"]
+            or observed_requests > max_requests
+        ):
+            raise EvidenceError(
+                f"dynamic parser {case} telemetry is malformed or out of bounds"
+            )
+
+        case_report = {
+            "case": case,
+            "input_sha256": input_digest,
+            "outcome": expected["outcome"],
+            "semantic_sha256": semantic_digest,
+            "stderr_sha256": stderr_digest,
+            "stdout_sha256": stdout_digest,
+            "telemetry_sha256": telemetry_digest,
+        }
+        if incremental_details is not None:
+            case_report["incremental_canonical_digest"] = incremental_details[
+                "canonical_digest"
+            ]
+        validation_cases.append(case_report)
+
+    source_recovery = validate_source_recovery_evidence(
+        expected_run_id=expected_run_id,
+        semantic_path=source_recovery_semantic_path,
+        telemetry_path=source_recovery_telemetry_path,
+        input_path=source_recovery_input_path,
+        stdout_path=source_recovery_stdout_path,
+        stderr_path=source_recovery_stderr_path,
+        artifact_root=artifact_root,
+    )
+    return {
+        "cases": validation_cases,
+        "incremental_law": (
+            "exact typed cones, opaque suffix invalidation, atomic refusal, "
+            "recovery, and incremental-equals-cold at every retained position"
+        ),
+        "interleaving_claim": DYNAMIC_PARSER_INTERLEAVING_CLAIM,
+        "resource_law": (
+            "budget exhaustion is Inconclusive with an untouched store "
+            "and no diagnostic"
+        ),
+        "run_id": expected_run_id,
+        "schema": DYNAMIC_PARSER_VALIDATION_SCHEMA,
+        "source_recovery": source_recovery,
+        "source_recovery_law": (
+            "the exact command stream alone controls publication; recovery "
+            "markers are explicit, epoch-bound, and incremental-equals-full"
+        ),
+        "thread_matrix": [1, 8, 32],
+        "typed_refusal": DYNAMIC_PARSER_UNKNOWN_CATEGORY_DIAGNOSTIC,
+        "verdict": "pass",
+    }
+
+
+def macro_txn_canonical_rows(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[list[dict[str, Any]], str]:
+    data, _size, digest = stable_file_facts(path, max_bytes=max_bytes)
+    rows: list[dict[str, Any]] = []
+    for number, raw in enumerate(data.splitlines(keepends=True), 1):
+        if not raw.endswith(b"\n"):
+            raise EvidenceError(
+                f"{label} row {number} is not newline terminated"
+            )
+        value = parse_json(raw, subject=f"{label} row {number}")
+        if not isinstance(value, dict):
+            raise EvidenceError(f"{label} row {number} is not an object")
+        if canonical_json(value) != raw:
+            raise EvidenceError(
+                f"{label} row {number} is not canonical JSON"
+            )
+        rows.append(value)
+    if not rows:
+        raise EvidenceError(f"{label} is empty")
+    return rows, digest
+
+
+def validate_macro_txn_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("macro transaction expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="macro transaction semantic evidence",
+        max_bytes=65_536,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="macro transaction telemetry",
+        max_bytes=4_096,
+    )
+    if len(semantic) != len(MACRO_TXN_SCENARIOS):
+        raise EvidenceError(
+            "macro transaction semantic row count differs from the frozen scenario set"
+        )
+    if [row.get("sequence") for row in semantic] != list(
+        range(len(MACRO_TXN_SCENARIOS))
+    ):
+        raise EvidenceError(
+            "macro transaction semantic sequence is not total and ordered"
+        )
+    if [row.get("scenario") for row in semantic] != list(
+        MACRO_TXN_SCENARIOS
+    ):
+        raise EvidenceError(
+            "macro transaction semantic scenarios are incomplete or reordered"
+        )
+    if any(
+        row.get("schema") != MACRO_TXN_SEMANTIC_SCHEMA  # ubs:ignore — public schema identity.
+        for row in semantic
+    ):
+        raise EvidenceError("macro transaction semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration_ns",
+        "host",
+        "pid",
+        "positive_operations",
+        "run_id",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError(
+            "macro transaction semantic authority contains telemetry"
+        )
+
+    expected_fields = {
+        "positive": {
+            "cacheability",
+            "capability_event_count",
+            "diagnostic_codes",
+            "effect_count",
+            "final_state",
+            "initial_state",
+            "published",
+            "read_count",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged_before_publish",
+            "status",
+            "value",
+        },
+        "memoization": {
+            "cached_equals_fresh",
+            "cached_final_state",
+            "collision_lookup",
+            "exact_lookup",
+            "fresh_final_state",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "stale_file",
+            "stale_iteration",
+            "stale_negative",
+            "stale_option",
+        },
+        "opaque_reads": {
+            "faithful_clock_cacheability",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "sound_clock_outcome",
+            "unknown_cacheability",
+            "unknown_memo_admission",
+        },
+        "failure": {
+            "capability_event",
+            "diagnostic_codes",
+            "error",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "cancellation": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "resource": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "internal_fault": {
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged",
+            "status",
+        },
+        "recovery": {
+            "final_state",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "value",
+        },
+        "quotation_seam": {
+            "failure_status",
+            "positive_root",
+            "positive_status",
+            "recovery_root",
+            "recovery_status",
+            "scenario",
+            "schema",
+            "sequence",
+            "state_unchanged_before_publication",
+        },
+        "thread_matrix": {
+            "productive_runs",
+            "published",
+            "scenario",
+            "schema",
+            "semantic_root",
+            "sequence",
+            "status",
+            "thread_counts",
+        },
+    }
+    for row in semantic:
+        scenario = row["scenario"]
+        if set(row) != expected_fields[scenario]:
+            raise EvidenceError(
+                f"macro transaction {scenario} fields differ from the frozen schema"
+            )
+
+    positive = semantic[0]
+    initial_root = positive.get("initial_state")
+    positive_root = positive.get("final_state")
+    if (
+        not isinstance(initial_root, str)
+        or SHA256_HEX.fullmatch(initial_root) is None
+        or not isinstance(positive_root, str)
+        or SHA256_HEX.fullmatch(positive_root) is None
+        or initial_root == positive_root
+        or positive.get("cacheability") != "cacheable"
+        or positive.get("capability_event_count") != 1
+        or positive.get("diagnostic_codes")
+        != ["nested-visible", "committed"]
+        or positive.get("effect_count") != 4
+        or positive.get("published") is not True
+        or positive.get("read_count") != 9
+        or positive.get("state_unchanged_before_publish") is not True
+        or positive.get("status") != "complete"
+        or positive.get("value") != "expanded:old:false"
+    ):
+        raise EvidenceError(
+            "macro transaction positive publication facts changed"
+        )
+
+    memoization = semantic[1]
+    if (
+        memoization.get("cached_equals_fresh") is not True
+        or memoization.get("cached_final_state") != positive_root
+        or memoization.get("collision_lookup") != "collision_miss"
+        or memoization.get("exact_lookup") != "hit"
+        or memoization.get("fresh_final_state") != positive_root
+        or memoization.get("published") is not True
+        or memoization.get("stale_file") != "stale_read_miss"
+        or memoization.get("stale_iteration") != "stale_read_miss"
+        or memoization.get("stale_negative") != "stale_read_miss"
+        or memoization.get("stale_option") != "stale_read_miss"
+    ):
+        raise EvidenceError(
+            "macro transaction exact memoization law changed"
+        )
+
+    opaque_reads = semantic[2]
+    if (
+        opaque_reads.get("faithful_clock_cacheability") != "uncacheable"
+        or opaque_reads.get("published") is not False
+        or opaque_reads.get("sound_clock_outcome") != "rejected"
+        or opaque_reads.get("unknown_cacheability") != "uncacheable"
+        or opaque_reads.get("unknown_memo_admission") != "refused"
+    ):
+        raise EvidenceError(
+            "macro transaction opaque-read policy changed"
+        )
+
+    failure = semantic[3]
+    if (
+        failure.get("capability_event") != "clock_denied_sound"
+        or failure.get("diagnostic_codes") != ["failure-visible"]
+        or failure.get("error") != "capability_denied_clock_sound"
+        or failure.get("published") is not False
+        or failure.get("state_unchanged") is not True
+        or failure.get("status") != "rejected"
+    ):
+        raise EvidenceError(
+            "macro transaction failure or diagnostic policy changed"
+        )
+
+    expected_negative_status = {
+        "cancellation": "inconclusive",
+        "resource": "inconclusive",
+        "internal_fault": "internal_fault",
+    }
+    for row in semantic[4:7]:
+        if (
+            row.get("status") != expected_negative_status[row["scenario"]]
+            or row.get("published") is not False
+            or row.get("state_unchanged") is not True
+        ):
+            raise EvidenceError(
+                "macro transaction non-authoritative outcome crossed publication"
+            )
+
+    recovery = semantic[7]
+    if (
+        recovery.get("final_state") != positive_root
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not True
+        or recovery.get("status") != "complete"
+        or recovery.get("value") != positive.get("value")
+    ):
+        raise EvidenceError(
+            "macro transaction clean recovery diverged from the positive control"
+        )
+
+    quotation = semantic[8]
+    quotation_root = quotation.get("positive_root")
+    quotation_recovery_root = quotation.get("recovery_root")
+    if (
+        not isinstance(quotation_root, str)
+        or SHA256_HEX.fullmatch(quotation_root) is None
+        or quotation_recovery_root != quotation_root
+        or quotation.get("positive_status") != "complete"
+        or quotation.get("failure_status") != "rejected"
+        or quotation.get("recovery_status") != "complete"
+        or quotation.get("state_unchanged_before_publication") is not True
+    ):
+        raise EvidenceError(
+            "actual quotation transaction seam failed positive, refusal, or recovery"
+        )
+
+    thread_matrix = semantic[9]
+    if (
+        thread_matrix.get("productive_runs")  # ubs:ignore — public run count.
+        != MACRO_TXN_PRODUCTIVE_RUNS
+        or thread_matrix.get("published") is not True
+        or thread_matrix.get("semantic_root") != positive_root
+        or thread_matrix.get("status") != "complete"
+        or thread_matrix.get("thread_counts") != MACRO_TXN_THREAD_COUNTS  # ubs:ignore — public thread set.
+    ):
+        raise EvidenceError(
+            "macro transaction productive 1/8/32 reduction changed"
+        )
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError(
+            "macro transaction telemetry row count is not one"
+        )
+    telemetry = telemetry_rows[0]
+    telemetry_fields = {
+        "observed_semantic_rows",
+        "positive_operations",
+        "productive_runs",
+        "run_id",
+        "schema",
+        "thread_counts",
+    }
+    if (
+        set(telemetry) != telemetry_fields
+        or telemetry.get("schema") != MACRO_TXN_TELEMETRY_SCHEMA  # ubs:ignore — public schema identity.
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("thread_counts") != MACRO_TXN_THREAD_COUNTS  # ubs:ignore — public thread set.
+        or telemetry.get("productive_runs") != MACRO_TXN_PRODUCTIVE_RUNS  # ubs:ignore — public run count.
+        or telemetry.get("observed_semantic_rows")
+        != len(MACRO_TXN_SCENARIOS)
+        or telemetry.get("positive_operations") != 17
+    ):
+        raise EvidenceError(
+            "macro transaction telemetry is malformed or not bound to the run"
+        )
+
+    return {
+        "initial_state": initial_root,
+        "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+        "quotation_root": quotation_root,
+        "run_id": expected_run_id,
+        "schema": MACRO_TXN_VALIDATION_SCHEMA,
+        "semantic_root": positive_root,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "thread_counts": MACRO_TXN_THREAD_COUNTS,
+        "verdict": "pass",
+    }
+
+
+def validate_certificate_format_export(path: Path) -> dict[str, Any]:
+    data, size, digest = stable_file_facts(
+        path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    raw_rows = data.splitlines(keepends=True)
+    if len(raw_rows) != CERTIFICATE_FORMAT_EXPORT_ROWS:
+        raise EvidenceError(
+            "certificate-format export row count differs from the pinned witness"
+        )
+    rows: list[dict[str, Any]] = []
+    for number, raw in enumerate(raw_rows, 1):
+        if not raw.endswith(b"\n"):
+            raise EvidenceError(
+                f"certificate-format export row {number} is not newline terminated"
+            )
+        row = parse_json(
+            raw,
+            subject=f"certificate-format export row {number}",
+        )
+        if not isinstance(row, dict):
+            raise EvidenceError(
+                f"certificate-format export row {number} is not an object"
+            )
+        if canonical_json(row) != raw:
+            raise EvidenceError(
+                f"certificate-format export row {number} is not canonical JSON"
+            )
+        rows.append(row)
+
+    expected_meta = {
+        "exporter": {
+            "name": "lean4export",
+            "version": CERTIFICATE_FORMAT_EXPORT_VERSION,
+        },
+        "format": {"version": CERTIFICATE_FORMAT_EXPORT_VERSION},
+        "lean": {
+            "githash": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+            "version": "4.32.0",
+        },
+    }
+    if rows[0] != {"meta": expected_meta}:
+        raise EvidenceError(
+            "certificate-format export metadata differs from the pinned toolchain"
+        )
+
+    names: dict[int, str] = {0: ""}
+    for number, row in enumerate(rows[1:], 2):
+        name_id = row.get("in")
+        if type(name_id) is not int or name_id < 1:
+            continue
+        if "str" in row:
+            component = row["str"]
+            expected = {"pre", "str"}
+            if not isinstance(component, dict) or set(component) != expected:
+                raise EvidenceError(
+                    f"certificate-format export string name row {number} is malformed"
+                )
+            predecessor = component["pre"]
+            leaf = component["str"]
+        elif "num" in row:
+            component = row["num"]
+            expected = {"i", "pre"}
+            if not isinstance(component, dict) or set(component) != expected:
+                raise EvidenceError(
+                    f"certificate-format export numeric name row {number} is malformed"
+                )
+            predecessor = component["pre"]
+            leaf = str(component["i"])
+        else:
+            continue
+        if (
+            type(predecessor) is not int
+            or predecessor not in names
+            or not isinstance(leaf, str)
+            or not leaf
+            or name_id in names
+        ):
+            raise EvidenceError(
+                f"certificate-format export name row {number} is not dependency ordered"
+            )
+        prefix = names[predecessor]
+        names[name_id] = f"{prefix}.{leaf}" if prefix else leaf
+
+    witness_rows = []
+    for row in rows:
+        theorem = row.get("thm")
+        if not isinstance(theorem, dict):
+            continue
+        name_id = theorem.get("name")
+        if type(name_id) is int and names.get(name_id) == (
+            "certificate_witness_add_zero"
+        ):
+            witness_rows.append(row)
+    if len(witness_rows) != 1 or rows[-1] != witness_rows[0]:
+        raise EvidenceError(
+            "certificate-format export does not end in exactly one witness theorem"
+        )
+
+    return {
+        "bytes": size,
+        "rows": len(rows),
+        "sha256": digest,
+        "witness": "certificate_witness_add_zero",
+    }
+
+
+def validate_certificate_format_process(
+    path: Path,
+    *,
+    stage_id: str,
+    classification: str,
+    wrapper_exit: int,
+    child_exit: int,
+) -> None:
+    record = read_json_object(path)
+    validate_supervisor_object(path, 1, record, expected_stage_id=stage_id)
+    if (
+        record.get("classification") != classification
+        or record.get("wrapper_exit") != wrapper_exit
+        or record.get("child_exit") != child_exit
+        or record.get("child_signal") is not None
+        or record.get("cancel_signal") is not None
+        or record.get("stdout", {}).get("truncated") is not False
+        or record.get("stderr", {}).get("truncated") is not False
+    ):
+        raise EvidenceError(f"certificate-format {stage_id} supervisor outcome changed")
+
+
+def validate_certificate_format_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    export_path: Path,
+    corrupt_export_path: Path,
+    process_artifacts: Mapping[str, Path] | None = None,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("certificate-format expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="certificate-format semantic evidence",
+        max_bytes=CERTIFICATE_FORMAT_MAX_SEMANTIC_BYTES,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="certificate-format telemetry",
+        max_bytes=CERTIFICATE_FORMAT_MAX_TELEMETRY_BYTES,
+    )
+    if (
+        len(semantic) != len(CERTIFICATE_FORMAT_SCENARIOS)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(CERTIFICATE_FORMAT_SCENARIOS)))
+        or [row.get("scenario") for row in semantic]
+        != list(CERTIFICATE_FORMAT_SCENARIOS)
+    ):
+        raise EvidenceError(
+            "certificate-format semantic scenarios are incomplete or reordered"
+        )
+    if any(row.get("schema") != CERTIFICATE_FORMAT_SEMANTIC_SCHEMA for row in semantic):
+        raise EvidenceError("certificate-format semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration_ns",
+        "host",
+        "pid",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("certificate-format semantic authority contains telemetry")
+
+    expected_fields = {
+        "pin_binding": {
+            "export_format",
+            "lean4export_revision",
+            "nanoda_revision",
+            "reference_revision",
+            "reference_version",
+            "scenario",
+            "schema",
+            "sequence",
+        },
+        "positive": {
+            "authority",
+            "checked_declarations",
+            "checker_exit",
+            "export_rows",
+            "export_sha256",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "failure": {
+            "authority",
+            "checker_exit",
+            "corrupt_sha256",
+            "positive_sha256",
+            "published",
+            "reason",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "recovery": {
+            "authority",
+            "checked_declarations",
+            "checker_exit",
+            "export_sha256",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "codec": {
+            "arbitrary_cases",
+            "authority",
+            "named_tests",
+            "productive_workers",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "thread_counts",
+        },
+        "nonpublication": {
+            "actions",
+            "authority",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "states",
+            "status",
+        },
+    }
+    for row in semantic:
+        if set(row) != expected_fields[row["scenario"]]:
+            raise EvidenceError(
+                f"certificate-format {row['scenario']} fields differ "
+                "from the frozen schema"
+            )
+
+    pin = semantic[0]
+    if (
+        pin.get("export_format") != CERTIFICATE_FORMAT_EXPORT_VERSION
+        or pin.get("lean4export_revision") != CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION
+        or pin.get("nanoda_revision") != CERTIFICATE_FORMAT_NANODA_REVISION
+        or pin.get("reference_revision") != CERTIFICATE_FORMAT_REFERENCE_REVISION
+        or pin.get("reference_version") != "v4.32.0"
+    ):
+        raise EvidenceError("certificate-format external pin binding changed")
+
+    export = validate_certificate_format_export(export_path)
+    corrupt_data, corrupt_size, corrupt_digest = stable_file_facts(
+        corrupt_export_path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    export_data, _export_size, _export_digest = stable_file_facts(
+        export_path,
+        max_bytes=CERTIFICATE_FORMAT_MAX_EXPORT_BYTES,
+    )
+    if corrupt_data != export_data + b"not-json\n":
+        raise EvidenceError(
+            "certificate-format negative export is not the one-variable malformed copy"
+        )
+
+    positive = semantic[1]
+    if (
+        positive.get("authority") is not False
+        or positive.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or positive.get("checker_exit") != 0
+        or positive.get("export_rows") != CERTIFICATE_FORMAT_EXPORT_ROWS
+        or positive.get("export_sha256") != export["sha256"]
+        or positive.get("published") is not False
+        or positive.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format positive witness facts changed")
+
+    failure = semantic[2]
+    if (
+        failure.get("authority") is not False
+        or failure.get("checker_exit") != 1
+        or failure.get("corrupt_sha256") != corrupt_digest  # ubs:ignore — public corruption-fixture digest.
+        or failure.get("positive_sha256") != export["sha256"]
+        or failure.get("published") is not False
+        or failure.get("reason") != "malformed_ndjson"
+        or failure.get("status") != "refused"
+    ):
+        raise EvidenceError("certificate-format malformed refusal facts changed")
+
+    recovery = semantic[3]
+    if (
+        recovery.get("authority") is not False
+        or recovery.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or recovery.get("checker_exit") != 0
+        or recovery.get("export_sha256") != export["sha256"]
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not False
+        or recovery.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format recovery diverged from positive")
+
+    codec = semantic[4]
+    if (
+        codec.get("arbitrary_cases") != 10_000
+        or codec.get("authority") is not False
+        or codec.get("named_tests") != 19
+        or codec.get("productive_workers") != 41
+        or codec.get("status") != "complete"
+        or codec.get("thread_counts") != [1, 8, 32]
+    ):
+        raise EvidenceError("certificate-format codec evidence floor changed")
+
+    nonpublication = semantic[5]
+    if (
+        nonpublication.get("actions")
+        != [
+            "recompute",
+            "recompute",
+            "quarantine_and_recompute_independently",
+        ]
+        or nonpublication.get("authority") is not False
+        or nonpublication.get("published") is not False
+        or nonpublication.get("states")
+        != ["cancelled", "resource_limited", "internal_fault"]
+        or nonpublication.get("status") != "complete"
+    ):
+        raise EvidenceError("certificate-format nonpublication policy changed")
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError("certificate-format telemetry row count is not one")
+    telemetry = telemetry_rows[0]
+    telemetry_fields = {
+        "artifact_bytes",
+        "durations_ns",
+        "host",
+        "process_exits",
+        "run_id",
+        "schema",
+    }
+    expected_exits = {
+        "codec": 0,
+        "failure": 1,
+        "positive": 0,
+        "recovery": 0,
+    }
+    if (
+        set(telemetry) != telemetry_fields
+        or telemetry.get("schema") != CERTIFICATE_FORMAT_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("artifact_bytes")
+        != {"corrupt": corrupt_size, "positive": export["bytes"]}
+        or telemetry.get("process_exits") != expected_exits
+        or not isinstance(telemetry.get("host"), dict)
+        or set(telemetry["host"]) != {"machine", "system"}
+        or not all(
+            isinstance(item, str) and item for item in telemetry["host"].values()
+        )
+        or not isinstance(telemetry.get("durations_ns"), dict)
+        or set(telemetry["durations_ns"]) != set(expected_exits)
+        or any(
+            type(value) is not int or value <= 0 or value > 3_600_000_000_000
+            for value in telemetry["durations_ns"].values()
+        )
+    ):
+        raise EvidenceError(
+            "certificate-format telemetry is malformed or semantically entangled"
+        )
+
+    if process_artifacts is not None:
+        expected_process_artifacts = {
+            "codec_metadata",
+            "codec_stdout",
+            "failure_metadata",
+            "failure_stderr",
+            "positive_metadata",
+            "positive_stdout",
+            "recovery_metadata",
+            "recovery_stdout",
+        }
+        if set(process_artifacts) != expected_process_artifacts:
+            raise EvidenceError("certificate-format process artifact set is incomplete")
+        validate_certificate_format_process(
+            process_artifacts["positive_metadata"],
+            stage_id="check_positive",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        validate_certificate_format_process(
+            process_artifacts["failure_metadata"],
+            stage_id="check_failure",
+            classification="fail",
+            wrapper_exit=1,
+            child_exit=1,
+        )
+        validate_certificate_format_process(
+            process_artifacts["recovery_metadata"],
+            stage_id="check_recovery",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        validate_certificate_format_process(
+            process_artifacts["codec_metadata"],
+            stage_id="codec_suites",
+            classification="pass",
+            wrapper_exit=0,
+            child_exit=0,
+        )
+        expected_success = (
+            f"Checked {CERTIFICATE_FORMAT_CHECKED_DECLARATIONS} "
+            "declarations with no errors\n"
+        ).encode()
+        positive_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["positive_stdout"],
+            max_bytes=4_096,
+        )
+        recovery_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["recovery_stdout"],
+            max_bytes=4_096,
+        )
+        failure_stderr, _size, _digest = stable_file_facts(
+            process_artifacts["failure_stderr"],
+            max_bytes=4_096,
+        )
+        codec_stdout, _size, _digest = stable_file_facts(
+            process_artifacts["codec_stdout"],
+            max_bytes=65_536,
+        )
+        if positive_stdout != expected_success or recovery_stdout != expected_success:
+            raise EvidenceError(
+                "certificate-format external checker non-vacuity floor changed"
+            )
+        if not failure_stderr.startswith(b"Error: expected ident"):
+            raise EvidenceError(
+                "certificate-format malformed export failed for an unexpected reason"
+            )
+        if (
+            codec_stdout.count(b"test result: ok.") != 4
+            or b"4 passed; 0 failed" not in codec_stdout
+            or b"5 passed; 0 failed" not in codec_stdout
+            or b"6 passed; 0 failed" not in codec_stdout
+        ):
+            raise EvidenceError(
+                "certificate-format named codec suites did not meet their floors"
+            )
+
+    return {
+        "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+        "export_rows": CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "export_sha256": export["sha256"],
+        "run_id": expected_run_id,
+        "schema": CERTIFICATE_FORMAT_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
+
+
+def cartridge_extract_tree(path: Path) -> dict[str, Any]:
+    absolute = lexical_absolute(path)
+    try:
+        mode = absolute.lstat().st_mode
+    except FileNotFoundError as error:
+        raise EvidenceError(
+            f"cartridge extraction directory is absent: {absolute}"
+        ) from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise EvidenceError(
+            f"cartridge extraction is not one real directory: {absolute}"
+        )
+    entries = sorted(
+        absolute.iterdir(),
+        key=lambda item: item.name.encode("utf-8"),
+    )
+    if len(entries) > CARTRIDGE_MAX_EXTRACTED_FILES:
+        raise EvidenceError("cartridge extraction file count exceeds its bound")
+    digest = hashlib.sha256(b"fln.cartridge-extraction/1\0")
+    total_bytes = 0
+    names: list[str] = []
+    for entry in entries:
+        entry_mode = entry.lstat().st_mode
+        if stat.S_ISLNK(entry_mode) or not stat.S_ISREG(entry_mode):
+            raise EvidenceError(f"cartridge extraction contains a non-file: {entry}")
+        data, size, _sha256 = stable_file_facts(
+            entry,
+            max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+        )
+        total_bytes += size
+        if total_bytes > CARTRIDGE_MAX_EXTRACTED_BYTES:
+            raise EvidenceError("cartridge extraction bytes exceed their bound")
+        name = entry.name
+        names.append(name)
+        name_bytes = name.encode("utf-8")
+        digest.update(len(name_bytes).to_bytes(8, "little"))
+        digest.update(name_bytes)
+        digest.update(size.to_bytes(8, "little"))
+        digest.update(data)
+
+    object_pattern = re.compile(
+        r"[0-9]{2}-(declaration|dependency|receipt|certificate|fixture|schema|"
+        r"resource-contract|witness|warm-defeq-cache)-[0-9a-f]{64}\.bin"
+    )
+    object_kinds: list[str] = []
+    for name in names:
+        if name == "manifest.bin":
+            continue
+        match = object_pattern.fullmatch(name)
+        if match is None:
+            raise EvidenceError(
+                f"cartridge extraction filename is not canonical: {name}"
+            )
+        object_kinds.append(match.group(1))
+    expected_kinds = sorted(
+        [
+            "certificate",
+            "declaration",
+            "dependency",
+            "fixture",
+            "receipt",
+            "resource-contract",
+            "schema",
+            "warm-defeq-cache",
+            "witness",
+        ]
+    )
+    if names.count("manifest.bin") != 1 or sorted(object_kinds) != expected_kinds:
+        raise EvidenceError(
+            "cartridge extraction does not contain the exact v1 object inventory"
+        )
+    return {
+        "bytes": total_bytes,
+        "files": len(entries),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def require_cartridge_absent(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise EvidenceError("failed cartridge extraction published filesystem state")
+
+
+def validate_cartridge_summary(
+    row: Mapping[str, Any],
+    *,
+    state: str,
+    archive_digest: bool,
+) -> None:
+    fields = {
+        "authority",
+        "frames",
+        "manifest_root",
+        "missing_optional",
+        "missing_required",
+        "objects",
+        "schema",
+        "state",
+    }
+    if archive_digest:
+        fields.add("archive_digest")
+    if (
+        set(row) != fields
+        or row.get("authority") is not False
+        or type(row.get("frames")) is not int
+        or row.get("frames", -1) < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("manifest_root")))
+        or type(row.get("missing_optional")) is not int
+        or row.get("missing_optional", -1) < 0
+        or type(row.get("missing_required")) is not int
+        or row.get("missing_required", -1) < 0
+        or row.get("objects") != CARTRIDGE_OBJECTS
+        or row.get("schema") != "fln.cartridge-handoff/1"
+        or row.get("state") != state
+        or (
+            archive_digest
+            and not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(row.get("archive_digest")),
+            )
+        )
+    ):
+        raise EvidenceError(f"cartridge {state} summary changed")
+
+
+def validate_cartridge_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    archive_path: Path,
+    corrupt_archive_path: Path,
+    export_path: Path,
+    positive_extract_path: Path,
+    failure_extract_path: Path,
+    recovery_extract_path: Path,
+    process_artifacts: Mapping[str, Path],
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("cartridge expected run id must be non-empty")
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="cartridge semantic evidence",
+        max_bytes=CARTRIDGE_MAX_SEMANTIC_BYTES,
+    )
+    telemetry_rows, telemetry_digest = macro_txn_canonical_rows(
+        telemetry_path,
+        label="cartridge telemetry",
+        max_bytes=CARTRIDGE_MAX_TELEMETRY_BYTES,
+    )
+    if (
+        len(semantic) != len(CARTRIDGE_SCENARIOS)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(CARTRIDGE_SCENARIOS)))
+        or [row.get("scenario") for row in semantic] != list(CARTRIDGE_SCENARIOS)
+    ):
+        raise EvidenceError("cartridge semantic scenarios are incomplete or reordered")
+    if any(row.get("schema") != CARTRIDGE_SEMANTIC_SCHEMA for row in semantic):
+        raise EvidenceError("cartridge semantic schema changed")
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "artifact_bytes",
+        "duration_ns",
+        "host",
+        "pid",
+        "process_exits",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("cartridge semantic authority contains telemetry")
+
+    expected_fields = {
+        "pin_binding": {
+            "export_format",
+            "lean4export_revision",
+            "nanoda_revision",
+            "reference_revision",
+            "reference_version",
+            "scenario",
+            "schema",
+            "sequence",
+        },
+        "positive": {
+            "archive_digest",
+            "archive_sha256",
+            "authority",
+            "checked_declarations",
+            "export_rows",
+            "export_sha256",
+            "frames",
+            "manifest_root",
+            "objects",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "state",
+            "status",
+            "warm_caches",
+        },
+        "populations": {
+            "authority",
+            "manifest_root",
+            "scenario",
+            "schema",
+            "sequence",
+            "shared_manifest_identity",
+            "states",
+            "status",
+        },
+        "failure": {
+            "archive_sha256",
+            "authority",
+            "changed_bits",
+            "changed_bytes",
+            "corrupt_sha256",
+            "published",
+            "reason",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "recovery": {
+            "archive_digest",
+            "archive_sha256",
+            "authority",
+            "extracted_files",
+            "manifest_root",
+            "matches_positive",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+        },
+        "codec": {
+            "arbitrary_cases",
+            "authority",
+            "named_tests",
+            "productive_workers",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "thread_counts",
+            "version_cases",
+        },
+        "nonpublication": {
+            "actions",
+            "authority",
+            "failure_output_absent",
+            "published",
+            "scenario",
+            "schema",
+            "sequence",
+            "states",
+            "status",
+        },
+    }
+    for row in semantic:
+        if set(row) != expected_fields[row["scenario"]]:
+            raise EvidenceError(
+                f"cartridge {row['scenario']} fields differ from the frozen schema"
+            )
+
+    pin = semantic[0]
+    if (
+        pin.get("export_format") != CERTIFICATE_FORMAT_EXPORT_VERSION
+        or pin.get("lean4export_revision") != CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION
+        or pin.get("nanoda_revision") != CERTIFICATE_FORMAT_NANODA_REVISION
+        or pin.get("reference_revision") != CERTIFICATE_FORMAT_REFERENCE_REVISION
+        or pin.get("reference_version") != "v4.32.0"
+    ):
+        raise EvidenceError("cartridge external pin binding changed")
+
+    export = validate_certificate_format_export(export_path)
+    archive_data, archive_size, archive_sha256 = stable_file_facts(
+        archive_path,
+        max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+    )
+    corrupt_data, corrupt_size, corrupt_sha256 = stable_file_facts(
+        corrupt_archive_path,
+        max_bytes=CARTRIDGE_MAX_ARCHIVE_BYTES,
+    )
+    if corrupt_size != archive_size:
+        raise EvidenceError("cartridge corrupt copy changed length")
+    changed = [
+        (left, right)
+        for left, right in zip(archive_data, corrupt_data, strict=True)
+        if left != right
+    ]
+    if len(changed) != 1:
+        raise EvidenceError("cartridge corrupt copy is not one changed byte")
+    changed_bits = (changed[0][0] ^ changed[0][1]).bit_count()
+    if changed_bits != 1:
+        raise EvidenceError("cartridge corrupt copy is not one changed bit")
+
+    expected_process_artifacts = {
+        "build_metadata",
+        "build_stdout",
+        "checker_metadata",
+        "checker_stdout",
+        "codec_metadata",
+        "codec_stdout",
+        "failure_metadata",
+        "failure_stderr",
+        "population_metadata",
+        "population_stdout",
+        "positive_extract_metadata",
+        "positive_extract_stdout",
+        "positive_metadata",
+        "positive_stdout",
+        "recovery_extract_metadata",
+        "recovery_extract_stdout",
+        "recovery_metadata",
+        "recovery_stdout",
+    }
+    if set(process_artifacts) != expected_process_artifacts:
+        raise EvidenceError("cartridge process artifact set is incomplete")
+    for key, stage_id, classification, wrapper_exit, child_exit in [
+        ("build_metadata", "build_handoff", "pass", 0, 0),
+        ("checker_metadata", "check_positive", "pass", 0, 0),
+        ("population_metadata", "transport_states", "pass", 0, 0),
+        ("positive_metadata", "verify_positive", "pass", 0, 0),
+        ("positive_extract_metadata", "extract_positive", "pass", 0, 0),
+        ("failure_metadata", "extract_failure", "fail", 1, 1),
+        ("recovery_metadata", "verify_recovery", "pass", 0, 0),
+        ("recovery_extract_metadata", "extract_recovery", "pass", 0, 0),
+        ("codec_metadata", "codec_suites", "pass", 0, 0),
+    ]:
+        validate_certificate_format_process(
+            process_artifacts[key],
+            stage_id=stage_id,
+            classification=classification,
+            wrapper_exit=wrapper_exit,
+            child_exit=child_exit,
+        )
+
+    build_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["build_stdout"],
+        label="cartridge build stdout",
+        max_bytes=16_384,
+    )
+    if len(build_rows) != 2:
+        raise EvidenceError("cartridge build did not emit two canonical summaries")
+    certificate_summary, pack_summary = build_rows
+    if (
+        set(certificate_summary)
+        != {"authority", "bytes", "certificate_digest", "schema"}
+        or certificate_summary.get("authority") is not False
+        or type(certificate_summary.get("bytes")) is not int
+        or certificate_summary.get("bytes", 0) <= 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(certificate_summary.get("certificate_digest")),
+        )
+        or certificate_summary.get("schema") != "fln.cartridge-handoff/1"
+    ):
+        raise EvidenceError("cartridge certificate summary changed")
+    validate_cartridge_summary(
+        pack_summary,
+        state="complete",
+        archive_digest=True,
+    )
+    if (
+        pack_summary.get("missing_optional") != 0
+        or pack_summary.get("missing_required") != 0
+        or pack_summary.get("frames", 0) <= 0
+    ):
+        raise EvidenceError("packed cartridge is not complete and populated")
+
+    positive_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["positive_stdout"],
+        label="cartridge positive stdout",
+        max_bytes=4_096,
+    )
+    recovery_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["recovery_stdout"],
+        label="cartridge recovery stdout",
+        max_bytes=4_096,
+    )
+    if len(positive_rows) != 1 or recovery_rows != positive_rows:
+        raise EvidenceError("cartridge recovery summary diverged from positive")
+    positive_summary = positive_rows[0]
+    positive_fields = {
+        "archive_digest",
+        "authority",
+        "frames",
+        "manifest_root",
+        "objects",
+        "schema",
+        "state",
+        "warm_caches",
+    }
+    if (
+        set(positive_summary) != positive_fields
+        or positive_summary.get("authority") is not False
+        or positive_summary.get("archive_digest") != pack_summary.get("archive_digest")
+        or positive_summary.get("frames") != pack_summary.get("frames")
+        or positive_summary.get("manifest_root") != pack_summary.get("manifest_root")
+        or positive_summary.get("objects") != CARTRIDGE_OBJECTS
+        or positive_summary.get("schema") != "fln.cartridge-handoff/1"
+        or positive_summary.get("state") != "complete"
+        or positive_summary.get("warm_caches") != 1
+    ):
+        raise EvidenceError("cartridge positive verification facts changed")
+
+    population_rows, _digest = macro_txn_canonical_rows(
+        process_artifacts["population_stdout"],
+        label="cartridge population stdout",
+        max_bytes=16_384,
+    )
+    expected_states = ["thin", "partial", "sealed", "complete"]
+    if len(population_rows) != len(expected_states):
+        raise EvidenceError("cartridge population row count changed")
+    for state, row in zip(expected_states, population_rows, strict=True):
+        validate_cartridge_summary(row, state=state, archive_digest=False)
+        if row.get("manifest_root") != pack_summary.get("manifest_root"):
+            raise EvidenceError(
+                "cartridge transport population moved the manifest root"
+            )
+    if (
+        population_rows[0].get("frames") != 0
+        or population_rows[0].get("missing_required", 0) <= 0
+        or population_rows[1].get("frames", 0) <= 0
+        or population_rows[1].get("missing_required", 0) <= 0
+        or population_rows[2].get("missing_required") != 0
+        or population_rows[2].get("missing_optional", 0) <= 0
+        or population_rows[3].get("missing_required") != 0
+        or population_rows[3].get("missing_optional") != 0
+    ):
+        raise EvidenceError("cartridge population completeness facts changed")
+
+    positive_extract = cartridge_extract_tree(positive_extract_path)
+    recovery_extract = cartridge_extract_tree(recovery_extract_path)
+    if positive_extract != recovery_extract:
+        raise EvidenceError("cartridge recovered extraction differs from positive")
+    require_cartridge_absent(failure_extract_path)
+    for key in ("positive_extract_stdout", "recovery_extract_stdout"):
+        rows, _digest = macro_txn_canonical_rows(
+            process_artifacts[key],
+            label=f"cartridge {key}",
+            max_bytes=4_096,
+        )
+        if len(rows) != 1 or rows[0] != {
+            "files": 10,
+            "objects": CARTRIDGE_OBJECTS,
+            "schema": "fln.cartridge-handoff/1",
+            "state": "extracted",
+            "warm_caches": 1,
+        }:
+            raise EvidenceError("cartridge extraction summary changed")
+
+    checker_stdout, _size, _digest = stable_file_facts(
+        process_artifacts["checker_stdout"],
+        max_bytes=4_096,
+    )
+    expected_checker_stdout = (
+        f"Checked {CERTIFICATE_FORMAT_CHECKED_DECLARATIONS} "
+        "declarations with no errors\n"
+    ).encode()
+    if checker_stdout != expected_checker_stdout:
+        raise EvidenceError("cartridge external checker floor changed")
+    failure_stderr, _size, _digest = stable_file_facts(
+        process_artifacts["failure_stderr"],
+        max_bytes=16_384,
+    )
+    if not failure_stderr.startswith(b"cartridge_handoff: "):
+        raise EvidenceError(
+            "cartridge corrupt extraction failed for an unexpected reason"
+        )
+    codec_stdout, _size, _digest = stable_file_facts(
+        process_artifacts["codec_stdout"],
+        max_bytes=128 * 1024,
+    )
+    if (
+        codec_stdout.count(b"test result: ok.") != 4
+        or b"6 passed; 0 failed" not in codec_stdout
+        or b"4 passed; 0 failed" not in codec_stdout
+        or b"7 passed; 0 failed" not in codec_stdout
+    ):
+        raise EvidenceError("cartridge named codec suites did not meet their floors")
+
+    positive = semantic[1]
+    if (
+        positive.get("archive_digest") != pack_summary["archive_digest"]
+        or positive.get("archive_sha256") != archive_sha256
+        or positive.get("authority") is not False
+        or positive.get("checked_declarations")
+        != CERTIFICATE_FORMAT_CHECKED_DECLARATIONS
+        or positive.get("export_rows") != export["rows"]
+        or positive.get("export_sha256") != export["sha256"]
+        or positive.get("frames") != pack_summary["frames"]
+        or positive.get("manifest_root") != pack_summary["manifest_root"]
+        or positive.get("objects") != CARTRIDGE_OBJECTS
+        or positive.get("published") is not False
+        or positive.get("state") != "complete"
+        or positive.get("status") != "complete"
+        or positive.get("warm_caches") != 1
+    ):
+        raise EvidenceError("cartridge positive semantic facts changed")
+
+    populations = semantic[2]
+    if (
+        populations.get("authority") is not False
+        or populations.get("manifest_root") != pack_summary["manifest_root"]
+        or populations.get("shared_manifest_identity") is not True
+        or populations.get("states") != expected_states
+        or populations.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge population semantic facts changed")
+
+    failure = semantic[3]
+    if (
+        failure.get("archive_sha256") != archive_sha256
+        or failure.get("authority") is not False
+        or failure.get("changed_bits") != changed_bits
+        or failure.get("changed_bytes") != len(changed)
+        or failure.get("corrupt_sha256") != corrupt_sha256
+        or failure.get("published") is not False
+        or failure.get("reason") != "frame_corruption"
+        or failure.get("status") != "refused"
+    ):
+        raise EvidenceError("cartridge corrupt refusal facts changed")
+
+    recovery = semantic[4]
+    if (
+        recovery.get("archive_digest") != pack_summary["archive_digest"]
+        or recovery.get("archive_sha256") != archive_sha256
+        or recovery.get("authority") is not False
+        or recovery.get("extracted_files") != positive_extract["files"]
+        or recovery.get("manifest_root") != pack_summary["manifest_root"]
+        or recovery.get("matches_positive") is not True
+        or recovery.get("published") is not False
+        or recovery.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge recovery semantic facts changed")
+
+    codec = semantic[5]
+    if (
+        codec.get("arbitrary_cases") != CARTRIDGE_ARBITRARY_CASES
+        or codec.get("authority") is not False
+        or codec.get("named_tests") != CARTRIDGE_NAMED_TESTS
+        or codec.get("productive_workers") != CARTRIDGE_PRODUCTIVE_WORKERS
+        or codec.get("status") != "complete"
+        or codec.get("thread_counts") != CARTRIDGE_THREAD_COUNTS
+        or codec.get("version_cases") != CARTRIDGE_VERSION_CASES
+    ):
+        raise EvidenceError("cartridge codec evidence floor changed")
+
+    nonpublication = semantic[6]
+    if (
+        nonpublication.get("actions")
+        != [
+            "verify_without_cache",
+            "verify_without_cache",
+            "quarantine_and_verify_independently",
+        ]
+        or nonpublication.get("authority") is not False
+        or nonpublication.get("failure_output_absent") is not True
+        or nonpublication.get("published") is not False
+        or nonpublication.get("states")
+        != ["cancelled", "resource_limited", "internal_fault"]
+        or nonpublication.get("status") != "complete"
+    ):
+        raise EvidenceError("cartridge nonpublication policy changed")
+
+    if len(telemetry_rows) != 1:
+        raise EvidenceError("cartridge telemetry row count is not one")
+    telemetry = telemetry_rows[0]
+    expected_exits = {
+        "checker": 0,
+        "codec": 0,
+        "failure": 1,
+        "positive": 0,
+        "positive_extract": 0,
+        "recovery": 0,
+        "recovery_extract": 0,
+        "transport": 0,
+    }
+    if (
+        set(telemetry)
+        != {
+            "artifact_bytes",
+            "durations_ns",
+            "host",
+            "process_exits",
+            "run_id",
+            "schema",
+        }
+        or telemetry.get("schema") != CARTRIDGE_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("artifact_bytes")
+        != {
+            "archive": archive_size,
+            "corrupt": corrupt_size,
+            "export": export["bytes"],
+        }
+        or telemetry.get("process_exits") != expected_exits
+        or not isinstance(telemetry.get("host"), dict)
+        or set(telemetry["host"]) != {"machine", "system"}
+        or not all(
+            isinstance(value, str) and value for value in telemetry["host"].values()
+        )
+        or not isinstance(telemetry.get("durations_ns"), dict)
+        or set(telemetry["durations_ns"]) != set(expected_exits)
+        or any(
+            type(value) is not int or value <= 0 or value > 3_600_000_000_000
+            for value in telemetry["durations_ns"].values()
+        )
+    ):
+        raise EvidenceError(
+            "cartridge telemetry is malformed or semantically entangled"
+        )
+
+    return {
+        "archive_sha256": archive_sha256,
+        "corrupt_sha256": corrupt_sha256,
+        "extraction_sha256": positive_extract["sha256"],
+        "manifest_root": pack_summary["manifest_root"],
+        "run_id": expected_run_id,
+        "schema": CARTRIDGE_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "verdict": "pass",
+    }
+
+
+def validate_bignum_no_mock_evidence(
+    *,
+    expected_run_id: str,
+    semantic_path: Path,
+    telemetry_path: Path,
+    inner_log_path: Path,
+    inner_root: Path,
+    lane_metadata_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    if not expected_run_id:
+        raise EvidenceError("bignum expected run id must be non-empty")
+    if inner_root.is_symlink() or not inner_root.is_dir():
+        raise EvidenceError("bignum inner artifact root is not a real directory")
+    validate_certificate_format_process(
+        lane_metadata_path,
+        stage_id="bignum_lane",
+        classification="pass",
+        wrapper_exit=0,
+        child_exit=0,
+    )
+
+    semantic, semantic_digest = macro_txn_canonical_rows(
+        semantic_path,
+        label="bignum semantic evidence",
+        max_bytes=BIGNUM_MAX_SEMANTIC_BYTES,
+    )
+    telemetry, telemetry_digest = read_canonical_record(
+        telemetry_path,
+        label="bignum telemetry",
+        max_bytes=BIGNUM_MAX_TELEMETRY_BYTES,
+    )
+    expected_scenarios = [
+        "vector_corpus",
+        "profile_binding",
+        "consumer_suites",
+        "c4_differential",
+        *(["mutation"] * len(BIGNUM_MUTATIONS)),
+        "recovery",
+    ]
+    if (
+        len(semantic) != len(expected_scenarios)
+        or [row.get("sequence") for row in semantic]
+        != list(range(len(expected_scenarios)))
+        or [row.get("scenario") for row in semantic] != expected_scenarios
+        or any(row.get("schema") != BIGNUM_SEMANTIC_SCHEMA for row in semantic)
+    ):
+        raise EvidenceError(
+            "bignum semantic scenarios are incomplete, reordered, or misversioned"
+        )
+    forbidden_semantic_fields = {
+        "absolute_path",
+        "duration",
+        "elapsed",
+        "host",
+        "pid",
+        "process_exit",
+        "run_id",
+        "wall_time",
+    }
+    if any(forbidden_semantic_fields.intersection(row) for row in semantic):
+        raise EvidenceError("bignum semantic authority contains telemetry")
+
+    inner_records, inner_digest = load_ndjson_snapshot(inner_log_path)
+    expected_inner_steps = [
+        "run_start",
+        "drift",
+        "profile_binding",
+        "suite",
+        "c4_gauntlet",
+        *[f"mutant_{mutation}" for mutation, _test in BIGNUM_MUTATIONS],
+        "recovery",
+        "run_end",
+    ]
+    if (
+        [record.get("step") for record in inner_records] != expected_inner_steps
+        or any(record.get("schema") != "fln-e2e/1" for record in inner_records)
+        or any(
+            record.get("run_id") != inner_records[0].get("run_id")
+            or record.get("bead") != "franken_lean-npl"
+            or record.get("scenario") != "bignum_vectors"
+            for record in inner_records
+        )
+        or inner_records[0].get("status") != "started"
+        or any(record.get("status") != "passed" for record in inner_records[1:])
+        or inner_records[-1].get("verdict") != "pass"
+    ):
+        raise EvidenceError("bignum retained inner lane is incomplete or failed")
+    inner_by_step = {str(record["step"]): record for record in inner_records}
+    if len(inner_by_step) != len(inner_records):
+        raise EvidenceError("bignum retained inner lane has duplicate step ids")
+
+    vector_path = require_within(
+        inner_root / "vector-fixture.txt",
+        artifact_root,
+        label="bignum vector fixture snapshot",
+    )
+    vector_data, _vector_bytes, vector_digest = stable_file_facts(
+        vector_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    try:
+        vector_text = vector_data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError("bignum vector fixture is not UTF-8") from error
+    vector_lines = vector_text.splitlines()
+    vector_count = sum(
+        "|" in line and not line.startswith("#") for line in vector_lines
+    )
+    if (
+        "schema fln-bignum-vectors/1" not in vector_lines
+        or vector_count != BIGNUM_VECTOR_COUNT
+    ):
+        raise EvidenceError("bignum vector fixture schema or population changed")
+    vector_row = semantic[0]
+    if (
+        set(vector_row)
+        != {
+            "fixture_sha256",
+            "scenario",
+            "schema",
+            "sequence",
+            "status",
+            "vectors",
+        }
+        or vector_row.get("fixture_sha256") != vector_digest
+        or vector_row.get("status") != "matched"
+        or vector_row.get("vectors") != BIGNUM_VECTOR_COUNT
+    ):
+        raise EvidenceError("bignum vector semantic row changed")
+
+    profile_path = require_within(
+        inner_root / "profile.snapshot.tsv",
+        artifact_root,
+        label="bignum threshold profile snapshot",
+    )
+    profile_data, _profile_bytes, _profile_digest = stable_file_facts(
+        profile_path,
+        max_bytes=65_536,
+    )
+    try:
+        profile_lines = profile_data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise EvidenceError("bignum threshold profile is not UTF-8") from error
+    if "schema\tfln.bignum-kernel-reduction-profile/2" not in profile_lines:
+        raise EvidenceError("bignum threshold profile schema changed")
+    source_rows = [
+        line.split("\t") for line in profile_lines if line.startswith("source\t")
+    ]
+    if len(source_rows) != len(BIGNUM_PROFILE_SOURCES) or any(
+        len(row) != 5 for row in source_rows
+    ):
+        raise EvidenceError("bignum threshold profile source inventory changed")
+    projection_facts: list[dict[str, str]] = []
+    full_source_drifts = 0
+    for index, (row, expected) in enumerate(
+        zip(source_rows, BIGNUM_PROFILE_SOURCES, strict=True),
+        1,
+    ):
+        _kind, source, measured_sha, projection_sha, projection_kind = row
+        expected_source, expected_kind, start_marker, end_marker = expected
+        if (
+            source != expected_source
+            or projection_kind != expected_kind
+            or SHA256_HEX.fullmatch(measured_sha) is None
+            or SHA256_HEX.fullmatch(projection_sha) is None
+        ):
+            raise EvidenceError("bignum threshold profile source row changed")
+        source_path = require_within(
+            inner_root / f"profile-source-{index}.bin",
+            artifact_root,
+            label=f"bignum profile source {index}",
+        )
+        source_data, _source_bytes, source_digest = stable_file_facts(
+            source_path,
+            max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+        )
+        if source_digest != measured_sha:
+            full_source_drifts += 1
+        if source_data.count(start_marker) != 1 or source_data.count(end_marker) != 1:
+            raise EvidenceError(
+                f"bignum profile projection markers changed for {projection_kind}"
+            )
+        start = source_data.index(start_marker)
+        end = source_data.index(end_marker, start + len(start_marker))
+        actual_projection = hashlib.sha256(source_data[start:end]).hexdigest()
+        if actual_projection != projection_sha:
+            raise EvidenceError(
+                f"bignum profile semantic projection drifted for {projection_kind}"
+            )
+        projection_facts.append(
+            {"kind": projection_kind, "sha256": projection_sha}
+        )
+    profile_row = semantic[1]
+    if (
+        set(profile_row)
+        != {
+            "projections",
+            "scenario",
+            "schema",
+            "sequence",
+            "sources",
+            "status",
+        }
+        or profile_row.get("projections") != projection_facts
+        or profile_row.get("sources") != len(BIGNUM_PROFILE_SOURCES)
+        or profile_row.get("status") != "matched"
+        or inner_by_step["profile_binding"].get("semantic_projections")
+        != len(BIGNUM_PROFILE_SOURCES)
+        or inner_by_step["profile_binding"].get("full_source_drifts")
+        != full_source_drifts
+    ):
+        raise EvidenceError("bignum profile semantic row or retained join changed")
+
+    suite_row = semantic[2]
+    if (
+        suite_row
+        != {
+            "packages": ["fln-bignum", "fln-rt", "fln-unsafe-abi"],
+            "scenario": "consumer_suites",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "status": "passed",
+        }
+    ):
+        raise EvidenceError("bignum consumer-suite semantic row changed")
+    suite_path = require_within(
+        inner_root / "suite.log",
+        artifact_root,
+        label="bignum consumer suite log",
+    )
+    suite_data, _suite_bytes, _suite_digest = stable_file_facts(
+        suite_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    if (
+        suite_data.count(b"test result: ok.") < 10
+        or b"15 passed; 0 failed" not in suite_data
+        or b"13 passed; 0 failed" not in suite_data
+        or b"52 passed; 0 failed" not in suite_data
+        or b"test result: FAILED." in suite_data
+    ):
+        raise EvidenceError("bignum consumer suites did not meet their floors")
+
+    c4_run_path = require_within(
+        inner_root / "c4-run.ndjson",
+        artifact_root,
+        label="bignum C4 retained run",
+    )
+    c4_records, _c4_run_digest = load_ndjson_snapshot(c4_run_path)
+    if (
+        any(
+            record.get("schema") != "fln-e2e/1"
+            or record.get("scenario") != "marrow_stage0_gauntlet"
+            for record in c4_records
+        )
+        or c4_records[-1].get("step") != "run_end"
+        or c4_records[-1].get("status") != "passed"
+        or not any(
+            record.get("step") == "fact_differential"
+            and record.get("status") == "passed"
+            for record in c4_records
+        )
+    ):
+        raise EvidenceError("bignum C4 retained lane is incomplete or skipped")
+    marrow_path = require_within(
+        inner_root / "c4-facts-marrow.ndjson",
+        artifact_root,
+        label="bignum Marrow C4 facts",
+    )
+    reference_path = require_within(
+        inner_root / "c4-facts-reference.ndjson",
+        artifact_root,
+        label="bignum Reference C4 facts",
+    )
+    marrow_data, _marrow_bytes, marrow_digest = stable_file_facts(
+        marrow_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    reference_data, _reference_bytes, reference_digest = stable_file_facts(
+        reference_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    marrow_nat_facts = sum(
+        b'"probe":"nat.' in line for line in marrow_data.splitlines()
+    )
+    reference_nat_facts = sum(
+        b'"probe":"nat.' in line for line in reference_data.splitlines()
+    )
+    if (
+        marrow_data != reference_data
+        or marrow_digest != reference_digest
+        or marrow_nat_facts != BIGNUM_C4_NAT_FACTS
+        or reference_nat_facts != BIGNUM_C4_NAT_FACTS
+    ):
+        raise EvidenceError("bignum C4 Nat fact differential changed")
+    c4_row = semantic[3]
+    if (
+        c4_row
+        != {
+            "fact_sha256": marrow_digest,
+            "nat_facts": BIGNUM_C4_NAT_FACTS,
+            "scenario": "c4_differential",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "status": "matched",
+        }
+    ):
+        raise EvidenceError("bignum C4 semantic row changed")
+
+    mutation_exits: dict[str, int] = {}
+    for offset, (mutation, test) in enumerate(BIGNUM_MUTATIONS, 4):
+        row = semantic[offset]
+        expected_row = {
+            "mutation": mutation,
+            "published": False,
+            "scenario": "mutation",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": offset,
+            "status": "killed",
+            "test": test,
+        }
+        if row != expected_row:
+            raise EvidenceError(f"bignum {mutation} semantic row changed")
+        inner_row = inner_by_step[f"mutant_{mutation}"]
+        actual_exit = inner_row.get("actual_exit")
+        if (
+            inner_row.get("expected_exit") != "nonzero"
+            or type(actual_exit) is not int
+            or actual_exit <= 0
+            or inner_row.get("test") != test
+            or inner_row.get("artifact") != f"mutant-{mutation}.log"
+        ):
+            raise EvidenceError(
+                f"bignum {mutation} was not killed by its registered test"
+            )
+        mutation_path = require_within(
+            inner_root / f"mutant-{mutation}.log",
+            artifact_root,
+            label=f"bignum {mutation} mutation log",
+        )
+        mutation_data, _mutation_bytes, _mutation_digest = stable_file_facts(
+            mutation_path,
+            max_bytes=MAX_LOG_BYTES,
+        )
+        expected_line = f"test {test} ... FAILED".encode()
+        if (
+            expected_line not in mutation_data
+            or b"test result: FAILED." not in mutation_data
+        ):
+            raise EvidenceError(
+                f"bignum {mutation} stopped before its registered test failed"
+            )
+        mutation_exits[mutation] = actual_exit
+
+    recovery_row = semantic[-1]
+    if (
+        recovery_row
+        != {
+            "matches_positive": True,
+            "scenario": "recovery",
+            "schema": BIGNUM_SEMANTIC_SCHEMA,
+            "sequence": len(semantic) - 1,
+            "status": "passed",
+        }
+    ):
+        raise EvidenceError("bignum recovery semantic row changed")
+    recovery_path = require_within(
+        inner_root / "recovered.log",
+        artifact_root,
+        label="bignum recovery log",
+    )
+    recovery_data, _recovery_bytes, _recovery_digest = stable_file_facts(
+        recovery_path,
+        max_bytes=MAX_LOG_BYTES,
+    )
+    pristine_path = require_within(
+        inner_root / "nat-source-pristine.rs",
+        artifact_root,
+        label="bignum pristine source snapshot",
+    )
+    recovered_source_path = require_within(
+        inner_root / "overlay/crates/fln-bignum/src/nat.rs",
+        artifact_root,
+        label="bignum recovered overlay source",
+    )
+    pristine_data, _pristine_bytes, pristine_digest = stable_file_facts(
+        pristine_path,
+        max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+    )
+    recovered_source_data, _recovered_bytes, recovered_source_digest = (
+        stable_file_facts(
+            recovered_source_path,
+            max_bytes=BIGNUM_MAX_FIXTURE_BYTES,
+        )
+    )
+    if (
+        recovery_data.count(b"test result: ok.") < 2
+        or b"15 passed; 0 failed" not in recovery_data
+        or b"13 passed; 0 failed" not in recovery_data
+        or b"test result: FAILED." in recovery_data
+        or recovered_source_data != pristine_data
+        or recovered_source_digest != pristine_digest
+    ):
+        raise EvidenceError("bignum pristine recovery is incomplete")
+
+    expected_telemetry_fields = {
+        "elapsed_ms_by_step",
+        "full_source_drifts",
+        "host",
+        "inner_run_id",
+        "inner_run_sha256",
+        "mutation_process_exits",
+        "run_id",
+        "schema",
+        "semantic_sha256",
+    }
+    expected_elapsed = {
+        str(record["step"]): record["elapsed_ms"]
+        for record in inner_records
+        if "elapsed_ms" in record
+    }
+    elapsed_values = list(expected_elapsed.values())
+    if (
+        set(telemetry) != expected_telemetry_fields
+        or telemetry.get("schema") != BIGNUM_TELEMETRY_SCHEMA
+        or telemetry.get("run_id") != expected_run_id
+        or telemetry.get("inner_run_id") != inner_records[0].get("run_id")
+        or telemetry.get("inner_run_sha256") != inner_digest
+        or telemetry.get("semantic_sha256") != semantic_digest
+        or telemetry.get("host") != inner_records[0].get("host")
+        or telemetry.get("full_source_drifts") != full_source_drifts
+        or telemetry.get("mutation_process_exits") != mutation_exits
+        or telemetry.get("elapsed_ms_by_step") != expected_elapsed
+        or not isinstance(telemetry.get("host"), str)
+        or not telemetry["host"]
+        or any(type(value) is not int or value < 0 for value in elapsed_values)
+        or elapsed_values != sorted(elapsed_values)
+    ):
+        raise EvidenceError(
+            "bignum telemetry is malformed, stale, or semantically entangled"
+        )
+
+    return {
+        "c4_nat_facts": BIGNUM_C4_NAT_FACTS,
+        "inner_run_sha256": inner_digest,
+        "mutation_cells": len(BIGNUM_MUTATIONS),
+        "run_id": expected_run_id,
+        "schema": BIGNUM_VALIDATION_SCHEMA,
+        "semantic_sha256": semantic_digest,
+        "telemetry_sha256": telemetry_digest,
+        "vectors": BIGNUM_VECTOR_COUNT,
+        "verdict": "pass",
+    }
+
+
+def verdict_exact_integer(record: Mapping[str, Any], key: str) -> int:
+    value = record.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"Verdict {key} is not a non-negative integer")
+    return value
+
+
+def validate_verdict_schema_evidence(
+    semantic_path: Path,
+    telemetry_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    observed_exit: int,
+    *,
+    positive_semantic_path: Path | None,
+) -> dict[str, Any]:
+    semantic, semantic_digest = verdict_read_canonical_record(
+        semantic_path,
+        label=f"Verdict {phase} semantic evidence",
+        max_bytes=VERDICT_MAX_SEMANTIC_BYTES,
+    )
+    telemetry, telemetry_digest = verdict_read_canonical_record(
+        telemetry_path,
+        label=f"Verdict {phase} telemetry",
+        max_bytes=VERDICT_MAX_TELEMETRY_BYTES,
+    )
+    stdout, _stdout_size, stdout_digest = stable_file_facts(
+        stdout_path, max_bytes=MAX_LOG_BYTES
+    )
+    stderr, _stderr_size, stderr_digest = stable_file_facts(
+        stderr_path, max_bytes=MAX_LOG_BYTES
+    )
+    stdout_text = stdout.decode("utf-8", errors="strict")
+    stderr_text = stderr.decode("utf-8", errors="strict")
+
+    common_semantic = {
+        "data_grade": "verified",
+        "schema": VERDICT_SEMANTIC_SCHEMA,
+        "version": VERDICT_SCHEMA_VERSION,
+    }
+    for key, expected in common_semantic.items():
+        if semantic.get(key) != expected:
+            raise EvidenceError(
+                f"Verdict {phase} semantic {key} {semantic.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+    forbidden_semantic_fragments = (
+        "duration",
+        "host",
+        "monotonic",
+        "path",
+        "pid",
+        "time",
+        "worker",
+    )
+    if any(
+        fragment in key
+        for key in semantic
+        for fragment in forbidden_semantic_fragments
+    ):
+        raise EvidenceError(
+            f"Verdict {phase} semantic row contains telemetry or host identity"
+        )
+
+    expected_telemetry_fields = {
+        "event",
+        "max_encoded_bytes",
+        "max_workers",
+        "observed_encoded_bytes",
+        "schema",
+        "timing_used_as_gate",
+        "version",
+        "workers_spawned",
+    }
+    if set(telemetry) != expected_telemetry_fields:
+        raise EvidenceError(
+            f"Verdict {phase} telemetry fields differ from the frozen schema"
+        )
+    if (
+        telemetry.get("schema") != VERDICT_TELEMETRY_SCHEMA
+        or telemetry.get("version") != VERDICT_SCHEMA_VERSION
+        or telemetry.get("event") != "phase_resources"
+        or telemetry.get("timing_used_as_gate") is not False
+    ):
+        raise EvidenceError(f"Verdict {phase} telemetry identity is malformed")
+    maximum_bytes = verdict_exact_integer(telemetry, "max_encoded_bytes")
+    maximum_workers = verdict_exact_integer(telemetry, "max_workers")
+    observed_bytes = verdict_exact_integer(telemetry, "observed_encoded_bytes")
+    workers_spawned = verdict_exact_integer(telemetry, "workers_spawned")
+    if (
+        maximum_bytes != VERDICT_MAX_ENCODED_BYTES
+        or observed_bytes > maximum_bytes
+        or maximum_workers != VERDICT_MAX_WORKERS
+        or workers_spawned > maximum_workers
+    ):
+        raise EvidenceError(f"Verdict {phase} telemetry exceeded or changed its bounds")
+
+    expected_sat_cnf = {
+        "variable_count": 3,
+        "clauses": [
+            {"id": 1, "literals": [1, -2]},
+            {"id": 2, "literals": [2]},
+            {"id": 3, "literals": [-1, 3]},
+        ],
+    }
+    expected_unsat_cnf = {
+        "variable_count": 1,
+        "clauses": [
+            {"id": 1, "literals": [1]},
+            {"id": 2, "literals": [-1]},
+        ],
+    }
+    expected_model = {
+        "variable_count": 3,
+        "assignments": [(1, True), (2, True), (3, True)],
+    }
+    expected_proof = {
+        "steps": [
+            {
+                "kind": "derive",
+                "id": 3,
+                "clause": [],
+                "rule": {
+                    "kind": "resolution",
+                    "pivot": 1,
+                    "positive_parent": 1,
+                    "negative_parent": 2,
+                },
+            },
+            {"kind": "conclude", "empty_clause": 3},
+        ]
+    }
+
+    if phase == "positive":
+        expected_fields = {
+            "cnf_hex",
+            "data_grade",
+            "event",
+            "model_hex",
+            "model_satisfies",
+            "proof_hex",
+            "schema",
+            "status",
+            "thread_cnf_hex",
+            "threads",
+            "unsat_cnf_hex",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict positive semantic fields differ from v1")
+        if semantic.get("event") != "positive" or semantic.get("status") != "pass":
+            raise EvidenceError("Verdict positive semantic verdict is not pass")
+        cnf_bytes = verdict_decode_hex(semantic.get("cnf_hex"), label="CNF")
+        model_bytes = verdict_decode_hex(semantic.get("model_hex"), label="model")
+        unsat_bytes = verdict_decode_hex(
+            semantic.get("unsat_cnf_hex"), label="UNSAT CNF"
+        )
+        proof_bytes = verdict_decode_hex(semantic.get("proof_hex"), label="proof")
+        if verdict_parse_cnf(cnf_bytes, subject="positive CNF") != expected_sat_cnf:
+            raise EvidenceError("Verdict positive CNF semantic fixture differs")
+        parsed_model = verdict_parse_model(model_bytes, subject="positive model")
+        if parsed_model != expected_model:
+            raise EvidenceError("Verdict positive model semantic fixture differs")
+        if verdict_parse_cnf(
+            unsat_bytes, subject="positive UNSAT CNF"
+        ) != expected_unsat_cnf:
+            raise EvidenceError("Verdict positive UNSAT CNF semantic fixture differs")
+        if verdict_parse_proof(
+            proof_bytes, subject="positive proof"
+        ) != expected_proof:
+            raise EvidenceError("Verdict positive proof semantic fixture differs")
+        assignment = dict(parsed_model["assignments"])
+        independently_satisfies = all(
+            any(
+                (assignment[abs(literal)] and literal > 0)
+                or (not assignment[abs(literal)] and literal < 0)
+                for literal in clause["literals"]
+            )
+            for clause in expected_sat_cnf["clauses"]
+        )
+        if (
+            semantic.get("model_satisfies") is not True
+            or not independently_satisfies
+            or semantic.get("threads") != [1, 8, 32]
+            or semantic.get("thread_cnf_hex")
+            != [semantic["cnf_hex"], semantic["cnf_hex"], semantic["cnf_hex"]]
+        ):
+            raise EvidenceError("Verdict positive semantic equivalence claim differs")
+        expected_observed_bytes = sum(
+            map(len, (cnf_bytes, model_bytes, unsat_bytes, proof_bytes))
+        )
+        if workers_spawned != 41:
+            raise EvidenceError("Verdict positive worker count is not 1+8+32")
+    elif phase == "failure":
+        expected_fields = {
+            "corrupted_proof_hex",
+            "data_grade",
+            "error_at",
+            "error_code",
+            "event",
+            "opcode",
+            "partial_artifact_published",
+            "schema",
+            "status",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict failure semantic fields differ from v1")
+        corrupted = verdict_decode_hex(
+            semantic.get("corrupted_proof_hex"), label="corrupted proof"
+        )
+        reader = VerdictWireReader(corrupted, subject="failure proof")
+        reader.header(3)
+        if reader.u64() != 2:
+            raise EvidenceError("Verdict failure proof changed its step count")
+        opcode_at = reader.at
+        opcode = reader.u8()
+        if (
+            semantic.get("event") != "failure"
+            or semantic.get("status") != "refused"
+            or semantic.get("error_code") != "unknown_opcode"
+            or semantic.get("error_at") != opcode_at
+            or semantic.get("opcode") != opcode
+            or opcode_at != VERDICT_WIRE_HEADER_BYTES + 8
+            or opcode != 255
+            or semantic.get("partial_artifact_published") is not False
+        ):
+            raise EvidenceError("Verdict failure refusal is not the intended opcode")
+        if stdout_text.count(VERDICT_FAILURE_MARKER) != 1:
+            raise EvidenceError("Verdict failure stdout lacks the exact mutant marker")
+        if stderr_text.count(VERDICT_FAILURE_MARKER) != 1:
+            raise EvidenceError("Verdict failure stderr lacks the exact mutant marker")
+        expected_observed_bytes = len(corrupted)
+        if workers_spawned != 0:
+            raise EvidenceError("Verdict failure unexpectedly spawned encoder workers")
+    elif phase == "recovery":
+        expected_fields = {
+            "cnf_hex",
+            "data_grade",
+            "event",
+            "proof_hex",
+            "recovered_after",
+            "schema",
+            "status",
+            "version",
+        }
+        if set(semantic) != expected_fields:
+            raise EvidenceError("Verdict recovery semantic fields differ from v1")
+        if (
+            semantic.get("event") != "recovery"
+            or semantic.get("status") != "pass"
+            or semantic.get("recovered_after") != "unknown_opcode"
+        ):
+            raise EvidenceError("Verdict recovery semantic verdict is malformed")
+        cnf_bytes = verdict_decode_hex(semantic.get("cnf_hex"), label="recovery CNF")
+        proof_bytes = verdict_decode_hex(
+            semantic.get("proof_hex"), label="recovery proof"
+        )
+        if verdict_parse_cnf(cnf_bytes, subject="recovery CNF") != expected_sat_cnf:
+            raise EvidenceError("Verdict recovery CNF differs")
+        if verdict_parse_proof(
+            proof_bytes, subject="recovery proof"
+        ) != expected_proof:
+            raise EvidenceError("Verdict recovery proof differs")
+        if positive_semantic_path is None:
+            raise EvidenceError("Verdict recovery lacks positive semantic baseline")
+        positive, _positive_digest = verdict_read_canonical_record(
+            positive_semantic_path,
+            label="Verdict recovery positive baseline",
+            max_bytes=VERDICT_MAX_SEMANTIC_BYTES,
+        )
+        if (
+            positive.get("event") != "positive"
+            or semantic.get("cnf_hex") != positive.get("cnf_hex")
+            or semantic.get("proof_hex") != positive.get("proof_hex")
+        ):
+            raise EvidenceError("Verdict recovery bytes differ from positive baseline")
+        expected_observed_bytes = len(cnf_bytes) + len(proof_bytes)
+        if workers_spawned != 0:
+            raise EvidenceError("Verdict recovery unexpectedly spawned encoder workers")
+    else:
+        raise EvidenceError(f"unknown Verdict evidence phase {phase!r}")
+
+    expected_exit = 101 if phase == "failure" else 0
+    if observed_exit != expected_exit:
+        raise EvidenceError(
+            f"Verdict {phase} child exit {observed_exit}, expected {expected_exit}"
+        )
+    if observed_bytes != expected_observed_bytes:
+        raise EvidenceError(
+            f"Verdict {phase} telemetry byte count disagrees with semantic bytes"
+        )
+    if phase == "failure":
+        if "test result: FAILED. 0 passed; 1 failed;" not in stdout_text:
+            raise EvidenceError("Verdict failure stdout lacks the one-test summary")
+        if "test result: ok. 1 passed; 0 failed;" in stdout_text + stderr_text:
+            raise EvidenceError("Verdict failure streams contain a passing summary")
+    elif "test result: ok. 1 passed; 0 failed;" not in stdout_text:
+        raise EvidenceError(f"Verdict {phase} stdout lacks the one-test pass summary")
+
+    return {
+        "phase": phase,
+        "schema": "fln.validation/1",
+        "semantic_sha256": semantic_digest,
+        "stderr_sha256": stderr_digest,
+        "stdout_sha256": stdout_digest,
+        "telemetry_sha256": telemetry_digest,
+        "valid": True,
+        "validator": "verdict-schema/1",
     }
 
 
@@ -3251,6 +11614,2553 @@ def validate_environment_collision(
     }
 
 
+def read_environment_resource_collision_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(
+        path, root, label=f"environment-resource-collision {label}"
+    )
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(
+            f"environment-resource-collision {label} is unterminated: {absolute}"
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"environment-resource-collision {label} is not UTF-8: {absolute}"
+        ) from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: environment-resource-collision "
+                f"{label} line is too large"
+            )
+    return absolute, data, text, digest, absolute.relative_to(root).as_posix()
+
+
+def environment_resource_collision_failure_material(text: str) -> bool:
+    failed_forms = {
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED",
+        f"test {ENVIRONMENT_RESOURCE_COLLISION_TEST} ... FAILED",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+            or stripped.startswith("error: could not compile")
+        ):
+            return True
+    return False
+
+
+def validate_environment_resource_collision(
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_cwd: str | None = None,
+    expected_argv: str | None = None,
+    expected_cache_state: str | None = None,
+) -> dict[str, Any]:
+    if phase not in {"positive", "mutant", "recovery"}:
+        raise EvidenceError(
+            f"unsupported environment-resource-collision phase: {phase!r}"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("environment-resource-collision run id is malformed")
+    if not isinstance(observed_exit, int) or isinstance(observed_exit, bool):
+        raise EvidenceError(
+            "environment-resource-collision observed exit is not an integer"
+        )
+    expected_exit = 101 if phase == "mutant" else 0
+    if observed_exit != expected_exit:
+        raise EvidenceError(
+            f"environment-resource-collision {phase} exit {observed_exit}, "
+            f"expected {expected_exit}"
+        )
+
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_environment_resource_collision_stream(
+            stdout_path, root, label="stdout"
+        )
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_environment_resource_collision_stream(
+            stderr_path, root, label="stderr"
+        )
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError(
+            "environment-resource-collision stdout and stderr are not distinct"
+        )
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        expected_path = Path(expected)
+        if (
+            not expected
+            or expected_path.is_absolute()
+            or ".." in expected_path.parts
+            or expected == "."
+            or expected_path.as_posix() != expected
+        ):
+            raise EvidenceError(
+                "environment-resource-collision expected "
+                f"{label} artifact is not a canonical relative path"
+            )
+        if expected != actual:
+            raise EvidenceError(
+                f"environment-resource-collision {label} path {actual!r}, "
+                f"expected {expected!r}"
+            )
+
+    schema_marker = ENVIRONMENT_RESOURCE_COLLISION_SCHEMA.encode("ascii")
+    if schema_marker in stderr_data:
+        raise EvidenceError(
+            "environment-resource-collision detail rows leaked into stderr"
+        )
+    records: list[dict[str, Any]] = []
+    for number, raw_line in enumerate(stdout_data.splitlines(), 1):
+        if schema_marker not in raw_line:
+            continue
+        object_start = raw_line.find(b"{")
+        if object_start < 0:
+            raise EvidenceError(
+                f"{stdout_path}:{number}: resource-collision evidence "
+                "is not a JSON object"
+            )
+        value = parse_json(
+            raw_line[object_start:].strip(), subject=f"{stdout_path}:{number}"
+        )
+        if not isinstance(value, dict):
+            raise EvidenceError(
+                f"{stdout_path}:{number}: resource-collision evidence "
+                "is not an object"
+            )
+        records.append(value)
+
+    failed_forms = {
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED",
+        f"test {ENVIRONMENT_RESOURCE_COLLISION_TEST} ... FAILED",
+    }
+    if phase == "mutant":
+        if records:
+            raise EvidenceError(
+                "killed environment-resource-collision mutant emitted passing records"
+            )
+        failed_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip() in failed_forms
+        ]
+        if len(failed_lines) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stdout lacks exactly one named "
+                "FAILED test result"
+            )
+        if any(line.strip() in failed_forms for line in stderr_text.splitlines()):
+            raise EvidenceError(
+                "resource-collision mutant FAILED test result leaked into stderr"
+            )
+        if ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER in stdout_text:
+            raise EvidenceError(
+                "resource-collision mutant assertion marker leaked into stdout"
+            )
+        panic_identity = re.compile(
+            rf"^thread '{re.escape(ENVIRONMENT_RESOURCE_COLLISION_TEST)}'"
+            r"(?: \([1-9][0-9]*\))? panicked at ",
+            re.MULTILINE,
+        )
+        if len(panic_identity.findall(stderr_text)) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stderr lacks exactly one named panic"
+            )
+        if stderr_text.count(ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER) != 1:
+            raise EvidenceError(
+                "resource-collision mutant stderr lacks the exact inline-threshold "
+                "assertion marker"
+            )
+        result_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip().startswith("test result: FAILED.")
+        ]
+        if len(result_lines) != 1 or not re.match(
+            r"^test result: FAILED\. 0 passed; 1 failed;", result_lines[0]
+        ):
+            raise EvidenceError(
+                "resource-collision mutant stdout lacks the exact one-test "
+                "failure summary"
+            )
+        if any(
+            line.strip().startswith("test result: FAILED.")
+            for line in stderr_text.splitlines()
+        ):
+            raise EvidenceError(
+                "resource-collision mutant failure summary leaked into stderr"
+            )
+        if any(
+            line.strip().startswith("test result: ok.")
+            for line in (*stdout_text.splitlines(), *stderr_text.splitlines())
+        ):
+            raise EvidenceError(
+                "resource-collision mutant streams contain a passing summary"
+            )
+        if "error: could not compile" in stdout_text + stderr_text:
+            raise EvidenceError(
+                "resource-collision mutant was a compile failure, not a killed mutant"
+            )
+        return {
+            "schema": "fln.validation/1",
+            "validator": "environment-resource-collision/1",
+            "subject": stdout_relative,
+            "valid": True,
+            "phase": phase,
+            "run_id": expected_run_id,
+            "observed_exit": observed_exit,
+            "records": 0,
+            "failed_test": ENVIRONMENT_RESOURCE_COLLISION_TEST,
+            "assertion_marker": ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER,
+            "stdout_artifact": stdout_relative,
+            "stderr_artifact": stderr_relative,
+            "stdout_sha256": stdout_digest,
+            "stderr_sha256": stderr_digest,
+        }
+
+    required_cli_values = {
+        "expected cwd": expected_cwd,
+        "expected argv": expected_argv,
+        "expected cache state": expected_cache_state,
+    }
+    missing_cli = sorted(
+        label
+        for label, value in required_cli_values.items()
+        if not isinstance(value, str) or not value
+    )
+    if missing_cli:
+        raise EvidenceError(
+            f"environment-resource-collision {phase} validation "
+            f"lacks {missing_cli!r}"
+        )
+    if not Path(expected_cwd).is_absolute():
+        raise EvidenceError(
+            "environment-resource-collision expected cwd is not absolute"
+        )
+    if len(records) != len(ENVIRONMENT_RESOURCE_COLLISION_THREADS):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} emitted {len(records)} "
+            f"detail records, expected "
+            f"{len(ENVIRONMENT_RESOURCE_COLLISION_THREADS)}"
+        )
+    if environment_resource_collision_failure_material(stdout_text):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} stdout contains failure material"
+        )
+    if environment_resource_collision_failure_material(stderr_text):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} stderr contains failure material"
+        )
+    pass_result_lines = [
+        line.strip()
+        for line in stdout_text.splitlines()
+        if line.strip().startswith("test result: ok.")
+    ]
+    if len(pass_result_lines) != 1 or not re.match(
+        r"^test result: ok\. 1 passed; 0 failed;", pass_result_lines[0]
+    ):
+        raise EvidenceError(
+            f"environment-resource-collision {phase} log lacks the exact "
+            "one-test pass summary"
+        )
+
+    expected_identity = {
+        "schema": ENVIRONMENT_RESOURCE_COLLISION_SCHEMA,
+        "bead": "fln-amv.13",
+        "claim_id": "fln-amv.13-resource-bounded-collisions",
+        "claim_type": "bounded_model",
+        "invariant_id": "FL-INV-01",
+        "invariant_relation": "supports-local-pmap-slice",
+        "gate_id": "PG-5",
+        "gate_relation": "partial-component-evidence",
+        "parity_ledger_row": (
+            "not_applicable_internal_data_structure_resource_bound"
+        ),
+        "data_grade": "verified",
+        "epoch": "lean-v4.32.0",
+        "mode": "sound",
+        "profile": "e2e",
+        "seed": "partition-rotation-v1",
+        "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+        "scenario": "collision-resource-schedule-matrix",
+        "status": "pass",
+        "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+        "expected_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "actual_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "expected_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "actual_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "representation_tier": "persistent-avl",
+        "secondary_identity": "exact-PKey-Ord-with-Eq-consistency",
+        "secondary_hashing": "none",
+        "secondary_identity_collision_behavior": (
+            "Ord-equal-overwrites;Ord-distinct-path-copies"
+        ),
+        "cleanup_status": "retained_by_policy",
+        "final_state": "typed-refusal-followed-by-exact-bound-recovery",
+    }
+    expected_bounds = {
+        "construction_comparisons": 18_000,
+        "inline_cloned_entries": 36,
+        "append_minimum_shared_nodes": 983,
+        "lookup_comparisons": 14,
+        "maximum_avl_height": 14,
+        "tree_fresh_nodes_per_insert": 17,
+        "legacy_vector_copies": 499_500,
+    }
+    canonical_order = list(range(ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY))
+    shared_platform: str | None = None
+    previous_end = -1
+
+    def exact_integer(record: dict[str, Any], key: str, expected: int) -> None:
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+            raise EvidenceError(
+                f"environment-resource-collision {key} {value!r}, "
+                f"expected integer {expected}"
+            )
+
+    def integer_vector(value: Any, label: str, length: int) -> list[int]:
+        if (
+            not isinstance(value, list)
+            or len(value) != length
+            or any(
+                not isinstance(item, int) or isinstance(item, bool) or item < 0
+                for item in value
+            )
+        ):
+            raise EvidenceError(
+                f"environment-resource-collision {label} is not a "
+                f"{length}-element nonnegative integer array"
+            )
+        return value
+
+    for record, threads in zip(
+        records, ENVIRONMENT_RESOURCE_COLLISION_THREADS, strict=True
+    ):
+        if set(record) != ENVIRONMENT_RESOURCE_COLLISION_FIELDS:
+            missing = sorted(ENVIRONMENT_RESOURCE_COLLISION_FIELDS - set(record))
+            extra = sorted(set(record) - ENVIRONMENT_RESOURCE_COLLISION_FIELDS)
+            raise EvidenceError(
+                "environment-resource-collision v1 field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        for key, expected in expected_identity.items():
+            if record.get(key) != expected:
+                raise EvidenceError(
+                    f"environment-resource-collision {key} "
+                    f"{record.get(key)!r}, expected {expected!r}"
+                )
+        exact_integer(
+            record, "version", ENVIRONMENT_RESOURCE_COLLISION_VERSION
+        )
+        exact_integer(
+            record,
+            "collision_cardinality",
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+        )
+        exact_integer(record, "threads", threads)
+        exact_integer(record, "workers_built", threads)
+        exact_integer(record, "distinct_insertion_orders", threads)
+        exact_integer(record, "promotion_cardinality", 9)
+        exact_integer(record, "demotion_cardinality", 8)
+        exact_integer(record, "process_exit", 0)
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError(
+                "environment-resource-collision detail run id mismatch"
+            )
+        if record.get("cwd") != expected_cwd:
+            raise EvidenceError("environment-resource-collision detail cwd mismatch")
+        if record.get("argv") != [expected_argv]:
+            raise EvidenceError("environment-resource-collision detail argv mismatch")
+        if (
+            record.get("stdout_artifact") != expected_stdout_artifact
+            or record.get("stderr_artifact") != expected_stderr_artifact
+        ):
+            raise EvidenceError(
+                "environment-resource-collision detail artifact identity mismatch"
+            )
+        if record.get("cache_state") != expected_cache_state:
+            raise EvidenceError(
+                "environment-resource-collision detail cache-state mismatch"
+            )
+        platform_value = record.get("platform")
+        if (
+            not isinstance(platform_value, str)
+            or not platform_value
+            or "-" not in platform_value
+        ):
+            raise EvidenceError(
+                "environment-resource-collision platform identity is malformed"
+            )
+        if shared_platform is None:
+            shared_platform = platform_value
+        elif platform_value != shared_platform:
+            raise EvidenceError(
+                "environment-resource-collision platform changed across schedules"
+            )
+        if record.get("schedule_id") != f"partitioned-{threads}":
+            raise EvidenceError(
+                "environment-resource-collision schedule id mismatch"
+            )
+
+        expected_representative = environment_collision_insertion_order(
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY, threads, 0
+        )
+        if record.get("representative_insertion_order") != expected_representative:
+            raise EvidenceError(
+                "environment-resource-collision representative insertion "
+                f"order differs for threads={threads}"
+            )
+        expected_insertion_roots = list(
+            ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS[threads]
+        )
+        if record.get("worker_insertion_order_roots") != expected_insertion_roots:
+            raise EvidenceError(
+                "environment-resource-collision worker insertion roots "
+                f"differ for threads={threads}"
+            )
+        if len(set(expected_insertion_roots)) != threads:
+            raise EvidenceError(
+                "environment-resource-collision pinned worker schedules "
+                "are not distinct"
+            )
+        if record.get("expected_order") != canonical_order:
+            raise EvidenceError(
+                "environment-resource-collision expected order is not canonical"
+            )
+        if record.get("actual_order") != canonical_order:
+            raise EvidenceError(
+                "environment-resource-collision actual order is not canonical"
+            )
+        if record.get("worker_enumeration_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker enumeration roots differ"
+            )
+        if record.get("worker_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker roots differ"
+            )
+        if record.get("worker_recovery_roots") != [
+            ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision worker recovery roots differ"
+            )
+
+        comparisons = integer_vector(record.get("comparisons"), "comparisons", threads)
+        fresh_map_nodes = integer_vector(
+            record.get("fresh_map_nodes"), "fresh_map_nodes", threads
+        )
+        fresh_collision_nodes = integer_vector(
+            record.get("fresh_collision_nodes"), "fresh_collision_nodes", threads
+        )
+        cloned_inline_entries = integer_vector(
+            record.get("cloned_inline_entries"), "cloned_inline_entries", threads
+        )
+        final_collision_nodes = integer_vector(
+            record.get("final_collision_nodes"), "final_collision_nodes", threads
+        )
+        snapshot_root_arc_bumps = integer_vector(
+            record.get("snapshot_root_arc_bumps"),
+            "snapshot_root_arc_bumps",
+            threads,
+        )
+        snapshot_shared_nodes = integer_vector(
+            record.get("snapshot_shared_collision_nodes"),
+            "snapshot_shared_collision_nodes",
+            threads,
+        )
+        append_shared_nodes = integer_vector(
+            record.get("append_shared_collision_nodes"),
+            "append_shared_collision_nodes",
+            threads,
+        )
+        append_fresh_nodes = integer_vector(
+            record.get("append_fresh_nodes"), "append_fresh_nodes", threads
+        )
+        lookup_comparisons = integer_vector(
+            record.get("max_lookup_comparisons"),
+            "max_lookup_comparisons",
+            threads,
+        )
+        if any(value <= 0 or value > 18_000 for value in comparisons):
+            raise EvidenceError(
+                "environment-resource-collision comparison bound exceeded"
+            )
+        if fresh_map_nodes != [ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY] * threads:
+            raise EvidenceError(
+                "environment-resource-collision fresh map-node count differs"
+            )
+        if any(value <= 0 or value > 18_000 for value in fresh_collision_nodes):
+            raise EvidenceError(
+                "environment-resource-collision construction allocation "
+                "bound exceeded"
+            )
+        if cloned_inline_entries != [36] * threads:
+            raise EvidenceError(
+                "environment-resource-collision inline clone count differs"
+            )
+        if final_collision_nodes != [
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision final node count differs"
+            )
+        if snapshot_root_arc_bumps != [1] * threads:
+            raise EvidenceError(
+                "environment-resource-collision snapshot root identity differs"
+            )
+        if snapshot_shared_nodes != [
+            ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+        ] * threads:
+            raise EvidenceError(
+                "environment-resource-collision snapshot sharing differs"
+            )
+        if any(
+            value < 983
+            or value > ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            for value in append_shared_nodes
+        ):
+            raise EvidenceError(
+                "environment-resource-collision append sharing bound violated"
+            )
+        if any(value <= 0 or value > 18 for value in append_fresh_nodes):
+            raise EvidenceError(
+                "environment-resource-collision append allocation bound exceeded"
+            )
+        if any(value <= 0 or value > 14 for value in lookup_comparisons):
+            raise EvidenceError(
+                "environment-resource-collision lookup comparison bound exceeded"
+            )
+
+        budget = record.get("budget")
+        if not isinstance(budget, dict) or set(budget) != {
+            "max_collision_entries",
+            "max_expanded_weight",
+            "admission_max_fresh_nodes",
+            "refusal_max_fresh_nodes",
+            "refusal_resource",
+            "refusal_attempted",
+            "failure_atomic",
+            "exact_boundary_recovery",
+        }:
+            raise EvidenceError(
+                "environment-resource-collision budget is malformed"
+            )
+        for key in ("max_collision_entries", "max_expanded_weight"):
+            value = budget.get(key)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value != ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+            ):
+                raise EvidenceError(
+                    f"environment-resource-collision budget {key} differs"
+                )
+        if integer_vector(
+            budget.get("admission_max_fresh_nodes"),
+            "budget.admission_max_fresh_nodes",
+            threads,
+        ) != [18] * threads:
+            raise EvidenceError(
+                "environment-resource-collision admission allocation differs"
+            )
+        if integer_vector(
+            budget.get("refusal_max_fresh_nodes"),
+            "budget.refusal_max_fresh_nodes",
+            threads,
+        ) != [17] * threads:
+            raise EvidenceError(
+                "environment-resource-collision refusal limit differs"
+            )
+        if integer_vector(
+            budget.get("refusal_attempted"),
+            "budget.refusal_attempted",
+            threads,
+        ) != [18] * threads:
+            raise EvidenceError(
+                "environment-resource-collision refusal attempt differs"
+            )
+        if budget.get("refusal_resource") != "FreshNodes":
+            raise EvidenceError(
+                "environment-resource-collision refusal resource differs"
+            )
+        if budget.get("failure_atomic") is not True:
+            raise EvidenceError(
+                "environment-resource-collision refusal was not failure-atomic"
+            )
+        if budget.get("exact_boundary_recovery") is not True:
+            raise EvidenceError(
+                "environment-resource-collision exact-bound recovery failed"
+            )
+        if record.get("bounds") != expected_bounds:
+            raise EvidenceError(
+                "environment-resource-collision bounds differ from the pin"
+            )
+        if record.get("resources") != {
+            "expanded_weight": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "environment_entries": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "timing_used_as_gate": False,
+        }:
+            raise EvidenceError(
+                "environment-resource-collision resource facts differ"
+            )
+
+        start_us = record.get("monotonic_start_us")
+        end_us = record.get("monotonic_end_us")
+        duration_us = record.get("duration_us")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (start_us, end_us, duration_us)
+        ):
+            raise EvidenceError(
+                "environment-resource-collision timing facts are malformed"
+            )
+        if end_us - start_us != duration_us or start_us < previous_end:
+            raise EvidenceError(
+                "environment-resource-collision timing facts are inconsistent"
+            )
+        previous_end = end_us
+        if record.get("timing_used_as_gate") is not False:
+            raise EvidenceError(
+                "environment-resource-collision timing was promoted to a gate"
+            )
+        if record.get("signal") is not None or record.get("first_divergence") is not None:
+            raise EvidenceError(
+                "passing environment-resource-collision claims a failure"
+            )
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "environment-resource-collision/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "phase": phase,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "thread_matrix": list(ENVIRONMENT_RESOURCE_COLLISION_THREADS),
+        "collision_cardinality": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+        "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+        "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+        "environment_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+        "recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def read_environment_identity_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(path, root, label=f"environment-identity {label}")
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(f"environment-identity {label} is unterminated: {absolute}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"environment-identity {label} is not UTF-8: {absolute}"
+        ) from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: environment-identity {label} line is too large"
+            )
+    return absolute, data, text, digest, absolute.relative_to(root).as_posix()
+
+
+def environment_identity_failure_material(text: str, test_name: str) -> bool:
+    failed_forms = {
+        f"{test_name} --- FAILED",
+        f"test {test_name} ... FAILED",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+            or stripped.startswith("error: could not compile")
+        ):
+            return True
+    return False
+
+
+def prepare_environment_identity_validation(
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    artifact_root: Path,
+    schema: str,
+    test_name: str,
+    expected_run_id: str,
+    observed_exit: int,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_records: int,
+    additional_schemas: Sequence[str] = (),
+) -> tuple[list[dict[str, Any]], str, str, str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("environment-identity run id is malformed")
+    if (
+        not isinstance(observed_exit, int)
+        or isinstance(observed_exit, bool)
+        or observed_exit != 0
+    ):
+        raise EvidenceError(
+            f"environment-identity observed exit {observed_exit!r}, expected 0"
+        )
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_environment_identity_stream(stdout_path, root, label="stdout")
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_environment_identity_stream(stderr_path, root, label="stderr")
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError("environment-identity stdout and stderr are not distinct")
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        if not isinstance(expected, str) or not expected:
+            raise EvidenceError(f"environment-identity expected {label} is missing")
+        if expected != actual:
+            raise EvidenceError(
+                f"environment-identity {label} path {actual!r}, expected {expected!r}"
+            )
+    if environment_identity_failure_material(stdout_text, test_name):
+        raise EvidenceError("environment-identity stdout contains failure material")
+    if environment_identity_failure_material(stderr_text, test_name):
+        raise EvidenceError("environment-identity stderr contains failure material")
+
+    schemas = (schema, *additional_schemas)
+    if len(set(schemas)) != len(schemas) or any(not item for item in schemas):
+        raise EvidenceError("environment-identity schema inventory is malformed")
+    schema_markers = {
+        item: f'"schema":"{item}"'.encode() for item in schemas
+    }
+    schema_prefixes = {
+        item: b'{"schema":"' + item.encode() + b'"' for item in schemas
+    }
+    records: list[dict[str, Any]] = []
+    for stream_label, data in (("stdout", stdout_data), ("stderr", stderr_data)):
+        for number, raw_line in enumerate(data.splitlines(), 1):
+            matched = [
+                item for item in schemas if schema_markers[item] in raw_line
+            ]
+            if not matched:
+                continue
+            if len(matched) != 1:
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record matches multiple schemas"
+                )
+            matched_schema = matched[0]
+            if not raw_line.startswith(schema_prefixes[matched_schema]):
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is not canonically positioned"
+                )
+            try:
+                record = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is malformed"
+                ) from error
+            if not isinstance(record, dict):
+                raise EvidenceError(
+                    f"environment-identity {stream_label}:{number} "
+                    "record is not an object"
+                )
+            if stream_label != "stdout":
+                raise EvidenceError(
+                    "environment-identity detail rows leaked into stderr"
+                )
+            records.append(record)
+    if len(records) != expected_records:
+        raise EvidenceError(
+            f"environment-identity emitted {len(records)} records, "
+            f"expected {expected_records}"
+        )
+    return (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    )
+
+
+def require_environment_identity_fields(
+    record: dict[str, Any],
+    expected_fields: set[str],
+    *,
+    schema: str,
+    expected_run_id: str,
+    expected_beads: list[str],
+    label: str,
+    expected_final_state: str = "verified",
+) -> None:
+    if set(record) != expected_fields:
+        missing = sorted(expected_fields - set(record))
+        extra = sorted(set(record) - expected_fields)
+        raise EvidenceError(
+            f"{label} field mismatch: missing={missing!r} extra={extra!r}"
+        )
+    if (
+        record.get("schema") != schema
+        or record.get("version") != ENVIRONMENT_IDENTITY_VERSION
+        or record.get("run_id") != expected_run_id
+        or record.get("beads") != expected_beads
+        or record.get("status") != "pass"
+        or record.get("final_state") != expected_final_state
+    ):
+        raise EvidenceError(f"{label} shared identity fields differ")
+
+
+def require_environment_identity_hex(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise EvidenceError(f"{label} is not canonical lowercase hex")
+    return value
+
+
+def require_environment_identity_count(value: Any, *, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise EvidenceError(f"{label} is not a nonnegative integer")
+    return value
+
+
+def validate_declaration_tag_matrix(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_TAG_MATRIX_SCHEMA,
+        test_name=DECLARATION_TAG_MATRIX_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=11,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    case_fields = common | {
+        "case",
+        "family",
+        "variant",
+        "kind",
+        "canonical_tag",
+        "production_tag",
+        "tag_source",
+        "stream_bytes",
+        "golden_stream_bytes",
+        "stream_hash",
+        "golden_stream_hash",
+        "expected_digest",
+        "actual_digest",
+        "golden_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "model",
+        "elapsed_us",
+    }
+    thread_fields = common | {
+        "worker_count",
+        "distinct_root_count",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "order_independence",
+        "elapsed_us",
+    }
+    summary_fields = common | {
+        "case_count",
+        "unique_digest_count",
+        "pairwise_comparisons",
+        "expected_pairwise_comparisons",
+        "thread_matrix",
+        "thread_matrix_roots_distinct",
+        "canonical_root",
+        "source_order_defect_root",
+        "source_order_defect_relation",
+        "omitted_declaration_root",
+        "omitted_declaration_relation",
+        "named_defects_discriminated",
+        "claim_type",
+        "elapsed_us",
+    }
+    case_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    thread_rows: dict[int, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"declaration-tag record {number}"
+        if scenario == "declaration-tag-matrix":
+            require_environment_identity_fields(
+                record,
+                case_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            key = (record.get("family"), record.get("variant"))
+            if key not in DECLARATION_TAG_GOLDENS or key in case_rows:
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            kind, tag, stream_bytes, stream_hash, digest = (
+                DECLARATION_TAG_GOLDENS[key]
+            )
+            if (
+                record.get("case") != f"{key[0]}/{key[1]}"
+                or record.get("kind") != kind
+                or record.get("canonical_tag") != tag
+                or record.get("production_tag") != tag
+                or record.get("tag_source") != "explicit_exhaustive_match"
+                or record.get("stream_bytes") != stream_bytes
+                or record.get("golden_stream_bytes") != stream_bytes
+                or record.get("stream_hash") != stream_hash
+                or record.get("golden_stream_hash") != stream_hash
+                # ubs:ignore — public fixture digest.
+                or record.get("expected_digest")
+                != digest  # ubs:ignore — public fixture digest.
+                or record.get("actual_digest")
+                != digest  # ubs:ignore — public fixture digest.
+                or record.get("golden_digest")
+                != digest  # ubs:ignore — public fixture digest.
+                or record.get("repeated_digest")
+                != digest  # ubs:ignore — public fixture digest.
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or record.get("root_relation") != "equal"
+                or record.get("model") != "independent-complete-stream-v1"
+            ):
+                raise EvidenceError(f"{label} differs from the frozen case contract")
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if expected_root != actual_root:
+                raise EvidenceError(f"{label} root relation is false")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            case_rows[key] = record
+        elif scenario == "declaration-tag-thread-matrix":
+            require_environment_identity_fields(
+                record,
+                thread_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            workers = record.get("worker_count")
+            if workers not in {1, 8, 32} or workers in thread_rows:
+                raise EvidenceError(f"{label} has an unknown or duplicate worker count")
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("distinct_root_count") != 1
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("order_independence") != "proven"
+            ):
+                raise EvidenceError(f"{label} thread relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            thread_rows[workers] = record
+        elif scenario == "declaration-tag-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=DECLARATION_TAG_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.12", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    if set(case_rows) != set(DECLARATION_TAG_GOLDENS):
+        raise EvidenceError("declaration-tag case matrix is incomplete")
+    if set(thread_rows) != {1, 8, 32}:
+        raise EvidenceError("declaration-tag thread matrix is incomplete")
+    if len(summaries) != 1:
+        raise EvidenceError("declaration-tag summary is missing or duplicated")
+    if len({row["actual_digest"] for row in case_rows.values()}) != 7:
+        raise EvidenceError("declaration-tag case digests are not pairwise distinct")
+    thread_roots = {row["actual_root"] for row in thread_rows.values()}
+    if len(thread_roots) != 1:
+        raise EvidenceError("declaration-tag thread roots differ")
+    summary = summaries[0]
+    canonical_root = require_environment_identity_hex(
+        summary.get("canonical_root"), label="declaration-tag canonical root"
+    )
+    source_order_root = require_environment_identity_hex(
+        summary.get("source_order_defect_root"),
+        label="declaration-tag source-order defect root",
+    )
+    omitted_root = require_environment_identity_hex(
+        summary.get("omitted_declaration_root"),
+        label="declaration-tag omitted-declaration root",
+    )
+    if (
+        summary.get("case_count") != 7
+        or summary.get("unique_digest_count") != 7
+        or summary.get("pairwise_comparisons") != 21
+        or summary.get("expected_pairwise_comparisons") != 21
+        or summary.get("thread_matrix") != [1, 8, 32]
+        or summary.get("thread_matrix_roots_distinct") != 1
+        or thread_roots != {canonical_root}
+        or source_order_root == canonical_root
+        or omitted_root == canonical_root
+        or summary.get("source_order_defect_relation") != "differs"
+        or summary.get("omitted_declaration_relation") != "differs"
+        or summary.get("named_defects_discriminated")
+        != ["cast_after_source_reorder", "omitted_declaration"]
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError("declaration-tag summary differs from the strict contract")
+    require_environment_identity_count(
+        summary.get("elapsed_us"), label="declaration-tag summary elapsed_us"
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-tag-matrix/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "case_count": len(case_rows),
+        "thread_matrix": [1, 8, 32],
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_declaration_membership(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_MEMBERSHIP_SCHEMA,
+        test_name=DECLARATION_MEMBERSHIP_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=41,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    matrix_fields = common | {
+        "kind",
+        "membership_case",
+        "member_count",
+        "expected_digest",
+        "actual_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "root_propagation",
+        "model",
+        "elapsed_us",
+    }
+    defect_fields = common | {
+        "kind",
+        "canonical_digest",
+        "dropped_list_digest",
+        "dropped_list_relation",
+        "omitted_count_digest",
+        "omitted_count_relation",
+        "sorted_members_digest",
+        "sorted_members_relation",
+        "sorted_members_order_collapse",
+        "wrong_domain_digest",
+        "wrong_domain_relation",
+        "real_root",
+        "stale_digest_root",
+        "root_propagation_relation",
+        "named_defects_discriminated",
+        "boundary_distinctions",
+    }
+    summary_fields = common | {
+        "kind_count",
+        "membership_case_count",
+        "matrix_rows",
+        "large_member_count",
+        "opaque_solo_digest",
+        "opaque_grouped_digest",
+        "opaque_regression_relation",
+        "root_propagation",
+        "claim_type",
+        "elapsed_us",
+    }
+    kinds = {"definition", "theorem", "opaque", "inductive", "recursor"}
+    member_counts = {
+        "empty": 0,
+        "singleton": 1,
+        "repeated": 2,
+        "ordered": 2,
+        "reordered": 2,
+        "renamed": 2,
+        "declared_large": 4096,
+    }
+    matrix: dict[tuple[str, str], dict[str, Any]] = {}
+    defects: dict[str, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"declaration-membership record {number}"
+        if scenario == "declaration-membership-matrix":
+            require_environment_identity_fields(
+                record,
+                matrix_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            key = (record.get("kind"), record.get("membership_case"))
+            if (
+                key[0] not in kinds
+                or key[1] not in member_counts
+                or key in matrix
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            expected_digest = require_environment_identity_hex(
+                record.get("expected_digest"), label=f"{label} expected digest"
+            )
+            actual_digest = require_environment_identity_hex(
+                record.get("actual_digest"), label=f"{label} actual digest"
+            )
+            repeated_digest = require_environment_identity_hex(
+                record.get("repeated_digest"), label=f"{label} repeated digest"
+            )
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("member_count") != member_counts[key[1]]
+                # ubs:ignore — public fixture digest.
+                or expected_digest
+                != actual_digest  # ubs:ignore — public fixture digest.
+                or repeated_digest
+                != actual_digest  # ubs:ignore — public fixture digest.
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("root_propagation") != "exact"
+                or record.get("model") != "independent-canonical-membership-v1"
+            ):
+                raise EvidenceError(f"{label} relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            matrix[key] = record
+        elif scenario == "declaration-membership-defects":
+            require_environment_identity_fields(
+                record,
+                defect_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            kind = record.get("kind")
+            if kind not in kinds or kind in defects:
+                raise EvidenceError(f"{label} has an unknown or duplicate kind")
+            defects[kind] = record
+        elif scenario == "declaration-membership-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=DECLARATION_MEMBERSHIP_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.1", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    expected_matrix = {
+        (kind, membership_case)
+        for kind in kinds
+        for membership_case in member_counts
+    }
+    if set(matrix) != expected_matrix:
+        raise EvidenceError("declaration-membership matrix is incomplete")
+    if set(defects) != kinds or len(summaries) != 1:
+        raise EvidenceError("declaration-membership defect or summary rows are incomplete")
+    for kind in kinds:
+        rows = {
+            membership_case: matrix[(kind, membership_case)]
+            for membership_case in member_counts
+        }
+        if len({row["actual_digest"] for row in rows.values()}) != 7:
+            raise EvidenceError(
+                f"declaration-membership {kind} boundary digests alias"
+            )
+        defect = defects[kind]
+        digests = {
+            field: require_environment_identity_hex(
+                defect.get(field), label=f"declaration-membership {kind} {field}"
+            )
+            for field in (
+                "canonical_digest",
+                "dropped_list_digest",
+                "omitted_count_digest",
+                "sorted_members_digest",
+                "wrong_domain_digest",
+            )
+        }
+        real_root = require_environment_identity_hex(
+            defect.get("real_root"), label=f"declaration-membership {kind} real root"
+        )
+        stale_root = require_environment_identity_hex(
+            defect.get("stale_digest_root"),
+            label=f"declaration-membership {kind} stale root",
+        )
+        canonical = rows["ordered"]["actual_digest"]
+        reordered = rows["reordered"]["actual_digest"]
+        if (
+            # ubs:ignore — public fixture digest.
+            digests["canonical_digest"]
+            != canonical  # ubs:ignore — public fixture digest.
+            or digests["dropped_list_digest"]
+            == canonical  # ubs:ignore — public mutant digest.
+            or digests["omitted_count_digest"]
+            == canonical  # ubs:ignore — public mutant digest.
+            or digests["wrong_domain_digest"]
+            == canonical  # ubs:ignore — public mutant digest.
+            or digests["sorted_members_digest"]
+            != canonical  # ubs:ignore — public fixture digest.
+            or digests["sorted_members_digest"]
+            == reordered  # ubs:ignore — public mutant digest.
+            or real_root != rows["ordered"]["actual_root"]
+            or stale_root == real_root
+            or defect.get("dropped_list_relation") != "differs"
+            or defect.get("omitted_count_relation") != "differs"
+            or defect.get("sorted_members_relation") != "differs"
+            or defect.get("sorted_members_order_collapse") is not True
+            or defect.get("wrong_domain_relation") != "differs"
+            or defect.get("root_propagation_relation") != "differs"
+            or defect.get("named_defects_discriminated")
+            != [
+                "dropped_list",
+                "omitted_count",
+                "reordered_membership",
+                "wrong_domain",
+                "failed_root_propagation",
+            ]
+            or defect.get("boundary_distinctions") != 7
+        ):
+            raise EvidenceError(
+                f"declaration-membership {kind} defect contract differs"
+            )
+    summary = summaries[0]
+    opaque_solo = require_environment_identity_hex(
+        summary.get("opaque_solo_digest"),
+        label="declaration-membership opaque solo digest",
+    )
+    opaque_grouped = require_environment_identity_hex(
+        summary.get("opaque_grouped_digest"),
+        label="declaration-membership opaque grouped digest",
+    )
+    if (
+        summary.get("kind_count") != 5
+        or summary.get("membership_case_count") != 7
+        or summary.get("matrix_rows") != 40
+        or summary.get("large_member_count") != 4096
+        # ubs:ignore — public fixture digest.
+        or opaque_solo
+        != matrix[("opaque", "singleton")][
+            "actual_digest"
+        ]  # ubs:ignore — public fixture digest.
+        or opaque_grouped
+        != matrix[("opaque", "ordered")][
+            "actual_digest"
+        ]  # ubs:ignore — public fixture digest.
+        or opaque_solo == opaque_grouped
+        or summary.get("opaque_regression_relation") != "differs"
+        or summary.get("root_propagation") != "exact"
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError(
+            "declaration-membership summary differs from the strict contract"
+        )
+    require_environment_identity_count(
+        summary.get("elapsed_us"),
+        label="declaration-membership summary elapsed_us",
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-membership/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "matrix_rows": len(matrix),
+        "defect_rows": len(defects),
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_extension_descriptor_matrix(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+        test_name=EXTENSION_DESCRIPTOR_MATRIX_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=25,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "final_state",
+    }
+    matrix_fields = common | {
+        "merge",
+        "merge_tag",
+        "checkpoint",
+        "checkpoint_tag",
+        "provenance",
+        "provenance_tag",
+        "descriptor_position",
+        "journal_entries",
+        "expected_digest",
+        "actual_digest",
+        "repeated_digest",
+        "digest_relation",
+        "repeat_relation",
+        "expected_root",
+        "actual_root",
+        "root_relation",
+        "root_propagation",
+        "model",
+        "elapsed_us",
+    }
+    defect_fields = common | {
+        "merge",
+        "checkpoint",
+        "provenance",
+        "canonical_digest",
+        "omit_merge_digest",
+        "omit_merge_relation",
+        "omit_checkpoint_digest",
+        "omit_checkpoint_relation",
+        "omit_provenance_digest",
+        "omit_provenance_relation",
+        "swapped_tag_digest",
+        "swapped_tag_relation",
+        "swapped_tag_discriminating",
+        "swapped_field_digest",
+        "swapped_field_relation",
+        "swapped_field_discriminating",
+        "debug_text_digest",
+        "debug_text_relation",
+        "after_journal_digest",
+        "after_journal_relation",
+        "named_defects_discriminated",
+    }
+    summary_fields = common | {
+        "combination_count",
+        "merge_variants",
+        "checkpoint_variants",
+        "provenance_variants",
+        "distinct_delta_digests",
+        "distinct_logical_roots",
+        "descriptor_position",
+        "matrix_rows",
+        "root_propagation",
+        "claim_type",
+        "elapsed_us",
+    }
+    merge_tags = {
+        "append_ordered": 0,
+        "set_union": 1,
+        "conflicts_require_review": 2,
+    }
+    checkpoint_tags = {"journal_suffix": 0, "full_journal": 1}
+    provenance_tags = {"understood": 0, "opaque": 1}
+    matrix: dict[tuple[str, str, str], dict[str, Any]] = {}
+    defects: dict[tuple[str, str, str], dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for number, record in enumerate(records, 1):
+        scenario = record.get("scenario")
+        label = f"extension-descriptor record {number}"
+        if scenario == "extension-descriptor-matrix":
+            require_environment_identity_fields(
+                record,
+                matrix_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            key = (
+                record.get("merge"),
+                record.get("checkpoint"),
+                record.get("provenance"),
+            )
+            if (
+                key[0] not in merge_tags
+                or key[1] not in checkpoint_tags
+                or key[2] not in provenance_tags
+                or key in matrix
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            expected_digest = require_environment_identity_hex(
+                record.get("expected_digest"), label=f"{label} expected digest"
+            )
+            actual_digest = require_environment_identity_hex(
+                record.get("actual_digest"), label=f"{label} actual digest"
+            )
+            repeated_digest = require_environment_identity_hex(
+                record.get("repeated_digest"), label=f"{label} repeated digest"
+            )
+            expected_root = require_environment_identity_hex(
+                record.get("expected_root"), label=f"{label} expected root"
+            )
+            actual_root = require_environment_identity_hex(
+                record.get("actual_root"), label=f"{label} actual root"
+            )
+            if (
+                record.get("merge_tag") != merge_tags[key[0]]
+                or record.get("checkpoint_tag") != checkpoint_tags[key[1]]
+                or record.get("provenance_tag") != provenance_tags[key[2]]
+                or record.get("descriptor_position") != "before_journal"
+                or record.get("journal_entries") != 2
+                # ubs:ignore — public fixture digest.
+                or expected_digest
+                != actual_digest  # ubs:ignore — public fixture digest.
+                or repeated_digest
+                != actual_digest  # ubs:ignore — public fixture digest.
+                or record.get("digest_relation") != "equal"
+                or record.get("repeat_relation") != "equal"
+                or expected_root != actual_root
+                or record.get("root_relation") != "equal"
+                or record.get("root_propagation") != "exact"
+                or record.get("model") != "independent-descriptor-layout-v1"
+            ):
+                raise EvidenceError(f"{label} relation differs")
+            require_environment_identity_count(
+                record.get("elapsed_us"), label=f"{label} elapsed_us"
+            )
+            matrix[key] = record
+        elif scenario == "extension-descriptor-defects":
+            require_environment_identity_fields(
+                record,
+                defect_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            key = (
+                record.get("merge"),
+                record.get("checkpoint"),
+                record.get("provenance"),
+            )
+            if (
+                key[0] not in merge_tags
+                or key[1] not in checkpoint_tags
+                or key[2] not in provenance_tags
+                or key in defects
+            ):
+                raise EvidenceError(f"{label} has an unknown or duplicate case")
+            defects[key] = record
+        elif scenario == "extension-descriptor-summary":
+            require_environment_identity_fields(
+                record,
+                summary_fields,
+                schema=EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                expected_run_id=expected_run_id,
+                expected_beads=["fln-amv.2", "fln-amv.14"],
+                label=label,
+            )
+            summaries.append(record)
+        else:
+            raise EvidenceError(f"{label} has an unknown scenario")
+    expected_matrix = {
+        (merge, checkpoint, provenance)
+        for merge in merge_tags
+        for checkpoint in checkpoint_tags
+        for provenance in provenance_tags
+    }
+    if set(matrix) != expected_matrix or set(defects) != expected_matrix:
+        raise EvidenceError("extension-descriptor matrix is incomplete")
+    if len(summaries) != 1:
+        raise EvidenceError("extension-descriptor summary is missing or duplicated")
+    if len({row["actual_digest"] for row in matrix.values()}) != 12:
+        raise EvidenceError("extension-descriptor delta digests alias")
+    if len({row["actual_root"] for row in matrix.values()}) != 12:
+        raise EvidenceError("extension-descriptor logical roots alias")
+    for key, row in matrix.items():
+        defect = defects[key]
+        canonical = row["actual_digest"]
+        digest_fields = (
+            "canonical_digest",
+            "omit_merge_digest",
+            "omit_checkpoint_digest",
+            "omit_provenance_digest",
+            "swapped_tag_digest",
+            "swapped_field_digest",
+            "debug_text_digest",
+            "after_journal_digest",
+        )
+        digests = {
+            field: require_environment_identity_hex(
+                defect.get(field),
+                label=f"extension-descriptor {'/'.join(key)} {field}",
+            )
+            for field in digest_fields
+        }
+        tag_discriminating = key[0] != "conflicts_require_review"
+        field_discriminating = merge_tags[key[0]] != checkpoint_tags[key[1]]
+        expected_tag_relation = (
+            "differs" if tag_discriminating else "equal_by_construction"
+        )
+        expected_field_relation = (
+            "differs" if field_discriminating else "equal_by_construction"
+        )
+        if (
+            # ubs:ignore — public fixture digest.
+            digests["canonical_digest"]
+            != canonical  # ubs:ignore — public fixture digest.
+            or any(
+                digests[field] == canonical  # ubs:ignore — public mutant digest.
+                for field in (
+                    "omit_merge_digest",
+                    "omit_checkpoint_digest",
+                    "omit_provenance_digest",
+                    "debug_text_digest",
+                    "after_journal_digest",
+                )
+            )
+            # ubs:ignore — public mutant digest.
+            or (digests["swapped_tag_digest"] != canonical)
+            != tag_discriminating  # ubs:ignore — public mutant digest.
+            or (
+                # ubs:ignore — public mutant digest.
+                digests["swapped_field_digest"] != canonical
+            )  # ubs:ignore — public mutant digest.
+            != field_discriminating
+            or defect.get("omit_merge_relation") != "differs"
+            or defect.get("omit_checkpoint_relation") != "differs"
+            or defect.get("omit_provenance_relation") != "differs"
+            or defect.get("swapped_tag_relation") != expected_tag_relation
+            or defect.get("swapped_tag_discriminating") is not tag_discriminating
+            or defect.get("swapped_field_relation") != expected_field_relation
+            or defect.get("swapped_field_discriminating")
+            is not field_discriminating
+            or defect.get("debug_text_relation") != "differs"
+            or defect.get("after_journal_relation") != "differs"
+            or defect.get("named_defects_discriminated")
+            != ["omitted_dimension", "swapped_tag", "debug_text", "after_journal"]
+        ):
+            raise EvidenceError(
+                f"extension-descriptor {'/'.join(key)} defect contract differs"
+            )
+    summary = summaries[0]
+    if (
+        summary.get("combination_count") != 12
+        or summary.get("merge_variants") != 3
+        or summary.get("checkpoint_variants") != 2
+        or summary.get("provenance_variants") != 2
+        or summary.get("distinct_delta_digests") != 12
+        or summary.get("distinct_logical_roots") != 12
+        or summary.get("descriptor_position") != "before_journal"
+        or summary.get("matrix_rows") != 24
+        or summary.get("root_propagation") != "exact"
+        or summary.get("claim_type") != "bounded_model"
+    ):
+        raise EvidenceError(
+            "extension-descriptor summary differs from the strict contract"
+        )
+    require_environment_identity_count(
+        summary.get("elapsed_us"), label="extension-descriptor summary elapsed_us"
+    )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "extension-descriptor-matrix/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "combination_count": len(matrix),
+        "defect_rows": len(defects),
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_environment_state(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    """Validate the exact checkpoint/history evidence contract (bead 41s).
+
+    A schema prefix and record count cannot distinguish a duplicated scenario,
+    two interleaved runs, a transposed record, or a checkpoint rebound to the
+    wrong base. This validator binds the four real producer rows, their order,
+    their typed final states, and the identities shared across those rows.
+    """
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        test_name=ENVIRONMENT_STATE_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=4,
+    )
+    common = {
+        "schema",
+        "version",
+        "run_id",
+        "beads",
+        "scenario",
+        "status",
+        "elapsed_us",
+        "final_state",
+    }
+    persistent_fields = common | {
+        "entry_count",
+        "chunk_capacity",
+        "chunk_count",
+        "node_count",
+        "shared_node_count",
+        "fresh_node_count",
+        "append_operations",
+        "replay_operations",
+        "node_allocations",
+        "copied_child_slots",
+        "copied_entry_slots",
+        "payload_bytes",
+        "expected_order_hash",
+        "actual_order_hash",
+        "expected_root",
+        "actual_root",
+        "snapshot_root",
+    }
+    checkpoint_fields = common | {
+        "mode",
+        "base_id",
+        "checkpoint_id",
+        "restored_id",
+        "base_root",
+        "checkpoint_base_root",
+        "expected_root",
+        "actual_root",
+        "base_entries",
+        "checkpoint_entries",
+        "restored_entries",
+        "payload_bytes",
+        "prefix_lookup_steps",
+        "capture_operations",
+        "restore_operations",
+        "entry_limit",
+        "payload_byte_limit",
+        "expected_outcome",
+        "actual_outcome",
+    }
+    recovery_fields = common | {
+        "mode",
+        "base_id",
+        "checkpoint_id",
+        "restored_id",
+        "base_root_before",
+        "base_root_after",
+        "expected_root",
+        "actual_root",
+        "base_entries",
+        "checkpoint_entries",
+        "restored_entries",
+        "entry_limit",
+        "payload_byte_limit",
+        "expected_outcome",
+        "actual_outcome",
+        "recovery_outcome",
+    }
+    expected_keys = [
+        ("persistent-journal", None),
+        ("checkpoint-roundtrip", "journal_suffix"),
+        ("checkpoint-roundtrip", "full_journal"),
+        ("checkpoint-negative-recovery", "journal_suffix"),
+    ]
+    actual_keys = [
+        (record.get("scenario"), record.get("mode")) for record in records
+    ]
+    if actual_keys != expected_keys:
+        raise EvidenceError(
+            "environment-state scenario order or identity differs: "
+            f"{actual_keys!r}"
+        )
+
+    persistent, suffix, full, recovery = records
+    require_environment_identity_fields(
+        persistent,
+        persistent_fields,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        expected_run_id=expected_run_id,
+        expected_beads=["fln-amv.5", "fln-amv.7"],
+        label="environment-state persistent-journal",
+    )
+    for label, record in (
+        ("journal-suffix", suffix),
+        ("full-journal", full),
+    ):
+        require_environment_identity_fields(
+            record,
+            checkpoint_fields,
+            schema=ENVIRONMENT_STATE_SCHEMA,
+            expected_run_id=expected_run_id,
+            expected_beads=["fln-amv.7"],
+            label=f"environment-state {label}",
+        )
+    require_environment_identity_fields(
+        recovery,
+        recovery_fields,
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        expected_run_id=expected_run_id,
+        expected_beads=["fln-amv.7"],
+        label="environment-state negative-recovery",
+        expected_final_state="clean_recovery",
+    )
+
+    stable_contracts: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+        (
+            "persistent-journal",
+            persistent,
+            {
+                "entry_count": 69,
+                "chunk_capacity": 32,
+                "chunk_count": 3,
+                "node_count": 4,
+                "shared_node_count": 2,
+                "fresh_node_count": 2,
+                "append_operations": 69,
+                "replay_operations": 69,
+                "node_allocations": 106,
+                "copied_child_slots": 77,
+                "copied_entry_slots": 1002,
+                "payload_bytes": 552,
+                "expected_order_hash": "8ac9a67f1111de29",
+                "actual_order_hash": "8ac9a67f1111de29",
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "snapshot_root": (
+                    "8f1976245ae9dce33f3eb0d3febd2bc"
+                    "32e2b5f1f88710c7aa579b80b0c1705ab"
+                ),
+            },
+        ),
+        (
+            "journal-suffix",
+            suffix,
+            {
+                "mode": "journal_suffix",
+                "base_id": (
+                    "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                    "46bcc9c5ff573f4f9d93997677d632ee"
+                ),
+                "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+                "restored_id": (
+                    "8d00a22b42354950b09dc8f2e927c523"
+                    "7dc7357cbd2bec7985fff5770b753972"
+                ),
+                "base_root": (
+                    "8f1976245ae9dce33f3eb0d3febd2bc"
+                    "32e2b5f1f88710c7aa579b80b0c1705ab"
+                ),
+                "checkpoint_base_root": (
+                    "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                    "46bcc9c5ff573f4f9d93997677d632ee"
+                ),
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "base_entries": 64,
+                "checkpoint_entries": 5,
+                "restored_entries": 69,
+                "payload_bytes": 40,
+                "prefix_lookup_steps": 2,
+                "capture_operations": 5,
+                "restore_operations": 5,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "restored",
+                "actual_outcome": "restored",
+            },
+        ),
+        (
+            "full-journal",
+            full,
+            {
+                "mode": "full_journal",
+                "base_id": None,
+                "checkpoint_id": "v1-full-37-38b8cd0e43c2cb09",
+                "restored_id": (
+                    "56b471fc08e0aaf91410cb01467c5a865"
+                    "23f6cfb0efd037c782c61818c6c988b"
+                ),
+                "base_root": None,
+                "checkpoint_base_root": None,
+                "expected_root": (
+                    "0af8c87b8a15bb34bc78108eadf4f6b0"
+                    "640051ba9678536bd17645d11263c131"
+                ),
+                "actual_root": (
+                    "0af8c87b8a15bb34bc78108eadf4f6b0"
+                    "640051ba9678536bd17645d11263c131"
+                ),
+                "base_entries": 0,
+                "checkpoint_entries": 37,
+                "restored_entries": 37,
+                "payload_bytes": 296,
+                "prefix_lookup_steps": 0,
+                "capture_operations": 37,
+                "restore_operations": 37,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "restored",
+                "actual_outcome": "restored",
+            },
+        ),
+        (
+            "negative-recovery",
+            recovery,
+            {
+                "mode": "journal_suffix",
+                "base_id": (
+                    "c0f8dd130cf1f9eccd9dd575a0ee9ddd"
+                    "75654c7afd999ffcfbb1bb557ca2f203"
+                ),
+                "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+                "restored_id": (
+                    "8d00a22b42354950b09dc8f2e927c523"
+                    "7dc7357cbd2bec7985fff5770b753972"
+                ),
+                "base_root_before": (
+                    "525e3fa4730a11ab0cbc6c56d10282c3"
+                    "80cd0b043751888bb15174fd17df5bbc"
+                ),
+                "base_root_after": (
+                    "525e3fa4730a11ab0cbc6c56d10282c3"
+                    "80cd0b043751888bb15174fd17df5bbc"
+                ),
+                "expected_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "actual_root": (
+                    "cffbec6eac072caa55a121f4e21f4bc6"
+                    "ac9c13bb324470a8f8ff8ba04ab797f9"
+                ),
+                "base_entries": 64,
+                "checkpoint_entries": 5,
+                "restored_entries": 69,
+                "entry_limit": 1000,
+                "payload_byte_limit": 64000,
+                "expected_outcome": "base_history_mismatch",
+                "actual_outcome": "base_history_mismatch",
+                "recovery_outcome": "restored",
+            },
+        ),
+    ]
+    for label, record, expected in stable_contracts:
+        for field, expected_value in expected.items():
+            if record.get(field) != expected_value:
+                raise EvidenceError(
+                    f"environment-state {label} {field} differs: "
+                    f"{record.get(field)!r}"
+                )
+        require_environment_identity_count(
+            record.get("elapsed_us"),
+            label=f"environment-state {label} elapsed_us",
+        )
+
+    if (
+        suffix["base_id"] != suffix["checkpoint_base_root"]
+        or suffix["base_root"] != persistent["snapshot_root"]
+        or suffix["expected_root"] != persistent["actual_root"]
+        or suffix["actual_root"] != persistent["actual_root"]
+    ):
+        raise EvidenceError(
+            "environment-state suffix checkpoint is rebound to another base or root"
+        )
+    if (
+        recovery["checkpoint_id"] != suffix["checkpoint_id"]
+        or recovery["restored_id"] != suffix["restored_id"]
+        or recovery["expected_root"] != suffix["expected_root"]
+        or recovery["actual_root"] != suffix["actual_root"]
+        or recovery["base_root_before"] != recovery["base_root_after"]
+    ):
+        raise EvidenceError(
+            "environment-state refusal/recovery is stale or uses another checkpoint"
+        )
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "environment-state/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "record_keys": [
+            scenario if mode is None else f"{scenario}/{mode}"
+            for scenario, mode in expected_keys
+        ],
+        "checkpoint_id": suffix["checkpoint_id"],
+        "logical_root": persistent["actual_root"],
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
+def validate_declaration_admission(
+    stdout_path: Path,
+    stderr_path: Path,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+) -> dict[str, Any]:
+    """Validate j8h's exact real declaration-admission evidence contract.
+
+    The producer deliberately reports seven budgeted limits while distinguishing
+    the five locally measured DeclarationDimensions from the two limits delegated
+    to term-weight preflight. This validator binds both sets, their order, typed
+    outcomes, publication authority, exact roots, and recovery identities.
+    """
+    (
+        records,
+        stdout_relative,
+        stderr_relative,
+        stdout_digest,
+        stderr_digest,
+    ) = prepare_environment_identity_validation(
+        stdout_path,
+        stderr_path,
+        artifact_root=artifact_root,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        additional_schemas=(DECLARATION_ADMISSION_SUMMARY_SCHEMA,),
+        test_name=DECLARATION_ADMISSION_TEST,
+        expected_run_id=expected_run_id,
+        observed_exit=observed_exit,
+        expected_stdout_artifact=expected_stdout_artifact,
+        expected_stderr_artifact=expected_stderr_artifact,
+        expected_records=19,
+    )
+    envelope = {
+        "schema",
+        "version",
+        "run_id",
+        "bead",
+        "claim_id",
+        "claim_type",
+        "invariant_id",
+        "invariant_relation",
+        "gate_id",
+        "gate_relation",
+        "parity_ledger_row",
+        "data_grade",
+        "epoch",
+        "mode",
+        "profile",
+        "platform",
+        "cache_state",
+        "canonical_input_root",
+        "cwd",
+        "argv",
+        "stdout_artifact",
+        "stderr_artifact",
+        "timing_used_as_gate",
+    }
+    detail = envelope | {
+        "scenario",
+        "step",
+        "step_index",
+        "declaration",
+        "status",
+        "cleanup_status",
+        "final_state",
+    }
+    publication = {
+        "base_root",
+        "published_root",
+        "authoritative",
+        "published",
+        "cacheable",
+        "expected_outcome",
+        "actual_outcome",
+        "first_divergence",
+    }
+    admitted_fields = detail | publication | {
+        "budget",
+        "usage",
+        "canonical_digest",
+        "limit_name",
+        "allowed",
+        "observed",
+        "structural_unit",
+    }
+    refusal_fields = admitted_fields | {
+        "is_declaration_dimension",
+        "measured_by",
+        "progress",
+    }
+    cancellation_fields = detail | publication | {"checkpoint"}
+    superseded_fields = detail | publication | {
+        "plan_base_root",
+        "commit_target_root",
+    }
+    recovery_fields = detail | publication | {
+        "budget",
+        "usage",
+        "canonical_digest",
+        "limit_name",
+    }
+    summary_fields = envelope | {
+        "scenario",
+        "steps",
+        "admitted_rows",
+        "refusal_rows",
+        "cancellation_rows",
+        "superseded_rows",
+        "recovery_rows",
+        "declaration_dimension_rows",
+        "delegated_limit_rows",
+        "status",
+        "cleanup_status",
+        "final_state",
+    }
+
+    def require_row(
+        record: dict[str, Any],
+        expected_fields: set[str],
+        *,
+        schema: str,
+        label: str,
+    ) -> None:
+        if set(record) != expected_fields:
+            missing = sorted(expected_fields - set(record))
+            extra = sorted(set(record) - expected_fields)
+            raise EvidenceError(
+                f"declaration-admission {label} field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        cwd = record.get("cwd")
+        if (
+            not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or Path(cwd).parts[-2:] != ("crates", "fln-env")
+        ):
+            raise EvidenceError(
+                f"declaration-admission {label} cwd is not the fln-env crate"
+            )
+        if (
+            record.get("schema") != schema
+            or record.get("version") != 1
+            or record.get("run_id") != expected_run_id
+            or record.get("bead") != "franken_lean-j8h"
+            or record.get("claim_id")
+            != "franken_lean-j8h-declaration-admission-resource-bounds"
+            or record.get("claim_type") != "bounded_model"
+            or record.get("invariant_id") != "FL-INV-07"
+            or record.get("invariant_relation")
+            != "inconclusive-is-not-rejected"
+            or record.get("gate_id") != "W2"
+            or record.get("gate_relation") != "partial-component-evidence"
+            or record.get("parity_ledger_row")
+            != "not_applicable_internal_declaration_admission"
+            or record.get("data_grade") != "verified"
+            or record.get("epoch") != "lean-v4.32.0"
+            or record.get("mode") != "sound"
+            or record.get("profile") != "e2e"
+            or record.get("platform") != "linux-x86_64"
+            or record.get("cache_state") != "uncontrolled"
+            or record.get("canonical_input_root")
+            != DECLARATION_ADMISSION_INPUT_ROOT
+            or record.get("argv") != [DECLARATION_ADMISSION_ARGV]
+            or record.get("stdout_artifact") != expected_stdout_artifact
+            or record.get("stderr_artifact") != expected_stderr_artifact
+            or record.get("timing_used_as_gate") is not False
+            or record.get("status") != "pass"
+        ):
+            raise EvidenceError(
+                f"declaration-admission {label} shared envelope differs"
+            )
+
+    expected_order = [
+        (0, "admitted-transaction", "admitted"),
+        *[
+            (index, "limit-refusal", f"refusal-{row[0]}")
+            for index, row in enumerate(DECLARATION_ADMISSION_REFUSALS, 1)
+        ],
+        (8, "cancellation", "cancel-before-expression"),
+        (9, "cancellation", "cancel-before-publication"),
+        (10, "superseded-plan", "superseded-nonpublication"),
+        *[
+            (index, "adequate-budget-recovery", f"recovery-{row[0]}")
+            for index, row in enumerate(DECLARATION_ADMISSION_RECOVERIES, 11)
+        ],
+        (None, "declaration-admission-real-path", None),
+    ]
+    actual_order = [
+        (record.get("step_index"), record.get("scenario"), record.get("step"))
+        for record in records
+    ]
+    if actual_order != expected_order:
+        raise EvidenceError(
+            "declaration-admission scenario or step order differs: "
+            f"{actual_order!r}"
+        )
+
+    admitted = records[0]
+    require_row(
+        admitted,
+        admitted_fields,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        label="admitted",
+    )
+    admitted_usage = {
+        "level_params": 2,
+        "mutual_rows": 0,
+        "constructor_rows": 0,
+        "recursor_rules": 0,
+        "canonical_bytes": 87,
+        "expressions": 1,
+        "expr_nodes": 1,
+        "expanded_weight": 1,
+        "max_logical_depth": 1,
+    }
+    if (
+        admitted.get("declaration") != "Admitted"
+        or admitted.get("budget") != DECLARATION_ADMISSION_UNBOUNDED_BUDGET
+        or admitted.get("usage") != admitted_usage
+        or admitted.get("canonical_digest")
+        != "8de3ad5e3cb6525929228ad73fea85aa71b4685d32a4b647599c7e9e31f80291"
+        or admitted.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+        or admitted.get("published_root")
+        != "4b6ce45719dce319af9c2bf24b3c12bf012e194b49952173f35a9563690d6abf"
+        or admitted.get("authoritative") is not True
+        or admitted.get("published") is not True
+        or admitted.get("cacheable") is not True
+        or admitted.get("expected_outcome") != "admitted"
+        or admitted.get("actual_outcome") != "admitted"
+        or any(
+            admitted.get(field) is not None
+            for field in (
+                "limit_name",
+                "allowed",
+                "observed",
+                "structural_unit",
+                "first_divergence",
+            )
+        )
+        or admitted.get("cleanup_status") != "not_applicable"
+        or admitted.get("final_state")
+        != "declaration-published-and-base-unchanged"
+    ):
+        raise EvidenceError("declaration-admission admitted transaction differs")
+    for field in ("canonical_digest", "base_root", "published_root"):
+        require_environment_identity_hex(
+            admitted[field], label=f"declaration-admission admitted {field}"
+        )
+
+    refusals = records[1:8]
+    for offset, (record, expected) in enumerate(
+        zip(refusals, DECLARATION_ADMISSION_REFUSALS, strict=True)
+    ):
+        (
+            limit_name,
+            is_dimension,
+            measured_by,
+            observed,
+            structural_unit,
+            progress,
+        ) = expected
+        require_row(
+            record,
+            refusal_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=f"refusal-{limit_name}",
+        )
+        budget = dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET)
+        budget[f"max_{limit_name}"] = 0
+        if (
+            record.get("declaration") != f"Refused{offset}"
+            or record.get("limit_name") != limit_name
+            or record.get("is_declaration_dimension") is not is_dimension
+            or record.get("measured_by") != measured_by
+            or record.get("allowed") != 0
+            or record.get("observed") != observed
+            or record.get("structural_unit") != structural_unit
+            or record.get("progress") != progress
+            or record.get("budget") != budget
+            or record.get("usage") is not None
+            or record.get("canonical_digest") is not None
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") is not None
+            or record.get("authoritative") is not False
+            or record.get("published") is not False
+            or record.get("cacheable") is not False
+            or record.get("expected_outcome")
+            != "inconclusive-resource-exhausted"
+            or record.get("actual_outcome")
+            != "inconclusive-resource-exhausted"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "nothing-published-and-base-unchanged"
+        ):
+            raise EvidenceError(
+                f"declaration-admission refusal {limit_name} differs"
+            )
+        if not isinstance(record["observed"], int) or (
+            isinstance(record["observed"], bool)
+            or record["observed"] <= record["allowed"]
+        ):
+            raise EvidenceError(
+                f"declaration-admission refusal {limit_name} is not exhaustion"
+            )
+
+    cancellations = records[8:10]
+    for record, step, checkpoint in (
+        (
+            cancellations[0],
+            "cancel-before-expression",
+            "before-expression/0",
+        ),
+        (
+            cancellations[1],
+            "cancel-before-publication",
+            "before-publication",
+        ),
+    ):
+        require_row(
+            record,
+            cancellation_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=step,
+        )
+        if (
+            record.get("declaration") != "Cancelled"
+            or record.get("checkpoint") != checkpoint
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") is not None
+            or record.get("authoritative") is not False
+            or record.get("published") is not False
+            or record.get("cacheable") is not False
+            or record.get("expected_outcome") != "inconclusive-cancelled"
+            or record.get("actual_outcome") != "inconclusive-cancelled"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "nothing-published-and-base-unchanged"
+        ):
+            raise EvidenceError(
+                f"declaration-admission cancellation {step} differs"
+            )
+
+    superseded = records[10]
+    require_row(
+        superseded,
+        superseded_fields,
+        schema=DECLARATION_ADMISSION_SCHEMA,
+        label="superseded-plan",
+    )
+    if (
+        superseded.get("declaration") != "Stale"
+        or superseded.get("plan_base_root") != DECLARATION_ADMISSION_BASE_ROOT
+        or superseded.get("commit_target_root") != admitted["published_root"]
+        or superseded.get("base_root") != admitted["published_root"]
+        or superseded.get("published_root") is not None
+        or superseded.get("authoritative") is not False
+        or superseded.get("published") is not False
+        or superseded.get("cacheable") is not False
+        or superseded.get("expected_outcome")
+        != "inconclusive-authority-incomplete"
+        or superseded.get("actual_outcome")
+        != "inconclusive-authority-incomplete"
+        or superseded.get("first_divergence")
+        != "plan-base-differs-from-commit-target"
+        or superseded.get("cleanup_status") != "not_applicable"
+        or superseded.get("final_state")
+        != "nothing-published-and-target-unchanged"
+    ):
+        raise EvidenceError("declaration-admission superseded-plan row differs")
+
+    recoveries = records[11:18]
+    recovery_digests: set[str] = set()
+    recovery_roots: set[str] = set()
+    for offset, (record, expected) in enumerate(
+        zip(recoveries, DECLARATION_ADMISSION_RECOVERIES, strict=True)
+    ):
+        limit_name, usage, digest, published_root = expected
+        require_row(
+            record,
+            recovery_fields,
+            schema=DECLARATION_ADMISSION_SCHEMA,
+            label=f"recovery-{limit_name}",
+        )
+        if (
+            record.get("declaration") != f"Recovered{offset}"
+            or record.get("limit_name") != limit_name
+            or record.get("budget") != DECLARATION_ADMISSION_UNBOUNDED_BUDGET
+            or record.get("usage") != usage
+            # ubs:ignore — public fixture digest.
+            or record.get("canonical_digest")
+            != digest  # ubs:ignore — public fixture digest.
+            or record.get("base_root") != DECLARATION_ADMISSION_BASE_ROOT
+            or record.get("published_root") != published_root
+            or record.get("authoritative") is not True
+            or record.get("published") is not True
+            or record.get("cacheable") is not True
+            or record.get("expected_outcome") != "admitted-after-refusal"
+            or record.get("actual_outcome") != "admitted-after-refusal"
+            or record.get("first_divergence") is not None
+            or record.get("cleanup_status") != "not_applicable"
+            or record.get("final_state")
+            != "declaration-published-after-earlier-refusal"
+        ):
+            raise EvidenceError(
+                f"declaration-admission recovery {limit_name} differs"
+            )
+        require_environment_identity_hex(
+            digest, label=f"declaration-admission recovery {limit_name} digest"
+        )
+        require_environment_identity_hex(
+            published_root,
+            label=f"declaration-admission recovery {limit_name} root",
+        )
+        recovery_digests.add(digest)
+        recovery_roots.add(published_root)
+    if len(recovery_digests) != 7 or len(recovery_roots) != 7:
+        raise EvidenceError(
+            "declaration-admission recoveries reuse a digest or published root"
+        )
+
+    summary = records[18]
+    require_row(
+        summary,
+        summary_fields,
+        schema=DECLARATION_ADMISSION_SUMMARY_SCHEMA,
+        label="summary",
+    )
+    if (
+        summary.get("scenario") != "declaration-admission-real-path"
+        or summary.get("steps") != 18
+        or summary.get("admitted_rows") != 1
+        or summary.get("refusal_rows") != 7
+        or summary.get("cancellation_rows") != 2
+        or summary.get("superseded_rows") != 1
+        or summary.get("recovery_rows") != 7
+        or summary.get("declaration_dimension_rows") != 5
+        or summary.get("delegated_limit_rows") != 2
+        or summary.get("cleanup_status") != "retained_by_policy"
+        or summary.get("final_state")
+        != "every-budgeted-limit-refused-typed-and-recovered"
+        or sum(
+            record["is_declaration_dimension"] is True for record in refusals
+        )
+        != 5
+        or sum(
+            record["is_declaration_dimension"] is False for record in refusals
+        )
+        != 2
+    ):
+        raise EvidenceError("declaration-admission summary or limit split differs")
+
+    return {
+        "schema": "fln.validation/1",
+        "validator": "declaration-admission/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "steps": 18,
+        "refusal_rows": len(refusals),
+        "declaration_dimension_rows": 5,
+        "delegated_limit_rows": 2,
+        "canonical_input_root": DECLARATION_ADMISSION_INPUT_ROOT,
+        "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
 def read_kernel_admission_stream(
     path: Path, artifact_root: Path, *, label: str
 ) -> tuple[Path, bytes, str, str, str]:
@@ -3393,15 +14303,24 @@ def validate_kernel_admission(
         for line in stdout_text.splitlines()
         if line.strip().startswith("test result: ok.")
     ]
-    if len(pass_result_lines) != 1 or not re.match(
-        r"^test result: ok\. 2 passed; 0 failed;", pass_result_lines[0]
+    expected_summary = re.compile(
+        rf"^test result: ok\. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+        rf"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+        r"0 measured; 0 filtered out; finished in .+$"
+    )
+    if (
+        len(pass_result_lines) != 1
+        or expected_summary.fullmatch(pass_result_lines[0]) is None
     ):
         raise EvidenceError(
-            f"kernel-admission {phase} log lacks the exact two-test pass summary"
+            f"kernel-admission {phase} log lacks the exact full-target "
+            f"{KERNEL_ADMISSION_TARGET_PASSED}-pass/"
+            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
         )
 
     matrix_records: list[dict[str, Any]] = []
     fault_records: list[dict[str, Any]] = []
+    artifact_records: list[dict[str, Any]] = []
     for number, raw_line in enumerate(stdout_data.splitlines(), 1):
         is_fault = fault_marker in raw_line
         if not is_fault and matrix_marker not in raw_line:
@@ -3418,7 +14337,12 @@ def validate_kernel_admission(
             raise EvidenceError(
                 f"{stdout_path}:{number}: kernel-admission evidence is not an object"
             )
-        (fault_records if is_fault else matrix_records).append(value)
+        if is_fault:
+            fault_records.append(value)
+        elif value.get("scenario") == "init-prelude-artifact-incomplete-census":
+            artifact_records.append(value)
+        else:
+            matrix_records.append(value)
 
     expected_shared_identity = {
         "bead": "franken_lean-ap6",
@@ -3427,7 +14351,7 @@ def validate_kernel_admission(
         "determinism_invariant": "FL-INV-01",
         "gate_id": "G1",
         "gate_relation": "partial-component-evidence",
-        "parity_ledger_row": "init-prelude-admission-replay",
+        "parity_ledger_row": "not_applicable_kernel_admission_replay",
         "data_grade": "verified",
         "epoch": "lean-v4.32.0",
         "mode": "sound",
@@ -3576,12 +14500,29 @@ def validate_kernel_admission(
                     f"kernel-admission census {key} "
                     f"{record.get(key)!r}, expected {expected_value}"
                 )
+        # Count conservation: validated + artifact-incomplete covers the module
+        # exactly — a typed limitation folded into a success total (or dropped)
+        # breaks this arithmetic (bead franken_lean-artifact-incomplete-
+        # private-refs-sgt).
+        if (
+            positive_integer(record, "checked")
+            + positive_integer(record, "artifact_incomplete")
+            != positive_integer(record, "decls_total")
+        ):
+            raise EvidenceError(
+                "kernel-admission census does not conserve declaration counts"
+            )
+        if record.get("artifact_incomplete_witness") != KERNEL_ADMISSION_ARTIFACT_WITNESS:
+            raise EvidenceError(
+                "kernel-admission artifact-incomplete witness "
+                f"{record.get('artifact_incomplete_witness')!r} is not the pin"
+            )
         digest = record.get("verdict_stream_digest")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise EvidenceError("kernel-admission verdict-stream digest is malformed")
         if shared_digest is None:
             shared_digest = digest
-        elif digest != shared_digest:
+        elif digest != shared_digest:  # ubs:ignore — public verdict-stream content digest, not authentication material.
             raise EvidenceError(
                 "kernel-admission verdict stream diverged across the thread matrix"
             )
@@ -3601,6 +14542,86 @@ def validate_kernel_admission(
         elif steps_total != shared_steps or depth_seen != shared_depth:
             raise EvidenceError(
                 "kernel-admission resource facts diverged across the thread matrix"
+            )
+
+    # The typed artifact-incomplete rows: exactly the pinned six, in canonical
+    # order, each denying every authority, all bound by the pinned witness.
+    if len(artifact_records) != len(KERNEL_ADMISSION_ARTIFACT_ROWS):
+        raise EvidenceError(
+            f"kernel-admission emitted {len(artifact_records)} artifact-incomplete "
+            f"rows, expected {len(KERNEL_ADMISSION_ARTIFACT_ROWS)}"
+        )
+    for record, (declaration, safety, missing) in zip(
+        artifact_records, KERNEL_ADMISSION_ARTIFACT_ROWS, strict=True
+    ):
+        if set(record) != KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS:
+            missing_fields = sorted(KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS - set(record))
+            extra = sorted(set(record) - KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS)
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete field mismatch: "
+                f"missing={missing_fields!r} extra={extra!r}"
+            )
+        if record.get("schema") != KERNEL_ADMISSION_SCHEMA:
+            raise EvidenceError("kernel-admission artifact-incomplete schema mismatch")
+        if record.get("claim_id") != "franken_lean-sgt-artifact-completeness":
+            raise EvidenceError("kernel-admission artifact-incomplete claim id mismatch")
+        if record.get("invariant_id") != "FL-INV-07":
+            raise EvidenceError(
+                "kernel-admission artifact-incomplete invariant id mismatch"
+            )
+        if record.get("phase") != "artifact-incomplete-row":
+            raise EvidenceError("kernel-admission artifact-incomplete phase mismatch")
+        for key, expected in expected_shared_identity.items():
+            if key in record and record.get(key) != expected:
+                raise EvidenceError(
+                    f"kernel-admission artifact-incomplete {key} mismatch"
+                )
+        version = record.get("version")
+        if version != KERNEL_ADMISSION_VERSION or isinstance(version, bool):
+            raise EvidenceError("kernel-admission artifact-incomplete version mismatch")
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError("kernel-admission artifact-incomplete run id mismatch")
+        if record.get("declaration") != declaration:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete row names "
+                f"{record.get('declaration')!r}, expected {declaration!r}"
+            )
+        if record.get("safety") != safety:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete safety collapsed for "
+                f"{declaration}: {record.get('safety')!r} != {safety!r}"
+            )
+        if record.get("missing_references") != list(missing):
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete missing references drifted "
+                f"for {declaration}: {record.get('missing_references')!r}"
+            )
+        if record.get("witness") != KERNEL_ADMISSION_ARTIFACT_WITNESS:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete witness drifted for "
+                f"{declaration}"
+            )
+        if record.get("outcome") != "inconclusive-artifact-incomplete":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete outcome laundered for "
+                f"{declaration}: {record.get('outcome')!r}"
+            )
+        if record.get("authority") != "none":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete authority claimed for "
+                f"{declaration}"
+            )
+        for denial in ("kernel_checked", "cacheable", "environment_admissible"):
+            if record.get(denial) is not False:
+                raise EvidenceError(
+                    f"kernel-admission artifact-incomplete {denial} must be false "
+                    f"for {declaration} (an Inconclusive is never cached, checked, "
+                    f"or admitted)"
+                )
+        if record.get("evidence_grade") != "verified":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete evidence grade mismatch for "
+                f"{declaration}"
             )
 
     expected_fault_count = len(KERNEL_ADMISSION_MUTANTS) + len(
@@ -3728,6 +14749,8 @@ def validate_kernel_admission(
         "observed_exit": observed_exit,
         "matrix_records": len(matrix_records),
         "fault_records": len(fault_records),
+        "artifact_incomplete_records": len(artifact_records),
+        "artifact_incomplete_witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
         "thread_matrix": list(KERNEL_ADMISSION_THREADS),
         "census": dict(KERNEL_ADMISSION_CENSUS),
         "mutants_killed": sorted(seen_mutants),
@@ -3740,6 +14763,237 @@ def validate_kernel_admission(
         "stdout_sha256": stdout_digest,
         "stderr_sha256": stderr_digest,
     }
+
+
+def census_skip_limitation(probe_root: str) -> str:
+    if not probe_root or not Path(probe_root).is_absolute():
+        raise EvidenceError("census probe root is not an absolute path")
+    return (
+        f"census evidence is absent under probe_root={probe_root}; "
+        f"{CENSUS_SKIP_LIMITATION_SUFFIX}"
+    )
+
+
+def validate_census_availability_receipt(
+    path: Path,
+    *,
+    expected_probe_root: str | None = None,
+) -> dict[str, Any]:
+    receipt = read_json_object(path)
+    expected_keys = {
+        "schema",
+        "outcome",
+        "reason_code",
+        "authority",
+        "child_exit",
+        "probe",
+        "probe_root",
+        "required_outputs",
+        "pin_inputs",
+        "no_mock_tests",
+    }
+    if set(receipt) != expected_keys:
+        raise EvidenceError(f"{path}: census-availability receipt shape mismatch")
+    if receipt.get("schema") != CENSUS_AVAILABILITY_SCHEMA:
+        raise EvidenceError(f"{path}: census-availability schema mismatch")
+    if receipt.get("probe") != "scripts/extract/census_materialize.sh --verify-only":
+        raise EvidenceError(f"{path}: census-availability probe is not authoritative")
+    probe_root = receipt.get("probe_root")
+    if (
+        not isinstance(probe_root, str)
+        or not probe_root
+        or not Path(probe_root).is_absolute()
+    ):
+        raise EvidenceError(f"{path}: census-availability probe root is malformed")
+    if expected_probe_root is not None and probe_root != expected_probe_root:
+        raise EvidenceError(
+            f"{path}: census-availability probe root {probe_root!r} does not "
+            f"match the run root {expected_probe_root!r}"
+        )
+    for key, expected in (
+        ("required_outputs", CENSUS_REQUIRED_OUTPUTS),
+        ("pin_inputs", CENSUS_PIN_INPUTS),
+        ("no_mock_tests", CENSUS_NO_MOCK_TESTS),
+    ):
+        if receipt.get(key) != list(expected):
+            raise EvidenceError(f"{path}: census-availability {key} drifted")
+    expected_outcomes = {
+        "available": ("census_matches_pins", "complete", 0),
+        "inconclusive": ("census_absent", "inconclusive", 3),
+    }
+    outcome = receipt.get("outcome")
+    if outcome not in expected_outcomes:
+        raise EvidenceError(f"{path}: unknown census-availability outcome")
+    reason, authority, child_exit = expected_outcomes[outcome]
+    if (
+        receipt.get("reason_code") != reason
+        # ubs:ignore — public evidence authority label, not secret material.
+        or receipt.get("authority") != authority
+        or receipt.get("child_exit") != child_exit
+    ):
+        raise EvidenceError(f"{path}: census-availability outcome facts disagree")
+    return receipt
+
+
+def validate_quality_gate_census_join(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    profile: str,
+    planted: str,
+) -> None:
+    stage_records = {
+        str(record.get("stage")): record
+        for record in records
+        if record.get("event") == "stage"
+    }
+    census = stage_records.get(CENSUS_AVAILABILITY_STAGE)
+    test = stage_records.get("test")
+    structure_guard = stage_records.get("structure-guard")
+    if census is None:
+        return
+    if census.get("outcome") in {"not_run", "fail", "internal_fault", "cancelled"}:
+        return
+    if planted in {
+        CENSUS_AVAILABILITY_STAGE,
+        f"unexpected:{CENSUS_AVAILABILITY_STAGE}",
+    }:
+        return
+
+    receipt_path = path.parent / CENSUS_AVAILABILITY_RECEIPT
+    expected_probe_root = str(Path(records[0]["cwd"]))
+    receipt = validate_census_availability_receipt(
+        receipt_path,
+        expected_probe_root=expected_probe_root,
+    )
+    expected_probe_argv = [
+        str(Path(records[0]["cwd"]) / "scripts/evidence.py"),
+        "classify-census-availability",
+        "--root",
+        str(Path(records[0]["cwd"])),
+        "--output",
+        str(receipt_path),
+        "--artifact-root",
+        str(path.parent),
+    ]
+
+    if census.get("outcome") == "pass":
+        supervisor = census.get("supervisor")
+    elif census.get("outcome") == "skipped":
+        supervisor = read_json_object(
+            path.parent / f"{CENSUS_AVAILABILITY_STAGE}.meta.json"
+        )
+        validate_supervisor_object(
+            path,
+            records.index(census) + 1,
+            supervisor,
+            expected_stage_id=CENSUS_AVAILABILITY_STAGE,
+        )
+    else:
+        raise EvidenceError(f"{path}: census stage has an unregistered outcome")
+    if not isinstance(supervisor, dict):
+        raise EvidenceError(f"{path}: census stage lacks its supervised probe")
+    probe_argv = supervisor.get("argv")
+    if (
+        not isinstance(probe_argv, list)
+        or len(probe_argv) != len(expected_probe_argv) + 3
+        or probe_argv[1:3] != ["-I", "-S"]
+        or probe_argv[3:] != expected_probe_argv
+    ):
+        raise EvidenceError(f"{path}: census stage did not invoke the exact probe")
+    if (
+        supervisor.get("classification") != "pass"
+        or supervisor.get("wrapper_exit") != 0
+        or supervisor.get("child_exit") != 0
+    ):
+        raise EvidenceError(f"{path}: census classifier did not complete cleanly")
+
+    if receipt["outcome"] == "available":
+        if census.get("outcome") != "pass":
+            raise EvidenceError(f"{path}: available census was rendered as a skip")
+        expected_test_argv = ["cargo", "test", "--locked"]
+    else:
+        if (
+            census.get("outcome") != "skipped"
+            or census.get("reason_code") != "typed_limitation"
+            or census.get("limitation")
+            != census_skip_limitation(expected_probe_root)
+        ):
+            raise EvidenceError(f"{path}: absent census was not a typed visible skip")
+        expected_test_argv = [
+            "cargo",
+            "test",
+            "--locked",
+            "--",
+            *(
+                item
+                for test_name in CENSUS_NO_MOCK_TESTS
+                for item in ("--skip", test_name)
+            ),
+        ]
+
+    test_is_planted = planted in {"test", "unexpected:test"}
+    if test is not None and isinstance(test.get("supervisor"), dict):
+        if not test_is_planted and test["supervisor"].get("argv") != expected_test_argv:
+            raise EvidenceError(
+                f"{path}: workspace test invocation disagrees with census availability"
+            )
+    elif test is not None and test.get("outcome") == "pass":
+        raise EvidenceError(f"{path}: census join lacks a completed workspace test")
+
+    guard_is_planted = planted in {"structure-guard", "unexpected:structure-guard"}
+    if structure_guard is not None and isinstance(
+        structure_guard.get("supervisor"), dict
+    ):
+        guard_argv = structure_guard["supervisor"].get("argv")
+        if receipt["outcome"] == "available":
+            expected_guard_argv = [
+                "cargo",
+                "run",
+                "-q",
+                "--locked",
+                "-p",
+                "structure-guard",
+                "--",
+                "--root",
+                str(Path(records[0]["cwd"])),
+                "--robot",
+            ]
+        else:
+            expected_guard_tail = [
+                str(Path(records[0]["cwd"]) / "scripts/evidence.py"),
+                "exec-structure-guard-census-inconclusive",
+                "--root",
+                str(Path(records[0]["cwd"])),
+                "--receipt",
+                str(receipt_path),
+                "--output",
+                str(path.parent / "structure-guard.census-inconclusive.ndjson"),
+                "--validation",
+                str(
+                    path.parent / "structure-guard.census-inconclusive.validation.json"
+                ),
+                "--artifact-root",
+                str(path.parent),
+            ]
+            expected_guard_argv = (
+                guard_argv
+                if isinstance(guard_argv, list)
+                and len(guard_argv) == len(expected_guard_tail) + 3
+                and guard_argv[1:3] == ["-I", "-S"]
+                and guard_argv[3:] == expected_guard_tail
+                else None
+            )
+        if not guard_is_planted and guard_argv != expected_guard_argv:
+            raise EvidenceError(
+                f"{path}: structure-guard invocation disagrees with census availability"
+            )
+    if profile == "ci" and receipt["outcome"] == "inconclusive":
+        # CI is allowed to proceed only because the no-mock obligation is explicit
+        # above. This branch is deliberately present so deleting the CI allowance
+        # from the validator cannot silently turn a skip into an ordinary green.
+        if census.get("outcome") != "skipped":
+            raise EvidenceError(f"{path}: CI hid an absent census")
 
 
 def validate_run(
@@ -3815,6 +15069,8 @@ def validate_run(
         "parity_ledger_row",
         "scenario",
     }
+    if schema == "fln.check/2":
+        start_required.add("verification_manifest")
     missing = sorted(key for key in start_required if key not in records[0])
     if missing:
         raise EvidenceError(f"{path}: run_start missing fields {missing!r}")
@@ -3832,6 +15088,13 @@ def validate_run(
         raise EvidenceError(f"{path}: argv must be a string array")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(records[0]["input_root"])):
         raise EvidenceError(f"{path}: input_root is not a canonical SHA-256 tree root")
+    if "producer_binding" in records[0]:
+        validate_producer_binding(
+            records[0]["producer_binding"],
+            live_repository_root=(
+                Path(records[0]["cwd"]) if live_context else None
+            ),
+        )
     budgets = records[0]["budgets"]
     if (
         not isinstance(budgets, dict)
@@ -3868,6 +15131,7 @@ def validate_run(
             "self-test-plant",
             "self-test-cancellation",
             "finalizer-self-test",
+            "early-fault-self-test",
             "evidence-manifest-self-test",
         }
         if schema == "fln.check/2"
@@ -3880,6 +15144,7 @@ def validate_run(
     binding_free_profiles = {
         "evidence-manifest-self-test",
         "finalizer-self-test",
+        "early-fault-self-test",
     }
     if schema == "fln.check/2" and profile not in binding_free_profiles:
         if records[0].get("ubs_inventory") != "ubs-inventory.json":
@@ -3888,6 +15153,14 @@ def validate_run(
             path.parent / "ubs-inventory.json",
             Path(records[0]["cwd"]) if live_context else None,
         )
+    if schema == "fln.check/2":
+        if records[0].get("verification_manifest") != VERIFICATION_MANIFEST_PATH:
+            raise EvidenceError(
+                f"{path}: quality gate names an unknown verification manifest"
+            )
+        # The explicit verification-manifest stage is the execution authority.
+        # Re-reading mutable tracker state during terminal publication would
+        # turn a later bead transition into an unrelated bundle failure.
     if schema == "fln.e2e/2" or profile not in binding_free_profiles:
         if records[0].get("vendor_binding") != "vendor-binding.json":
             raise EvidenceError(f"{path}: run lacks its Reference vendor binding")
@@ -3991,44 +15264,140 @@ def validate_run(
             if not isinstance(record["stage"], str) or not record["stage"]:
                 raise EvidenceError(f"{path}:{index}: invalid stage identity")
             event_id = record["stage"]
-            if record["outcome"] != "skipped":
+            base_keys = {
+                "schema",
+                "event",
+                "run_id",
+                "bead",
+                "scenario",
+                "sequence",
+                "monotonic_ns",
+                "wall_time_utc",
+                "stage",
+                "outcome",
+                "reason_code",
+                "expected",
+                "actual",
+            }
+            if record["outcome"] == "not_run":
+                expected_keys = base_keys | {"causal_stage", "causal_reason"}
+                if set(record) != expected_keys:
+                    raise EvidenceError(
+                        f"{path}:{index}: not_run stage shape mismatch"
+                    )
+                if (
+                    record["reason_code"] != "blocked_by_prior_stage"
+                    or record["expected"] != "not_run"
+                    or record["actual"] != "not_run"
+                    or not isinstance(record.get("causal_stage"), str)
+                    or not record["causal_stage"]
+                    or not isinstance(record.get("causal_reason"), str)
+                    or not record["causal_reason"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{index}: invalid not_run causal record"
+                    )
+            elif record["outcome"] != "skipped":
                 if record.get("supervisor_available") is False:
+                    expected_keys = base_keys | {
+                        "supervisor_available",
+                        "wrapper_exit",
+                    }
+                    if set(record) != expected_keys:
+                        raise EvidenceError(
+                            f"{path}:{index}: missing-supervisor stage shape mismatch"
+                        )
                     if (
                         record["outcome"] != "internal_fault"
                         or record.get("reason_code") != "missing_supervisor_metadata"
+                        or record.get("expected") != "exit_zero"
+                        or record.get("actual") != "metadata_unavailable"
                         or record.get("wrapper_exit") != SETUP_FAILURE
                     ):
                         raise EvidenceError(
                             f"{path}:{index}: invalid missing-supervisor event"
                         )
                 else:
+                    expected_keys = base_keys | {"supervisor", "wrapper_exit"}
+                    if set(record) != expected_keys:
+                        raise EvidenceError(
+                            f"{path}:{index}: supervised stage shape mismatch"
+                        )
                     validate_supervisor_object(
                         path,
                         index,
                         record.get("supervisor"),
                         expected_stage_id=event_id,
                     )
-                    if record["supervisor"]["classification"] != record["outcome"]:
+                    wrapper_mismatch = (
+                        record.get("outcome") == "internal_fault"
+                        and record.get("reason_code") == "wrapper_exit_mismatch"
+                    )
+                    if (
+                        record["supervisor"]["classification"] != record["outcome"]
+                        and not wrapper_mismatch
+                    ):
                         raise EvidenceError(
                             f"{path}:{index}: stage/supervisor outcome mismatch"
                         )
                     if (
                         record.get("wrapper_exit")
                         != record["supervisor"]["wrapper_exit"]
+                        and not wrapper_mismatch
                     ):
                         raise EvidenceError(
                             f"{path}:{index}: stage/supervisor exit mismatch"
                         )
-            elif (
-                event_id != "ubs"
-                or records[0]["profile"] == "ci"
-                or record.get("reason_code") != "typed_limitation"
-                or record.get("expected") != "not_applicable"
-                or record.get("actual") != "skipped"
-                or not isinstance(record.get("limitation"), str)
-                or not record["limitation"]
-            ):
-                raise EvidenceError(f"{path}:{index}: invalid skipped obligation")
+                    if wrapper_mismatch and (
+                        record.get("wrapper_exit")
+                        == record["supervisor"]["wrapper_exit"]
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{index}: false wrapper-exit mismatch"
+                        )
+                    if wrapper_mismatch:
+                        if (
+                            record.get("expected") != "supervisor_wrapper_exit"
+                            or record.get("actual")
+                            != "shell_wrapper_exit_mismatch"
+                        ):
+                            raise EvidenceError(
+                                f"{path}:{index}: malformed wrapper-exit mismatch"
+                            )
+                    elif (
+                        record.get("reason_code")
+                        != record["supervisor"]["reason_code"]
+                        or record.get("expected") != "exit_zero"
+                        or record.get("actual") != record["outcome"]
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{index}: stage decision differs from supervisor"
+                        )
+            else:
+                expected_keys = base_keys | {"limitation"}
+                if set(record) != expected_keys:
+                    raise EvidenceError(
+                        f"{path}:{index}: skipped stage shape mismatch"
+                    )
+                ordinary_local_skip = (
+                    event_id == "ubs" and records[0]["profile"] != "ci"
+                )
+                census_skip = (
+                    event_id == CENSUS_AVAILABILITY_STAGE
+                    and record.get("limitation")
+                    == census_skip_limitation(str(records[0]["cwd"]))
+                )
+                if (
+                    not (ordinary_local_skip or census_skip)
+                    or record.get("reason_code") != "typed_limitation"
+                    or record.get("expected") != "not_applicable"
+                    or record.get("actual") != "skipped"
+                    or not isinstance(record.get("limitation"), str)
+                    or not record["limitation"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{index}: invalid skipped obligation"
+                    )
         elif event == "step":
             required = {
                 "step_id",
@@ -4139,7 +15508,7 @@ def validate_run(
             ]
             if len(actual_ids) != len(exercised):
                 raise EvidenceError(f"{path}: check self-test contains foreign events")
-        elif profile == "finalizer-self-test":
+        elif profile in {"finalizer-self-test", "early-fault-self-test"}:
             expected_ids = ["finalizer-probe"]
             actual_ids = [
                 str(record.get("stage"))
@@ -4152,12 +15521,11 @@ def validate_run(
                 )
         else:
             expected_ids = CHECK_STAGE_ORDER
-            actual_ids = [
-                str(record.get("stage"))
-                for record in exercised
-                if record.get("event") == "stage"
+            stage_records = [
+                record for record in exercised if record.get("event") == "stage"
             ]
-            if len(actual_ids) != len(exercised):
+            actual_ids = [str(record.get("stage")) for record in stage_records]
+            if len(stage_records) != len(exercised):
                 raise EvidenceError(f"{path}: quality gate contains foreign events")
         if actual_ids != expected_ids[: len(actual_ids)]:
             raise EvidenceError(
@@ -4165,6 +15533,37 @@ def validate_run(
             )
         if expected_verdict == "pass" and actual_ids != expected_ids:
             raise EvidenceError(f"{path}: passing check omitted mandatory obligations")
+        failed_stage_records = [
+            record
+            for record in exercised
+            if record.get("event") == "stage"
+            and record.get("outcome")
+            not in {"pass", "skipped", "not_run"}
+        ]
+        if failed_stage_records:
+            if len(failed_stage_records) != 1 or actual_ids != expected_ids:
+                raise EvidenceError(
+                    f"{path}: failed check omitted explicit downstream not_run stages"
+                )
+            failed_record = failed_stage_records[0]
+            failed_index = exercised.index(failed_record)
+            for record in exercised[failed_index + 1 :]:
+                if (
+                    record.get("event") != "stage"
+                    or record.get("outcome") != "not_run"
+                    or record.get("causal_stage") != failed_record.get("stage")
+                    or record.get("causal_reason")
+                    != failed_record.get("reason_code")
+                ):
+                    raise EvidenceError(
+                        f"{path}: downstream stage lacks exact failure causality"
+                    )
+        elif any(
+            record.get("event") == "stage"
+            and record.get("outcome") == "not_run"
+            for record in exercised
+        ):
+            raise EvidenceError(f"{path}: not_run stages have no failed cause")
         bound_plant = records[0]["planted"]
         planted_events = [
             record
@@ -4173,11 +15572,27 @@ def validate_run(
             and isinstance(record.get("supervisor"), dict)
             and record["supervisor"].get("planted") is True
         ]
-        if bound_plant:
+        if isinstance(bound_plant, str) and bound_plant.startswith("unexpected:"):
+            # The deliberate unexpected-failure plant: the planted stage must
+            # type internal_fault with the unexpected-exit reason, never a
+            # semantic stage failure.
+            unexpected_stage = bound_plant.removeprefix("unexpected:")
+            if (
+                profile != "self-test-plant"
+                or expected_verdict != "internal_fault"
+                or not unexpected_stage
+                or len(planted_events) != 1
+                or planted_events[0].get("stage") != unexpected_stage
+                or planted_events[0].get("outcome") != "internal_fault"
+                or planted_events[0].get("reason_code") != "unexpected_child_exit"
+            ):
+                raise EvidenceError(
+                    f"{path}: planted unexpected-failure contract is inconsistent"
+                )
+        elif bound_plant:
             if (
                 profile != "self-test-plant"
                 or expected_verdict != "fail"
-                or actual_ids[-1:] != [bound_plant]
                 or len(planted_events) != 1
                 or planted_events[0].get("stage") != bound_plant
                 or planted_events[0].get("outcome") != "fail"
@@ -4185,6 +15600,12 @@ def validate_run(
                 raise EvidenceError(f"{path}: planted failure contract is inconsistent")
         elif planted_events:
             raise EvidenceError(f"{path}: unbound planted failure evidence")
+        validate_quality_gate_census_join(
+            path,
+            records,
+            profile=profile,
+            planted=bound_plant,
+        )
     else:
         if scenario not in E2E_STEP_ORDERS:
             raise EvidenceError(f"{path}: unknown E2E scenario {scenario!r}")
@@ -4248,6 +15669,17 @@ def validate_run(
                 raise EvidenceError(
                     f"{path}: an earlier stage failed before the requested plant"
                 )
+        for record in records[records.index(planted_record) + 1 : -1]:
+            if (
+                record.get("event") != "stage"
+                or record.get("outcome") != "not_run"
+                or record.get("causal_stage") != expected_planted_stage
+                or record.get("causal_reason")
+                != planted_record.get("reason_code")
+            ):
+                raise EvidenceError(
+                    f"{path}: planted failure lacks explicit downstream not_run records"
+                )
         if records[0].get("planted") != expected_planted_stage:
             raise EvidenceError(f"{path}: run start does not bind the requested plant")
     return {
@@ -4273,6 +15705,8 @@ def validate_supervisor_object(
         "fln.supervisor/1",
         "fln.supervisor/2",
         "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
     }:
         raise EvidenceError(f"{path}:{record_number}: missing supervisor envelope")
     schema = value["schema"]
@@ -4302,14 +15736,198 @@ def validate_supervisor_object(
         "errors",
         "host",
     }
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         expected_keys.update({"phase_timing", "target_exec"})
-    if schema == "fln.supervisor/3":
+    if schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         expected_keys.add("test_control")
+    if schema in {"fln.supervisor/4", "fln.supervisor/5"}:
+        expected_keys.add("sealed_compiler")
+    if schema == "fln.supervisor/5":
+        expected_keys.add("sealed_interpreter")
     if set(value) != expected_keys:
         raise EvidenceError(
             f"{path}:{record_number}: supervisor envelope shape mismatch"
         )
+    if schema in {"fln.supervisor/4", "fln.supervisor/5"}:
+        sealed = value["sealed_compiler"]
+        if sealed is not None:
+            if not isinstance(sealed, dict):
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-compiler facts are not an object"
+                )
+            commit = sealed.get("commit")
+            if "commit" in sealed and (
+                not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-compiler commit is malformed"
+                )
+            for environment_field in (
+                "admitted_env",
+                "overridden_env",
+                "rejected_env",
+            ):
+                environment_names = sealed.get(environment_field)
+                if environment_field in sealed and (
+                    not isinstance(environment_names, list)
+                    or not all(
+                        isinstance(item, str) and item
+                        for item in environment_names
+                    )
+                    or environment_names != sorted(set(environment_names))
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: sealed-compiler "
+                        f"{environment_field} is malformed"
+                    )
+            component_reason = value["reason_code"] in {
+                "sealed_compiler_component_undeclared",
+                "sealed_compiler_component_absent",
+            }
+            fmt_released = (
+                value["argv"][:2] == ["cargo", "fmt"]
+                and value["classification"] in {"pass", "fail"}
+            )
+            if component_reason or fmt_released:
+                declared_components = sealed.get("declared_components")
+                required_component = sealed.get("required_component")
+                required_executables = sealed.get(
+                    "required_component_executables"
+                )
+                if (
+                    not isinstance(declared_components, list)
+                    or not declared_components
+                    or not all(
+                        isinstance(item, str) and item
+                        for item in declared_components
+                    )
+                    or len(declared_components) != len(set(declared_components))
+                    or required_component != "rustfmt"
+                    or required_executables != ["cargo-fmt", "rustfmt"]
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: fmt component-admission facts are malformed"
+                    )
+                component_declared = required_component in declared_components
+                if (
+                    value["reason_code"] == "sealed_compiler_component_undeclared"
+                    and component_declared
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: undeclared fmt component is declared"
+                    )
+                if (
+                    value["reason_code"] != "sealed_compiler_component_undeclared"
+                    and not component_declared
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: admitted fmt component is undeclared"
+                    )
+                if value["reason_code"] != "sealed_compiler_component_undeclared":
+                    executable_paths = sealed.get("required_executable_paths")
+                    if (
+                        not isinstance(executable_paths, list)
+                        or len(executable_paths) != len(required_executables)
+                        or not all(
+                            isinstance(item, str)
+                            and Path(item).is_absolute()
+                            and Path(item).name == executable
+                            for item, executable in zip(
+                                executable_paths, required_executables, strict=True
+                            )
+                        )
+                    ):
+                        raise EvidenceError(
+                            f"{path}:{record_number}: fmt executable paths are malformed"
+                        )
+    if schema == "fln.supervisor/5":
+        sealed_interpreter = value["sealed_interpreter"]
+        if not isinstance(sealed_interpreter, dict):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter facts are not an object"
+            )
+        expected_interpreter_keys = {
+            "executable",
+            "version",
+            "stdlib_prefix",
+            "base_prefix",
+            "exec_prefix",
+            "flags",
+            "overridden_env",
+        }
+        if set(sealed_interpreter) != expected_interpreter_keys:
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter shape mismatch"
+            )
+        host_identity = effective_interpreter_identity({})
+        for identity_field in (
+            "executable",
+            "version",
+            "stdlib_prefix",
+            "base_prefix",
+            "exec_prefix",
+        ):
+            if sealed_interpreter[identity_field] != host_identity[identity_field]:
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-interpreter "
+                    f"{identity_field} is stale"
+                )
+        flags = sealed_interpreter["flags"]
+        expected_flags = {
+            "isolated": True,
+            "ignore_environment": True,
+            "no_site": True,
+            "no_user_site": True,
+            "safe_path": True,
+        }
+        if (
+            not isinstance(flags, dict)
+            or set(flags) != set(expected_flags)
+            or not all(isinstance(flag, bool) for flag in flags.values())
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter flags are malformed"
+            )
+        overridden_env = sealed_interpreter["overridden_env"]
+        if (
+            not isinstance(overridden_env, list)
+            or not all(
+                isinstance(name, str) and name.startswith("PYTHON")
+                for name in overridden_env
+            )
+            or overridden_env != sorted(set(overridden_env))
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed-interpreter environment names "
+                "are malformed"
+            )
+        if value["reason_code"] == "sealed_interpreter_unsealed_startup":
+            if flags == expected_flags:
+                raise EvidenceError(
+                    f"{path}:{record_number}: unsealed-startup reason lacks effect"
+                )
+        elif flags != expected_flags:
+            raise EvidenceError(
+                f"{path}:{record_number}: sealed interpreter lacks -I -S facts"
+            )
+        if value["reason_code"] == "sealed_interpreter_hostile_environment":
+            if not overridden_env:
+                raise EvidenceError(
+                    f"{path}:{record_number}: hostile-interpreter reason lacks names"
+                )
+        elif overridden_env:
+            raise EvidenceError(
+                f"{path}:{record_number}: non-hostile result carries Python channels"
+            )
     if not isinstance(value["argv"], list) or not value["argv"] or not all(
         isinstance(item, str) for item in value["argv"]
     ):
@@ -4401,7 +16019,12 @@ def validate_supervisor_object(
             raise EvidenceError(f"{path}:{record_number}: malformed supervisor timing")
     if value["monotonic_end_ns"] - value["monotonic_start_ns"] != value["duration_ns"]:
         raise EvidenceError(f"{path}:{record_number}: supervisor duration mismatch")
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         phase = value["phase_timing"]
         expected_phase_keys = {
             "admission_protocol",
@@ -4414,7 +16037,11 @@ def validate_supervisor_object(
             "child_reaped_ns",
             "execution_duration_ns",
         }
-        if schema == "fln.supervisor/3":
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }:
             expected_phase_keys.update(
                 {
                     "setup_deadline_ns",
@@ -4440,7 +16067,16 @@ def validate_supervisor_object(
             "setup_start_ns",
             "setup_end_ns",
             "setup_duration_ns",
-            *(("setup_deadline_ns",) if schema == "fln.supervisor/3" else ()),
+            *(
+                ("setup_deadline_ns",)
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
+                else ()
+            ),
         ):
             if (
                 not isinstance(phase[key], int)
@@ -4458,10 +16094,24 @@ def validate_supervisor_object(
             "execution_duration_ns",
             *(
                 ("synthetic_cancel_deadline_ns", "termination_decision_ns")
-                if schema == "fln.supervisor/3"
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 else ()
             ),
-            *(("child_terminal_observed_ns",) if schema == "fln.supervisor/3" else ()),
+            *(
+                ("child_terminal_observed_ns",)
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
+                else ()
+            ),
         ):
             if phase[key] is not None and (
                 not isinstance(phase[key], int)
@@ -4497,7 +16147,12 @@ def validate_supervisor_object(
             readiness_ns is None
             or not readiness_ns <= release_ns <= phase["setup_end_ns"]
             or (
-                schema == "fln.supervisor/3"
+                schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 and release_ns >= phase["setup_deadline_ns"]
             )
         ):
@@ -4529,14 +16184,22 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: inconsistent execution phase timing"
                 )
-        if schema == "fln.supervisor/3" and synthetic_cancel_deadline_ns is not None and (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and synthetic_cancel_deadline_ns is not None and (
             execution_ns is None
             or synthetic_cancel_deadline_ns < execution_ns
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: synthetic cancellation predates execution"
             )
-        if schema == "fln.supervisor/3" and termination_decision_ns is not None and not (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and termination_decision_ns is not None and not (
             phase["setup_start_ns"]
             <= termination_decision_ns
             <= value["monotonic_end_ns"]
@@ -4555,7 +16218,12 @@ def validate_supervisor_object(
                     "termination_decision_ns",
                     "child_terminal_observed_ns",
                 )
-                if schema == "fln.supervisor/3"
+                if schema
+                in {
+                    "fln.supervisor/3",
+                    "fln.supervisor/4",
+                    "fln.supervisor/5",
+                }
                 else ()
             ),
         ):
@@ -4570,7 +16238,11 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: phase timestamp lies outside run: {key}"
                 )
-        if schema == "fln.supervisor/3" and (
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        } and (
             (child_terminal_observed_ns is None)
             != (child_reaped_ns is None)
             or (
@@ -4662,7 +16334,11 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: unreleased target has a semantic outcome"
             )
-        if schema == "fln.supervisor/3":
+        if schema in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }:
             test_control = value["test_control"]
             if (
                 not isinstance(test_control, dict)
@@ -4755,6 +16431,17 @@ def validate_supervisor_object(
                     raise EvidenceError(
                         f"{path}:{record_number}: planted thread fault lacks effect"
                     )
+            if fault_point == "admission_fd_exhaustion" and (
+                value["classification"] != "internal_fault"
+                or value["reason_code"] != "supervisor_or_capture_failure"
+                or value["phase_timing"]["execution_start_ns"] is not None
+                or not any(
+                    "Too many open files" in error for error in value["errors"]
+                )
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: planted descriptor exhaustion lacks effect"
+                )
     expected_wrapper = {
         "pass": 0,
         "fail": 1,
@@ -4778,6 +16465,24 @@ def validate_supervisor_object(
             "supervisor_or_capture_failure",
             "unexpected_child_exit",
             "target_exec_failure",
+            # Sealed compiler environment (bead fln-evidence-runner-bootstrap-
+            # btk): typed setup faults of the compiler-sealing envelope step.
+            "sealed_compiler_hostile_environment",
+            "sealed_compiler_ambient_config",
+            "sealed_compiler_lock_unreadable",
+            "sealed_compiler_lock_incomplete",
+            "sealed_compiler_toolchain_toml_unreadable",
+            "sealed_compiler_channel_disagreement",
+            "sealed_compiler_components_unreadable",
+            "sealed_compiler_component_undeclared",
+            "sealed_compiler_component_absent",
+            "sealed_compiler_unsupported_host",
+            "sealed_compiler_toolchain_unresolved",
+            "sealed_compiler_probe_failure",
+            "sealed_compiler_identity_mismatch",
+            "sealed_compiler_build_root_unavailable",
+            "sealed_interpreter_unsealed_startup",
+            "sealed_interpreter_hostile_environment",
         },
         "inconclusive": {
             "setup_timeout",
@@ -4809,15 +16514,39 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: artifact failure lacks publication error"
         )
-    if value["errors"] and value["reason_code"] not in {
-        "artifact_publication_failure",
-        "supervisor_or_capture_failure",
-    }:
+    if (
+        value["errors"]
+        and value["reason_code"]
+        not in {
+            "artifact_publication_failure",
+            "supervisor_or_capture_failure",
+        }
+        and not (
+            value["reason_code"].startswith("sealed_compiler_")
+            and any(
+                error.startswith("sealed compiler rejection:")
+                for error in value["errors"]
+            )
+        )
+        and not (
+            value["reason_code"].startswith("sealed_interpreter_")
+            and any(
+                error.startswith("sealed interpreter rejection:")
+                for error in value["errors"]
+            )
+        )
+    ):
         raise EvidenceError(
             f"{path}:{record_number}: recorded errors do not bind terminal reason"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"] == "target_exec_failure"
         and value["target_exec"]["status"] != "failed"
     ):
@@ -4879,7 +16608,13 @@ def validate_supervisor_object(
     if (
         classification == "internal_fault"
         and not (
-            schema in {"fln.supervisor/2", "fln.supervisor/3"}
+            schema
+            in {
+                "fln.supervisor/2",
+                "fln.supervisor/3",
+                "fln.supervisor/4",
+                "fln.supervisor/5",
+            }
             and value["reason_code"] == "target_exec_failure"
             and value["target_exec"]["status"] == "failed"
         )
@@ -4930,7 +16665,11 @@ def validate_supervisor_object(
             "setup_timeout_ms",
             "timeout_ms",
         )
-    elif schema == "fln.supervisor/3":
+    elif schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         positive_integer_facts = (
             *positive_integer_facts,
             "setup_timeout_ms",
@@ -4944,7 +16683,11 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
             )
-    if schema == "fln.supervisor/3":
+    if schema in {
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         cancel_after = resource_facts.get("cancel_after_ms")
         if cancel_after is not None and (
             not isinstance(cancel_after, int)
@@ -5076,7 +16819,13 @@ def validate_supervisor_object(
             f"{path}:{record_number}: inconclusive outcome carries cancellation"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"].startswith("child_signal_")
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -5087,7 +16836,13 @@ def validate_supervisor_object(
             f"{path}:{record_number}: child signal lacks released target execution"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema
+        in {
+            "fln.supervisor/2",
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and value["reason_code"] == "target_exec_failure"
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -5159,7 +16914,12 @@ def validate_supervisor_object(
         schema == "fln.supervisor/2"
         and readiness.get("schema") != "fln.supervisor-readiness/2"
     ) or (
-        schema == "fln.supervisor/3"
+        schema
+        in {
+            "fln.supervisor/3",
+            "fln.supervisor/4",
+            "fln.supervisor/5",
+        }
         and readiness.get("schema") != "fln.supervisor-readiness/3"
     ):
         raise EvidenceError(f"{path}:{record_number}: supervisor/readiness version drift")
@@ -5197,7 +16957,12 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: readiness/terminal classification mismatch"
             )
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+        "fln.supervisor/4",
+        "fln.supervisor/5",
+    }:
         phase = value["phase_timing"]
         if readiness_status == "ready":
             if readiness["monotonic_ns"] != phase["readiness_ns"]:
@@ -5393,9 +17158,158 @@ def sha256_file(path: Path) -> str:
     return digest
 
 
+def canonical_governed_paths(requested: Sequence[str]) -> list[str]:
+    if not requested:
+        raise EvidenceError("governed path set must not be empty")
+    observed: set[str] = set()
+    canonical: list[str] = []
+    for raw in requested:
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or "\0" in raw
+            or "\\" in raw
+            or raw.startswith("./")
+            or "//" in raw
+        ):
+            raise EvidenceError(f"governed path is not canonical: {raw!r}")
+        parsed = Path(raw)
+        if (
+            parsed.is_absolute()
+            or parsed.as_posix() != raw
+            or any(part == ".." for part in parsed.parts)
+        ):
+            raise EvidenceError(f"governed path is not canonical: {raw!r}")
+        if raw in observed:
+            raise EvidenceError(f"duplicate governed path: {raw!r}")
+        observed.add(raw)
+        canonical.append(raw)
+    return sorted(canonical, key=lambda value: value.encode("utf-8"))
+
+
+def governed_path_set_identity(requested: Sequence[str]) -> str:
+    canonical = canonical_governed_paths(requested)
+    digest = hashlib.sha256(b"fln.governed-path-set/1\0")
+    for value in canonical:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def governed_scope(requested: Sequence[str]) -> str:
+    canonical = canonical_governed_paths(requested)
+    return (
+        "full_repository"
+        if canonical == ["."]
+        else "lane_declared_subset"
+    )
+
+
+def repository_head(root: Path, *, subject: str) -> str:
+    root = lexical_absolute(root)
+    top_level = git_text(
+        root,
+        ["rev-parse", "--show-toplevel"],
+        subject=f"{subject} repository top level",
+    )
+    if lexical_absolute(Path(top_level)) != root:
+        raise EvidenceError(
+            f"{subject} repository top level mismatch: "
+            f"expected={root} actual={top_level}"
+        )
+    head = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject=f"{subject} repository HEAD",
+    )
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise EvidenceError(f"{subject} repository HEAD is malformed")
+    repeated = git_text(
+        root,
+        ["rev-parse", "--verify", "HEAD"],
+        subject=f"{subject} repeated repository HEAD",
+    )
+    if not hmac.compare_digest(head, repeated):
+        raise EvidenceError(f"{subject} repository HEAD changed during capture")
+    return head
+
+
+def build_producer_binding(
+    repository_root: Path, governed_paths: Sequence[str]
+) -> dict[str, Any]:
+    canonical = canonical_governed_paths(governed_paths)
+    return {
+        "schema": PRODUCER_BINDING_SCHEMA,
+        "repository_head": repository_head(
+            repository_root, subject="producer binding"
+        ),
+        "governed_scope": governed_scope(canonical),
+        "governed_set": governed_path_set_identity(canonical),
+        "governed_paths": canonical,
+    }
+
+
+def validate_producer_binding(
+    value: Any,
+    *,
+    live_repository_root: Path | None = None,
+    expected_governed_paths: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema",
+        "repository_head",
+        "governed_scope",
+        "governed_set",
+        "governed_paths",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise EvidenceError("producer binding has unknown or missing fields")
+    if value.get("schema") != PRODUCER_BINDING_SCHEMA:
+        raise EvidenceError("producer binding schema is unsupported")
+    recorded_head = value.get("repository_head")
+    if not isinstance(recorded_head, str) or re.fullmatch(
+        r"[0-9a-f]{40}", recorded_head
+    ) is None:
+        raise EvidenceError(
+            "producer binding repository HEAD is not full lowercase hexadecimal"
+        )
+    recorded_paths = value.get("governed_paths")
+    if not isinstance(recorded_paths, list) or not all(
+        isinstance(path, str) for path in recorded_paths
+    ):
+        raise EvidenceError("producer binding governed paths must be an array")
+    canonical = canonical_governed_paths(recorded_paths)
+    if recorded_paths != canonical:
+        raise EvidenceError(
+            "producer binding governed paths are not canonically ordered"
+        )
+    if expected_governed_paths is not None:
+        expected = canonical_governed_paths(expected_governed_paths)
+        if recorded_paths != expected:
+            raise EvidenceError(
+                "producer binding governed paths differ from completion inputs"
+            )
+    expected_scope = governed_scope(canonical)
+    if value.get("governed_scope") != expected_scope:
+        raise EvidenceError("producer binding governed scope is inconsistent")
+    expected_set = governed_path_set_identity(canonical)
+    if not hmac.compare_digest(str(value.get("governed_set")), expected_set):
+        raise EvidenceError("producer binding governed set identity differs")
+    if live_repository_root is not None:
+        live_head = repository_head(
+            live_repository_root, subject="live producer binding"
+        )
+        if not hmac.compare_digest(recorded_head, live_head):
+            raise EvidenceError(
+                "producer binding repository HEAD changed after run start"
+            )
+    return dict(value)
+
+
 def iter_tree_files(root: Path, requested: Sequence[str]) -> Iterable[tuple[str, Path]]:
     seen: set[str] = set()
-    for raw in sorted(requested):
+    for raw in canonical_governed_paths(requested):
         raw_path = Path(raw)
         if raw_path.is_absolute() or ".." in raw_path.parts:
             raise EvidenceError(f"hash input escapes root: {raw}")
@@ -5538,7 +17452,33 @@ def run_git(
     except FileNotFoundError as error:
         raise EvidenceError(f"{subject} requires an explicit repository .git directory") from error
     if stat.S_ISLNK(git_mode) or not stat.S_ISDIR(git_mode):
-        raise EvidenceError(f"{subject} requires a real repository .git directory")
+        # Name the condition here, because every caller's own summary blames something
+        # else: check.sh reports that it cannot inventory UBS inputs, closure_audit that
+        # it cannot hash governed inputs, and seven lanes that they cannot verify the
+        # pinned Reference tree. Three wrong causes get asserted louder than this one
+        # correct line, so the reader goes looking for a missing tool, a dirty tree or an
+        # absent pin. A linked git worktree writes `.git` as a FILE holding `gitdir: …`,
+        # and that is by far the most common way to reach here
+        # (bead `franken_lean-worktree-gitdir-refusal-hugg`).
+        if stat.S_ISLNK(git_mode):
+            detail = "a symlink, not a directory"
+        elif stat.S_ISREG(git_mode):
+            try:
+                is_pointer = git_dir.read_bytes()[:7] == b"gitdir:"
+            except OSError:
+                is_pointer = False
+            if is_pointer:
+                detail = (
+                    "a gitdir pointer, so this is a LINKED GIT WORKTREE; the trusted "
+                    "evidence surface runs in the main tree only, under the gate lock"
+                )
+            else:
+                detail = "a file, not a directory"
+        else:
+            detail = "not a directory"
+        raise EvidenceError(
+            f"{subject} requires a real repository .git directory: {git_dir} is {detail}"
+        )
     git_environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
@@ -5559,6 +17499,8 @@ def run_git(
         "core.ignoreStat=false",
         "-c",
         "core.filemode=true",
+        "-c",
+        "maintenance.auto=false",
         *args,
     ]
     completed = subprocess.run(
@@ -5908,18 +17850,24 @@ def validate_ubs_inventory_document(inventory: Any) -> dict[str, Any]:
     return inventory
 
 
-def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
+def validate_ubs_inventory(
+    path: Path,
+    root: Path | None,
+    *,
+    require_live_scope: bool = False,
+) -> dict[str, Any]:
     inventory = validate_ubs_inventory_document(read_json_object(path))
     if root is None:
         return inventory
     root = lexical_absolute(root)
     _root, descriptor = open_directory_nofollow(root, create=False)
     os.close(descriptor)
-    recomputed = collect_ubs_inventory(root, inventory["scope"])
-    if recomputed != inventory:
-        raise EvidenceError(
-            "UBS inventory does not exactly cover its declared live repository scope"
-        )
+    if require_live_scope:
+        recomputed = collect_ubs_inventory(root, inventory["scope"])
+        if recomputed != inventory:
+            raise EvidenceError(
+                "UBS inventory does not exactly cover its declared live repository scope"
+            )
     for row in inventory["files"]:
         rel = row["path"]
         candidate = require_within(root / rel, root, label="UBS inventory input")
@@ -5929,7 +17877,10 @@ def validate_ubs_inventory(path: Path, root: Path | None) -> dict[str, Any]:
         _data, size, digest = stable_file_facts(candidate)
         if row["bytes"] != size or not hmac.compare_digest(row["sha256"], digest):
             raise EvidenceError(f"UBS inventory input changed: {rel}")
-    if collect_ubs_inventory(root, inventory["scope"]) != inventory:
+    if (
+        require_live_scope
+        and collect_ubs_inventory(root, inventory["scope"]) != inventory
+    ):
         raise EvidenceError("UBS inventory scope changed during validation")
     return inventory
 
@@ -6231,6 +18182,10 @@ def cleanup_guardian_descendants(worker_pid: int, grace_s: float = 1.0) -> list[
 def artifact_role(rel: str) -> str:
     if rel == "run.ndjson":
         return "run_log"
+    if rel == CHECK_HUMAN_LOG:
+        return "human_semantic_log"
+    if rel == "human.log":
+        return "human_telemetry_log"
     if rel.startswith("fixtures/"):
         return "repro_fixture"
     if rel.endswith(".ndjson"):
@@ -6309,6 +18264,28 @@ def artifact_inventory(art_dir: Path, *, excluded: set[Path]) -> list[dict[str, 
     )
 
 
+def validate_manifest_producer_binding(
+    manifest_schema: Any,
+    start: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    live_context: bool,
+) -> None:
+    if manifest_schema == EVIDENCE_MANIFEST_SCHEMA:
+        producer_binding = validate_producer_binding(
+            manifest.get("producer_binding"),
+            live_repository_root=(
+                Path(start["cwd"]) if live_context else None
+            ),
+        )
+        if start.get("producer_binding") != producer_binding:
+            raise EvidenceError("manifest/run producer binding mismatch")
+    elif "producer_binding" in start:
+        raise EvidenceError(
+            "legacy evidence manifest dropped the run producer binding"
+        )
+
+
 def generate_manifest(
     art_dir: Path,
     output: Path,
@@ -6335,8 +18312,15 @@ def generate_manifest(
     if run_schema not in RUN_SCHEMAS:
         raise EvidenceError("run log has an unsupported schema")
     run_report = validate_run(run_log, run_schema, verdict)
+    if run_schema == "fln.check/2":
+        validate_check_human(run_log, art_dir / CHECK_HUMAN_LOG)
     start = run_records[0]
     terminal = run_records[-1]
+    if "producer_binding" not in start:
+        raise EvidenceError(
+            "new evidence manifests require a producer binding at run start"
+        )
+    producer_binding = validate_producer_binding(start["producer_binding"])
     expected_identity = {
         "run_id": run_id,
         "bead": bead,
@@ -6371,12 +18355,14 @@ def generate_manifest(
     )
     present = {entry["path"] for entry in entries}
     required = {"run.ndjson", "run.validation.json"}
+    if run_schema == "fln.check/2":
+        required.add(CHECK_HUMAN_LOG)
     if not required.issubset(present):
         raise EvidenceError(
             f"manifest is missing required artifacts: {sorted(required - present)!r}"
         )
     manifest = {
-        "schema": "fln.evidence-manifest/1",
+        "schema": EVIDENCE_MANIFEST_SCHEMA,
         "run_schema": run_schema,
         "run_id": run_id,
         "bead": bead,
@@ -6386,6 +18372,7 @@ def generate_manifest(
         "input_root": input_root,
         "final_root": final_root,
         "final_state_matches_input": input_root == final_root,
+        "producer_binding": producer_binding,
         "artifacts": entries,
     }
     data = canonical_json(manifest)
@@ -6413,8 +18400,32 @@ def validate_manifest(
         digest_path, art_dir, "manifest.digest", label="manifest digest"
     )
     manifest = read_json_object(manifest_path)
-    if manifest.get("schema") != "fln.evidence-manifest/1":
+    manifest_schema = manifest.get("schema")
+    if manifest_schema not in {
+        LEGACY_EVIDENCE_MANIFEST_SCHEMA,
+        EVIDENCE_MANIFEST_SCHEMA,
+    }:
         raise EvidenceError("wrong evidence manifest schema")
+    common_keys = {
+        "schema",
+        "run_schema",
+        "run_id",
+        "bead",
+        "scenario",
+        "verdict",
+        "created_utc",
+        "input_root",
+        "final_root",
+        "final_state_matches_input",
+        "artifacts",
+    }
+    expected_manifest_keys = (
+        common_keys | {"producer_binding"}
+        if manifest_schema == EVIDENCE_MANIFEST_SCHEMA
+        else common_keys
+    )
+    if set(manifest) != expected_manifest_keys:
+        raise EvidenceError("evidence manifest has unknown or missing fields")
     if manifest.get("run_schema") not in RUN_SCHEMAS:
         raise EvidenceError("manifest run schema is unsupported")
     if manifest.get("verdict") not in {
@@ -6497,6 +18508,8 @@ def validate_manifest(
             f"manifest inventory mismatch: recorded={entries!r} actual={actual_entries!r}"
         )
     required = {"run.ndjson", "run.validation.json"}
+    if manifest["run_schema"] == "fln.check/2":
+        required.add(CHECK_HUMAN_LOG)
     if not required.issubset(seen_paths):
         raise EvidenceError(
             f"manifest is missing required artifacts: {sorted(required - seen_paths)!r}"
@@ -6508,10 +18521,18 @@ def validate_manifest(
         str(manifest.get("verdict")),
         live_context=live_context,
     )
+    if manifest["run_schema"] == "fln.check/2":
+        validate_check_human(run_log, art_dir / CHECK_HUMAN_LOG)
     if read_json_object(art_dir / "run.validation.json") != run_report:
         raise EvidenceError("manifested run validation report is stale or forged")
     terminal = load_ndjson(run_log)[-1]
     start = load_ndjson(run_log)[0]
+    validate_manifest_producer_binding(
+        manifest_schema,
+        start,
+        manifest,
+        live_context=live_context,
+    )
     for key, manifest_key in (
         ("run_id", "run_id"),
         ("bead", "bead"),
@@ -6625,6 +18646,7 @@ def complete_bundle(
     vendor_path: str | None = None,
     restore_signal_state: bool = True,
     test_fail_after_link: bool = False,
+    test_marker_pause: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
     art_dir = lexical_absolute(art_dir)
     manifest_path = require_exact_artifact_path(
@@ -6639,16 +18661,27 @@ def complete_bundle(
     validate_manifest(art_dir, manifest_path, digest_path)
     manifest = read_json_object(manifest_path)
     run_log = art_dir / "run.ndjson"
-    terminal = load_ndjson(run_log)[-1]
+    run_records = load_ndjson(run_log)
+    start = run_records[0]
+    terminal = run_records[-1]
     if terminal.get("bundle_commit") != output.name:
         raise EvidenceError("run terminal names a different bundle commit marker")
+    if manifest.get("schema") != EVIDENCE_MANIFEST_SCHEMA:
+        raise EvidenceError(
+            "new complete bundles require the producer-bound evidence manifest"
+        )
+    producer_binding = validate_producer_binding(
+        manifest.get("producer_binding"),
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     initial_bindings = (
         sha256_file(run_log),
         sha256_file(manifest_path),
         sha256_file(digest_path),
     )
     marker: dict[str, Any] = {
-        "schema": "fln.evidence-bundle-commit/1",
+        "schema": EVIDENCE_BUNDLE_COMMIT_SCHEMA,
         "status": "committed",
         "run_id": manifest["run_id"],
         "bead": manifest["bead"],
@@ -6662,6 +18695,7 @@ def complete_bundle(
             "path": digest_path.name,
             "sha256": initial_bindings[2],
         },
+        "producer_binding": producer_binding,
     }
     validate_marker_bindings(marker, manifest, terminal, initial_bindings)
     marker_data = canonical_json(marker)
@@ -6673,6 +18707,11 @@ def complete_bundle(
     )
     if current_root != expected_root or current_root != manifest.get("final_root"):
         raise EvidenceError("governed inputs changed before bundle commit")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     # The governed hash can be long. Revalidate every artifact after it, then prove
     # both sides stable across another full pass before publishing the marker.
     validate_manifest(art_dir, manifest_path, digest_path)
@@ -6697,6 +18736,11 @@ def complete_bundle(
     )
     if repeated_root != current_root:
         raise EvidenceError("governed inputs changed during prospective validation")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     durably_sync_manifested_bundle(art_dir, manifest_path, digest_path)
     validate_manifest(art_dir, manifest_path, digest_path)
     durable_bindings = (
@@ -6714,6 +18758,11 @@ def complete_bundle(
     )
     if final_root != current_root:
         raise EvidenceError("governed inputs changed before durable bundle commit")
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=Path(start["cwd"]),
+        expected_governed_paths=governed_paths,
+    )
     validate_manifest(art_dir, manifest_path, digest_path)
     final_bindings = (
         sha256_file(run_log),
@@ -6735,6 +18784,7 @@ def complete_bundle(
         decision_path=output.with_name("bundle.decision"),
         restore_signal_state=restore_signal_state,
         test_fail_after_link=test_fail_after_link,
+        test_marker_pause=test_marker_pause,
     )
     return marker
 
@@ -6745,7 +18795,7 @@ def validate_marker_bindings(
     terminal: dict[str, Any],
     bindings: tuple[str, str, str],
 ) -> None:
-    if set(marker) != {
+    common_keys = {
         "schema",
         "status",
         "run_id",
@@ -6757,13 +18807,33 @@ def validate_marker_bindings(
         "run_log",
         "manifest",
         "manifest_digest",
-    }:
+    }
+    marker_schema = marker.get("schema")
+    expected_marker_keys = (
+        common_keys | {"producer_binding"}
+        if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA
+        else common_keys
+    )
+    if set(marker) != expected_marker_keys:
         raise EvidenceError("bundle marker has unknown or missing fields")
-    if (
-        marker.get("schema") != "fln.evidence-bundle-commit/1"
-        or marker.get("status") != "committed"
-    ):
+    if marker_schema not in {
+        LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA,
+        EVIDENCE_BUNDLE_COMMIT_SCHEMA,
+    } or marker.get("status") != "committed":
         raise EvidenceError("invalid evidence bundle commit marker")
+    expected_manifest_schema = (
+        EVIDENCE_MANIFEST_SCHEMA
+        if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA
+        else LEGACY_EVIDENCE_MANIFEST_SCHEMA
+    )
+    if manifest.get("schema") != expected_manifest_schema:
+        raise EvidenceError("bundle marker and evidence manifest schemas disagree")
+    if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        marker_binding = validate_producer_binding(
+            marker.get("producer_binding")
+        )
+        if manifest.get("producer_binding") != marker_binding:
+            raise EvidenceError("bundle marker producer binding mismatch")
     for key in ("run_id", "bead", "scenario", "verdict"):
         if marker.get(key) != manifest.get(key):
             raise EvidenceError(f"bundle marker identity mismatch for {key}")
@@ -6791,6 +18861,13 @@ def validate_bundle(
     digest_path: Path,
     commit_path: Path,
 ) -> dict[str, Any]:
+    """Side-effect-free bundle validation: reads, verifies, and reports only.
+
+    Validation never creates, links, or syncs anything. A winning decision
+    whose publisher died before the canonical marker link is recovered only by
+    the explicitly named adoption operation (`adopt_bundle`); validation of
+    such a bundle fails typed until adoption has run.
+    """
     art_dir = lexical_absolute(art_dir)
     manifest_path = require_exact_artifact_path(
         manifest_path, art_dir, "manifest.json", label="manifest"
@@ -6813,23 +18890,14 @@ def validate_bundle(
     decision_path = art_dir / "bundle.decision"
     decision_marker = read_json_object(decision_path)
     validate_marker_bindings(decision_marker, manifest, terminal, bindings)
-    _parent, parent_fd = open_directory_nofollow(art_dir, create=False)
-    try:
-        try:
-            os.link(
-                decision_path.name,
-                commit_path.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            pass
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
     decision_data, _size, _digest = stable_file_facts(decision_path)
-    commit_data, _size, _digest = stable_file_facts(commit_path)
+    try:
+        commit_data, _size, _digest = stable_file_facts(commit_path)
+    except FileNotFoundError:
+        raise EvidenceError(
+            "bundle commit marker is absent; a winning decision is recovered "
+            "only by the named adoption operation"
+        ) from None
     if not hmac.compare_digest(decision_data, commit_data):
         raise EvidenceError("bundle marker does not match its commit decision")
     marker = read_json_object(commit_path)
@@ -6839,33 +18907,6 @@ def validate_bundle(
         terminal,
         bindings,
     )
-    # A publisher can die after the commit decision wins but before the canonical
-    # marker link/fsync. A validator recovers that marker, durably orders the whole
-    # bundle, and revalidates the adopted bytes before reporting commitment.
-    durably_sync_manifested_bundle(
-        art_dir, manifest_path, digest_path, commit_path=commit_path
-    )
-    validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
-    manifest = read_json_object(manifest_path)
-    decision_marker = read_json_object(decision_path)
-    marker = read_json_object(commit_path)
-    terminal = load_ndjson(run_log)[-1]
-    bindings = (
-        sha256_file(run_log),
-        sha256_file(manifest_path),
-        sha256_file(digest_path),
-    )
-    validate_marker_bindings(decision_marker, manifest, terminal, bindings)
-    validate_marker_bindings(
-        marker,
-        manifest,
-        terminal,
-        bindings,
-    )
-    decision_data, _size, _digest = stable_file_facts(decision_path)
-    commit_data, _size, _digest = stable_file_facts(commit_path)
-    if not hmac.compare_digest(decision_data, commit_data):
-        raise EvidenceError("durable bundle marker changed from its commit decision")
     return {
         "schema": "fln.bundle-validation/1",
         "valid": True,
@@ -6874,6 +18915,562 @@ def validate_bundle(
         "verdict": marker["verdict"],
         "process_exit": marker["process_exit"],
         "commit_sha256": sha256_file(commit_path),
+    }
+
+
+def adopt_bundle(
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+) -> dict[str, Any]:
+    """The explicitly named adoption operation (Design: validate/adopt split).
+
+    A publisher can die after its bundle decision wins but before the canonical
+    marker link or its durable ordering. Adoption recovers exactly that state:
+    it verifies the winning decision against the manifested run, publishes the
+    canonical marker exclusively as a hard link of the decision, fsyncs through
+    the artifact-directory ancestry, durably orders every manifested artifact,
+    and finishes with the full side-effect-free revalidation. Concurrent
+    adoption is idempotent — the link either publishes the single canonical
+    name or observes it already present — and an empty decision, claimed by
+    cancellation, is refused typed: cancellation can never be adopted as pass.
+    """
+    art_dir = lexical_absolute(art_dir)
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    commit_path = require_exact_artifact_path(
+        commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+    )
+    run_log = art_dir / "run.ndjson"
+    decision_path = art_dir / "bundle.decision"
+    # Publishing the canonical marker as a hard link changes the decision
+    # inode's ctime. Serialize adopters across the decision read and link so
+    # another legitimate adopter cannot look like an in-place data mutation to
+    # stable_file_facts. The lock is held on the immutable decision inode and
+    # therefore works across both threads and processes.
+    _decision_absolute, decision_fd = open_regular_nofollow(decision_path)
+    try:
+        fcntl.flock(decision_fd, fcntl.LOCK_EX)
+        _decision_data, decision_size, _decision_digest = stable_file_facts(
+            decision_path
+        )
+        if decision_size == 0:
+            raise EvidenceError(
+                "cancellation claimed the bundle decision; adoption refused"
+            )
+        validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
+        manifest = read_json_object(manifest_path)
+        terminal = load_ndjson(run_log)[-1]
+        bindings = (
+            sha256_file(run_log),
+            sha256_file(manifest_path),
+            sha256_file(digest_path),
+        )
+        decision_marker = read_json_object(decision_path)
+        validate_marker_bindings(decision_marker, manifest, terminal, bindings)
+        _parent, parent_fd = open_directory_nofollow(art_dir, create=False)
+        try:
+            try:
+                os.link(
+                    decision_path.name,
+                    commit_path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(decision_fd)
+    durably_sync_manifested_bundle(
+        art_dir, manifest_path, digest_path, commit_path=commit_path
+    )
+    return validate_bundle(art_dir, manifest_path, digest_path, commit_path)
+
+
+def sha256_file_identity(path: Path) -> str:
+    return f"sha256:{sha256_file(path)}"
+
+
+def verification_receipt_execution(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    dispositions: dict[str, list[str]] = {
+        "executed": [],
+        "expected_failure": [],
+        "typed_skip": [],
+        "not_run": [],
+    }
+    for record in records[1:-1]:
+        event = record.get("event")
+        if event == "stage":
+            identity = f"stage:{record['stage']}"
+            outcome = record.get("outcome")
+            if outcome == "skipped":
+                disposition = "typed_skip"
+            elif outcome == "not_run":
+                disposition = "not_run"
+            elif outcome in {
+                "pass",
+                "fail",
+                "inconclusive",
+                "internal_fault",
+                "cancelled",
+            }:
+                disposition = "executed"
+            else:
+                raise EvidenceError(
+                    f"receipt promotion cannot classify stage outcome {outcome!r}"
+                )
+        elif event == "step":
+            identity = f"step:{record['step_id']}"
+            if record.get("assertion") not in {"pass", "fail"}:
+                raise EvidenceError(
+                    "receipt promotion cannot classify an unknown step assertion"
+                )
+            is_expected_failure = (
+                record.get("assertion") == "pass"
+                and (
+                    record.get("expected_child_exit") != PASS
+                    or record.get("expected_wrapper_exit") != PASS
+                    or record.get("expected_supervisor_classification")
+                    not in {"pass", "skipped"}
+                )
+            )
+            disposition = (
+                "expected_failure" if is_expected_failure else "executed"
+            )
+        elif event == "self_test":
+            identity = f"self_test:{record['stage']}"
+            disposition = (
+                "expected_failure"
+                if record.get("ok") is True
+                and record.get("planted_exit") != PASS
+                else "executed"
+            )
+        else:
+            raise EvidenceError(
+                f"receipt promotion cannot classify event {event!r}"
+            )
+        dispositions[disposition].append(identity)
+    for identities in dispositions.values():
+        if len(identities) != len(set(identities)):
+            raise EvidenceError(
+                "receipt execution identities are duplicated"
+            )
+        identities.sort()
+    if not any(dispositions.values()):
+        raise EvidenceError("receipt execution inventory is empty")
+    return {
+        "authority": "structured_run_log",
+        **dispositions,
+    }
+
+
+def validate_verification_receipt_source(
+    record: Mapping[str, Any],
+    *,
+    run_path: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+) -> None:
+    source = record.get("source")
+    if not isinstance(source, dict):
+        raise EvidenceError("verification receipt source binding is missing")
+    expected = {
+        "bundle_commit_sha256": sha256_file_identity(commit_path),
+        "manifest_sha256": sha256_file_identity(manifest_path),
+        "manifest_digest_sha256": sha256_file_identity(digest_path),
+        "run_log_sha256": sha256_file_identity(run_path),
+    }
+    for field, expected_identity in expected.items():
+        if not hmac.compare_digest(
+            str(source.get(field)), expected_identity
+        ):
+            raise EvidenceError(
+                f"verification receipt source digest differs for {field}"
+            )
+
+
+def verification_receipt_producer_binding(
+    marker: Mapping[str, Any],
+    *,
+    legacy_producing_commit: str | None,
+    legacy_governed_scope: str | None,
+) -> tuple[str, str, str, str]:
+    marker_schema = marker.get("schema")
+    if marker_schema == EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        if (
+            legacy_producing_commit is not None
+            or legacy_governed_scope is not None
+        ):
+            raise EvidenceError(
+                "recorded producer binding cannot be replaced by legacy "
+                "operator arguments"
+            )
+        binding = validate_producer_binding(marker.get("producer_binding"))
+        return (
+            binding["repository_head"],
+            "recorded",
+            binding["governed_scope"],
+            binding["governed_set"],
+        )
+    if marker_schema != LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA:
+        raise EvidenceError("receipt source has an unsupported bundle schema")
+    if legacy_governed_scope not in {
+        "full_repository",
+        "lane_declared_subset",
+    }:
+        raise EvidenceError(
+            "historical bundle promotion requires a typed "
+            "--legacy-governed-scope"
+        )
+    if legacy_producing_commit is None:
+        producing_commit = "unavailable"
+        commit_binding = "unbound"
+    else:
+        if re.fullmatch(r"[0-9a-f]{40}", legacy_producing_commit) is None:
+            raise EvidenceError(
+                "legacy producing commit must be full lowercase hexadecimal"
+            )
+        producing_commit = legacy_producing_commit
+        commit_binding = "operator_attested_legacy"
+    return (
+        producing_commit,
+        commit_binding,
+        legacy_governed_scope,
+        "unavailable",
+    )
+
+
+def promote_verification_receipt(
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+    *,
+    legacy_producing_commit: str | None = None,
+    legacy_governed_scope: str | None = None,
+) -> dict[str, Any]:
+    """Project one validated bundle into a compact, content-addressed receipt."""
+    art_dir = lexical_absolute(art_dir)
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    commit_path = require_exact_artifact_path(
+        commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+    )
+    validate_bundle(art_dir, manifest_path, digest_path, commit_path)
+    run_path = art_dir / "run.ndjson"
+    records = load_ndjson(run_path)
+    start = records[0]
+    terminal = records[-1]
+    manifest = read_json_object(manifest_path)
+    marker = read_json_object(commit_path)
+    (
+        producing_commit,
+        commit_binding,
+        receipt_governed_scope,
+        receipt_governed_set,
+    ) = verification_receipt_producer_binding(
+        marker,
+        legacy_producing_commit=legacy_producing_commit,
+        legacy_governed_scope=legacy_governed_scope,
+    )
+
+    vendor_binding = start.get("vendor_binding")
+    if vendor_binding == "vendor-binding.json":
+        reference = {
+            "status": "installed_and_bound",
+            "binding_sha256": sha256_file_identity(
+                art_dir / "vendor-binding.json"
+            ),
+        }
+    elif isinstance(vendor_binding, str) and vendor_binding.startswith(
+        "not_applicable"
+    ):
+        reference = {
+            "status": "not_applicable",
+            "binding_sha256": "not_applicable",
+        }
+    else:
+        reference = {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        }
+
+    record: dict[str, Any] = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": start["schema"],
+            "run_id": start["run_id"],
+            "bead": start["bead"],
+            "scenario": start["scenario"],
+            "producing_commit": producing_commit,
+            "commit_binding": commit_binding,
+        },
+        "outcome": {
+            "verdict": terminal["verdict"],
+            "process_exit": terminal["process_exit"],
+            "reason_code": terminal["reason_code"],
+            "input_root": manifest["input_root"],
+            "final_root": manifest["final_root"],
+            "governed_state_static": hmac.compare_digest(
+                manifest["input_root"], manifest["final_root"]
+            ),
+            "governed_scope": receipt_governed_scope,
+            "governed_set": receipt_governed_set,
+        },
+        "source": {
+            "bundle_commit_sha256": sha256_file_identity(commit_path),
+            "manifest_sha256": sha256_file_identity(manifest_path),
+            "manifest_digest_sha256": sha256_file_identity(digest_path),
+            "run_log_sha256": sha256_file_identity(run_path),
+        },
+        "execution": verification_receipt_execution(records),
+        "reference": reference,
+    }
+    record["receipt"] = verification_receipt_content_address(record)
+    validate_verification_receipt_source(
+        record,
+        run_path=run_path,
+        manifest_path=manifest_path,
+        digest_path=digest_path,
+        commit_path=commit_path,
+    )
+    validate_verification_receipt_record(
+        Path(VERIFICATION_EVIDENCE_REGISTRY_PATH),
+        1,
+        record,
+        {str(start["bead"]): {}},
+    )
+    return record
+
+
+PARTIAL_BUNDLE_CLASSIFICATIONS = {"internal_fault", "inconclusive", "cancelled"}
+
+
+def publish_partial_bundle(
+    art_dir: Path,
+    *,
+    run_id: str,
+    bead: str,
+    scenario: str,
+    step: str,
+    reason: str,
+    classification: str,
+    argv: Sequence[str],
+    cwd: str,
+    restore_signal_state: bool = True,
+) -> dict[str, Any]:
+    """Publish the typed durable partial bundle for an early-envelope fault.
+
+    A consumer whose evidence envelope faulted between artifact-directory
+    creation and its run_start emission has no validatable run log, so bundle
+    completeness can never be claimed for it. The partial form carries its own
+    marker name (`bundle.incomplete.json`) and schemas, is refused typed by
+    complete-bundle validation and by adoption alike, and its classification
+    can never be pass. Publication still races cancellation on the shared
+    write-once `bundle.decision` linearization point.
+    """
+    art_dir = lexical_absolute(art_dir)
+    if classification not in PARTIAL_BUNDLE_CLASSIFICATIONS:
+        raise EvidenceError("partial bundle classification is unsupported")
+    for label, value in (
+        ("run_id", run_id),
+        ("bead", bead),
+        ("scenario", scenario),
+        ("step", step),
+        ("reason", reason),
+        ("cwd", cwd),
+    ):
+        if not isinstance(value, str) or not value:
+            raise EvidenceError(f"partial bundle {label} must be present")
+    rendered_argv, _had_redaction = redacted_argv(list(argv))
+    fault = {
+        "schema": "fln.check-setup-fault/1",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "argv": rendered_argv,
+        "cwd": cwd,
+        "monotonic_ns": time.monotonic_ns(),
+        "wall_time_utc": utc_now(),
+    }
+    fault_path = art_dir / "setup-fault.json"
+    write_new(fault_path, canonical_json(fault))
+    manifest_path = art_dir / "manifest-incomplete.json"
+    digest_path = art_dir / "manifest-incomplete.digest"
+    marker_path = art_dir / "bundle.incomplete.json"
+    decision_path = art_dir / "bundle.decision"
+    entries = artifact_inventory(
+        art_dir,
+        excluded={manifest_path, digest_path, decision_path, marker_path},
+    )
+    present = {entry["path"] for entry in entries}
+    if "setup-fault.json" not in present:
+        raise EvidenceError("partial manifest lost its setup fault record")
+    manifest = {
+        "schema": "fln.evidence-manifest-incomplete/1",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "created_utc": utc_now(),
+        "setup_fault_sha256": sha256_file(fault_path),
+        "artifacts": entries,
+    }
+    manifest_data = canonical_json(manifest)
+    write_new(manifest_path, manifest_data)
+    manifest_digest = hashlib.sha256(manifest_data).hexdigest()
+    write_new(
+        digest_path,
+        f"sha256:{manifest_digest}  {manifest_path.name}\n".encode(),
+    )
+    marker = {
+        "schema": "fln.evidence-bundle-incomplete-commit/1",
+        "status": "incomplete",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "created_utc": utc_now(),
+        "setup_fault": {
+            "path": fault_path.name,
+            "sha256": sha256_file(fault_path),
+        },
+        "manifest": {
+            "path": manifest_path.name,
+            "sha256": sha256_file(manifest_path),
+        },
+        "manifest_digest": {
+            "path": digest_path.name,
+            "sha256": sha256_file(digest_path),
+        },
+    }
+    write_signal_committed_atomic_new(
+        marker_path,
+        canonical_json(marker),
+        decision_path=decision_path,
+        restore_signal_state=restore_signal_state,
+    )
+    return marker
+
+
+def validate_partial_bundle(art_dir: Path) -> dict[str, Any]:
+    """Side-effect-free validation of a typed early-envelope partial bundle."""
+    art_dir = lexical_absolute(art_dir)
+    fault_path = art_dir / "setup-fault.json"
+    manifest_path = art_dir / "manifest-incomplete.json"
+    digest_path = art_dir / "manifest-incomplete.digest"
+    marker_path = art_dir / "bundle.incomplete.json"
+    decision_path = art_dir / "bundle.decision"
+    fault = read_json_object(fault_path)
+    if fault.get("schema") != "fln.check-setup-fault/1":
+        raise EvidenceError("wrong setup-fault schema")
+    identity_keys = (
+        "run_id",
+        "bead",
+        "scenario",
+        "step",
+        "reason_code",
+        "classification",
+    )
+    for key in identity_keys + ("argv", "cwd", "monotonic_ns", "wall_time_utc"):
+        if key not in fault:
+            raise EvidenceError(f"setup fault is missing {key}")
+    if fault["classification"] not in PARTIAL_BUNDLE_CLASSIFICATIONS:
+        raise EvidenceError(
+            "partial bundle classification can never claim completion"
+        )
+    manifest = read_json_object(manifest_path)
+    if manifest.get("schema") != "fln.evidence-manifest-incomplete/1":
+        raise EvidenceError("wrong incomplete-manifest schema")
+    for key in identity_keys:
+        if manifest.get(key) != fault[key]:
+            raise EvidenceError(
+                f"incomplete manifest {key} disagrees with the setup fault"
+            )
+    if manifest.get("setup_fault_sha256") != sha256_file(fault_path):
+        raise EvidenceError("incomplete manifest lost its setup-fault binding")
+    manifest_data, _manifest_size, _manifest_digest = stable_file_facts(
+        manifest_path
+    )
+    digest_data, _digest_size, _digest_digest = stable_file_facts(digest_path)
+    expected_digest_line = (
+        f"sha256:{hashlib.sha256(manifest_data).hexdigest()}"
+        f"  {manifest_path.name}\n"
+    ).encode()
+    if not hmac.compare_digest(digest_data, expected_digest_line):
+        raise EvidenceError("incomplete manifest digest does not match")
+    recomputed = artifact_inventory(
+        art_dir,
+        excluded={manifest_path, digest_path, decision_path, marker_path},
+    )
+    if recomputed != manifest.get("artifacts"):
+        raise EvidenceError(
+            "partial bundle artifacts changed after publication"
+        )
+    marker = read_json_object(marker_path)
+    if (
+        marker.get("schema") != "fln.evidence-bundle-incomplete-commit/1"
+        or marker.get("status") != "incomplete"
+    ):
+        raise EvidenceError("wrong incomplete-bundle marker schema")
+    for key in identity_keys:
+        if marker.get(key) != fault[key]:
+            raise EvidenceError(
+                f"incomplete marker {key} disagrees with the setup fault"
+            )
+    if (
+        marker.get("setup_fault")
+        != {"path": fault_path.name, "sha256": sha256_file(fault_path)}
+        or marker.get("manifest")
+        != {"path": manifest_path.name, "sha256": sha256_file(manifest_path)}
+        or marker.get("manifest_digest")
+        != {"path": digest_path.name, "sha256": sha256_file(digest_path)}
+    ):
+        raise EvidenceError("incomplete marker bindings do not match")
+    marker_data, _marker_size, _marker_bytes_digest = stable_file_facts(
+        marker_path
+    )
+    decision_data, _decision_size, _decision_digest = stable_file_facts(
+        decision_path
+    )
+    if not hmac.compare_digest(marker_data, decision_data):
+        raise EvidenceError(
+            "incomplete marker does not match its commit decision"
+        )
+    return {
+        "schema": "fln.partial-bundle-validation/1",
+        "valid": True,
+        "committed": False,
+        "run_id": fault["run_id"],
+        "step": fault["step"],
+        "reason_code": fault["reason_code"],
+        "classification": fault["classification"],
+        "marker_sha256": sha256_file(marker_path),
     }
 
 
@@ -6923,6 +19520,17 @@ def cmd_emit(args: argparse.Namespace) -> int:
     require_within(Path(args.file), Path(args.artifact_root), label="NDJSON log")
     record: dict[str, Any] = {}
     add_fields(record, args)
+    if bool(args.producer_binding_root) != bool(args.governed_path):
+        raise EvidenceError(
+            "producer binding requires both --producer-binding-root and "
+            "--governed-path"
+        )
+    if args.producer_binding_root:
+        if "producer_binding" in record:
+            raise EvidenceError("duplicate field: producer_binding")
+        record["producer_binding"] = build_producer_binding(
+            Path(args.producer_binding_root), args.governed_path
+        )
     append_record(Path(args.file), record, must_be_new=args.new_log)
     return PASS
 
@@ -6963,6 +19571,11 @@ def run_supervised_from_args(
         test_before_release_delay_ms=args.test_before_release_delay_ms,
         test_gate_mode=args.test_gate_mode,
         test_fault_point=args.test_fault_point,
+        sealed_cargo=args.sealed_cargo,
+        suite_lock_path=Path(args.suite_lock) if args.suite_lock else None,
+        sealed_build_root=(
+            Path(args.sealed_build_root) if args.sealed_build_root else None
+        ),
     )
 
 
@@ -7237,6 +19850,212 @@ def cmd_run(args: argparse.Namespace) -> int:
     raise EvidenceError(f"inner supervisor died unexpectedly with status {worker_exit}")
 
 
+def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
+    try:
+        report = validate_verification_manifest(
+            Path(args.manifest),
+            Path(args.beads),
+            receipt_registry_path=(
+                Path(args.receipt_registry)
+                if args.receipt_registry is not None
+                else None
+            ),
+        )
+    except VerificationEvidenceRegistryAbsent as error:
+        print(f"verification-manifest: typed absence: {error}", file=sys.stderr)
+        return INCONCLUSIVE
+    except (
+        EvidenceError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+    ) as error:
+        print(f"verification-manifest: {error}", file=sys.stderr)
+        return FAIL
+    if args.output:
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_render_check_human(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    run_path = require_exact_artifact_path(
+        Path(args.file), artifact_root, "run.ndjson", label="check run"
+    )
+    output = require_exact_artifact_path(
+        Path(args.output), artifact_root, CHECK_HUMAN_LOG, label="check human log"
+    )
+    records = load_ndjson(run_path)
+    write_new(output, render_check_human(records))
+    validate_check_human(run_path, output)
+    return PASS
+
+
+def cmd_classify_census_availability(args: argparse.Namespace) -> int:
+    root = lexical_absolute(Path(args.root)).resolve(strict=True)
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    output = require_within(
+        Path(args.output), artifact_root, label="census-availability receipt"
+    )
+    if output.name != CENSUS_AVAILABILITY_RECEIPT:
+        raise EvidenceError("census-availability receipt has a non-canonical name")
+    script = root / "scripts/extract/census_materialize.sh"
+    if script.is_symlink() or not script.is_file():
+        raise EvidenceError("census materializer is not a regular repository script")
+    command = ["bash", str(script), "--verify-only"]
+    try:
+        probe = subprocess.run(  # ubs:ignore — fixed repository script and fixed flag.
+            command,
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f"census availability probe timed out: {error}", file=sys.stderr)
+        return SETUP_FAILURE
+    if len(probe.stdout) + len(probe.stderr) > MAX_LOG_BYTES:
+        print("census availability probe exceeded its evidence bound", file=sys.stderr)
+        return SETUP_FAILURE
+    sys.stdout.buffer.write(probe.stdout)
+    sys.stderr.buffer.write(probe.stderr)
+
+    if probe.returncode == PASS:
+        outcome = "available"
+        reason_code = "census_matches_pins"
+        authority = "complete"
+    elif probe.returncode == INCONCLUSIVE:
+        reasons = re.findall(
+            r"^\[census_materialize\] inconclusive reason=([a-z0-9_]+):",
+            probe.stderr.decode("utf-8", "replace"),
+            flags=re.MULTILINE,
+        )
+        if reasons != ["census_absent"]:
+            print(
+                "census availability is inconclusive for a reason other than "
+                f"plain absence: {reasons!r}",
+                file=sys.stderr,
+            )
+            return SETUP_FAILURE
+        outcome = "inconclusive"
+        reason_code = "census_absent"
+        authority = "inconclusive"
+    elif probe.returncode == FAIL:
+        return FAIL
+    elif probe.returncode == SETUP_FAILURE:
+        return SETUP_FAILURE
+    else:
+        print(
+            f"census materializer returned unregistered exit {probe.returncode}",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
+
+    receipt = {
+        "schema": CENSUS_AVAILABILITY_SCHEMA,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "authority": authority,
+        "child_exit": probe.returncode,
+        "probe": "scripts/extract/census_materialize.sh --verify-only",
+        "probe_root": str(root),
+        "required_outputs": list(CENSUS_REQUIRED_OUTPUTS),
+        "pin_inputs": list(CENSUS_PIN_INPUTS),
+        "no_mock_tests": list(CENSUS_NO_MOCK_TESTS),
+    }
+    write_new(output, canonical_json(receipt))
+    validate_census_availability_receipt(
+        output,
+        expected_probe_root=str(root),
+    )
+    return PASS
+
+
+def cmd_exec_structure_guard_census_inconclusive(
+    args: argparse.Namespace,
+) -> int:
+    root = lexical_absolute(Path(args.root)).resolve(strict=True)
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    receipt_path = require_within(
+        Path(args.receipt), artifact_root, label="census-availability receipt"
+    )
+    receipt = validate_census_availability_receipt(
+        receipt_path,
+        expected_probe_root=str(root),
+    )
+    if receipt["outcome"] != "inconclusive":
+        raise EvidenceError(
+            "census-inconclusive guard adapter requires an inconclusive receipt"
+        )
+    output = require_within(
+        Path(args.output), artifact_root, label="structure-guard census output"
+    )
+    validation = require_within(
+        Path(args.validation),
+        artifact_root,
+        label="structure-guard census validation",
+    )
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "--locked",
+        "-p",
+        "structure-guard",
+        "--",
+        "--root",
+        str(root),
+        "--robot",
+    ]
+    try:
+        guard = subprocess.run(  # ubs:ignore — fixed guard argv over the explicit root.
+            command,
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f"structure-guard census adapter timed out: {error}", file=sys.stderr)
+        return SETUP_FAILURE
+    if len(guard.stdout) + len(guard.stderr) > MAX_LOG_BYTES:
+        print(
+            "structure-guard census adapter exceeded its evidence bound",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
+    write_new(output, guard.stdout)
+    sys.stderr.buffer.write(guard.stderr)
+    if guard.returncode != INCONCLUSIVE:
+        print(
+            "census receipt was inconclusive but structure-guard returned "
+            f"{guard.returncode}",
+            file=sys.stderr,
+        )
+        return FAIL if guard.returncode in {PASS, FAIL} else SETUP_FAILURE
+    try:
+        report = validate_guard(
+            output,
+            INCONCLUSIVE,
+            "inconclusive",
+            ["FLN-STRUCT-036@contracts/builtin_environment.tsv"],
+            str(root),
+            guard.returncode,
+        )
+    except EvidenceError as error:
+        print(
+            f"structure-guard census-inconclusive join failed: {error}",
+            file=sys.stderr,
+        )
+        return FAIL
+    write_new(validation, canonical_json(report))
+    return PASS
+
+
 def cmd_validate_guard(args: argparse.Namespace) -> int:
     report = validate_guard(
         Path(args.file),
@@ -7287,6 +20106,643 @@ def cmd_validate_environment_collision(args: argparse.Namespace) -> int:
     else:
         sys.stdout.buffer.write(canonical_json(report))
     return PASS
+
+
+def cmd_validate_verdict_schema(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_within(
+        Path(args.semantic), artifact_root, label="Verdict semantic evidence"
+    )
+    telemetry_path = require_within(
+        Path(args.telemetry), artifact_root, label="Verdict telemetry"
+    )
+    stdout_path = require_within(
+        Path(args.stdout), artifact_root, label="Verdict stdout"
+    )
+    stderr_path = require_within(
+        Path(args.stderr), artifact_root, label="Verdict stderr"
+    )
+    positive_semantic_path = (
+        require_within(
+            Path(args.positive_semantic),
+            artifact_root,
+            label="Verdict positive semantic baseline",
+        )
+        if args.positive_semantic
+        else None
+    )
+    report = validate_verdict_schema_evidence(
+        semantic_path,
+        telemetry_path,
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.observed_exit,
+        positive_semantic_path=positive_semantic_path,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label="Verdict schema validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_diagnostic_projection(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_exact_artifact_path(
+        Path(args.semantic),
+        artifact_root,
+        "semantic.ndjson",
+        label="diagnostic projection semantic evidence",
+    )
+    telemetry_path = require_exact_artifact_path(
+        Path(args.telemetry),
+        artifact_root,
+        "telemetry.ndjson",
+        label="diagnostic projection telemetry",
+    )
+    report = validate_diagnostic_projection_evidence(
+        expected_run_id=args.run_id,
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    if args.output:
+        output = require_exact_artifact_path(
+            Path(args.output),
+            artifact_root,
+            "projection.validation.json",
+            label="diagnostic projection validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_lexer_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"), f"lexer {case} semantic evidence"
+        )
+        for case in LEXER_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(getattr(args, f"{case}_telemetry"), f"lexer {case} telemetry")
+        for case in LEXER_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(getattr(args, f"{case}_input"), f"lexer {case} input")
+        for case in LEXER_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(getattr(args, f"{case}_stdout"), f"lexer {case} stdout")
+        for case in LEXER_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(getattr(args, f"{case}_stderr"), f"lexer {case} stderr")
+        for case in LEXER_CASE_INPUTS
+    }
+    report = validate_lexer_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label="lexer semantic validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_parser_corpus_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"),
+            f"parser corpus {case} semantic evidence",
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(
+            getattr(args, f"{case}_telemetry"),
+            f"parser corpus {case} telemetry",
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(
+            getattr(args, f"{case}_input"), f"parser corpus {case} input"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stdout"), f"parser corpus {case} stdout"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stderr"), f"parser corpus {case} stderr"
+        )
+        for case in PARSER_CORPUS_CASE_INPUTS
+    }
+    report = validate_parser_corpus_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="parser corpus semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_dynamic_parser_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    semantic_paths = {
+        case: artifact(
+            getattr(args, f"{case}_semantic"),
+            f"dynamic parser {case} semantic evidence",
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    telemetry_paths = {
+        case: artifact(
+            getattr(args, f"{case}_telemetry"),
+            f"dynamic parser {case} telemetry",
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    input_paths = {
+        case: artifact(
+            getattr(args, f"{case}_input"), f"dynamic parser {case} input"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    stdout_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stdout"), f"dynamic parser {case} stdout"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    stderr_paths = {
+        case: artifact(
+            getattr(args, f"{case}_stderr"), f"dynamic parser {case} stderr"
+        )
+        for case in DYNAMIC_PARSER_CASE_INPUTS
+    }
+    source_recovery_semantic_path = artifact(
+        args.source_recovery_semantic,
+        "source recovery semantic evidence",
+    )
+    source_recovery_telemetry_path = artifact(
+        args.source_recovery_telemetry,
+        "source recovery telemetry",
+    )
+    source_recovery_input_path = artifact(
+        args.source_recovery_input,
+        "source recovery input",
+    )
+    source_recovery_stdout_path = artifact(
+        args.source_recovery_stdout,
+        "source recovery stdout",
+    )
+    source_recovery_stderr_path = artifact(
+        args.source_recovery_stderr,
+        "source recovery stderr",
+    )
+    report = validate_dynamic_parser_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_paths=semantic_paths,
+        telemetry_paths=telemetry_paths,
+        input_paths=input_paths,
+        stdout_paths=stdout_paths,
+        stderr_paths=stderr_paths,
+        source_recovery_semantic_path=source_recovery_semantic_path,
+        source_recovery_telemetry_path=source_recovery_telemetry_path,
+        source_recovery_input_path=source_recovery_input_path,
+        source_recovery_stdout_path=source_recovery_stdout_path,
+        source_recovery_stderr_path=source_recovery_stderr_path,
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="dynamic parser semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_macro_txn_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    semantic_path = require_within(
+        Path(args.semantic),
+        artifact_root,
+        label="macro transaction semantic evidence",
+    )
+    telemetry_path = require_within(
+        Path(args.telemetry),
+        artifact_root,
+        label="macro transaction telemetry",
+    )
+    report = validate_macro_txn_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="macro transaction semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_certificate_format_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_certificate_format_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "certificate-format semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "certificate-format telemetry",
+        ),
+        export_path=artifact(
+            args.export,
+            "certificate-format positive export",
+        ),
+        corrupt_export_path=artifact(
+            args.corrupt_export,
+            "certificate-format corrupt export",
+        ),
+        process_artifacts={
+            "codec_metadata": artifact(
+                args.codec_metadata,
+                "certificate-format codec metadata",
+            ),
+            "codec_stdout": artifact(
+                args.codec_stdout,
+                "certificate-format codec stdout",
+            ),
+            "failure_metadata": artifact(
+                args.failure_metadata,
+                "certificate-format failure metadata",
+            ),
+            "failure_stderr": artifact(
+                args.failure_stderr,
+                "certificate-format failure stderr",
+            ),
+            "positive_metadata": artifact(
+                args.positive_metadata,
+                "certificate-format positive metadata",
+            ),
+            "positive_stdout": artifact(
+                args.positive_stdout,
+                "certificate-format positive stdout",
+            ),
+            "recovery_metadata": artifact(
+                args.recovery_metadata,
+                "certificate-format recovery metadata",
+            ),
+            "recovery_stdout": artifact(
+                args.recovery_stdout,
+                "certificate-format recovery stdout",
+            ),
+        },
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "certificate-format semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_cartridge_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_cartridge_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "cartridge semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "cartridge telemetry",
+        ),
+        archive_path=artifact(
+            args.archive,
+            "cartridge positive archive",
+        ),
+        corrupt_archive_path=artifact(
+            args.corrupt_archive,
+            "cartridge corrupt archive",
+        ),
+        export_path=artifact(
+            args.export,
+            "cartridge positive export",
+        ),
+        positive_extract_path=artifact(
+            args.positive_extract,
+            "cartridge positive extraction",
+        ),
+        failure_extract_path=artifact(
+            args.failure_extract,
+            "cartridge failed extraction",
+        ),
+        recovery_extract_path=artifact(
+            args.recovery_extract,
+            "cartridge recovery extraction",
+        ),
+        process_artifacts={
+            "build_metadata": artifact(
+                args.build_metadata,
+                "cartridge build metadata",
+            ),
+            "build_stdout": artifact(
+                args.build_stdout,
+                "cartridge build stdout",
+            ),
+            "checker_metadata": artifact(
+                args.checker_metadata,
+                "cartridge checker metadata",
+            ),
+            "checker_stdout": artifact(
+                args.checker_stdout,
+                "cartridge checker stdout",
+            ),
+            "codec_metadata": artifact(
+                args.codec_metadata,
+                "cartridge codec metadata",
+            ),
+            "codec_stdout": artifact(
+                args.codec_stdout,
+                "cartridge codec stdout",
+            ),
+            "failure_metadata": artifact(
+                args.failure_metadata,
+                "cartridge failure metadata",
+            ),
+            "failure_stderr": artifact(
+                args.failure_stderr,
+                "cartridge failure stderr",
+            ),
+            "population_metadata": artifact(
+                args.population_metadata,
+                "cartridge population metadata",
+            ),
+            "population_stdout": artifact(
+                args.population_stdout,
+                "cartridge population stdout",
+            ),
+            "positive_extract_metadata": artifact(
+                args.positive_extract_metadata,
+                "cartridge positive extraction metadata",
+            ),
+            "positive_extract_stdout": artifact(
+                args.positive_extract_stdout,
+                "cartridge positive extraction stdout",
+            ),
+            "positive_metadata": artifact(
+                args.positive_metadata,
+                "cartridge positive metadata",
+            ),
+            "positive_stdout": artifact(
+                args.positive_stdout,
+                "cartridge positive stdout",
+            ),
+            "recovery_extract_metadata": artifact(
+                args.recovery_extract_metadata,
+                "cartridge recovery extraction metadata",
+            ),
+            "recovery_extract_stdout": artifact(
+                args.recovery_extract_stdout,
+                "cartridge recovery extraction stdout",
+            ),
+            "recovery_metadata": artifact(
+                args.recovery_metadata,
+                "cartridge recovery metadata",
+            ),
+            "recovery_stdout": artifact(
+                args.recovery_stdout,
+                "cartridge recovery stdout",
+            ),
+        },
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "cartridge semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_bignum_no_mock(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+
+    def artifact(argument: str, label: str) -> Path:
+        return require_within(Path(argument), artifact_root, label=label)
+
+    report = validate_bignum_no_mock_evidence(
+        expected_run_id=args.expected_run_id,
+        semantic_path=artifact(
+            args.semantic,
+            "bignum semantic evidence",
+        ),
+        telemetry_path=artifact(
+            args.telemetry,
+            "bignum telemetry",
+        ),
+        inner_log_path=artifact(
+            args.inner_log,
+            "bignum retained inner run",
+        ),
+        inner_root=artifact(
+            args.inner_root,
+            "bignum retained inner root",
+        ),
+        lane_metadata_path=artifact(
+            args.lane_metadata,
+            "bignum lane supervisor metadata",
+        ),
+        artifact_root=artifact_root,
+    )
+    if args.output:
+        output = artifact(
+            args.output,
+            "bignum semantic validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_environment_resource_collision(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label="environment-resource-collision log"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file),
+        artifact_root,
+        label="environment-resource-collision stderr",
+    )
+    report = validate_environment_resource_collision(
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+        expected_cwd=args.expected_cwd,
+        expected_argv=args.expected_argv,
+        expected_cache_state=args.expected_cache_state,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="environment-resource-collision validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_environment_identity(
+    args: argparse.Namespace,
+    validator: Callable[..., dict[str, Any]],
+    *,
+    label: str,
+) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label=f"{label} stdout"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file), artifact_root, label=f"{label} stderr"
+    )
+    report = validator(
+        stdout_path,
+        stderr_path,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output), artifact_root, label=f"{label} validation"
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_declaration_tag_matrix(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_tag_matrix,
+        label="declaration-tag-matrix",
+    )
+
+
+def cmd_validate_declaration_membership(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_membership,
+        label="declaration-membership",
+    )
+
+
+def cmd_validate_extension_descriptor_matrix(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_extension_descriptor_matrix,
+        label="extension-descriptor-matrix",
+    )
+
+
+def cmd_validate_environment_state(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_environment_state,
+        label="environment-state",
+    )
+
+
+def cmd_validate_declaration_admission(args: argparse.Namespace) -> int:
+    return cmd_validate_environment_identity(
+        args,
+        validate_declaration_admission,
+        label="declaration-admission",
+    )
 
 
 def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
@@ -7362,6 +20818,11 @@ def cmd_validate_supervisor(args: argparse.Namespace) -> int:
 
 def cmd_hash_tree(args: argparse.Namespace) -> int:
     inventory_path = Path(args.inventory) if args.inventory else None
+    if args.test_mutate_input:
+        global _TEST_MUTATE_DURING_READ
+        _TEST_MUTATE_DURING_READ = lexical_absolute(
+            Path(args.root) / args.test_mutate_input
+        )
     root = tree_hash(
         Path(args.root),
         args.path,
@@ -7392,18 +20853,295 @@ def cmd_vendor_binding(args: argparse.Namespace) -> int:
     return PASS
 
 
+UNSAFE_NOTE_SITE_SCHEMA = "fln-unsafe-note-clippy-sites/1"
+UNSAFE_NOTE_LINT = "clippy::undocumented_unsafe_blocks"
+UNSAFE_NOTE_MAX_REPORT_BYTES = 64 * 1024 * 1024
+UNSAFE_NOTE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+UNSAFE_NOTE_MAX_REPORT_LINES = 100_000
+UNSAFE_NOTE_CONTEXT_LINES = 6
+UNSAFE_NOTE_MISMATCH = 101
+
+
+def render_unsafe_note_sites(rows: Iterable[tuple[str, str, str]]) -> bytes:
+    ordered = sorted(rows)
+    lines = [
+        f"schema {UNSAFE_NOTE_SITE_SCHEMA}",
+        f"lint {UNSAFE_NOTE_LINT}",
+        "columns\tpath\tfunction\tcontext_sha256",
+    ]
+    lines.extend(
+        f"site\t{path}\t{function}\t{digest}"
+        for path, function, digest in ordered
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def parse_unsafe_note_sites(path: Path) -> set[tuple[str, str, str]]:
+    data, _size, _digest = stable_file_facts(
+        path, max_bytes=UNSAFE_NOTE_MAX_REPORT_BYTES
+    )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{path}: unsafe-note site list is not UTF-8") from error
+    lines = text.splitlines()
+    expected_header = [
+        f"schema {UNSAFE_NOTE_SITE_SCHEMA}",
+        f"lint {UNSAFE_NOTE_LINT}",
+        "columns\tpath\tfunction\tcontext_sha256",
+    ]
+    if lines[:3] != expected_header:
+        raise EvidenceError(f"{path}: unsafe-note site-list header is invalid")
+    rows: set[tuple[str, str, str]] = set()
+    for index, line in enumerate(lines[3:], start=4):
+        columns = line.split("\t")
+        if len(columns) != 4 or columns[0] != "site":
+            raise EvidenceError(f"{path}:{index}: malformed unsafe-note site row")
+        relative, function, digest = columns[1:]
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not relative.startswith("crates/fln-unsafe-")
+            or not relative.endswith(".rs")
+        ):
+            raise EvidenceError(f"{path}:{index}: invalid unsafe-note source path")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", function) is None:
+            raise EvidenceError(f"{path}:{index}: invalid enclosing function")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise EvidenceError(f"{path}:{index}: invalid context digest")
+        row = (relative, function, digest)
+        if row in rows:
+            raise EvidenceError(f"{path}:{index}: duplicate unsafe-note site row")
+        rows.add(row)
+    if render_unsafe_note_sites(rows) != data:
+        raise EvidenceError(f"{path}: unsafe-note site list is not canonical")
+    return rows
+
+
+def extract_unsafe_note_sites(
+    root: Path, report_path: Path
+) -> set[tuple[str, str, str]]:
+    root = root.resolve(strict=True)
+    report, _size, _digest = stable_file_facts(
+        report_path, max_bytes=UNSAFE_NOTE_MAX_REPORT_BYTES
+    )
+    try:
+        report_text = report.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"{report_path}: Clippy report is not UTF-8") from error
+    report_lines = report_text.splitlines()
+    if len(report_lines) > UNSAFE_NOTE_MAX_REPORT_LINES:
+        raise EvidenceError(
+            f"{report_path}: Clippy report exceeds "
+            f"{UNSAFE_NOTE_MAX_REPORT_LINES} records"
+        )
+
+    diagnostic_spans: set[tuple[str, int, int]] = set()
+    rows: set[tuple[str, str, str]] = set()
+    function_pattern = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for index, line in enumerate(report_lines, start=1):
+        if len(line.encode("utf-8")) > MAX_RECORD_BYTES:
+            raise EvidenceError(f"{report_path}:{index}: JSON record is too large")
+        record = parse_json(line.encode("utf-8"), subject=f"{report_path}:{index}")
+        if not isinstance(record, dict):
+            raise EvidenceError(f"{report_path}:{index}: JSON record is not an object")
+        if record.get("reason") != "compiler-message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            raise EvidenceError(
+                f"{report_path}:{index}: compiler-message payload is not an object"
+            )
+        code = message.get("code")
+        if not isinstance(code, dict) or code.get("code") != UNSAFE_NOTE_LINT:
+            continue
+        primary = [
+            span
+            for span in message.get("spans", [])
+            if isinstance(span, dict) and span.get("is_primary") is True
+        ]
+        if len(primary) != 1:
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note diagnostic needs one primary span"
+            )
+        span = primary[0]
+        relative = span.get("file_name")
+        byte_start = span.get("byte_start")
+        byte_end = span.get("byte_end")
+        if (
+            not isinstance(relative, str)
+            or not isinstance(byte_start, int)
+            or not isinstance(byte_end, int)
+            or byte_start < 0
+            or byte_end <= byte_start
+        ):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span facts are invalid"
+            )
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or not relative.startswith("crates/fln-unsafe-")
+            or not relative.endswith(".rs")
+        ):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span escapes boundary crates"
+            )
+        span_key = (relative, byte_start, byte_end)
+        if span_key in diagnostic_spans:
+            continue
+        diagnostic_spans.add(span_key)
+
+        source_path = require_within(
+            root / relative_path, root, label="unsafe-note Clippy source"
+        )
+        source, _source_size, _source_digest = stable_file_facts(
+            source_path, max_bytes=UNSAFE_NOTE_MAX_SOURCE_BYTES
+        )
+        if byte_end > len(source):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span exceeds {relative}"
+            )
+        try:
+            source_text = source.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvidenceError(f"{relative}: Rust source is not UTF-8") from error
+        line_index = source[:byte_start].count(b"\n")
+        source_lines = source_text.splitlines()
+        if line_index >= len(source_lines):
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note span line is absent"
+            )
+        function = None
+        for source_line in reversed(source_lines[: line_index + 1]):
+            match = function_pattern.search(source_line)
+            if match is not None:
+                function = match.group(1)
+                break
+        if function is None:
+            raise EvidenceError(
+                f"{report_path}:{index}: unsafe-note site has no enclosing function"
+            )
+        context = "\n".join(
+            source_line.strip()
+            for source_line in source_lines[
+                line_index : line_index + UNSAFE_NOTE_CONTEXT_LINES
+            ]
+        ).encode("utf-8")
+        context_digest = f"sha256:{hashlib.sha256(context).hexdigest()}"
+        row = (relative, function, context_digest)
+        if row in rows:
+            raise EvidenceError(
+                f"{report_path}:{index}: line-independent unsafe-note identity collided"
+            )
+        rows.add(row)
+    return rows
+
+
+def cmd_unsafe_note_clippy_sites(args: argparse.Namespace) -> int:
+    operation = args.operation
+    artifact_root = Path(args.artifact_root) if args.artifact_root else None
+    if operation == "extract":
+        if not args.root or not args.report or not args.output or artifact_root is None:
+            raise EvidenceError(
+                "unsafe-note extract requires --root, --report, --output, "
+                "and --artifact-root"
+            )
+        rows = extract_unsafe_note_sites(Path(args.root), Path(args.report))
+        output = require_within(
+            Path(args.output), artifact_root, label="unsafe-note observed sites"
+        )
+        write_new(output, render_unsafe_note_sites(rows))
+        print(f"unsafe-note clippy extract: {len(rows)} unique sites")
+        return PASS
+
+    if operation == "compare":
+        if not args.declared or not args.observed:
+            raise EvidenceError(
+                "unsafe-note compare requires --declared and --observed"
+            )
+        declared = parse_unsafe_note_sites(Path(args.declared))
+        observed = parse_unsafe_note_sites(Path(args.observed))
+        unexpected = sorted(observed - declared)
+        stale = sorted(declared - observed)
+        for row in unexpected:
+            print(
+                "undeclared clippy site: " + "\t".join(row),
+                file=sys.stderr,
+            )
+        for row in stale:
+            print(
+                "stale declared clippy site: " + "\t".join(row),
+                file=sys.stderr,
+            )
+        if unexpected or stale:
+            return UNSAFE_NOTE_MISMATCH
+        print(f"unsafe-note clippy match: {len(observed)} sites")
+        return PASS
+
+    if operation in {"drop-first", "add-observed", "add-stale"}:
+        if not args.declared or not args.output or artifact_root is None:
+            raise EvidenceError(
+                f"unsafe-note {operation} requires --declared, --output, "
+                "and --artifact-root"
+            )
+        rows = parse_unsafe_note_sites(Path(args.declared))
+        if operation == "drop-first":
+            if not rows:
+                raise EvidenceError("cannot drop a site from an empty declaration")
+            removed = sorted(rows)[0]
+            rows.remove(removed)
+            detail = "dropped " + "\t".join(removed)
+        elif operation == "add-observed":
+            planted = (
+                "crates/fln-unsafe-abi/src/__planted_undeclared__.rs",
+                "planted_undeclared_site",
+                "sha256:" + ("f" * 64),
+            )
+            if planted in rows:
+                raise EvidenceError("planted undeclared unsafe-note site already exists")
+            rows.add(planted)
+            detail = "added " + "\t".join(planted)
+        else:
+            planted = (
+                "crates/fln-unsafe-abi/src/__planted_stale__.rs",
+                "planted_stale_site",
+                "sha256:" + ("0" * 64),
+            )
+            if planted in rows:
+                raise EvidenceError("planted stale unsafe-note site already exists")
+            rows.add(planted)
+            detail = "added " + "\t".join(planted)
+        output = require_within(
+            Path(args.output), artifact_root, label="unsafe-note mutant declaration"
+        )
+        write_new(output, render_unsafe_note_sites(rows))
+        print(f"unsafe-note clippy mutant: {detail}")
+        return PASS
+
+    raise EvidenceError(f"unknown unsafe-note operation: {operation}")
+
+
 def cmd_ubs_inventory(args: argparse.Namespace) -> int:
     root = Path(args.root)
     inventory = collect_ubs_inventory(root, args.scope)
     output = Path(args.output)
     require_within(output, Path(args.artifact_root), label="UBS inventory")
     write_new(output, canonical_json(inventory))
-    validate_ubs_inventory(output, root)
+    validate_ubs_inventory(output, root, require_live_scope=True)
     return PASS
 
 
 def cmd_validate_ubs_inventory(args: argparse.Namespace) -> int:
-    report = validate_ubs_inventory(Path(args.inventory), Path(args.root))
+    report = validate_ubs_inventory(
+        Path(args.inventory),
+        Path(args.root),
+        require_live_scope=args.require_live_scope,
+    )
     sys.stdout.buffer.write(canonical_json(report))
     return PASS
 
@@ -7420,6 +21158,7 @@ def cmd_exec_ubs_inventory(args: argparse.Namespace) -> int:
     raise EvidenceError("inventory execution unexpectedly returned")
 
 
+# ubs:ignore — fixed exec subcommand name; this definition executes nothing.
 def cmd_stopped_exec(args: argparse.Namespace) -> int:
     command = list(args.command)
     if command and command[0] == "--":
@@ -7666,6 +21405,10 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 
 
 def cmd_complete_bundle(args: argparse.Namespace) -> int:
+    if bool(args.test_marker_pause_ready) != bool(args.test_marker_pause_release):
+        raise EvidenceError(
+            "marker-link pause requires both its readiness and release paths"
+        )
     complete_bundle(
         Path(args.art_dir),
         Path(args.manifest),
@@ -7678,6 +21421,11 @@ def cmd_complete_bundle(args: argparse.Namespace) -> int:
         vendor_path=args.vendor_path,
         restore_signal_state=False,
         test_fail_after_link=args.test_fail_after_link,
+        test_marker_pause=(
+            (Path(args.test_marker_pause_ready), Path(args.test_marker_pause_release))
+            if args.test_marker_pause_ready
+            else None
+        ),
     )
     return PASS
 
@@ -7709,6 +21457,93 @@ def cmd_validate_bundle(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_promote_verification_receipt(args: argparse.Namespace) -> int:
+    receipt = promote_verification_receipt(
+        Path(args.art_dir),
+        Path(args.manifest),
+        Path(args.digest),
+        Path(args.commit),
+        legacy_producing_commit=args.legacy_producing_commit,
+        legacy_governed_scope=args.legacy_governed_scope,
+    )
+    sys.stdout.buffer.write(canonical_json(receipt))
+    return PASS
+
+
+def cmd_publish_partial_bundle(args: argparse.Namespace) -> int:
+    argv_value = parse_json(
+        args.argv_json.encode("utf-8"), subject="partial bundle argv"
+    )
+    if not isinstance(argv_value, list) or not all(
+        isinstance(item, str) for item in argv_value
+    ):
+        raise EvidenceError("partial bundle argv must be a JSON string array")
+    publish_partial_bundle(
+        Path(args.art_dir),
+        run_id=args.run_id,
+        bead=args.bead,
+        scenario=args.scenario,
+        step=args.step,
+        reason=args.reason,
+        classification=args.classification,
+        argv=argv_value,
+        cwd=args.cwd,
+        restore_signal_state=False,
+    )
+    return PASS
+
+
+def cmd_validate_partial_bundle(args: argparse.Namespace) -> int:
+    report = validate_partial_bundle(Path(args.art_dir))
+    if args.output:
+        output = lexical_absolute(Path(args.output))
+        art_dir = lexical_absolute(Path(args.art_dir))
+        try:
+            output.relative_to(art_dir)
+        except ValueError:
+            pass
+        else:
+            raise EvidenceError(
+                "partial validation output cannot mutate the published bundle"
+            )
+        require_within(
+            Path(args.output),
+            Path(args.artifact_root),
+            label="partial bundle validation",
+        )
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_adopt_bundle(args: argparse.Namespace) -> int:
+    report = adopt_bundle(
+        Path(args.art_dir),
+        Path(args.manifest),
+        Path(args.digest),
+        Path(args.commit),
+    )
+    if args.output:
+        output = lexical_absolute(Path(args.output))
+        art_dir = lexical_absolute(Path(args.art_dir))
+        try:
+            output.relative_to(art_dir)
+        except ValueError:
+            pass
+        else:
+            raise EvidenceError(
+                "bundle adoption output cannot mutate the committed bundle"
+            )
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="bundle adoption"
+        )
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def read_json_object(path: Path) -> dict[str, Any]:
     data, _size, _digest = stable_file_facts(path, max_bytes=MAX_LOG_BYTES)
     value = parse_json(data, subject=str(path))
@@ -7722,6 +21557,1153 @@ def require(condition: bool, detail: str) -> None:
         raise EvidenceError(detail)
 
 
+def run_sealed_supervisor_case(
+    *,
+    stem: str,
+    sealed_root: Path,
+    env_overrides: Mapping[str, str],
+    cwd: Path,
+    suite_lock: Path,
+    expected_reason: str,
+    expected_class: str,
+    expected_exit: int,
+    target_argv: Sequence[str] = ("cargo", "-V"),
+) -> dict[str, Any]:
+    """Run one real sealed-cargo supervisor cell and validate its envelope."""
+    base_env = {
+        "PATH": SEALED_PATH_TAIL,
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+    base_env.update(env_overrides)
+    invocation = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve()),
+            "run",
+            "--cwd",
+            str(cwd),
+            "--metadata",
+            str(sealed_root / f"{stem}.meta.json"),
+            "--stdout",
+            str(sealed_root / f"{stem}.out"),
+            "--stderr",
+            str(sealed_root / f"{stem}.err"),
+            "--readiness",
+            str(sealed_root / f"{stem}.ready.json"),
+            "--artifact-root",
+            str(sealed_root),
+            "--capture-bytes",
+            "65536",
+            "--output-budget-bytes",
+            "1048576",
+            "--timeout-ms",
+            "120000",
+            "--grace-ms",
+            "2000",
+            "--stage-id",
+            stem,
+            "--sealed-cargo",
+            "--suite-lock",
+            str(suite_lock),
+            "--sealed-build-root",
+            str(sealed_root / "build"),
+            "--",
+            *target_argv,
+        ],
+        capture_output=True,
+        env=base_env,
+        timeout=180,
+        check=False,
+    )
+    require(
+        invocation.returncode == expected_exit,
+        f"sealed case {stem}: exit {invocation.returncode}, "
+        f"expected {expected_exit}: {invocation.stderr!r}",
+    )
+    metadata = sealed_root / f"{stem}.meta.json"
+    envelope = read_json_object(metadata)
+    validate_supervisor_object(metadata, 1, envelope, expected_stage_id=stem)
+    require(
+        envelope["classification"] == expected_class
+        and envelope["reason_code"] == expected_reason,
+        f"sealed case {stem}: {envelope['classification']}/"
+        f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
+    )
+    return envelope
+
+
+def run_fmt_component_admission_self_test(root: Path) -> dict[str, Any]:
+    """Exercise U4J7 before the broader self-test reaches recursive gate probes."""
+    repo = Path(__file__).resolve().parent.parent
+    work = root / "work"
+    work.mkdir()
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (work / pin_name).write_bytes((repo / pin_name).read_bytes())
+    lock_rows = parse_rust_lock(work / "SUITE.lock")
+    toolchain = resolve_sealed_toolchain(lock_rows)
+    triple = SEALED_HOST_TRIPLES[platform.machine()]
+    component_home = root / "component-rustup-home"
+    component_bin = (
+        component_home
+        / "toolchains"
+        / f"{lock_rows['rust-nightly']}-{triple}"
+        / "bin"
+    )
+    component_bin.mkdir(parents=True)
+    # The enclosing quality-gate bundle rejects every symlink, including test
+    # fixtures. Regular-file launchers preserve that law while executing the
+    # already identity-checked pinned binaries from their real toolchain root;
+    # copying or hard-linking rustc here would change its path-based sysroot
+    # lookup and turn the intended component-absence cell into an identity
+    # mismatch.
+    for executable in ("rustc", "cargo"):
+        source = Path(toolchain[f"{executable}_path"])
+        target = component_bin / executable
+        write_new(
+            target,
+            (f'#!/bin/sh\nexec {shlex.quote(str(source))} "$@"\n').encode(),
+        )
+        target.chmod(0o755)
+    component_marker = component_bin / "RUSTFMT-EXECUTED"
+    missing = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_absent",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=work,
+        suite_lock=work / "SUITE.lock",
+        expected_reason="sealed_compiler_component_absent",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        missing["phase_timing"]["execution_start_ns"] is None
+        and not component_marker.exists(),
+        "a cargo fmt target executed after its pinned rustfmt component was refused",
+    )
+    undeclared_work = root / "undeclared-work"
+    undeclared_work.mkdir()
+    (undeclared_work / "SUITE.lock").write_bytes((work / "SUITE.lock").read_bytes())
+    manifest = (work / "rust-toolchain.toml").read_text()
+    undeclared_manifest = manifest.replace('"rustfmt", ', "")
+    require(
+        undeclared_manifest != manifest,
+        "the rustfmt declaration needle moved before the undeclared-component cell",
+    )
+    (undeclared_work / "rust-toolchain.toml").write_text(undeclared_manifest)
+    undeclared = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_undeclared",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=undeclared_work,
+        suite_lock=undeclared_work / "SUITE.lock",
+        expected_reason="sealed_compiler_component_undeclared",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        undeclared["phase_timing"]["execution_start_ns"] is None,
+        "cargo fmt executed after rustfmt disappeared from the pin",
+    )
+    malformed_work = root / "malformed-work"
+    malformed_work.mkdir()
+    (malformed_work / "SUITE.lock").write_bytes((work / "SUITE.lock").read_bytes())
+    malformed_manifest = manifest.replace("components =", "components_disabled =")
+    require(
+        malformed_manifest != manifest,
+        "the components declaration needle moved before the malformed-manifest cell",
+    )
+    (malformed_work / "rust-toolchain.toml").write_text(malformed_manifest)
+    malformed = run_sealed_supervisor_case(
+        stem="sealed_fmt_components_unreadable",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=malformed_work,
+        suite_lock=malformed_work / "SUITE.lock",
+        expected_reason="sealed_compiler_components_unreadable",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        malformed["phase_timing"]["execution_start_ns"] is None,
+        "cargo fmt executed after its component declaration became unreadable",
+    )
+    fake_rustfmt = component_bin / "rustfmt"
+    fake_rustfmt.write_text(
+        "#!/bin/sh\n"
+        "printf 'rustfmt u4j7-control\\n'\n"
+    )
+    fake_rustfmt.chmod(0o755)
+    fake_cargo_fmt = component_bin / "cargo-fmt"
+    fake_cargo_fmt.write_text(
+        "#!/bin/sh\n"
+        "printf 'executed\\n' > \"${0%/*}/RUSTFMT-EXECUTED\"\n"
+        "printf 'cargo-fmt u4j7-control\\n'\n"
+    )
+    fake_cargo_fmt.chmod(0o755)
+    recovery = run_sealed_supervisor_case(
+        stem="sealed_fmt_component_recovery",
+        sealed_root=root,
+        env_overrides={"RUSTUP_HOME": str(component_home)},
+        cwd=work,
+        suite_lock=work / "SUITE.lock",
+        expected_reason="exit_zero",
+        expected_class="pass",
+        expected_exit=PASS,
+        target_argv=("cargo", "fmt", "--version"),
+    )
+    require(
+        recovery["phase_timing"]["execution_start_ns"] is not None
+        and component_marker.read_text() == "executed\n",
+        "restoring the pinned rustfmt executable did not admit and execute cargo fmt",
+    )
+
+    def reject_component_metadata_mutation(
+        label: str,
+        source: dict[str, Any],
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> None:
+        candidate = parse_json(
+            canonical_json(source),
+            subject=f"fmt component metadata mutation {label}",
+        )
+        if not isinstance(candidate, dict):
+            raise EvidenceError("fmt component mutation source is not an object")
+        mutate(candidate)
+        try:
+            validate_supervisor_object(
+                root / f"{source['stage_id']}.meta.json",
+                1,
+                candidate,
+                expected_stage_id=source["stage_id"],
+            )
+        except EvidenceError:
+            return
+        raise EvidenceError(
+            f"fmt component validator accepted metadata mutation: {label}"
+        )
+
+    reject_component_metadata_mutation(
+        "undeclared-but-listed",
+        undeclared,
+        lambda candidate: candidate["sealed_compiler"][
+            "declared_components"
+        ].insert(0, "rustfmt"),
+    )
+    reject_component_metadata_mutation(
+        "absent-but-not-declared",
+        missing,
+        lambda candidate: candidate["sealed_compiler"][
+            "declared_components"
+        ].remove("rustfmt"),
+    )
+    reject_component_metadata_mutation(
+        "executable-order",
+        recovery,
+        lambda candidate: candidate["sealed_compiler"].__setitem__(
+            "required_component_executables", ["rustfmt", "cargo-fmt"]
+        ),
+    )
+    reject_component_metadata_mutation(
+        "executable-path",
+        recovery,
+        lambda candidate: candidate["sealed_compiler"][
+            "required_executable_paths"
+        ].__setitem__(0, "/tmp/not-cargo-fmt"),
+    )
+    return {
+        "case": "sealed_fmt_component_admission",
+        "ok": True,
+        "absence": "sealed_compiler_component_absent",
+        "undeclared": "sealed_compiler_component_undeclared",
+        "unreadable": "sealed_compiler_components_unreadable",
+        "recovery": "exit_zero",
+        "validator_mutants": 4,
+    }
+
+
+def run_macro_txn_validator_self_test(root: Path) -> dict[str, Any]:
+    initial_root = "1" * 64
+    semantic_root = "2" * 64
+    quotation_root = "3" * 64
+    records = [
+        {
+            "cacheability": "cacheable",
+            "capability_event_count": 1,
+            "diagnostic_codes": ["nested-visible", "committed"],
+            "effect_count": 4,
+            "final_state": semantic_root,
+            "initial_state": initial_root,
+            "published": True,
+            "read_count": 9,
+            "scenario": "positive",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 0,
+            "state_unchanged_before_publish": True,
+            "status": "complete",
+            "value": "expanded:old:false",
+        },
+        {
+            "cached_equals_fresh": True,
+            "cached_final_state": semantic_root,
+            "collision_lookup": "collision_miss",
+            "exact_lookup": "hit",
+            "fresh_final_state": semantic_root,
+            "published": True,
+            "scenario": "memoization",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 1,
+            "stale_file": "stale_read_miss",
+            "stale_iteration": "stale_read_miss",
+            "stale_negative": "stale_read_miss",
+            "stale_option": "stale_read_miss",
+        },
+        {
+            "faithful_clock_cacheability": "uncacheable",
+            "published": False,
+            "scenario": "opaque_reads",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "sound_clock_outcome": "rejected",
+            "unknown_cacheability": "uncacheable",
+            "unknown_memo_admission": "refused",
+        },
+        {
+            "capability_event": "clock_denied_sound",
+            "diagnostic_codes": ["failure-visible"],
+            "error": "capability_denied_clock_sound",
+            "published": False,
+            "scenario": "failure",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "state_unchanged": True,
+            "status": "rejected",
+        },
+        {
+            "published": False,
+            "scenario": "cancellation",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 4,
+            "state_unchanged": True,
+            "status": "inconclusive",
+        },
+        {
+            "published": False,
+            "scenario": "resource",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 5,
+            "state_unchanged": True,
+            "status": "inconclusive",
+        },
+        {
+            "published": False,
+            "scenario": "internal_fault",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 6,
+            "state_unchanged": True,
+            "status": "internal_fault",
+        },
+        {
+            "final_state": semantic_root,
+            "matches_positive": True,
+            "published": True,
+            "scenario": "recovery",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 7,
+            "status": "complete",
+            "value": "expanded:old:false",
+        },
+        {
+            "failure_status": "rejected",
+            "positive_root": quotation_root,
+            "positive_status": "complete",
+            "recovery_root": quotation_root,
+            "recovery_status": "complete",
+            "scenario": "quotation_seam",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "sequence": 8,
+            "state_unchanged_before_publication": True,
+        },
+        {
+            "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+            "published": True,
+            "scenario": "thread_matrix",
+            "schema": MACRO_TXN_SEMANTIC_SCHEMA,
+            "semantic_root": semantic_root,
+            "sequence": 9,
+            "status": "complete",
+            "thread_counts": MACRO_TXN_THREAD_COUNTS,
+        },
+    ]
+    telemetry = {
+        "observed_semantic_rows": len(records),
+        "positive_operations": 17,
+        "productive_runs": MACRO_TXN_PRODUCTIVE_RUNS,
+        "run_id": "macro-txn-validator-self-test",
+        "schema": MACRO_TXN_TELEMETRY_SCHEMA,
+        "thread_counts": MACRO_TXN_THREAD_COUNTS,
+    }
+
+    def write_records(
+        path: Path, values: Sequence[Mapping[str, Any]]
+    ) -> None:
+        write_new(path, b"".join(canonical_json(value) for value in values))
+
+    semantic_path = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic_path, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_macro_txn_no_mock_evidence(
+        expected_run_id="macro-txn-validator-self-test",
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+    )
+    require(
+        report["verdict"] == "pass"  # ubs:ignore — public validator verdict.
+        and report["productive_runs"] == MACRO_TXN_PRODUCTIVE_RUNS,  # ubs:ignore — public run count.
+        "macro transaction positive validator control failed",
+    )
+
+    mutants_killed = 0
+
+    def cloned_records() -> list[dict[str, Any]]:
+        candidate = parse_json(
+            canonical_json(records),
+            subject="macro transaction self-test records",
+        )
+        if not isinstance(candidate, list) or not all(
+            isinstance(record, dict) for record in candidate
+        ):
+            raise EvidenceError(
+                "macro transaction self-test clone is malformed"
+            )
+        return candidate
+
+    def expect_semantic_rejection(
+        label: str,
+        mutate: Callable[[list[dict[str, Any]]], None],
+    ) -> None:
+        nonlocal mutants_killed
+        candidate = cloned_records()
+        mutate(candidate)
+        candidate_path = root / f"{label}.semantic.ndjson"
+        write_records(candidate_path, candidate)
+        try:
+            validate_macro_txn_no_mock_evidence(
+                expected_run_id="macro-txn-validator-self-test",
+                semantic_path=candidate_path,
+                telemetry_path=telemetry_path,
+            )
+        except EvidenceError:
+            mutants_killed += 1
+            return
+        raise EvidenceError(
+            f"macro transaction validator accepted {label} mutation"
+        )
+
+    expect_semantic_rejection("scenario_omission", lambda value: value.pop())
+    expect_semantic_rejection(
+        "collision_cross_hit",
+        lambda value: value[1].__setitem__("collision_lookup", "hit"),
+    )
+    expect_semantic_rejection(
+        "resource_as_rejection",
+        lambda value: value[5].__setitem__("status", "rejected"),
+    )
+    expect_semantic_rejection(
+        "internal_fault_publication",
+        lambda value: value[6].__setitem__("published", True),
+    )
+    expect_semantic_rejection(
+        "recovery_root_drift",
+        lambda value: value[7].__setitem__("final_state", "4" * 64),
+    )
+    expect_semantic_rejection(
+        "semantic_telemetry_leak",
+        lambda value: value[0].__setitem__(
+            "run_id", "macro-txn-validator-self-test"
+        ),
+    )
+    expect_semantic_rejection(
+        "thread_root_drift",
+        lambda value: value[9].__setitem__("semantic_root", "5" * 64),
+    )
+
+    noncanonical_path = root / "noncanonical.semantic.ndjson"
+    write_new(
+        noncanonical_path,
+        b"".join(
+            b" " + canonical_json(record)
+            if index == 0
+            else canonical_json(record)
+            for index, record in enumerate(records)
+        ),
+    )
+    try:
+        validate_macro_txn_no_mock_evidence(
+            expected_run_id="macro-txn-validator-self-test",
+            semantic_path=noncanonical_path,
+            telemetry_path=telemetry_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "macro transaction validator accepted noncanonical NDJSON"
+        )
+
+    telemetry_mutant = dict(telemetry)
+    telemetry_mutant["positive_operations"] = 16
+    telemetry_mutant_path = root / "operation.telemetry.ndjson"
+    write_new(telemetry_mutant_path, canonical_json(telemetry_mutant))
+    try:
+        validate_macro_txn_no_mock_evidence(
+            expected_run_id="macro-txn-validator-self-test",
+            semantic_path=semantic_path,
+            telemetry_path=telemetry_mutant_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "macro transaction validator accepted telemetry operation drift"
+        )
+
+    return {
+        "case": "macro_txn_validator",
+        "mutants_killed": mutants_killed,
+        "ok": True,
+        "positive_cases": len(records),
+    }
+
+
+def run_certificate_format_validator_self_test(
+    root: Path,
+) -> dict[str, Any]:
+    export_rows: list[dict[str, Any]] = [
+        {
+            "meta": {
+                "exporter": {
+                    "name": "lean4export",
+                    "version": CERTIFICATE_FORMAT_EXPORT_VERSION,
+                },
+                "format": {"version": CERTIFICATE_FORMAT_EXPORT_VERSION},
+                "lean": {
+                    "githash": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+                    "version": "4.32.0",
+                },
+            }
+        }
+    ]
+    for name_id in range(1, 40):
+        leaf = (
+            "certificate_witness_add_zero"
+            if name_id == 39
+            else f"declaration_{name_id}"
+        )
+        export_rows.append({"in": name_id, "str": {"pre": 0, "str": leaf}})
+    for name_id in range(1, 39):
+        export_rows.append(
+            {
+                "axiom": {
+                    "all": [name_id],
+                    "isUnsafe": False,
+                    "levelParams": [],
+                    "name": name_id,
+                    "type": 0,
+                }
+            }
+        )
+    expression_rows = CERTIFICATE_FORMAT_EXPORT_ROWS - len(export_rows) - 1
+    for expr_id in range(expression_rows):
+        export_rows.append({"bvar": 0, "ie": expr_id})
+    export_rows.append(
+        {
+            "thm": {
+                "all": [39],
+                "levelParams": [],
+                "name": 39,
+                "type": 0,
+                "value": 0,
+            }
+        }
+    )
+    require(
+        len(export_rows) == CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "certificate-format self-test export row floor is inconsistent",
+    )
+
+    export_data = b"".join(canonical_json(row) for row in export_rows)
+    corrupt_data = export_data + b"not-json\n"
+    export_path = root / "positive.export.ndjson"
+    corrupt_export_path = root / "corrupt.export.ndjson"
+    write_new(export_path, export_data)
+    write_new(corrupt_export_path, corrupt_data)
+    export_digest = hashlib.sha256(export_data).hexdigest()
+    corrupt_digest = hashlib.sha256(corrupt_data).hexdigest()
+
+    records = [
+        {
+            "export_format": CERTIFICATE_FORMAT_EXPORT_VERSION,
+            "lean4export_revision": CERTIFICATE_FORMAT_LEAN4EXPORT_REVISION,
+            "nanoda_revision": CERTIFICATE_FORMAT_NANODA_REVISION,
+            "reference_revision": CERTIFICATE_FORMAT_REFERENCE_REVISION,
+            "reference_version": "v4.32.0",
+            "scenario": "pin_binding",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 0,
+        },
+        {
+            "authority": False,
+            "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+            "checker_exit": 0,
+            "export_rows": CERTIFICATE_FORMAT_EXPORT_ROWS,
+            "export_sha256": export_digest,
+            "published": False,
+            "scenario": "positive",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 1,
+            "status": "complete",
+        },
+        {
+            "authority": False,
+            "checker_exit": 1,
+            "corrupt_sha256": corrupt_digest,
+            "positive_sha256": export_digest,
+            "published": False,
+            "reason": "malformed_ndjson",
+            "scenario": "failure",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 2,
+            "status": "refused",
+        },
+        {
+            "authority": False,
+            "checked_declarations": CERTIFICATE_FORMAT_CHECKED_DECLARATIONS,
+            "checker_exit": 0,
+            "export_sha256": export_digest,
+            "matches_positive": True,
+            "published": False,
+            "scenario": "recovery",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 3,
+            "status": "complete",
+        },
+        {
+            "arbitrary_cases": 10_000,
+            "authority": False,
+            "named_tests": 19,
+            "productive_workers": 41,
+            "scenario": "codec",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 4,
+            "status": "complete",
+            "thread_counts": [1, 8, 32],
+        },
+        {
+            "actions": [
+                "recompute",
+                "recompute",
+                "quarantine_and_recompute_independently",
+            ],
+            "authority": False,
+            "published": False,
+            "scenario": "nonpublication",
+            "schema": CERTIFICATE_FORMAT_SEMANTIC_SCHEMA,
+            "sequence": 5,
+            "states": [
+                "cancelled",
+                "resource_limited",
+                "internal_fault",
+            ],
+            "status": "complete",
+        },
+    ]
+    telemetry = {
+        "artifact_bytes": {
+            "corrupt": len(corrupt_data),
+            "positive": len(export_data),
+        },
+        "durations_ns": {
+            "codec": 1,
+            "failure": 1,
+            "positive": 1,
+            "recovery": 1,
+        },
+        "host": {"machine": "self-test", "system": "self-test"},
+        "process_exits": {
+            "codec": 0,
+            "failure": 1,
+            "positive": 0,
+            "recovery": 0,
+        },
+        "run_id": "certificate-format-validator-self-test",
+        "schema": CERTIFICATE_FORMAT_TELEMETRY_SCHEMA,
+    }
+
+    def write_records(
+        path: Path,
+        values: Sequence[Mapping[str, Any]],
+    ) -> None:
+        write_new(path, b"".join(canonical_json(value) for value in values))
+
+    semantic_path = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic_path, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_certificate_format_no_mock_evidence(
+        expected_run_id="certificate-format-validator-self-test",
+        semantic_path=semantic_path,
+        telemetry_path=telemetry_path,
+        export_path=export_path,
+        corrupt_export_path=corrupt_export_path,
+    )
+    require(
+        report["verdict"] == "pass"
+        and report["export_rows"] == CERTIFICATE_FORMAT_EXPORT_ROWS,
+        "certificate-format positive validator control failed",
+    )
+
+    rejected_cells = 0
+    missing = [dict(row) for row in records]
+    missing[1].pop("authority")
+    missing_path = root / "missing-field.semantic.ndjson"
+    write_records(missing_path, missing)
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=missing_path,
+            telemetry_path=telemetry_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "certificate-format validator accepted a missing semantic field"
+        )
+
+    noncanonical_path = root / "noncanonical.semantic.ndjson"
+    write_new(
+        noncanonical_path,
+        b" "
+        + canonical_json(records[0])
+        + b"".join(canonical_json(row) for row in records[1:]),
+    )
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=noncanonical_path,
+            telemetry_path=telemetry_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("certificate-format validator accepted noncanonical NDJSON")
+
+    telemetry_drift = dict(telemetry)
+    telemetry_drift["process_exits"] = dict(telemetry["process_exits"])
+    telemetry_drift["process_exits"]["failure"] = 0
+    telemetry_drift_path = root / "drift.telemetry.ndjson"
+    write_new(telemetry_drift_path, canonical_json(telemetry_drift))
+    try:
+        validate_certificate_format_no_mock_evidence(
+            expected_run_id="certificate-format-validator-self-test",
+            semantic_path=semantic_path,
+            telemetry_path=telemetry_drift_path,
+            export_path=export_path,
+            corrupt_export_path=corrupt_export_path,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "certificate-format validator accepted telemetry exit drift"
+        )
+
+    return {
+        "case": "certificate_format_validator",
+        "negative_cells_rejected": rejected_cells,
+        "ok": True,
+        "positive_cases": len(records),
+    }
+
+
+def run_cartridge_validator_self_test(root: Path) -> dict[str, Any]:
+    object_kinds = [
+        "declaration",
+        "dependency",
+        "receipt",
+        "certificate",
+        "fixture",
+        "schema",
+        "resource-contract",
+        "witness",
+        "warm-defeq-cache",
+    ]
+
+    def build_extract(
+        name: str,
+        *,
+        kinds: Sequence[str] = object_kinds,
+        extra_name: str | None = None,
+    ) -> Path:
+        extract = root / name
+        extract.mkdir()
+        write_new(extract / "manifest.bin", b"manifest")
+        for index, kind in enumerate(kinds):
+            object_id = hashlib.sha256(f"{index}:{kind}".encode()).hexdigest()
+            write_new(
+                extract / f"{index:02d}-{kind}-{object_id}.bin",
+                f"object:{kind}".encode(),
+            )
+        if extra_name is not None:
+            write_new(extract / extra_name, b"extra")
+        return extract
+
+    positive_path = build_extract("positive")
+    recovery_path = build_extract("recovery")
+    positive = cartridge_extract_tree(positive_path)
+    recovery = cartridge_extract_tree(recovery_path)
+    require(
+        positive == recovery and positive["files"] == 10,
+        "cartridge extraction positive control is not exact",
+    )
+
+    rejected_cells = 0
+
+    missing_path = build_extract(
+        "missing-kind",
+        kinds=object_kinds[:-1],
+    )
+    try:
+        cartridge_extract_tree(missing_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "cartridge extraction validator accepted a missing object kind"
+        )
+
+    noncanonical_path = build_extract(
+        "noncanonical-name",
+        extra_name="unexpected.bin",
+    )
+    try:
+        cartridge_extract_tree(noncanonical_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError(
+            "cartridge extraction validator accepted a noncanonical filename"
+        )
+
+    absent_path = root / "failed-extraction"
+    require_cartridge_absent(absent_path)
+    published_path = build_extract("published-after-failure")
+    try:
+        require_cartridge_absent(published_path)
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("cartridge validator accepted failure output publication")
+
+    summary = {
+        "archive_digest": "1" * 64,
+        "authority": False,
+        "frames": 9,
+        "manifest_root": "2" * 64,
+        "missing_optional": 0,
+        "missing_required": 0,
+        "objects": CARTRIDGE_OBJECTS,
+        "schema": "fln.cartridge-handoff/1",
+        "state": "complete",
+    }
+    validate_cartridge_summary(
+        summary,
+        state="complete",
+        archive_digest=True,
+    )
+    authority_mutant = dict(summary)
+    authority_mutant["authority"] = True
+    try:
+        validate_cartridge_summary(
+            authority_mutant,
+            state="complete",
+            archive_digest=True,
+        )
+    except EvidenceError:
+        rejected_cells += 1
+    else:
+        raise EvidenceError("cartridge summary validator accepted authority promotion")
+
+    return {
+        "case": "cartridge_validator",
+        "negative_cells_rejected": rejected_cells,
+        "ok": True,
+        "positive_files": positive["files"],
+    }
+
+
+def run_diagnostic_projection_validator_self_test(
+    root: Path,
+) -> dict[str, Any]:
+    reference_root = "fnv1a64:0000000000000001"
+    corrupt_root = "fnv1a64:0000000000000002"
+    full = {
+        "channel": "stdout",
+        "comparisonClass": "exact",
+        "epoch": "v4.32.0",
+        "expectedExit": "user_error",
+        "expectedRoot": reference_root,
+        "format": "human",
+        "frontend": "cli",
+        "mode": "faithful",
+        "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+    }
+    records = [
+        {
+            **full,
+            "actual": "equal",
+            "actualExit": "user_error",
+            "actualRoot": reference_root,
+            "authority": True,
+            "case": "reference",
+            "expected": "equal",
+            "sequence": 0,
+        },
+        {
+            **full,
+            "actual": "divergent",
+            "actualExit": "user_error",
+            "actualRoot": corrupt_root,
+            "authority": True,
+            "case": "corrupt",
+            "expected": "divergent",
+            "sequence": 1,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "malformed",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 2,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "aged_epoch",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 3,
+        },
+        {
+            "actual": "typed_refusal",
+            "actualExit": "refused",
+            "actualRoot": "none",
+            "authority": False,
+            "case": "mock_substitution",
+            "expected": "typed_refusal",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 4,
+        },
+        {
+            "actual": "inconclusive",
+            "actualExit": "inconclusive",
+            "actualRoot": "fnv1a64:0000000000000003",
+            "authority": False,
+            "case": "resource",
+            "expected": "inconclusive",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 5,
+        },
+        {
+            "actual": "inconclusive",
+            "actualExit": "inconclusive",
+            "actualRoot": "fnv1a64:0000000000000004",
+            "authority": False,
+            "case": "cancelled",
+            "expected": "inconclusive",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 6,
+        },
+        {
+            "actual": "internal_fault",
+            "actualExit": "internal_fault",
+            "actualRoot": "fnv1a64:0000000000000005",
+            "authority": False,
+            "case": "internal_fault",
+            "expected": "internal_fault",
+            "schema": DIAGNOSTIC_PROJECTION_SEMANTIC_SCHEMA,
+            "sequence": 7,
+        },
+        {
+            **full,
+            "actual": "equal",
+            "actualExit": "user_error",
+            "actualRoot": reference_root,
+            "authority": True,
+            "case": "recovery",
+            "expected": "equal",
+            "sequence": 8,
+        },
+    ]
+    telemetry = {
+        "durationNs": 1,
+        "pid": 1,
+        "rawProcessExits": {
+            "aged_epoch": 101,
+            "cancelled": 2,
+            "corrupt": 1,
+            "internal-fault": 3,
+            "malformed": 101,
+            "mock_substitution": 101,
+            "recovery": 1,
+            "reference_oracle": 1,
+            "reference_projection": 1,
+            "resource": 2,
+        },
+        "runId": "diagnostic-projection-self-test",
+        "schema": DIAGNOSTIC_PROJECTION_TELEMETRY_SCHEMA,
+        "scratch": "/tmp/diagnostic-projection-self-test",
+    }
+
+    def write_records(path: Path, value: Sequence[Mapping[str, Any]]) -> None:
+        write_new(path, b"".join(canonical_json(record) for record in value))
+
+    semantic = root / "positive.semantic.ndjson"
+    telemetry_path = root / "positive.telemetry.ndjson"
+    write_records(semantic, records)
+    write_new(telemetry_path, canonical_json(telemetry))
+    report = validate_diagnostic_projection_evidence(
+        expected_run_id="diagnostic-projection-self-test",
+        semantic_path=semantic,
+        telemetry_path=telemetry_path,
+    )
+    require(
+        report["verdict"] == "pass" and report["case_count"] == 9,
+        "diagnostic projection positive validator control failed",
+    )
+
+    mutants_killed = 0
+
+    def cloned_records() -> list[dict[str, Any]]:
+        candidate = parse_json(
+            canonical_json(records),
+            subject="diagnostic projection self-test records",
+        )
+        if not isinstance(candidate, list) or not all(
+            isinstance(record, dict) for record in candidate
+        ):
+            raise EvidenceError(
+                "diagnostic projection self-test clone is malformed"
+            )
+        return candidate
+
+    def expect_semantic_rejection(
+        label: str,
+        mutate: Callable[[list[dict[str, Any]]], None],
+    ) -> None:
+        nonlocal mutants_killed
+        candidate = cloned_records()
+        mutate(candidate)
+        path = root / f"{label}.semantic.ndjson"
+        write_records(path, candidate)
+        try:
+            validate_diagnostic_projection_evidence(
+                expected_run_id="diagnostic-projection-self-test",
+                semantic_path=path,
+                telemetry_path=telemetry_path,
+            )
+        except EvidenceError:
+            mutants_killed += 1
+            return
+        raise EvidenceError(
+            f"diagnostic projection validator accepted {label} mutation"
+        )
+
+    expect_semantic_rejection("case_omission", lambda value: value.pop())
+    expect_semantic_rejection(
+        "inconclusive_as_user_error",
+        lambda value: value[5].__setitem__("actualExit", "user_error"),
+    )
+    expect_semantic_rejection(
+        "internal_fault_as_user_error",
+        lambda value: value[7].__setitem__("actualExit", "user_error"),
+    )
+    expect_semantic_rejection(
+        "unknown_epoch",
+        lambda value: value[0].__setitem__("epoch", "v99.0.0"),
+    )
+    expect_semantic_rejection(
+        "sequence_reorder",
+        lambda value: value.__setitem__(slice(0, 2), [value[1], value[0]]),
+    )
+    expect_semantic_rejection(
+        "corrupt_root_borrow",
+        lambda value: value[1].__setitem__("actualRoot", reference_root),
+    )
+    expect_semantic_rejection(
+        "recovery_root_drift",
+        lambda value: value[8].__setitem__("actualRoot", corrupt_root),
+    )
+    expect_semantic_rejection(
+        "mock_authority_promotion",
+        lambda value: value[4].__setitem__("authority", True),
+    )
+    expect_semantic_rejection(
+        "semantic_pid_leak",
+        lambda value: value[0].__setitem__("pid", 1),
+    )
+    expect_semantic_rejection(
+        "comparison_fact_loss",
+        lambda value: value[0].pop("expected"),
+    )
+
+    telemetry_mutant = parse_json(
+        canonical_json(telemetry),
+        subject="diagnostic projection telemetry self-test",
+    )
+    if not isinstance(telemetry_mutant, dict):
+        raise EvidenceError(
+            "diagnostic projection telemetry self-test clone is malformed"
+        )
+    telemetry_mutant["rawProcessExits"]["resource"] = 1
+    mutant_telemetry_path = root / "resource_exit.telemetry.ndjson"
+    write_new(mutant_telemetry_path, canonical_json(telemetry_mutant))
+    try:
+        validate_diagnostic_projection_evidence(
+            expected_run_id="diagnostic-projection-self-test",
+            semantic_path=semantic,
+            telemetry_path=mutant_telemetry_path,
+        )
+    except EvidenceError:
+        mutants_killed += 1
+    else:
+        raise EvidenceError(
+            "diagnostic projection validator accepted resource exit mutation"
+        )
+
+    return {
+        "case": "diagnostic_projection_validator",
+        "ok": True,
+        "mutants_killed": mutants_killed,
+        "positive_cases": len(records),
+    }
+
+
 def cmd_self_test(args: argparse.Namespace) -> int:
     """Exercise supervisor boundary cases without mocks or disposable fixtures."""
     art_dir = lexical_absolute(Path(args.art_dir))
@@ -7729,6 +22711,25 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         raise EvidenceError(f"self-test artifact directory already exists: {art_dir}")
     _created, created_fd = open_directory_nofollow(art_dir, create=True)
     os.close(created_fd)
+    # Nested-supervision determinism (bead fln-evidence-runner-bootstrap-btk):
+    # when the self-test itself runs as a supervised stage, the runner's
+    # supervisor above us is a child subreaper, so orphans of our probe trees
+    # would be adopted there and never promptly reaped — hanging every
+    # "descendant reaped" assertion. The self-test owns every process tree it
+    # spawns; becoming the subreaper for its own domain makes orphan adoption
+    # and `reap_adopted_children` deterministic on every topology (standalone,
+    # nested stage, CI). The process exits at the end of the command, so no
+    # restore is needed.
+    enable_child_subreaper()
+    # Launcher-independence for the signal-boundary campaign: a detached
+    # launcher (nohup, shell background jobs) hands this process SIG_IGN
+    # dispositions for HUP/INT, every probe shell inherits them, and POSIX
+    # forbids a non-interactive shell from trapping a signal that was ignored
+    # at entry — the finalizer probes would then never observe their signals.
+    # The self-test owns its probe domain, so it pins the watched dispositions
+    # to default before spawning anything.
+    for owned_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(owned_signal, signal.SIG_DFL)
     cases: list[dict[str, Any]] = []
     require(
         GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS > MAX_PROCESS_IDENTITY_WAIT_MS * 3,
@@ -7739,6 +22740,1860 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         path = art_dir / name
         path.mkdir()
         return path
+
+    cases.append(
+        run_fmt_component_admission_self_test(
+            case_dir("sealed_fmt_component_admission")
+        )
+    )
+    cases.append(
+        run_macro_txn_validator_self_test(
+            case_dir("macro_txn_validator")
+        )
+    )
+    cases.append(
+        run_certificate_format_validator_self_test(
+            case_dir("certificate_format_validator")
+        )
+    )
+    cases.append(run_cartridge_validator_self_test(case_dir("cartridge_validator")))
+    cases.append(
+        run_diagnostic_projection_validator_self_test(
+            case_dir("diagnostic_projection_validator")
+        )
+    )
+
+    parity_root = case_dir("parity_ledger_reference_integrity")
+    parity_row = (
+        "row meta-api | Lean.Name.hash | function | native | L2 | faithful "
+        "| pinned-binary | exact | self-test.fixture | D0 | OBSERVED "
+        "| parity-reference-self-test\n"
+    )
+    parity_ledger = parity_root / "positive.txt"
+    write_new(
+        parity_ledger,
+        f"schema {PARITY_LEDGER_SCHEMA}\n{parity_row}".encode(),
+    )
+    parity_symbols = load_parity_ledger_symbols(parity_ledger)
+    require(
+        parity_symbols == frozenset({"Lean.Name.hash"}),
+        "positive parity ledger did not expose its exact symbol namespace",
+    )
+    validate_parity_ledger_reference(
+        "Lean.Name.hash",
+        subject="parity ledger live-symbol self-test",
+        symbols=parity_symbols,
+    )
+    validate_parity_ledger_reference(
+        "not_applicable_self_test",
+        subject="parity ledger sentinel self-test",
+        symbols=parity_symbols,
+    )
+
+    parity_mutants_killed = 0
+
+    def expect_parity_ledger_rejection(label: str, payload: bytes) -> None:
+        nonlocal parity_mutants_killed
+        mutant = parity_root / f"{label}.txt"
+        write_new(mutant, payload)
+        try:
+            load_parity_ledger_symbols(mutant)
+        except EvidenceError:
+            parity_mutants_killed += 1
+            return
+        raise EvidenceError(f"{label} parity ledger mutant was accepted")
+
+    expect_parity_ledger_rejection(
+        "schema_only",
+        f"schema {PARITY_LEDGER_SCHEMA}\n".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "duplicate_symbol",
+        f"schema {PARITY_LEDGER_SCHEMA}\n{parity_row}{parity_row}".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_row",
+        (
+            f"schema {PARITY_LEDGER_SCHEMA}\n"
+            "row meta-api | Lean.Name.hash | function | native | L2 | faithful "
+            "| pinned-binary | exact | self-test.fixture | D0 | OBSERVED\n"
+        ).encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_schema",
+        f"schema fln-parity-ledger/999\n{parity_row}".encode(),
+    )
+    expect_parity_ledger_rejection(
+        "malformed_enum",
+        (
+            f"schema {PARITY_LEDGER_SCHEMA}\n"
+            + parity_row.replace(" | D0 | ", " | D9 | ")
+        ).encode(),
+    )
+
+    def expect_parity_reference_rejection(label: str, value: Any) -> None:
+        nonlocal parity_mutants_killed
+        try:
+            validate_parity_ledger_reference(
+                value,
+                subject=f"{label} parity reference self-test",
+                symbols=parity_symbols,
+            )
+        except EvidenceError:
+            parity_mutants_killed += 1
+            return
+        raise EvidenceError(f"{label} parity reference mutant was accepted")
+
+    expect_parity_reference_rejection("dangling_symbol", "Lean.Missing.symbol")
+    expect_parity_reference_rejection(
+        "malformed_sentinel", "not_applicable_Bad-Reason"
+    )
+
+    positive_source = (
+        b"--string parity_ledger_row Lean.Name.hash\n"
+        br'emit row pass "\"parity_ledger_row\":\"not_applicable_self_test\""'
+        b"\n"
+    )
+    require(
+        validate_parity_ledger_source(
+            positive_source,
+            subject="positive parity emitter self-test",
+            symbols=parity_symbols,
+        )
+        == 2,
+        "positive parity emitter source did not expose both reference forms",
+    )
+    for label, source in (
+        ("dynamic_direct_emitter", b"--string parity_ledger_row $row\n"),
+        (
+            "dynamic_json_emitter",
+            br'emit row pass "\"parity_ledger_row\":\"kernel.$module\""'
+            b"\n",
+        ),
+        (
+            "unclassifiable_emitter",
+            b'--string "parity_ledger_row" Lean.Name.hash\n',
+        ),
+    ):
+        try:
+            validate_parity_ledger_source(
+                source,
+                subject=f"{label} self-test",
+                symbols=parity_symbols,
+            )
+        except EvidenceError:
+            parity_mutants_killed += 1
+        else:
+            raise EvidenceError(f"{label} parity emitter mutant was accepted")
+
+    emitter_facts = validate_parity_ledger_emitters()
+    cases.append(
+        {
+            "case": "parity_ledger_reference_integrity",
+            "ok": True,
+            "mutants_killed": parity_mutants_killed,
+            "emitter_files": emitter_facts["files"],
+            "emitter_references": emitter_facts["references"],
+            "ledger_symbols": emitter_facts["symbols"],
+        }
+    )
+
+    census_receipt_root = case_dir("census_availability_receipt")
+    census_probe_root = str(art_dir)
+    census_receipt = {
+        "schema": CENSUS_AVAILABILITY_SCHEMA,
+        "outcome": "inconclusive",
+        "reason_code": "census_absent",
+        "authority": "inconclusive",
+        "child_exit": INCONCLUSIVE,
+        "probe": "scripts/extract/census_materialize.sh --verify-only",
+        "probe_root": census_probe_root,
+        "required_outputs": list(CENSUS_REQUIRED_OUTPUTS),
+        "pin_inputs": list(CENSUS_PIN_INPUTS),
+        "no_mock_tests": list(CENSUS_NO_MOCK_TESTS),
+    }
+    census_receipt_path = census_receipt_root / CENSUS_AVAILABILITY_RECEIPT
+    write_new(census_receipt_path, canonical_json(census_receipt))
+    validate_census_availability_receipt(
+        census_receipt_path,
+        expected_probe_root=census_probe_root,
+    )
+
+    census_receipt_mutants: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
+        (
+            "missing_pin_input",
+            lambda receipt: receipt["pin_inputs"].pop(),
+        ),
+        (
+            "wrong_required_output",
+            lambda receipt: receipt["required_outputs"].__setitem__(
+                0, "contracts/not-the-census.tsv"
+            ),
+        ),
+        (
+            "wrong_probe_root",
+            lambda receipt: receipt.__setitem__(
+                "probe_root", str(census_receipt_root)
+            ),
+        ),
+        (
+            "inconclusive_promoted_to_available",
+            lambda receipt: receipt.__setitem__("outcome", "available"),
+        ),
+    ]
+    for mutant_name, mutate in census_receipt_mutants:
+        mutant = parse_json(
+            json.dumps(census_receipt),
+            subject=f"census receipt mutant {mutant_name}",
+        )
+        mutate(mutant)
+        mutant_path = census_receipt_root / f"{mutant_name}.json"
+        write_new(mutant_path, canonical_json(mutant))
+        try:
+            validate_census_availability_receipt(
+                mutant_path,
+                expected_probe_root=census_probe_root,
+            )
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(
+                f"census-availability receipt survived mutant {mutant_name}"
+            )
+    cases.append(
+        {
+            "case": "census_availability_receipt",
+            "ok": True,
+            "mutants_killed": [name for name, _mutate in census_receipt_mutants],
+        }
+    )
+
+    # A supervisor may begin only when it owns no other child lifetime. Recreate
+    # the Git 2.54 auto-maintenance topology directly: a launcher forks a
+    # detached worker, the launcher exits, and this subreaper adopts the exited
+    # worker. The guard must reject that unreaped child instead of silently
+    # broadening its authority; only the fixture then reaps the exact child.
+    detached_root = case_dir("preexisting_detached_child_refusal")
+    detached_program = (
+        "import os,sys\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setsid()\n"
+        "    os._exit(0)\n"
+        "sys.stdout.write(str(child))\n"
+        "sys.stdout.flush()\n"
+    )
+    try:
+        detached_launcher = subprocess.run(
+            [sys.executable, "-c", detached_program],
+            cwd=art_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise EvidenceError("detached-child launcher timed out") from error
+    require(
+        detached_launcher.returncode == 0,
+        "detached-child launcher failed: "
+        f"{detached_launcher.stderr[-300:]!r}",
+    )
+    try:
+        detached_pid = int(detached_launcher.stdout.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise EvidenceError(
+            "detached-child launcher returned a malformed PID"
+        ) from error
+    detached_deadline = time.monotonic() + 1.0
+    detached_facts: tuple[str, int, int] | None = None
+    detached_children: set[int] = set()
+    while time.monotonic() < detached_deadline:
+        detached_children = proc_children(os.getpid())
+        if detached_pid in detached_children:
+            detached_facts = proc_stat_facts(detached_pid)
+            if detached_facts is not None and detached_facts[0] == "Z":
+                break
+        time.sleep(0.005)
+    require(
+        detached_facts is not None
+        and detached_facts[0] == "Z"
+        and detached_children == {detached_pid},
+        "detached-child topology did not produce an adopted zombie",
+    )
+    try:
+        run_supervised(
+            argv=[sys.executable, "-c", "raise SystemExit('guard bypassed')"],
+            cwd=art_dir,
+            metadata_path=detached_root / "stage.meta.json",
+            stdout_path=detached_root / "stage.out",
+            stderr_path=detached_root / "stage.err",
+            readiness_path=detached_root / "stage.ready.json",
+            artifact_root=art_dir,
+            capture_bytes=4096,
+            output_budget_bytes=262_144,
+            timeout_ms=1000,
+            grace_ms=500,
+            stage_id="preexisting_detached_child_refusal",
+            planted=True,
+            setup_timeout_ms=1000,
+        )
+    except EvidenceError as error:
+        require(
+            "supervisor process already owns unrelated child lifetimes" in str(error)
+            and str(detached_pid) in str(error),
+            f"detached-child topology failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("supervisor accepted an unrelated adopted child")
+    finally:
+        reap_adopted_children()
+    require(
+        proc_stat_facts(detached_pid) is None,
+        "detached-child refusal fixture did not reap its adopted zombie",
+    )
+    cases.append(
+        {
+            "case": "preexisting_detached_child_refusal",
+            "ok": True,
+            "observed_state": "adopted_zombie",
+            "guard": "typed_refusal",
+        }
+    )
+
+    # The verification registry is a closed schema with a frozen adoption
+    # boundary. Exercise both the real transition law and discriminating
+    # authority mutants before any repository stage can rely on it.
+    verification_root = case_dir("verification-manifest")
+    # Comment instants straddle FIXTURE_CLOSE_BOUND, and that close is itself
+    # later than CLOSURE_BINDING_EFFECTIVE_FROM. Both relations are load-bearing:
+    # moving the production boundary past FIXTURE_CLOSE_BOUND exempts the planted
+    # historical case below and the mutant survives, which is how an edit to the
+    # constant is caught without a second copy of it.
+    fixture_close_exempt = "2026-07-25T00:00:00.000000000Z"
+    fixture_close_bound = "2026-07-26T21:00:00.000000000Z"
+    verification_beads = [
+        {"id": "baseline-closed", "status": "closed"},
+        {
+            "id": "rur",
+            "status": "in_progress",
+            "comments": [
+                {"id": 41, "created_at": "2026-07-26T20:59:59Z"},
+                {"id": 42, "created_at": "2026-07-26T21:00:00Z"},
+                {"id": 43, "created_at": "2026-07-26T21:05:00Z"},
+            ],
+        },
+        {
+            "id": "rur-consumer",
+            "status": "in_progress",
+            "comments": [{"id": 44, "created_at": "2026-07-26T21:06:00Z"}],
+        },
+    ]
+    verification_ids = sorted(record["id"] for record in verification_beads)
+    verification_header = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "adoption",
+        "source": ".beads/issues.jsonl",
+        "projection": "sorted-canonical-bead-ids-v1",
+        "hash_algorithm": "sha256",
+        "hash_preimage": (
+            "fln.verification-manifest.adoption.ids/1+nul+"
+            "u64le-length-prefixed-utf8"
+        ),
+        "record_count": len(verification_ids),
+        "projection_hash": verification_adoption_hash(verification_ids),
+        "adoption_ids": verification_ids,
+        "adoption_open_ids": ["rur", "rur-consumer"],
+    }
+    verification_authority_hash = verification_adoption_authority_hash(
+        verification_header["adoption_ids"],
+        verification_header["adoption_open_ids"],
+    )
+    verification_coverage = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "coverage",
+        "bead": "rur",
+        "owner": "fixture",
+        "workstream": "W1",
+        "claim_type": "invariant",
+        "evidence_kind": "no_mock_e2e",
+        "mock_only": False,
+        "skip": "none",
+        "requirement_ids": ["REQ-QUALITY-GATE"],
+        "claim_ids": ["CLAIM-QUALITY-GATE"],
+        "invariant_ids": ["FL-INV-07"],
+        "parity_rows": ["not_applicable_fixture"],
+        "behavior_notes": [],
+        "gate_ids": ["G0"],
+        "unit": ["unit:happy"],
+        "boundary": ["unit:boundary"],
+        "error": ["unit:error"],
+        "resource": ["unit:resource"],
+        "cancellation": ["unit:cancellation"],
+        "failure_atomicity": ["unit:failure-atomicity"],
+        "property": [],
+        "metamorphic": [],
+        "fuzz": [],
+        "mutation": ["mutation:missing-stage"],
+        "fault": ["fault:cancellation"],
+        "scenarios": ["quality_gate"],
+        "negative_recovery": ["quality_gate:failure-recovery"],
+        "artifacts": ["human.log", "run.ndjson"],
+    }
+    verification_shared_coverage = dict(verification_coverage)
+    verification_shared_coverage.update(
+        bead="rur-consumer",
+        owner="consumer-fixture",
+        requirement_ids=["REQ-SHARED-QUALITY-GATE"],
+        claim_ids=["CLAIM-SHARED-QUALITY-GATE"],
+    )
+    verification_scenario = {
+        "schema": VERIFICATION_MANIFEST_SCHEMA,
+        "kind": "scenario",
+        "scenario": "quality_gate",
+        "owner": "rur",
+        "activation": "active",
+        "claim_type": "invariant",
+        "evidence_kind": "no_mock_e2e",
+        "gate_ids": ["G0"],
+        "ci_required": True,
+        "ci_root": "check/quality-gate",
+        "artifact_kind": "direct",
+        "artifact_name": "-",
+    }
+    verification_records = [
+        verification_header,
+        verification_coverage,
+        verification_shared_coverage,
+        verification_scenario,
+    ]
+
+    def clone_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return parse_json(
+            json.dumps(records), subject="verification manifest self-test clone"
+        )
+
+    def write_verification_case(
+        name: str,
+        records: list[dict[str, Any]],
+        beads: list[dict[str, Any]] | None = None,
+    ) -> tuple[Path, Path]:
+        root = verification_root / name
+        root.mkdir()
+        manifest = root / "manifest.jsonl"
+        tracker = root / "issues.jsonl"
+        write_new(
+            manifest,
+            b"".join(canonical_json(record) for record in records),
+        )
+        write_new(
+            tracker,
+            b"".join(
+                canonical_json(record)
+                for record in (verification_beads if beads is None else beads)
+            ),
+        )
+        return manifest, tracker
+
+    positive_manifest, positive_beads = write_verification_case(
+        "positive", clone_records(verification_records)
+    )
+    positive_report = validate_verification_manifest(
+        positive_manifest,
+        positive_beads,
+        expected_adoption_authority_hash=verification_authority_hash,
+    )
+    require(
+        positive_report["coverage_rows"] == 2
+        and positive_report["scenario_rows"] == 1
+        and positive_report["ci_scenarios"] == ["quality_gate"],
+        "verification manifest shared scenario lost its authority rows",
+    )
+    require(
+        positive_report["coverage_state_source"] == ".beads/issues.jsonl"
+        and positive_report["derived_state_counts"]["active"] == 2,
+        "verification manifest did not derive active lifecycle from the tracker",
+    )
+    require(
+        positive_report["receipt_registry_status"]
+        == "absent_no_receipt_claims"
+        and positive_report["artifact_reference_validation"]
+        == "not_adopted_registry_absent"
+        and positive_report["receipt_rows"] == 0,
+        "an unadopted optional receipt registry was not reported as typed absence",
+    )
+
+    # The exact same human-authored judgment row remains valid when its bead
+    # closes: lifecycle is projected from the tracker, never edited into the
+    # manifest. This is the regression that killed three full-gate attempts
+    # before fln.verification-manifest/2. The close is dated before
+    # CLOSURE_BINDING_EFFECTIVE_FROM, so this case also carries the exempt side of
+    # the closure-binding law: a row for a pre-law closure passes on its own data,
+    # with no hand-listed exemption anywhere.
+    closed_beads = clone_records(verification_beads)
+    closed_beads[1]["status"] = "closed"
+    closed_beads[1]["closed_at"] = fixture_close_exempt
+    derived_closed_manifest, derived_closed_tracker = write_verification_case(
+        "derived-closed-lifecycle",
+        clone_records(verification_records),
+        closed_beads,
+    )
+    derived_closed_report = validate_verification_manifest(
+        derived_closed_manifest,
+        derived_closed_tracker,
+        expected_adoption_authority_hash=verification_authority_hash,
+    )
+    require(
+        derived_closed_report["derived_state_counts"]["complete"] == 1
+        and derived_closed_report["derived_state_counts"]["active"] == 1,
+        "verification manifest did not derive closure from the tracker",
+    )
+    require(
+        derived_closed_report["closure_exempt_rows"] == 1
+        and derived_closed_report["closure_bound_rows"] == 0,
+        "a pre-law closure was not exempted by its own closed_at",
+    )
+    verification_mutants = 0
+
+    def reject_verification_case(
+        name: str,
+        mutate: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]]], None
+        ],
+        because: tuple[str, ...] = (),
+    ) -> None:
+        """A mutant must be refused, and — where `because` is given — for the stated reason.
+
+        A rig that scores any refusal as a kill scores a test that has stopped
+        testing the property (the `uagk` lesson). Every closure-binding case below
+        names the words its refusal must carry.
+        """
+        nonlocal verification_mutants
+        records = clone_records(verification_records)
+        beads = clone_records(verification_beads)
+        mutate(records, beads)
+        manifest, tracker = write_verification_case(name, records, beads)
+        try:
+            validate_verification_manifest(
+                manifest,
+                tracker,
+                expected_adoption_authority_hash=verification_authority_hash,
+            )
+        except EvidenceError as error:
+            missing = [needle for needle in because if needle not in str(error)]
+            if missing:
+                raise EvidenceError(
+                    f"verification manifest mutant {name} was refused for the "
+                    f"wrong reason (missing {missing!r}): {error}"
+                ) from error
+            verification_mutants += 1
+        else:
+            raise EvidenceError(
+                f"verification manifest mutant survived: {name}"
+            )
+
+    def accept_verification_case(
+        name: str,
+        mutate: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]]], None
+        ],
+    ) -> dict[str, Any]:
+        """A correct authoring must stay green — the control that catches a wall.
+
+        Plant the repair, not only the violation: a law that refuses the violation
+        AND the fix is indistinguishable from a working one until it reddens
+        somebody who did the work.
+        """
+        records = clone_records(verification_records)
+        beads = clone_records(verification_beads)
+        mutate(records, beads)
+        manifest, tracker = write_verification_case(name, records, beads)
+        return validate_verification_manifest(
+            manifest,
+            tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
+
+    reject_verification_case(
+        "absent-coverage",
+        lambda records, _beads: records.pop(1),
+    )
+    reject_verification_case(
+        "mock-only-invariant",
+        lambda records, _beads: records[1].update(
+            evidence_kind="mock", mock_only=True
+        ),
+    )
+    reject_verification_case(
+        "fuzz-closes-invariant",
+        lambda records, _beads: records[1].update(evidence_kind="fuzz"),
+    )
+    reject_verification_case(
+        "unclassified-skip",
+        lambda records, _beads: records[1].update(skip="silent"),
+    )
+    reject_verification_case(
+        "planned-counted-passed",
+        lambda records, _beads: records[-1].update(activation="planned"),
+    )
+    reject_verification_case(
+        "mock-scenario-closes-invariant",
+        lambda records, _beads: records[-1].update(evidence_kind="mock"),
+    )
+    reject_verification_case(
+        "active-scenario-not-ci-enforced",
+        lambda records, _beads: records[-1].update(
+            ci_required=False,
+            ci_root="-",
+            artifact_kind="none",
+            artifact_name="-",
+        ),
+    )
+    reject_verification_case(
+        "orphan-scenario",
+        lambda records, _beads: records[-1].update(owner="missing-owner"),
+    )
+    reject_verification_case(
+        "extra-field",
+        lambda records, _beads: records[1].update(extra="unreviewed"),
+    )
+    reject_verification_case(
+        "stale-adoption-hash",
+        lambda records, _beads: records[0].update(
+            projection_hash=f"sha256:{'0' * 64}"
+        ),
+    )
+    reject_verification_case(
+        "new-bead-without-row",
+        lambda _records, beads: beads.append(
+            {"id": "new-unregistered", "status": "open"}
+        ),
+    )
+    reject_verification_case(
+        "receipt-claim-with-absent-registry",
+        lambda records, _beads: records[1].update(
+            artifacts=[
+                "human.log",
+                f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}",
+                "run.ndjson",
+            ]
+        ),
+        because=("registry is absent", "manifest receipt claims require it"),
+    )
+
+    try:
+        validate_verification_manifest(
+            positive_manifest,
+            positive_beads,
+            expected_adoption_authority_hash=verification_authority_hash,
+            receipt_registry_path=positive_manifest,
+        )
+    except EvidenceError as error:
+        require(
+            "registry exists before its legacy adoption authority is frozen"
+            in str(error),
+            "a present unadopted registry was refused for the wrong reason",
+        )
+        verification_mutants += 1
+    else:
+        raise EvidenceError(
+            "a present registry was mistaken for optional absence"
+        )
+
+    def expand_adoption_boundary(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        beads.append({"id": "new-grandfathered", "status": "open"})
+        adopted = sorted([*records[0]["adoption_ids"], "new-grandfathered"])
+        adopted_open = sorted(
+            [*records[0]["adoption_open_ids"], "new-grandfathered"]
+        )
+        records[0].update(
+            adoption_ids=adopted,
+            adoption_open_ids=adopted_open,
+            record_count=len(adopted),
+            projection_hash=verification_adoption_hash(adopted),
+        )
+
+    reject_verification_case(
+        "dynamic-unbounded-adoption",
+        expand_adoption_boundary,
+    )
+    def close_without_complete_judgment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_exempt
+        records[1]["unit"] = []
+
+    reject_verification_case(
+        "closed-bead-without-complete-judgment",
+        close_without_complete_judgment,
+        because=("unit must not be empty",),
+    )
+
+    # --- The judgement row must judge the closure it is filed for -------------
+    # (bead fln-judgement-row-not-bound-to-its-closure-iumd)
+    #
+    # The refusal case is `fln-lyc8` at b2ee77cd reduced to fixture scale: a bead
+    # closed inside a commit whose row was authored earlier and cites only
+    # comments predating the close, while a post-close comment (43) sits in the
+    # tracker uncited. The full historical replay against that commit's real
+    # blobs is recorded on the bead; this is the permanent case.
+    def close_bound_by_the_law(
+        beads: list[dict[str, Any]], artifacts: list[str]
+    ) -> None:
+        beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_bound
+        artifacts.sort()
+
+    def close_citing_only_pre_close_evidence(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:41"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closed-row-predating-the-closure-it-judges",
+        close_citing_only_pre_close_evidence,
+        because=(
+            "'rur'",
+            "does not judge the closure it is filed for",
+            "bead-comment:rur:41 (created 2026-07-26T20:59:59Z, before the close)",
+        ),
+    )
+
+    def close_citing_an_absent_comment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [
+            *records[1]["artifacts"],
+            "bead-comment:rur:9999",
+        ]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closure-citation-with-no-referent",
+        close_citing_an_absent_comment,
+        because=("no such comment on rur in the tracker",),
+    )
+
+    def close_citing_another_beads_comment(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [
+            *records[1]["artifacts"],
+            "bead-comment:rur-consumer:44",
+        ]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    reject_verification_case(
+        "closure-citation-borrowed-from-another-bead",
+        close_citing_another_beads_comment,
+        because=("cites bead 'rur-consumer', not this row's bead",),
+    )
+
+    def close_without_a_decidable_instant(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        records[1]["artifacts"].sort()
+        beads[1]["status"] = "closed"
+
+    reject_verification_case(
+        "closed-row-without-a-decidable-closure-instant",
+        close_without_a_decidable_instant,
+        because=("is complete, so its closed_at is missing",),
+    )
+
+    def close_citing_a_malformed_instant(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+        beads[1]["comments"][2]["created_at"] = "just after the close"
+
+    reject_verification_case(
+        "closure-citation-with-an-unparseable-instant",
+        close_citing_a_malformed_instant,
+        because=("comment 43 created_at is not a UTC instant",),
+    )
+
+    def close_citing_post_close_evidence(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:43"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    bound_report = accept_verification_case(
+        "closure-bound-and-cited",
+        close_citing_post_close_evidence,
+    )
+    require(
+        bound_report["closure_bound_rows"] == 1
+        and bound_report["closure_exempt_rows"] == 0
+        and bound_report["derived_state_counts"]["complete"] == 1,
+        "a close whose row cites post-close evidence was not accepted as bound",
+    )
+
+    def close_cited_within_the_closing_second(
+        records: list[dict[str, Any]], beads: list[dict[str, Any]]
+    ) -> None:
+        records[1]["artifacts"] = [*records[1]["artifacts"], "bead-comment:rur:42"]
+        close_bound_by_the_law(beads, records[1]["artifacts"])
+
+    same_second_report = accept_verification_case(
+        "closure-cited-within-the-closing-second",
+        close_cited_within_the_closing_second,
+    )
+    require(
+        same_second_report["closure_bound_rows"] == 1,
+        "a comment written in the closing second was not accepted",
+    )
+
+    # A test citation is a stable join key, not proof of execution.  Keep the
+    # Python syntax reader byte-for-byte aligned in meaning with
+    # fln-conformance's Rust resolver, then exercise the complete artifact
+    # classifier against real filesystem shapes.  In particular, existing and
+    # pruned target paths have the same forbidden class: pruning cannot turn an
+    # invalid citation into a valid one.
+    # The classifier must see a real symlink, while the enclosing quality-gate
+    # bundle is constitutionally symlink-free. Keep this retained test input
+    # outside every publishable artifact root and bind its unique name to this
+    # self-test attempt; no cleanup is performed.
+    classification_fixture_id = hashlib.sha256(
+        str(verification_root).encode()
+    ).hexdigest()[:24]
+    classification_root = (
+        Path("/data/tmp")
+        / f"fln-evidence-artifact-classification-{classification_fixture_id}"
+    )
+    if classification_root.exists() or classification_root.is_symlink():
+        raise EvidenceError(
+            f"artifact-classification fixture already exists: {classification_root}"
+        )
+    classification_root.mkdir()
+    write_new(classification_root / "tracked.log", b"tracked\n")
+    write_new(classification_root / "untracked.log", b"untracked\n")
+    write_new(classification_root / "ignored.log", b"ignored\n")
+    (classification_root / "directory").mkdir()
+    write_new(
+        classification_root / "directory" / "tracked-child.log",
+        b"tracked child\n",
+    )
+    (classification_root / "symlink.log").symlink_to("tracked.log")
+    (classification_root / "target").mkdir()
+    write_new(classification_root / "target" / "live.log", b"transient\n")
+    classification_absolute_path = str(
+        (classification_root / "tracked.log").resolve()
+    )
+    classification_authority = {
+        "root": classification_root,
+        "head": "1" * 40,
+        "index_digest": f"sha256:{'1' * 64}",
+        "tracked_modes": {
+            "directory/tracked-child.log": "100644",
+            "missing-tracked.log": "100644",
+            "tracked.log": "100644",
+        },
+        "ignored_paths": {"ignored.log"},
+        "reachable_commits": {"1" * 40},
+        "live_git": False,
+    }
+    classification_beads = bead_tracker_projection(positive_beads)
+    classification_expectations = {
+        "test:fixture::integration::passes": "test_function_claim",
+        "test:fixture::lib::module::nested::passes": "test_function_claim",
+        "test:": "malformed_test_function_claim",
+        "test:::integration::passes": "malformed_test_function_claim",
+        "test:fixture::::passes": "malformed_test_function_claim",
+        "test:fixture::integration": "malformed_test_function_claim",
+        "test:fixture::integration::": "malformed_test_function_claim",
+        "test:fixture::integration::::passes": (
+            "malformed_test_function_claim"
+        ),
+        "bead-comment:rur:41": "bead_comment",
+        "bead-comment:rur-consumer:44": "invalid_comment",
+        "bead:rur:description": "bead",
+        "bead:rur-consumer:description": "invalid_bead",
+        f"commit:{'1' * 40}": "commit",
+        "commit:1111111": "short_commit",
+        "tracked.log": "tracked_file",
+        "repo-file:tracked.log": "tracked_file",
+        "untracked.log": "untracked",
+        "ignored.log": "ignored",
+        "missing.log": "missing",
+        "missing-tracked.log": "missing",
+        "directory": "directory",
+        "symlink.log": "symlink",
+        "target/live.log": "target_path",
+        "target/pruned.log": "target_path",
+        "../escape.log": "traversal_path",
+        "./tracked.log": "traversal_path",
+        "*.log": "glob",
+        classification_absolute_path: "absolute_path",
+        "legacy:terminal-evidence": "unknown_structured",
+        f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}": (
+            "unknown_receipt"
+        ),
+    }
+    for artifact, expected_classification in classification_expectations.items():
+        actual_classification = verification_artifact_classification(
+            "rur",
+            artifact,
+            bead_states=classification_beads,
+            authority=classification_authority,
+            receipts={},
+        )
+        require(
+            actual_classification == expected_classification,
+            f"verification artifact {artifact!r} classified as "
+            f"{actual_classification!r}, expected {expected_classification!r}",
+        )
+
+    legacy_artifact = "legacy:terminal-evidence"
+    legacy_pair_id = verification_legacy_pair_id("rur", legacy_artifact)
+    registry_migration_commit = "1" * 40
+    registry_adoption_pair_ids = [legacy_pair_id]
+    registry_authority_hash = verification_legacy_adoption_authority_hash(
+        registry_migration_commit,
+        registry_adoption_pair_ids,
+    )
+    receipt_record = {
+        "schema": VERIFICATION_EVIDENCE_RECEIPT_SCHEMA,
+        "kind": "receipt",
+        "receipt": f"sha256:{'0' * 64}",
+        "producer": {
+            "tool": "scripts/evidence.py:promote-verification-receipt/1",
+            "run_schema": "fln.check/2",
+            "run_id": "check-receipt-registry-fixture",
+            "bead": "rur",
+            "scenario": "quality_gate",
+            "producing_commit": "unavailable",
+            "commit_binding": "unbound",
+        },
+        "outcome": {
+            "verdict": "pass",
+            "process_exit": 0,
+            "reason_code": "all_obligations_passed",
+            "input_root": f"sha256:{'2' * 64}",
+            "final_root": f"sha256:{'2' * 64}",
+            "governed_state_static": True,
+            "governed_scope": "lane_declared_subset",
+            "governed_set": "unavailable",
+        },
+        "source": {
+            "bundle_commit_sha256": f"sha256:{'3' * 64}",
+            "manifest_sha256": f"sha256:{'4' * 64}",
+            "manifest_digest_sha256": f"sha256:{'5' * 64}",
+            "run_log_sha256": f"sha256:{'6' * 64}",
+        },
+        "execution": {
+            "authority": "structured_run_log",
+            "executed": ["stage:verification-manifest"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "reference": {
+            "status": "unobserved",
+            "binding_sha256": "not_applicable",
+        },
+    }
+    receipt_record["receipt"] = verification_receipt_content_address(
+        receipt_record
+    )
+    receipt_reference = f"receipt:{receipt_record['receipt']}"
+    registry_header = {
+        "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+        "kind": "registry",
+        "source": VERIFICATION_MANIFEST_PATH,
+        "projection": "exact-terminal-artifact-pairs-v1",
+        "hash_algorithm": "sha256",
+        "hash_preimage": (
+            "fln.verification-evidence.legacy-pair/1+nul+"
+            "u64le-length-prefixed-bead+artifact"
+        ),
+        "migration_commit": registry_migration_commit,
+        "adoption_record_count": len(registry_adoption_pair_ids),
+        "adoption_projection_hash": (
+            verification_legacy_adoption_projection_hash(
+                registry_adoption_pair_ids
+            )
+        ),
+        "adoption_pair_ids": registry_adoption_pair_ids,
+        "record_count": 2,
+        "receipt_count": 1,
+        "target_artifact_ceiling": 0,
+    }
+    legacy_record = {
+        "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+        "kind": "legacy-artifact",
+        "pair_id": legacy_pair_id,
+        "bead": "rur",
+        "artifact": legacy_artifact,
+        "classification": "unknown_structured",
+        "tracking_bead": VERIFICATION_LEGACY_TRACKING_BEAD,
+    }
+    registry_records = [
+        registry_header,
+        legacy_record,
+        receipt_record,
+    ]
+
+    def receipt_registry_manifest_records() -> list[dict[str, Any]]:
+        records = clone_records(verification_records)
+        records[1]["artifacts"] = sorted(
+            [
+                legacy_artifact,
+                receipt_reference,
+                "test:fixture::lib::rur::registry_is_enforced",
+            ]
+        )
+        records[2]["artifacts"] = [
+            "test:fixture::integration::consumer_registry_is_enforced"
+        ]
+        return records
+
+    def receipt_registry_beads() -> list[dict[str, Any]]:
+        beads = clone_records(verification_beads)
+        beads[1]["status"] = "closed"
+        beads[1]["closed_at"] = fixture_close_exempt
+        return beads
+
+    def write_receipt_registry_case(
+        name: str,
+        records: list[dict[str, Any]],
+        beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> tuple[Path, Path, Path]:
+        manifest, tracker = write_verification_case(name, records, beads)
+        registry_path = manifest.with_name(
+            Path(VERIFICATION_EVIDENCE_REGISTRY_PATH).name
+        )
+        write_new(
+            registry_path,
+            b"".join(canonical_json(record) for record in receipt_records),
+        )
+        return manifest, tracker, registry_path
+
+    registry_manifest, registry_tracker, registry_path = (
+        write_receipt_registry_case(
+            "receipt-registry-positive",
+            receipt_registry_manifest_records(),
+            receipt_registry_beads(),
+            clone_records(registry_records),
+        )
+    )
+    registry_report = validate_verification_manifest(
+        registry_manifest,
+        registry_tracker,
+        expected_adoption_authority_hash=verification_authority_hash,
+        receipt_registry_path=registry_path,
+        artifact_authority=classification_authority,
+        expected_legacy_authority_hash=registry_authority_hash,
+    )
+    require(
+        registry_report["artifact_reference_validation"] == "enforced"
+        and registry_report["artifact_pairs_scanned"] == 4
+        and registry_report["durable_artifact_pairs"] == 3
+        and registry_report["legacy_artifact_pairs"] == 1
+        and registry_report["receipt_references"] == 1
+        and registry_report["receipt_rows"] == 1
+        and registry_report["target_artifact_ceiling"] == 0,
+        "verification receipt registry positive control lost its exact census",
+    )
+    require(
+        verification_artifact_classification(
+            "rur",
+            receipt_reference,
+            bead_states=classification_beads,
+            authority=classification_authority,
+            receipts={receipt_record["receipt"]: receipt_record},
+        )
+        == "receipt",
+        "a known verification receipt did not resolve through the registry",
+    )
+
+    def replace_fixture_artifact(
+        records: list[dict[str, Any]],
+        *,
+        row: int,
+        old: str,
+        new: str,
+    ) -> None:
+        records[row]["artifacts"] = sorted(
+            new if artifact == old else artifact
+            for artifact in records[row]["artifacts"]
+        )
+
+    def reject_receipt_registry_case(
+        name: str,
+        mutate: Callable[
+            [
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+            ],
+            None,
+        ],
+        *,
+        because: tuple[str, ...],
+    ) -> None:
+        nonlocal verification_mutants
+        records = receipt_registry_manifest_records()
+        beads = receipt_registry_beads()
+        receipt_records = clone_records(registry_records)
+        mutate(records, beads, receipt_records)
+        manifest, tracker, mutant_registry = write_receipt_registry_case(
+            name,
+            records,
+            beads,
+            receipt_records,
+        )
+        try:
+            validate_verification_manifest(
+                manifest,
+                tracker,
+                expected_adoption_authority_hash=verification_authority_hash,
+                receipt_registry_path=mutant_registry,
+                artifact_authority=classification_authority,
+                expected_legacy_authority_hash=registry_authority_hash,
+            )
+        except EvidenceError as error:
+            missing = [needle for needle in because if needle not in str(error)]
+            if missing:
+                raise EvidenceError(
+                    f"verification receipt registry mutant {name} was "
+                    f"refused for the wrong reason (missing {missing!r}): "
+                    f"{error}"
+                ) from error
+            verification_mutants += 1
+        else:
+            raise EvidenceError(
+                f"verification receipt registry mutant survived: {name}"
+            )
+
+    reject_receipt_registry_case(
+        "receipt-registry-live-target",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="target/live.log",
+        ),
+        because=("transient target artifact", "promoted before citation"),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-pruned-target",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="target/pruned.log",
+        ),
+        because=("transient target artifact", "promoted before citation"),
+    )
+    for name, artifact, classification in (
+        ("present-untracked", "untracked.log", "untracked"),
+        ("present-ignored", "ignored.log", "ignored"),
+        ("missing-tracked", "missing-tracked.log", "missing"),
+        ("tracked-directory", "directory", "directory"),
+        ("tracked-symlink", "symlink.log", "symlink"),
+        ("traversal", "../escape.log", "traversal_path"),
+        ("absolute", classification_absolute_path, "absolute_path"),
+        ("glob", "*.log", "glob"),
+    ):
+        reject_receipt_registry_case(
+            f"receipt-registry-{name}",
+            lambda records, _beads, _registry, artifact=artifact: (
+                replace_fixture_artifact(
+                    records,
+                    row=1,
+                    old=legacy_artifact,
+                    new=artifact,
+                )
+            ),
+            because=(
+                "non-durable artifact",
+                classification,
+                "no exact migration allowance",
+            ),
+        )
+    reject_receipt_registry_case(
+        "receipt-registry-unknown-receipt",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=receipt_reference,
+            new=f"{VERIFICATION_RECEIPT_REFERENCE_PREFIX}{'0' * 64}",
+        ),
+        because=("does not resolve through the tracked registry",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-legacy",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=1,
+            old=legacy_artifact,
+            new="test:fixture::lib::rur::legacy_was_repaired",
+        ),
+        because=("legacy allowances outlived their exact non-durable pairs",),
+    )
+
+    def expand_receipt_registry_adoption(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        expanded_artifact = "legacy:expanded"
+        expanded_pair_id = verification_legacy_pair_id(
+            "baseline-closed",
+            expanded_artifact,
+        )
+        expanded_pair_ids = sorted(
+            [*receipt_records[0]["adoption_pair_ids"], expanded_pair_id]
+        )
+        receipt_records[0].update(
+            adoption_pair_ids=expanded_pair_ids,
+            adoption_record_count=len(expanded_pair_ids),
+            adoption_projection_hash=(
+                verification_legacy_adoption_projection_hash(
+                    expanded_pair_ids
+                )
+            ),
+            record_count=3,
+        )
+        receipt_records.insert(
+            1,
+            {
+                "schema": VERIFICATION_EVIDENCE_REGISTRY_SCHEMA,
+                "kind": "legacy-artifact",
+                "pair_id": expanded_pair_id,
+                "bead": "baseline-closed",
+                "artifact": expanded_artifact,
+                "classification": "unknown_structured",
+                "tracking_bead": VERIFICATION_LEGACY_TRACKING_BEAD,
+            },
+        )
+
+    reject_receipt_registry_case(
+        "receipt-registry-adoption-expansion",
+        expand_receipt_registry_adoption,
+        because=("legacy adoption authority differs from the frozen migration",),
+    )
+
+    def reopen_receipt_registry_legacy_bead(
+        _records: list[dict[str, Any]],
+        beads: list[dict[str, Any]],
+        _registry: list[dict[str, Any]],
+    ) -> None:
+        beads[1]["status"] = "in_progress"
+        beads[1].pop("closed_at", None)
+
+    reject_receipt_registry_case(
+        "receipt-registry-nonterminal-legacy",
+        reopen_receipt_registry_legacy_bead,
+        because=("nonterminal bead consumes legacy debt",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-malformed-test-claim",
+        lambda records, _beads, _registry: replace_fixture_artifact(
+            records,
+            row=2,
+            old="test:fixture::integration::consumer_registry_is_enforced",
+            new="test:fixture::integration::",
+        ),
+        because=(
+            "nonterminal coverage cannot consume legacy artifact debt",
+            "malformed_test_function_claim",
+        ),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-record-count",
+        lambda _records, _beads, registry: registry[0].update(
+            record_count=99
+        ),
+        because=("registry record count is stale",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-receipt-count",
+        lambda _records, _beads, registry: registry[0].update(
+            receipt_count=0
+        ),
+        because=("receipt count is stale",),
+    )
+
+    def reverse_receipt_registry_rows(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        receipt_records[1], receipt_records[2] = (
+            receipt_records[2],
+            receipt_records[1],
+        )
+
+    reject_receipt_registry_case(
+        "receipt-registry-row-order",
+        reverse_receipt_registry_rows,
+        because=("legacy-then-receipt canonical order",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-authority-substitution",
+        lambda _records, _beads, registry: registry[0].update(
+            migration_commit="2" * 40
+        ),
+        because=("legacy adoption authority differs from the frozen migration",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-target-ceiling",
+        lambda _records, _beads, registry: registry[0].update(
+            target_artifact_ceiling=1
+        ),
+        because=("target artifact ceiling must remain zero",),
+    )
+    reject_receipt_registry_case(
+        "receipt-registry-stale-projection",
+        lambda _records, _beads, registry: registry[0].update(
+            adoption_projection_hash=f"sha256:{'0' * 64}"
+        ),
+        because=("adoption projection hash is stale",),
+    )
+
+    def tamper_receipt_without_readdressing(
+        _records: list[dict[str, Any]],
+        _beads: list[dict[str, Any]],
+        receipt_records: list[dict[str, Any]],
+    ) -> None:
+        receipt_records[2]["outcome"]["reason_code"] = "tampered"
+
+    reject_receipt_registry_case(
+        "receipt-registry-tampered-receipt",
+        tamper_receipt_without_readdressing,
+        because=("receipt content address differs",),
+    )
+
+    # The two fixture closes must stay either side of the production boundary, or
+    # the cases above stop testing the law they were written for: an exempt case
+    # that drifted past the boundary would demand a citation, and a bound case
+    # that drifted below it would be exempted and its mutant would survive. Said
+    # here as well as measured there, because a case that goes quiet is the
+    # failure this whole bead is about.
+    fixture_boundary = utc_second_prefix(
+        "CLOSURE_BINDING_EFFECTIVE_FROM", CLOSURE_BINDING_EFFECTIVE_FROM
+    )
+    require(
+        bound_report["closure_binding_effective_from"]
+        == CLOSURE_BINDING_EFFECTIVE_FROM
+        and utc_second_prefix("fixture_close_bound", fixture_close_bound)
+        >= fixture_boundary
+        and utc_second_prefix("fixture_close_exempt", fixture_close_exempt)
+        < fixture_boundary,
+        "the closure-binding fixtures stopped straddling the production boundary",
+    )
+    reject_verification_case(
+        "hand-maintained-lifecycle-field",
+        lambda records, _beads: records[1].update(state="active"),
+    )
+    reject_verification_case(
+        "duplicate-row",
+        lambda records, _beads: records.insert(2, dict(records[1])),
+    )
+
+    duplicate_root = verification_root / "duplicate-key"
+    duplicate_root.mkdir()
+    duplicate_manifest = duplicate_root / "manifest.jsonl"
+    duplicate_tracker = duplicate_root / "issues.jsonl"
+    duplicate_coverage = canonical_json(verification_coverage).rstrip(b"\n")
+    write_new(
+        duplicate_manifest,
+        canonical_json(verification_header)
+        + duplicate_coverage[:-1]
+        + b',"owner":"duplicate-owner"}\n'
+        + canonical_json(verification_scenario),
+    )
+    write_new(
+        duplicate_tracker,
+        b"".join(canonical_json(record) for record in verification_beads),
+    )
+    try:
+        validate_verification_manifest(
+            duplicate_manifest,
+            duplicate_tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
+    except EvidenceError:
+        verification_mutants += 1
+    else:
+        raise EvidenceError("duplicate manifest key was accepted")
+
+    truncated_root = verification_root / "truncated"
+    truncated_root.mkdir()
+    truncated_manifest = truncated_root / "manifest.jsonl"
+    truncated_tracker = truncated_root / "issues.jsonl"
+    write_new(
+        truncated_manifest,
+        b"".join(canonical_json(record) for record in verification_records)[:-1],
+    )
+    write_new(
+        truncated_tracker,
+        b"".join(canonical_json(record) for record in verification_beads),
+    )
+    try:
+        validate_verification_manifest(
+            truncated_manifest,
+            truncated_tracker,
+            expected_adoption_authority_hash=verification_authority_hash,
+        )
+    except EvidenceError:
+        verification_mutants += 1
+    else:
+        raise EvidenceError("truncated verification manifest was accepted")
+    require(
+        verification_mutants == 46,
+        "verification manifest mutation matrix is incomplete",
+    )
+    cases.append(
+        {
+            "case": "verification_manifest_model",
+            "ok": True,
+            "mutants_killed": verification_mutants,
+            "artifact_classification_checks": len(
+                classification_expectations
+            ),
+        }
+    )
+    cases.extend(
+        (
+            {
+                "case": "claim_evidence_authority",
+                "ok": True,
+                "mutants_killed": 3,
+            },
+            {
+                "case": "scenario_activation_registry",
+                "ok": True,
+                "mutants_killed": 3,
+            },
+        )
+    )
+
+    # A changed-scope inventory is frozen at run start. Git index/commit
+    # transitions can change the live "changed" set without changing any
+    # captured bytes, especially in the shared-tree swarm. Those transitions
+    # must not break terminal publication; actual byte drift remains fatal.
+    ubs_scope_root = case_dir("ubs_inventory_scope_snapshot")
+    ubs_scope_repo = ubs_scope_root / "repo"
+    ubs_scope_repo.mkdir()
+    git_init = subprocess.run(
+        ["git", "init", "-q", str(ubs_scope_repo)],
+        cwd=ubs_scope_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        git_init.returncode == 0,
+        f"UBS scope fixture git init failed: {git_init.stderr[-300:]!r}",
+    )
+    maintenance_auto = run_git(
+        ubs_scope_repo,
+        ["config", "--bool", "--get", "maintenance.auto"],
+        subject="UBS scope fixture sealed maintenance policy",
+    ).decode("ascii").strip()
+    require(
+        maintenance_auto == "false",
+        "evidence Git invocation did not disable automatic maintenance",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git policy query left an adopted maintenance child",
+    )
+    tracked_input = ubs_scope_repo / "tracked.py"
+    stable_input = ubs_scope_repo / "stable.py"
+    write_new(tracked_input, b"value = 1\n")
+    write_new(stable_input, b"stable = True\n")
+    run_git(
+        ubs_scope_repo,
+        ["add", "tracked.py", "stable.py"],
+        subject="UBS scope fixture initial add",
+    )
+    run_git(
+        ubs_scope_repo,
+        [
+            "-c",
+            "user.name=FrankenLean Tribunal",
+            "-c",
+            "user.email=tribunal@invalid",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        subject="UBS scope fixture initial commit",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git initial commit left an adopted maintenance child",
+    )
+    with tracked_input.open("ab") as handle:
+        handle.write(b"# captured change\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    captured_inventory = collect_ubs_inventory(ubs_scope_repo, "changed")
+    require(
+        [row["path"] for row in captured_inventory["files"]] == ["tracked.py"],
+        "UBS scope fixture did not capture the intended changed file",
+    )
+    captured_inventory_path = ubs_scope_root / "ubs-inventory.json"
+    write_new(captured_inventory_path, canonical_json(captured_inventory))
+    validate_ubs_inventory(
+        captured_inventory_path,
+        ubs_scope_repo,
+        require_live_scope=True,
+    )
+    captured_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    run_git(
+        ubs_scope_repo,
+        ["add", "tracked.py"],
+        subject="UBS scope fixture transition add",
+    )
+    run_git(
+        ubs_scope_repo,
+        [
+            "-c",
+            "user.name=FrankenLean Tribunal",
+            "-c",
+            "user.email=tribunal@invalid",
+            "commit",
+            "-q",
+            "-m",
+            "scope transition",
+        ],
+        subject="UBS scope fixture transition commit",
+    )
+    require(
+        not proc_children(os.getpid()),
+        "sealed Git transition commit left an adopted maintenance child",
+    )
+    try:
+        validate_ubs_inventory(
+            captured_inventory_path,
+            ubs_scope_repo,
+            require_live_scope=True,
+        )
+    except EvidenceError as error:
+        require(
+            "declared live repository scope" in str(error),
+            f"UBS live-scope transition failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("UBS strict live-scope transition was not detected")
+    validate_ubs_inventory(captured_inventory_path, ubs_scope_repo)
+    transitioned_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    require(
+        transitioned_root == captured_root,
+        "Git-only UBS scope transition changed the immutable input root",
+    )
+    with stable_input.open("ab") as handle:
+        handle.write(b"# governed byte drift\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    drifted_root = tree_hash(
+        ubs_scope_repo,
+        ["tracked.py", "stable.py"],
+        inventory_path=captured_inventory_path,
+    )
+    require(
+        drifted_root != captured_root,
+        "governed byte drift did not change the immutable input root",
+    )
+    with tracked_input.open("ab") as handle:
+        handle.write(b"# captured byte drift\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        validate_ubs_inventory(captured_inventory_path, ubs_scope_repo)
+    except EvidenceError as error:
+        require(
+            "UBS inventory input changed: tracked.py" in str(error),
+            f"UBS captured-byte drift failed for the wrong reason: {error}",
+        )
+    else:
+        raise EvidenceError("UBS captured-byte drift was accepted")
+    cases.append(
+        {
+            "case": "ubs_inventory_scope_snapshot",
+            "ok": True,
+            "mutants_killed": 2,
+        }
+    )
+    cases.append(
+        {
+            "case": "git_maintenance_subreaper_boundary",
+            "ok": True,
+            "maintenance_auto": maintenance_auto,
+            "owned_children_after_commits": [],
+        }
+    )
+
+    # The structure guard's robot stream is a versioned evidence contract, not a
+    # best-effort JSON bag. Exercise one complete /5 stream and discriminating
+    # mutations here so the validator cannot silently stop checking newly authoritative
+    # fields while the E2E lanes continue to look green.
+    guard_root = case_dir("structure-guard-contract")
+    guard_start = {
+        "schema": STRUCTURE_GUARD_SCHEMA,
+        "event": "run_start",
+        "root": str(guard_root),
+        "root_identity": str(guard_root.resolve(strict=True)),
+        "graph_digest": "fnv1a64:0123456789abcdef",
+        "crates": 1,
+        "edges": 0,
+        "authority_inventory": {
+            "package_class": "workspace-graph-exact",
+            "packages": 1,
+            "target_class": "cargo-auto-discovery-closed",
+            "targets": 1,
+            "feature_class": "manifest-enumerated",
+            "features": 0,
+            "target_triple_class": "suite-lock-declared",
+            "target_triples": 1,
+        },
+        "effective_compiler_identity": {
+            "source": "PATH",
+            "channel": "nightly-2026-07-13",
+            "release": "1.99.0-nightly",
+            "commit": "77cf889bc178ddb44d6a1c78e5a820b5abb31d8d",
+            "host": "x86_64-unknown-linux-gnu",
+            "contract_declared": True,
+            "configuration_match": True,
+            "contract_match": True,
+        },
+        "admitted_environment": {
+            "policy": "names-only-no-values/1",
+            "admitted_names": ["HOME", "PATH"],
+            "compiler_override_names": [],
+        },
+    }
+    guard_end = {
+        "schema": STRUCTURE_GUARD_SCHEMA,
+        "event": "run_end",
+        "verdict": "pass",
+        "exit_code": 0,
+        "findings": 0,
+        "authority": "complete",
+        "data_grade": "verified",
+        "unestablished": [],
+        "contract_handoff_root": "fnv1a64:0123456789abcdef",
+        "traversal": {
+            "directories_visited": 3,
+            "files_discovered": 4,
+            "files_scanned": 4,
+            "files_skipped_unreadable": 0,
+        },
+        "mode_closure": {
+            "scan_class": "vacuous",
+            "frontier_surfaces": 0,
+            "product_roots": 0,
+            "closures_scanned": 0,
+            "closure_nodes": 0,
+            "nodes": 1,
+            "edges": 0,
+        },
+        "authority_count_rule": (
+            "files_scanned+files_skipped_unreadable=files_discovered"
+        ),
+        "authority_count_rule_holds": True,
+        "governed_root_before": "fnv1a64:fedcba9876543210",
+        "governed_root_after": "fnv1a64:fedcba9876543210",
+        "governed_root_unchanged": True,
+        "duration_ms": 1,
+    }
+
+    def write_guard_stream(
+        name: str, mutate: Callable[[list[dict[str, Any]]], None] | None = None
+    ) -> Path:
+        records = json.loads(json.dumps([guard_start, guard_end]))
+        if mutate is not None:
+            mutate(records)
+        stream = guard_root / f"{name}.ndjson"
+        write_new(stream, b"".join(canonical_json(record) for record in records))
+        return stream
+
+    guard_valid = write_guard_stream("valid")
+    validate_guard(guard_valid, PASS, "pass", [], str(guard_root), PASS)
+
+    def provisional_guard(records: list[dict[str, Any]]) -> None:
+        records[1].update(
+            {
+                "verdict": "inconclusive",
+                "exit_code": INCONCLUSIVE,
+                "authority": "incomplete",
+                "data_grade": "provisional",
+                "unestablished": ["contract_handoff"],
+                "contract_handoff_root": None,
+            }
+        )
+
+    provisional_valid = write_guard_stream("provisional-valid", provisional_guard)
+    validate_guard(
+        provisional_valid,
+        INCONCLUSIVE,
+        "inconclusive",
+        [],
+        str(guard_root),
+        INCONCLUSIVE,
+    )
+
+    def provisional_lies_verified(records: list[dict[str, Any]]) -> None:
+        provisional_guard(records)
+        records[1]["data_grade"] = "verified"
+
+    def provisional_omits_unestablished(records: list[dict[str, Any]]) -> None:
+        provisional_guard(records)
+        records[1]["unestablished"] = []
+
+    provisional_mutants = (
+        ("provisional-lies-verified", provisional_lies_verified),
+        ("provisional-omits-unestablished", provisional_omits_unestablished),
+    )
+    for mutant_name, mutate in provisional_mutants:
+        mutant = write_guard_stream(mutant_name, mutate)
+        try:
+            validate_guard(
+                mutant,
+                INCONCLUSIVE,
+                "inconclusive",
+                [],
+                str(guard_root),
+                INCONCLUSIVE,
+            )
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(
+                f"structure-guard validator survived mutant {mutant_name}"
+            )
+
+    def old_guard_schema(records: list[dict[str, Any]]) -> None:
+        # The immediately preceding version is the discriminating mutant: `/4` has the
+        # same D18 scope but no data-grade join.
+        for record in records:
+            record["schema"] = "structure-guard/4"
+
+    def missing_guard_field(records: list[dict[str, Any]]) -> None:
+        records[0].pop("root_identity")
+
+    def extra_guard_field(records: list[dict[str, Any]]) -> None:
+        records[1]["unversioned_claim"] = True
+
+    def false_guard_data_grade(records: list[dict[str, Any]]) -> None:
+        records[1]["data_grade"] = "provisional"
+
+    def false_guard_unestablished(records: list[dict[str, Any]]) -> None:
+        records[1]["unestablished"] = ["contract_handoff"]
+
+    def missing_guard_handoff_root(records: list[dict[str, Any]]) -> None:
+        records[1]["contract_handoff_root"] = None
+
+    def malformed_guard_handoff_root(records: list[dict[str, Any]]) -> None:
+        records[1]["contract_handoff_root"] = "fnv1a64:not-a-root"
+
+    def broken_guard_conservation(records: list[dict[str, Any]]) -> None:
+        records[1]["traversal"]["files_scanned"] = 3
+
+    def false_guard_root_equality(records: list[dict[str, Any]]) -> None:
+        records[1]["governed_root_after"] = "fnv1a64:1111111111111111"
+
+    def unbound_guard_compiler(records: list[dict[str, Any]]) -> None:
+        records[0]["effective_compiler_identity"]["configuration_match"] = False
+
+    def leaked_guard_environment_value(records: list[dict[str, Any]]) -> None:
+        records[0]["admitted_environment"]["admitted_names"] = ["/secret/path"]
+
+    # The D18 scope mutants (bead `fln-q8qt`). The first is the defect the bead reports —
+    # the object simply not being there — and the rest are the ways an object CAN be
+    # there and still not qualify the verdict beside it. Each violates exactly one law,
+    # so a law that stops being checked is a mutant that stops dying.
+    def absent_guard_mode_closure(records: list[dict[str, Any]]) -> None:
+        records[1].pop("mode_closure")
+
+    def unregistered_guard_scan_class(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["scan_class"] = "clean"
+
+    def guard_vacuity_lie(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["scan_class"] = "traversed"
+
+    def guard_nodes_without_a_closure(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["closure_nodes"] = 3
+
+    def guard_closure_without_nodes(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"].update(
+            {
+                "scan_class": "traversed",
+                "product_roots": 1,
+                "closures_scanned": 1,
+                "closure_nodes": 0,
+            }
+        )
+
+    def guard_closure_without_a_root(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"].update(
+            {"scan_class": "traversed", "closures_scanned": 1, "closure_nodes": 1}
+        )
+
+    def guard_scope_over_a_foreign_workspace(records: list[dict[str, Any]]) -> None:
+        records[1]["mode_closure"]["nodes"] = 2
+
+    guard_mutants = [
+        ("old-schema", old_guard_schema),
+        ("missing-field", missing_guard_field),
+        ("extra-field", extra_guard_field),
+        ("false-data-grade", false_guard_data_grade),
+        ("false-unestablished", false_guard_unestablished),
+        ("missing-contract-handoff-root", missing_guard_handoff_root),
+        ("malformed-contract-handoff-root", malformed_guard_handoff_root),
+        ("broken-conservation", broken_guard_conservation),
+        ("false-root-equality", false_guard_root_equality),
+        ("unbound-compiler", unbound_guard_compiler),
+        ("environment-value", leaked_guard_environment_value),
+        ("mode-closure-absent", absent_guard_mode_closure),
+        ("mode-closure-unregistered-class", unregistered_guard_scan_class),
+        ("mode-closure-vacuity-lie", guard_vacuity_lie),
+        ("mode-closure-nodes-without-a-closure", guard_nodes_without_a_closure),
+        ("mode-closure-closure-without-nodes", guard_closure_without_nodes),
+        ("mode-closure-closure-without-a-root", guard_closure_without_a_root),
+        ("mode-closure-foreign-workspace", guard_scope_over_a_foreign_workspace),
+    ]
+    for mutant_name, mutate in guard_mutants:
+        mutant = write_guard_stream(mutant_name, mutate)
+        try:
+            validate_guard(mutant, PASS, "pass", [], str(guard_root), PASS)
+        except EvidenceError:
+            pass
+        else:
+            raise EvidenceError(f"structure-guard validator survived mutant {mutant_name}")
+    cases.append(
+        {
+            "case": "structure_guard_v5_contract",
+            "ok": True,
+            "mutants_killed": [
+                name for name, _mutate in (*provisional_mutants, *guard_mutants)
+            ],
+        }
+    )
 
     def run_case(
         name: str,
@@ -7823,8 +24678,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     ) -> dict[str, Any]:
         repo = Path(__file__).resolve().parent.parent
         check_script = repo / "scripts" / "check.sh"
-        probe_root = art_dir / f"shell_finalizer_{point}"
+        probe_signal_name = signal.Signals(signal_number).name.lower()
+        probe_root = art_dir / f"shell_finalizer_{point}_{probe_signal_name}"
         control_root = Path(f"{probe_root}.control")
+        # The three post-terminal points run the real finalization pipeline
+        # before their checkpoint; the entry points die at the first finalizer.
+        deep_pipeline = point in {"decision_write", "marker_link", "post_decision"}
         require(
             not probe_root.exists()
             and not probe_root.is_symlink()
@@ -7878,7 +24737,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 raise EvidenceError(f"finalizer probe shell was not bindable: {point}")
 
             ready_path = control_root / "ready"
-            ready_timeout_s = 180.0 if point == "post_decision" else 60.0
+            ready_timeout_s = 180.0 if deep_pipeline else 60.0
             deadline = time.monotonic() + ready_timeout_s
             ready_values: tuple[int, int] | None = None
             while time.monotonic() < deadline:
@@ -7902,10 +24761,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             if ready_values is None:
                 raise EvidenceError(f"finalizer probe readiness timed out: {point}")
             finalizer_pid, finalizer_ticks = ready_values
-            if point == "post_decision":
+            if deep_pipeline:
                 require(
                     ready_values == (0, 0),
-                    "post-decision probe unexpectedly retained an active finalizer",
+                    f"{point} probe unexpectedly retained an active finalizer",
                 )
             else:
                 require(finalizer_pid > 1, f"invalid finalizer probe PID: {point}")
@@ -7948,7 +24807,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 signal_process_handle(child.pid, child_handle, signal_number),
                 f"finalizer probe shell disappeared before signal: {point}",
             )
-            if point == "post_decision":
+            if point in {"post_decision", "marker_link"}:
+                # The decision has already been linked, so the signal must lose:
+                # the shell acknowledges it and the committed bundle survives.
                 ack_path = control_root / "signal-ack"
                 expected_ack = signal.Signals(signal_number).name.removeprefix(
                     "SIG"
@@ -7967,11 +24828,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                     time.sleep(0.005)
                 else:
                     raise EvidenceError(
-                        "post-decision signal was not acknowledged correctly"
+                        f"{point} signal was not acknowledged correctly"
                     )
                 write_new(control_root / "release", b"release\n")
 
-            communicate_timeout_s = 180 if point == "post_decision" else 120
+            communicate_timeout_s = 180 if deep_pipeline else 120
             _stdout, stderr = child.communicate(timeout=communicate_timeout_s)
             require(
                 child.returncode == expected_exit,
@@ -7985,7 +24846,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                     decision == b"",
                     f"pre-decision finalizer probe crossed its decision: {point}",
                 )
-            if point in {"spawn_bind", "active_wait"}:
+            if point in {"spawn_bind", "active_wait", "decision_write"}:
                 require(
                     b"CANCELLED: signal_" in stderr,
                     f"finalizer cancellation lacked its terminal reason: {point}",
@@ -8051,7 +24912,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 os.close(child_handle[1])
             reap_adopted_children()
         return {
-            "case": f"shell_finalizer_{point}",
+            "case": f"shell_finalizer_{point}_{probe_signal_name}",
             "ok": True,
             "signal": signal.Signals(signal_number).name,
             "process_exit": expected_exit,
@@ -8362,7 +25223,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     tree_program = (
         "import os,pathlib,subprocess,sys,time;"
         "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
-        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"  # ubs:ignore — fixed process-tree probe source.
         f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
         "time.sleep(60)"
     )
@@ -8396,7 +25257,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     leader_program = (
         "import os,pathlib,subprocess,sys;"
         "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
-        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"  # ubs:ignore — fixed process-tree probe source.
         f"pathlib.Path({str(leader_pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n')"
     )
     rc = run_supervised(
@@ -8457,8 +25318,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "code=\"import os,pathlib,signal,time;\""
         "\"signal.signal(signal.SIGTERM,lambda *_:os.write(1,b'CHILD\\\\n'));\""
         f"\"pathlib.Path({str(cancel_child_ready)!r}).write_text('ready');\""
-        "\"time.sleep(60)\";"
-        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        '"time.sleep(60)";'
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"  # ubs:ignore — fixed process-tree probe source.
         f"ready=pathlib.Path({str(cancel_child_ready)!r});\n"
         "deadline=time.monotonic()+15\n"
         "while not ready.exists() and time.monotonic()<deadline:\n time.sleep(.01)\n"
@@ -8470,6 +25331,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -8569,6 +25432,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         terminal_wrapper = subprocess.Popen(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "run",
                 "--cwd",
@@ -8639,18 +25504,405 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             }
         )
 
+    # --- HUP/INT/TERM boundary-injection campaign, runner-side boundaries
+    # (bead fln-evidence-runner-bootstrap-btk). Spawn: the signal is queued
+    # against the guardian while its launch gate still holds every watched
+    # signal blocked, so cancellation deterministically wins before the
+    # stopped child can be admitted. Readiness: the signal lands inside the
+    # deliberately widened window between readiness publication and the
+    # private release, so cancellation wins before exec. Running: the signal
+    # lands only after the released target has published its own PID. The
+    # terminal-publication boundary is the terminal_commit_* matrix above;
+    # the finalizer-side boundaries (finalizer entry, decision write, marker
+    # link, post-fsync) are the shell finalizer probes below. In every
+    # pre-release case the target argv must never execute.
+    for boundary in ("spawn", "readiness", "running"):
+        for boundary_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal_name = signal.Signals(boundary_signal).name
+            case_name = f"boundary_{boundary}_{signal_name.lower()}"
+            boundary_root = case_dir(case_name)
+            boundary_marker = boundary_root / "target-executed.marker"
+            boundary_ready = boundary_root / "stage.ready.json"
+            launch_ready = boundary_root / "launch.ready.json"
+            launch_release = boundary_root / "launch.release.json"
+            boundary_pid_file = boundary_root / "target.pid"
+            if boundary == "running":
+                boundary_program = (
+                    "import os,pathlib,time;"
+                    f"pathlib.Path({str(boundary_marker)!r}).write_text('executed');"
+                    f"pathlib.Path({str(boundary_pid_file)!r})"
+                    ".write_text(str(os.getpid()));"
+                    "time.sleep(60)"
+                )
+            else:
+                boundary_program = (
+                    "import pathlib;"
+                    f"pathlib.Path({str(boundary_marker)!r}).write_text('executed')"
+                )
+            boundary_argv = [
+                sys.executable,
+                "-I",
+                "-S",
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(art_dir),
+                "--metadata",
+                str(boundary_root / "stage.meta.json"),
+                "--stdout",
+                str(boundary_root / "stage.out"),
+                "--stderr",
+                str(boundary_root / "stage.err"),
+                "--readiness",
+                str(boundary_ready),
+                "--artifact-root",
+                str(art_dir),
+                "--capture-bytes",
+                "4096",
+                "--output-budget-bytes",
+                "65536",
+                "--timeout-ms",
+                "30000",
+                "--grace-ms",
+                "500",
+                "--stage-id",
+                case_name,
+            ]
+            if boundary == "spawn":
+                # The stop delay widens the spawn-to-admission window so the
+                # queued signal always wins during admission even under
+                # pathological scheduling of the guardian's forwarder.
+                boundary_argv += [
+                    "--launch-ready",
+                    str(launch_ready),
+                    "--launch-release",
+                    str(launch_release),
+                    "--planted",
+                    "--test-before-stop-delay-ms",
+                    "1500",
+                ]
+            elif boundary == "readiness":
+                boundary_argv += [
+                    "--planted",
+                    "--test-before-release-delay-ms",
+                    "2000",
+                ]
+            boundary_argv += ["--", sys.executable, "-c", boundary_program]
+            boundary_wrapper = subprocess.Popen(
+                boundary_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            boundary_deadline = time.monotonic() + 15
+            if boundary == "spawn":
+                launch_identity: dict[str, Any] | None = None
+                while time.monotonic() < boundary_deadline:
+                    if boundary_wrapper.poll() is not None:
+                        break
+                    try:
+                        launch_identity = read_json_object(launch_ready)
+                        break
+                    except (EvidenceError, FileNotFoundError, OSError):
+                        time.sleep(0.01)
+                require(
+                    launch_identity is not None
+                    and launch_identity.get("status") == "awaiting_release"
+                    and launch_identity.get("guardian_pid")
+                    == boundary_wrapper.pid,
+                    f"{case_name}: guardian launch readiness was not bound",
+                )
+                # W is our unreaped direct child, so this delivery cannot touch
+                # a recycled PID; the guardian holds every watched signal
+                # blocked until after its launch release, so the signal is
+                # queued ahead of the spawn boundary.
+                boundary_wrapper.send_signal(boundary_signal)
+                release_payload = dict(launch_identity)
+                release_payload["status"] = "released"
+                write_atomic_new(
+                    launch_release, canonical_json(release_payload)
+                )
+            else:
+                waited_paths = [boundary_ready]
+                if boundary == "running":
+                    waited_paths.append(boundary_pid_file)
+                while (
+                    not all(path.exists() for path in waited_paths)
+                    and boundary_wrapper.poll() is None
+                    and time.monotonic() < boundary_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    all(path.exists() for path in waited_paths),
+                    f"{case_name}: the {boundary} boundary was never reached",
+                )
+                ready_object = read_json_object(boundary_ready)
+                require(
+                    ready_object.get("status") == "ready",
+                    f"{case_name}: readiness was not the admitted-child form",
+                )
+                boundary_wrapper.send_signal(boundary_signal)
+            _boundary_out, boundary_err = boundary_wrapper.communicate(
+                timeout=30
+            )
+            require(
+                boundary_wrapper.returncode == CANCELLED,
+                f"{case_name}: wrapper exit {boundary_wrapper.returncode}: "
+                f"{boundary_err[-500:]!r}",
+            )
+            boundary_meta = read_json_object(
+                boundary_root / "stage.meta.json"
+            )
+            validate_supervisor_object(
+                boundary_root / "stage.meta.json",
+                1,
+                boundary_meta,
+                expected_stage_id=case_name,
+            )
+            require(
+                boundary_meta["classification"] == "cancelled"
+                and boundary_meta["reason_code"] == f"signal_{signal_name}"
+                and hmac.compare_digest(
+                    str(boundary_meta["cancel_signal"]), signal_name
+                ),
+                f"{case_name}: cancellation was not typed to its boundary signal",
+            )
+            if boundary == "running":
+                require(
+                    boundary_marker.exists(),
+                    f"{case_name}: released target never reached execution",
+                )
+                boundary_pid = int(
+                    boundary_pid_file.read_text(encoding="ascii")
+                )
+                require(
+                    boundary_pid > 1 and not process_alive(boundary_pid),
+                    f"{case_name}: cancellation left the target alive",
+                )
+            else:
+                require(
+                    not boundary_marker.exists(),
+                    f"{case_name}: target executed across a {boundary}-boundary "
+                    "cancellation",
+                )
+            if boundary == "spawn":
+                spawn_ready_object = read_json_object(boundary_ready)
+                require(
+                    spawn_ready_object.get("status") == "setup_cancelled",
+                    f"{case_name}: spawn-boundary readiness was not typed "
+                    "setup_cancelled",
+                )
+            cases.append(
+                {
+                    "case": case_name,
+                    "ok": True,
+                    "metadata": str(boundary_root / "stage.meta.json"),
+                }
+            )
+
+    # --- named stress gaps (bead fln-evidence-runner-bootstrap-btk): real
+    # descriptor exhaustion at admission, cancellation storms, and PID
+    # allocation churn under live supervision. Forced same-PID reuse needs
+    # namespace privileges the no-mock lane does not hold; reuse safety is
+    # carried by the identity-refusal cases (emergency_kill_rejects_unrelated,
+    # bound_group_stale_identity, direct_child_cleanup_identity) plus the
+    # allocation churn here, and by the unreaped-direct-child law.
+    rc, meta, exhaustion_root = run_case(
+        "admission_fd_exhaustion",
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        setup_timeout=10_000,
+        fault_point="admission_fd_exhaustion",
+    )
+    require(rc == SETUP_FAILURE, "descriptor exhaustion changed the exit law")
+    require(
+        meta["classification"] == "internal_fault"
+        and meta["reason_code"] == "supervisor_or_capture_failure"
+        and any("Too many open files" in error for error in meta["errors"])
+        and meta["phase_timing"]["execution_start_ns"] is None,
+        "descriptor exhaustion was not a typed contained setup fault",
+    )
+    cases.append(
+        {
+            "case": "admission_fd_exhaustion",
+            "ok": True,
+            "metadata": str(exhaustion_root / "stage.meta.json"),
+        }
+    )
+
+    def run_cancellation_storm(
+        name: str,
+        wrapper_count: int,
+        churn_processes: int = 0,
+    ) -> None:
+        storm_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        churners: list[subprocess.Popen[bytes]] = []
+        wrappers: list[tuple[str, subprocess.Popen[bytes], Path, Path]] = []
+        surviving_targets: list[tuple[str, int]] = []
+        churn_program = (
+            "import os\n"
+            "while True:\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        os._exit(0)\n"
+            "    os.waitpid(pid, 0)\n"
+        )
+        try:
+            for _ in range(churn_processes):
+                churners.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", churn_program],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            for index in range(wrapper_count):
+                member = f"{name}_{index}"
+                member_root = case_dir(member)
+                member_pid_file = member_root / "target.pid"
+                member_program = (
+                    "import os,pathlib,time;"
+                    f"pathlib.Path({str(member_pid_file)!r})"
+                    ".write_text(str(os.getpid()));"
+                    "time.sleep(60)"
+                )
+                wrappers.append(
+                    (
+                        member,
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                str(Path(__file__).resolve()),
+                                "run",
+                                "--cwd",
+                                str(art_dir),
+                                "--metadata",
+                                str(member_root / "stage.meta.json"),
+                                "--stdout",
+                                str(member_root / "stage.out"),
+                                "--stderr",
+                                str(member_root / "stage.err"),
+                                "--readiness",
+                                str(member_root / "stage.ready.json"),
+                                "--artifact-root",
+                                str(art_dir),
+                                "--capture-bytes",
+                                "4096",
+                                "--output-budget-bytes",
+                                "65536",
+                                "--timeout-ms",
+                                "30000",
+                                "--grace-ms",
+                                "500",
+                                "--stage-id",
+                                member,
+                                "--",
+                                sys.executable,
+                                "-c",
+                                member_program,
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        ),
+                        member_root,
+                        member_pid_file,
+                    )
+                )
+            storm_deadline = time.monotonic() + 20
+            for member, wrapper, member_root, member_pid_file in wrappers:
+                while (
+                    not (
+                        member_pid_file.exists()
+                        and (member_root / "stage.ready.json").exists()
+                    )
+                    and wrapper.poll() is None
+                    and time.monotonic() < storm_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    member_pid_file.exists()
+                    and (member_root / "stage.ready.json").exists(),
+                    f"{member}: storm target never became stormable",
+                )
+            # The storm proper: twenty rapid rounds of alternating watched
+            # signals against every wrapper, with no pacing between rounds.
+            for round_index in range(20):
+                for _member, wrapper, _member_root, _member_pid_file in wrappers:
+                    if wrapper.poll() is None:
+                        wrapper.send_signal(
+                            storm_signals[round_index % len(storm_signals)]
+                        )
+            for member, wrapper, member_root, member_pid_file in wrappers:
+                _storm_out, storm_err = wrapper.communicate(timeout=60)
+                require(
+                    wrapper.returncode == CANCELLED,
+                    f"{member}: storm wrapper exit {wrapper.returncode}: "
+                    f"{storm_err[-300:]!r}",
+                )
+                storm_meta = read_json_object(member_root / "stage.meta.json")
+                validate_supervisor_object(
+                    member_root / "stage.meta.json",
+                    1,
+                    storm_meta,
+                    expected_stage_id=member,
+                )
+                require(
+                    storm_meta["classification"] == "cancelled"
+                    and storm_meta["cancel_signal"]
+                    in {"SIGHUP", "SIGINT", "SIGTERM"}
+                    and storm_meta["reason_code"]
+                    == f"signal_{storm_meta['cancel_signal']}",
+                    f"{member}: storm cancellation lost its typed terminal",
+                )
+                surviving_targets.append(
+                    (
+                        member,
+                        int(member_pid_file.read_text(encoding="ascii")),
+                    )
+                )
+        finally:
+            for _member, wrapper, _member_root, _member_pid_file in wrappers:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.communicate(timeout=10)
+            for churner in churners:
+                churner.kill()
+                churner.communicate(timeout=10)
+            reap_adopted_children()
+        # Liveness is asserted only after every churner is dead, so a recycled
+        # target PID cannot alias a live churn child.
+        for member, storm_pid in surviving_targets:
+            require(
+                storm_pid > 1 and not process_alive(storm_pid),
+                f"{member}: storm left the target alive",
+            )
+        cases.append(
+            {
+                "case": name,
+                "ok": True,
+                "wrappers": wrapper_count,
+                "churners": churn_processes,
+            }
+        )
+
+    run_cancellation_storm("cancellation_storm", 1)
+    run_cancellation_storm("concurrent_cancellation_storm", 6)
+    run_cancellation_storm("pid_churn_storm", 4, churn_processes=4)
+
     emergency_root = case_dir("emergency_kill_detached")
     emergency_pid_file = emergency_root / "pids.txt"
     emergency_program = (
         "import os,pathlib,subprocess,sys,time;"
         "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
-        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"  # ubs:ignore — fixed process-tree probe source.
         f"pathlib.Path({str(emergency_pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
         "time.sleep(60)"
     )
     emergency_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -8808,6 +26060,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     guardian_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -8869,13 +26123,15 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     guardian_fault_program = (
         "import os,pathlib,signal,subprocess,sys,time;"
         "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
-        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"  # ubs:ignore — fixed process-tree probe source.
         f"pathlib.Path({str(guardian_fault_pids)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
         "time.sleep(60)"
     )
     guardian_fault_wrapper = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "run",
             "--cwd",
@@ -8949,7 +26205,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     pdeath_pid_file = pdeath_root / "pids.txt"
     pdeath_program = (
         "import os,pathlib,subprocess,sys,time;"
-        "p=subprocess.Popen([sys.executable,"
+        "p=subprocess.Popen([sys.executable,'-I','-S',"
         f"{str(Path(__file__).resolve())!r},'stopped-exec',"
         "'--expected-parent-pid',str(os.getpid()),'--',sys.executable,'-c',"
         "'import time;time.sleep(60)'],start_new_session=True,"
@@ -9091,6 +26347,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         identity_probe = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 str(Path(__file__).resolve()),
                 "process-start-ticks",
                 "--pid",
@@ -9228,6 +26486,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     bound_group_child = subprocess.Popen(
         [
             sys.executable,
+            "-I",
+            "-S",
             str(Path(__file__).resolve()),
             "stopped-exec",
             "--expected-parent-pid",
@@ -9432,36 +26692,67 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
-    cases.append(
-        run_shell_finalizer_probe(
-            "spawn_bind",
-            signal.SIGHUP,
-            129,
-            expect_committed_bundle=False,
+    # The complete finalizer-side boundary matrix (bead
+    # fln-evidence-runner-bootstrap-btk): every watched signal at every named
+    # post-terminal boundary. Before the bundle decision (finalizer entry via
+    # spawn_bind/active_wait, and decision_write immediately before the
+    # publisher spawns) the signal must win: typed cancellation, an empty
+    # claimed decision, and no committed bundle. From the linked decision
+    # onward (marker_link holds the decision-to-marker window open,
+    # post_decision fires after the durable commit) the signal must lose: the
+    # committed bundle survives and validates. helper_failure exercises the
+    # cleanup-uncertainty dimension of finalizer entry.
+    for probe_signal, probe_exit in (
+        (signal.SIGHUP, 129),
+        (signal.SIGINT, 130),
+        (signal.SIGTERM, 143),
+    ):
+        cases.append(
+            run_shell_finalizer_probe(
+                "spawn_bind",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
         )
-    )
-    cases.append(
-        run_shell_finalizer_probe(
-            "active_wait",
-            signal.SIGINT,
-            130,
-            expect_committed_bundle=False,
+        cases.append(
+            run_shell_finalizer_probe(
+                "active_wait",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
         )
-    )
+        cases.append(
+            run_shell_finalizer_probe(
+                "decision_write",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
+        )
+        cases.append(
+            run_shell_finalizer_probe(
+                "marker_link",
+                probe_signal,
+                PASS,
+                expect_committed_bundle=True,
+            )
+        )
+        cases.append(
+            run_shell_finalizer_probe(
+                "post_decision",
+                probe_signal,
+                PASS,
+                expect_committed_bundle=True,
+            )
+        )
     cases.append(
         run_shell_finalizer_probe(
             "helper_failure",
             signal.SIGTERM,
             SETUP_FAILURE,
             expect_committed_bundle=False,
-        )
-    )
-    cases.append(
-        run_shell_finalizer_probe(
-            "post_decision",
-            signal.SIGTERM,
-            PASS,
-            expect_committed_bundle=True,
         )
     )
 
@@ -9535,7 +26826,1006 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         pass
     else:
         raise EvidenceError("unterminated run was accepted")
-    cases.append({"case": "malformed_evidence", "ok": True})
+    cases.append(
+        {"case": "strict_ndjson_validator", "ok": True, "mutants_killed": 2}
+    )
+
+    identity_validation_root = case_dir("environment_identity_matrix_validation")
+    identity_run_id = "environment-identity-self-test"
+
+    def identity_hex(index: int) -> str:
+        return f"{index:064x}"
+
+    def identity_log(records: Sequence[dict[str, Any]]) -> bytes:
+        return (
+            b"running 1 test\n"
+            + b"".join(
+                (
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+                for record in records
+            )
+            + b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    def write_identity_fixture(
+        label: str,
+        records: Sequence[dict[str, Any]],
+        *,
+        stderr: bytes = b"",
+    ) -> tuple[Path, Path]:
+        stdout_path = identity_validation_root / f"{label}.out"
+        stderr_path = identity_validation_root / f"{label}.err"
+        write_new(stdout_path, identity_log(records))
+        write_new(stderr_path, stderr)
+        return stdout_path, stderr_path
+
+    def identity_validator_call(
+        validator: Callable[..., dict[str, Any]],
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> dict[str, Any]:
+        return validator(
+            stdout_path,
+            stderr_path,
+            identity_run_id,
+            0,
+            artifact_root=identity_validation_root,
+            expected_stdout_artifact=stdout_path.name,
+            expected_stderr_artifact=stderr_path.name,
+        )
+
+    def expect_identity_rejection(
+        label: str,
+        validator: Callable[..., dict[str, Any]],
+        records: Sequence[dict[str, Any]],
+        *,
+        stderr: bytes = b"",
+    ) -> None:
+        stdout_path, stderr_path = write_identity_fixture(
+            label, records, stderr=stderr
+        )
+        try:
+            identity_validator_call(validator, stdout_path, stderr_path)
+        except EvidenceError:
+            return
+        raise EvidenceError(f"{label} environment-identity mutant was accepted")
+
+    tag_records: list[dict[str, Any]] = []
+    for index, ((family, variant), golden) in enumerate(
+        DECLARATION_TAG_GOLDENS.items(), 1
+    ):
+        kind, tag, stream_bytes, stream_hash, digest = golden
+        root = identity_hex(100 + index)
+        tag_records.append(
+            {
+                "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.12", "fln-amv.14"],
+                "scenario": "declaration-tag-matrix",
+                "case": f"{family}/{variant}",
+                "family": family,
+                "variant": variant,
+                "kind": kind,
+                "canonical_tag": tag,
+                "production_tag": tag,
+                "tag_source": "explicit_exhaustive_match",
+                "stream_bytes": stream_bytes,
+                "golden_stream_bytes": stream_bytes,
+                "stream_hash": stream_hash,
+                "golden_stream_hash": stream_hash,
+                "expected_digest": digest,
+                "actual_digest": digest,
+                "golden_digest": digest,
+                "repeated_digest": digest,
+                "digest_relation": "equal",
+                "repeat_relation": "equal",
+                "expected_root": root,
+                "actual_root": root,
+                "root_relation": "equal",
+                "model": "independent-complete-stream-v1",
+                "status": "pass",
+                "elapsed_us": index,
+                "final_state": "verified",
+            }
+        )
+    aggregate_root = identity_hex(500)
+    for index, workers in enumerate((1, 8, 32), 1):
+        tag_records.append(
+            {
+                "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.12", "fln-amv.14"],
+                "scenario": "declaration-tag-thread-matrix",
+                "worker_count": workers,
+                "distinct_root_count": 1,
+                "expected_root": aggregate_root,
+                "actual_root": aggregate_root,
+                "root_relation": "equal",
+                "order_independence": "proven",
+                "status": "pass",
+                "elapsed_us": index,
+                "final_state": "verified",
+            }
+        )
+    tag_records.append(
+        {
+            "schema": DECLARATION_TAG_MATRIX_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.12", "fln-amv.14"],
+            "scenario": "declaration-tag-summary",
+            "case_count": 7,
+            "unique_digest_count": 7,
+            "pairwise_comparisons": 21,
+            "expected_pairwise_comparisons": 21,
+            "thread_matrix": [1, 8, 32],
+            "thread_matrix_roots_distinct": 1,
+            "canonical_root": aggregate_root,
+            "source_order_defect_root": identity_hex(501),
+            "source_order_defect_relation": "differs",
+            "omitted_declaration_root": identity_hex(502),
+            "omitted_declaration_relation": "differs",
+            "named_defects_discriminated": [
+                "cast_after_source_reorder",
+                "omitted_declaration",
+            ],
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 10,
+            "final_state": "verified",
+        }
+    )
+    tag_stdout, tag_stderr = write_identity_fixture("tag_valid", tag_records)
+    require(
+        identity_validator_call(
+            validate_declaration_tag_matrix, tag_stdout, tag_stderr
+        )["records"]
+        == 11,
+        "valid declaration-tag matrix was not accepted",
+    )
+    tag_missing_field = json.loads(json.dumps(tag_records))
+    del tag_missing_field[0]["production_tag"]
+    expect_identity_rejection(
+        "tag_missing_field",
+        validate_declaration_tag_matrix,
+        tag_missing_field,
+    )
+    tag_wrong_pin = json.loads(json.dumps(tag_records))
+    tag_wrong_pin[0]["golden_digest"] = identity_hex(900)
+    expect_identity_rejection(
+        "tag_wrong_pin",
+        validate_declaration_tag_matrix,
+        tag_wrong_pin,
+    )
+
+    membership_kinds = (
+        "definition",
+        "theorem",
+        "opaque",
+        "inductive",
+        "recursor",
+    )
+    membership_cases = {
+        "empty": 0,
+        "singleton": 1,
+        "repeated": 2,
+        "ordered": 2,
+        "reordered": 2,
+        "renamed": 2,
+        "declared_large": 4096,
+    }
+    membership_records: list[dict[str, Any]] = []
+    membership_matrix: dict[tuple[str, str], dict[str, Any]] = {}
+    identity_index = 1_000
+    for kind in membership_kinds:
+        for membership_case, member_count in membership_cases.items():
+            digest = identity_hex(identity_index)
+            root = identity_hex(identity_index + 500)
+            identity_index += 1
+            row = {
+                "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.1", "fln-amv.14"],
+                "scenario": "declaration-membership-matrix",
+                "kind": kind,
+                "membership_case": membership_case,
+                "member_count": member_count,
+                "expected_digest": digest,
+                "actual_digest": digest,
+                "repeated_digest": digest,
+                "digest_relation": "equal",
+                "repeat_relation": "equal",
+                "expected_root": root,
+                "actual_root": root,
+                "root_relation": "equal",
+                "root_propagation": "exact",
+                "model": "independent-canonical-membership-v1",
+                "status": "pass",
+                "elapsed_us": identity_index,
+                "final_state": "verified",
+            }
+            membership_records.append(row)
+            membership_matrix[(kind, membership_case)] = row
+    for kind_index, kind in enumerate(membership_kinds, 1):
+        ordered = membership_matrix[(kind, "ordered")]
+        membership_records.append(
+            {
+                "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.1", "fln-amv.14"],
+                "scenario": "declaration-membership-defects",
+                "kind": kind,
+                "canonical_digest": ordered["actual_digest"],
+                "dropped_list_digest": identity_hex(2_000 + kind_index),
+                "dropped_list_relation": "differs",
+                "omitted_count_digest": identity_hex(2_100 + kind_index),
+                "omitted_count_relation": "differs",
+                "sorted_members_digest": ordered["actual_digest"],
+                "sorted_members_relation": "differs",
+                "sorted_members_order_collapse": True,
+                "wrong_domain_digest": identity_hex(2_200 + kind_index),
+                "wrong_domain_relation": "differs",
+                "real_root": ordered["actual_root"],
+                "stale_digest_root": identity_hex(2_300 + kind_index),
+                "root_propagation_relation": "differs",
+                "named_defects_discriminated": [
+                    "dropped_list",
+                    "omitted_count",
+                    "reordered_membership",
+                    "wrong_domain",
+                    "failed_root_propagation",
+                ],
+                "boundary_distinctions": 7,
+                "status": "pass",
+                "final_state": "verified",
+            }
+        )
+    membership_records.append(
+        {
+            "schema": DECLARATION_MEMBERSHIP_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.1", "fln-amv.14"],
+            "scenario": "declaration-membership-summary",
+            "kind_count": 5,
+            "membership_case_count": 7,
+            "matrix_rows": 40,
+            "large_member_count": 4096,
+            "opaque_solo_digest": membership_matrix[
+                ("opaque", "singleton")
+            ]["actual_digest"],
+            "opaque_grouped_digest": membership_matrix[
+                ("opaque", "ordered")
+            ]["actual_digest"],
+            "opaque_regression_relation": "differs",
+            "root_propagation": "exact",
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 1,
+            "final_state": "verified",
+        }
+    )
+    membership_stdout, membership_stderr = write_identity_fixture(
+        "membership_valid", membership_records
+    )
+    require(
+        identity_validator_call(
+            validate_declaration_membership,
+            membership_stdout,
+            membership_stderr,
+        )["records"]
+        == 41,
+        "valid declaration-membership matrix was not accepted",
+    )
+    membership_false_collapse = json.loads(json.dumps(membership_records))
+    opaque_defect = next(
+        row
+        for row in membership_false_collapse
+        if row.get("scenario") == "declaration-membership-defects"
+        and row.get("kind") == "opaque"
+    )
+    opaque_defect["sorted_members_digest"] = membership_matrix[
+        ("opaque", "reordered")
+    ]["actual_digest"]
+    expect_identity_rejection(
+        "membership_false_collapse",
+        validate_declaration_membership,
+        membership_false_collapse,
+    )
+
+    merge_tags = {
+        "append_ordered": 0,
+        "set_union": 1,
+        "conflicts_require_review": 2,
+    }
+    checkpoint_tags = {"journal_suffix": 0, "full_journal": 1}
+    provenance_tags = {"understood": 0, "opaque": 1}
+    descriptor_records: list[dict[str, Any]] = []
+    descriptor_matrix: dict[tuple[str, str, str], dict[str, Any]] = {}
+    descriptor_index = 3_000
+    for merge, merge_tag in merge_tags.items():
+        for checkpoint, checkpoint_tag in checkpoint_tags.items():
+            for provenance, provenance_tag in provenance_tags.items():
+                digest = identity_hex(descriptor_index)
+                root = identity_hex(descriptor_index + 500)
+                descriptor_index += 1
+                key = (merge, checkpoint, provenance)
+                row = {
+                    "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                    "version": ENVIRONMENT_IDENTITY_VERSION,
+                    "run_id": identity_run_id,
+                    "beads": ["fln-amv.2", "fln-amv.14"],
+                    "scenario": "extension-descriptor-matrix",
+                    "merge": merge,
+                    "merge_tag": merge_tag,
+                    "checkpoint": checkpoint,
+                    "checkpoint_tag": checkpoint_tag,
+                    "provenance": provenance,
+                    "provenance_tag": provenance_tag,
+                    "descriptor_position": "before_journal",
+                    "journal_entries": 2,
+                    "expected_digest": digest,
+                    "actual_digest": digest,
+                    "repeated_digest": digest,
+                    "digest_relation": "equal",
+                    "repeat_relation": "equal",
+                    "expected_root": root,
+                    "actual_root": root,
+                    "root_relation": "equal",
+                    "root_propagation": "exact",
+                    "model": "independent-descriptor-layout-v1",
+                    "status": "pass",
+                    "elapsed_us": descriptor_index,
+                    "final_state": "verified",
+                }
+                descriptor_records.append(row)
+                descriptor_matrix[key] = row
+    for defect_index, (key, row) in enumerate(descriptor_matrix.items(), 1):
+        merge, checkpoint, provenance = key
+        canonical = row["actual_digest"]
+        tag_discriminating = merge != "conflicts_require_review"
+        field_discriminating = merge_tags[merge] != checkpoint_tags[checkpoint]
+        descriptor_records.append(
+            {
+                "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+                "version": ENVIRONMENT_IDENTITY_VERSION,
+                "run_id": identity_run_id,
+                "beads": ["fln-amv.2", "fln-amv.14"],
+                "scenario": "extension-descriptor-defects",
+                "merge": merge,
+                "checkpoint": checkpoint,
+                "provenance": provenance,
+                "canonical_digest": canonical,
+                "omit_merge_digest": identity_hex(4_000 + defect_index),
+                "omit_merge_relation": "differs",
+                "omit_checkpoint_digest": identity_hex(4_100 + defect_index),
+                "omit_checkpoint_relation": "differs",
+                "omit_provenance_digest": identity_hex(4_200 + defect_index),
+                "omit_provenance_relation": "differs",
+                "swapped_tag_digest": (
+                    identity_hex(4_300 + defect_index)
+                    if tag_discriminating
+                    else canonical
+                ),
+                "swapped_tag_relation": (
+                    "differs"
+                    if tag_discriminating
+                    else "equal_by_construction"
+                ),
+                "swapped_tag_discriminating": tag_discriminating,
+                "swapped_field_digest": (
+                    identity_hex(4_400 + defect_index)
+                    if field_discriminating
+                    else canonical
+                ),
+                "swapped_field_relation": (
+                    "differs"
+                    if field_discriminating
+                    else "equal_by_construction"
+                ),
+                "swapped_field_discriminating": field_discriminating,
+                "debug_text_digest": identity_hex(4_500 + defect_index),
+                "debug_text_relation": "differs",
+                "after_journal_digest": identity_hex(4_600 + defect_index),
+                "after_journal_relation": "differs",
+                "named_defects_discriminated": [
+                    "omitted_dimension",
+                    "swapped_tag",
+                    "debug_text",
+                    "after_journal",
+                ],
+                "status": "pass",
+                "final_state": "verified",
+            }
+        )
+    descriptor_records.append(
+        {
+            "schema": EXTENSION_DESCRIPTOR_MATRIX_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.2", "fln-amv.14"],
+            "scenario": "extension-descriptor-summary",
+            "combination_count": 12,
+            "merge_variants": 3,
+            "checkpoint_variants": 2,
+            "provenance_variants": 2,
+            "distinct_delta_digests": 12,
+            "distinct_logical_roots": 12,
+            "descriptor_position": "before_journal",
+            "matrix_rows": 24,
+            "root_propagation": "exact",
+            "claim_type": "bounded_model",
+            "status": "pass",
+            "elapsed_us": 1,
+            "final_state": "verified",
+        }
+    )
+    descriptor_stdout, descriptor_stderr = write_identity_fixture(
+        "descriptor_valid", descriptor_records
+    )
+    require(
+        identity_validator_call(
+            validate_extension_descriptor_matrix,
+            descriptor_stdout,
+            descriptor_stderr,
+        )["records"]
+        == 25,
+        "valid extension-descriptor matrix was not accepted",
+    )
+    descriptor_false_conditional = json.loads(json.dumps(descriptor_records))
+    nondiscriminating = next(
+        row
+        for row in descriptor_false_conditional
+        if row.get("scenario") == "extension-descriptor-defects"
+        and row.get("merge") == "conflicts_require_review"
+    )
+    nondiscriminating["swapped_tag_digest"] = identity_hex(9_000)
+    expect_identity_rejection(
+        "descriptor_false_conditional",
+        validate_extension_descriptor_matrix,
+        descriptor_false_conditional,
+    )
+
+    environment_state_records = [
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.5", "fln-amv.7"],
+            "scenario": "persistent-journal",
+            "status": "pass",
+            "entry_count": 69,
+            "chunk_capacity": 32,
+            "chunk_count": 3,
+            "node_count": 4,
+            "shared_node_count": 2,
+            "fresh_node_count": 2,
+            "append_operations": 69,
+            "replay_operations": 69,
+            "node_allocations": 106,
+            "copied_child_slots": 77,
+            "copied_entry_slots": 1002,
+            "payload_bytes": 552,
+            "expected_order_hash": "8ac9a67f1111de29",
+            "actual_order_hash": "8ac9a67f1111de29",
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "snapshot_root": (
+                "8f1976245ae9dce33f3eb0d3febd2bc"
+                "32e2b5f1f88710c7aa579b80b0c1705ab"
+            ),
+            "elapsed_us": 1,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-roundtrip",
+            "mode": "journal_suffix",
+            "status": "pass",
+            "base_id": (
+                "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                "46bcc9c5ff573f4f9d93997677d632ee"
+            ),
+            "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+            "restored_id": (
+                "8d00a22b42354950b09dc8f2e927c523"
+                "7dc7357cbd2bec7985fff5770b753972"
+            ),
+            "base_root": (
+                "8f1976245ae9dce33f3eb0d3febd2bc"
+                "32e2b5f1f88710c7aa579b80b0c1705ab"
+            ),
+            "checkpoint_base_root": (
+                "a9c5fd7d6f4e70ce4c0a6cd3f90c9355"
+                "46bcc9c5ff573f4f9d93997677d632ee"
+            ),
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "base_entries": 64,
+            "checkpoint_entries": 5,
+            "restored_entries": 69,
+            "payload_bytes": 40,
+            "prefix_lookup_steps": 2,
+            "capture_operations": 5,
+            "restore_operations": 5,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "restored",
+            "actual_outcome": "restored",
+            "elapsed_us": 2,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-roundtrip",
+            "mode": "full_journal",
+            "status": "pass",
+            "base_id": None,
+            "checkpoint_id": "v1-full-37-38b8cd0e43c2cb09",
+            "restored_id": (
+                "56b471fc08e0aaf91410cb01467c5a865"
+                "23f6cfb0efd037c782c61818c6c988b"
+            ),
+            "base_root": None,
+            "checkpoint_base_root": None,
+            "expected_root": (
+                "0af8c87b8a15bb34bc78108eadf4f6b0"
+                "640051ba9678536bd17645d11263c131"
+            ),
+            "actual_root": (
+                "0af8c87b8a15bb34bc78108eadf4f6b0"
+                "640051ba9678536bd17645d11263c131"
+            ),
+            "base_entries": 0,
+            "checkpoint_entries": 37,
+            "restored_entries": 37,
+            "payload_bytes": 296,
+            "prefix_lookup_steps": 0,
+            "capture_operations": 37,
+            "restore_operations": 37,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "restored",
+            "actual_outcome": "restored",
+            "elapsed_us": 3,
+            "final_state": "verified",
+        },
+        {
+            "schema": ENVIRONMENT_STATE_SCHEMA,
+            "version": ENVIRONMENT_IDENTITY_VERSION,
+            "run_id": identity_run_id,
+            "beads": ["fln-amv.7"],
+            "scenario": "checkpoint-negative-recovery",
+            "mode": "journal_suffix",
+            "status": "pass",
+            "base_id": (
+                "c0f8dd130cf1f9eccd9dd575a0ee9ddd"
+                "75654c7afd999ffcfbb1bb557ca2f203"
+            ),
+            "checkpoint_id": "v1-suffix-5-7567db5a9df19e29",
+            "restored_id": (
+                "8d00a22b42354950b09dc8f2e927c523"
+                "7dc7357cbd2bec7985fff5770b753972"
+            ),
+            "base_root_before": (
+                "525e3fa4730a11ab0cbc6c56d10282c3"
+                "80cd0b043751888bb15174fd17df5bbc"
+            ),
+            "base_root_after": (
+                "525e3fa4730a11ab0cbc6c56d10282c3"
+                "80cd0b043751888bb15174fd17df5bbc"
+            ),
+            "expected_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "actual_root": (
+                "cffbec6eac072caa55a121f4e21f4bc6"
+                "ac9c13bb324470a8f8ff8ba04ab797f9"
+            ),
+            "base_entries": 64,
+            "checkpoint_entries": 5,
+            "restored_entries": 69,
+            "entry_limit": 1000,
+            "payload_byte_limit": 64000,
+            "expected_outcome": "base_history_mismatch",
+            "actual_outcome": "base_history_mismatch",
+            "recovery_outcome": "restored",
+            "elapsed_us": 4,
+            "final_state": "clean_recovery",
+        },
+    ]
+    state_stdout, state_stderr = write_identity_fixture(
+        "environment_state_valid", environment_state_records
+    )
+    require(
+        identity_validator_call(
+            validate_environment_state,
+            state_stdout,
+            state_stderr,
+        )["records"]
+        == 4,
+        "valid environment-state evidence was not accepted",
+    )
+    expect_identity_rejection(
+        "environment_state_missing",
+        validate_environment_state,
+        environment_state_records[:-1],
+    )
+    state_extra = json.loads(json.dumps(environment_state_records))
+    state_extra.append(json.loads(json.dumps(state_extra[-1])))
+    expect_identity_rejection(
+        "environment_state_extra",
+        validate_environment_state,
+        state_extra,
+    )
+    state_duplicate = json.loads(json.dumps(environment_state_records))
+    state_duplicate[2] = json.loads(json.dumps(state_duplicate[1]))
+    expect_identity_rejection(
+        "environment_state_duplicate",
+        validate_environment_state,
+        state_duplicate,
+    )
+    state_swapped = json.loads(json.dumps(environment_state_records))
+    state_swapped[1], state_swapped[2] = state_swapped[2], state_swapped[1]
+    expect_identity_rejection(
+        "environment_state_swapped",
+        validate_environment_state,
+        state_swapped,
+    )
+    state_wrong_collision = json.loads(json.dumps(environment_state_records))
+    state_wrong_collision[3]["checkpoint_id"] = state_wrong_collision[2][
+        "checkpoint_id"
+    ]
+    expect_identity_rejection(
+        "environment_state_wrong_collision",
+        validate_environment_state,
+        state_wrong_collision,
+    )
+    state_stale = json.loads(json.dumps(environment_state_records))
+    state_stale[3]["base_root_after"] = state_stale[1]["base_root"]
+    expect_identity_rejection(
+        "environment_state_stale",
+        validate_environment_state,
+        state_stale,
+    )
+    state_merged = json.loads(json.dumps(environment_state_records))
+    state_merged[2]["run_id"] = "another-run"
+    expect_identity_rejection(
+        "environment_state_merged_stream",
+        validate_environment_state,
+        state_merged,
+    )
+    state_incomplete = json.loads(json.dumps(environment_state_records))
+    del state_incomplete[3]["final_state"]
+    expect_identity_rejection(
+        "environment_state_incomplete",
+        validate_environment_state,
+        state_incomplete,
+    )
+
+    def declaration_admission_fixture(
+        label: str,
+    ) -> list[dict[str, Any]]:
+        envelope = {
+            "version": 1,
+            "run_id": identity_run_id,
+            "bead": "franken_lean-j8h",
+            "claim_id": (
+                "franken_lean-j8h-declaration-admission-resource-bounds"
+            ),
+            "claim_type": "bounded_model",
+            "invariant_id": "FL-INV-07",
+            "invariant_relation": "inconclusive-is-not-rejected",
+            "gate_id": "W2",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": (
+                "not_applicable_internal_declaration_admission"
+            ),
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "cache_state": "uncontrolled",
+            "canonical_input_root": DECLARATION_ADMISSION_INPUT_ROOT,
+            "cwd": "/tmp/self-test/crates/fln-env",
+            "argv": [DECLARATION_ADMISSION_ARGV],
+            "stdout_artifact": f"{label}.out",
+            "stderr_artifact": f"{label}.err",
+            "timing_used_as_gate": False,
+        }
+
+        def detail(
+            scenario: str,
+            step: str,
+            step_index: int,
+            declaration: str,
+            final_state: str,
+        ) -> dict[str, Any]:
+            return {
+                "schema": DECLARATION_ADMISSION_SCHEMA,
+                **envelope,
+                "scenario": scenario,
+                "step": step,
+                "step_index": step_index,
+                "declaration": declaration,
+                "status": "pass",
+                "cleanup_status": "not_applicable",
+                "final_state": final_state,
+            }
+
+        records: list[dict[str, Any]] = []
+        records.append(
+            {
+                **detail(
+                    "admitted-transaction",
+                    "admitted",
+                    0,
+                    "Admitted",
+                    "declaration-published-and-base-unchanged",
+                ),
+                "budget": dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET),
+                "usage": {
+                    "level_params": 2,
+                    "mutual_rows": 0,
+                    "constructor_rows": 0,
+                    "recursor_rules": 0,
+                    "canonical_bytes": 87,
+                    "expressions": 1,
+                    "expr_nodes": 1,
+                    "expanded_weight": 1,
+                    "max_logical_depth": 1,
+                },
+                "canonical_digest": (
+                    "8de3ad5e3cb6525929228ad73fea85aa7"
+                    "1b4685d32a4b647599c7e9e31f80291"
+                ),
+                "limit_name": None,
+                "allowed": None,
+                "observed": None,
+                "structural_unit": None,
+                "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                "published_root": (
+                    "4b6ce45719dce319af9c2bf24b3c12bf"
+                    "012e194b49952173f35a9563690d6abf"
+                ),
+                "authoritative": True,
+                "published": True,
+                "cacheable": True,
+                "expected_outcome": "admitted",
+                "actual_outcome": "admitted",
+                "first_divergence": None,
+            }
+        )
+        for offset, expected in enumerate(DECLARATION_ADMISSION_REFUSALS):
+            (
+                limit_name,
+                is_dimension,
+                measured_by,
+                observed,
+                structural_unit,
+                progress,
+            ) = expected
+            budget = dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET)
+            budget[f"max_{limit_name}"] = 0
+            records.append(
+                {
+                    **detail(
+                        "limit-refusal",
+                        f"refusal-{limit_name}",
+                        offset + 1,
+                        f"Refused{offset}",
+                        "nothing-published-and-base-unchanged",
+                    ),
+                    "budget": budget,
+                    "usage": None,
+                    "canonical_digest": None,
+                    "limit_name": limit_name,
+                    "is_declaration_dimension": is_dimension,
+                    "measured_by": measured_by,
+                    "allowed": 0,
+                    "observed": observed,
+                    "structural_unit": structural_unit,
+                    "progress": progress,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": None,
+                    "authoritative": False,
+                    "published": False,
+                    "cacheable": False,
+                    "expected_outcome": "inconclusive-resource-exhausted",
+                    "actual_outcome": "inconclusive-resource-exhausted",
+                    "first_divergence": None,
+                }
+            )
+        for step_index, step, checkpoint in (
+            (8, "cancel-before-expression", "before-expression/0"),
+            (9, "cancel-before-publication", "before-publication"),
+        ):
+            records.append(
+                {
+                    **detail(
+                        "cancellation",
+                        step,
+                        step_index,
+                        "Cancelled",
+                        "nothing-published-and-base-unchanged",
+                    ),
+                    "checkpoint": checkpoint,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": None,
+                    "authoritative": False,
+                    "published": False,
+                    "cacheable": False,
+                    "expected_outcome": "inconclusive-cancelled",
+                    "actual_outcome": "inconclusive-cancelled",
+                    "first_divergence": None,
+                }
+            )
+        admitted_root = records[0]["published_root"]
+        records.append(
+            {
+                **detail(
+                    "superseded-plan",
+                    "superseded-nonpublication",
+                    10,
+                    "Stale",
+                    "nothing-published-and-target-unchanged",
+                ),
+                "plan_base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                "commit_target_root": admitted_root,
+                "base_root": admitted_root,
+                "published_root": None,
+                "authoritative": False,
+                "published": False,
+                "cacheable": False,
+                "expected_outcome": "inconclusive-authority-incomplete",
+                "actual_outcome": "inconclusive-authority-incomplete",
+                "first_divergence": "plan-base-differs-from-commit-target",
+            }
+        )
+        for offset, expected in enumerate(DECLARATION_ADMISSION_RECOVERIES):
+            limit_name, usage, digest, published_root = expected
+            records.append(
+                {
+                    **detail(
+                        "adequate-budget-recovery",
+                        f"recovery-{limit_name}",
+                        offset + 11,
+                        f"Recovered{offset}",
+                        "declaration-published-after-earlier-refusal",
+                    ),
+                    "budget": dict(DECLARATION_ADMISSION_UNBOUNDED_BUDGET),
+                    "usage": usage,
+                    "canonical_digest": digest,
+                    "limit_name": limit_name,
+                    "base_root": DECLARATION_ADMISSION_BASE_ROOT,
+                    "published_root": published_root,
+                    "authoritative": True,
+                    "published": True,
+                    "cacheable": True,
+                    "expected_outcome": "admitted-after-refusal",
+                    "actual_outcome": "admitted-after-refusal",
+                    "first_divergence": None,
+                }
+            )
+        records.append(
+            {
+                "schema": DECLARATION_ADMISSION_SUMMARY_SCHEMA,
+                **envelope,
+                "scenario": "declaration-admission-real-path",
+                "steps": 18,
+                "admitted_rows": 1,
+                "refusal_rows": 7,
+                "cancellation_rows": 2,
+                "superseded_rows": 1,
+                "recovery_rows": 7,
+                "declaration_dimension_rows": 5,
+                "delegated_limit_rows": 2,
+                "status": "pass",
+                "cleanup_status": "retained_by_policy",
+                "final_state": (
+                    "every-budgeted-limit-refused-typed-and-recovered"
+                ),
+            }
+        )
+        return records
+
+    admission_valid = declaration_admission_fixture("admission_valid")
+    admission_stdout, admission_stderr = write_identity_fixture(
+        "admission_valid", admission_valid
+    )
+    require(
+        identity_validator_call(
+            validate_declaration_admission,
+            admission_stdout,
+            admission_stderr,
+        )["records"]
+        == 19,
+        "valid declaration-admission evidence was not accepted",
+    )
+    admission_mutants: list[
+        tuple[str, Callable[[list[dict[str, Any]]], None]]
+    ] = [
+        ("missing", lambda rows: rows.pop(17)),
+        ("extra", lambda rows: rows.append(dict(rows[-1]))),
+        ("duplicate", lambda rows: rows.__setitem__(2, dict(rows[1]))),
+        (
+            "reordered",
+            lambda rows: rows.__setitem__(
+                slice(1, 3), [dict(rows[2]), dict(rows[1])]
+            ),
+        ),
+        (
+            "stale",
+            lambda rows: rows[8].__setitem__(
+                "canonical_input_root", identity_hex(90_001)
+            ),
+        ),
+        (
+            "contradictory",
+            lambda rows: rows[1].__setitem__(
+                "actual_outcome", "rejected"
+            ),
+        ),
+        (
+            "summary_split",
+            lambda rows: rows[-1].__setitem__(
+                "declaration_dimension_rows", 7
+            ),
+        ),
+    ]
+    for mutant, mutate in admission_mutants:
+        label = f"admission_{mutant}"
+        mutant_records = declaration_admission_fixture(label)
+        mutate(mutant_records)
+        expect_identity_rejection(
+            label,
+            validate_declaration_admission,
+            mutant_records,
+        )
+    expect_identity_rejection(
+        "tag_stderr_leak",
+        validate_declaration_tag_matrix,
+        tag_records,
+        stderr=canonical_json(tag_records[0]),
+    )
+    cases.append(
+        {
+            "case": "environment_identity_matrix_validation",
+            "ok": True,
+            "validators": 5,
+            "mutants_killed": 20,
+        }
+    )
 
     collision_validation_root = case_dir("environment_collision_validation")
     collision_run_id = "collision-self-test"
@@ -9952,6 +28242,500 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
+    resource_validation_root = case_dir(
+        "environment_resource_collision_validation"
+    )
+    resource_run_id = "resource-collision-self-test"
+    resource_cwd = str(art_dir)
+    resource_argv = (
+        "cargo test --locked -q -p fln-env "
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} -- --exact --nocapture"
+    )
+    resource_cache_state = "self-test-cache"
+    resource_order = list(range(ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY))
+
+    def resource_detail_record(
+        threads: int,
+        start_us: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema": ENVIRONMENT_RESOURCE_COLLISION_SCHEMA,
+            "version": ENVIRONMENT_RESOURCE_COLLISION_VERSION,
+            "run_id": resource_run_id,
+            "bead": "fln-amv.13",
+            "claim_id": "fln-amv.13-resource-bounded-collisions",
+            "claim_type": "bounded_model",
+            "invariant_id": "FL-INV-01",
+            "invariant_relation": "supports-local-pmap-slice",
+            "gate_id": "PG-5",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": (
+                "not_applicable_internal_data_structure_resource_bound"
+            ),
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "seed": "partition-rotation-v1",
+            "cache_state": resource_cache_state,
+            "canonical_input_root": ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT,
+            "scenario": "collision-resource-schedule-matrix",
+            "schedule_id": f"partitioned-{threads}",
+            "status": "pass",
+            "cwd": resource_cwd,
+            "argv": [resource_argv],
+            "stdout_artifact": stdout_artifact,
+            "stderr_artifact": stderr_artifact,
+            "collision_cardinality": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+            "collision_hash": ENVIRONMENT_RESOURCE_COLLISION_HASH,
+            "threads": threads,
+            "workers_built": threads,
+            "distinct_insertion_orders": threads,
+            "representative_insertion_order": (
+                environment_collision_insertion_order(
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY, threads, 0
+                )
+            ),
+            "worker_insertion_order_roots": list(
+                ENVIRONMENT_RESOURCE_COLLISION_INSERTION_ROOTS[threads]
+            ),
+            "expected_order": resource_order,
+            "actual_order": resource_order,
+            "worker_enumeration_roots": [
+                ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+            ]
+            * threads,
+            "expected_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+            "actual_root": ENVIRONMENT_RESOURCE_COLLISION_ROOT,
+            "worker_roots": [ENVIRONMENT_RESOURCE_COLLISION_ROOT] * threads,
+            "expected_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+            "actual_recovery_root": ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+            "worker_recovery_roots": [
+                ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT
+            ]
+            * threads,
+            "representation_tier": "persistent-avl",
+            "secondary_identity": "exact-PKey-Ord-with-Eq-consistency",
+            "secondary_hashing": "none",
+            "secondary_identity_collision_behavior": (
+                "Ord-equal-overwrites;Ord-distinct-path-copies"
+            ),
+            "promotion_cardinality": 9,
+            "demotion_cardinality": 8,
+            "comparisons": [9_000] * threads,
+            "fresh_map_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "fresh_collision_nodes": [11_000] * threads,
+            "cloned_inline_entries": [36] * threads,
+            "final_collision_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "snapshot_root_arc_bumps": [1] * threads,
+            "snapshot_shared_collision_nodes": [
+                ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+            ]
+            * threads,
+            "append_shared_collision_nodes": [990] * threads,
+            "append_fresh_nodes": [12] * threads,
+            "max_lookup_comparisons": [11] * threads,
+            "budget": {
+                "max_collision_entries": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+                ),
+                "max_expanded_weight": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY + 1
+                ),
+                "admission_max_fresh_nodes": [18] * threads,
+                "refusal_max_fresh_nodes": [17] * threads,
+                "refusal_resource": "FreshNodes",
+                "refusal_attempted": [18] * threads,
+                "failure_atomic": True,
+                "exact_boundary_recovery": True,
+            },
+            "bounds": {
+                "construction_comparisons": 18_000,
+                "inline_cloned_entries": 36,
+                "append_minimum_shared_nodes": 983,
+                "lookup_comparisons": 14,
+                "maximum_avl_height": 14,
+                "tree_fresh_nodes_per_insert": 17,
+                "legacy_vector_copies": 499_500,
+            },
+            "resources": {
+                "expanded_weight": ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY,
+                "environment_entries": (
+                    ENVIRONMENT_RESOURCE_COLLISION_CARDINALITY
+                ),
+                "timing_used_as_gate": False,
+            },
+            "monotonic_start_us": start_us,
+            "monotonic_end_us": start_us + 5,
+            "duration_us": 5,
+            "timing_used_as_gate": False,
+            "process_exit": 0,
+            "signal": None,
+            "first_divergence": None,
+            "cleanup_status": "retained_by_policy",
+            "final_state": "typed-refusal-followed-by-exact-bound-recovery",
+        }
+
+    def resource_records_for(
+        stdout_artifact: str, stderr_artifact: str
+    ) -> list[dict[str, Any]]:
+        return [
+            resource_detail_record(
+                threads, index * 10, stdout_artifact, stderr_artifact
+            )
+            for index, threads in enumerate(
+                ENVIRONMENT_RESOURCE_COLLISION_THREADS
+            )
+        ]
+
+    def resource_pass_log(records: list[dict[str, Any]]) -> bytes:
+        return (
+            b"running 1 test\n"
+            + b"".join(canonical_json(record) for record in records)
+            + b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    def resource_validate(
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        return validate_environment_resource_collision(
+            stdout_path,
+            stderr_path,
+            phase,
+            resource_run_id,
+            observed_exit,
+            artifact_root=resource_validation_root,
+            expected_stdout_artifact=stdout_artifact,
+            expected_stderr_artifact=stderr_artifact,
+            expected_cwd=resource_cwd,
+            expected_argv=resource_argv,
+            expected_cache_state=resource_cache_state,
+        )
+
+    def expect_resource_rejection(
+        label: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        *,
+        expected_message: str | None = None,
+    ) -> None:
+        try:
+            resource_validate(
+                stdout_path,
+                stderr_path,
+                phase,
+                observed_exit,
+                stdout_artifact,
+                stderr_artifact,
+            )
+        except (EvidenceError, OSError) as error:
+            if expected_message is not None:
+                require(
+                    expected_message in str(error),
+                    f"{label} rejected for the wrong reason: {error}",
+                )
+        else:
+            raise EvidenceError(f"{label} was accepted")
+
+    resource_positive_stdout = "resource_positive.out"
+    resource_positive_stderr = "resource_positive.err"
+    resource_positive_records = resource_records_for(
+        resource_positive_stdout, resource_positive_stderr
+    )
+    resource_positive_bytes = resource_pass_log(resource_positive_records)
+    resource_positive = resource_validation_root / resource_positive_stdout
+    resource_positive_err = resource_validation_root / resource_positive_stderr
+    write_new(resource_positive, resource_positive_bytes)
+    write_new(resource_positive_err, b"")
+    resource_report = resource_validate(
+        resource_positive,
+        resource_positive_err,
+        "positive",
+        0,
+        resource_positive_stdout,
+        resource_positive_stderr,
+    )
+    require(
+        resource_report["records"]
+        == len(ENVIRONMENT_RESOURCE_COLLISION_THREADS),
+        "valid resource-collision evidence lost schedule records",
+    )
+    require(
+        resource_report["canonical_input_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_INPUT_ROOT
+        and resource_report["environment_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_ROOT
+        and resource_report["recovery_root"]
+        == ENVIRONMENT_RESOURCE_COLLISION_RECOVERY_ROOT,
+        "valid resource-collision evidence lost its pinned roots",
+    )
+
+    resource_recovery_stdout = "resource_recovery.out"
+    resource_recovery_stderr = "resource_recovery.err"
+    resource_recovery = resource_validation_root / resource_recovery_stdout
+    resource_recovery_err = resource_validation_root / resource_recovery_stderr
+    write_new(
+        resource_recovery,
+        resource_pass_log(
+            resource_records_for(
+                resource_recovery_stdout, resource_recovery_stderr
+            )
+        ),
+    )
+    write_new(resource_recovery_err, b"warning: benign recovery diagnostic\n")
+    recovery_report = resource_validate(
+        resource_recovery,
+        resource_recovery_err,
+        "recovery",
+        0,
+        resource_recovery_stdout,
+        resource_recovery_stderr,
+    )
+    require(
+        recovery_report["phase"] == "recovery",
+        "valid resource-collision recovery lost its phase identity",
+    )
+
+    def resource_record_rejection(
+        label: str,
+        mutation: Callable[[list[dict[str, Any]]], None],
+        expected_message: str,
+    ) -> None:
+        stdout_artifact = f"resource_{label}.out"
+        stderr_artifact = f"resource_{label}.err"
+        records = parse_json(
+            json.dumps(resource_records_for(stdout_artifact, stderr_artifact)),
+            subject=f"resource-collision self-test {label}",
+        )
+        mutation(records)
+        stdout_path = resource_validation_root / stdout_artifact
+        stderr_path = resource_validation_root / stderr_artifact
+        write_new(stdout_path, resource_pass_log(records))
+        write_new(stderr_path, b"")
+        expect_resource_rejection(
+            label,
+            stdout_path,
+            stderr_path,
+            "positive",
+            0,
+            stdout_artifact,
+            stderr_artifact,
+            expected_message=expected_message,
+        )
+
+    resource_record_rejection(
+        "missing_field",
+        lambda records: records[0].pop("resources"),
+        "field mismatch",
+    )
+    resource_record_rejection(
+        "extra_field",
+        lambda records: records[0].__setitem__("unexpected", True),
+        "field mismatch",
+    )
+    resource_record_rejection(
+        "stale_input_root",
+        lambda records: records[0].__setitem__(
+            "canonical_input_root", f"fln-fixture:{'0' * 64}"
+        ),
+        "canonical_input_root",
+    )
+    resource_record_rejection(
+        "stale_environment_root",
+        lambda records: records[0].__setitem__("actual_root", "0" * 64),
+        "actual_root",
+    )
+    resource_record_rejection(
+        "wrong_order",
+        lambda records: records[1].__setitem__(
+            "actual_order", list(reversed(resource_order))
+        ),
+        "actual order is not canonical",
+    )
+    resource_record_rejection(
+        "duplicate_schedule",
+        lambda records: records[1]["worker_insertion_order_roots"].__setitem__(
+            1, records[1]["worker_insertion_order_roots"][0]
+        ),
+        "worker insertion roots differ",
+    )
+    resource_record_rejection(
+        "wrong_threshold",
+        lambda records: records[0].__setitem__("promotion_cardinality", 10),
+        "promotion_cardinality",
+    )
+    resource_record_rejection(
+        "comparison_over_bound",
+        lambda records: records[2]["comparisons"].__setitem__(0, 18_001),
+        "comparison bound exceeded",
+    )
+    resource_record_rejection(
+        "allocation_over_bound",
+        lambda records: records[2]["append_fresh_nodes"].__setitem__(0, 19),
+        "append allocation bound exceeded",
+    )
+    resource_record_rejection(
+        "false_atomicity",
+        lambda records: records[0]["budget"].__setitem__(
+            "failure_atomic", False
+        ),
+        "not failure-atomic",
+    )
+    resource_record_rejection(
+        "timing_gate",
+        lambda records: records[0].__setitem__("timing_used_as_gate", True),
+        "timing was promoted to a gate",
+    )
+
+    resource_mutant_stdout = "resource_mutant.out"
+    resource_mutant_stderr = "resource_mutant.err"
+    resource_mutant = resource_validation_root / resource_mutant_stdout
+    resource_mutant_err = resource_validation_root / resource_mutant_stderr
+    resource_mutant_stdout_bytes = (
+        "running 1 test\n"
+        f"{ENVIRONMENT_RESOURCE_COLLISION_TEST} --- FAILED\n\n"
+        "failures:\n"
+        f"    {ENVIRONMENT_RESOURCE_COLLISION_TEST}\n\n"
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n"
+    ).encode()
+    resource_mutant_stderr_bytes = (
+        f"thread '{ENVIRONMENT_RESOURCE_COLLISION_TEST}' "
+        "panicked at crates/fln-env/src/pmap.rs:3222:17:\n"
+        f"{ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER}\n"
+        "error: test failed, to rerun pass `-p fln-env --lib`\n"
+    ).encode()
+    write_new(resource_mutant, resource_mutant_stdout_bytes)
+    write_new(resource_mutant_err, resource_mutant_stderr_bytes)
+    resource_mutant_report = resource_validate(
+        resource_mutant,
+        resource_mutant_err,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        resource_mutant_stderr,
+    )
+    require(
+        resource_mutant_report["failed_test"]
+        == ENVIRONMENT_RESOURCE_COLLISION_TEST,
+        "resource-collision mutant validation lost the failed test identity",
+    )
+
+    resource_wrong_assertion = (
+        resource_validation_root / "resource_wrong_assertion.err"
+    )
+    write_new(
+        resource_wrong_assertion,
+        resource_mutant_stderr_bytes.replace(b"left: 28", b"left: 27"),
+    )
+    expect_resource_rejection(
+        "wrong resource-collision assertion",
+        resource_mutant,
+        resource_wrong_assertion,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        "resource_wrong_assertion.err",
+        expected_message="inline-threshold assertion marker",
+    )
+
+    resource_missing_marker = (
+        resource_validation_root / "resource_missing_marker.err"
+    )
+    write_new(
+        resource_missing_marker,
+        resource_mutant_stderr_bytes.replace(
+            ENVIRONMENT_RESOURCE_COLLISION_MUTANT_MARKER.encode(),
+            b"assertion failed without the planted threshold signature",
+        ),
+    )
+    expect_resource_rejection(
+        "missing resource-collision mutant marker",
+        resource_mutant,
+        resource_missing_marker,
+        "mutant",
+        101,
+        resource_mutant_stdout,
+        "resource_missing_marker.err",
+        expected_message="inline-threshold assertion marker",
+    )
+
+    resource_compile_stdout = "resource_compile_failure.out"
+    resource_compile_stderr = "resource_compile_failure.err"
+    resource_compile = resource_validation_root / resource_compile_stdout
+    resource_compile_err = resource_validation_root / resource_compile_stderr
+    write_new(resource_compile, b"running 0 tests\n")
+    write_new(
+        resource_compile_err, b"error: could not compile `fln-env` (lib test)\n"
+    )
+    expect_resource_rejection(
+        "resource-collision compile failure",
+        resource_compile,
+        resource_compile_err,
+        "mutant",
+        101,
+        resource_compile_stdout,
+        resource_compile_stderr,
+        expected_message="named FAILED test result",
+    )
+
+    resource_merged_stdout = "resource_merged.out"
+    resource_merged_stderr = "resource_merged.err"
+    resource_merged = resource_validation_root / resource_merged_stdout
+    resource_merged_err = resource_validation_root / resource_merged_stderr
+    write_new(
+        resource_merged,
+        resource_mutant_stdout_bytes + resource_mutant_stderr_bytes,
+    )
+    write_new(resource_merged_err, b"")
+    expect_resource_rejection(
+        "merged resource-collision streams",
+        resource_merged,
+        resource_merged_err,
+        "mutant",
+        101,
+        resource_merged_stdout,
+        resource_merged_stderr,
+        expected_message="assertion marker leaked into stdout",
+    )
+    expect_resource_rejection(
+        "surviving resource-collision mutant",
+        resource_positive,
+        resource_positive_err,
+        "mutant",
+        0,
+        resource_positive_stdout,
+        resource_positive_stderr,
+        expected_message="mutant exit 0",
+    )
+    cases.append(
+        {
+            "case": "environment_resource_collision_validation",
+            "ok": True,
+            "positive": str(resource_positive),
+            "mutant": str(resource_mutant),
+            "recovery": str(resource_recovery),
+            "negative_cases": 16,
+        }
+    )
+
     admission_validation_root = case_dir("kernel_admission_validation")
     admission_run_id = "kernel-admission-self-test"
     admission_cwd = str(art_dir)
@@ -9975,7 +28759,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "determinism_invariant": "FL-INV-01",
             "gate_id": "G1",
             "gate_relation": "partial-component-evidence",
-            "parity_ledger_row": "init-prelude-admission-replay",
+            "parity_ledger_row": "not_applicable_kernel_admission_replay",
             "data_grade": "verified",
             "epoch": "lean-v4.32.0",
             "mode": "sound",
@@ -10024,6 +28808,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 "final_logical_root": admission_env_root,
                 "steps_used_total": 2_694_649,
                 "max_depth_seen": 132,
+                "artifact_incomplete_witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
                 "final_state": (
                     "byte-identical-across-1-8-32"
                     if phase == "matrix-identity"
@@ -10032,6 +28817,48 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             }
         )
         record.update(KERNEL_ADMISSION_CENSUS)
+        return record
+
+    def admission_artifact_record(
+        row: tuple[str, str, tuple[str, ...]],
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        declaration, safety, missing = row
+        record = admission_common(stdout_artifact, stderr_artifact, 0)
+        for absent in (
+            "status",
+            "budget_steps",
+            "budget_depth",
+            "monotonic_start_us",
+            "monotonic_end_us",
+            "duration_us",
+            "timing_used_as_gate",
+            "process_exit",
+            "signal",
+            "first_divergence",
+            "cleanup_status",
+        ):
+            record.pop(absent, None)
+        record.update(
+            {
+                "schema": KERNEL_ADMISSION_SCHEMA,
+                "claim_id": "franken_lean-sgt-artifact-completeness",
+                "invariant_id": "FL-INV-07",
+                "scenario": "init-prelude-artifact-incomplete-census",
+                "phase": "artifact-incomplete-row",
+                "declaration": declaration,
+                "safety": safety,
+                "missing_references": list(missing),
+                "witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
+                "outcome": "inconclusive-artifact-incomplete",
+                "authority": "none",
+                "kernel_checked": False,
+                "cacheable": False,
+                "environment_admissible": False,
+                "evidence_grade": "verified",
+            }
+        )
         return record
 
     def admission_fault_record(
@@ -10097,6 +28924,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             )
         )
         clock += 10
+        for row in KERNEL_ADMISSION_ARTIFACT_ROWS:
+            records.append(
+                admission_artifact_record(row, stdout_artifact, stderr_artifact)
+            )
         for mutant in KERNEL_ADMISSION_MUTANTS:
             records.append(
                 admission_fault_record(
@@ -10142,16 +28973,24 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     def admission_pass_log(records: list[dict[str, Any]]) -> bytes:
         return (
-            b"running 2 tests\n"
-            + b"".join(canonical_json(record) for record in records)
-            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+            f"running {KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
+            "tests\n"
+        ).encode() + (
+            b"".join(canonical_json(record) for record in records)
+            + (
+                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+                "0 measured; 0 filtered out; finished in 0.01s\n"
+            ).encode()
         )
 
     admission_stderr_bytes = (
         b"kernel_replay order: 1915 units over 2204 declarations\n"
-        b'kernel_replay census: checked=2198 accepted=2198 inconclusive=0 '
-        b'rejected={} unchecked={"nonsafe_with_unserialized_refs": 6} '
-        b"nested_partial_blocks=0 nested_full_blocks=1\n"
+        b"kernel_replay census: checked=2198 accepted=2198 inconclusive=0 "
+        b"rejected={} unchecked={} artifact_incomplete=6 "
+        b"artifact_incomplete_witness="
+        + KERNEL_ADMISSION_ARTIFACT_WITNESS.encode("ascii")
+        + b" nested_partial_blocks=0 nested_full_blocks=1\n"
     )
 
     def admission_validate(
@@ -10255,6 +29094,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         admission_report["matrix_records"] == len(KERNEL_ADMISSION_THREADS) + 1
         and admission_report["fault_records"]
         == len(KERNEL_ADMISSION_MUTANTS) + len(KERNEL_ADMISSION_RESOURCE_PHASES)
+        and admission_report["artifact_incomplete_records"]
+        == len(KERNEL_ADMISSION_ARTIFACT_ROWS)
+        and admission_report["artifact_incomplete_witness"]
+        == KERNEL_ADMISSION_ARTIFACT_WITNESS
         and sorted(admission_report["mutants_killed"])
         == sorted(KERNEL_ADMISSION_MUTANTS),
         "valid kernel-admission evidence lost its records",
@@ -10277,13 +29120,43 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "valid kernel-admission recovery evidence lost its identity",
     )
 
+    stale_admission_out = "admission_stale_test_floor.out"
+    stale_admission_err = "admission_stale_test_floor.err"
+    stale_admission_records = admission_records_for(
+        stale_admission_out, stale_admission_err
+    )
+    expect_admission_rejection(
+        "stale two-test kernel-admission floor",
+        "admission_stale_test_floor",
+        stdout_bytes=(
+            b"running 2 tests\n"
+            + b"".join(
+                canonical_json(record) for record in stale_admission_records
+            )
+            + b"test result: ok. 2 passed; 0 failed; 0 ignored; "
+            b"0 measured; 0 filtered out; finished in 0.01s\n"
+        ),
+        expected_message=(
+            f"exact full-target {KERNEL_ADMISSION_TARGET_PASSED}-pass/"
+            f"{KERNEL_ADMISSION_TARGET_IGNORED}-ignore summary"
+        ),
+    )
+
     expect_admission_rejection(
         "malformed kernel-admission row",
         "admission_malformed",
         stdout_bytes=(
-            b"running 2 tests\n"
+            (
+                f"running "
+                f"{KERNEL_ADMISSION_TARGET_PASSED + KERNEL_ADMISSION_TARGET_IGNORED} "
+                f"tests\n"
+            ).encode("ascii")
             + b'{"schema":"' + KERNEL_ADMISSION_SCHEMA.encode() + b'", not-json\n'
-            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+            + (
+                f"test result: ok. {KERNEL_ADMISSION_TARGET_PASSED} passed; "
+                f"0 failed; {KERNEL_ADMISSION_TARGET_IGNORED} ignored; "
+                f"0 measured; 0 filtered out; finished in 0.01s\n"
+            ).encode("ascii")
         ),
     )
 
@@ -10305,6 +29178,71 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "admission_missing_field",
         drop_field,
         expected_message="missing=['verdict_stream_digest']",
+    )
+
+    def artifact_rows_of(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in records
+            if record.get("phase") == "artifact-incomplete-row"
+        ]
+
+    # Named artifact-completeness validator mutants (bead
+    # franken_lean-artifact-incomplete-private-refs-sgt): each leaves exactly
+    # one defect and must be rejected for the intended reason.
+
+    def mark_incomplete_as_checked(records: list[dict[str, Any]]) -> None:
+        for record in records:
+            if record.get("scenario") == "init-prelude-admission-thread-matrix":
+                record["checked"] += record["artifact_incomplete"]
+                record["accepted"] += record["artifact_incomplete"]
+                record["artifact_incomplete"] = 0
+
+    expect_admission_rejection(
+        "artifact-incomplete rows folded into the checked total",
+        "admission_mark_incomplete_as_checked",
+        mark_incomplete_as_checked,
+        expected_message="census checked",
+    )
+
+    def collapse_unsafe_with_validated(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["safety"] = "safe"
+
+    expect_admission_rejection(
+        "artifact-incomplete safety class collapsed into validated",
+        "admission_collapse_unsafe_with_validated",
+        collapse_unsafe_with_validated,
+        expected_message="safety collapsed",
+    )
+
+    def omit_a_missing_reference(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["missing_references"] = []
+
+    expect_admission_rejection(
+        "artifact-incomplete row omits its missing reference",
+        "admission_omit_missing_reference",
+        omit_a_missing_reference,
+        expected_message="missing references drifted",
+    )
+
+    def accept_stale_reconstruction(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[1]["witness"] = "0" * 64
+
+    expect_admission_rejection(
+        "artifact-incomplete row accepts a stale reconstruction witness",
+        "admission_accept_stale_reconstruction",
+        accept_stale_reconstruction,
+        expected_message="witness drifted",
+    )
+
+    def cache_inconclusive(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["cacheable"] = True
+
+    expect_admission_rejection(
+        "artifact-incomplete row claims cacheability",
+        "admission_cache_inconclusive",
+        cache_inconclusive,
+        expected_message="must be false",
     )
 
     def diverge_digest(records: list[dict[str, Any]]) -> None:
@@ -10437,8 +29375,166 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(first_hash == second_hash, "canonical tree hash depends on argument order")
     cases.append({"case": "canonical_hash", "ok": True, "root": first_hash})
 
+    producer_repository_root = lexical_absolute(Path(__file__).parent.parent)
+    producer_binding = build_producer_binding(
+        producer_repository_root, ["b", "a"]
+    )
+    validate_producer_binding(
+        producer_binding,
+        live_repository_root=producer_repository_root,
+        expected_governed_paths=["a", "b"],
+    )
+
+    def expect_producer_binding_rejection(
+        label: str,
+        mutate: Callable[[dict[str, Any]], None],
+        expected_message: str,
+        *,
+        live: bool = False,
+    ) -> None:
+        mutant = parse_json(
+            canonical_json(producer_binding),
+            subject=f"producer binding mutant {label}",
+        )
+        mutate(mutant)
+        try:
+            validate_producer_binding(
+                mutant,
+                live_repository_root=(
+                    producer_repository_root if live else None
+                ),
+            )
+        except EvidenceError as error:
+            require(
+                expected_message in str(error),
+                f"producer binding mutant {label!r} produced the wrong failure: "
+                f"{error}",
+            )
+        else:
+            raise EvidenceError(
+                f"producer binding mutant {label!r} was accepted"
+            )
+
+    different_head = (
+        "0" * 40
+        if producer_binding["repository_head"] != "0" * 40
+        else "1" * 40
+    )
+    producer_binding_mutants: list[
+        tuple[
+            str,
+            Callable[[dict[str, Any]], None],
+            str,
+            bool,
+        ]
+    ] = [
+        (
+            "missing_repository_head",
+            lambda binding: binding.pop("repository_head"),
+            "unknown or missing",
+            False,
+        ),
+        (
+            "short_repository_head",
+            lambda binding: binding.__setitem__("repository_head", "deadbeef"),
+            "not full lowercase hexadecimal",
+            False,
+        ),
+        (
+            "substituted_repository_head",
+            lambda binding: binding.__setitem__(
+                "repository_head", different_head
+            ),
+            "changed after run start",
+            True,
+        ),
+        (
+            "reordered_governed_paths",
+            lambda binding: binding.__setitem__(
+                "governed_paths",
+                list(reversed(binding["governed_paths"])),
+            ),
+            "not canonically ordered",
+            False,
+        ),
+        (
+            "duplicated_governed_path",
+            lambda binding: binding["governed_paths"].append(
+                binding["governed_paths"][0]
+            ),
+            "duplicate governed path",
+            False,
+        ),
+        (
+            "substituted_governed_set",
+            lambda binding: binding.__setitem__(
+                "governed_set", f"sha256:{'0' * 64}"
+            ),
+            "identity differs",
+            False,
+        ),
+        (
+            "subset_upgraded_to_full_repository",
+            lambda binding: binding.__setitem__(
+                "governed_scope", "full_repository"
+            ),
+            "scope is inconsistent",
+            False,
+        ),
+    ]
+    for (
+        mutant_label,
+        mutant_transform,
+        mutant_message,
+        mutant_live,
+    ) in producer_binding_mutants:
+        expect_producer_binding_rejection(
+            mutant_label,
+            mutant_transform,
+            mutant_message,
+            live=mutant_live,
+        )
+    full_repository_binding = build_producer_binding(
+        producer_repository_root, ["."]
+    )
+    require(
+        full_repository_binding["governed_scope"] == "full_repository",
+        "the exact full-repository governed set was typed as a subset",
+    )
+    try:
+        validate_manifest_producer_binding(
+            EVIDENCE_MANIFEST_SCHEMA,
+            {
+                "cwd": str(producer_repository_root),
+                "producer_binding": producer_binding,
+            },
+            {"schema": EVIDENCE_MANIFEST_SCHEMA},
+            live_context=False,
+        )
+    except EvidenceError as error:
+        require(
+            "unknown or missing fields" in str(error),
+            "missing manifest producer binding produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("missing manifest producer binding was accepted")
+    cases.append(
+        {
+            "case": "producer_binding",
+            "ok": True,
+            "mutants_killed": len(producer_binding_mutants) + 1,
+            "repository_head": producer_binding["repository_head"],
+            "governed_set": producer_binding["governed_set"],
+            "governed_scope": producer_binding["governed_scope"],
+        }
+    )
+
     manifest_root = case_dir("write_once_manifest")
     manifest_run_id = "manifest-self-test"
+    manifest_repository_root = producer_repository_root
+    manifest_producer_binding = build_producer_binding(
+        manifest_repository_root, ["a", "b"]
+    )
     manifest_meta = manifest_root / "manifest-stage.meta.json"
     manifest_rc = run_supervised(
         argv=[sys.executable, "-c", "print('manifest-stage')"],
@@ -10468,7 +29564,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "monotonic_ns": 1,
             "wall_time_utc": utc_now(),
             "argv": ["evidence.py", "self-test"],
-            "cwd": str(art_dir),
+            "cwd": str(manifest_repository_root),
             "claim_ids": ["FLN-EVIDENCE-SELF-TEST"],
             "invariant_ids": ["FL-INV-07"],
             "gate_ids": ["G0-10"],
@@ -10486,9 +29582,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "seed": "deterministic",
             "cache_state": "not_applicable",
             "input_root": first_hash,
+            "producer_binding": manifest_producer_binding,
             "budgets": {"timeout_ms": 5000},
             "parity_ledger_row": "not_applicable_evidence_self_test",
             "planted": "",
+            "verification_manifest": VERIFICATION_MANIFEST_PATH,
         },
         {
             "schema": "fln.check/2",
@@ -10534,6 +29632,27 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     write_new(
         manifest_root / "run.ndjson",
         b"".join(canonical_json(record) for record in manifest_records),
+    )
+    human_render = render_check_human(manifest_records)
+    write_new(manifest_root / CHECK_HUMAN_LOG, human_render)
+    validate_check_human(
+        manifest_root / "run.ndjson", manifest_root / CHECK_HUMAN_LOG
+    )
+    human_mutant_root = case_dir("event_render_equivalence")
+    human_mutant = human_mutant_root / "human.semantic.mutant.log"
+    write_new(human_mutant, human_render + b"forged-extra-event\n")
+    try:
+        validate_check_human(manifest_root / "run.ndjson", human_mutant)
+    except EvidenceError:
+        pass
+    else:
+        raise EvidenceError("human/NDJSON divergence was accepted")
+    cases.append(
+        {
+            "case": "event_render_equivalence",
+            "ok": True,
+            "mutants_killed": 1,
+        }
     )
     run_report = validate_run(manifest_root / "run.ndjson", "fln.check/2", "pass")
     write_new(manifest_root / "run.validation.json", canonical_json(run_report))
@@ -10583,21 +29702,290 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and not (manifest_root / "bundle.complete.json").exists(),
         "bundle link fault did not exercise the recovery window",
     )
+    # Validation is side-effect-free: on a winning decision whose marker was
+    # never linked it must fail typed and must not create the marker itself.
+    try:
+        validate_bundle(
+            manifest_root,
+            manifest_root / "manifest.json",
+            manifest_root / "manifest.digest",
+            manifest_root / "bundle.complete.json",
+        )
+    except EvidenceError as error:
+        require(
+            "named adoption operation" in str(error),
+            "pre-marker validation produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("pre-marker bundle validation reported commitment")
+    require(
+        not (manifest_root / "bundle.complete.json").exists(),
+        "side-effect-free validation created the bundle marker",
+    )
+    # Concurrent adoption is idempotent: both adopters must succeed and agree
+    # on the single canonical marker recovered from the winning decision.
+    adoption_results: list[str] = []
+
+    def race_adopter(label: str) -> None:
+        try:
+            adopt_bundle(
+                manifest_root,
+                manifest_root / "manifest.json",
+                manifest_root / "manifest.digest",
+                manifest_root / "bundle.complete.json",
+            )
+            adoption_results.append(f"{label}:adopted")
+        except EvidenceError as adopt_error:
+            adoption_results.append(f"{label}:{adopt_error}")
+
+    first_adopter = threading.Thread(target=race_adopter, args=("first",))
+    second_adopter = threading.Thread(target=race_adopter, args=("second",))
+    first_adopter.start()
+    second_adopter.start()
+    first_adopter.join()
+    second_adopter.join()
+    require(
+        sorted(adoption_results) == ["first:adopted", "second:adopted"],
+        f"concurrent adoption was not idempotent: {adoption_results}",
+    )
+    require(
+        (manifest_root / "bundle.complete.json").exists(),
+        "adoption did not recover the winning decision",
+    )
+    adopted_marker, _adopted_size, _adopted_digest = stable_file_facts(
+        manifest_root / "bundle.complete.json"
+    )
+    winning_decision, _winning_size, _winning_digest = stable_file_facts(
+        manifest_root / "bundle.decision"
+    )
+    require(
+        hmac.compare_digest(adopted_marker, winning_decision),
+        "adopted marker disagrees with the winning decision",
+    )
     validate_bundle(
         manifest_root,
         manifest_root / "manifest.json",
         manifest_root / "manifest.digest",
         manifest_root / "bundle.complete.json",
     )
-    require(
-        (manifest_root / "bundle.complete.json").exists(),
-        "bundle validation did not recover the winning decision",
-    )
     validate_bundle(
         relative_manifest_root,
         relative_manifest_root / "manifest.json",
         relative_manifest_root / "manifest.digest",
         relative_manifest_root / "bundle.complete.json",
+    )
+    receipt_source_paths = (
+        manifest_root / "run.ndjson",
+        manifest_root / "manifest.json",
+        manifest_root / "manifest.digest",
+        manifest_root / "bundle.decision",
+        manifest_root / "bundle.complete.json",
+    )
+    receipt_source_before = {
+        path.name: stable_file_facts(path) for path in receipt_source_paths
+    }
+    promoted_receipt = promote_verification_receipt(
+        manifest_root,
+        manifest_root / "manifest.json",
+        manifest_root / "manifest.digest",
+        manifest_root / "bundle.complete.json",
+    )
+    receipt_source_after = {
+        path.name: stable_file_facts(path) for path in receipt_source_paths
+    }
+    require(
+        receipt_source_before == receipt_source_after,
+        "receipt promotion mutated its source bundle",
+    )
+    require(
+        promoted_receipt["producer"]["commit_binding"] == "recorded"
+        and promoted_receipt["producer"]["producing_commit"]
+        == manifest_producer_binding["repository_head"]
+        and promoted_receipt["outcome"]["governed_scope"]
+        == "lane_declared_subset"
+        and promoted_receipt["outcome"]["governed_set"]
+        == manifest_producer_binding["governed_set"],
+        "receipt promotion lost its recorded producer binding",
+    )
+    require(
+        promoted_receipt["execution"]
+        == {
+            "authority": "structured_run_log",
+            "executed": ["stage:manifest-stage"],
+            "expected_failure": [],
+            "typed_skip": [],
+            "not_run": [],
+        },
+        "receipt promotion misclassified its structured execution",
+    )
+    receipt_source_mutant = parse_json(
+        canonical_json(promoted_receipt),
+        subject="receipt source digest mutant",
+    )
+    receipt_source_mutant["source"]["manifest_sha256"] = (
+        f"sha256:{'0' * 64}"
+    )
+    receipt_source_mutant["receipt"] = verification_receipt_content_address(
+        receipt_source_mutant
+    )
+    validate_verification_receipt_record(
+        Path(VERIFICATION_EVIDENCE_REGISTRY_PATH),
+        1,
+        receipt_source_mutant,
+        {"fln-8mj": {}},
+    )
+    try:
+        validate_verification_receipt_source(
+            receipt_source_mutant,
+            run_path=manifest_root / "run.ndjson",
+            manifest_path=manifest_root / "manifest.json",
+            digest_path=manifest_root / "manifest.digest",
+            commit_path=manifest_root / "bundle.complete.json",
+        )
+    except EvidenceError as error:
+        require(
+            "manifest_sha256" in str(error),
+            "receipt source digest mutant produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("receipt source digest mutant was accepted")
+
+    disposition_projection = verification_receipt_execution(
+        [
+            {"event": "run_start"},
+            {"event": "stage", "stage": "executed", "outcome": "pass"},
+            {"event": "stage", "stage": "typed-skip", "outcome": "skipped"},
+            {"event": "stage", "stage": "not-run", "outcome": "not_run"},
+            {"event": "run_end"},
+        ]
+    )
+    require(
+        disposition_projection["executed"] == ["stage:executed"]
+        and disposition_projection["typed_skip"] == ["stage:typed-skip"]
+        and disposition_projection["not_run"] == ["stage:not-run"]
+        and disposition_projection["expected_failure"] == [],
+        "receipt projection collapsed typed skip, not-run, or execution",
+    )
+
+    require(
+        # ubs:ignore — public self-test authority map, not authentication data.
+        self_test_verification_receipt_execution_authority()
+        == {
+            "bundle_only_test_inventory": "accepted",
+            "log_derived_libtest_execution": "refused",
+            "structured_stage_execution": "accepted",
+        },
+        "receipt execution-authority self-test reported an unknown cell",
+    )
+
+    legacy_marker = {"schema": LEGACY_EVIDENCE_BUNDLE_COMMIT_SCHEMA}
+    legacy_unbound = verification_receipt_producer_binding(
+        legacy_marker,
+        legacy_producing_commit=None,
+        legacy_governed_scope="lane_declared_subset",
+    )
+    legacy_attested = verification_receipt_producer_binding(
+        legacy_marker,
+        legacy_producing_commit=manifest_producer_binding[
+            "repository_head"
+        ],
+        legacy_governed_scope="lane_declared_subset",
+    )
+    require(
+        legacy_unbound
+        == (
+            "unavailable",
+            "unbound",
+            "lane_declared_subset",
+            "unavailable",
+        )
+        and legacy_attested
+        == (
+            manifest_producer_binding["repository_head"],
+            "operator_attested_legacy",
+            "lane_declared_subset",
+            "unavailable",
+        ),
+        "legacy receipt promotion upgraded or lost its provenance grade",
+    )
+    try:
+        verification_receipt_producer_binding(
+            read_json_object(manifest_root / "bundle.complete.json"),
+            legacy_producing_commit=manifest_producer_binding[
+                "repository_head"
+            ],
+            legacy_governed_scope="lane_declared_subset",
+        )
+    except EvidenceError as error:
+        require(
+            "cannot be replaced by legacy" in str(error),
+            "recorded-binding override produced the wrong failure",
+        )
+    else:
+        raise EvidenceError(
+            "recorded producer binding accepted a legacy override"
+        )
+
+    manifest_binding_mutant = parse_json(
+        canonical_json(read_json_object(manifest_root / "manifest.json")),
+        subject="manifest producer binding mutant",
+    )
+    manifest_binding_mutant["producer_binding"]["repository_head"] = (
+        different_head
+    )
+    try:
+        validate_manifest_producer_binding(
+            EVIDENCE_MANIFEST_SCHEMA,
+            manifest_records[0],
+            manifest_binding_mutant,
+            live_context=False,
+        )
+    except EvidenceError as error:
+        require(
+            "manifest/run producer binding mismatch" in str(error),
+            "manifest producer substitution produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("manifest producer substitution was accepted")
+
+    marker_binding_mutant = parse_json(
+        canonical_json(
+            read_json_object(manifest_root / "bundle.complete.json")
+        ),
+        subject="bundle marker producer binding mutant",
+    )
+    marker_binding_mutant["producer_binding"]["repository_head"] = (
+        different_head
+    )
+    manifest_object = read_json_object(manifest_root / "manifest.json")
+    manifest_terminal = load_ndjson(manifest_root / "run.ndjson")[-1]
+    manifest_bindings = (
+        sha256_file(manifest_root / "run.ndjson"),
+        sha256_file(manifest_root / "manifest.json"),
+        sha256_file(manifest_root / "manifest.digest"),
+    )
+    try:
+        validate_marker_bindings(
+            marker_binding_mutant,
+            manifest_object,
+            manifest_terminal,
+            manifest_bindings,
+        )
+    except EvidenceError as error:
+        require(
+            "bundle marker producer binding mismatch" in str(error),
+            "bundle marker producer substitution produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("bundle marker producer substitution was accepted")
+    cases.append(
+        {
+            "case": "verification_receipt_promotion",
+            "ok": True,
+            "receipt": promoted_receipt["receipt"],
+            "mutants_killed": 4,
+            "source_bundle_preserved": True,
+        }
     )
     try:
         validate_bundle(
@@ -10689,7 +30077,778 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         not cancellation_marker.exists(),
         "cancelled bundle decision still published a commit marker",
     )
+    # Cancellation can never be adopted as pass: the named adoption operation
+    # must refuse the empty claimed decision and must not create the marker.
+    try:
+        adopt_bundle(
+            cancellation_root,
+            cancellation_root / "manifest.json",
+            cancellation_root / "manifest.digest",
+            cancellation_marker,
+        )
+    except EvidenceError as error:
+        require(
+            "adoption refused" in str(error),
+            "cancelled-decision adoption produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("cancellation was adopted as a committed bundle")
+    require(
+        not cancellation_marker.exists(),
+        "refused adoption still published a commit marker",
+    )
     cases.append({"case": "bundle_decision_cancellation", "ok": True})
+
+    # --- early-envelope partial bundles (bead fln-evidence-runner-bootstrap-btk):
+    # a consumer fault between artifact-directory creation and run_start still
+    # finalizes a typed durable partial bundle that can never claim, be
+    # validated as, or be adopted into completeness.
+    partial_root = case_dir("partial_bundle_publication")
+    write_new(partial_root / "human.log", b"[probe] early fault\n")
+    write_new(partial_root / "ubs-inventory.json", b"{}\n")
+    partial_marker_object = publish_partial_bundle(
+        partial_root,
+        run_id="partial-selftest-1",
+        bead="fln-8mj",
+        scenario="quality_gate",
+        step="vendor_binding",
+        reason="early_vendor_binding_failure",
+        classification="internal_fault",
+        argv=["scripts/check.sh", "--token=supersecret"],
+        cwd=str(partial_root),
+    )
+    require(
+        partial_marker_object["status"] == "incomplete",
+        "partial marker did not carry the incomplete status",
+    )
+    partial_fault_data, _partial_fault_size, _partial_fault_digest = (
+        stable_file_facts(partial_root / "setup-fault.json")
+    )
+    require(
+        b"supersecret" not in partial_fault_data
+        and b"<redacted>" in partial_fault_data,
+        "partial setup fault leaked a secret argv value",
+    )
+    partial_report = validate_partial_bundle(partial_root)
+    require(
+        partial_report["valid"] is True
+        and partial_report["committed"] is False
+        and partial_report["classification"] == "internal_fault",
+        "partial bundle validation lost its typed shape",
+    )
+    try:
+        publish_partial_bundle(
+            partial_root,
+            run_id="partial-selftest-1",
+            bead="fln-8mj",
+            scenario="quality_gate",
+            step="vendor_binding",
+            reason="early_vendor_binding_failure",
+            classification="internal_fault",
+            argv=["scripts/check.sh"],
+            cwd=str(partial_root),
+        )
+    except FileExistsError:
+        pass
+    else:
+        raise EvidenceError("partial bundle publication was not write-once")
+    try:
+        adopt_bundle(
+            partial_root,
+            partial_root / "manifest.json",
+            partial_root / "manifest.digest",
+            partial_root / "bundle.complete.json",
+        )
+    except (EvidenceError, FileNotFoundError):
+        pass
+    else:
+        raise EvidenceError("a partial decision was adopted as complete")
+    require(
+        not (partial_root / "bundle.complete.json").exists(),
+        "refused partial adoption still created the complete marker",
+    )
+    try:
+        validate_bundle(
+            partial_root,
+            partial_root / "manifest.json",
+            partial_root / "manifest.digest",
+            partial_root / "bundle.complete.json",
+        )
+    except (EvidenceError, FileNotFoundError):
+        pass
+    else:
+        raise EvidenceError("a partial bundle validated as complete")
+    write_new(partial_root / "late-artifact.txt", b"late\n")
+    try:
+        validate_partial_bundle(partial_root)
+    except EvidenceError as error:
+        require(
+            "changed after publication" in str(error),
+            "post-publication drift produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("post-publication drift was not detected")
+    cases.append(
+        {
+            "case": "partial_bundle_publication",
+            "ok": True,
+            "artifact": str(partial_root),
+        }
+    )
+
+    partial_cancel_root = case_dir("partial_bundle_cancellation")
+    write_new(partial_cancel_root / "bundle.decision", b"")
+    try:
+        publish_partial_bundle(
+            partial_cancel_root,
+            run_id="partial-selftest-2",
+            bead="fln-8mj",
+            scenario="quality_gate",
+            step="initial_hash",
+            reason="early_initial_hash_failure",
+            classification="internal_fault",
+            argv=["scripts/check.sh"],
+            cwd=str(partial_cancel_root),
+        )
+    except EvidenceError as error:
+        require(
+            "cancellation won the bundle decision race" in str(error),
+            "partial cancellation race produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("partial publication ignored a claimed decision")
+    require(
+        not (partial_cancel_root / "bundle.incomplete.json").exists(),
+        "cancelled partial publication still linked its marker",
+    )
+    cases.append({"case": "partial_bundle_cancellation", "ok": True})
+
+    hash_mutation_root = case_dir("initial_hash_mutation")
+    write_new(hash_mutation_root / "governed-a.txt", b"alpha\n")
+    write_new(hash_mutation_root / "governed-b.txt", b"beta\n")
+    hash_control = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve()),
+            "hash-tree",
+            "--root",
+            str(hash_mutation_root),
+            "--path",
+            "governed-a.txt",
+            "--path",
+            "governed-b.txt",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        hash_control.returncode == 0,
+        f"control hash failed: {hash_control.stderr[-200:]!r}",
+    )
+    mutation_size_before = (hash_mutation_root / "governed-a.txt").stat().st_size
+    hash_mutated = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve()),
+            "hash-tree",
+            "--root",
+            str(hash_mutation_root),
+            "--path",
+            "governed-a.txt",
+            "--path",
+            "governed-b.txt",
+            "--test-mutate-input",
+            "governed-a.txt",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        hash_mutated.returncode != 0
+        and b"changed while being read" in hash_mutated.stderr,
+        f"planted hash mutation was not detected: {hash_mutated.stderr[-200:]!r}",
+    )
+    require(
+        (hash_mutation_root / "governed-a.txt").stat().st_size
+        == mutation_size_before + 1,
+        "planted hash mutation did not really mutate the input",
+    )
+    cases.append({"case": "initial_hash_mutation", "ok": True})
+
+    # --- deliberate early-envelope fault probes against the real consumer
+    # (bead fln-evidence-runner-bootstrap-btk): every early step of check.sh
+    # from artifact-directory creation through run_start faults against a
+    # planted-real obstruction and still finalizes a typed durable partial
+    # bundle; an early signal cancels into the same partial form; a reused
+    # artifact directory is refused without touching foreign state.
+    def run_early_fault_probe(
+        test_step: str,
+        expected_exit: int,
+        expected_classification: str,
+        expected_step: str,
+        expected_reason: str,
+        *,
+        signal_number: int | None = None,
+    ) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        check_script = repo / "scripts" / "check.sh"
+        probe_root = art_dir / f"early_fault_{test_step}"
+        require(
+            not probe_root.exists() and not probe_root.is_symlink(),
+            f"early fault probe root already exists: {test_step}",
+        )
+        probe_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FLN_CHECK_")
+            and not key.startswith("FLN_FINALIZER_")
+        }
+        probe_environment.update(
+            {
+                "FLN_CHECK_ART_DIR": str(probe_root),
+                "FLN_CHECK_TEST_EARLY_FAULT": test_step,
+            }
+        )
+        child = subprocess.Popen(
+            ["bash", str(check_script), "--early-fault-probe"],
+            cwd=repo,
+            env=probe_environment,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            if signal_number is not None:
+                hold_path = probe_root / "early.hold"
+                hold_deadline = time.monotonic() + 30
+                while (
+                    not hold_path.exists()
+                    and child.poll() is None
+                    and time.monotonic() < hold_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    hold_path.exists(),
+                    f"{test_step}: early hold point was never reached",
+                )
+                child.send_signal(signal_number)
+            _early_out, early_err = child.communicate(timeout=120)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=10)
+        require(
+            child.returncode == expected_exit,
+            f"{test_step}: early probe exit {child.returncode}: "
+            f"{early_err[-300:]!r}",
+        )
+        require(
+            b"partial early-envelope evidence" in early_err,
+            f"{test_step}: partial publication was not reported",
+        )
+        early_report = validate_partial_bundle(probe_root)
+        require(
+            early_report["valid"] is True
+            and early_report["committed"] is False
+            and early_report["classification"] == expected_classification
+            and early_report["step"] == expected_step
+            and early_report["reason_code"] == expected_reason,
+            f"{test_step}: partial bundle lost its typed shape: {early_report}",
+        )
+        require(
+            not (probe_root / "bundle.complete.json").exists(),
+            f"{test_step}: an early fault produced a complete bundle marker",
+        )
+        cases.append(
+            {
+                "case": f"early_fault_{test_step}",
+                "ok": True,
+                "artifact": str(probe_root),
+            }
+        )
+
+    run_early_fault_probe(
+        "probe_control",
+        SETUP_FAILURE,
+        "internal_fault",
+        "probe_control",
+        "early_probe_control_failure",
+    )
+    run_early_fault_probe(
+        "ubs_inventory",
+        SETUP_FAILURE,
+        "internal_fault",
+        "ubs_inventory",
+        "early_ubs_inventory_failure",
+    )
+    run_early_fault_probe(
+        "vendor_binding",
+        SETUP_FAILURE,
+        "internal_fault",
+        "vendor_binding",
+        "early_vendor_binding_failure",
+    )
+    run_early_fault_probe(
+        "initial_hash",
+        INCONCLUSIVE,
+        "inconclusive",
+        "initial_hash",
+        "governed_input_mutation_during_initial_hash",
+    )
+    run_early_fault_probe(
+        "run_start_emission",
+        SETUP_FAILURE,
+        "internal_fault",
+        "run_start_emission",
+        "early_run_start_emission_failure",
+    )
+    run_early_fault_probe(
+        "human_log",
+        SETUP_FAILURE,
+        "internal_fault",
+        "human_log",
+        "early_human_log_failure",
+    )
+    run_early_fault_probe(
+        "early_signal_hold",
+        143,
+        "cancelled",
+        "artifact_directory_creation",
+        "signal_TERM",
+        signal_number=signal.SIGTERM,
+    )
+
+    reused_root = case_dir("early_fault_reused_directory")
+    write_new(reused_root / "canary.txt", b"canary\n")
+    reused_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FLN_CHECK_")
+        and not key.startswith("FLN_FINALIZER_")
+    }
+    reused_environment["FLN_CHECK_ART_DIR"] = str(reused_root)
+    reused_probe = subprocess.run(
+        [
+            "bash",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+            "--early-fault-probe",
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=reused_environment,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        reused_probe.returncode == SETUP_FAILURE
+        and b"evidence directory already claimed" in reused_probe.stderr,
+        f"reused-directory refusal lost its type: {reused_probe.stderr[-200:]!r}",
+    )
+    require(
+        sorted(path.name for path in reused_root.iterdir()) == ["canary.txt"],
+        "reused-directory refusal touched foreign state",
+    )
+    cases.append({"case": "early_fault_reused_directory", "ok": True})
+
+    # The shell finalizer is armed before the artifact root is claimed. Prove
+    # that its ownership state follows the atomic mkdir result rather than the
+    # mere existence of the path: a concurrent loser must exit typed without
+    # publishing into, truncating, or otherwise changing the winner's root.
+    claim_root = art_dir / "concurrent_artifact_directory_claim"
+    require(
+        not claim_root.exists() and not claim_root.is_symlink(),
+        "concurrent artifact-directory claim root was not fresh",
+    )
+    claim_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FLN_CHECK_")
+        and not key.startswith("FLN_FINALIZER_")
+    }
+    claim_environment.update(
+        {
+            "FLN_CHECK_ART_DIR": str(claim_root),
+            "FLN_CHECK_TEST_EARLY_FAULT": "early_signal_hold",
+        }
+    )
+    claim_winner = subprocess.Popen(
+        ["bash", str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+         "--early-fault-probe"],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=claim_environment,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        claim_hold = claim_root / "early.hold"
+        claim_deadline = time.monotonic() + 30
+        while (
+            not claim_hold.exists()
+            and claim_winner.poll() is None
+            and time.monotonic() < claim_deadline
+        ):
+            time.sleep(0.01)
+        require(
+            claim_hold.exists(),
+            "artifact-directory claim winner never reached its hold point",
+        )
+        before_loser = sorted(path.name for path in claim_root.iterdir())
+        require(
+            before_loser == ["early.hold"],
+            f"claim winner published unexpected pre-envelope state: {before_loser}",
+        )
+        hold_data, hold_size, hold_digest = stable_file_facts(claim_hold)
+        claim_loser = subprocess.run(
+            [
+                "bash",
+                str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+                "--early-fault-probe",
+            ],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=claim_environment,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        require(
+            claim_loser.returncode == SETUP_FAILURE
+            and b"evidence directory already claimed" in claim_loser.stderr,
+            "artifact-directory claim loser lost its typed refusal: "
+            f"{claim_loser.stderr[-300:]!r}",
+        )
+        after_loser = sorted(path.name for path in claim_root.iterdir())
+        require(
+            after_loser == before_loser,
+            "artifact-directory claim loser changed the winner's namespace",
+        )
+        repeated_data, repeated_size, repeated_digest = stable_file_facts(claim_hold)
+        require(
+            (repeated_data, repeated_size, repeated_digest)
+            == (hold_data, hold_size, hold_digest),
+            "artifact-directory claim loser changed the winner's hold artifact",
+        )
+        claim_winner.send_signal(signal.SIGTERM)
+        _claim_out, claim_err = claim_winner.communicate(timeout=120)
+    finally:
+        if claim_winner.poll() is None:
+            claim_winner.kill()
+            claim_winner.communicate(timeout=10)
+    require(
+        claim_winner.returncode == 143,
+        f"artifact-directory claim winner exit {claim_winner.returncode}: "
+        f"{claim_err[-300:]!r}",
+    )
+    claim_report = validate_partial_bundle(claim_root)
+    require(
+        claim_report["valid"] is True
+        and claim_report["committed"] is False
+        and claim_report["classification"] == "cancelled"
+        and claim_report["step"] == "artifact_directory_creation"
+        and claim_report["reason_code"] == "signal_TERM",
+        f"artifact-directory claim winner lost its bundle: {claim_report}",
+    )
+    cases.append(
+        {
+            "case": "concurrent_artifact_directory_claim",
+            "ok": True,
+            "loser_exit": SETUP_FAILURE,
+            "winner_artifact": str(claim_root),
+        }
+    )
+
+    # --- deliberate consumer-outcome scenarios (bead
+    # fln-evidence-runner-bootstrap-btk): the remaining outcome families for
+    # the three consumers in complete-bundle form — unexpected failure,
+    # post-run_start internal fault, and (for check.sh) concurrent source
+    # drift. Lane source drift requires mutating governed inputs, so it is
+    # proven against a scratch clone with the guarded during_first_step_drift
+    # plant and retained as close evidence rather than run per-gate.
+    def run_consumer_fault_case(
+        case_name: str,
+        argv: list[str],
+        environment_overrides: dict[str, str],
+        art_dir_env: str,
+        art_glob: str | None,
+        expected_exit: int,
+        schema: str,
+        expected_verdict: str,
+        expected_reason: str,
+        expected_stderr_fragment: bytes | None = None,
+    ) -> Path:
+        repo = Path(__file__).resolve().parent.parent
+        case_root = art_dir / case_name
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FLN_CHECK_")
+            and not key.startswith("FLN_FINALIZER_")
+            and not key.startswith("FLN_SG_")
+            and not key.startswith("FLN_CA_")
+            and not key.startswith("FLN_E2E_")
+        }
+        environment.update(environment_overrides)
+        environment[art_dir_env] = str(case_root)
+        child = subprocess.run(
+            argv,
+            cwd=repo,
+            env=environment,
+            capture_output=True,
+            timeout=600,
+            check=False,
+        )
+        require(
+            child.returncode == expected_exit,
+            f"{case_name}: exit {child.returncode}: {child.stderr[-300:]!r}",
+        )
+        if expected_stderr_fragment is not None:
+            require(
+                expected_stderr_fragment in child.stderr,
+                f"{case_name}: expected stderr fragment was not emitted: "
+                f"{child.stderr[-300:]!r}",
+            )
+        if art_glob is None:
+            bundle_dir = case_root
+        else:
+            matches = sorted(case_root.glob(art_glob))
+            require(
+                len(matches) == 1,
+                f"{case_name}: expected one bundle dir, found {len(matches)}",
+            )
+            bundle_dir = matches[0]
+        validate_run(
+            bundle_dir / "run.ndjson",
+            schema,
+            expected_verdict,
+            live_context=False,
+        )
+        validate_bundle(
+            bundle_dir,
+            bundle_dir / "manifest.json",
+            bundle_dir / "manifest.digest",
+            bundle_dir / "bundle.complete.json",
+        )
+        terminal = load_ndjson(bundle_dir / "run.ndjson")[-1]
+        require(
+            terminal.get("reason_code") == expected_reason,
+            f"{case_name}: terminal reason {terminal.get('reason_code')!r}, "
+            f"expected {expected_reason!r}",
+        )
+        cases.append(
+            {"case": case_name, "ok": True, "artifact": str(bundle_dir)}
+        )
+        return bundle_dir
+
+    consumer_check_script = str(
+        Path(__file__).resolve().parent.parent / "scripts" / "check.sh"
+    )
+    short_circuit_bundle = run_consumer_fault_case(
+        "consumer_check_unexpected_stage",
+        ["bash", consumer_check_script],
+        {"FLN_CHECK_PLANT_UNEXPECTED": "evidence-self-test"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        SETUP_FAILURE,
+        "fln.check/2",
+        "internal_fault",
+        "evidence-self-test:unexpected_child_exit",
+    )
+
+    def clone_short_circuit_mutant(
+        name: str, mutate: Callable[[list[dict[str, Any]]], None]
+    ) -> Path:
+        mutant_root = case_dir(name)
+        for source in sorted(
+            short_circuit_bundle.rglob("*"),
+            key=lambda path: (len(path.relative_to(short_circuit_bundle).parts), str(path)),
+        ):
+            relative = source.relative_to(short_circuit_bundle)
+            target = mutant_root / relative
+            if source.is_dir():
+                target.mkdir()
+            elif source.is_file():
+                if relative == Path("run.ndjson"):
+                    continue
+                data, _size, _digest = stable_file_facts(source)
+                write_new(target, data)
+            else:
+                raise EvidenceError(
+                    f"short-circuit fixture contains a special file: {source}"
+                )
+        records = load_ndjson(short_circuit_bundle / "run.ndjson")
+        mutate(records)
+        for sequence, record in enumerate(records):
+            record["sequence"] = sequence
+        write_new(
+            mutant_root / "run.ndjson",
+            b"".join(canonical_json(record) for record in records),
+        )
+        return mutant_root / "run.ndjson"
+
+    omitted_not_run = clone_short_circuit_mutant(
+        "stage_short_circuit_omitted_not_run",
+        lambda records: records.pop(
+            next(
+                index
+                for index, record in enumerate(records)
+                if record.get("outcome") == "not_run"
+            )
+        ),
+    )
+    wrong_cause = clone_short_circuit_mutant(
+        "stage_short_circuit_wrong_cause",
+        lambda records: next(
+            record for record in records if record.get("outcome") == "not_run"
+        ).update(causal_reason="forged-cause"),
+    )
+    for mutant, expected_fragment in (
+        (omitted_not_run, "non-canonical check obligation order"),
+        (wrong_cause, "exact failure causality"),
+    ):
+        try:
+            validate_run(
+                mutant,
+                "fln.check/2",
+                "internal_fault",
+                live_context=False,
+            )
+        except EvidenceError as error:
+            require(
+                expected_fragment in str(error),
+                f"short-circuit mutant failed for the wrong reason: {error}",
+            )
+        else:
+            raise EvidenceError(
+                f"short-circuit mutant survived: {mutant.parent.name}"
+            )
+    cases.append(
+        {"case": "stage_short_circuit_model", "ok": True, "mutants_killed": 2}
+    )
+    run_consumer_fault_case(
+        "consumer_check_drift",
+        ["bash", consumer_check_script, "--early-fault-probe"],
+        {"FLN_CHECK_TEST_EARLY_FAULT": "post_run_start_drift"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        INCONCLUSIVE,
+        "fln.check/2",
+        "inconclusive",
+        "final_workspace_changed",
+    )
+    run_consumer_fault_case(
+        "consumer_check_abort",
+        ["bash", consumer_check_script, "--early-fault-probe"],
+        {"FLN_CHECK_TEST_EARLY_FAULT": "post_run_start_abort"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        SETUP_FAILURE,
+        "fln.check/2",
+        "internal_fault",
+        "unexpected_shell_exit",
+    )
+    for lane_script_name, lane_env, lane_glob, lane_tag in (
+        (
+            "structure_gate.sh",
+            "FLN_SG_TEST_EARLY_FAULT",
+            "structure-gate-*",
+            "structure_gate",
+        ),
+        (
+            "closure_audit.sh",
+            "FLN_CA_TEST_EARLY_FAULT",
+            "closure-audit-*",
+            "closure_audit",
+        ),
+    ):
+        lane_script = str(
+            Path(__file__).resolve().parent.parent
+            / "scripts"
+            / "e2e"
+            / lane_script_name
+        )
+        unexpected_bundle = run_consumer_fault_case(
+            f"consumer_{lane_tag}_unexpected_step",
+            ["bash", lane_script],
+            {lane_env: "unexpected_first_step"},
+            "FLN_E2E_ART_ROOT",
+            lane_glob,
+            SETUP_FAILURE,
+            "fln.e2e/2",
+            "internal_fault",
+            "build_guard:unexpected_child_exit",
+            (
+                b"[structure_gate] post-seal diagnostic probe: "
+                b"unexpected_first_step"
+                if lane_tag == "structure_gate"
+                else None
+            ),
+        )
+        if lane_tag == "structure_gate":
+            manifest = read_json_object(unexpected_bundle / "manifest.json")
+            human_rows = [
+                row
+                for row in manifest["artifacts"]
+                if row.get("path") == "human.log"
+            ]
+            require(
+                len(human_rows) == 1,
+                "consumer_structure_gate_unexpected_step: manifest must bind "
+                "human.log exactly once",
+            )
+            human_data, human_size, human_digest = stable_file_facts(
+                unexpected_bundle / "human.log"
+            )
+            expected_terminal = (
+                b"[structure_gate] terminal verdict=internal_fault "
+                b"reason=build_guard:unexpected_child_exit process_exit=2\n"
+            )
+            require(
+                human_data.endswith(expected_terminal),
+                "consumer_structure_gate_unexpected_step: human.log was not "
+                "sealed after its terminal semantic record",
+            )
+            require(
+                b"post-seal diagnostic probe" not in human_data,
+                "consumer_structure_gate_unexpected_step: a post-seal "
+                "diagnostic mutated human.log",
+            )
+            require(
+                human_rows[0].get("bytes") == human_size
+                # ubs:ignore — public artifact digest.
+                and human_rows[0].get("sha256")
+                == human_digest,  # ubs:ignore — public artifact digest.
+                "consumer_structure_gate_unexpected_step: manifested human.log "
+                "facts differ from the final file",
+            )
+            cases.append(
+                {
+                    "case": (
+                        "consumer_structure_gate_unexpected_step_human_log_sealed"
+                    ),
+                    "ok": True,
+                    "bytes": human_size,
+                    "sha256": human_digest,
+                }
+            )
+        run_consumer_fault_case(
+            f"consumer_{lane_tag}_abort",
+            ["bash", lane_script],
+            {lane_env: "post_run_start_abort"},
+            "FLN_E2E_ART_ROOT",
+            lane_glob,
+            SETUP_FAILURE,
+            "fln.e2e/2",
+            "internal_fault",
+            "unexpected_shell_exit",
+        )
 
     race_root = case_dir("write_collision_race")
     race_path = race_root / "collision-race.txt"
@@ -10715,6 +30874,535 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     race_data, _race_size, _race_digest = stable_file_facts(race_path)
     require(race_data in {b"first\n", b"second\n"}, "collision race corrupted evidence")
     cases.append({"case": "write_collision_race", "ok": True})
+
+    # --- sealed interpreter environment (bead franken_lean-h40t): prove the
+    # negative control first. A real unsealed evidence.py import must execute a
+    # PYTHONPATH shadow; the real -I -S supervisor must then refuse that same
+    # channel typed before spawning its target, retain names only, and recover.
+    interpreter_root = case_dir("sealed_interpreter_validation")
+    interpreter_shadow = interpreter_root / "shadow"
+    interpreter_shadow.mkdir()
+    shadow_marker = interpreter_root / "shadow-imported"
+    (interpreter_shadow / "platform.py").write_text(
+        "with open("
+        + repr(str(shadow_marker))
+        + ", 'ab') as marker:\n"
+        "    marker.write(b'shadow-imported\\n')\n"
+        "raise RuntimeError('planted PYTHONPATH shadow executed')\n"
+    )
+    interpreter_base_env = {
+        "PATH": SEALED_PATH_TAIL,
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+    hostile_python_path = str(interpreter_shadow)
+    interpreter_hostile_env = {
+        **interpreter_base_env,
+        "PYTHONPATH": hostile_python_path,
+    }
+    negative_control = subprocess.run(  # ubs:ignore — exact current interpreter and checked-in evidence utility prove the planted import channel.
+        [sys.executable, str(Path(__file__).resolve()), "--help"],
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    shadow_before, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    require(
+        negative_control.returncode != PASS
+        and shadow_before == b"shadow-imported\n",
+        "unsealed PYTHONPATH negative control did not execute the planted shadow",
+    )
+    direct_hash_argv = [
+        str(Path(__file__).resolve()),
+        "hash-tree",
+        "--root",
+        str(interpreter_root),
+        "--path",
+        "shadow",
+    ]
+    direct_unsealed = subprocess.run(
+        [sys.executable, *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        direct_unsealed.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_unsealed_startup" in direct_unsealed.stderr
+        and direct_unsealed.stdout == b"",
+        "direct evidence command did not refuse unsealed startup typed",
+    )
+    direct_hostile = subprocess.run(
+        [sys.executable, "-I", "-S", *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    repeated_shadow, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    require(
+        direct_hostile.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment" in direct_hostile.stderr
+        and direct_hostile.stdout == b""
+        and repeated_shadow == shadow_before,
+        "direct evidence command did not refuse hostile Python configuration",
+    )
+    direct_recovery = subprocess.run(
+        [sys.executable, "-I", "-S", *direct_hash_argv],
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        direct_recovery.returncode == PASS
+        and direct_recovery.stdout.startswith(b"sha256:")
+        and len(direct_recovery.stdout.strip()) == len(b"sha256:") + 64,
+        f"sealed direct evidence command did not recover: {direct_recovery.stderr!r}",
+    )
+    trusted_repo = Path(__file__).resolve().parent.parent
+    hostile_shell_root = interpreter_root / "hostile-shell-must-not-exist"
+    hostile_shell_env = {
+        **interpreter_hostile_env,
+        "FLN_CHECK_ART_DIR": str(hostile_shell_root),
+        "FLN_CHECK_TEST_EARLY_FAULT": "probe_control",
+    }
+    hostile_shell = subprocess.run(
+        ["bash", str(trusted_repo / "scripts" / "check.sh"), "--early-fault-probe"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=hostile_shell_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        hostile_shell.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment names=PYTHONPATH"
+        in hostile_shell.stderr
+        and hostile_python_path.encode() not in hostile_shell.stderr
+        and not hostile_shell_root.exists()
+        and not hostile_shell_root.is_symlink(),
+        "trusted shell did not refuse hostile Python configuration before claiming artifacts",
+    )
+    generator = trusted_repo / "scripts" / "extract" / "gen_bignum_vectors.py"
+    generator_unsealed = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    generator_hostile = subprocess.run(
+        [sys.executable, "-I", "-S", str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_hostile_env,
+        timeout=30,
+        check=False,
+    )
+    generator_recovery = subprocess.run(
+        [sys.executable, "-I", "-S", str(generator), "--check"],
+        cwd=trusted_repo,
+        capture_output=True,
+        env=interpreter_base_env,
+        timeout=30,
+        check=False,
+    )
+    require(
+        generator_unsealed.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_unsealed_startup" in generator_unsealed.stderr
+        and generator_hostile.returncode == SETUP_FAILURE
+        and b"sealed_interpreter_hostile_environment names=PYTHONPATH"
+        in generator_hostile.stderr
+        and hostile_python_path.encode() not in generator_hostile.stderr
+        and generator_recovery.returncode == PASS
+        and b"no drift" in generator_recovery.stderr,
+        "trusted extraction script did not refuse both startup channels and recover",
+    )
+
+    interpreter_case_counter = [0]
+    interpreter_target_marker = interpreter_root / "target-executed"
+
+    def run_interpreter_case(
+        label: str,
+        *,
+        environment: Mapping[str, str],
+        expected_reason: str,
+        expected_class: str,
+        expected_exit: int,
+    ) -> tuple[dict[str, Any], Path]:
+        interpreter_case_counter[0] += 1
+        stem = f"{label}-{interpreter_case_counter[0]}"
+        metadata = interpreter_root / f"{stem}.meta.json"
+        invocation = subprocess.run(  # ubs:ignore — exact isolated interpreter launches the checked-in evidence supervisor with a fixed planted target.
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(interpreter_root),
+                "--metadata",
+                str(metadata),
+                "--stdout",
+                str(interpreter_root / f"{stem}.out"),
+                "--stderr",
+                str(interpreter_root / f"{stem}.err"),
+                "--readiness",
+                str(interpreter_root / f"{stem}.ready.json"),
+                "--artifact-root",
+                str(interpreter_root),
+                "--capture-bytes",
+                "4096",
+                "--output-budget-bytes",
+                "65536",
+                "--timeout-ms",
+                "30000",
+                "--grace-ms",
+                "500",
+                "--stage-id",
+                stem,
+                "--",
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                (
+                    "from pathlib import Path;"
+                    f"Path({str(interpreter_target_marker)!r}).write_text('target-ran')"
+                ),
+            ],
+            capture_output=True,
+            env=dict(environment),
+            timeout=60,
+            check=False,
+        )
+        require(
+            invocation.returncode == expected_exit,
+            f"sealed interpreter case {label}: exit {invocation.returncode}, "
+            f"expected {expected_exit}: {invocation.stderr!r}",
+        )
+        envelope = read_json_object(metadata)
+        validate_supervisor_object(
+            metadata, 1, envelope, expected_stage_id=stem
+        )
+        require(
+            envelope["classification"] == expected_class
+            and envelope["reason_code"] == expected_reason,
+            f"sealed interpreter case {label}: {envelope['classification']}/"
+            f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
+        )
+        return envelope, metadata
+
+    hostile_interpreter, hostile_metadata = run_interpreter_case(
+        "hostile-pythonpath",
+        environment=interpreter_hostile_env,
+        expected_reason="sealed_interpreter_hostile_environment",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+    shadow_after, _shadow_size, _shadow_digest = stable_file_facts(shadow_marker)
+    hostile_metadata_bytes, _metadata_size, _metadata_digest = stable_file_facts(
+        hostile_metadata
+    )
+    require(
+        shadow_after == shadow_before,
+        "sealed interpreter imported the planted PYTHONPATH shadow",
+    )
+    require(
+        not interpreter_target_marker.exists()
+        and hostile_interpreter["target_exec"]["status"] == "not_released",
+        "hostile Python configuration reached target execution",
+    )
+    require(
+        hostile_interpreter["sealed_interpreter"]["overridden_env"]
+        == ["PYTHONPATH"],
+        "hostile Python configuration name was not retained exactly",
+    )
+    require(
+        hostile_python_path.encode() not in hostile_metadata_bytes,
+        "hostile Python configuration value leaked into evidence",
+    )
+
+    recovery_interpreter, recovery_metadata = run_interpreter_case(
+        "clean-recovery",
+        environment=interpreter_base_env,
+        expected_reason="exit_zero",
+        expected_class="pass",
+        expected_exit=PASS,
+    )
+    require(
+        interpreter_target_marker.read_text() == "target-ran"
+        and recovery_interpreter["sealed_interpreter"]["overridden_env"] == []
+        and recovery_interpreter["sealed_interpreter"]["flags"]
+        == {
+            "isolated": True,
+            "ignore_environment": True,
+            "no_site": True,
+            "no_user_site": True,
+            "safe_path": True,
+        },
+        "sealed interpreter did not recover with exact -I -S identity",
+    )
+
+    def reject_interpreter_mutation(
+        label: str,
+        source: dict[str, Any],
+        metadata: Path,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> None:
+        candidate = parse_json(
+            canonical_json(source),
+            subject=f"sealed interpreter mutation {label}",
+        )
+        if not isinstance(candidate, dict):
+            raise EvidenceError("sealed interpreter mutation source is not an object")
+        mutate(candidate)
+        try:
+            validate_supervisor_object(
+                metadata,
+                1,
+                candidate,
+                expected_stage_id=candidate["stage_id"],
+            )
+        except EvidenceError:
+            return
+        raise EvidenceError(
+            f"sealed interpreter validator accepted mutation: {label}"
+        )
+
+    interpreter_mutants = (
+        (
+            "missing-identity",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate.pop("sealed_interpreter"),
+        ),
+        (
+            "extra-identity-field",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "unexpected", True
+            ),
+        ),
+        (
+            "stale-identity",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "version", "0.0.0-stale"
+            ),
+        ),
+        (
+            "remove-no-site",
+            recovery_interpreter,
+            recovery_metadata,
+            lambda candidate: candidate["sealed_interpreter"]["flags"].__setitem__(
+                "no_site", False
+            ),
+        ),
+        (
+            "drop-python-classification",
+            hostile_interpreter,
+            hostile_metadata,
+            lambda candidate: candidate["sealed_interpreter"].__setitem__(
+                "overridden_env", []
+            ),
+        ),
+    )
+    for mutant_name, source, metadata, mutate in interpreter_mutants:
+        reject_interpreter_mutation(mutant_name, source, metadata, mutate)
+    cases.append(
+        {
+            "case": "sealed_interpreter_validation",
+            "ok": True,
+            "negative_control": "PYTHONPATH platform.py shadow executed unsealed",
+            "typed_reason": "sealed_interpreter_hostile_environment",
+            "direct_cli_reasons": [
+                "sealed_interpreter_unsealed_startup",
+                "sealed_interpreter_hostile_environment",
+            ],
+            "trusted_shell_refusal": "PYTHONPATH refused before artifact claim",
+            "trusted_extraction_recovery": "gen_bignum_vectors --check",
+            "mutants_killed": [
+                name for name, _source, _metadata, _mutate in interpreter_mutants
+            ],
+        }
+    )
+
+    # --- sealed compiler environment (bead fln-evidence-runner-bootstrap-btk):
+    # the hostile-environment matrix, no-mock: every case is a REAL
+    # `evidence.py run --sealed-cargo` subprocess. Hostile channels must be
+    # rejected typed before any repo-controlled compilation; a planted hostile
+    # binary must never execute (marker law); the positive lane must prove the
+    # pinned identity end to end when the toolchain is installed.
+    sealed_root = case_dir("sealed_compiler_validation")
+    sealed_repo = Path(__file__).resolve().parent.parent
+    sealed_work = sealed_root / "work"
+    sealed_work.mkdir()
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (sealed_work / pin_name).write_bytes((sealed_repo / pin_name).read_bytes())
+    sealed_marker = sealed_root / "HOSTILE-EXECUTED"
+    sealed_fake = sealed_root / "fake-tool"
+    sealed_fake.write_text(f'#!/bin/sh\ntouch "{sealed_marker}"\nexec "$@"\n')
+    sealed_fake.chmod(0o755)
+    sealed_lock_rows = parse_rust_lock(sealed_work / "SUITE.lock")
+    try:
+        sealed_toolchain = resolve_sealed_toolchain(sealed_lock_rows)
+    except SealedCompilerRejection:
+        sealed_toolchain = None
+    sealed_case_counter = [0]
+
+    def run_sealed_case(
+        label: str,
+        *,
+        env_overrides: dict[str, str],
+        cwd: Path,
+        suite_lock: Path,
+        expected_reason: str,
+        expected_class: str,
+        expected_exit: int,
+        target_argv: Sequence[str] = ("cargo", "-V"),
+    ) -> dict[str, Any]:
+        sealed_case_counter[0] += 1
+        stem = f"{label}-{sealed_case_counter[0]}"
+        return run_sealed_supervisor_case(
+            stem=stem,
+            sealed_root=sealed_root,
+            env_overrides=env_overrides,
+            cwd=cwd,
+            suite_lock=suite_lock,
+            expected_reason=expected_reason,
+            expected_class=expected_class,
+            expected_exit=expected_exit,
+            target_argv=target_argv,
+        )
+
+    hostile_channels = {
+        "sealed_reject_rustflags": {"RUSTFLAGS": "--cap-lints allow"},
+        "sealed_reject_encoded_rustflags": {"CARGO_ENCODED_RUSTFLAGS": "--cap-lints\x1fallow"},
+        "sealed_reject_target_rustflags": {
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cap-lints allow"
+        },
+        "sealed_reject_fake_rustc": {"RUSTC": str(sealed_fake)},
+        "sealed_reject_wrapper": {"RUSTC_WRAPPER": str(sealed_fake)},
+        "sealed_reject_workspace_wrapper": {"RUSTC_WORKSPACE_WRAPPER": str(sealed_fake)},
+        "sealed_reject_alt_toolchain": {"RUSTUP_TOOLCHAIN": "stable"},
+    }
+    for sealed_label, overrides in hostile_channels.items():
+        run_sealed_case(
+            sealed_label,
+            env_overrides=overrides,
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="sealed_compiler_hostile_environment",
+            expected_class="internal_fault",
+            expected_exit=SETUP_FAILURE,
+        )
+    require(
+        not sealed_marker.exists(),
+        "a planted hostile compiler binary was executed by the sealed lane",
+    )
+
+    sealed_config_work = sealed_root / "config-work"
+    (sealed_config_work / ".cargo").mkdir(parents=True)
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (sealed_config_work / pin_name).write_bytes(
+            (sealed_repo / pin_name).read_bytes()
+        )
+    (sealed_config_work / ".cargo" / "config.toml").write_text(
+        '[build]\nrustflags = ["--cap-lints", "allow"]\n'
+    )
+    run_sealed_case(
+        "sealed_reject_ambient_config",
+        env_overrides={},
+        cwd=sealed_config_work,
+        suite_lock=sealed_config_work / "SUITE.lock",
+        expected_reason="sealed_compiler_ambient_config",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+
+    sealed_mismatch_work = sealed_root / "mismatch-work"
+    sealed_mismatch_work.mkdir()
+    (sealed_mismatch_work / "rust-toolchain.toml").write_bytes(
+        (sealed_repo / "rust-toolchain.toml").read_bytes()
+    )
+    doctored = re.sub(
+        r"^rust-commit .*$",
+        "rust-commit " + "0" * 40,
+        (sealed_repo / "SUITE.lock").read_text(),
+        flags=re.MULTILINE,
+    )
+    (sealed_mismatch_work / "SUITE.lock").write_text(doctored)
+    run_sealed_case(
+        "sealed_identity_mismatch",
+        env_overrides={},
+        cwd=sealed_mismatch_work,
+        suite_lock=sealed_mismatch_work / "SUITE.lock",
+        expected_reason=(
+            "sealed_compiler_identity_mismatch"
+            if sealed_toolchain is not None
+            else "sealed_compiler_toolchain_unresolved"
+        ),
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+
+    if sealed_toolchain is not None:
+        positive = run_sealed_case(
+            "sealed_positive",
+            env_overrides={},
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="exit_zero",
+            expected_class="pass",
+            expected_exit=PASS,
+        )
+        sealed_facts = positive["sealed_compiler"]
+        require(
+            isinstance(sealed_facts, dict)
+            and sealed_facts["commit"] == sealed_lock_rows["rust-commit"]  # ubs:ignore — public compiler commit, not a secret.
+            and sealed_facts["release"] == sealed_lock_rows["rust-release"]
+            and sealed_facts["channel"] == sealed_lock_rows["rust-nightly"]
+            and sealed_facts["effective_argv0"] == sealed_facts["cargo_path"],
+            "sealed positive envelope does not bind the locked compiler identity",
+        )
+        # Clean recovery after every rejection: the positive lane runs green
+        # again with nothing left behind by the hostile attempts.
+        run_sealed_case(
+            "sealed_recovery",
+            env_overrides={},
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="exit_zero",
+            expected_class="pass",
+            expected_exit=PASS,
+        )
+        cases.append(
+            {
+                "case": "sealed_compiler_validation",
+                "ok": True,
+                "toolchain": sealed_facts["toolchain_root"],
+                "commit": sealed_facts["commit"],
+            }
+        )
+    else:
+        # Typed limitation: the pinned toolchain is not installed on this
+        # host, so the positive/recovery lanes are unverifiable here — the
+        # rejection matrix above still ran for real. CI hosts install the pin
+        # and exercise the full lane.
+        cases.append(
+            {
+                "case": "sealed_compiler_validation",
+                "ok": True,
+                "limitation": "pinned toolchain absent; rejection matrix only",
+            }
+        )
 
     report = {
         "schema": "fln.evidence-self-test/1",
@@ -10745,6 +31433,8 @@ def build_parser() -> argparse.ArgumentParser:
     emit_parser.add_argument("--json-value", nargs=2, action="append")
     emit_parser.add_argument("--append-string", nargs=2, action="append")
     emit_parser.add_argument("--json-file", nargs=2, action="append")
+    emit_parser.add_argument("--producer-binding-root")
+    emit_parser.add_argument("--governed-path", action="append")
     emit_parser.set_defaults(func=cmd_emit)
 
     run_parser = subparsers.add_parser(
@@ -10800,9 +31490,63 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    run_parser.add_argument(
+        "--sealed-cargo",
+        action="store_true",
+        help="seal the compiler environment: reject hostile channels, verify "
+        "the SUITE.lock-pinned toolchain identity, isolate CARGO_HOME/target",
+    )
+    run_parser.add_argument("--suite-lock", help="path to SUITE.lock for sealing")
+    run_parser.add_argument(
+        "--sealed-build-root", help="per-attempt isolated build-state root"
+    )
     run_parser.add_argument("--test-guardian-child-ready", help=argparse.SUPPRESS)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     run_parser.set_defaults(func=cmd_run)
+
+    verification_manifest_parser = subparsers.add_parser(
+        "validate-verification-manifest",
+        help="validate the governed bead coverage and scenario-activation registry",
+    )
+    verification_manifest_parser.add_argument("--manifest", required=True)
+    verification_manifest_parser.add_argument("--beads", required=True)
+    verification_manifest_parser.add_argument(
+        "--receipt-registry",
+        help="verification receipt registry (defaults beside the manifest)",
+    )
+    verification_manifest_parser.add_argument("--output")
+    verification_manifest_parser.set_defaults(
+        func=cmd_validate_verification_manifest
+    )
+
+    check_human_parser = subparsers.add_parser(
+        "render-check-human",
+        help="render the canonical human event log from one fln.check/2 stream",
+    )
+    check_human_parser.add_argument("--file", required=True)
+    check_human_parser.add_argument("--output", required=True)
+    check_human_parser.add_argument("--artifact-root", required=True)
+    check_human_parser.set_defaults(func=cmd_render_check_human)
+
+    census_availability_parser = subparsers.add_parser(
+        "classify-census-availability",
+        help="turn the census materializer taxonomy into a checked availability receipt",
+    )
+    census_availability_parser.add_argument("--root", required=True)
+    census_availability_parser.add_argument("--output", required=True)
+    census_availability_parser.add_argument("--artifact-root", required=True)
+    census_availability_parser.set_defaults(func=cmd_classify_census_availability)
+
+    census_guard_parser = subparsers.add_parser(
+        "exec-structure-guard-census-inconclusive",
+        help="run the full guard and accept only the exact typed absent-census result",
+    )
+    census_guard_parser.add_argument("--root", required=True)
+    census_guard_parser.add_argument("--receipt", required=True)
+    census_guard_parser.add_argument("--output", required=True)
+    census_guard_parser.add_argument("--validation", required=True)
+    census_guard_parser.add_argument("--artifact-root", required=True)
+    census_guard_parser.set_defaults(func=cmd_exec_structure_guard_census_inconclusive)
 
     guard_parser = subparsers.add_parser(
         "validate-guard", help="validate exact structure-guard NDJSON semantics"
@@ -10836,6 +31580,274 @@ def build_parser() -> argparse.ArgumentParser:
     collision_parser.add_argument("--artifact-root", required=True)
     collision_parser.add_argument("--output")
     collision_parser.set_defaults(func=cmd_validate_environment_collision)
+
+    resource_collision_parser = subparsers.add_parser(
+        "validate-environment-resource-collision",
+        help="validate fln-amv.13 collision resource-bound or mutant evidence",
+    )
+    resource_collision_parser.add_argument("--file", required=True)
+    resource_collision_parser.add_argument("--stderr-file", required=True)
+    resource_collision_parser.add_argument(
+        "--phase", required=True, choices=("positive", "mutant", "recovery")
+    )
+    resource_collision_parser.add_argument("--expected-run-id", required=True)
+    resource_collision_parser.add_argument(
+        "--observed-exit", type=int, required=True
+    )
+    resource_collision_parser.add_argument("--expected-cwd")
+    resource_collision_parser.add_argument("--expected-argv")
+    resource_collision_parser.add_argument(
+        "--expected-stdout-artifact", required=True
+    )
+    resource_collision_parser.add_argument(
+        "--expected-stderr-artifact", required=True
+    )
+    resource_collision_parser.add_argument("--expected-cache-state")
+    resource_collision_parser.add_argument("--artifact-root", required=True)
+    resource_collision_parser.add_argument("--output")
+    resource_collision_parser.set_defaults(
+        func=cmd_validate_environment_resource_collision
+    )
+
+    for command, help_text, command_func in (
+        (
+            "validate-declaration-tag-matrix",
+            "strictly validate the fln-amv.12 declaration-tag matrix",
+            cmd_validate_declaration_tag_matrix,
+        ),
+        (
+            "validate-declaration-membership",
+            "strictly validate the fln-amv.1 declaration-membership matrix",
+            cmd_validate_declaration_membership,
+        ),
+        (
+            "validate-extension-descriptor-matrix",
+            "strictly validate the fln-amv.2 extension-descriptor matrix",
+            cmd_validate_extension_descriptor_matrix,
+        ),
+        (
+            "validate-environment-state",
+            "strictly validate the 41s checkpoint/history identity evidence",
+            cmd_validate_environment_state,
+        ),
+        (
+            "validate-declaration-admission",
+            "strictly validate the j8h declaration-admission evidence",
+            cmd_validate_declaration_admission,
+        ),
+    ):
+        identity_parser = subparsers.add_parser(command, help=help_text)
+        identity_parser.add_argument("--file", required=True)
+        identity_parser.add_argument("--stderr-file", required=True)
+        identity_parser.add_argument("--expected-run-id", required=True)
+        identity_parser.add_argument("--observed-exit", type=int, required=True)
+        identity_parser.add_argument("--expected-stdout-artifact", required=True)
+        identity_parser.add_argument("--expected-stderr-artifact", required=True)
+        identity_parser.add_argument("--artifact-root", required=True)
+        identity_parser.add_argument("--output")
+        identity_parser.set_defaults(func=command_func)
+
+    verdict_parser = subparsers.add_parser(
+        "validate-verdict-schema",
+        help="independently validate Verdict semantic NDJSON and bounded telemetry",
+    )
+    verdict_parser.add_argument("--semantic", required=True)
+    verdict_parser.add_argument("--telemetry", required=True)
+    verdict_parser.add_argument("--stdout", required=True)
+    verdict_parser.add_argument("--stderr", required=True)
+    verdict_parser.add_argument(
+        "--phase", required=True, choices=("positive", "failure", "recovery")
+    )
+    verdict_parser.add_argument("--observed-exit", type=int, required=True)
+    verdict_parser.add_argument("--positive-semantic")
+    verdict_parser.add_argument("--artifact-root", required=True)
+    verdict_parser.add_argument("--output")
+    verdict_parser.set_defaults(func=cmd_validate_verdict_schema)
+
+    diagnostic_projection_parser = subparsers.add_parser(
+        "validate-diagnostic-projection",
+        help=(
+            "independently validate diagnostic projection semantics "
+            "and disjoint host telemetry"
+        ),
+    )
+    diagnostic_projection_parser.add_argument("--semantic", required=True)
+    diagnostic_projection_parser.add_argument("--telemetry", required=True)
+    diagnostic_projection_parser.add_argument("--run-id", required=True)
+    diagnostic_projection_parser.add_argument("--artifact-root", required=True)
+    diagnostic_projection_parser.add_argument("--output")
+    diagnostic_projection_parser.set_defaults(
+        func=cmd_validate_diagnostic_projection
+    )
+
+    lexer_parser = subparsers.add_parser(
+        "validate-lexer-no-mock",
+        help="independently validate lexer real-file semantics and bounded telemetry",
+    )
+    lexer_parser.add_argument("--expected-run-id", required=True)
+    for lexer_case in ("positive", "failure", "recovery"):
+        lexer_parser.add_argument(f"--{lexer_case}-semantic", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-telemetry", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-input", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-stdout", required=True)
+        lexer_parser.add_argument(f"--{lexer_case}-stderr", required=True)
+    lexer_parser.add_argument("--artifact-root", required=True)
+    lexer_parser.add_argument("--output")
+    lexer_parser.set_defaults(func=cmd_validate_lexer_no_mock)
+
+    parser_corpus_parser = subparsers.add_parser(
+        "validate-parser-corpus-no-mock",
+        help=(
+            "independently validate Pratt real-file semantics "
+            "and bounded telemetry"
+        ),
+    )
+    parser_corpus_parser.add_argument("--expected-run-id", required=True)
+    for parser_corpus_case in ("positive", "failure", "recovery"):
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-semantic", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-telemetry", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-input", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-stdout", required=True
+        )
+        parser_corpus_parser.add_argument(
+            f"--{parser_corpus_case}-stderr", required=True
+        )
+    parser_corpus_parser.add_argument("--artifact-root", required=True)
+    parser_corpus_parser.add_argument("--output")
+    parser_corpus_parser.set_defaults(func=cmd_validate_parser_corpus_no_mock)
+
+    dynamic_parser = subparsers.add_parser(
+        "validate-dynamic-parser-no-mock",
+        help=(
+            "independently validate dynamic-registration real-file "
+            "semantics and bounded telemetry"
+        ),
+    )
+    dynamic_parser.add_argument("--expected-run-id", required=True)
+    for dynamic_parser_case in DYNAMIC_PARSER_CASE_INPUTS:
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-semantic", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-telemetry", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-input", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-stdout", required=True
+        )
+        dynamic_parser.add_argument(
+            f"--{dynamic_parser_case}-stderr", required=True
+        )
+    dynamic_parser.add_argument("--source-recovery-semantic", required=True)
+    dynamic_parser.add_argument("--source-recovery-telemetry", required=True)
+    dynamic_parser.add_argument("--source-recovery-input", required=True)
+    dynamic_parser.add_argument("--source-recovery-stdout", required=True)
+    dynamic_parser.add_argument("--source-recovery-stderr", required=True)
+    dynamic_parser.add_argument("--artifact-root", required=True)
+    dynamic_parser.add_argument("--output")
+    dynamic_parser.set_defaults(func=cmd_validate_dynamic_parser_no_mock)
+
+    macro_txn_parser = subparsers.add_parser(
+        "validate-macro-txn-no-mock",
+        help=(
+            "independently validate macro transaction semantics "
+            "and bounded telemetry"
+        ),
+    )
+    macro_txn_parser.add_argument("--expected-run-id", required=True)
+    macro_txn_parser.add_argument("--semantic", required=True)
+    macro_txn_parser.add_argument("--telemetry", required=True)
+    macro_txn_parser.add_argument("--artifact-root", required=True)
+    macro_txn_parser.add_argument("--output")
+    macro_txn_parser.set_defaults(func=cmd_validate_macro_txn_no_mock)
+
+    certificate_format_parser = subparsers.add_parser(
+        "validate-certificate-format-no-mock",
+        help=(
+            "independently validate certificate-format external-checker "
+            "semantics and bounded telemetry"
+        ),
+    )
+    certificate_format_parser.add_argument("--expected-run-id", required=True)
+    certificate_format_parser.add_argument("--semantic", required=True)
+    certificate_format_parser.add_argument("--telemetry", required=True)
+    certificate_format_parser.add_argument("--export", required=True)
+    certificate_format_parser.add_argument("--corrupt-export", required=True)
+    certificate_format_parser.add_argument("--positive-metadata", required=True)
+    certificate_format_parser.add_argument("--positive-stdout", required=True)
+    certificate_format_parser.add_argument("--failure-metadata", required=True)
+    certificate_format_parser.add_argument("--failure-stderr", required=True)
+    certificate_format_parser.add_argument("--recovery-metadata", required=True)
+    certificate_format_parser.add_argument("--recovery-stdout", required=True)
+    certificate_format_parser.add_argument("--codec-metadata", required=True)
+    certificate_format_parser.add_argument("--codec-stdout", required=True)
+    certificate_format_parser.add_argument("--artifact-root", required=True)
+    certificate_format_parser.add_argument("--output")
+    certificate_format_parser.set_defaults(func=cmd_validate_certificate_format_no_mock)
+
+    cartridge_parser = subparsers.add_parser(
+        "validate-cartridge-no-mock",
+        help=(
+            "independently validate cartridge transport, extraction, "
+            "recovery, semantic evidence, and bounded telemetry"
+        ),
+    )
+    cartridge_parser.add_argument("--expected-run-id", required=True)
+    cartridge_parser.add_argument("--semantic", required=True)
+    cartridge_parser.add_argument("--telemetry", required=True)
+    cartridge_parser.add_argument("--archive", required=True)
+    cartridge_parser.add_argument("--corrupt-archive", required=True)
+    cartridge_parser.add_argument("--export", required=True)
+    cartridge_parser.add_argument("--positive-extract", required=True)
+    cartridge_parser.add_argument("--failure-extract", required=True)
+    cartridge_parser.add_argument("--recovery-extract", required=True)
+    cartridge_parser.add_argument("--build-metadata", required=True)
+    cartridge_parser.add_argument("--build-stdout", required=True)
+    cartridge_parser.add_argument("--checker-metadata", required=True)
+    cartridge_parser.add_argument("--checker-stdout", required=True)
+    cartridge_parser.add_argument("--codec-metadata", required=True)
+    cartridge_parser.add_argument("--codec-stdout", required=True)
+    cartridge_parser.add_argument("--failure-metadata", required=True)
+    cartridge_parser.add_argument("--failure-stderr", required=True)
+    cartridge_parser.add_argument("--population-metadata", required=True)
+    cartridge_parser.add_argument("--population-stdout", required=True)
+    cartridge_parser.add_argument("--positive-extract-metadata", required=True)
+    cartridge_parser.add_argument("--positive-extract-stdout", required=True)
+    cartridge_parser.add_argument("--positive-metadata", required=True)
+    cartridge_parser.add_argument("--positive-stdout", required=True)
+    cartridge_parser.add_argument("--recovery-extract-metadata", required=True)
+    cartridge_parser.add_argument("--recovery-extract-stdout", required=True)
+    cartridge_parser.add_argument("--recovery-metadata", required=True)
+    cartridge_parser.add_argument("--recovery-stdout", required=True)
+    cartridge_parser.add_argument("--artifact-root", required=True)
+    cartridge_parser.add_argument("--output")
+    cartridge_parser.set_defaults(func=cmd_validate_cartridge_no_mock)
+
+    bignum_parser = subparsers.add_parser(
+        "validate-bignum-no-mock",
+        help=(
+            "independently validate bignum vectors, semantic profile "
+            "projections, C4 facts, mutation kills, and pristine recovery"
+        ),
+    )
+    bignum_parser.add_argument("--expected-run-id", required=True)
+    bignum_parser.add_argument("--semantic", required=True)
+    bignum_parser.add_argument("--telemetry", required=True)
+    bignum_parser.add_argument("--inner-log", required=True)
+    bignum_parser.add_argument("--inner-root", required=True)
+    bignum_parser.add_argument("--lane-metadata", required=True)
+    bignum_parser.add_argument("--artifact-root", required=True)
+    bignum_parser.add_argument("--output")
+    bignum_parser.set_defaults(func=cmd_validate_bignum_no_mock)
 
     admission_parser = subparsers.add_parser(
         "validate-kernel-admission",
@@ -10888,6 +31900,7 @@ def build_parser() -> argparse.ArgumentParser:
     hash_parser.add_argument("--vendor-path")
     hash_parser.add_argument("--output")
     hash_parser.add_argument("--artifact-root")
+    hash_parser.add_argument("--test-mutate-input")
     hash_parser.set_defaults(func=cmd_hash_tree)
 
     vendor_parser = subparsers.add_parser(
@@ -10899,6 +31912,23 @@ def build_parser() -> argparse.ArgumentParser:
     vendor_parser.add_argument("--output")
     vendor_parser.add_argument("--artifact-root")
     vendor_parser.set_defaults(func=cmd_vendor_binding)
+
+    unsafe_note_parser = subparsers.add_parser(
+        "unsafe-note-clippy-sites",
+        help="extract, compare, or mutate the Clippy unsafe-note site census",
+    )
+    unsafe_note_parser.add_argument(
+        "--operation",
+        required=True,
+        choices=("extract", "compare", "drop-first", "add-observed", "add-stale"),
+    )
+    unsafe_note_parser.add_argument("--root")
+    unsafe_note_parser.add_argument("--report")
+    unsafe_note_parser.add_argument("--declared")
+    unsafe_note_parser.add_argument("--observed")
+    unsafe_note_parser.add_argument("--output")
+    unsafe_note_parser.add_argument("--artifact-root")
+    unsafe_note_parser.set_defaults(func=cmd_unsafe_note_clippy_sites)
 
     inventory_parser = subparsers.add_parser(
         "ubs-inventory", help="publish an exact project-authored UBS file inventory"
@@ -10913,10 +31943,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     inventory_validation = subparsers.add_parser(
         "validate-ubs-inventory",
-        help="verify an exact UBS inventory against the workspace",
+        help="verify captured UBS file facts against the workspace",
     )
     inventory_validation.add_argument("--root", required=True)
     inventory_validation.add_argument("--inventory", required=True)
+    inventory_validation.add_argument(
+        "--require-live-scope",
+        action="store_true",
+        help="also require the current Git-derived scope to equal the captured scope",
+    )
     inventory_validation.set_defaults(func=cmd_validate_ubs_inventory)
 
     inventory_execution = subparsers.add_parser(
@@ -11067,10 +32102,12 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--inventory")
     complete_parser.add_argument("--vendor-path")
     complete_parser.add_argument("--test-fail-after-link", action="store_true")
+    complete_parser.add_argument("--test-marker-pause-ready")
+    complete_parser.add_argument("--test-marker-pause-release")
     complete_parser.set_defaults(func=cmd_complete_bundle)
 
     bundle_validation = subparsers.add_parser(
-        "validate-bundle", help="verify a committed evidence bundle"
+        "validate-bundle", help="verify a committed evidence bundle (read-only)"
     )
     bundle_validation.add_argument("--art-dir", required=True)
     bundle_validation.add_argument("--manifest", required=True)
@@ -11079,6 +32116,61 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_validation.add_argument("--artifact-root", required=True)
     bundle_validation.add_argument("--output")
     bundle_validation.set_defaults(func=cmd_validate_bundle)
+
+    receipt_promotion = subparsers.add_parser(
+        "promote-verification-receipt",
+        help="project one validated bundle into a compact tracked receipt",
+    )
+    receipt_promotion.add_argument("--art-dir", required=True)
+    receipt_promotion.add_argument("--manifest", required=True)
+    receipt_promotion.add_argument("--digest", required=True)
+    receipt_promotion.add_argument("--commit", required=True)
+    receipt_promotion.add_argument("--legacy-producing-commit")
+    receipt_promotion.add_argument(
+        "--legacy-governed-scope",
+        choices=("full_repository", "lane_declared_subset"),
+    )
+    receipt_promotion.set_defaults(func=cmd_promote_verification_receipt)
+
+    partial_publication = subparsers.add_parser(
+        "publish-partial-bundle",
+        help="publish the typed durable partial bundle for an early fault",
+    )
+    partial_publication.add_argument("--art-dir", required=True)
+    partial_publication.add_argument("--run-id", required=True)
+    partial_publication.add_argument("--bead", required=True)
+    partial_publication.add_argument("--scenario", required=True)
+    partial_publication.add_argument("--step", required=True)
+    partial_publication.add_argument("--reason", required=True)
+    partial_publication.add_argument(
+        "--classification",
+        required=True,
+        choices=sorted(PARTIAL_BUNDLE_CLASSIFICATIONS),
+    )
+    partial_publication.add_argument("--argv-json", required=True)
+    partial_publication.add_argument("--cwd", required=True)
+    partial_publication.set_defaults(func=cmd_publish_partial_bundle)
+
+    partial_validation = subparsers.add_parser(
+        "validate-partial-bundle",
+        help="verify a published early-fault partial bundle (read-only)",
+    )
+    partial_validation.add_argument("--art-dir", required=True)
+    partial_validation.add_argument("--artifact-root", required=True)
+    partial_validation.add_argument("--output")
+    partial_validation.set_defaults(func=cmd_validate_partial_bundle)
+
+    bundle_adoption = subparsers.add_parser(
+        "adopt-bundle",
+        help="recover a winning pre-marker bundle decision, then revalidate",
+    )
+    bundle_adoption.add_argument("--art-dir", required=True)
+    bundle_adoption.add_argument("--manifest", required=True)
+    bundle_adoption.add_argument("--digest", required=True)
+    bundle_adoption.add_argument("--commit", required=True)
+    bundle_adoption.add_argument("--artifact-root", required=True)
+    bundle_adoption.add_argument("--output")
+    bundle_adoption.set_defaults(func=cmd_adopt_bundle)
 
     self_test_parser = subparsers.add_parser(
         "self-test", help="exercise capture, cancellation, exhaustion, and validation"
@@ -11092,7 +32184,20 @@ def main() -> int:
     try:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         args = build_parser().parse_args()
+        # The supervisor has its own structured rejection path because it owns
+        # the metadata envelope needed to prove that no target was released.
+        # Every other evidence command still refuses an unsealed interpreter
+        # here. Trusted shell launchers structurally supply -I -S before imports;
+        # this runtime check is defense in depth for direct CLI use.
+        if args.subcommand != "run":
+            prepare_sealed_interpreter(os.environ)
         return int(args.func(args))
+    except SealedInterpreterRejection as error:
+        print(
+            f"evidence: {error.reason_token}: {error}",
+            file=sys.stderr,
+        )
+        return SETUP_FAILURE
     except (
         EvidenceError,
         OSError,

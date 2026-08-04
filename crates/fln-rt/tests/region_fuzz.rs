@@ -60,6 +60,44 @@ impl Rng {
     }
 }
 
+/// The boundary constants uniform sampling never lands on.
+///
+/// This is the coverage hole bead franken_lean-008q was filed for. The word
+/// operators below DO reach every category header field — a random aligned
+/// word lands on an mpz's `_mp_alloc`/`_mp_size` pair constantly. What they
+/// never land on is a *specific* value: `_mp_size == i32::MIN` is one of 2^32
+/// values in its 4-byte subfield, so a defect gated on it has probability
+/// ~2^-32 per write. Across 1500 cases that is ~10^-6 expected hits, which is
+/// why the panic fixed in 84d4f1f survived this rig indefinitely.
+///
+/// Integer laws pivot on these values, so they are sampled with probability
+/// ~1 instead of ~2^-32: the extremes where negation, absolute value, and
+/// signed/unsigned reinterpretation break.
+const INTERESTING_U32: &[u32] = &[
+    0,
+    1,
+    2,
+    0x7FFF_FFFE,
+    0x7FFF_FFFF, // i32::MAX
+    0x8000_0000, // i32::MIN — the one that panicked
+    0x8000_0001,
+    0xFFFF_FFFE,
+    0xFFFF_FFFF, // -1
+];
+
+/// As [`INTERESTING_U32`], for whole-word fields (array/string size and
+/// capacity, stored pointers).
+const INTERESTING_U64: &[u64] = &[
+    0,
+    1,
+    8,
+    0x0000_0000_8000_0000, // i32::MIN in the high subfield of a zero word
+    0x7FFF_FFFF_FFFF_FFFF,
+    0x8000_0000_0000_0000,
+    0xFFFF_FFFF_0000_0000,
+    0xFFFF_FFFF_FFFF_FFFF,
+];
+
 /// A synthetic seed region covering every slice-1 category with sharing —
 /// small enough that thousands of mutants stay cheap.
 fn synthetic_seed() -> Vec<u8> {
@@ -91,7 +129,7 @@ fn mutate(rng: &mut Rng, bytes: &mut Vec<u8>) {
     // Word-level operators need one whole word; short buffers (a prior
     // truncation) degrade to byte noise instead of indexing off the end.
     let words = bytes.len() / 8;
-    let op = if words == 0 { 0 } else { rng.below(9) };
+    let op = if words == 0 { 0 } else { rng.below(10) };
     match op {
         0 => {
             // Byte noise.
@@ -147,10 +185,33 @@ fn mutate(rng: &mut Rng, bytes: &mut Vec<u8>) {
             let end = (start + rng.below(256) + 1).min(bytes.len());
             bytes[start..end].fill(0);
         }
-        _ => {
+        8 => {
             // Scalar-bit flips: turn pointers into scalars and back.
             let at = rng.below(words) * 8;
             bytes[at] ^= 1;
+        }
+        _ => {
+            // Boundary constants, at a whole word AND at each 4-byte subfield.
+            // The subfield writes are the ones that matter for the packed
+            // signed pairs: an mpz keeps `_mp_alloc` and `_mp_size` in the two
+            // halves of one word, so only a half-word write can set `_mp_size`
+            // to i32::MIN while leaving `_mp_alloc` a plausible value — which
+            // is exactly the shape that reaches the integrity law.
+            let at = rng.below(words) * 8;
+            match rng.below(3) {
+                0 => {
+                    let v = INTERESTING_U64[rng.below(INTERESTING_U64.len())];
+                    bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                1 => {
+                    let v = INTERESTING_U32[rng.below(INTERESTING_U32.len())];
+                    bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                _ => {
+                    let v = INTERESTING_U32[rng.below(INTERESTING_U32.len())];
+                    bytes[at + 4..at + 8].copy_from_slice(&v.to_le_bytes());
+                }
+            }
         }
     }
 }
@@ -298,6 +359,82 @@ fn hostile_regions_fault_typed_within_budgets() {
         }
     }
     worker.join().expect("fuzz worker must not die");
+}
+
+/// Exhaustive, deterministic boundary sweep — the coverage guarantee behind
+/// bead franken_lean-008q.
+///
+/// The random campaign above explores boundary constants only in expectation:
+/// with one boundary operator in ten, three placements, and nine constants,
+/// the chance any given run lands `_mp_size = i32::MIN` on the seed's single
+/// mpz is a fraction of one case. That is an improvement, not a guarantee, and
+/// a coverage fix that only *probably* rediscovers the bug is not a coverage
+/// fix. This sweep is the guarantee: every aligned word of a well-formed
+/// region, every 4-byte subfield of it, crossed with every boundary constant,
+/// enumerated rather than sampled. It is deterministic, so it either always
+/// covers the mpz integrity law or the coverage floor below fails.
+///
+/// Verified to rediscover the real defect: with the `checked` mpz law in
+/// region.rs reverted to the pre-84d4f1f `alloc < mp_size.abs()`, this test
+/// fails on the engine panic; with the fix in place it passes.
+#[test]
+fn boundary_constant_sweep_covers_every_category_header_field() {
+    let seed = synthetic_seed();
+
+    // Coverage floor, self-asserting: the sweep is only meaningful if the seed
+    // actually contains the categories whose header laws we are attacking. A
+    // tag byte sits at offset 7 of each object, so scan that residue class.
+    let tags: Vec<u8> = seed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 8 == 7)
+        .map(|(_, b)| *b)
+        .collect();
+    for (name, tag) in [
+        ("mpz", fln_rt::abi::TAG_MPZ),
+        ("string", fln_rt::abi::TAG_STRING),
+        ("array", fln_rt::abi::TAG_ARRAY),
+    ] {
+        assert!(
+            tags.contains(&tag),
+            "seed corpus lost its {name} object — the sweep would no longer \
+             exercise that category's header law"
+        );
+    }
+
+    let words = seed.len() / 8;
+    let worker = std::thread::Builder::new()
+        .name("region-fuzz-sweep".into())
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let mut cases = 0u64;
+            for w in 0..words {
+                let at = w * 8;
+                // Whole-word constants: sizes, capacities, stored pointers.
+                for (i, &v) in INTERESTING_U64.iter().enumerate() {
+                    let mut m = seed.clone();
+                    m[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                    run_case(0x5_0000_0000 + (w * 64 + i) as u64, &m);
+                    cases += 1;
+                }
+                // Subfield constants: the packed signed pairs (mpz
+                // `_mp_alloc`/`_mp_size`) are only reachable this way.
+                for (h, half) in [0usize, 4].into_iter().enumerate() {
+                    for (i, &v) in INTERESTING_U32.iter().enumerate() {
+                        let mut m = seed.clone();
+                        m[at + half..at + half + 4].copy_from_slice(&v.to_le_bytes());
+                        run_case(0x6_0000_0000 + (w * 64 + h * 16 + i) as u64, &m);
+                        cases += 1;
+                    }
+                }
+            }
+            let expected =
+                words as u64 * (INTERESTING_U64.len() + 2 * INTERESTING_U32.len()) as u64;
+            assert_eq!(cases, expected, "sweep did not enumerate its full space");
+            println!("region-fuzz boundary-sweep: {cases} cases over {words} words");
+        })
+        .expect("spawn bounded-stack sweep worker");
+    worker.join().expect("boundary sweep must not die");
 }
 
 /// Envelope fuzz: hostile 64-byte headers over a real file image — parse

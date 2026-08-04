@@ -38,7 +38,7 @@ jobs:
             exit 2
           fi
           mkdir -p "$evidence_root/check" "$evidence_root/e2e"
-          python3 - "$evidence_root/attempt-start.json" <<'PY'
+          python3 -I - "$evidence_root/attempt-start.json" <<'PY'
           import json
           import os
           import sys
@@ -86,7 +86,7 @@ jobs:
             exit 2
           fi
           printf 'UBS source commit: %s\n' "$actual_commit"
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib
           from pathlib import Path
 
@@ -102,14 +102,86 @@ jobs:
           chmod +x target/ci-tools/ubs/ubs
           echo "$GITHUB_WORKSPACE/target/ci-tools/ubs" >> "$GITHUB_PATH"
 
+      # The trusted bootstrap parses SUITE.lock and rust-toolchain.toml to decide which
+      # compiler to install, before structure-guard or any other repository check runs.
+      # Prove — against a real hostile module, not a comment — that the interpreter it
+      # uses cannot be redirected by module shadowing, and that the probe itself is
+      # meaningful because the non-isolated interpreter IS redirected. The shadow lives
+      # in a scratch directory; the repository tree is never mutated.
+      - name: bootstrap interpreter isolation probe
+        shell: bash
+        run: |
+          shadow="$(mktemp -d)"
+          cat > "$shadow/tomllib.py" <<'SHADOW'
+          def loads(*_args, **_kwargs):
+              return {"toolchain": {"channel": "attacker-chosen-toolchain"}}
+          SHADOW
+          probe=$'import pathlib, sys, sysconfig, tomllib\n'
+          probe+=$'stdlib = pathlib.Path(sysconfig.get_paths()["stdlib"]).resolve()\n'
+          probe+=$'shadowed = not pathlib.Path(tomllib.__file__).resolve().is_relative_to(stdlib)\n'
+          probe+=$'print("shadowed" if shadowed else "stdlib")\n'
+
+          # Vector 1: a module beside the script / in the cwd of a stdin script.
+          vulnerable="$(cd "$shadow" && printf '%s' "$probe" | python3 -)"
+          isolated="$(cd "$shadow" && printf '%s' "$probe" | python3 -I -)"
+          # Vector 2: an ambient PYTHONPATH.
+          vulnerable_env="$(PYTHONPATH="$shadow" python3 -c "$probe")"
+          isolated_env="$(PYTHONPATH="$shadow" python3 -I -c "$probe")"
+
+          rc=0
+          if [[ "$vulnerable" != "shadowed" ]]; then
+            echo "probe is not meaningful: cwd shadowing did not take effect" >&2
+            rc=2
+          fi
+          if [[ "$vulnerable_env" != "shadowed" ]]; then
+            echo "probe is not meaningful: PYTHONPATH shadowing did not take effect" >&2
+            rc=2
+          fi
+          if [[ "$isolated" != "stdlib" ]]; then
+            echo "isolated interpreter was shadowed via the script directory" >&2
+            rc=2
+          fi
+          if [[ "$isolated_env" != "stdlib" ]]; then
+            echo "isolated interpreter was shadowed via PYTHONPATH" >&2
+            rc=2
+          fi
+          # Every trusted bootstrap snippet in this workflow must request isolation.
+          if grep -nE '^\s*(channel="\$\()?([A-Z_]+="[^"]*" )*python3 - ' .github/workflows/ci.yml; then
+            echo "a bootstrap snippet invokes python3 without -I (see matches above)" >&2
+            rc=2
+          fi
+          if [[ $rc -eq 0 ]]; then
+            echo "bootstrap interpreter isolation: both shadowing vectors reproduced and both refused"
+          fi
+          exit "$rc"
+
       # rust-toolchain.toml pins the exact nightly; rustup honors it automatically.
       - name: install pinned toolchain
         shell: bash
         run: |
-          channel="$(python3 - <<'PY'
+          channel="$(python3 -I - <<'PY'
           import pathlib
           import re
+          import sys
+          import sysconfig
           import tomllib
+
+          # This snippet decides which compiler the whole job installs, and it runs
+          # before any repository-controlled check. Python resolves imports from the
+          # script's directory (or the cwd, for a stdin script) and from PYTHONPATH, so
+          # a checked-in `tomllib.py` or an ambient PYTHONPATH would otherwise choose
+          # the toolchain for us. `-I` closes both channels; assert it rather than
+          # trusting that a future edit keeps the flag.
+          if not sys.flags.isolated:
+              raise SystemExit(
+                  "bootstrap parser must run under `python3 -I`: without isolation a "
+                  "repository-local or PYTHONPATH module can shadow the stdlib parser "
+                  "that selects the toolchain"
+              )
+          stdlib = pathlib.Path(sysconfig.get_paths()["stdlib"]).resolve()
+          resolved = pathlib.Path(tomllib.__file__).resolve()
+          if not resolved.is_relative_to(stdlib):
+              raise SystemExit(f"tomllib resolved outside the stdlib: {resolved}")
 
           def parse_suite_channel(source):
               rows = []
@@ -246,7 +318,7 @@ jobs:
           )"
           rustup toolchain install "$channel" --profile minimal \
             --component rustfmt --component clippy
-          PINNED_RUST_CHANNEL="$channel" python3 - <<'PY'
+          PINNED_RUST_CHANNEL="$channel" python3 -I - <<'PY'
           import os
           import pathlib
           import subprocess
@@ -354,6 +426,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           exit "$command_rc"
 
+      - name: tribunal epoch-lab nested workspace
+        id: epoch_lab
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          ./scripts/check.sh --tribunal-manifest-inventory
+          cargo test --locked --manifest-path tribunal/epoch-lab/Cargo.toml
+          cargo run --locked --manifest-path tribunal/epoch-lab/Cargo.toml -- verify v4.32.0
+
       - name: gate self-test (planted failures must be caught and named)
         id: gate_self_test
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
@@ -438,7 +519,181 @@ jobs:
           fi
           exit "$command_rc"
 
-      - name: e2e smoke — environment collision determinism
+      - name: e2e smoke — Tribunal campaign frameworks
+        id: campaign_frameworks
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/campaign-frameworks"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/campaign_frameworks.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "campaign frameworks lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — attribute state census
+        id: attribute_state_census
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/attribute-state-census"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/attribute_state_census.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "attribute state census lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — bidirectional unsafe-note Clippy census
+        id: unsafe_note_clippy
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/unsafe-note-clippy"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/unsafe_note_clippy.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "unsafe-note Clippy lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      # The census shards are governed outputs that the checkout carries, so this
+      # proves them against the committed pins rather than fetching anything: the
+      # per-shard bytes= in contracts/CONTRACT_HANDOFF.txt and the two sha256 group
+      # digests in contracts/EXTERN_BUILTIN_ENVIRONMENT.txt (bead
+      # fln-census-out-of-git-2ya9). Running it here means the census consumers
+      # below are reading bytes that have already been checked.
+      #
+      # The exits are separated deliberately. A census that DISAGREES with the pins
+      # is a decided failure and stops the run. A census that is merely absent is
+      # inconclusive, not a failure — that is the state a future untracked census
+      # would present on a runner with no Reference toolchain, and it should skip
+      # the dependent steps rather than redden the gate.
+      - name: verify extern/builtin census against committed pins
+        id: census
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          set +e
+          ./scripts/extract/census_materialize.sh --verify-only
+          census_rc=$?
+          set -e
+          case "$census_rc" in
+            0) echo "available=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "census unavailable; dependent steps will be skipped" >&2
+               echo "available=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "available=false" >> "$GITHUB_OUTPUT"
+               echo "census does not match the committed pins" >&2
+               exit "$census_rc" ;;
+          esac
+
+      - name: e2e — canonical W1 contract handoff
+        id: contract_handoff
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' && steps.census.outputs.available == 'true' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/contract-handoff"
+          mkdir "$step_root"
+          set +e
+          # --validate, not --check. --check re-walks the Reference and needs an elan
+          # toolchain pinned to SUITE.lock, which this runner does not install; asking
+          # for it here only produced a setup failure (exit 2) that looked like a real
+          # verification. Reference-drift detection therefore runs in
+          # .github/workflows/contract-drift.yml, which installs the SUITE.lock-pinned
+          # toolchain and runs scripts/e2e/contract_drift.sh with its seeded mutants.
+          # This comment used to defer to "a scheduled job that actually installs the
+          # toolchain" and name none, because none existed; the deferral then outlived
+          # its own missing referent, which is what bead franken_lean-0kpa was filed
+          # for. Do not re-word it back into a promise: what holds the delegation is
+          # contract_roots.rs, which fails if no gate INVOKES that lane, and being
+          # named in check.sh's INPUT_PATHS or shellcheck arguments is not invocation.
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_CONTRACT_HANDOFF_FULL_CENSUS=0 \
+            ./scripts/e2e/contract_handoff.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "contract handoff published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — environment snapshots and collision children
         id: environment_collision
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
         shell: bash
@@ -454,19 +709,268 @@ jobs:
           mapfile -d '' -t parent_bundles < <(
             find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
           )
+          parent_artifact=""
           artifact=""
+          resource_artifact=""
           capture_rc=0
           if (( ${#parent_bundles[@]} != 1 )); then
-            echo "environment collision lane published ${#parent_bundles[@]} parent bundles; expected exactly one" >&2
+            echo "environment snapshots lane published ${#parent_bundles[@]} parent bundles; expected exactly one" >&2
             capture_rc=2
           else
-            candidate="${parent_bundles[0]}/collision-fln-amv.10"
+            parent_candidate="${parent_bundles[0]}"
+            if [[ -L "$parent_candidate" || ! -d "$parent_candidate" ]]; then
+              echo "environment snapshots parent bundle is missing or not a real directory: $parent_candidate" >&2
+              capture_rc=2
+            else
+              parent_artifact="$parent_candidate"
+            fi
+            candidate="$parent_candidate/collision-fln-amv.10"
             if [[ -L "$candidate" || ! -d "$candidate" ]]; then
               echo "environment collision child bundle is missing or not a real directory: $candidate" >&2
               capture_rc=2
             else
               artifact="$candidate"
             fi
+            resource_candidate="${parent_bundles[0]}/resource-collision-fln-amv.13"
+            if [[ -L "$resource_candidate" || ! -d "$resource_candidate" ]]; then
+              echo "environment resource collision child bundle is missing or not a real directory: $resource_candidate" >&2
+              capture_rc=2
+            else
+              resource_artifact="$resource_candidate"
+            fi
+          fi
+          {
+            printf 'parent_artifact_path=%s\n' "$parent_artifact"
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'resource_artifact_path=%s\n' "$resource_artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Vellum lexer real-file contract
+        id: lexer_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/lexer-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/lexer_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "lexer no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Vellum parser corpus real-file contract
+        id: parser_corpus_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/parser-corpus-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/parser_corpus_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "parser corpus no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Vellum dynamic parser registration contract
+        id: dynamic_parser_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/dynamic-parser-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/dynamic_parser_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "dynamic parser no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Vellum macro hygiene contract
+        id: hygiene_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/hygiene-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/hygiene_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "hygiene no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Vellum macro transaction contract
+        id: macro_txn_no_mock_e2e
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/macro-txn-no-mock"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/macro_txn_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "macro transaction no-mock lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — vellum naming contract
+        id: vellum_naming
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/vellum-naming"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/vellum_naming_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "vellum naming lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — Verdict schema contract
+        id: verdict_schema
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/verdict-schema"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/verdict_schema.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "Verdict schema lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
           fi
           {
             printf 'artifact_path=%s\n' "$artifact"
@@ -489,10 +993,34 @@ jobs:
           STRUCTURE_EXIT: ${{ steps.structure_gate.outputs.command_exit }}
           CLOSURE_ARTIFACT: ${{ steps.closure_audit.outputs.artifact_path }}
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
+          UNSAFE_NOTE_CLIPPY_ARTIFACT: ${{ steps.unsafe_note_clippy.outputs.artifact_path }}
+          UNSAFE_NOTE_CLIPPY_EXIT: ${{ steps.unsafe_note_clippy.outputs.command_exit }}
+          CONTRACT_HANDOFF_ARTIFACT: ${{ steps.contract_handoff.outputs.artifact_path }}
+          CONTRACT_HANDOFF_EXIT: ${{ steps.contract_handoff.outputs.command_exit }}
+          CAMPAIGN_ARTIFACT: ${{ steps.campaign_frameworks.outputs.artifact_path }}
+          CAMPAIGN_EXIT: ${{ steps.campaign_frameworks.outputs.command_exit }}
+          ATTRIBUTE_CENSUS_ARTIFACT: ${{ steps.attribute_state_census.outputs.artifact_path }}
+          ATTRIBUTE_CENSUS_EXIT: ${{ steps.attribute_state_census.outputs.command_exit }}
+          ENV_SNAPSHOTS_ARTIFACT: ${{ steps.environment_collision.outputs.parent_artifact_path }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
+          ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.resource_artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
+          LEXER_NO_MOCK_ARTIFACT: ${{ steps.lexer_no_mock_e2e.outputs.artifact_path }}
+          LEXER_NO_MOCK_EXIT: ${{ steps.lexer_no_mock_e2e.outputs.command_exit }}
+          PARSER_CORPUS_NO_MOCK_ARTIFACT: ${{ steps.parser_corpus_no_mock_e2e.outputs.artifact_path }}
+          PARSER_CORPUS_NO_MOCK_EXIT: ${{ steps.parser_corpus_no_mock_e2e.outputs.command_exit }}
+          DYNAMIC_PARSER_NO_MOCK_ARTIFACT: ${{ steps.dynamic_parser_no_mock_e2e.outputs.artifact_path }}
+          DYNAMIC_PARSER_NO_MOCK_EXIT: ${{ steps.dynamic_parser_no_mock_e2e.outputs.command_exit }}
+          HYGIENE_NO_MOCK_ARTIFACT: ${{ steps.hygiene_no_mock_e2e.outputs.artifact_path }}
+          HYGIENE_NO_MOCK_EXIT: ${{ steps.hygiene_no_mock_e2e.outputs.command_exit }}
+          MACRO_TXN_NO_MOCK_ARTIFACT: ${{ steps.macro_txn_no_mock_e2e.outputs.artifact_path }}
+          MACRO_TXN_NO_MOCK_EXIT: ${{ steps.macro_txn_no_mock_e2e.outputs.command_exit }}
+          VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
+          VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
+          VERDICT_SCHEMA_ARTIFACT: ${{ steps.verdict_schema.outputs.artifact_path }}
+          VERDICT_SCHEMA_EXIT: ${{ steps.verdict_schema.outputs.command_exit }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import hashlib
           import json
           import os
@@ -515,7 +1043,23 @@ jobs:
 
           expected_roots = {
               check_root: {"quality-gate", "gate-self-test"},
-              e2e_root: {"structure-gate", "closure-audit", "environment-collision"},
+              e2e_root: {
+                  "structure-gate",
+                  "closure-audit",
+                  "campaign-frameworks",
+                  "attribute-state-census",
+                  "unsafe-note-clippy",
+                  "contract-handoff",
+                  # env_snapshots is the sole parent bundle at this shared root;
+                  # the two collision scenarios are its named children.
+                  "environment-collision",
+                  "dynamic-parser-no-mock",
+                  "hygiene-no-mock",
+                  "lexer-no-mock",
+                  "parser-corpus-no-mock",
+                  "vellum-naming",
+                  "verdict-schema",
+              },
           }
           for root, expected_names in expected_roots.items():
               observed = {entry.name for entry in root.iterdir()}
@@ -555,13 +1099,144 @@ jobs:
                   True,
               ),
               (
+                  "campaign_frameworks",
+                  os.environ.get("CAMPAIGN_ARTIFACT", ""),
+                  os.environ.get("CAMPAIGN_EXIT", ""),
+                  e2e_root / "campaign-frameworks",
+                  True,
+              ),
+              (
+                  "attribute_state_census",
+                  os.environ.get("ATTRIBUTE_CENSUS_ARTIFACT", ""),
+                  os.environ.get("ATTRIBUTE_CENSUS_EXIT", ""),
+                  e2e_root / "attribute-state-census",
+                  True,
+              ),
+              (
+                  "unsafe_note_clippy",
+                  os.environ.get("UNSAFE_NOTE_CLIPPY_ARTIFACT", ""),
+                  os.environ.get("UNSAFE_NOTE_CLIPPY_EXIT", ""),
+                  e2e_root / "unsafe-note-clippy",
+                  True,
+              ),
+              (
+                  "contract_handoff",
+                  os.environ.get("CONTRACT_HANDOFF_ARTIFACT", ""),
+                  os.environ.get("CONTRACT_HANDOFF_EXIT", ""),
+                  e2e_root / "contract-handoff",
+                  True,
+              ),
+              (
+                  "env_snapshots",
+                  os.environ.get("ENV_SNAPSHOTS_ARTIFACT", ""),
+                  os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
+                  e2e_root / "environment-collision",
+                  True,
+              ),
+              (
                   "environment_collision",
                   os.environ.get("ENVIRONMENT_COLLISION_ARTIFACT", ""),
                   os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
                   e2e_root / "environment-collision",
-                  "nested",
+                  "collision-fln-amv.10",
+              ),
+              (
+                  "environment_resource_collision",
+                  os.environ.get("ENVIRONMENT_RESOURCE_COLLISION_ARTIFACT", ""),
+                  os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
+                  e2e_root / "environment-collision",
+                  "resource-collision-fln-amv.13",
+              ),
+              (
+                  "lexer_no_mock_e2e",
+                  os.environ.get("LEXER_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("LEXER_NO_MOCK_EXIT", ""),
+                  e2e_root / "lexer-no-mock",
+                  True,
+              ),
+              (
+                  "parser_corpus_no_mock_e2e",
+                  os.environ.get("PARSER_CORPUS_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("PARSER_CORPUS_NO_MOCK_EXIT", ""),
+                  e2e_root / "parser-corpus-no-mock",
+                  True,
+              ),
+              (
+                  "dynamic_parser_no_mock_e2e",
+                  os.environ.get("DYNAMIC_PARSER_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("DYNAMIC_PARSER_NO_MOCK_EXIT", ""),
+                  e2e_root / "dynamic-parser-no-mock",
+                  True,
+              ),
+              (
+                  "hygiene_no_mock_e2e",
+                  os.environ.get("HYGIENE_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("HYGIENE_NO_MOCK_EXIT", ""),
+                  e2e_root / "hygiene-no-mock",
+                  True,
+              ),
+              (
+                  "macro_txn_no_mock_e2e",
+                  os.environ.get("MACRO_TXN_NO_MOCK_ARTIFACT", ""),
+                  os.environ.get("MACRO_TXN_NO_MOCK_EXIT", ""),
+                  e2e_root / "macro-txn-no-mock",
+                  True,
+              ),
+              (
+                  "vellum_naming",
+                  os.environ.get("VELLUM_NAMING_ARTIFACT", ""),
+                  os.environ.get("VELLUM_NAMING_EXIT", ""),
+                  e2e_root / "vellum-naming",
+                  True,
+              ),
+              (
+                  "verdict_schema",
+                  os.environ.get("VERDICT_SCHEMA_ARTIFACT", ""),
+                  os.environ.get("VERDICT_SCHEMA_EXIT", ""),
+                  e2e_root / "verdict-schema",
+                  True,
               ),
           )
+
+          manifest_records = [
+              json.loads(line)
+              for line in Path("ci/VERIFICATION_MANIFEST.jsonl")
+              .read_text(encoding="utf-8")
+              .splitlines()
+          ]
+          ci_registry = {
+              record["scenario"]: record
+              for record in manifest_records
+              if record.get("kind") == "scenario"
+              and record.get("activation") == "active"
+              and record.get("ci_required") is True
+          }
+          spec_labels = {label for label, *_rest in specs}
+          if set(ci_registry) != spec_labels:
+              raise SystemExit(
+                  "CI specs and active verification registry differ: "
+                  f"{sorted(spec_labels)} != {sorted(ci_registry)}"
+              )
+          for label, _raw_path, _raw_exit, expected, is_child in specs:
+              registry = ci_registry[label]
+              expected_root = expected.relative_to(attempt_root).as_posix()
+              expected_kind = (
+                  "named-child"
+                  if isinstance(is_child, str)
+                  else "single-bundle"
+                  if is_child
+                  else "direct"
+              )
+              expected_name = is_child if isinstance(is_child, str) else "-"
+              if (
+                  registry.get("ci_root") != expected_root
+                  or registry.get("artifact_kind") != expected_kind
+                  or registry.get("artifact_name") != expected_name
+              ):
+                  raise SystemExit(
+                      f"{label} CI artifact contract differs from "
+                      "ci/VERIFICATION_MANIFEST.jsonl"
+                  )
 
           records = []
           seen = set()
@@ -576,7 +1251,7 @@ jobs:
               if artifact.is_symlink() or not artifact.is_dir():
                   raise SystemExit(f"{label} artifact is not a real directory: {artifact}")
               artifact = artifact.resolve(strict=True)
-              if is_child == "nested":
+              if isinstance(is_child, str):
                   expected = expected.resolve(strict=True)
                   parent = artifact.parent
                   if parent.parent != expected:
@@ -584,7 +1259,7 @@ jobs:
                           f"{label} artifact escaped its isolated nested root: {artifact}"
                       )
                   parents = list(expected.iterdir())
-                  if parents != [parent] or artifact.name != "collision-fln-amv.10":
+                  if parents != [parent] or artifact.name != is_child:
                       raise SystemExit(
                           f"{label} root does not contain exactly its named parent/child bundle"
                       )
@@ -614,6 +1289,7 @@ jobs:
               subprocess.run(
                   [
                       "python3",
+                      "-I",
                       "scripts/evidence.py",
                       "validate-bundle",
                       "--art-dir",

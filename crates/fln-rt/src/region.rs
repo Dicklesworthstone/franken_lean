@@ -173,7 +173,15 @@ pub fn parse_olean_envelope(file: &[u8]) -> RResult<OleanEnvelope> {
     if !(base_addr as usize).is_multiple_of(rc::REGION_ALIGN) {
         return Err(RegionFault::MisalignedBase { base: base_addr });
     }
+    // The one envelope law the rest of the codec leans on: the payload's pointer
+    // base plus the file's extent must fit a u64, or every base+offset add
+    // downstream either panics (debug) or wraps into an address the audit then
+    // cannot tell from a valid one (fln-abaz finding 3).
     let (data_off, _) = header_field("data");
+    let extent = base_addr
+        .checked_add(file.len() as u64)
+        .ok_or(RegionFault::MisalignedBase { base: base_addr })?;
+    let _ = extent;
     Ok(OleanEnvelope {
         version,
         base_addr,
@@ -393,8 +401,15 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
         need(buf, offset, MPZ_FIXED)?;
         let mp_size = read_i32(buf, offset + 12);
         let limbs = usize::try_from(mp_size.unsigned_abs()).expect("u32 fits usize");
-        let alloc = read_i32(buf, offset + 8);
-        if limbs == 0 || alloc < mp_size.abs() {
+        // Both fields are attacker-controlled bytes, so the `_mp_alloc >=
+        // |_mp_size|` law is checked in the UNSIGNED domain: `i32::MIN.abs()`
+        // panics on overflow (debug) or stays negative (release), and a
+        // negative `_mp_alloc` is itself incoherent rather than a comparison
+        // operand.
+        let Ok(alloc) = u32::try_from(read_i32(buf, offset + 8)) else {
+            return Err(RegionFault::MpzIntegrity { offset });
+        };
+        if limbs == 0 || alloc < mp_size.unsigned_abs() {
             return Err(RegionFault::MpzIntegrity { offset });
         }
         let size = MPZ_FIXED
@@ -832,7 +847,7 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     out.extend_from_slice(&mp_size.to_le_bytes());
                     let limb_addr = base.wrapping_add(offset + MPZ_FIXED as u64);
                     out.extend_from_slice(&limb_addr.to_le_bytes());
-                    for l in &limbs {
+                    for l in limbs {
                         out.extend_from_slice(&l.to_le_bytes());
                     }
                 } else {
@@ -859,20 +874,48 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
     Ok(out)
 }
 
+/// The staging file name for `path` in THIS process and THIS thread.
+///
+/// The token is per-(process, thread, target) rather than per-process. Keying
+/// it on the pid alone means two THREADS publishing the same target share one
+/// staging file, and `File::create` truncates: T1 writes half its bytes, T2
+/// truncates and writes its own, T1 fsyncs and renames a MIXTURE into place.
+/// That is a corrupt artifact published through the path whose whole job is to
+/// make publication atomic, and it is reachable the moment anything publishes
+/// in parallel — which is the point of a deterministic-parallel build fabric.
+///
+/// Keeping it a pure function of (pid, thread, target) is what lets
+/// [`staging_tmp_path`] still predict it for the crash drill; a counter or a
+/// random token would be unique but unpredictable.
+fn staging_name(path: &std::path::Path) -> String {
+    let thread: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "region".to_string()),
+        std::process::id(),
+        thread
+    )
+}
+
 /// Atomically publish a region file: write to a sibling temp file, fsync it,
 /// rename over the target, fsync the directory. A crash at ANY point leaves
 /// either the old target or no target — never a half-published region (the
 /// fln-wgp staging drill kills the process between temp write and rename and
 /// asserts exactly that).
+///
+/// Concurrency: safe for two threads publishing the SAME target, because the
+/// staging file is per-thread (see [`staging_name`]) and `rename` is atomic —
+/// the target ends up as exactly one caller's bytes, never a mixture. Which
+/// caller wins is the last rename, which is the caller's problem to care about,
+/// not this function's.
 pub fn write_region_file(bytes: &[u8], path: &std::path::Path) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "region".to_string()),
-        std::process::id()
-    ));
+    let tmp = dir.join(staging_name(path));
     {
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, bytes)?;
@@ -883,14 +926,10 @@ pub fn write_region_file(bytes: &[u8], path: &std::path::Path) -> std::io::Resul
 }
 
 /// The staging temp path `write_region_file` uses for `path` in THIS process
-/// — exposed so the crash drill can assert "temp present, target absent".
+/// and THIS thread — exposed so the crash drill can assert "temp present,
+/// target absent". Call it from the thread that publishes, or it will name a
+/// different file.
 pub fn staging_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    dir.join(format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "region".to_string()),
-        std::process::id()
-    ))
+    dir.join(staging_name(path))
 }

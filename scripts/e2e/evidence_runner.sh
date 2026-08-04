@@ -1236,7 +1236,7 @@ semantic_exits = (
 )
 
 exact("shell exit", actual_exit, expected_exit)
-exact("metadata schema", metadata.get("schema"), "fln.supervisor/3")
+exact("metadata schema", metadata.get("schema"), "fln.supervisor/5")
 exact("stage", metadata.get("stage_id"), stage_id)
 exact("wrapper exit", metadata.get("wrapper_exit"), expected_exit)
 exact(
@@ -1255,6 +1255,36 @@ expected_planted = expected_planted_raw == "true"
 if expected_planted_raw not in {"true", "false"}:
     raise AssertionError("expected planted value is not boolean text")
 exact("planted", metadata.get("planted"), expected_planted)
+sealed_interpreter = metadata.get("sealed_interpreter")
+if not isinstance(sealed_interpreter, dict):
+    raise AssertionError("sealed_interpreter is not an object")
+exact(
+    "sealed interpreter flags",
+    sealed_interpreter.get("flags"),
+    {
+        "isolated": True,
+        "ignore_environment": True,
+        "no_site": True,
+        "no_user_site": True,
+        "safe_path": True,
+    },
+)
+configuration_names = sealed_interpreter.get("overridden_env")
+if expected_reason == "sealed_interpreter_hostile_environment":
+    if (
+        not isinstance(configuration_names, list)
+        or not configuration_names
+        or configuration_names != sorted(set(configuration_names))
+        or not all(
+            isinstance(name, str) and name.startswith("PYTHON")
+            for name in configuration_names
+        )
+    ):
+        raise AssertionError(
+            "hostile interpreter setup fault lacks exact Python variable names"
+        )
+else:
+    exact("sealed interpreter environment", configuration_names, [])
 expected_test_control = {
     "before_stop_delay_ms": int(expected_before_stop_delay_ms_raw),
     "before_release_delay_ms": 0,
@@ -1543,6 +1573,46 @@ note "start ($DATA_GRADE): artifacts in $ART_DIR"
 SEMANTIC_SEVEN_CODE='raise SystemExit(7)'
 SELF_SIGKILL_CODE='import os, signal, time; time.sleep(0.1); os.kill(os.getpid(), signal.SIGKILL)'
 SEMANTIC_TWO_CODE='raise SystemExit(2)'
+
+HOSTILE_PYTHON_CONFIGURATION=()
+while IFS= read -r environment_name; do
+  if [[ "$environment_name" == PYTHON* ]]; then
+    HOSTILE_PYTHON_CONFIGURATION+=("$environment_name")
+  fi
+done < <(compgen -e)
+if ((${#HOSTILE_PYTHON_CONFIGURATION[@]} > 0)); then
+  run_case \
+    "$ART_DIR/setup/hostile-python-configuration" \
+    setup-hostile-python-configuration \
+    3000 \
+    1000 \
+    2 \
+    internal_fault \
+    sealed_interpreter_hostile_environment \
+    null \
+    null \
+    not_released \
+    setup_failed \
+    "" \
+    null \
+    null \
+    nonempty \
+    /usr/bin/true \
+    unreleased \
+    false \
+    0 \
+    normal \
+    -- \
+    /usr/bin/true
+  emit_event setup_fault \
+    --string classification internal_fault \
+    --string reason_code sealed_interpreter_hostile_environment \
+    --integer wrapper_exit 2 \
+    --integer rejected_channel_count "${#HOSTILE_PYTHON_CONFIGURATION[@]}" \
+    --string artifact_dir setup/hostile-python-configuration
+  note "SETUP FAULT: hostile Python configuration was refused before target execution"
+  exit 2
+fi
 
 run_family \
   immediate-true \
@@ -1990,7 +2060,7 @@ watchdog = load(str(Path(metadata_path).parent / "watchdog.json"))
 expected_exit = int(expected_exit_raw)
 checks = {
     "shell exit": (int(actual_exit_raw), expected_exit),
-    "metadata schema": (metadata.get("schema"), "fln.supervisor/3"),
+    "metadata schema": (metadata.get("schema"), "fln.supervisor/5"),
     "stage": (metadata.get("stage_id"), stage_id),
     "wrapper exit": (metadata.get("wrapper_exit"), expected_exit),
     "classification": (metadata.get("classification"), expected_classification),
@@ -2042,6 +2112,17 @@ checks = {
 for label, (actual, expected) in checks.items():
     if actual != expected:
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
+sealed_interpreter = metadata.get("sealed_interpreter")
+if not isinstance(sealed_interpreter, dict):
+    raise AssertionError("sealed_interpreter is not an object")
+if sealed_interpreter.get("flags") != {
+    "isolated": True,
+    "ignore_environment": True,
+    "no_site": True,
+    "no_user_site": True,
+    "safe_path": True,
+} or sealed_interpreter.get("overridden_env") != []:
+    raise AssertionError("pre-release cancellation lacks sealed interpreter facts")
 if (
     not isinstance(watchdog.get("timeout_ms"), int)
     or isinstance(watchdog.get("timeout_ms"), bool)

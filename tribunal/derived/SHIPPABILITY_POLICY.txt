@@ -1,0 +1,50 @@
+fln-shippability-policy/1
+# Which crates' lib/bin targets can reach a released artifact.
+#
+# This file is the POLICY half of the classification. The target set and each
+# target's kind are derived mechanically by `derive::derive_targets`; whether a
+# crate ships is a judgement, so it is declared here and `derive::classify`
+# blocks on any derived crate this file does not cover. An unclassified crate
+# is a hard gap, never a default: a shippable target misfiled as
+# development-only is invisible to the very gate built to catch it.
+#
+# Note what this file does NOT control. A test, bench, example or build-script
+# target never ships regardless of what is written here — that is mechanical,
+# enforced in `classify`, and not overridable by policy.
+#
+# shippable        = part of the product surface (§4: the toolchain binaries,
+#                    the embeddable library, the MCP server)
+# development-only = tooling, harnesses and rigs, absent from every release
+crate fln shippable
+crate fln-anvil shippable
+crate fln-bench development-only
+crate fln-bignum shippable
+crate fln-checker shippable
+crate fln-cli shippable
+crate fln-comp shippable
+crate fln-conformance development-only
+crate fln-core shippable
+crate fln-doc shippable
+crate fln-elab shippable
+crate fln-env shippable
+crate fln-hash shippable
+crate fln-hound shippable
+crate fln-kernel shippable
+crate fln-lake shippable
+crate fln-ledger shippable
+crate fln-libm shippable
+crate fln-mcp shippable
+crate fln-olean shippable
+crate fln-parse shippable
+crate fln-rt shippable
+crate fln-server shippable
+crate fln-syntax shippable
+crate fln-trace shippable
+crate fln-tui shippable
+crate fln-unsafe-abi shippable
+crate fln-unsafe-jit shippable
+crate fln-unsafe-region shippable
+crate fln-verdict shippable
+crate fln-vm shippable
+crate fln-wasm shippable
+crate structure-guard development-only

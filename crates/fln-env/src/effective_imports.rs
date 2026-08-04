@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::modules::{DirectImport, ModuleGraph, ModuleId};
+use fln_core::diag::{ResourceReason, StructuralUnit};
+use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
 
 /// The three Reference `.olean` loading profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +267,22 @@ pub enum ClosureResource {
     WitnessSteps,
 }
 
+impl ClosureResource {
+    /// The resource's own name, for renderers and structured logs.
+    ///
+    /// The shared [`ResourceUsage`] carries only the numbers and a unit, so this is what
+    /// tells a reader WHICH of the five bounded counts stopped the run.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ClosureResource::RootImportRows => "root-import-rows",
+            ClosureResource::PendingItems => "pending-items",
+            ClosureResource::WorkItems => "work-items",
+            ClosureResource::StateUpgrades => "state-upgrades",
+            ClosureResource::WitnessSteps => "witness-steps",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InconclusiveReason {
     Cancelled {
@@ -299,6 +317,10 @@ pub enum WitnessComponent {
     ImportAll,
     Exported,
     IrTransitive,
+    /// The route witness that records how a module was first reached. Its own
+    /// component, because a missing first-discovery path is a different failure from
+    /// a missing data or import-all witness and must not be reported as one.
+    FirstDiscovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,13 +333,36 @@ pub enum ClosureInternalFault {
     },
 }
 
+/// The census's **verdict** about an import request — what a completed traversal
+/// concluded (bead `fln-um4a`).
+///
+/// All three arms are answers, which is why they live inside [`Outcome::Complete`]
+/// rather than beside it. `fln_core::outcome::Inconclusive`'s own documentation names
+/// this type when it draws the line: `Incomplete` and `Invalid` "are *completed*
+/// traversals reporting a verdict, exactly as a decoder's 'malformed' is a verdict about
+/// bytes". The traversal ran; it found a missing module or a malformed request and says
+/// so. Nothing was left unknown.
+///
+/// The non-answers — cancellation, budget exhaustion, and our own invariants breaking —
+/// are the other two [`Outcome`] arms and carry no domain payload at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClosureStatus {
+pub enum ClosureVerdict {
     Complete,
     Incomplete { missing: Vec<MissingModuleFinding> },
-    Inconclusive { reason: InconclusiveReason },
     Invalid { reason: InvalidImportRequest },
-    InternalFault { fault: ClosureInternalFault },
+}
+
+/// Which bounded resource stopped a closure, and where.
+///
+/// Present only on a resource stop, and it is the *finer* fact beside the shared
+/// [`ResourceUsage`], which carries the numbers. `Inconclusive` is payload-free by the
+/// `fln-171x` decision, so a caller with genuine domain detail keeps it on its own report
+/// and folds only the authority field — which is exactly what this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureStop {
+    pub resource: ClosureResource,
+    /// The module the limit tripped on, when the stop is attributable to one.
+    pub module: Option<ModuleId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -427,8 +472,16 @@ impl EffectiveImportClosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveImportReport {
     pub closure: EffectiveImportClosure,
-    pub status: ClosureStatus,
+    /// The authority: whether this report answers the question at all, and if so what it
+    /// answered (bead `fln-um4a`).
+    pub status: Outcome<ClosureVerdict>,
     pub facts: ClosureFacts,
+    /// Which resource stopped the run, on a resource stop only.
+    ///
+    /// `facts` already carries the cancellation checkpoint — `InconclusiveReason` used to
+    /// report `at_work_item`, and that value was always literally `facts.work_items`, so
+    /// folding cancellation onto the shared type dropped no fact.
+    pub stop: Option<ClosureStop>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,22 +557,24 @@ pub fn compute_effective_imports(
         if import.module.name().is_anonymous() {
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Invalid {
+                status: Outcome::Complete(ClosureVerdict::Invalid {
                     reason: InvalidImportRequest::AnonymousRootImport { direct_row_index },
-                },
+                }),
                 facts,
+                stop: None,
             };
         }
         if name_has_overflow(import.module.name()) {
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Invalid {
+                status: Outcome::Complete(ClosureVerdict::Invalid {
                     reason: InvalidImportRequest::OverflowingRootModule {
                         module: import.module.clone(),
                         direct_row_index,
                     },
-                },
+                }),
                 facts,
+                stop: None,
             };
         }
     }
@@ -540,14 +595,14 @@ pub fn compute_effective_imports(
 
     while let Some(item) = stack.pop() {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            // The checkpoint is `facts.work_items`, which the report already carries —
+            // `InconclusiveReason::Cancelled` reported exactly that value, so folding onto
+            // the shared cause dropped no fact. `at` names the phase, not the number.
             return EffectiveImportReport {
                 closure,
-                status: ClosureStatus::Inconclusive {
-                    reason: InconclusiveReason::Cancelled {
-                        at_work_item: facts.work_items,
-                    },
-                },
+                status: Outcome::Inconclusive(Inconclusive::cancelled("closure-worklist")),
                 facts,
+                stop: None,
             };
         }
         facts.work_items = facts.work_items.saturating_add(1);
@@ -594,10 +649,18 @@ pub fn compute_effective_imports(
                     Ok(Some(candidate)) => candidate,
                     Ok(None) => continue,
                     Err(fault) => {
+                        // Our own invariant broke, not the caller's request. The typed
+                        // domain fault is preserved in the detail rather than discarded,
+                        // because "which witness was missing, reaching which module"
+                        // is what makes this diagnosable.
                         return EffectiveImportReport {
                             closure,
-                            status: ClosureStatus::InternalFault { fault },
+                            status: Outcome::InternalFault(InternalFault::new(
+                                "fln-env.effective-imports.missing-component-witness",
+                                format!("{fault:?}"),
+                            )),
                             facts,
+                            stop: None,
                         };
                     }
                 };
@@ -613,6 +676,27 @@ pub fn compute_effective_imports(
                 }
 
                 if let Some(existing) = closure.states.get_mut(&import.module) {
+                    // THIS CLONE IS A TRANSACTION BOUNDARY. DO NOT REMOVE IT.
+                    //
+                    // It reads like pure waste — on the common non-upgrading edge the clone is
+                    // built and dropped — and it was flagged as exactly that by an allocation
+                    // audit under `franken_lean-mvak` before the audit was checked. Recording why
+                    // it is wrong here, because the next reader will have the same idea.
+                    //
+                    // `merge_state` mutates MORE than the condition it reports. `changed` is
+                    // "exactly the Reference five-field update condition" (see its doc), while the
+                    // body also fills witnesses via `retain_first_witness` and accumulates
+                    // `ir_requested`. So merging into `existing` directly would publish those two
+                    // even on paths that must not publish anything.
+                    //
+                    // The path that must not publish is immediately below: when the state-upgrade
+                    // budget is exhausted, `report_inconclusive` returns THIS closure, and an
+                    // FL-INV-07 non-answer must not carry a half-applied upgrade. Merging in place
+                    // would leave the refused module upgraded in the returned closure — a resource
+                    // stop that mutated the thing it declined to compute.
+                    //
+                    // `every_limit_is_typed_and_stops_before_over_budget_semantic_work` pins that,
+                    // so an in-place merge fails the suite rather than passing quietly.
                     let mut merged = existing.clone();
                     let upgraded = merge_state(&mut merged, candidate.state);
                     if !upgraded {
@@ -685,13 +769,14 @@ pub fn compute_effective_imports(
             {
                 return EffectiveImportReport {
                     closure,
-                    status: ClosureStatus::Invalid {
+                    status: Outcome::Complete(ClosureVerdict::Invalid {
                         reason: InvalidImportRequest::NonModuleDirectImport {
                             module: import.module.clone(),
                             direct_row_index,
                         },
-                    },
+                    }),
                     facts,
+                    stop: None,
                 };
             }
         }
@@ -702,15 +787,19 @@ pub fn compute_effective_imports(
             .cmp(&right.module)
             .then_with(|| left.witness.cmp(&right.witness))
     });
-    let status = if missing.is_empty() {
-        ClosureStatus::Complete
+    // Both arms are ANSWERS. A missing module is what a finished traversal found, not a
+    // question it failed to settle, so it belongs inside `Complete` beside the clean
+    // verdict rather than in a non-authoritative arm.
+    let verdict = if missing.is_empty() {
+        ClosureVerdict::Complete
     } else {
-        ClosureStatus::Incomplete { missing }
+        ClosureVerdict::Incomplete { missing }
     };
     EffectiveImportReport {
         closure,
-        status,
+        status: Outcome::Complete(verdict),
         facts,
+        stop: None,
     }
 }
 
@@ -881,7 +970,17 @@ fn propagate_candidate(
             .cloned()
             .unwrap_or_else(|| route_witness.clone())
     });
-    let first_path = route_witness.paths.first().cloned().unwrap_or_default();
+    // A discovered module always has at least one route path: `ComponentWitness::root`
+    // seeds one and `append` only extends. If that invariant ever breaks, the honest
+    // answer is a typed fault — substituting `ImportWitnessPath::default()` would
+    // publish an empty path as this module's first discovery, a plausible-looking
+    // value asserting it was reached by no import at all. Under FL-INV-07 an
+    // invariant failure is an InternalFault, never a fabricated result.
+    let first_path = route_witness
+        .paths
+        .first()
+        .cloned()
+        .ok_or_else(|| fault(WitnessComponent::FirstDiscovery))?;
 
     Ok(Some(Candidate {
         state: EffectiveImportState {
@@ -973,17 +1072,33 @@ fn report_inconclusive(
     actual: usize,
     module: Option<ModuleId>,
 ) -> EffectiveImportReport {
+    // `StructuralUnit::ProducedNodes` for every one of these: each `ClosureResource` is a
+    // count of things this traversal MATERIALIZED — rows examined, work items, pending
+    // items, state upgrades, witness steps. None is a byte count and none is a denoted
+    // size, so the other two units would be untrue. Which of the five it was is the finer
+    // fact and rides `stop`, exactly as the row families' finer facts ride
+    // `DeclarationDimension` rather than multiplying the closed D8 unit taxonomy.
+    let mut inconclusive = Inconclusive::resource(ResourceUsage {
+        reason: ResourceReason::StructuralBudget {
+            unit: StructuralUnit::ProducedNodes,
+        },
+        allowed: limit as u64,
+        observed: actual as u64,
+    });
+    if let Some(module) = module.as_ref() {
+        inconclusive = inconclusive.with_progress(format!(
+            "{} at {}",
+            resource.label(),
+            module.name().to_display_string()
+        ));
+    } else {
+        inconclusive = inconclusive.with_progress(resource.label());
+    }
     EffectiveImportReport {
         closure,
-        status: ClosureStatus::Inconclusive {
-            reason: InconclusiveReason::ResourceLimitExceeded {
-                resource,
-                limit,
-                actual,
-                module,
-            },
-        },
+        status: Outcome::Inconclusive(inconclusive),
         facts,
+        stop: Some(ClosureStop { resource, module }),
     }
 }
 
@@ -991,6 +1106,7 @@ fn report_inconclusive(
 mod tests {
     use super::*;
     use fln_core::name::Name;
+    use fln_core::outcome::InconclusiveCause;
     use fln_hash::domain::Digest;
 
     use crate::modules::{
@@ -1014,7 +1130,7 @@ mod tests {
             epoch.clone(),
             ModuleGraphLimits::new(10_000, 100_000, 1_000, u128::MAX),
         )
-        .expect("test epoch");
+        .expect_complete("test epoch");
         for (index, (module, is_module, imports)) in records.into_iter().enumerate() {
             graph = graph
                 .register(ModuleRecord::new(
@@ -1028,7 +1144,7 @@ mod tests {
                         grade: ArtifactGrade::OracleFixture,
                     },
                 ))
-                .expect("test module registers")
+                .expect_complete("test module registers")
                 .graph;
         }
         graph
@@ -1266,7 +1382,7 @@ mod tests {
             GlobalOLeanLevel::Exported,
         );
         let report = compute_effective_imports(&graph, &request, None);
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         for bits in 0u8..8 {
             let state = report.closure.state(&id(&format!("M{bits}"))).unwrap();
             assert!(state.has_data);
@@ -1530,7 +1646,7 @@ mod tests {
             let expected = model_compute(&forward, &request);
             let actual = compute_effective_imports(&forward, &request, None);
             let reordered = compute_effective_imports(&reverse, &request, None);
-            assert_eq!(actual.status, ClosureStatus::Complete);
+            assert_eq!(actual.status, Outcome::Complete(ClosureVerdict::Complete));
             assert_eq!(actual, reordered);
             assert_eq!(actual.closure.reference_discovery(), expected.1);
             assert_eq!(actual.closure.len(), expected.0.len());
@@ -1642,7 +1758,7 @@ mod tests {
             &EffectiveImportRequest::new(roots, GlobalOLeanLevel::Exported),
             None,
         );
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         assert!(report.facts.state_upgrades <= report.closure.len().saturating_mul(5));
         assert!(
             report.facts.direct_rows_examined
@@ -1673,12 +1789,16 @@ mod tests {
             GlobalOLeanLevel::Exported,
         );
         let report = compute_effective_imports(&graph, &request, None);
-        assert!(matches!(&report.status, ClosureStatus::Incomplete { .. }));
-        let missing = if let ClosureStatus::Incomplete { missing } = report.status {
-            missing
-        } else {
-            Vec::new()
-        };
+        assert!(matches!(
+            &report.status,
+            Outcome::Complete(ClosureVerdict::Incomplete { .. })
+        ));
+        let missing =
+            if let Outcome::Complete(ClosureVerdict::Incomplete { missing }) = report.status {
+                missing
+            } else {
+                Vec::new()
+            };
         assert_eq!(missing.len(), 2);
         let finding = missing
             .iter()
@@ -1705,7 +1825,10 @@ mod tests {
                 .with_root_is_exported(false),
             None,
         );
-        assert_eq!(overridden.status, ClosureStatus::Complete);
+        assert_eq!(
+            overridden.status,
+            Outcome::Complete(ClosureVerdict::Complete)
+        );
         assert!(!overridden.closure.state(&id("A")).unwrap().is_exported);
 
         let anonymous = EffectiveImportRequest::new(
@@ -1719,11 +1842,11 @@ mod tests {
         );
         assert_eq!(
             compute_effective_imports(&graph, &anonymous, None).status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::AnonymousRootImport {
                     direct_row_index: 0,
                 }
-            }
+            })
         );
 
         let overflowed = ModuleId::new(Name::num_overflowing(Name::anonymous(), u64::MAX));
@@ -1733,12 +1856,93 @@ mod tests {
         );
         assert_eq!(
             compute_effective_imports(&graph, &overflow, None).status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::OverflowingRootModule {
                     module: overflowed,
                     direct_row_index: 0,
                 }
-            }
+            })
+        );
+    }
+
+    /// A discovered module always has at least one route path, so this state is
+    /// unreachable today — which is exactly why it must fault rather than default.
+    /// The rejected code substituted `ImportWitnessPath::default()`, publishing an
+    /// empty path as the module's first discovery: a plausible-looking value
+    /// asserting it was reached by no import at all. That is the same
+    /// substitute-a-plausible-default class as the witness collision in
+    /// franken_lean-f6br, and it is worse than a loud failure because nothing
+    /// downstream can tell the difference.
+    #[test]
+    fn a_missing_first_discovery_path_faults_instead_of_defaulting_to_empty() {
+        // Reaches the route-witness step with every component witness absent, so the
+        // route is `parent.route_witness.append(..)` — and `append` maps over `paths`,
+        // so an empty parent route stays empty.
+        let empty_route = PropagationContext {
+            import_all: false,
+            is_exported: false,
+            needs_data: false,
+            needs_ir_transitive: false,
+            import_all_witness: None,
+            exported_witness: None,
+            data_witness: None,
+            ir_transitive_witness: None,
+            route_witness: ComponentWitness {
+                paths: Vec::new().into(),
+            },
+        };
+        let mut facts = ClosureFacts::default();
+        // `Server` requests IR globally, so the candidate is not short-circuited as
+        // uninteresting before the route witness is built.
+        let outcome = propagate_candidate(
+            GlobalOLeanLevel::Server,
+            ImportSource::Root,
+            0,
+            &direct("A", 0),
+            &empty_route,
+            &mut facts,
+        );
+        assert_eq!(
+            outcome.expect_err("an absent first-discovery path is an invariant failure"),
+            ClosureInternalFault::MissingComponentWitness {
+                component: WitnessComponent::FirstDiscovery,
+                source: ImportSource::Root,
+                direct_row_index: 0,
+                target: id("A"),
+            },
+            "the fault must name the first-discovery component, not borrow another's"
+        );
+
+        // Not a blanket refusal: the identical request with a well-formed route
+        // witness still produces a candidate, so the fault is about the missing
+        // evidence and not about the request.
+        let healthy = PropagationContext {
+            route_witness: ComponentWitness::root(),
+            ..empty_route
+        };
+        let mut facts = ClosureFacts::default();
+        let candidate = propagate_candidate(
+            GlobalOLeanLevel::Server,
+            ImportSource::Root,
+            0,
+            &direct("A", 0),
+            &healthy,
+            &mut facts,
+        )
+        .expect("a seeded route witness is not a fault")
+        .expect("the candidate is produced");
+        // `ComponentWitness::root` seeds one empty path and this propagation appends
+        // exactly one step, so a real first-discovery witness has exactly one step —
+        // and is therefore distinguishable from the empty default the fix removed.
+        assert_eq!(
+            candidate.state.witnesses.first_discovery.steps.len(),
+            1,
+            "the healthy path must yield a first-discovery witness with a real step"
+        );
+        assert_ne!(
+            candidate.state.witnesses.first_discovery,
+            ImportWitnessPath::default(),
+            "a real witness must be distinguishable from the substituted default"
         );
     }
 
@@ -1775,6 +1979,88 @@ mod tests {
         );
     }
 
+    /// **`stop` and `status` are two representations of one fact, so they are pinned to
+    /// agree** (bead `fln-um4a`).
+    ///
+    /// This is the hazard cc_3 found in `fln-hash`'s canon decoder and recorded on this
+    /// bead: a stop held as side-channel state beside a returned value, where the two can
+    /// disagree and the type has no arm for "they disagree", so the disagreement resolves
+    /// silently in favour of acceptance. Folding the authority onto `Outcome` reintroduced
+    /// exactly that shape here — `status` says whether the run stopped, and `stop` says so
+    /// again with the finer fact attached.
+    ///
+    /// They cannot disagree today because `report_inconclusive` is the only thing that
+    /// builds either, but "only one function does it" is a property of today's code, not
+    /// of the type. This asserts the biconditional over every reachable outcome, so a
+    /// future path that sets one without the other fails here rather than shipping a
+    /// report whose two halves tell different stories.
+    #[test]
+    fn a_stop_is_present_exactly_when_the_outcome_is_a_resource_refusal() {
+        let graph = graph(vec![
+            ("A", true, vec![direct("C", 3)]),
+            ("B", true, vec![direct("A", 7)]),
+            ("C", true, vec![]),
+        ]);
+        let base = EffectiveImportRequest::new(
+            vec![direct("A", 2), direct("B", 3)],
+            GlobalOLeanLevel::Exported,
+        );
+
+        // A clean run: an answer, and therefore no stop.
+        let clean = compute_effective_imports(&graph, &base, None);
+        assert!(matches!(clean.status, Outcome::Complete(_)));
+        assert!(
+            clean.stop.is_none(),
+            "an answered request must not carry a resource stop"
+        );
+
+        // Cancellation: a non-answer, but NOT a resource refusal — so still no stop.
+        let cancelled = AtomicBool::new(true);
+        let stopped = compute_effective_imports(&graph, &base, Some(&cancelled));
+        assert!(matches!(stopped.status, Outcome::Inconclusive(_)));
+        assert!(
+            stopped.stop.is_none(),
+            "cancellation is not a resource refusal and must not claim one"
+        );
+
+        // Every resource refusal: a non-answer that DOES carry its finer fact.
+        for resource in [
+            ClosureResource::RootImportRows,
+            ClosureResource::PendingItems,
+            ClosureResource::WorkItems,
+            ClosureResource::StateUpgrades,
+            ClosureResource::WitnessSteps,
+        ] {
+            let mut request = base.clone();
+            match resource {
+                ClosureResource::RootImportRows => request.limits.max_root_import_rows = 0,
+                ClosureResource::PendingItems => request.limits.max_pending_items = 0,
+                ClosureResource::WorkItems => request.limits.max_work_items = 0,
+                ClosureResource::StateUpgrades => request.limits.max_state_upgrades = 0,
+                ClosureResource::WitnessSteps => request.limits.max_witness_steps = 0,
+            }
+            let report = compute_effective_imports(&graph, &request, None);
+            let is_resource_stop = matches!(
+                &report.status,
+                Outcome::Inconclusive(Inconclusive {
+                    cause: InconclusiveCause::ResourceExhausted { .. },
+                    ..
+                })
+            );
+            assert_eq!(
+                is_resource_stop,
+                report.stop.is_some(),
+                "`status` and `stop` must agree about whether this was a resource \
+                 refusal ({resource:?})"
+            );
+            assert_eq!(
+                report.stop.as_ref().map(|stop| stop.resource),
+                Some(resource),
+                "and the stop must name the resource that tripped"
+            );
+        }
+    }
+
     #[test]
     fn every_limit_is_typed_and_stops_before_over_budget_semantic_work() {
         let graph = graph(vec![
@@ -1805,18 +2091,43 @@ mod tests {
                 ClosureResource::WitnessSteps => request.limits.max_witness_steps = 0,
             }
             let report = compute_effective_imports(&graph, &request, None);
-            assert!(matches!(
-                report.status,
-                ClosureStatus::Inconclusive {
-                    reason: InconclusiveReason::ResourceLimitExceeded {
-                        resource: actual,
-                        ..
-                    }
-                } if actual == resource
-            ));
+            assert!(
+                matches!(report.status, Outcome::Inconclusive(_)),
+                "a budget stop is a non-answer, never a verdict"
+            );
+            // The finer fact moved from the arm to the report when the authority folded
+            // onto the shared taxonomy (bead `fln-um4a`). It is still asserted: knowing a
+            // stop happened is useless without knowing WHICH of the five bounds tripped.
+            assert_eq!(
+                report.stop.as_ref().map(|stop| stop.resource),
+                Some(resource),
+                "the stop must name the resource that tripped"
+            );
             if resource == ClosureResource::StateUpgrades {
                 assert_eq!(report.facts.state_upgrades, 0);
-                assert!(!report.closure.state(&id("A")).unwrap().import_all);
+                // ATOMICITY OF THE REFUSED UPGRADE, checked across everything `merge_state`
+                // touches rather than on one field.
+                //
+                // The five-field condition is what `merge_state` REPORTS, but its body also
+                // fills witnesses and accumulates `ir_requested`. Asserting only `import_all`
+                // leaves those two unpinned, so a merge that published them on the refused path
+                // would pass. They are the fields most at risk precisely because they sit
+                // outside the reported condition.
+                let refused = report.closure.state(&id("A")).unwrap();
+                assert!(
+                    !refused.import_all,
+                    "a refused upgrade must not publish the five-field merge"
+                );
+                assert!(
+                    !refused.ir_requested,
+                    "`ir_requested` is accumulated OUTSIDE the reported condition, so a refused \
+                     upgrade is exactly where it can leak"
+                );
+                assert!(
+                    refused.witnesses.import_all.is_none(),
+                    "`retain_first_witness` also runs outside the reported condition; a refused \
+                     upgrade must not leave the witness for a component it declined to set"
+                );
             }
         }
     }
@@ -1837,7 +2148,7 @@ mod tests {
             ),
             None,
         );
-        assert_eq!(report.status, ClosureStatus::Complete);
+        assert_eq!(report.status, Outcome::Complete(ClosureVerdict::Complete));
         let a = report.closure.state(&id("A")).unwrap();
         let c = report.closure.state(&id("C")).unwrap();
         assert!(a.has_data && a.import_all && a.is_exported);
@@ -1922,30 +2233,34 @@ mod tests {
         let request =
             EffectiveImportRequest::new(vec![direct("Missing", 2)], GlobalOLeanLevel::Exported);
         let missing = compute_effective_imports(&empty, &request, None);
-        assert!(matches!(missing.status, ClosureStatus::Incomplete { .. }));
+        assert!(matches!(
+            missing.status,
+            Outcome::Complete(ClosureVerdict::Incomplete { .. })
+        ));
         assert_eq!(missing.closure.reference_discovery(), [id("Missing")]);
 
         let cancelled = AtomicBool::new(true);
         let cancelled_report = compute_effective_imports(&empty, &request, Some(&cancelled));
         assert!(matches!(
             cancelled_report.status,
-            ClosureStatus::Inconclusive {
-                reason: InconclusiveReason::Cancelled { .. }
-            }
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::Cancelled { .. },
+                ..
+            })
         ));
+        assert!(
+            cancelled_report.stop.is_none(),
+            "cancellation is not a resource stop and must not claim one"
+        );
 
         let mut limited_request = request.clone();
         limited_request.limits.max_work_items = 0;
         let limited = compute_effective_imports(&empty, &limited_request, None);
-        assert!(matches!(
-            limited.status,
-            ClosureStatus::Inconclusive {
-                reason: InconclusiveReason::ResourceLimitExceeded {
-                    resource: ClosureResource::WorkItems,
-                    ..
-                }
-            }
-        ));
+        assert!(matches!(limited.status, Outcome::Inconclusive(_)));
+        assert_eq!(
+            limited.stop.as_ref().map(|stop| stop.resource),
+            Some(ClosureResource::WorkItems)
+        );
 
         let nonmodule = graph(vec![("Legacy", false, vec![])]);
         let invalid = compute_effective_imports(
@@ -1955,12 +2270,12 @@ mod tests {
         );
         assert_eq!(
             invalid.status,
-            ClosureStatus::Invalid {
+            Outcome::Complete(ClosureVerdict::Invalid {
                 reason: InvalidImportRequest::NonModuleDirectImport {
                     module: id("Legacy"),
                     direct_row_index: 0,
                 }
-            }
+            })
         );
 
         let private = compute_effective_imports(
@@ -1968,7 +2283,7 @@ mod tests {
             &EffectiveImportRequest::new(vec![direct("Legacy", 0)], GlobalOLeanLevel::Private),
             None,
         );
-        assert_eq!(private.status, ClosureStatus::Complete);
+        assert_eq!(private.status, Outcome::Complete(ClosureVerdict::Complete));
         assert_eq!(
             private.closure.state(&id("Legacy")).unwrap().exposure(),
             ImportExposure::PrivateAll

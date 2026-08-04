@@ -14,6 +14,11 @@
 //! relocation engine that drives these mappings lives in `fln-rt::region`.
 
 #![deny(unsafe_code)]
+// D3's SAFETY-note half, enforced here because this crate's library is clean
+// (FLN-STRUCT-040). Scope note: a crate-root lint does not reach `examples/`, and
+// examples/region_trap_probe.rs still has one undocumented block, tracked on bead
+// franken_lean-d3-safety-note-unenforced-cdbg.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 // The mapping primitive is Linux-syscall based; the certified platform matrix
 // is 64-bit little-endian, and slice 1 is Linux-only (macOS/Windows join with

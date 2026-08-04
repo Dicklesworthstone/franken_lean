@@ -24,8 +24,22 @@ pub struct Dep {
 #[derive(Debug)]
 pub struct Manifest {
     pub name: String,
+    /// Package version as written in the manifest. The closure audit compares this
+    /// independently with both Cargo.lock and the reviewed allowlist.
+    pub version: Option<String>,
     pub edition: String,
+    /// Reviewed package license identifier. Cargo accepts many legal spellings; the
+    /// guard preserves the exact string so the allowlist, rather than this parser,
+    /// remains the policy authority.
+    pub license: Option<String>,
     pub deps: Vec<Dep>,
+    /// Explicit feature names from the one reviewed `[features]` table.
+    ///
+    /// Feature values are validated while parsing, but the structural authority
+    /// inventory also needs the exact axis cardinality. Keeping the names here
+    /// prevents robot evidence from claiming a closed feature class without
+    /// deriving it from the same manifest parse that drives the dependency audit.
+    pub features: Vec<String>,
 }
 
 const DEP_SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
@@ -245,7 +259,9 @@ pub fn parse_workspace_members(text: &str, display_path: &str) -> Result<Vec<Str
 
 pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
     let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
     let mut edition: Option<String> = None;
+    let mut license: Option<String> = None;
     let mut deps: Vec<Dep> = Vec::new();
     let mut section: Option<String> = None;
     let mut seen_sections = BTreeSet::new();
@@ -297,7 +313,18 @@ pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
                         "name" => {
                             name = Some(
                                 unquote(v)
+                                    .filter(|value| !value.is_empty())
                                     .ok_or_else(|| err("name must be a quoted string"))?
+                                    .to_string(),
+                            );
+                        }
+                        "version" => {
+                            version = Some(
+                                unquote(v)
+                                    .filter(|value| !value.is_empty())
+                                    .ok_or_else(|| {
+                                        err("version must be a non-empty quoted string")
+                                    })?
                                     .to_string(),
                             );
                         }
@@ -305,6 +332,16 @@ pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
                             edition = Some(
                                 unquote(v)
                                     .ok_or_else(|| err("edition must be a quoted string"))?
+                                    .to_string(),
+                            );
+                        }
+                        "license" => {
+                            license = Some(
+                                unquote(v)
+                                    .filter(|value| !value.is_empty())
+                                    .ok_or_else(|| {
+                                        err("license must be a non-empty quoted string")
+                                    })?
                                     .to_string(),
                             );
                         }
@@ -365,8 +402,11 @@ pub fn parse(text: &str, display_path: &str) -> Result<Manifest, String> {
 
     Ok(Manifest {
         name: name.ok_or_else(|| format!("{display_path}: missing package.name"))?,
+        version,
         edition: edition.ok_or_else(|| format!("{display_path}: missing package.edition"))?,
+        license,
         deps,
+        features: feature_keys.into_iter().collect(),
     })
 }
 
@@ -380,8 +420,11 @@ mod tests {
     fn parses_stub_manifest() {
         let m = parse(OK, "t").expect("parses");
         assert_eq!(m.name, "fln-core");
+        assert_eq!(m.version.as_deref(), Some("0.0.0"));
         assert_eq!(m.edition, "2024");
+        assert!(m.license.is_none());
         assert!(m.deps.is_empty());
+        assert!(m.features.is_empty());
     }
 
     #[test]
@@ -409,6 +452,7 @@ mod tests {
         let text = format!("{OK}\n[features]\niron = []\nfrontier = [\"iron\", \"dep:fln-jit\"]\n");
         let m = parse(&text, "t").expect("parses");
         assert!(m.deps.is_empty());
+        assert_eq!(m.features, ["frontier", "iron"]);
 
         let malformed = format!("{OK}\n[features]\niron = [\"ok\",, \"bad\"]\n");
         assert!(parse(&malformed, "t").is_err());

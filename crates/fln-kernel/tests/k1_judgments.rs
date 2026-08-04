@@ -4,17 +4,53 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
+use fln_core::diag::ResourceReason;
+use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
+use fln_core::outcome::{Authority, CacheAdmission, InconclusiveCause, Outcome, ResourceUsage};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
-    InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints, TheoremVal,
+    InductiveVal, OpaqueVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
+    TheoremVal,
 };
-use fln_env::environment::Environment;
-use fln_kernel::verdict::{Budget, ExhaustionReason, RejectClass, Verdict};
+use fln_env::environment::{DeclarationBudget, Environment};
+use fln_env::pmap::CollisionBudget;
+use fln_kernel::capability::{Published, admit as capability_admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
+use fln_kernel::verdict::{Budget, RejectClass, Verdict};
 use fln_kernel::{Declaration, check, check_def_eq};
+
+trait KernelOutcomeAssertions {
+    fn is_accepted(&self) -> bool;
+    fn is_rejected(&self) -> bool;
+    fn is_inconclusive(&self) -> bool;
+}
+
+impl KernelOutcomeAssertions for Outcome<Verdict> {
+    fn is_accepted(&self) -> bool {
+        matches!(self, Outcome::Complete(Verdict::Accepted { .. }))
+    }
+
+    fn is_rejected(&self) -> bool {
+        matches!(self, Outcome::Complete(Verdict::Rejected { .. }))
+    }
+
+    fn is_inconclusive(&self) -> bool {
+        matches!(self, Outcome::Inconclusive(_))
+    }
+}
+
+fn exhausted_usage(outcome: &Outcome<Verdict>) -> &ResourceUsage {
+    match outcome {
+        Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => usage,
+            other => panic!("expected resource exhaustion, got {other:?}"),
+        },
+        other => panic!("expected an inconclusive kernel outcome, got {other:?}"),
+    }
+}
 
 fn n(s: &str) -> Name {
     Name::str(Name::anonymous(), s)
@@ -63,17 +99,18 @@ fn admit(env: &Environment, decl: &Declaration) -> Environment {
         Declaration::Axiom(v) => ConstantInfo::Axiom(v),
         Declaration::Defn(v) => ConstantInfo::Defn(v),
         Declaration::Thm(v) => ConstantInfo::Thm(v),
+        Declaration::Opaque(v) => ConstantInfo::Opaque(v),
         // Block declarations use their own admission helpers in these tests.
-        Declaration::Inductive(_) | Declaration::Quotient(_) => {
+        Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_) => {
             unreachable!("admit() is only used for single-constant declarations")
         }
     };
     env.add_decl(info).expect("kernel-accepted decl adds")
 }
 
-fn reject_class(verdict: &Verdict) -> Option<RejectClass> {
+fn reject_class(verdict: &Outcome<Verdict>) -> Option<RejectClass> {
     match verdict {
-        Verdict::Rejected { class, .. } => Some(*class),
+        Outcome::Complete(Verdict::Rejected { class, .. }) => Some(*class),
         _ => None,
     }
 }
@@ -90,6 +127,44 @@ fn kr970_the_one_name_one_constant_law() {
     let env = admit(&Environment::new(), &axiom("A", sort1()));
     let verdict = check(&env, &axiom("A", sort1()), Budget::DEFAULT);
     assert_eq!(reject_class(&verdict), Some(RejectClass::AlreadyDeclared));
+}
+
+#[test]
+fn kr972_a_declaration_type_that_is_not_a_sort_is_rejected() {
+    // KR-972: a declaration's TYPE must itself check to a sort. The existing
+    // kr104_kr972 case covers the direction where it does; a mutation campaign
+    // found the refusal unguarded — deleting the check left all 98 tests
+    // passing, because nothing ever declared something whose type is not a
+    // type.
+    //
+    // `dd : D` and `D : Sort 1`, so the type expression `dd` infers to `D`,
+    // which is a Const and not a Sort. Admitting `bad : dd` would put a
+    // constant in the environment whose type is not a type at all, and every
+    // later judgment about `bad` would be reasoning about a non-type.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let env = admit(&env, &axiom("dd", Expr::const_(n("D"), vec![])));
+    let verdict = check(
+        &env,
+        &axiom("bad", Expr::const_(n("dd"), vec![])),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::SortExpected),
+        "a declaration whose type is not a sort must be refused; got {verdict:?}"
+    );
+
+    // CONTROL: the same shape one level up still admits, so this is not a
+    // blanket refusal of constants-as-types.
+    assert!(
+        check(
+            &env,
+            &axiom("fine", Expr::const_(n("D"), vec![])),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "a declaration whose type IS a sort-typed constant must still admit"
+    );
 }
 
 #[test]
@@ -137,6 +212,38 @@ fn kr100_loose_bvars_are_a_typed_rejection() {
 }
 
 #[test]
+fn kr102_free_variables_are_telescope_bound_or_rejected() {
+    // A caller-supplied fvar has no local declaration and must never acquire a
+    // type by name coincidence or defaulting.
+    let unknown = Expr::fvar(FVarId(n("x")));
+    let verdict = check(&Environment::new(), &axiom("bad", unknown), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::UnknownFVar),
+        "an fvar outside the kernel's local telescope must be a typed rejection"
+    );
+
+    // CONTROL: public binders are opened to fresh fvars internally and those
+    // locals do type correctly. This arm keeps the test discriminating rather
+    // than accepting a blanket refusal of every fvar.
+    let identity = defn(
+        "id",
+        Expr::forall_e(n("A"), sort1(), sort1(), BinderInfo::Default),
+        Expr::lam(
+            n("A"),
+            sort1(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+    );
+    let verdict = check(&Environment::new(), &identity, Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "a fresh fvar introduced by a valid binder telescope must type; got {verdict:?}"
+    );
+}
+
+#[test]
 fn kr103_metavariables_are_a_typed_rejection() {
     let env = Environment::new();
     let mvar = Expr::mvar(fln_core::expr::MVarId(n("m")));
@@ -161,6 +268,30 @@ fn kr105_universe_arity_is_checked() {
     assert_eq!(
         reject_class(&verdict),
         Some(RejectClass::UniverseArityMismatch)
+    );
+}
+
+#[test]
+fn kr105_unknown_constants_are_rejected() {
+    let missing = Expr::const_(n("Missing"), vec![]);
+    let verdict = check(&Environment::new(), &axiom("bad", missing), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::UnknownConstant),
+        "a constant absent from the environment must be a typed rejection"
+    );
+
+    // CONTROL: the same declaration shape admits when the referenced constant
+    // is present with a sort-typed declaration.
+    let env = admit(&Environment::new(), &axiom("Present", sort1()));
+    let verdict = check(
+        &env,
+        &axiom("good", Expr::const_(n("Present"), vec![])),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "a present constant with the right universe arity must type; got {verdict:?}"
     );
 }
 
@@ -397,8 +528,9 @@ fn distinct_axioms_are_not_defeq() {
 
 #[test]
 fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
-    // The identity-function check under a 5-step budget: must be Inconclusive
-    // with a consumption profile — categorically NOT a rejection.
+    // The identity-function check under a 5-step budget: must be an
+    // outcome-level Inconclusive with bounded usage facts — categorically not
+    // a domain verdict.
     let ty = Expr::forall_e(
         n("alpha"),
         sort1(),
@@ -421,46 +553,36 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
         ),
         BinderInfo::Default,
     );
-    let tiny = Budget {
-        steps: 5,
-        depth: 4096,
-    };
+    let tiny = Budget::DEFAULT.narrowed(5, 4096);
     let verdict = check(
         &Environment::new(),
         &defn("id", ty.clone(), value.clone()),
         tiny,
     );
-    assert!(
-        matches!(
-            &verdict,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Steps,
-                ..
-            }
-        ),
-        "FL-INV-07 violated: expected Steps-exhaustion Inconclusive, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert!(usage.observed > tiny.steps);
+    assert_eq!(usage.allowed, tiny.steps);
+    assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+    assert_eq!(
+        verdict.cache_admission(),
+        CacheAdmission::Refused {
+            authority: Authority::NonAuthoritative,
+        }
     );
-    if let Verdict::Inconclusive { consumption, .. } = &verdict {
-        assert!(consumption.steps_used >= 5);
-    }
-    assert!(!verdict.is_rejected() && !verdict.is_accepted());
+    assert!(verdict.as_complete().is_none());
 
     // Depth exhaustion likewise.
-    let shallow = Budget {
-        steps: 1_000_000,
-        depth: 1,
-    };
+    let shallow = Budget::DEFAULT.narrowed(1_000_000, 1);
     let verdict = check(&Environment::new(), &defn("id", ty, value), shallow);
-    assert!(
-        matches!(
-            verdict,
-            Verdict::Inconclusive {
-                reason: ExhaustionReason::Depth,
-                ..
-            }
-        ),
-        "{verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::RecursionDepth {
+            limit: u64::from(shallow.depth),
+        }
     );
+    assert_eq!(usage.allowed, u64::from(shallow.depth));
+    assert!(usage.observed > usage.allowed);
 }
 
 #[test]
@@ -1826,13 +1948,10 @@ fn fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected() {
         &[],
         &lhs,
         &Expr::const_(n("nmz"), vec![]),
-        Budget {
-            steps: 2_000,
-            depth: 64,
-        },
+        Budget::DEFAULT.narrowed(2_000, 64),
     );
     assert!(
-        matches!(verdict, Verdict::Inconclusive { .. }),
+        verdict.is_inconclusive(),
         "budget exhaustion in an iota chain is Inconclusive, got {verdict:?}"
     );
 }
@@ -2002,6 +2121,234 @@ fn kr317_k_like_recursor_reduces_an_opaque_proof() {
         )
         .is_accepted(),
         "K-like reduction fires on an opaque proof of a K-eligible inductive"
+    );
+}
+
+#[test]
+fn kr317_k_conversion_refuses_a_major_whose_index_does_not_match_the_constructor() {
+    // KR-317's GATE. K conversion replaces an opaque major with the nullary
+    // constructor, but only after checking that the constructor's type is defeq
+    // to the major's. `kr317_k_like_recursor_reduces_an_opaque_proof` above
+    // covers the direction where K must FIRE; a mutation campaign found the
+    // direction where it must NOT fire completely unguarded — replacing the
+    // defeq gate with `if false` left all 97 tests passing, even though the
+    // gate is reached (a planted panic there fires in exactly one test).
+    //
+    // SOUNDNESS STAKE, and it is the worst in the campaign so far. `E` here is
+    // Eq-shaped: one parameter, one index, one constructor `E.refl : (a : D) →
+    // E a a`. For an opaque `h : E x y` the nullary constructor at those
+    // parameters is `E.refl x : E x x`, which is NOT defeq to `E x y`. Without
+    // the gate the kernel rewrites `h` to `E.refl x` and iota-reduces, so a
+    // recursor application at index `y` computes as though it were at `x` —
+    // that is a proof of `x = y` for arbitrary distinct `x` and `y`.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = || Expr::const_(n("D"), vec![]);
+    let env = admit(&env, &axiom("x", d()));
+    let env = admit(&env, &axiom("y", d()));
+    let x = || Expr::const_(n("x"), vec![]);
+    let y = || Expr::const_(n("y"), vec![]);
+    let e = || Expr::const_(n("E"), vec![]);
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = n("u");
+
+    // E : (a : D) → D → Prop, with `a` a parameter and the second D an index.
+    let env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: cval(
+                n("E"),
+                vec![],
+                Expr::forall_e(
+                    n("a"),
+                    d(),
+                    Expr::forall_e(n("b"), d(), prop(), BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+            ),
+            num_params: 1,
+            num_indices: 1,
+            all: vec![n("E")],
+            ctors: vec![nn("E", "refl")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    // E.refl : (a : D) → E a a
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: cval(
+                nn("E", "refl"),
+                vec![],
+                Expr::forall_e(
+                    n("a"),
+                    d(),
+                    Expr::app(Expr::app(e(), bv(0)), bv(0)),
+                    BinderInfo::Default,
+                ),
+            ),
+            induct: n("E"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 0,
+            is_unsafe: false,
+        }),
+    );
+
+    // motive : (b : D) → E a b → Sort u   (under the `a` binder)
+    let motive_ty = Expr::forall_e(
+        n("b"),
+        d(),
+        Expr::forall_e(
+            n("h"),
+            Expr::app(Expr::app(e(), bv(1)), bv(0)),
+            Expr::sort(Level::param(u.clone())),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // refl_case : motive a (E.refl a)   (under a, motive)
+    let refl_case_ty = Expr::app(
+        Expr::app(bv(0), bv(1)),
+        Expr::app(Expr::const_(nn("E", "refl"), vec![]), bv(1)),
+    );
+    // E.rec : {a} {motive} (refl_case) {b} (h : E a b) → motive b h
+    let rec_ty = Expr::forall_e(
+        n("a"),
+        d(),
+        Expr::forall_e(
+            n("motive"),
+            motive_ty.clone(),
+            Expr::forall_e(
+                n("refl_case"),
+                refl_case_ty.clone(),
+                Expr::forall_e(
+                    n("b"),
+                    d(),
+                    Expr::forall_e(
+                        n("h"),
+                        Expr::app(Expr::app(e(), bv(3)), bv(0)),
+                        Expr::app(Expr::app(bv(3), bv(1)), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    // rule rhs: fun a motive refl_case => refl_case
+    let rhs = Expr::lam(
+        n("a"),
+        d(),
+        Expr::lam(
+            n("motive"),
+            motive_ty,
+            Expr::lam(n("refl_case"), refl_case_ty, bv(0), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: cval(nn("E", "rec"), vec![u], rec_ty),
+            all: vec![n("E")],
+            num_params: 1,
+            num_indices: 1,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("E", "refl"),
+                nfields: 0,
+                rhs,
+            }],
+            k: true,
+            is_unsafe: false,
+        }),
+    );
+    // EM : (b : D) → E x b → Sort 1;  ec : EM x (E.refl x);  h : E x y
+    let env = admit(
+        &env,
+        &axiom(
+            "EM",
+            Expr::forall_e(
+                n("b"),
+                d(),
+                Expr::forall_e(
+                    n("h"),
+                    Expr::app(Expr::app(e(), x()), bv(0)),
+                    sort1(),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+    );
+    let em = || Expr::const_(n("EM"), vec![]);
+    let env = admit(
+        &env,
+        &axiom(
+            "ec",
+            Expr::app(
+                Expr::app(em(), x()),
+                Expr::app(Expr::const_(nn("E", "refl"), vec![]), x()),
+            ),
+        ),
+    );
+    let env = admit(&env, &axiom("h", Expr::app(Expr::app(e(), x()), y())));
+
+    // E.rec.{1} x EM ec y h  —  stuck, because K may not rewrite `h : E x y`
+    // into `E.refl x : E x x`.
+    let mut lhs = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        x(),
+        em(),
+        Expr::const_(n("ec"), vec![]),
+        y(),
+        Expr::const_(n("h"), vec![]),
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    assert!(
+        !check_def_eq(
+            &env,
+            &[],
+            &lhs,
+            &Expr::const_(n("ec"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "K conversion must NOT fire when the nullary constructor's type is not \
+         defeq to the major's: reducing here proves `x = y` for distinct x, y"
+    );
+
+    // CONTROL: at the MATCHING index the gate passes and K does fire, so the
+    // test is not merely asserting that this recursor never reduces.
+    let mut ok = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        x(),
+        em(),
+        Expr::const_(n("ec"), vec![]),
+        x(),
+        Expr::app(Expr::const_(nn("E", "refl"), vec![]), x()),
+    ] {
+        ok = Expr::app(ok, arg);
+    }
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &ok,
+            &Expr::const_(n("ec"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "at the matching index the recursor must still reduce"
     );
 }
 
@@ -3323,6 +3670,86 @@ fn kr301_distinct_literals_are_decisively_not_defeq() {
 }
 
 #[test]
+fn kr301_structural_equality_closes_at_the_one_step_boundary() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("B", sort1()));
+    let a = Expr::const_(n("A"), vec![]);
+    let b = Expr::const_(n("B"), vec![]);
+    let one_step = Budget::DEFAULT.narrowed(1, Budget::DEFAULT.depth);
+
+    let same = check_def_eq(&env, &[], &a, &a, one_step);
+    assert!(
+        same.is_accepted(),
+        "structural equality must close immediately after the counted entry hook; got {same:?}"
+    );
+
+    // CONTROL: the one-step ceiling is genuinely tight. A non-identical pair
+    // cannot enter normalization and therefore yields typed exhaustion rather
+    // than being blanket-accepted.
+    let distinct = check_def_eq(&env, &[], &a, &b, one_step);
+    assert!(
+        distinct.is_inconclusive(),
+        "a distinct pair must not pass the structural fast path; got {distinct:?}"
+    );
+}
+
+#[test]
+fn kr311_application_congruence_checks_heads_and_arguments() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_ty = Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_ty.clone()));
+    let env = admit(&env, &axiom("b", a_ty.clone()));
+    let arrow = Expr::forall_e(n("_"), a_ty.clone(), a_ty, BinderInfo::Default);
+    let env = admit(&env, &axiom("f", arrow.clone()));
+    let env = admit(&env, &axiom("g", arrow));
+    let a = Expr::const_(n("a"), vec![]);
+    let b = Expr::const_(n("b"), vec![]);
+    let f = Expr::const_(n("f"), vec![]);
+    let g = Expr::const_(n("g"), vec![]);
+
+    let id = Expr::lam(
+        n("x"),
+        Expr::const_(n("A"), vec![]),
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let beta_a = Expr::app(id, a.clone());
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), beta_a),
+            &Expr::app(f.clone(), a.clone()),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "application congruence must close defeq arguments after reduction"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), a.clone()),
+            &Expr::app(g, a.clone()),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "application congruence must compare the function head"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::app(f.clone(), a),
+            &Expr::app(f, b),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "application congruence must compare every argument"
+    );
+}
+
+#[test]
 fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
     // A shiftLeft whose RESULT would dwarf the step budget converts to typed
     // Inconclusive BEFORE any allocation — never a rejection, never an
@@ -3331,9 +3758,13 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
     let env = add_nat_literal_axioms(&Environment::new());
     let huge_count = nat_op_app("shiftLeft", lit(1), lit(1u64 << 40));
     let verdict = check_def_eq(&env, &[], &huge_count, &lit(0), Budget::DEFAULT);
-    assert!(
-        verdict.is_inconclusive() && !verdict.is_rejected() && !verdict.is_accepted(),
-        "an infeasible shift is a verdict about the RUN, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(usage.allowed, Budget::DEFAULT.steps);
+    assert!(usage.observed > usage.allowed);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::ExecutionSteps,
+        "an infeasible shift is an outcome about the run"
     );
     // A count beyond u64 entirely (2^64, limbs [0,1]) takes the same typed path.
     let beyond_u64 = nat_op_app(
@@ -3342,9 +3773,11 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
         Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
     );
     let verdict = check_def_eq(&env, &[], &beyond_u64, &lit(0), Budget::DEFAULT);
-    assert!(
-        verdict.is_inconclusive(),
-        "a beyond-u64 shift count is typed exhaustion, got {verdict:?}"
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(
+        (usage.allowed, usage.observed),
+        (Budget::DEFAULT.steps, Budget::DEFAULT.steps + 1),
+        "a beyond-u64 shift count records the minimal forecasted overrun"
     );
     // shiftRight only shrinks: the same beyond-u64 count simply zeroes.
     let shr_all = nat_op_app(
@@ -4003,9 +4436,9 @@ fn shift(e: &Expr, d: u32) -> Expr {
     go(e, d, 0)
 }
 
-fn reject_message(verdict: &Verdict) -> String {
+fn reject_message(verdict: &Outcome<Verdict>) -> String {
     match verdict {
-        Verdict::Rejected { message, .. } => message.clone(),
+        Outcome::Complete(Verdict::Rejected { message, .. }) => message.clone(),
         other => panic!("expected rejection, got {other:?}"),
     }
 }
@@ -4018,14 +4451,275 @@ fn kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration() {
     // byte-for-byte. An inverted KR-604 universe condition, a dropped
     // consume_type_annotations, or any generation drift rejects this block.
     let (types, ctors, recursors) = mynat_block();
-    let verdict = check(
-        &Environment::new(),
-        &block_decl(types, ctors, recursors),
-        Budget::DEFAULT,
-    );
+    let declaration = block_decl(types, ctors, recursors);
+    let env = Environment::new();
+    let verdict = check(&env, &declaration, Budget::DEFAULT);
     assert!(
         verdict.is_accepted(),
         "MyNat block must admit; got {verdict:?}"
+    );
+
+    // The capability handoff must carry every row the block checker compared,
+    // in the same type/constructor/recursor order, and expose no prefix.
+    let admitted = match capability_admit(&env, declaration, Budget::DEFAULT) {
+        Outcome::Complete(admitted) => admitted,
+        Outcome::Inconclusive(_) => {
+            panic!("an accepted MyNat block became inconclusive at the capability boundary")
+        }
+        Outcome::InternalFault(_) => {
+            panic!("an accepted MyNat block faulted at the capability boundary")
+        }
+    };
+    let checked = match convene(&Council::nobody_was_asked(), admitted) {
+        CouncilOutcome::Agreed(checked) => checked,
+        CouncilOutcome::KernelRejected { class, .. } => {
+            panic!("the capability path rejected the accepted MyNat block as {class:?}")
+        }
+        CouncilOutcome::Halted(halt) => {
+            panic!(
+                "an empty council halted the MyNat block: {}",
+                halt.summary()
+            )
+        }
+    };
+    match checked.publish(
+        DeclarationBudget::UNBOUNDED,
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::BlockCommitted(publication)) => {
+            assert_eq!(
+                publication.names,
+                vec![
+                    n("MyNat"),
+                    nn("MyNat", "zero"),
+                    nn("MyNat", "succ"),
+                    nn("MyNat", "rec")
+                ]
+            );
+            assert!(matches!(
+                publication.environment.find(&n("MyNat")),
+                Some(ConstantInfo::Induct(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "zero")),
+                Some(ConstantInfo::Ctor(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "succ")),
+                Some(ConstantInfo::Ctor(_))
+            ));
+            assert!(matches!(
+                publication.environment.find(&nn("MyNat", "rec")),
+                Some(ConstantInfo::Rec(_))
+            ));
+        }
+        other => panic!("the checked MyNat block did not publish atomically: {other:?}"),
+    }
+    assert_eq!(
+        env.len(),
+        0,
+        "publishing the block must not mutate its checked base"
+    );
+}
+
+#[test]
+fn kr600_block_preconditions_reject_empty_and_colliding_names() {
+    let empty = block_decl(vec![], vec![], vec![]);
+    let verdict = check(&Environment::new(), &empty, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("empty inductive block"),
+        "the empty-block precondition must be explicit; got {}",
+        reject_message(&verdict)
+    );
+
+    let (types, ctors, recursors) = mynat_block();
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: cval(n("MyNat"), vec![], sort1()),
+            is_unsafe: false,
+        }),
+    );
+    let verdict = check(
+        &env,
+        &block_decl(types.clone(), ctors.clone(), recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "an inductive type name must be fresh"
+    );
+
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: cval(nn("MyNat", "rec"), vec![], sort1()),
+            is_unsafe: false,
+        }),
+    );
+    let verdict = check(
+        &env,
+        &block_decl(types.clone(), ctors.clone(), recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::AlreadyDeclared),
+        "an inductive recursor name must be fresh"
+    );
+
+    assert!(
+        check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the exact block must remain a positive control"
+    );
+}
+
+#[test]
+fn kr601_mutual_block_parameters_must_match() {
+    let names = vec![n("Left"), n("Right")];
+    let row = |name: &str, parameter_type: Expr| InductiveVal {
+        base: cval(
+            n(name),
+            vec![],
+            Expr::forall_e(n("p"), parameter_type, sort1(), BinderInfo::Default),
+        ),
+        num_params: 1,
+        num_indices: 0,
+        all: names.clone(),
+        ctors: vec![],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mismatched = block_decl(
+        vec![row("Left", sort1()), row("Right", prop())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &mismatched, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("parameters of all inductive datatypes must match"),
+        "the rejection must come from the shared-parameter judgment; got {}",
+        reject_message(&verdict)
+    );
+
+    let matching = block_decl(
+        vec![row("Left", sort1()), row("Right", sort1())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &matching, Budget::DEFAULT);
+    assert!(
+        !reject_message(&verdict).contains("parameters of all inductive datatypes must match"),
+        "matching parameter telescopes must pass KR-601 before later decoded-row checks"
+    );
+}
+
+#[test]
+fn kr602_mutual_results_share_one_universe_and_end_in_sorts() {
+    let names = vec![n("Left"), n("Right")];
+    let row = |name: &str, type_: Expr| InductiveVal {
+        base: cval(n(name), vec![], type_),
+        num_params: 0,
+        num_indices: 0,
+        all: names.clone(),
+        ctors: vec![],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mismatched = block_decl(
+        vec![row("Left", sort1()), row("Right", prop())],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&Environment::new(), &mismatched, Budget::DEFAULT);
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("must live in the same universe"),
+        "the rejection must come from the one-universe judgment; got {}",
+        reject_message(&verdict)
+    );
+
+    let env = admit(&Environment::new(), &axiom("Carrier", sort1()));
+    let non_sort = block_decl(
+        vec![row("Left", Expr::const_(n("Carrier"), vec![]))],
+        vec![],
+        vec![],
+    );
+    let verdict = check(&env, &non_sort, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::SortExpected),
+        "an inductive type must end in a sort"
+    );
+}
+
+#[test]
+fn kr603_constructor_metadata_and_return_type_are_cross_checked() {
+    let (types, ctors, recursors) = mynat_block();
+
+    let mut wrong_index = ctors.clone();
+    wrong_index[0].cidx = 1;
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_index, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("constructor observables mismatch"),
+        "constructor indices are decoded evidence, never authority; got {}",
+        reject_message(&verdict)
+    );
+
+    let mut wrong_order = ctors.clone();
+    wrong_order.swap(0, 1);
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_order, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("decoded ctor order mismatch"),
+        "constructor order must match the parent row; got {}",
+        reject_message(&verdict)
+    );
+
+    let mut wrong_return = ctors.clone();
+    wrong_return[0].base.type_ = sort1();
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types.clone(), wrong_return, recursors.clone()),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("invalid return type"),
+        "a constructor must return its declared inductive; got {}",
+        reject_message(&verdict)
+    );
+
+    assert!(
+        check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "the exact constructor rows must remain a positive control"
     );
 }
 
@@ -4434,6 +5128,200 @@ fn kr700_a_restricted_block_admits_with_prop_elimination() {
 }
 
 #[test]
+fn kr701_a_single_constructor_prop_carrying_data_is_elimination_restricted() {
+    // KR-701's subsingleton rule: a ONE-constructor `Prop` may eliminate large
+    // only if every non-parameter field is itself a Prop, or is pinned by the
+    // result's arguments. `S : Prop` with a single field `d : D`, `D : Sort 1`,
+    // satisfies neither — `D` is data, and `S` has no indices for `d` to occur
+    // in — so `S` eliminates ONLY into Prop, and the Prop-restricted recursor
+    // below is the one the kernel must regenerate.
+    //
+    // SOUNDNESS STAKE: large elimination here would let a proof of `S` be
+    // destructed into `Sort 1`, carrying the `D` witness out of Prop. That is
+    // proof-irrelevance broken at the recursor, not at a projection.
+    //
+    // WHY THIS TEST EXISTS: a mutation campaign inverted each half of the
+    // KR-701 test independently — the field-sort check and the
+    // occurs-in-result-args check — and BOTH mutants survived all 93 kernel
+    // tests. Every pre-existing KR-700/701 case used nullary constructors, so
+    // the field loop this rule lives in was never entered. The two-constructor
+    // rule above it was guarded; the single-constructor rule was not.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let s = || Expr::const_(n("S"), vec![]);
+    let d = || Expr::const_(n("D"), vec![]);
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+
+    let ind = InductiveVal {
+        base: cval(n("S"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("S")],
+        ctors: vec![nn("S", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let ctor = ConstructorVal {
+        base: cval(
+            nn("S", "mk"),
+            vec![],
+            Expr::forall_e(n("d"), d(), s(), BinderInfo::Default),
+        ),
+        induct: n("S"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+
+    // {motive : S -> Prop} -> (mk : (d : D) -> motive (S.mk d)) -> (t : S) -> motive t
+    let motive_ty = Expr::forall_e(n("t"), s(), prop(), BinderInfo::Default);
+    let minor_ty = Expr::forall_e(
+        n("d"),
+        d(),
+        Expr::app(bv(1), Expr::app(Expr::const_(nn("S", "mk"), vec![]), bv(0))),
+        BinderInfo::Default,
+    );
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("mk"),
+            minor_ty.clone(),
+            Expr::forall_e(n("t"), s(), Expr::app(bv(2), bv(0)), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    // fun motive mk d => mk d
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("mk"),
+            minor_ty,
+            Expr::lam(n("d"), d(), Expr::app(bv(1), bv(0)), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec = RecursorVal {
+        base: cval(nn("S", "rec"), vec![], rec_ty),
+        all: vec![n("S")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 1,
+        rules: vec![RecursorRule {
+            ctor: nn("S", "mk"),
+            nfields: 1,
+            rhs,
+        }],
+        k: false,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &env,
+        &block_decl(vec![ind], vec![ctor], vec![rec]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "a 1-ctor Prop with a data field must admit with Prop-RESTRICTED \
+         elimination; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr302_binder_congruence_compares_the_domain_not_only_the_body() {
+    // KR-302: two binders are defeq only if their DOMAINS are defeq and their
+    // bodies agree under a shared local. Dropping the domain half leaves the
+    // body comparison, which still succeeds — so `B -> A` would be accepted
+    // where `A -> A` was declared, for arbitrary unrelated `A` and `B`.
+    //
+    // A mutation campaign found this unguarded: replacing the domain check
+    // with `if false` left all 94 kernel tests passing. Every pre-existing
+    // binder-congruence case (KR-312 eta, KR-202 beta, the lambda cases) had
+    // matching domains, so nothing ever exercised the disagreeing branch.
+    //
+    // SOUNDNESS STAKE: function types would become defeq up to their argument
+    // types, so a proof about `B -> A` could be used where `A -> A` is
+    // required, and the kernel would admit the substitution silently.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("B", sort1()));
+    let env = admit(&env, &axiom("a", Expr::const_(n("A"), vec![])));
+    let a_ty = || Expr::const_(n("A"), vec![]);
+    let b_ty = || Expr::const_(n("B"), vec![]);
+
+    // value : A -> A  (fun _ : A => a)
+    let value = Expr::lam(
+        n("x"),
+        a_ty(),
+        Expr::const_(n("a"), vec![]),
+        BinderInfo::Default,
+    );
+    // declared : B -> A — same body type, DIFFERENT domain.
+    let declared = Expr::forall_e(n("x"), b_ty(), a_ty(), BinderInfo::Default);
+    let verdict = check(&env, &defn("f", declared, value), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "a binder whose DOMAIN differs must not be defeq; got {verdict:?}"
+    );
+
+    // The matching-domain version still admits, so the rule is not a blanket
+    // refusal of binder congruence.
+    let ok = Expr::forall_e(n("x"), a_ty(), a_ty(), BinderInfo::Default);
+    let value_ok = Expr::lam(
+        n("x"),
+        a_ty(),
+        Expr::const_(n("a"), vec![]),
+        BinderInfo::Default,
+    );
+    assert!(
+        check(&env, &defn("g", ok, value_ok), Budget::DEFAULT).is_accepted(),
+        "matching domains must still admit"
+    );
+}
+
+#[test]
+fn kr802_decoded_recursor_arity_observables_are_cross_checked() {
+    // KR-802: the decoded recursor's observables are REGENERATED, never
+    // trusted. `num_motives` and `num_minors` are not decoration — tc.rs uses
+    // them to locate the major premise in an application spine
+    // (num_params + num_motives + num_minors + num_indices), so a decoded lie
+    // makes iota reduce against the WRONG argument while the recursor's own
+    // type still checks out.
+    //
+    // A mutation campaign found both unguarded: deleting either comparison
+    // from the observables check left all 94 kernel tests passing. The type
+    // comparison beside it does not cover them, because these are separate
+    // decoded fields that can disagree with a perfectly well-formed type.
+    // kr607 pins the decoded *flags* (is_rec); nothing pinned the arities.
+    for (label, corrupt) in [
+        (
+            "num_minors",
+            (|r: &mut RecursorVal| r.num_minors += 1) as fn(&mut RecursorVal),
+        ),
+        ("num_motives", |r: &mut RecursorVal| r.num_motives += 1),
+    ] {
+        let (types, ctors, mut recursors) = mynat_block();
+        corrupt(&mut recursors[0]);
+        let verdict = check(
+            &Environment::new(),
+            &block_decl(types, ctors, recursors),
+            Budget::DEFAULT,
+        );
+        assert_eq!(
+            reject_class(&verdict),
+            Some(RejectClass::BlockMismatch),
+            "a decoded recursor overstating {label} must be rejected; got {verdict:?}"
+        );
+    }
+}
+
+#[test]
 fn kr607_decoded_flags_are_cross_checked() {
     // The decoded is_rec flag is UNTRUSTED: MyNat decoded as non-recursive
     // must reject (a flags-comparison-drop mutant dies here).
@@ -4450,6 +5338,261 @@ fn kr607_decoded_flags_are_cross_checked() {
         "got: {}",
         reject_message(&verdict)
     );
+}
+
+fn eq_environment_with_refl(refl_type: Expr) -> Environment {
+    let u = n("u");
+    let level = Level::param(u.clone());
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+    let eq_type = Expr::forall_e(
+        n("α"),
+        Expr::sort(level.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::forall_e(n("b"), bv(1), prop(), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let eq = ConstantInfo::Induct(InductiveVal {
+        base: cval(n("Eq"), vec![u.clone()], eq_type),
+        num_params: 1,
+        num_indices: 2,
+        all: vec![n("Eq")],
+        ctors: vec![nn("Eq", "refl")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    });
+    let refl = ConstantInfo::Ctor(ConstructorVal {
+        base: cval(nn("Eq", "refl"), vec![u], refl_type),
+        induct: n("Eq"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    });
+    add_info(&add_info(&Environment::new(), eq), refl)
+}
+
+fn exact_eq_environment() -> Environment {
+    let level = Level::param(n("u"));
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+    let refl_type = Expr::forall_e(
+        n("α"),
+        Expr::sort(level.clone()),
+        Expr::forall_e(
+            n("a"),
+            bv(0),
+            Expr::app(
+                Expr::app(Expr::app(Expr::const_(n("Eq"), vec![level]), bv(1)), bv(0)),
+                bv(0),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    eq_environment_with_refl(refl_type)
+}
+
+fn exact_quotient_rows() -> Vec<QuotVal> {
+    let arrow = |domain: Expr, codomain: Expr| {
+        Expr::forall_e(n("a"), domain, codomain, BinderInfo::Default)
+    };
+    let pi = |name: &str, info: BinderInfo, type_: Expr, body: Expr| {
+        Expr::forall_e(n(name), type_, body, info)
+    };
+    let quot = n("Quot");
+    let u_name = n("u");
+    let v_name = n("v");
+    let u = Level::param(u_name.clone());
+    let v = Level::param(v_name.clone());
+    let bv = |index: u32| Expr::bvar(index).expect("packs");
+
+    let quot_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        arrow(arrow(bv(0), arrow(bv(1), prop())), Expr::sort(u.clone())),
+    );
+    let quot_app = |alpha: Expr, relation: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), alpha),
+            relation,
+        )
+    };
+    let quot_mk_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Default,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi("a", BinderInfo::Default, bv(1), quot_app(bv(2), bv(1))),
+        ),
+    );
+
+    let eq_name = n("Eq");
+    let soundness = pi(
+        "a",
+        BinderInfo::Default,
+        bv(3),
+        pi(
+            "b",
+            BinderInfo::Default,
+            bv(4),
+            arrow(
+                Expr::app(Expr::app(bv(4), bv(1)), bv(0)),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::const_(eq_name, vec![v.clone()]), bv(4)),
+                        Expr::app(bv(3), bv(2)),
+                    ),
+                    Expr::app(bv(3), bv(1)),
+                ),
+            ),
+        ),
+    );
+    let quot_lift_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Implicit,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi(
+                "β",
+                BinderInfo::Implicit,
+                Expr::sort(v.clone()),
+                pi(
+                    "f",
+                    BinderInfo::Default,
+                    arrow(bv(2), bv(1)),
+                    arrow(
+                        soundness,
+                        arrow(
+                            Expr::app(
+                                Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(4)),
+                                bv(3),
+                            ),
+                            bv(3),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+
+    let quot_mk = nn("Quot", "mk");
+    let quot_ind_type = pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        pi(
+            "r",
+            BinderInfo::Implicit,
+            arrow(bv(0), arrow(bv(1), prop())),
+            pi(
+                "β",
+                BinderInfo::Implicit,
+                arrow(
+                    Expr::app(
+                        Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(1)),
+                        bv(0),
+                    ),
+                    prop(),
+                ),
+                pi(
+                    "mk",
+                    BinderInfo::Default,
+                    pi(
+                        "a",
+                        BinderInfo::Default,
+                        bv(2),
+                        Expr::app(
+                            bv(1),
+                            Expr::app(
+                                Expr::app(
+                                    Expr::app(
+                                        Expr::const_(quot_mk.clone(), vec![u.clone()]),
+                                        bv(3),
+                                    ),
+                                    bv(2),
+                                ),
+                                bv(0),
+                            ),
+                        ),
+                    ),
+                    pi(
+                        "q",
+                        BinderInfo::Default,
+                        Expr::app(
+                            Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), bv(3)),
+                            bv(2),
+                        ),
+                        Expr::app(bv(2), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+
+    vec![
+        QuotVal {
+            base: cval(quot, vec![u_name.clone()], quot_type),
+            kind: QuotKind::Type,
+        },
+        QuotVal {
+            base: cval(quot_mk, vec![u_name.clone()], quot_mk_type),
+            kind: QuotKind::Ctor,
+        },
+        QuotVal {
+            base: cval(
+                nn("Quot", "lift"),
+                vec![u_name.clone(), v_name],
+                quot_lift_type,
+            ),
+            kind: QuotKind::Lift,
+        },
+        QuotVal {
+            base: cval(nn("Quot", "ind"), vec![u_name], quot_ind_type),
+            kind: QuotKind::Ind,
+        },
+    ]
+}
+
+#[test]
+fn kr951_kr952_kr953_kr954_quotient_rows_are_checked_individually() {
+    let env = exact_eq_environment();
+    let rows = exact_quotient_rows();
+    let verdict = check(&env, &Declaration::Quotient(rows.clone()), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "the exact Quot, Quot.mk, Quot.lift, and Quot.ind rows must initialize; got {verdict:?}"
+    );
+
+    for (index, rule) in ["KR-951", "KR-952", "KR-953", "KR-954"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut corrupted = rows.clone();
+        corrupted[index].base.type_ = sort1();
+        let verdict = check(&env, &Declaration::Quotient(corrupted), Budget::DEFAULT);
+        assert_eq!(
+            reject_class(&verdict),
+            Some(RejectClass::BlockMismatch),
+            "{rule}: a decoded quotient type must not override the pin-derived row"
+        );
+        assert!(
+            reject_message(&verdict).contains("type diverges"),
+            "{rule}: the first divergence must identify the corrupt row; got {}",
+            reject_message(&verdict)
+        );
+    }
 }
 
 #[test]
@@ -4469,11 +5612,291 @@ fn kr95x_quotient_initialization_requires_the_exact_eq_shape() {
 }
 
 #[test]
-fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
+fn kr950_quotient_init_checks_the_eq_constructor_not_only_the_eq_type() {
+    // KR-950 validates BOTH halves of the pinned equality: the `Eq` type AND
+    // its `Eq.refl` constructor. A mutation campaign found the constructor
+    // half unguarded — replacing its structural comparison with `if false`
+    // left all 96 tests passing, because the only existing KR-95x case removes
+    // `Eq` from the environment entirely and returns long before the
+    // constructor is ever looked at.
+    //
+    // SOUNDNESS STAKE: `Quot.sound` is stated in terms of this `Eq`. An
+    // `Eq.refl` of the wrong type is a different equality wearing the right
+    // name, and quotient soundness is what rests on it.
+    let u = n("u");
+    let lvl = Level::param(u.clone());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+
+    // A "refl" that is NOT reflexive: forall {a} (x y : a), Eq a x y — it
+    // relates two DIFFERENT values, so it proves everything equal.
+    let bad_refl = Expr::forall_e(
+        n("α"),
+        Expr::sort(lvl.clone()),
+        Expr::forall_e(
+            n("x"),
+            bv(0),
+            Expr::forall_e(
+                n("y"),
+                bv(1),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::const_(n("Eq"), vec![lvl.clone()]), bv(2)),
+                        bv(1),
+                    ),
+                    bv(0),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let verdict = check(
+        &eq_environment_with_refl(bad_refl),
+        &Declaration::Quotient(vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("type for 'Eq' type constructor"),
+        "a non-reflexive `Eq.refl` must be refused by name; got: {}",
+        reject_message(&verdict)
+    );
+
+    // CONTROL: with the correct refl the run gets PAST this check — it then
+    // fails on the absent quotient declarations instead. Without this the test
+    // could pass for any reason at all.
+    let control = check(
+        &exact_eq_environment(),
+        &Declaration::Quotient(vec![]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        !reject_message(&control).contains("type for 'Eq' type constructor"),
+        "the correct refl must clear the constructor check; got: {}",
+        reject_message(&control)
+    );
+}
+
+#[test]
+fn kr974_opaque_declarations_check_the_body_and_stay_opaque_to_defeq() {
+    // Pin environment.cpp:add_opaque checks an opaque's header and body with
+    // the ordinary safe type checker, then stores it as ConstantInfo::Opaque.
+    // The body is evidence for admission, not a delta-reduction rule.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_type()));
+    let opaque = OpaqueVal {
+        base: cval(n("sealed"), vec![], a_type()),
+        value: Expr::const_(n("a"), vec![]),
+        is_unsafe: false,
+        all: vec![n("sealed")],
+    };
+    let verdict = check(&env, &Declaration::Opaque(opaque.clone()), Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "a well-typed opaque must admit; got {verdict:?}"
+    );
+
+    let with_opaque = add_info(&env, ConstantInfo::Opaque(opaque));
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &with_opaque,
+            &[],
+            &Expr::const_(n("sealed"), vec![]),
+            &Expr::const_(n("a"), vec![]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "an admitted opaque body must not become a delta-reduction rule"
+    );
+
+    let bad = OpaqueVal {
+        base: cval(n("badOpaque"), vec![], a_type()),
+        value: Expr::const_(n("A"), vec![]),
+        is_unsafe: false,
+        all: vec![n("badOpaque")],
+    };
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Opaque(bad), Budget::DEFAULT)),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "an opaque body still has to inhabit its declared type"
+    );
+
+    // This is subtle pin behavior: OpaqueVal.isUnsafe is metadata, but
+    // add_opaque constructs the ordinary SAFE checker. Marking the declaration
+    // unsafe therefore does not let its body reference an unsafe definition.
+    let function_type = Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let unsafe_info = DefinitionVal {
+        base: cval(n("unsafeId"), vec![], function_type.clone()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Unsafe,
+        all: vec![n("unsafeId")],
+    };
+    let unsafe_env = add_info(&env, ConstantInfo::Defn(unsafe_info));
+    let unsafe_opaque = OpaqueVal {
+        base: cval(n("unsafeOpaque"), vec![], function_type),
+        value: Expr::const_(n("unsafeId"), vec![]),
+        is_unsafe: true,
+        all: vec![n("unsafeOpaque")],
+    };
+    assert_eq!(
+        reject_class(&check(
+            &unsafe_env,
+            &Declaration::Opaque(unsafe_opaque),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::SafetyViolation),
+        "OpaqueVal.isUnsafe must not silently widen the pin's safe body checker"
+    );
+}
+
+#[test]
+fn kr977_mutual_definitions_predeclare_the_whole_block_and_fail_atomically() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let function_type = || Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let all = vec![n("mutualF"), n("mutualG")];
+    let member = |name: &str, target: &str| DefinitionVal {
+        base: cval(n(name), vec![], function_type()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::app(
+                Expr::const_(n(target), vec![]),
+                Expr::bvar(0).expect("packs"),
+            ),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Partial,
+        all: all.clone(),
+    };
+    let f = member("mutualF", "mutualG");
+    let g = member("mutualG", "mutualF");
+
+    // A single partial definition sees itself, but not its not-yet-added peer.
+    // The same first member therefore fails outside the block. This is the
+    // discriminating control for "predeclare EVERY member before ANY body".
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Defn(f.clone()), Budget::DEFAULT)),
+        Some(RejectClass::UnknownConstant)
+    );
+
+    let block = Declaration::Mutual(vec![f.clone(), g.clone()]);
+    let verdict = check(&env, &block, Budget::DEFAULT);
+    let used = match verdict {
+        Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
+        other => panic!("a well-typed partial mutual block must admit: {other:?}"),
+    };
+    assert!(used > 1, "the block must perform real shared work");
+
+    // The allowance is shared across headers and bodies. Exact work passes;
+    // moving the boundary by one produces typed Inconclusive, never rejection.
+    assert!(
+        check(
+            &env,
+            &block,
+            Budget::DEFAULT.narrowed(used, Budget::DEFAULT.depth)
+        )
+        .is_accepted(),
+        "the exact measured step boundary must admit"
+    );
+    assert!(
+        check(
+            &env,
+            &block,
+            Budget::DEFAULT.narrowed(used - 1, Budget::DEFAULT.depth)
+        )
+        .is_inconclusive(),
+        "one step below the shared boundary must be typed Inconclusive"
+    );
+
+    let mut bad_g = g;
+    bad_g.value = Expr::sort(Level::zero());
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![f, bad_g]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::DefinitionTypeMismatch)
+    );
+    assert!(
+        !env.contains(&n("mutualF")) && !env.contains(&n("mutualG")),
+        "checking a block must not publish an accepted prefix"
+    );
+}
+
+#[test]
+fn kr977_mutual_definition_shape_is_nonempty_uniform_and_nonsafe() {
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_type = || Expr::const_(n("A"), vec![]);
+    let function_type = || Expr::forall_e(n("x"), a_type(), a_type(), BinderInfo::Default);
+    let member = |name: &str, safety: DefinitionSafety| DefinitionVal {
+        base: cval(n(name), vec![], function_type()),
+        value: Expr::lam(
+            n("x"),
+            a_type(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety,
+        all: vec![n("shapeF"), n("shapeG")],
+    };
+
+    assert_eq!(
+        reject_class(&check(&env, &Declaration::Mutual(vec![]), Budget::DEFAULT)),
+        Some(RejectClass::BlockMismatch),
+        "the pin refuses an empty mutual definition"
+    );
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![member("safeMutual", DefinitionSafety::Safe)]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::BlockMismatch),
+        "safe mutual definitions are not a kernel declaration form"
+    );
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![
+                member("shapeF", DefinitionSafety::Partial),
+                member("shapeG", DefinitionSafety::Unsafe),
+            ]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::BlockMismatch),
+        "every mutual member must carry the same safety annotation"
+    );
+
+    let duplicate = member("duplicateMutual", DefinitionSafety::Partial);
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &Declaration::Mutual(vec![duplicate.clone(), duplicate]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::AlreadyDeclared),
+        "the private scratch environment must preserve one-name-one-constant"
+    );
+}
+
+#[test]
+fn kr973_kr975_kr976_nonsafe_definitions_check_and_safe_references_are_gated() {
     // Pin add_definition/add_mutual semantics: a PARTIAL definition may
     // reference itself (header → add → body in the scratch env); a SAFE
     // definition may reference neither partial nor unsafe declarations
-    // (KR-973), while an UNSAFE definition may reference unsafe ones.
+    // (KR-976/KR-975), while an UNSAFE definition may reference unsafe ones.
     let env = admit(&Environment::new(), &axiom("A", sort1()));
     let a = || Expr::const_(n("A"), vec![]);
     let mk_defn = |name: &str, safety: DefinitionSafety, value: Expr| {
@@ -4533,7 +5956,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
         "safe definitions cannot be self-recursive"
     );
     // Admit the partial def, then: a SAFE definition referencing it rejects
-    // (KR-973), an UNSAFE definition referencing an unsafe one admits.
+    // (KR-976), an UNSAFE definition referencing an unsafe one admits.
     let env = add_info(
         &env,
         ConstantInfo::Defn(DefinitionVal {
@@ -4556,7 +5979,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
     assert_eq!(
         reject_class(&check(&env, &safe_uses_partial, Budget::DEFAULT)),
         Some(RejectClass::SafetyViolation),
-        "a safe definition must not reference a partial one (KR-973)"
+        "a safe definition must not reference a partial one (KR-976)"
     );
     let unsafe_id = mk_defn(
         "unsafeId",
@@ -4603,7 +6026,7 @@ fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
             Budget::DEFAULT
         )),
         Some(RejectClass::SafetyViolation),
-        "a safe definition must not reference an unsafe one (KR-973)"
+        "a safe definition must not reference an unsafe one (KR-975)"
     );
     let uses_unsafe = mk_defn(
         "unsafeUsesUnsafe",
@@ -4717,6 +6140,19 @@ fn kr310_projection_congruence_on_stuck_scrutinees() {
 /// The environment rows the translation copies: a plain parameterized
 /// `MyList` (α : Type) with nil/cons, monomorphic for fixture clarity.
 fn mylist_env() -> Environment {
+    let (mylist, ctors) = mylist_rows();
+    let mut env = Environment::new()
+        .add_decl(ConstantInfo::Induct(mylist))
+        .expect("env");
+    for ctor in ctors {
+        env = env.add_decl(ConstantInfo::Ctor(ctor)).expect("env");
+    }
+    env
+}
+
+/// `MyList`'s rows on their own, so an environment can declare the families in
+/// either order (the declaration-order permutation).
+fn mylist_rows() -> (InductiveVal, Vec<ConstructorVal>) {
     let mylist = InductiveVal {
         base: cval(
             n("MyList"),
@@ -4777,13 +6213,7 @@ fn mylist_env() -> Environment {
         num_fields: 2,
         is_unsafe: false,
     };
-    Environment::new()
-        .add_decl(ConstantInfo::Induct(mylist))
-        .expect("env")
-        .add_decl(ConstantInfo::Ctor(nil))
-        .expect("env")
-        .add_decl(ConstantInfo::Ctor(cons))
-        .expect("env")
+    (mylist, vec![nil, cons])
 }
 
 /// The decoded (restored-form) nested block: `MyTree.node : MyList MyTree →
@@ -5157,14 +6587,1409 @@ fn kr608_nested_translation_exhaustion_is_typed() {
     let verdict = check(
         &mylist_env(),
         &block_decl(types, ctors, recursors),
-        Budget {
-            steps: 5,
-            depth: 4096,
-        },
+        Budget::DEFAULT.narrowed(5, 4096),
     );
     assert!(
         verdict.is_inconclusive(),
         "budget exhaustion in the translation must be typed Inconclusive; got {verdict:?}"
     );
     assert!(!verdict.is_accepted() && !verdict.is_rejected());
+}
+
+// ---------------------------------------------------------------------------
+// KR-608, second channel: TRANSITIVE (worklist) discovery, deduplication, and
+// auxiliary accounting — the pin's cascade (bead franken_lean-8ce PIN-PROBE
+// CORRECTION). At the pin, `Lean.Syntax.node` nests `Array Syntax` directly;
+// copying `Array` at `Syntax` exposes `Array.mk : List Syntax → Array Syntax`,
+// whose field is itself nested, so `List` is copied too and `num_nested = 2`.
+// The second occurrence exists in NO declared row — only in a minted one — so
+// it is reachable only by iterating the worklist over the auxiliaries.
+//
+// `MyArr` below plays `Array`, `MyList` plays `List`, `MyTree` plays `Syntax`.
+// ---------------------------------------------------------------------------
+
+/// [`mylist_env`] extended with `MyArr α`, whose ONLY constructor carries a
+/// `MyList α` field. Nothing here is nested by itself: the cascade appears
+/// only once `MyArr` is copied at `MyTree`.
+fn myarr_env() -> Environment {
+    cascade_env(false)
+}
+
+/// Both families, with `arr_first` choosing which is DECLARED first. The
+/// translation resolves nested heads by name out of the environment, so this
+/// order must not be observable anywhere in the result.
+fn cascade_env(arr_first: bool) -> Environment {
+    let (mylist, list_ctors) = mylist_rows();
+    let (myarr, arr_ctor) = myarr_rows();
+    let list: Vec<ConstantInfo> = std::iter::once(ConstantInfo::Induct(mylist))
+        .chain(list_ctors.into_iter().map(ConstantInfo::Ctor))
+        .collect();
+    let arr = vec![ConstantInfo::Induct(myarr), ConstantInfo::Ctor(arr_ctor)];
+    let (first, second) = if arr_first { (arr, list) } else { (list, arr) };
+    let mut env = Environment::new();
+    for info in first.into_iter().chain(second) {
+        env = env.add_decl(info).expect("env");
+    }
+    env
+}
+
+/// `MyArr`'s rows: the family whose copy exposes the cascade.
+fn myarr_rows() -> (InductiveVal, ConstructorVal) {
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let myarr = InductiveVal {
+        base: cval(
+            n("MyArr"),
+            vec![],
+            Expr::forall_e(n("α"), sort1(), sort1(), BinderInfo::Default),
+        ),
+        num_params: 1,
+        num_indices: 0,
+        all: vec![n("MyArr")],
+        ctors: vec![nn("MyArr", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("MyArr", "mk"),
+            vec![],
+            Expr::forall_e(
+                n("α"),
+                sort1(),
+                Expr::forall_e(
+                    n("data"),
+                    Expr::app(Expr::const_(n("MyList"), vec![]), bv(0)),
+                    Expr::app(Expr::const_(n("MyArr"), vec![]), bv(1)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyArr"),
+        cidx: 0,
+        num_params: 1,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    (myarr, mk)
+}
+
+/// Decoded rows for the cascading block: `MyTree.node : MyArr MyTree → MyTree`
+/// (`with_direct_list` adds a second field `MyList MyTree`, which the `MyArr`
+/// copy ALSO reaches — the duplicate-reachability case). `num_nested` is a
+/// parameter because it is the observable each cascade case pins.
+fn cascaded_mytree_rows(
+    num_nested: u32,
+    with_direct_list: bool,
+) -> (Vec<InductiveVal>, Vec<ConstructorVal>) {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr_tree = Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list_tree = Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let node_ty = if with_direct_list {
+        Expr::forall_e(
+            n("a"),
+            arr_tree,
+            Expr::forall_e(n("l"), list_tree, tree(), BinderInfo::Default),
+            BinderInfo::Default,
+        )
+    } else {
+        Expr::forall_e(n("a"), arr_tree, tree(), BinderInfo::Default)
+    };
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(nn("MyTree", "node"), vec![], node_ty),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: if with_direct_list { 2 } else { 1 },
+        is_unsafe: false,
+    };
+    (vec![ind], vec![node])
+}
+
+/// The cascading block in full restored form: the decoded rows the pin would
+/// serialize for `MyTree.node : MyArr MyTree → MyTree`, including all THREE
+/// recursors. Auxiliary creation order is observable here and nowhere else:
+/// `MyTree.rec_1` eliminates the first auxiliary (`MyArr MyTree`, minted from
+/// the declared field) and `MyTree.rec_2` the second (`MyList MyTree`, minted
+/// from inside the first auxiliary's constructor).
+fn cascaded_mytree_block() -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let (types, ctors) = cascaded_mytree_rows(2, false);
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = Level::param(n("u"));
+    let motive_ty =
+        |major: Expr| Expr::forall_e(n("t"), major, Expr::sort(u.clone()), BinderInfo::Default);
+    let motive_1_ty = motive_ty(tree());
+    let motive_2_ty = motive_ty(arr());
+    let motive_3_ty = motive_ty(list());
+    // node : Π (a : MyArr MyTree), motive_2 a → motive_1 (MyTree.node a)
+    let node_minor_ty = Expr::forall_e(
+        n("a"),
+        arr(),
+        Expr::forall_e(
+            n("a_ih"),
+            Expr::app(bv(2), bv(0)),
+            Expr::app(
+                bv(4),
+                Expr::app(Expr::const_(nn("MyTree", "node"), vec![]), bv(1)),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // mk : Π (data : MyList MyTree), motive_3 data → motive_2 (MyArr.mk MyTree data)
+    let mk_minor_ty = Expr::forall_e(
+        n("data"),
+        list(),
+        Expr::forall_e(
+            n("data_ih"),
+            Expr::app(bv(2), bv(0)),
+            Expr::app(
+                bv(4),
+                Expr::app(
+                    Expr::app(Expr::const_(nn("MyArr", "mk"), vec![]), tree()),
+                    bv(1),
+                ),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // nil : motive_3 (MyList.nil MyTree)
+    let nil_minor_ty = Expr::app(
+        bv(2),
+        Expr::app(Expr::const_(nn("MyList", "nil"), vec![]), tree()),
+    );
+    // cons : Π (head : MyTree) (tail : MyList MyTree), motive_1 head →
+    //   motive_3 tail → motive_3 (MyList.cons MyTree head tail)
+    let cons_minor_ty = Expr::forall_e(
+        n("head"),
+        tree(),
+        Expr::forall_e(
+            n("tail"),
+            list(),
+            Expr::forall_e(
+                n("head_ih"),
+                Expr::app(bv(7), bv(1)),
+                Expr::forall_e(
+                    n("tail_ih"),
+                    Expr::app(bv(6), bv(1)),
+                    Expr::app(
+                        bv(7),
+                        Expr::app(
+                            Expr::app(
+                                Expr::app(Expr::const_(nn("MyList", "cons"), vec![]), tree()),
+                                bv(3),
+                            ),
+                            bv(2),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let minors = [
+        (n("node"), node_minor_ty.clone()),
+        (n("mk"), mk_minor_ty.clone()),
+        (n("nil"), nil_minor_ty.clone()),
+        (n("cons"), cons_minor_ty.clone()),
+    ];
+    let telescope = |major_ty: Expr, result_motive_at: u32| {
+        let mut body = Expr::forall_e(
+            n("t"),
+            major_ty,
+            Expr::app(bv(result_motive_at), bv(0)),
+            BinderInfo::Default,
+        );
+        for (name, ty) in minors.iter().rev() {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Default);
+        }
+        for (name, ty) in [
+            (n("motive_3"), motive_3_ty.clone()),
+            (n("motive_2"), motive_2_ty.clone()),
+            (n("motive_1"), motive_1_ty.clone()),
+        ] {
+            body = Expr::forall_e(name, ty, body, BinderInfo::Implicit);
+        }
+        body
+    };
+    // λ motive_1 motive_2 motive_3 node mk nil cons, λ fields…, body
+    let lam7 = |body: Expr, field_lams: &[(Name, Expr)]| {
+        let mut inner = body;
+        for (name, ty) in field_lams.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in minors.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in [
+            (n("motive_3"), motive_3_ty.clone()),
+            (n("motive_2"), motive_2_ty.clone()),
+            (n("motive_1"), motive_1_ty.clone()),
+        ] {
+            inner = Expr::lam(name, ty, inner, BinderInfo::Default);
+        }
+        inner
+    };
+    let rec_call = |rec: &str, args: &[u32]| {
+        let mut app = Expr::const_(nn("MyTree", rec), vec![u.clone()]);
+        for a in args {
+            app = Expr::app(app, bv(*a));
+        }
+        app
+    };
+    // node rule: … (a) => node a (MyTree.rec_1 … a)
+    let node_rhs = lam7(
+        Expr::app(
+            Expr::app(bv(4), bv(0)),
+            rec_call("rec_1", &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("a"), arr())],
+    );
+    // mk rule: … (data) => mk data (MyTree.rec_2 … data)
+    let mk_rhs = lam7(
+        Expr::app(
+            Expr::app(bv(3), bv(0)),
+            rec_call("rec_2", &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("data"), list())],
+    );
+    // nil rule: … => nil
+    let nil_rhs = lam7(bv(1), &[]);
+    // cons rule: … (head) (tail) => cons head tail (MyTree.rec … head)
+    //   (MyTree.rec_2 … tail)
+    let cons_rhs = lam7(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                rec_call("rec", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call("rec_2", &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(n("head"), tree()), (n("tail"), list())],
+    );
+    let mk_rec = |name: Name, ty: Expr, rules: Vec<RecursorRule>| RecursorVal {
+        base: cval(name, vec![n("u")], ty),
+        all: vec![n("MyTree")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 3,
+        num_minors: 4,
+        rules,
+        k: false,
+        is_unsafe: false,
+    };
+    let recursors = vec![
+        mk_rec(
+            nn("MyTree", "rec"),
+            telescope(tree(), 7),
+            vec![RecursorRule {
+                ctor: nn("MyTree", "node"),
+                nfields: 1,
+                rhs: node_rhs,
+            }],
+        ),
+        mk_rec(
+            nn("MyTree", "rec_1"),
+            telescope(arr(), 6),
+            vec![RecursorRule {
+                ctor: nn("MyArr", "mk"),
+                nfields: 1,
+                rhs: mk_rhs,
+            }],
+        ),
+        mk_rec(
+            nn("MyTree", "rec_2"),
+            telescope(list(), 5),
+            vec![
+                RecursorRule {
+                    ctor: nn("MyList", "nil"),
+                    nfields: 0,
+                    rhs: nil_rhs,
+                },
+                RecursorRule {
+                    ctor: nn("MyList", "cons"),
+                    nfields: 2,
+                    rhs: cons_rhs,
+                },
+            ],
+        ),
+    ];
+    (types, ctors, recursors)
+}
+
+#[test]
+fn kr608_cascaded_block_admits_with_byte_exact_translated_regeneration() {
+    // The cascade end to end: two auxiliaries (one of them discovered only
+    // inside the other), the full ordinary ruleset on the synthesized
+    // three-type block, three regenerated recursors, restored names and
+    // occurrences — byte-equal to these hand-built restored rows.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "the cascaded MyTree block must admit under the FULL ruleset; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_auxiliary_recursor_numbering_follows_creation_order() {
+    // MUTANT ("reordered auxiliaries"): swap the two auxiliary recursors'
+    // majors. `rec_1` must eliminate the FIRST-minted auxiliary (`MyArr`) and
+    // `rec_2` the one minted from inside it (`MyList`); a translation that
+    // numbered auxiliaries by any other order — environment order, name
+    // order, discovery-set iteration order — admits this swap.
+    let (types, ctors, mut recursors) = cascaded_mytree_block();
+    let rec_1_ty = recursors[1].base.type_.clone();
+    recursors[1].base.type_ = recursors[2].base.type_.clone();
+    recursors[2].base.type_ = rec_1_ty;
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "auxiliary recursor numbering must follow creation order: {}",
+        reject_message(&verdict)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// KR-608 permutations (bead franken_lean-8ce). Auxiliaries are minted in
+// OCCURRENCE order, so permuting the constructor's fields permutes the
+// translated block's types — and with them the motive positions, the minor
+// order, and which auxiliary `rec_1` eliminates. Permuting the ENVIRONMENT's
+// declaration order must change nothing at all: nested heads are resolved by
+// name. Both blocks below nest `MyArr MyTree` and `MyList MyTree` directly and
+// differ only in which field comes first.
+// ---------------------------------------------------------------------------
+
+/// One minor binder — name and type — in telescope order.
+type Minor = (Name, Expr);
+/// An auxiliary recursor: its restored name suffix and its rules, each a
+/// constructor with that constructor's field count.
+type AuxRecursorSpec = (&'static str, Vec<(Name, u32)>);
+
+/// The two-field cascading block. `arr_first` puts `MyArr MyTree` before
+/// `MyList MyTree` in `MyTree.node`'s telescope.
+fn permuted_rows(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>) {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let ((first, first_ty), (second, second_ty)) = if arr_first {
+        ((n("a"), arr()), (n("l"), list()))
+    } else {
+        ((n("l"), list()), (n("a"), arr()))
+    };
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested: 2,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(
+            nn("MyTree", "node"),
+            vec![],
+            Expr::forall_e(
+                first,
+                first_ty,
+                Expr::forall_e(second, second_ty, tree(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 2,
+        is_unsafe: false,
+    };
+    (vec![ind], vec![node])
+}
+
+/// The same block in full restored form, with the three recursors the pin
+/// would serialize for THAT field order. The two orders are genuinely
+/// different decoded rows, not a relabelling: `motive_2`/`motive_3` swap
+/// meaning, the minors reorder (`node mk nil cons` versus `node nil cons mk`),
+/// and every rule right-hand side shifts with them.
+fn permuted_block(arr_first: bool) -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let (types, ctors) = permuted_rows(arr_first);
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let arr = || Expr::app(Expr::const_(n("MyArr"), vec![]), tree());
+    let list = || Expr::app(Expr::const_(n("MyList"), vec![]), tree());
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let u = Level::param(n("u"));
+    let motive_ty =
+        |major: Expr| Expr::forall_e(n("t"), major, Expr::sort(u.clone()), BinderInfo::Default);
+    // Motive order IS translated-type order: main, then auxiliaries in
+    // creation order — which is the field order.
+    let (aux_1, aux_2) = if arr_first {
+        (arr(), list())
+    } else {
+        (list(), arr())
+    };
+    let motive_1_ty = motive_ty(tree());
+    let motive_2_ty = motive_ty(aux_1.clone());
+    let motive_3_ty = motive_ty(aux_2.clone());
+    // The `node` minor is index-identical under both orders: whichever field
+    // comes first is the first-minted auxiliary and therefore `motive_2`.
+    let (f1, f1_ty, f2, f2_ty) = if arr_first {
+        (n("a"), arr(), n("l"), list())
+    } else {
+        (n("l"), list(), n("a"), arr())
+    };
+    let node_minor_ty = Expr::forall_e(
+        f1.clone(),
+        f1_ty,
+        Expr::forall_e(
+            f2.clone(),
+            f2_ty,
+            Expr::forall_e(
+                Name::str(Name::anonymous(), format!("{}_ih", f1.to_display_string())),
+                Expr::app(bv(3), bv(1)),
+                Expr::forall_e(
+                    Name::str(Name::anonymous(), format!("{}_ih", f2.to_display_string())),
+                    Expr::app(bv(3), bv(1)),
+                    Expr::app(
+                        bv(6),
+                        Expr::app(
+                            Expr::app(Expr::const_(nn("MyTree", "node"), vec![]), bv(3)),
+                            bv(2),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let mk_app = |data: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(nn("MyArr", "mk"), vec![]), tree()),
+            data,
+        )
+    };
+    let nil_app = || Expr::app(Expr::const_(nn("MyList", "nil"), vec![]), tree());
+    let cons_app = |head: Expr, tail: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(nn("MyList", "cons"), vec![]), tree()),
+                head,
+            ),
+            tail,
+        )
+    };
+    // Minor types depend on each minor's POSITION in the telescope, so the two
+    // orders carry different de Bruijn indices for the same judgment.
+    let (minors, aux_rules): (Vec<Minor>, [AuxRecursorSpec; 2]) = if arr_first {
+        // …node mk nil cons: mk is the 2nd minor, nil/cons the 3rd and 4th.
+        let mk_minor_ty = Expr::forall_e(
+            n("data"),
+            list(),
+            Expr::forall_e(
+                n("data_ih"),
+                Expr::app(bv(2), bv(0)),
+                Expr::app(bv(4), mk_app(bv(1))),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let nil_minor_ty = Expr::app(bv(2), nil_app());
+        let cons_minor_ty = Expr::forall_e(
+            n("head"),
+            tree(),
+            Expr::forall_e(
+                n("tail"),
+                list(),
+                Expr::forall_e(
+                    n("head_ih"),
+                    Expr::app(bv(7), bv(1)),
+                    Expr::forall_e(
+                        n("tail_ih"),
+                        Expr::app(bv(6), bv(1)),
+                        Expr::app(bv(7), cons_app(bv(3), bv(2))),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        (
+            vec![
+                (n("node"), node_minor_ty.clone()),
+                (n("mk"), mk_minor_ty),
+                (n("nil"), nil_minor_ty),
+                (n("cons"), cons_minor_ty),
+            ],
+            [
+                ("rec_1", vec![(nn("MyArr", "mk"), 1)]),
+                (
+                    "rec_2",
+                    vec![(nn("MyList", "nil"), 0), (nn("MyList", "cons"), 2)],
+                ),
+            ],
+        )
+    } else {
+        // …node nil cons mk: nil/cons are the 2nd and 3rd minors, mk the 4th.
+        let nil_minor_ty = Expr::app(bv(2), nil_app());
+        let cons_minor_ty = Expr::forall_e(
+            n("head"),
+            tree(),
+            Expr::forall_e(
+                n("tail"),
+                list(),
+                Expr::forall_e(
+                    n("head_ih"),
+                    Expr::app(bv(6), bv(1)),
+                    Expr::forall_e(
+                        n("tail_ih"),
+                        Expr::app(bv(6), bv(1)),
+                        Expr::app(bv(7), cons_app(bv(3), bv(2))),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let mk_minor_ty = Expr::forall_e(
+            n("data"),
+            list(),
+            Expr::forall_e(
+                n("data_ih"),
+                Expr::app(bv(5), bv(0)),
+                Expr::app(bv(5), mk_app(bv(1))),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        (
+            vec![
+                (n("node"), node_minor_ty.clone()),
+                (n("nil"), nil_minor_ty),
+                (n("cons"), cons_minor_ty),
+                (n("mk"), mk_minor_ty),
+            ],
+            [
+                (
+                    "rec_1",
+                    vec![(nn("MyList", "nil"), 0), (nn("MyList", "cons"), 2)],
+                ),
+                ("rec_2", vec![(nn("MyArr", "mk"), 1)]),
+            ],
+        )
+    };
+    let motive_binders = [
+        (n("motive_3"), motive_3_ty.clone()),
+        (n("motive_2"), motive_2_ty.clone()),
+        (n("motive_1"), motive_1_ty.clone()),
+    ];
+    let telescope = |major_ty: Expr, result_motive_at: u32| {
+        let mut body = Expr::forall_e(
+            n("t"),
+            major_ty,
+            Expr::app(bv(result_motive_at), bv(0)),
+            BinderInfo::Default,
+        );
+        for (name, ty) in minors.iter().rev() {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Default);
+        }
+        for (name, ty) in &motive_binders {
+            body = Expr::forall_e(name.clone(), ty.clone(), body, BinderInfo::Implicit);
+        }
+        body
+    };
+    let lam = |body: Expr, field_lams: &[(Name, Expr)]| {
+        let mut inner = body;
+        for (name, ty) in field_lams.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in minors.iter().rev() {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        for (name, ty) in &motive_binders {
+            inner = Expr::lam(name.clone(), ty.clone(), inner, BinderInfo::Default);
+        }
+        inner
+    };
+    let rec_call = |rec: &str, args: &[u32]| {
+        let mut app = Expr::const_(nn("MyTree", rec), vec![u.clone()]);
+        for a in args {
+            app = Expr::app(app, bv(*a));
+        }
+        app
+    };
+    // node: … (f1) (f2) => node f1 f2 (rec_1 … f1) (rec_2 … f2). The minor
+    // sits at index 5 under both orders (two fields plus three later minors).
+    let node_rhs = lam(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(5), bv(1)), bv(0)),
+                rec_call("rec_1", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call("rec_2", &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(f1, aux_1.clone()), (f2, aux_2.clone())],
+    );
+    // The `MyList` copy's own recursor: `rec_2` when the list is minted second,
+    // `rec_1` when it is minted first.
+    let list_rec = if arr_first { "rec_2" } else { "rec_1" };
+    let (mk_minor_at, nil_minor_at, cons_minor_at) = if arr_first { (3, 1, 2) } else { (1, 2, 3) };
+    let mk_rhs = lam(
+        Expr::app(
+            Expr::app(bv(mk_minor_at), bv(0)),
+            rec_call(list_rec, &[7, 6, 5, 4, 3, 2, 1, 0]),
+        ),
+        &[(n("data"), list())],
+    );
+    let nil_rhs = lam(bv(nil_minor_at), &[]);
+    let cons_rhs = lam(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::app(bv(cons_minor_at), bv(1)), bv(0)),
+                rec_call("rec", &[8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            rec_call(list_rec, &[8, 7, 6, 5, 4, 3, 2, 0]),
+        ),
+        &[(n("head"), tree()), (n("tail"), list())],
+    );
+    let rhs_for = |ctor: &Name| -> Expr {
+        if ctor == &nn("MyArr", "mk") {
+            mk_rhs.clone()
+        } else if ctor == &nn("MyList", "nil") {
+            nil_rhs.clone()
+        } else {
+            cons_rhs.clone()
+        }
+    };
+    let mk_rec = |name: Name, ty: Expr, rules: Vec<RecursorRule>| RecursorVal {
+        base: cval(name, vec![n("u")], ty),
+        all: vec![n("MyTree")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 3,
+        num_minors: 4,
+        rules,
+        k: false,
+        is_unsafe: false,
+    };
+    let mut recursors = vec![mk_rec(
+        nn("MyTree", "rec"),
+        telescope(tree(), 7),
+        vec![RecursorRule {
+            ctor: nn("MyTree", "node"),
+            nfields: 2,
+            rhs: node_rhs,
+        }],
+    )];
+    for (index, (rec_name, rules)) in aux_rules.iter().enumerate() {
+        let major = if index == 0 {
+            aux_1.clone()
+        } else {
+            aux_2.clone()
+        };
+        recursors.push(mk_rec(
+            nn("MyTree", rec_name),
+            telescope(major, 6 - index as u32),
+            rules
+                .iter()
+                .map(|(ctor, nfields)| RecursorRule {
+                    ctor: ctor.clone(),
+                    nfields: *nfields,
+                    rhs: rhs_for(ctor),
+                })
+                .collect(),
+        ));
+    }
+    (types, ctors, recursors)
+}
+
+/// Step ceiling for admitting the cascading block. Deduplication is what makes
+/// the translation terminate at all — without it each minted copy's own
+/// self-occurrence mints another copy forever — so the cost covenant is the
+/// discriminating, TERMINATING form of that mutant: a run that mints redundant
+/// auxiliaries blows this ceiling and reports typed exhaustion instead of the
+/// verdict. Pinned at roughly twice the measured cost so ordinary refactors do
+/// not trip it. Measured cost at the time of pinning: 151 steps.
+const CASCADE_STEP_CAP: u64 = 300;
+
+// ---------------------------------------------------------------------------
+// KR-608 property lane (bead franken_lean-8ce). The fixtures above prove the
+// shapes I thought of. This proves the ones I did not: random nested shapes,
+// each checked against an INDEPENDENT model of the pin's discovery rule —
+// occurrences are the applications whose parameter mentions a block type, each
+// copy exposes its family's constructor fields instantiated at the occurrence,
+// and the worklist closes over what those expose, deduplicated.
+//
+// Deterministic and replayable: fixed seeds, a dependency-free SplitMix64, and
+// every failure prints the seed, the trial, the rendered constructor and the
+// exact permutation, so a red run reproduces without re-rolling.
+// ---------------------------------------------------------------------------
+
+/// SplitMix64 — the test apparatus obeys D1 too, so the generator is ours.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+/// The parameterized families the fixture environment declares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Family {
+    List,
+    Arr,
+}
+
+impl Family {
+    fn name(self) -> Name {
+        match self {
+            Family::List => n("MyList"),
+            Family::Arr => n("MyArr"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Family::List => "MyList",
+            Family::Arr => "MyArr",
+        }
+    }
+
+    /// What a copy of this family exposes: its constructors' field types,
+    /// written over the family's own parameter. This is the model's only
+    /// knowledge of the environment, and it mirrors the rows `mylist_rows`
+    /// and `myarr_rows` declare — `MyList.cons : α → MyList α → MyList α`
+    /// (`MyList.nil` has no fields) and `MyArr.mk : MyList α → MyArr α`.
+    fn field_shapes(self) -> Vec<ParamShape> {
+        match self {
+            Family::List => vec![
+                ParamShape::Param,
+                ParamShape::App(Family::List, Box::new(ParamShape::Param)),
+            ],
+            Family::Arr => vec![ParamShape::App(Family::List, Box::new(ParamShape::Param))],
+        }
+    }
+}
+
+/// A generated field type: `MyTree`, `MyUnit`, or a family applied to another.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Shape {
+    Tree,
+    Unit,
+    App(Family, Box<Shape>),
+}
+
+/// A family's field type, written over its parameter.
+enum ParamShape {
+    Param,
+    App(Family, Box<ParamShape>),
+}
+
+impl Shape {
+    fn render(&self) -> String {
+        match self {
+            Shape::Tree => "MyTree".to_string(),
+            Shape::Unit => "MyUnit".to_string(),
+            Shape::App(f, arg) => format!("({} {})", f.label(), arg.render()),
+        }
+    }
+
+    fn to_expr(&self) -> Expr {
+        match self {
+            Shape::Tree => Expr::const_(n("MyTree"), vec![]),
+            Shape::Unit => Expr::const_(n("MyUnit"), vec![]),
+            Shape::App(f, arg) => Expr::app(Expr::const_(f.name(), vec![]), arg.to_expr()),
+        }
+    }
+
+    fn mentions_tree(&self) -> bool {
+        match self {
+            Shape::Tree => true,
+            Shape::Unit => false,
+            Shape::App(_, arg) => arg.mentions_tree(),
+        }
+    }
+
+    /// The pin's rule: an application is a nested occurrence exactly when one
+    /// of the head's parameters mentions a type of the block being declared.
+    /// The parameter is NOT descended into here — it is carried verbatim into
+    /// the occurrence key and only translated inside the copy, which is what
+    /// makes the worklist necessary.
+    fn occurrence(&self) -> Option<(Family, Shape)> {
+        match self {
+            Shape::App(f, arg) if arg.mentions_tree() => Some((*f, (**arg).clone())),
+            _ => None,
+        }
+    }
+}
+
+fn substitute(shape: &ParamShape, arg: &Shape) -> Shape {
+    match shape {
+        ParamShape::Param => arg.clone(),
+        ParamShape::App(f, inner) => Shape::App(*f, Box::new(substitute(inner, arg))),
+    }
+}
+
+/// The independent model: the deduplicated worklist closure of the auxiliaries
+/// a block with these constructor fields must mint, in creation order.
+fn expected_auxiliaries(fields: &[Shape]) -> Vec<(Family, Shape)> {
+    let mut auxes: Vec<(Family, Shape)> = Vec::new();
+    let push = |auxes: &mut Vec<(Family, Shape)>, occurrence: Option<(Family, Shape)>| {
+        if let Some(occurrence) = occurrence
+            && !auxes.contains(&occurrence)
+        {
+            auxes.push(occurrence);
+        }
+    };
+    for field in fields {
+        push(&mut auxes, field.occurrence());
+    }
+    let mut next = 0;
+    while next < auxes.len() {
+        let (family, arg) = auxes[next].clone();
+        for field_shape in family.field_shapes() {
+            let field = substitute(&field_shape, &arg);
+            push(&mut auxes, field.occurrence());
+        }
+        next += 1;
+    }
+    auxes
+}
+
+/// `MyUnit` — a nullary type, so a generated field can be legitimately
+/// NON-nested and the model is tested on what must not be minted too.
+fn property_env(arr_first: bool) -> Environment {
+    let unit = InductiveVal {
+        base: cval(n("MyUnit"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyUnit")],
+        ctors: vec![nn("MyUnit", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("MyUnit", "mk"),
+            vec![],
+            Expr::const_(n("MyUnit"), vec![]),
+        ),
+        induct: n("MyUnit"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    cascade_env(arr_first)
+        .add_decl(ConstantInfo::Induct(unit))
+        .expect("env")
+        .add_decl(ConstantInfo::Ctor(mk))
+        .expect("env")
+}
+
+/// A generated block: `MyTree.node : fields… → MyTree`, declaring no recursors
+/// so the translated type count is observable as a typed rejection.
+fn generated_block(fields: &[Shape], num_nested: u32) -> Declaration {
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let mut ctor_type = tree();
+    for (index, field) in fields.iter().enumerate().rev() {
+        ctor_type = Expr::forall_e(
+            Name::str(Name::anonymous(), format!("f{index}")),
+            field.to_expr(),
+            ctor_type,
+            BinderInfo::Default,
+        );
+    }
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(nn("MyTree", "node"), vec![], ctor_type),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: fields.len() as u32,
+        is_unsafe: false,
+    };
+    block_decl(vec![ind], vec![node], vec![])
+}
+
+fn random_shape(rng: &mut SplitMix64, depth: usize) -> Shape {
+    if depth == 0 {
+        return if rng.below(2) == 0 {
+            Shape::Tree
+        } else {
+            Shape::Unit
+        };
+    }
+    match rng.below(4) {
+        0 => Shape::Tree,
+        1 => Shape::Unit,
+        2 => Shape::App(Family::List, Box::new(random_shape(rng, depth - 1))),
+        _ => Shape::App(Family::Arr, Box::new(random_shape(rng, depth - 1))),
+    }
+}
+
+fn render_fields(fields: &[Shape]) -> String {
+    let rendered: Vec<String> = fields.iter().map(Shape::render).collect();
+    format!("MyTree.node : {} → MyTree", rendered.join(" → "))
+}
+
+/// Fixed seeds; every trial is a fresh random block plus a random permutation
+/// of its fields, checked against both environment declaration orders.
+const PROPERTY_SEEDS: [u64; 4] = [
+    0x0000_0000_0000_002a,
+    0x5eed_0000_dead_beef,
+    0xa5a5_a5a5_5a5a_5a5a,
+    0x0123_4567_89ab_cdef,
+];
+const TRIALS_PER_SEED: usize = 120;
+
+#[test]
+fn kr608_random_nested_shapes_agree_with_the_independent_model() {
+    // Coverage counters. A property lane that generates only trivial shapes
+    // passes while proving nothing, so the corpus has to justify itself: the
+    // floors below are asserted after the loop.
+    let mut cascading = 0usize;
+    let mut multi_aux = 0usize;
+    let mut deepest = 0usize;
+    for seed in PROPERTY_SEEDS {
+        let mut rng = SplitMix64(seed);
+        for trial in 0..TRIALS_PER_SEED {
+            // Generate until the block actually nests: a block with no nested
+            // occurrence takes the ordinary path, which this lane is not about.
+            let (fields, auxes) = loop {
+                let count = 1 + rng.below(4);
+                let fields: Vec<Shape> = (0..count)
+                    .map(|_| {
+                        let depth = 1 + rng.below(3);
+                        random_shape(&mut rng, depth)
+                    })
+                    .collect();
+                let auxes = expected_auxiliaries(&fields);
+                if !auxes.is_empty() {
+                    break (fields, auxes);
+                }
+            };
+            // A random permutation of the fields (Fisher-Yates, same stream).
+            let mut permutation: Vec<usize> = (0..fields.len()).collect();
+            for i in (1..permutation.len()).rev() {
+                permutation.swap(i, rng.below(i + 1));
+            }
+            let permuted: Vec<Shape> = permutation.iter().map(|&i| fields[i].clone()).collect();
+            // The auxiliary SET is permutation-invariant, so both orders must
+            // report the same translated type count — only the order differs.
+            let permuted_auxes = expected_auxiliaries(&permuted);
+            assert_eq!(
+                auxes.len(),
+                permuted_auxes.len(),
+                "seed {seed:#x} trial {trial}: the model's own auxiliary count \
+                 moved under permutation {permutation:?}\n  original: {}\n  permuted: {}",
+                render_fields(&fields),
+                render_fields(&permuted)
+            );
+            // An auxiliary the fields do not name directly was discovered
+            // inside another copy — the cascade this bead exists for.
+            let direct = fields.iter().filter_map(Shape::occurrence).fold(
+                Vec::new(),
+                |mut seen: Vec<(Family, Shape)>, occurrence| {
+                    if !seen.contains(&occurrence) {
+                        seen.push(occurrence);
+                    }
+                    seen
+                },
+            );
+            if auxes.len() > direct.len() {
+                cascading += 1;
+            }
+            if auxes.len() >= 2 {
+                multi_aux += 1;
+            }
+            deepest = deepest.max(auxes.len());
+            let expected = format!(
+                "block declares 0 recursors, expected {} (main + auxiliary)",
+                1 + auxes.len()
+            );
+            for (label, order) in [("declared", &fields), ("permuted", &permuted)] {
+                for arr_first in [true, false] {
+                    let verdict = check(
+                        &property_env(arr_first),
+                        &generated_block(order, auxes.len() as u32),
+                        Budget::DEFAULT,
+                    );
+                    let context = format!(
+                        "seed {seed:#x} trial {trial} [{label} order, env arr_first={arr_first}]\n  \
+                         permutation: {permutation:?}\n  block: {}\n  model auxiliaries: {}",
+                        render_fields(order),
+                        auxes
+                            .iter()
+                            .map(|(f, arg)| format!("{} {}", f.label(), arg.render()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    match &verdict {
+                        Outcome::Complete(Verdict::Rejected { class, message, .. }) => {
+                            assert_eq!(
+                                *class,
+                                RejectClass::BlockMismatch,
+                                "{context}\n  expected a block-mismatch rejection, got {class:?}: {message}"
+                            );
+                            assert!(
+                                message.contains(&expected),
+                                "{context}\n  expected: {expected}\n  actual:   {message}"
+                            );
+                        }
+                        other => panic!(
+                            "{context}\n  expected the recursor-count rejection, got {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    let trials = PROPERTY_SEEDS.len() * TRIALS_PER_SEED;
+    assert!(
+        cascading * 10 >= trials,
+        "corpus is too shallow: only {cascading}/{trials} trials needed the \
+         worklist to reach an auxiliary no field names directly"
+    );
+    assert!(
+        multi_aux * 4 >= trials,
+        "corpus is too shallow: only {multi_aux}/{trials} trials minted two or \
+         more auxiliaries"
+    );
+    assert!(
+        deepest >= 3,
+        "corpus never reached a three-auxiliary block (deepest was {deepest})"
+    );
+}
+
+#[test]
+fn kr608_same_head_at_two_instantiations_mints_distinct_auxiliaries() {
+    // MUTANT ("altered auxiliary names"): the minted names carry a per-copy
+    // uniquifier. It is load-bearing ONLY when one head is copied at two
+    // different instantiations in a single block — `MyList MyTree` and
+    // `MyList (MyList MyTree)` here. Lean.Syntax never does this (each of its
+    // heads is nested at one instantiation), so the real Prelude replay cannot
+    // see the uniquifier at all; without this fixture, dropping it is a
+    // surviving mutant. With the names collapsed, the translated block would
+    // declare the same auxiliary type twice and a LEGITIMATE block would be
+    // refused `already declared`.
+    let tree = || Expr::const_(n("MyTree"), vec![]);
+    let list = |arg: Expr| Expr::app(Expr::const_(n("MyList"), vec![]), arg);
+    let ind = InductiveVal {
+        base: cval(n("MyTree"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTree")],
+        ctors: vec![nn("MyTree", "node")],
+        num_nested: 2,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let node = ConstructorVal {
+        base: cval(
+            nn("MyTree", "node"),
+            vec![],
+            Expr::forall_e(
+                n("shallow"),
+                list(tree()),
+                Expr::forall_e(n("deep"), list(list(tree())), tree(), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("MyTree"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 2,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(vec![ind], vec![node], vec![]),
+        Budget::DEFAULT,
+    );
+    // Two DISTINCT auxiliaries were minted from the same head, so the
+    // translated block has three types and wants three recursors. The block
+    // deliberately declares none, which is how the count becomes observable
+    // without hand-building the telescopes; a name collision would instead
+    // fail earlier, and differently.
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    let message = reject_message(&verdict);
+    assert!(
+        message.contains("block declares 0 recursors, expected 3"),
+        "one head at two instantiations must mint two distinct auxiliaries: {message}"
+    );
+    assert!(
+        !message.contains("already declared"),
+        "auxiliary names must stay distinct across instantiations of one head: {message}"
+    );
+}
+
+#[test]
+fn kr608_deduplication_keeps_the_cascade_cost_bounded() {
+    // The capped run comes FIRST and is what makes this mutant terminating: a
+    // translation that mints a fresh auxiliary per reachability path never
+    // finishes (each copy's own self-occurrence mints another), so under a
+    // generous budget it would spin instead of failing. Bounded to the
+    // ceiling, it stops at typed exhaustion and the assertion below fires.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let capped = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT.narrowed(CASCADE_STEP_CAP, 4_096),
+    );
+    assert!(
+        capped.is_accepted(),
+        "the cascading block must admit within the pinned ceiling of \
+         {CASCADE_STEP_CAP} steps; got {capped:?}"
+    );
+    // Only then measure the real cost, so the ceiling keeps its margin honest.
+    let (types, ctors, recursors) = cascaded_mytree_block();
+    let measured = match check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    ) {
+        Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
+        other => panic!("the cascading block must admit; got {other:?}"),
+    };
+    assert!(
+        measured <= CASCADE_STEP_CAP,
+        "cascade cost {measured} exceeds the pinned ceiling {CASCADE_STEP_CAP}; \
+         a redundant auxiliary was minted"
+    );
+}
+
+#[test]
+fn kr608_permutation_arr_first_admits_byte_exact() {
+    // Fields (MyArr MyTree, MyList MyTree): auxiliaries are minted
+    // [MyArr, MyList], so `rec_1` eliminates the array copy and the minors run
+    // node/mk/nil/cons.
+    let (types, ctors, recursors) = permuted_block(true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "arr-first permutation must admit with its own recursors; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_permutation_list_first_admits_byte_exact() {
+    // The mirrored order (MyList MyTree, MyArr MyTree): auxiliaries are minted
+    // [MyList, MyArr], `rec_1` eliminates the list copy, and the minors run
+    // node/nil/cons/mk. Same judgment, different serialized block.
+    let (types, ctors, recursors) = permuted_block(false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "list-first permutation must admit with its own recursors; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr608_permutation_arr_first_recursors_reject_the_list_first_block() {
+    // Insertion order is OBSERVABLE, and each order gets its own recursors: a
+    // translation that fixed the auxiliary order (by name, by environment
+    // position, by set iteration) would admit this cross-feed.
+    let (types, ctors) = permuted_rows(false);
+    let (_, _, arr_first_recursors) = permuted_block(true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, arr_first_recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "arr-first recursors must not satisfy the list-first block: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_permutation_list_first_recursors_reject_the_arr_first_block() {
+    // The mirror of the previous test, so neither direction passes by accident.
+    let (types, ctors) = permuted_rows(true);
+    let (_, _, list_first_recursors) = permuted_block(false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, list_first_recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("diverges from regeneration"),
+        "list-first recursors must not satisfy the arr-first block: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_permutation_environment_declaration_order_is_not_observable() {
+    // The other permutation axis: declaring `MyArr` before `MyList` or after
+    // must change nothing, because nested heads are resolved by name out of
+    // the environment. Both field orders are checked against both environment
+    // orders — four runs, one verdict.
+    for arr_first_block in [true, false] {
+        for arr_first_env in [true, false] {
+            let (types, ctors, recursors) = permuted_block(arr_first_block);
+            let verdict = check(
+                &cascade_env(arr_first_env),
+                &block_decl(types, ctors, recursors),
+                Budget::DEFAULT,
+            );
+            assert!(
+                verdict.is_accepted(),
+                "declaration order must not be observable \
+                 (block arr_first={arr_first_block}, env arr_first={arr_first_env}); got {verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn kr608_cascade_discovers_the_transitive_auxiliary() {
+    // MUTANT ("stops after the direct edge"): `MyList MyTree` occurs in no
+    // declared constructor — only inside the MINTED copy of `MyArr`. A
+    // translation that replaced occurrences in the declared block and stopped
+    // would mint ONE auxiliary and happily accept this `num_nested = 1` row.
+    // The pin's worklist keeps translating the auxiliaries it mints, so the
+    // block has two, and the decoded count is wrong.
+    let (types, ctors) = cascaded_mytree_rows(1, false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("vs 2 translated auxiliaries"),
+        "the worklist must cascade into the auxiliary it just minted: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_cascade_regenerates_one_recursor_per_translated_type() {
+    // With the auxiliary count agreed, the run reaches the recursor
+    // cross-check. The expected count is the translated block's type count —
+    // main + both auxiliaries — so this pins that the cascade built a
+    // THREE-motive block (`MyTree.rec`, `.rec_1`, `.rec_2`) rather than the
+    // two-motive block a direct-only translation would produce. Reaching this
+    // check at all means the synthesized block already passed the full
+    // ordinary ruleset (positivity, universes, regeneration) after the
+    // cascade.
+    let (types, ctors) = cascaded_mytree_rows(2, false);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("block declares 0 recursors, expected 3"),
+        "one recursor per translated type, auxiliaries included: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr608_duplicate_reachability_mints_one_auxiliary() {
+    // `MyList MyTree` is now reachable TWICE: directly, as `node`'s second
+    // field, and transitively through the `MyArr` copy. The pin dedups by the
+    // parameter-normalized occurrence key, so the block still carries exactly
+    // two auxiliaries — a translation that minted per reachability path would
+    // report three.
+    let (types, ctors) = cascaded_mytree_rows(3, true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("vs 2 translated auxiliaries"),
+        "the same occurrence reached twice is ONE auxiliary: {}",
+        reject_message(&verdict)
+    );
+
+    // …and the deduplicated block is still the three-type block, so the
+    // duplicate path did not silently drop the cascade either.
+    let (types, ctors) = cascaded_mytree_rows(2, true);
+    let verdict = check(
+        &myarr_env(),
+        &block_decl(types, ctors, vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("block declares 0 recursors, expected 3"),
+        "deduplication must not lose the cascaded auxiliary: {}",
+        reject_message(&verdict)
+    );
 }

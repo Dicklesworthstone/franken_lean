@@ -118,7 +118,12 @@ fn shared_fault(
     use fln_rt::region::RegionFault as F;
     match fault {
         F::Truncated { offset, wanted } => RegionError::Truncated {
-            wanted_end: shift + offset as u64 + wanted as u64,
+            // Diagnostic only: `wanted` is attacker-influenced, so the end
+            // saturates rather than panicking the typed-error path (fln-abaz
+            // finding 4).
+            wanted_end: shift
+                .saturating_add(offset as u64)
+                .saturating_add(wanted as u64),
             len: file_len,
         },
         F::BadMagic => RegionError::BadMagic,
@@ -392,7 +397,14 @@ impl<'a> OleanView<'a> {
     pub fn shared_audit(&self) -> RResult<fln_rt::region::RegionReport> {
         let header = format::OLEAN_HEADER_SIZE as u64;
         let payload = self.read_bytes(header, self.bytes.len() as u64 - header)?;
-        fln_rt::region::audit(payload, self.header.base_addr + header).map_err(|fault| {
+        let base =
+            self.header
+                .base_addr
+                .checked_add(header)
+                .ok_or(RegionError::MisalignedBase {
+                    base_addr: self.header.base_addr,
+                })?;
+        fln_rt::region::audit(payload, base).map_err(|fault| {
             shared_fault(
                 fault,
                 header,
@@ -491,12 +503,25 @@ impl<'a> OleanView<'a> {
                     budget: budget.max_objects,
                 });
             }
-            let (tag, other, _cs_sz) = self.obj_header(off)?;
+            let (tag, other, cs_sz) = self.obj_header(off)?;
             if tag <= abi::TAG_MAX_CTOR_TAG {
                 report.ctors += 1;
+                // The constructor's full extent is cs_sz bytes; the header and
+                // pointer fields are only its front. Mirror the shared engine:
+                // the extent must cover 8 + 8*other and be 8-aligned, or the
+                // scalar tail overruns (fln-abaz finding 5).
+                let min = 8u64 + 8 * u64::from(other);
+                let extent = u64::from(cs_sz);
+                if extent < min || extent % 8 != 0 {
+                    return Err(RegionError::DecodeShape {
+                        offset: off,
+                        reason: "constructor extent below its minimum or unaligned",
+                    });
+                }
                 for i in 0..other as u64 {
                     stack.push(self.read_u64(off + 8 + 8 * i)?);
                 }
+                self.read_bytes(off + min, extent - min)?;
             } else if tag == abi::TAG_ARRAY {
                 report.arrays += 1;
                 let size = self.read_u64(off + 8)?;
@@ -513,7 +538,22 @@ impl<'a> OleanView<'a> {
             } else if tag == abi::TAG_SCALAR_ARRAY {
                 report.scalar_arrays += 1;
                 let size = self.read_u64(off + 8)?;
-                self.read_bytes(off + 24, size)?;
+                let capacity = self.read_u64(off + 16)?;
+                if size > capacity {
+                    return Err(RegionError::DecodeShape {
+                        offset: off,
+                        reason: "scalar-array size > capacity",
+                    });
+                }
+                // The allocation spans capacity * elem bytes, not `size` bytes —
+                // charging only `size` let a payload run past EOF with a clean
+                // verdict (fln-abaz finding 5).
+                let elem = u64::from(other).max(1);
+                let extent = capacity.checked_mul(elem).ok_or(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "scalar-array extent overflows the address space",
+                })?;
+                self.read_bytes(off + 24, extent)?;
             } else if tag == abi::TAG_STRING {
                 report.strings += 1;
                 self.check_string(off)?;
@@ -578,14 +618,37 @@ impl<'a> OleanView<'a> {
         // GMP encoding (header flags bit 0 set at the pin): the mpz_object
         // carries {alloc: i32, size: i32, limbs: ptr}; the compactor copies
         // the limb array right after the object and rewrites the one pointer.
+        // All three of the shared engine's laws are enforced here (fln-abaz
+        // finding 6): limbs >= 1, _mp_alloc >= |_mp_size| in the UNSIGNED domain,
+        // and the limb block INLINE immediately after the object — the last is
+        // the one that stops an mpz from pointing its limbs into another object
+        // and decoding foreign bytes as a number.
         let word = self.read_u64(off + 8)?;
         let mpz_size = ((word >> 32) as u32) as i32;
         let limbs = mpz_size.unsigned_abs() as u64;
+        let Ok(alloc) = u32::try_from((word as u32) as i32) else {
+            return Err(RegionError::MpzIntegrity { offset: off });
+        };
+        if limbs == 0 || alloc < mpz_size.unsigned_abs() {
+            return Err(RegionError::MpzIntegrity { offset: off });
+        }
         let limb_ptr = self.read_u64(off + 16)?;
         let limb_off = self
             .deref(limb_ptr)
             .map_err(|_| RegionError::MpzIntegrity { offset: off })?;
-        self.read_bytes(limb_off, limbs.saturating_mul(8))
+        let limb_bytes = limbs
+            .checked_mul(8)
+            .ok_or(RegionError::MpzIntegrity { offset: off })?;
+        let inline_start = off
+            .checked_add(24)
+            .ok_or(RegionError::MpzIntegrity { offset: off })?;
+        let inline_end = inline_start
+            .checked_add(limb_bytes)
+            .ok_or(RegionError::MpzIntegrity { offset: off })?;
+        if limb_off < inline_start || limb_off >= inline_end {
+            return Err(RegionError::MpzIntegrity { offset: off });
+        }
+        self.read_bytes(limb_off, limb_bytes)
             .map_err(|_| RegionError::MpzIntegrity { offset: off })?;
         Ok(())
     }
@@ -748,7 +811,26 @@ impl<'a> OleanView<'a> {
                 reason: what,
             });
         }
-        Ok((off, self.read_u64(off + 8)?))
+        let len = self.read_u64(off + 8)?;
+        // The length is attacker-controlled and must be proven to fit BEFORE it
+        // reaches a caller, because callers size allocations from it. Without this,
+        // a 24-byte array object claiming 2^40 elements makes the decoder allocate
+        // terabytes and abort — a process death rather than the typed RegionError
+        // this module promises for every malformed input. Charging the storage here
+        // means the length is bounded by the file, so an allocation derived from it
+        // is bounded too.
+        let elements = len.checked_mul(8).ok_or(RegionError::DecodeShape {
+            offset: off,
+            reason: "array length overflows its element storage",
+        })?;
+        self.read_bytes(
+            off.checked_add(24).ok_or(RegionError::Truncated {
+                wanted_end: u64::MAX,
+                len: self.bytes.len() as u64,
+            })?,
+            elements,
+        )?;
+        Ok((off, len))
     }
 
     fn decode_array_view(

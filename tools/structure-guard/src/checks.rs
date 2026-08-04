@@ -28,10 +28,63 @@
 //!   the census ⇄ `ci/ABI_EXPORT_STATUS.txt` ⇄ `export_name`-site join is broken —
 //!   an unclassified symbol, a stale or lying status row, an export outside
 //!   `fln-unsafe-abi`, or an unextractable symbol string (fail closed)
+//! * `FLN-STRUCT-027` a governed file could not be read as UTF-8, so structural
+//!   authority over it is *inconclusive* rather than clean. It is reported per file so
+//!   that one unreadable input cannot mask every other finding in the run, and it is
+//!   still a finding — never a pass — because the covenant, lint posture, or ledger
+//!   evidence that file carries was not established (FL-INV-07).
+//! * `FLN-STRUCT-028` governed inputs changed during the scan, so the verdict is
+//!   inconclusive rather than being attached to a hybrid source root.
+//! * `FLN-STRUCT-029` the effective compiler identity disagrees with the complete
+//!   `SUITE.lock` compiler contract, so compiler authority is inconclusive.
+//! * `FLN-STRUCT-030` kernel generated authority is not source-callsite closed:
+//!   a project-defined macro, unreviewed macro invocation, procedural attribute, or
+//!   derive outside the exact compiler-builtin inventory could contribute checking
+//!   logic without a reviewed, LOC-counted source mapping.
+//! * `FLN-STRUCT-031` an active SUITE.lock checkout or its commit identity cannot be
+//!   verified, so dependency-closure authority is inconclusive rather than clean.
+//! * `FLN-STRUCT-032` the canonical pin/target inventory is malformed, stale, or not
+//!   the exact bijective join of current `SUITE.lock` facts and reviewed policy.
+//! * `FLN-STRUCT-033` pin/target inventory authority is inconclusive: a publication
+//!   candidate remains, a governed source is unavailable, or a bounded publication
+//!   operation could not establish one complete generation.
+//! * `FLN-STRUCT-034` kernel-contract ownership publication is inconclusive because an
+//!   interrupted/competing `.candidate` exists or its absence cannot be established.
+//! * `FLN-STRUCT-035` the canonical contract handoff is malformed, stale, or disagrees
+//!   with the exact current join of inventory, policy, and rendered output bytes.
+//! * `FLN-STRUCT-036` contract-handoff authority is inconclusive because publication
+//!   is interrupted, a governed source changed, or a bounded operation exhausted.
+//! * `FLN-STRUCT-037` `fln-checker` reaches a SEMANTIC item across its independence
+//!   boundary — a universe judgment, a traversal-pruning data-word answer, a
+//!   `Canonical` reader, or `fln-bignum` arithmetic. The crate graph cannot express
+//!   this: `fln-checker -> fln-hash` must stay permitted so the wire format is
+//!   shared, while the `Canonical` readers must not be (bead `franken_lean-r0xu`).
+//! * `FLN-STRUCT-038` `Environment::add_decl` — admission with no kernel check — is
+//!   called from production source in a crate that depends on fln-env. Allowlist is
+//!   empty: a first production caller is the violation (bead `franken_lean-oof9`).
+//! * `FLN-STRUCT-039` `Environment::plan_add_decl` is reachable outside the two
+//!   reviewed fln-kernel call sites. D6 reserves admission to the kernel, and no
+//!   type-level guarantee is available at this boundary because fln-env sits BELOW
+//!   fln-kernel and cannot name it (bead `franken_lean-oof9`).
+//! * `FLN-STRUCT-040` an unsafe boundary crate's root neither enables
+//!   `clippy::undocumented_unsafe_blocks` nor declares, with a bead, that it has not.
+//!   D3 requires a SAFETY note at every unsafe site; that lint decides it and nothing
+//!   else does, so a boundary crate silent about its posture leaves a reader unable to
+//!   tell an enforced rule from an unenforced one. The rule checks POSTURE, never
+//!   documentation itself: clippy owns that decision and a second implementation of one
+//!   property is how the two disagree (bead
+//!   `franken_lean-d3-safety-note-unenforced-cdbg`).
+//! * `FLN-STRUCT-041` a Python module in a trusted resolution directory shadows a
+//!   module the evidence bootstrap imports — Python resolves the script directory and
+//!   the cwd before the standard library, so such a file replaces the module that
+//!   computes the digests and decides the verdicts (bead `franken_lean-h40t`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::boundary_api;
 use crate::export_status;
@@ -51,12 +104,597 @@ pub struct Finding {
     pub detail: String,
 }
 
+/// One line-count covenant, as measured — not as re-derived.
+///
+/// `loc` is the value `count_loc` returned inside the enforcing walk, carried out rather than
+/// recomputed. That is the whole design: the covenant was *walked* and its number *discarded*
+/// unless it exceeded the limit, so anyone who needed "how big is the kernel" had exactly one
+/// counter they could actually invoke and it was `wc -l`. Two of the three kernel-size figures
+/// ever written down in this repository were that raw count — 6,535 in
+/// `fln-conformance/src/witness.rs` against a covenant of 5,416, and 6,382 in the `ukzx` row
+/// against 5,379 — authored independently by different people, neither aware of the other.
+/// The substitution was not carelessness; it was the only available move
+/// (bead `franken_lean-kernel-loc-covenant-not-disclosed-t0g7`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovenantFact {
+    pub crate_name: String,
+    pub loc: usize,
+    pub limit: usize,
+}
+
+impl CovenantFact {
+    /// Lines still available under the cap. Saturating: a crate already over its limit has no
+    /// negative headroom, it has none, and `FLN-STRUCT-015` is the thing that says so.
+    pub fn headroom(&self) -> usize {
+        self.limit.saturating_sub(self.loc)
+    }
+}
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub findings: Vec<Finding>,
+    /// Every line-count covenant the run measured, in declaration order. Scope is inherited
+    /// from the enforcing walk's own `g.covenants`, never listed here — a hand-listed scope
+    /// rots silently and this repository has paid for that more than once
+    /// (`fln-guard-scope-must-be-derived`).
+    pub covenants: Vec<CovenantFact>,
     pub crate_count: usize,
     pub edge_count: usize,
     pub graph_digest: u64,
+    pub contract_handoff_root: Option<String>,
+    pub root_identity: String,
+    pub governed_root_before: u64,
+    pub governed_root_after: u64,
+    pub traversal: TraversalFacts,
+    pub authority: Authority,
+    pub authority_inventory: AuthorityInventory,
+    pub compiler_identity: CompilerIdentity,
+    pub admitted_environment: AdmittedEnvironment,
+    /// Scope the D18 mode-closure derivation achieved (bead `franken_lean-r2st`).
+    /// Carried so that "the D18 check ran" can never be read as "a product closure was
+    /// traversed": `ModeClosureFacts::is_vacuous` distinguishes the two.
+    pub mode_closure: crate::mode_closure::ModeClosureFacts,
+}
+
+/// Whether the run established authority over its complete governed input closure.
+///
+/// A structural violation over a complete closure is an authoritative failure. An
+/// unreadable input, compiler-identity ambiguity, or a root that changed during the
+/// scan is different: it is inconclusive under FL-INV-07 and must never be rendered
+/// as either a clean pass or an authoritative rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Authority {
+    Complete,
+    Incomplete,
+}
+
+impl Authority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Conservation facts for the dependency-free governed-input traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraversalFacts {
+    pub directories_visited: usize,
+    pub files_discovered: usize,
+    pub files_scanned: usize,
+    pub files_skipped_unreadable: usize,
+}
+
+impl TraversalFacts {
+    pub fn count_rule_holds(&self) -> bool {
+        self.files_scanned
+            .checked_add(self.files_skipped_unreadable)
+            .is_some_and(|total| total == self.files_discovered)
+    }
+}
+
+/// Exact cardinalities behind the package/target/feature/target-triple authority axes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityInventory {
+    pub packages: usize,
+    pub targets: usize,
+    pub features: usize,
+    pub target_triples: usize,
+}
+
+/// Runtime compiler facts, compared against the mechanically parsed `SUITE.lock` rows.
+///
+/// Paths are deliberately not emitted: the public evidence needs identity, not a home
+/// directory or other host-specific path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerIdentity {
+    pub source: &'static str,
+    pub channel: Option<String>,
+    pub release: Option<String>,
+    pub commit: Option<String>,
+    pub host: Option<String>,
+    pub contract_declared: bool,
+    pub configuration_match: bool,
+    pub contract_match: bool,
+}
+
+/// Names-only environment evidence. Values are never retained or rendered because
+/// compiler-related environment variables can contain credentials or host paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedEnvironment {
+    pub policy: &'static str,
+    pub admitted_names: Vec<String>,
+    pub compiler_override_names: Vec<String>,
+}
+
+impl RunOutcome {
+    pub fn verdict(&self) -> &'static str {
+        if self.authority == Authority::Incomplete {
+            "inconclusive"
+        } else if self.findings.is_empty() {
+            "pass"
+        } else {
+            "fail"
+        }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        match self.verdict() {
+            "pass" => 0,
+            "fail" => 1,
+            "inconclusive" => 3,
+            _ => 2,
+        }
+    }
+
+    /// The subject graded by this outcome's terminal record.
+    ///
+    /// The setup, CLI-failure, and help renderers have no `RunOutcome`, so they construct
+    /// another `TerminalSubject` variant and use the same accessors. That keeps all terminal
+    /// paths on one derivation instead of transcribing a grade beside a null handoff root.
+    pub fn terminal_subject(&self) -> TerminalSubject<'_> {
+        TerminalSubject::Audited {
+            contract_handoff_root: self.contract_handoff_root.as_deref(),
+        }
+    }
+
+    /// Which audits contributing to this verdict established no evidence.
+    ///
+    /// DERIVED from the same `Option` the root is rendered from, never set by a caller. A
+    /// second source for this answer is the defect the bead is about: a hand-set grade is
+    /// exactly what lets a stale "verified" outlive the audit it describes
+    /// (`fln-census-empty-referent-no-mock-krb0`).
+    ///
+    /// **The population is one, and that is a fact about today's tree rather than a law.**
+    /// `contract_handoff_root` is the only field in `RunOutcome` carrying an audit that can
+    /// establish nothing without saying so in the verdict, so this list has at most one
+    /// member by construction. A second such audit must move this function; nothing here
+    /// would notice on its own, and no caller may read a one-member list as a complete
+    /// inventory of what went unestablished.
+    pub fn unestablished(&self) -> Vec<String> {
+        self.terminal_subject().unestablished()
+    }
+
+    /// The FL-INV-07 data grade AGENTS.md's Agent Ergonomics section already requires of a
+    /// robot surface, and which this record does not carry.
+    ///
+    /// `provisional` is NOT a failure and must never be rendered as one. It is the difference
+    /// between "audited and clean" and "not audited" — which, measured in a real fresh clone
+    /// at `a0c9b1c8` and reproduced as a one-variable fixture by
+    /// `the_data_grade_is_the_only_field_that_separates_an_unaudited_tree`, only a `null` in
+    /// one field carried, while `verdict`, `authority` and the finding count stayed identical.
+    ///
+    /// **What this does NOT distinguish, measured at `d560560c`.** `contract_handoff_root` is
+    /// `None` in three different situations, and this grade collapses them: an invalid
+    /// inventory prerequisite (`contract_handoff::audit_with_snapshot` returns early), an
+    /// absent census (typed `Inconclusive`, no finding — the krb0 shape), and an audit that
+    /// ran and failed (`FLN-STRUCT-035`/`036`, which DOES emit a finding). Only the middle
+    /// case is "not audited"; the third established a rejection and is still graded
+    /// `provisional` here. A reader who needs those separated must read `findings`, not this.
+    pub fn data_grade(&self) -> &'static str {
+        self.terminal_subject().data_grade()
+    }
+}
+
+/// What a terminal record grades.
+///
+/// Completed runs derive the grade from their contract-handoff root. Setup and CLI failures
+/// never started an audit, while help requested no audit. Keeping those cases distinct avoids
+/// both false `verified` grades and the opposite error of describing a CLI typo as a completed
+/// but provisional repository audit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSubject<'a> {
+    Audited {
+        contract_handoff_root: Option<&'a str>,
+    },
+    NotStarted,
+    NoAudit,
+}
+
+impl TerminalSubject<'_> {
+    /// The FL-INV-07 data grade summarized by the terminal record.
+    pub fn data_grade(&self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_established",
+            Self::NoAudit => "not_applicable",
+            Self::Audited { .. } => {
+                if self.unestablished().is_empty() {
+                    "verified"
+                } else {
+                    "provisional"
+                }
+            }
+        }
+    }
+
+    /// Audits reached by this terminal subject that established no evidence.
+    pub fn unestablished(&self) -> Vec<String> {
+        match self {
+            Self::Audited {
+                contract_handoff_root: None,
+            } => vec!["contract_handoff".to_string()],
+            Self::Audited { .. } | Self::NotStarted | Self::NoAudit => Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GovernedSnapshot {
+    digest: u64,
+    directories_visited: usize,
+    files_discovered: usize,
+    files_scanned: usize,
+    unreadable: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct RustcProbe {
+    source: &'static str,
+    release: Option<String>,
+    commit: Option<String>,
+    host: Option<String>,
+}
+
+const GOVERNED_ROOT_FILES: [&str; 4] = ["Cargo.toml", LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE];
+const GOVERNED_ROOT_DIRS: [&str; 4] = ["ci", "contracts", "crates", "tools"];
+pub const AUTHORITY_COUNT_RULE: &str = "files_scanned+files_skipped_unreadable=files_discovered";
+
+fn fnv_update(mut state: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        state ^= u64::from(*byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    state
+}
+
+fn bind_field(state: &mut u64, bytes: &[u8]) {
+    *state = fnv_update(*state, &(bytes.len() as u64).to_le_bytes());
+    *state = fnv_update(*state, bytes);
+}
+
+fn normalized_relative(root: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map_err(|_| {
+            format!(
+                "{} escaped canonical root {}",
+                path.display(),
+                root.display()
+            )
+        })?
+        .to_str()
+        .map(|relative| relative.replace('\\', "/"))
+        .ok_or_else(|| format!("governed path is not UTF-8: {}", path.display()))
+}
+
+fn collect_governed_entries(
+    root: &Path,
+    start: &Path,
+    entries: &mut Vec<(String, u8, Vec<u8>)>,
+    snapshot: &mut GovernedSnapshot,
+) {
+    let rel = match normalized_relative(root, start) {
+        Ok(rel) => rel,
+        Err(detail) => {
+            snapshot
+                .unreadable
+                .push((start.display().to_string(), detail));
+            return;
+        }
+    };
+    let metadata = match fs::symlink_metadata(start) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            entries.push((rel, b'm', Vec::new()));
+            return;
+        }
+        Err(error) => {
+            snapshot.unreadable.push((
+                rel.clone(),
+                format!("cannot inspect governed input: {error}"),
+            ));
+            entries.push((rel, b'u', Vec::new()));
+            return;
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = match fs::read_link(start) {
+            Ok(target) => target.to_string_lossy().as_bytes().to_vec(),
+            Err(error) => {
+                snapshot.unreadable.push((
+                    rel.clone(),
+                    format!("cannot read governed symlink: {error}"),
+                ));
+                Vec::new()
+            }
+        };
+        entries.push((rel, b'l', target));
+        return;
+    }
+    if file_type.is_file() {
+        snapshot.files_discovered += 1;
+        match fs::read(start) {
+            Ok(bytes) => {
+                snapshot.files_scanned += 1;
+                entries.push((rel, b'f', bytes));
+            }
+            Err(error) => {
+                snapshot
+                    .unreadable
+                    .push((rel.clone(), format!("cannot read governed input: {error}")));
+                entries.push((rel, b'u', Vec::new()));
+            }
+        }
+        return;
+    }
+    if !file_type.is_dir() {
+        entries.push((rel, b'o', Vec::new()));
+        return;
+    }
+
+    snapshot.directories_visited += 1;
+    entries.push((rel.clone(), b'd', Vec::new()));
+    let mut children = match fs::read_dir(start) {
+        Ok(children) => match children.collect::<Result<Vec<_>, _>>() {
+            Ok(children) => children,
+            Err(error) => {
+                snapshot.unreadable.push((
+                    rel,
+                    format!("cannot enumerate governed directory completely: {error}"),
+                ));
+                return;
+            }
+        },
+        Err(error) => {
+            snapshot
+                .unreadable
+                .push((rel, format!("cannot read governed directory: {error}")));
+            return;
+        }
+    };
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        collect_governed_entries(root, &child.path(), entries, snapshot);
+    }
+}
+
+fn governed_snapshot(root: &Path) -> GovernedSnapshot {
+    let mut snapshot = GovernedSnapshot {
+        digest: 0,
+        directories_visited: 0,
+        files_discovered: 0,
+        files_scanned: 0,
+        unreadable: Vec::new(),
+    };
+    let mut entries = Vec::new();
+    for rel in GOVERNED_ROOT_FILES {
+        collect_governed_entries(root, &root.join(rel), &mut entries, &mut snapshot);
+    }
+    for rel in GOVERNED_ROOT_DIRS {
+        collect_governed_entries(root, &root.join(rel), &mut entries, &mut snapshot);
+    }
+    entries.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    let mut digest = fnv1a64(b"fln.structure-guard.governed-root/1\0");
+    for (path, kind, bytes) in entries {
+        bind_field(&mut digest, path.as_bytes());
+        bind_field(&mut digest, &[kind]);
+        bind_field(&mut digest, &bytes);
+    }
+    snapshot.digest = digest;
+    snapshot
+}
+
+fn parse_rustc_verbose(stdout: &[u8], source: &'static str) -> RustcProbe {
+    let text = String::from_utf8_lossy(stdout);
+    let mut release = None;
+    let mut commit = None;
+    let mut host = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "release" if !value.is_empty() => release = Some(value.to_string()),
+            "commit-hash" if !value.is_empty() => commit = Some(value.to_ascii_lowercase()),
+            "host" if !value.is_empty() => host = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    RustcProbe {
+        source,
+        release,
+        commit,
+        host,
+    }
+}
+
+fn effective_rustc_probe() -> RustcProbe {
+    static PROBE: OnceLock<RustcProbe> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            // Never execute the program named by ambient RUSTC. The evidence runner's
+            // sealed lane supplies an exact RUSTC path, but a direct invocation may not:
+            // treating that string as an executable would turn identity validation into
+            // arbitrary command execution. Probe the fixed PATH name and compare an
+            // override by canonical file identity below.
+            match Command::new("rustc").arg("-Vv").output() {
+                Ok(output) if output.status.success() => {
+                    parse_rustc_verbose(&output.stdout, "PATH")
+                }
+                _ => RustcProbe {
+                    source: "PATH",
+                    release: None,
+                    commit: None,
+                    host: None,
+                },
+            }
+        })
+        .clone()
+}
+
+fn resolve_path_executable(program: &OsStr) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return fs::canonicalize(path)
+            .ok()
+            .filter(|candidate| candidate.is_file());
+    }
+    std::env::var_os("PATH").and_then(|search| {
+        std::env::split_paths(&search).find_map(|directory| {
+            fs::canonicalize(directory.join(path))
+                .ok()
+                .filter(|candidate| candidate.is_file())
+        })
+    })
+}
+
+fn rustc_override_matches_path() -> bool {
+    let Some(override_program) = std::env::var_os("RUSTC") else {
+        return true;
+    };
+    if override_program.is_empty() {
+        return false;
+    }
+    resolve_path_executable(OsStr::new("rustc"))
+        .zip(resolve_path_executable(&override_program))
+        .is_some_and(|(from_path, from_override)| from_path == from_override)
+}
+
+fn compiler_identity(root: &Path) -> CompilerIdentity {
+    let expected = fs::read_to_string(root.join(SUITE_LOCK_FILE))
+        .ok()
+        .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok());
+    let probe = effective_rustc_probe();
+    let channel = expected.as_ref().map(|lock| lock.rust_nightly.clone());
+    let expected_release = expected
+        .as_ref()
+        .map(|lock| lock.rust_release.as_str())
+        .filter(|release| !release.is_empty());
+    let expected_commit = expected
+        .as_ref()
+        .map(|lock| lock.rust_commit.as_str())
+        .filter(|commit| !commit.is_empty());
+    let contract_declared = expected_release.is_some()
+        && expected_commit.is_some()
+        && expected
+            .as_ref()
+            .is_some_and(|lock| !lock.targets.is_empty());
+    let host_is_declared = expected.as_ref().is_some_and(|lock| {
+        probe
+            .host
+            .as_ref()
+            .is_some_and(|host| lock.targets.contains(host))
+    });
+    // The guard invokes the PATH compiler directly for the identity probe and
+    // strips Cargo/rustc tuning variables from expansion subprocesses. Those
+    // ambient names are still disclosed in the robot envelope, but cannot
+    // change the governed computation. RUSTC is the one identity-bearing
+    // alias: require it to resolve to the same file as PATH's rustc.
+    let configuration_match = rustc_override_matches_path();
+    let contract_match = expected_release
+        .zip(expected_commit)
+        .is_some_and(|(release, commit)| {
+            probe.release.as_deref() == Some(release)
+                && probe.commit.as_deref() == Some(commit)
+                && host_is_declared
+                && configuration_match
+        });
+    CompilerIdentity {
+        source: probe.source,
+        channel,
+        release: probe.release,
+        commit: probe.commit,
+        host: probe.host,
+        contract_declared,
+        configuration_match,
+        contract_match,
+    }
+}
+
+fn admitted_environment() -> AdmittedEnvironment {
+    const ADMITTED_EXACT: [&str; 12] = [
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "RUSTUP_HOME",
+    ];
+    const COMPILER_EXACT: [&str; 14] = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_TARGET",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
+    ];
+    const COMPILER_PREFIXES: [&str; 5] = [
+        "CARGO_TARGET_",
+        "CARGO_ALIAS_",
+        "CARGO_UNSTABLE_",
+        "CARGO_REGISTRIES_",
+        "CARGO_PROFILE_",
+    ];
+
+    let mut admitted_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| ADMITTED_EXACT.contains(&name.as_str()) || name.starts_with("LC_"))
+        .collect();
+    let mut compiler_override_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            COMPILER_EXACT.contains(&name.as_str())
+                || (name != "CARGO_TARGET_DIR"
+                    && COMPILER_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix)))
+        })
+        .collect();
+    admitted_names.sort();
+    admitted_names.dedup();
+    compiler_override_names.sort();
+    compiler_override_names.dedup();
+    AdmittedEnvironment {
+        policy: "names-only-no-values/1",
+        admitted_names,
+        compiler_override_names,
+    }
 }
 
 struct DiscoveredCrate {
@@ -175,6 +813,80 @@ fn audit_governed_symlinks(root: &Path, findings: &mut Vec<Finding>) -> Result<(
     scan_symlinks(root, &root.join("tools"), findings)
 }
 
+/// Configuration files that silently re-point the compiler if a supported command runs
+/// from the directory that contains them. Cargo merges `.cargo/config(.toml)` from the
+/// invocation directory *upward*, and rustup resolves the toolchain the same way, so the
+/// discovery surface is every directory a caller may `cd` into — not only the root.
+const FORBIDDEN_CONFIG_FILES: [&str; 4] = [
+    ".cargo/config.toml",
+    ".cargo/config",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+];
+
+fn audit_configuration_files_in(
+    root: &Path,
+    dir: &Path,
+    names: &[&str],
+    findings: &mut Vec<Finding>,
+) -> Result<(), String> {
+    for name in names {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                findings.push(Finding {
+                    code: "FLN-STRUCT-016",
+                    path: rel,
+                    detail: "repository-local Cargo/toolchain configuration is forbidden because it can change the compiler, lint, linker, runner, or dependency-source contract outside the reviewed manifests; Cargo and rustup discover it from any directory a supported command runs in"
+                        .to_string(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn audit_configuration_surface_recursive(
+    root: &Path,
+    dir: &Path,
+    findings: &mut Vec<Finding>,
+) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+    };
+    // Symlinked directories are already a finding in `audit_governed_symlinks`; do not
+    // follow one here, or the scan could escape the workspace or cycle.
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    audit_configuration_files_in(root, dir, &FORBIDDEN_CONFIG_FILES, findings)?;
+
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            audit_configuration_surface_recursive(root, &path, findings)?;
+        }
+    }
+    Ok(())
+}
+
 fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Result<(), String> {
     // Package and workspace manifests are intentionally constrained above, but Cargo
     // also reads repository-local configuration before it compiles anything. Such a
@@ -182,24 +894,71 @@ fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Re
     // source replacement without appearing in the reviewed dependency graph. There is
     // no approved repository-local Cargo configuration surface yet, so both the current
     // and legacy filenames fail closed.
-    for rel in [".cargo/config.toml", ".cargo/config"] {
-        match fs::symlink_metadata(root.join(rel)) {
-            Ok(_) => findings.push(Finding {
-                code: "FLN-STRUCT-016",
-                path: rel.to_string(),
-                detail: "repository-local Cargo configuration is forbidden because it can change the compiler, lint, linker, runner, or dependency-source contract outside the reviewed manifests"
-                    .to_string(),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("cannot inspect {rel}: {error}")),
-        }
+    //
+    // At the root, `rust-toolchain.toml` is the reviewed pin itself (validated against
+    // SUITE.lock elsewhere) and is therefore the one legal member of this family; its
+    // legacy no-suffix spelling is not, because rustup prefers `.toml` when both exist
+    // and the unreviewed file would otherwise sit there undetected.
+    audit_configuration_files_in(
+        root,
+        root,
+        &[".cargo/config.toml", ".cargo/config", "rust-toolchain"],
+        findings,
+    )?;
+
+    // Below the root every member of the family is forbidden at every depth: a file at
+    // `crates/fln-kernel/.cargo/config.toml` never appears in the reviewed graph, yet
+    // `cd crates/fln-kernel && cargo build` merges it.
+    for subdir in ["crates", "tools"] {
+        audit_configuration_surface_recursive(root, &root.join(subdir), findings)?;
     }
     Ok(())
 }
 
+/// Read a governed file that the run can survive without. A file the guard cannot decode
+/// is an inconclusive input, not a setup failure: propagating the error would abort the
+/// whole run at exit 2 and hide every other finding, which turns one unreadable byte into
+/// a way to suppress the gate. The caller records the typed finding and skips the file, so
+/// the run can never be reported clean.
+/// A crate-root declaration that the SAFETY-note lint is knowingly not yet enabled,
+/// naming the bead that tracks the outstanding sites (`FLN-STRUCT-040`).
+///
+/// Comment-only and bead-bearing, both deliberately. Comment-only mirrors
+/// `ledger::marker_id`: a string literal containing the marker must not be able to waive
+/// a crate. Bead-bearing is what separates a declared remainder from a shrug — a waiver
+/// with nowhere to look is how a temporary exemption becomes permanent.
+fn safety_note_waiver(line: &str) -> Option<String> {
+    let comment = line.trim_start().strip_prefix("//")?.trim_start();
+    let rest = comment.strip_prefix("UNSAFE-NOTE-WAIVER:")?.trim();
+    let bead: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (bead.len() >= 8).then_some(bead)
+}
+
+fn read_governed(path: &Path, rel: &str, findings: &mut Vec<Finding>) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: rel.to_string(),
+                detail: format!(
+                    "governed file could not be read as UTF-8 ({error}); its structural authority is inconclusive and the scan is incomplete"
+                ),
+            });
+            None
+        }
+    }
+}
+
 /// Count covenant-relevant lines: non-blank, not starting with `//` after trim.
 /// Block comments count as code — the covenant is deliberately conservative.
-fn count_loc(dir: &Path) -> Result<usize, String> {
+///
+/// A file that cannot be decoded is reported and skipped, so an unreadable source file
+/// understates the count as a finding rather than passing the covenant silently.
+fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usize, String> {
     let mut total = 0;
     let metadata = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
@@ -227,8 +986,14 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
             if file_type.is_dir() {
                 stack.push(p);
             } else if file_type.is_file() && p.extension().is_some_and(|e| e == "rs") {
-                let text = fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let Some(text) = read_governed(&p, &rel, findings) else {
+                    continue;
+                };
                 total += text
                     .lines()
                     .filter(|l| {
@@ -240,6 +1005,432 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
         }
     }
     Ok(total)
+}
+
+/// The semantic half of the `fln-checker` independence boundary
+/// (bead `franken_lean-r0xu`; plan §8.3b, `franken_lean-gii`).
+///
+/// `gii` requires `fln-checker` to share "only reviewed data schemas" with
+/// `fln-kernel`. `ci/WORKSPACE_GRAPH.txt` enforces the crate half — no
+/// `fln-kernel`, `fln-olean`, `fln-rt` or `fln-unsafe-*`, and no `fln-env` —
+/// and it **cannot** enforce this half, at any phrasing:
+///
+/// > `fln-checker -> fln-hash` must stay permitted so the wire format and the
+/// > domain tags are shared, while the `Canonical` readers must not be. That
+/// > asymmetry is exactly why an item-level rule is needed.
+///
+/// The same holds one level down: prohibiting `fln-core` would be absurd, since
+/// both implementations need `ExprNode` and `Name` to denote the same term —
+/// yet `Level::is_equiv` inside `fln-core` is a judgment `fln-kernel` returns
+/// directly as its verdict (`tc.rs:949`). Crate granularity is the wrong unit.
+///
+/// A cross-check is worth exactly the questions its two sides answer
+/// *separately*, so each entry below is an answer that would otherwise be
+/// shared — and therefore checked once and believed twice.
+///
+/// Names, not call sites: the rule rejects these identifiers anywhere in
+/// `fln-checker`, including as the checker's *own* definitions. That is
+/// deliberate. A reviewer who reads `is_equiv` in this crate cannot tell the
+/// shared judgment from a local reimplementation, and a boundary that requires
+/// the reader to resolve names is not a boundary. Bare `normalize` is
+/// deliberately **absent**: the checker's own eager normalization legitimately
+/// wants that name, while `normalize_fixpoint` is the distinctive `fln-core`
+/// entry point and is refused.
+pub const CHECKER_SEMANTIC: [(&str, &str); 12] = [
+    (
+        "is_equiv",
+        "universe equivalence is a judgment fln-kernel returns as its verdict (KR-303); \
+             the checker must decide it independently",
+    ),
+    (
+        "normalize_fixpoint",
+        "universe normalization is a judgment; imax/max fixpoint is where unsoundness hides",
+    ),
+    (
+        "loose_bvar_range",
+        "a precomputed answer `instantiate` prunes traversal on (tc.rs:176); \
+             a shared wrong range makes both engines skip the same subterm",
+    ),
+    (
+        "has_fvar",
+        "a precomputed answer the `abstract_*` walks prune on (tc.rs:1645/1707/1779)",
+    ),
+    (
+        "has_expr_mvar",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "has_level_mvar",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "has_level_param",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "approx_depth",
+        "a precomputed data-word answer, not a schema",
+    ),
+    (
+        "read_body",
+        "the Canonical reader: share the wire FORMAT, never the PARSER — decoding is \
+             where franken_lean-d17i measured 37 real defects",
+    ),
+    (
+        "from_canonical_bytes",
+        "the Canonical reader; fln-checker must bring its own decoder (gii)",
+    ),
+    (
+        "from_canonical_bytes_budgeted",
+        "the Canonical reader canon.rs itself steers callers to for untrusted input, \
+             so a checker author following the documentation would slip past a guard \
+             that named only the unbudgeted entry point",
+    ),
+    (
+        "fln_bignum",
+        "kernel arithmetic is judgment: KR-313 decides definitional equality by computing, \
+             so a shared sum is a shared verdict",
+    ),
+];
+
+/// Refuse every [`CHECKER_SEMANTIC`] identifier appearing anywhere in `fln-checker`.
+///
+/// The inventory is `pub` and sits above this function rather than inside it so that
+/// the seeded campaign and `fln-checker`'s own charter test read the **same array**.
+/// Both previously held transcriptions of it, and a transcription is free to drift
+/// from the rule it claims to describe: `seeded.rs`'s copy still called the inventory
+/// "eleven items" after it grew to twelve, and the charter declared a prohibition
+/// enforced here as "NOT ENFORCED" for two days.
+fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    let wanted: Vec<&str> = CHECKER_SEMANTIC.iter().map(|(name, _)| *name).collect();
+    for site in ledger::identifier_sites(text, &wanted) {
+        let why = CHECKER_SEMANTIC
+            .iter()
+            .find(|(name, _)| *name == site.name)
+            .map(|(_, why)| *why)
+            .unwrap_or("outside the reviewed fln-checker independence boundary");
+        findings.push(Finding {
+            code: "FLN-STRUCT-037",
+            path: format!("{source_rel}:{}", site.line),
+            detail: format!(
+                "`{}` is SEMANTIC across the fln-checker independence boundary: {why}. \
+                 See crates/fln-checker/src/lib.rs for the schema-versus-semantic rule.",
+                site.name
+            ),
+        });
+    }
+}
+
+/// The two files that may plan a declaration admission outside fln-env.
+///
+/// Paths, not line numbers, and that is a measured choice rather than a stylistic one:
+/// over five hours on 2026-07-25 these two call sites did not change at all while their
+/// recorded positions moved (`admit.rs` 3032 -> 3035, `capability.rs` 182 -> 201). An
+/// allowlist keyed on positions would have gone stale without anything being wrong.
+///
+/// Two entries is the point. It is small enough to review by eye, and a third file
+/// appearing is a loud failure rather than a quiet spread of the raw surface.
+const PLANNED_ADMISSION_ALLOWLIST: [&str; 2] = [
+    "crates/fln-kernel/src/admit.rs",
+    "crates/fln-kernel/src/capability.rs",
+];
+
+/// Keep declaration admission unreachable outside the kernel, not merely unused
+/// (bead `franken_lean-oof9`).
+///
+/// D6 says nothing but the kernel may admit a constant. `fln-yswb` and
+/// `fln-kernel-bounded-decl-admission-ukzx` made that true by MIGRATION — no production
+/// caller uses the raw surface today — but `Environment::add_decl` and
+/// `Environment::plan_add_decl` are still `pub`, so it was true by audit rather than by
+/// construction, and an audit expires the moment someone writes the next caller.
+///
+/// # A build-gate is not the second-best mechanism here; it is the only one
+///
+/// The natural fix — making the raw entry points take a kernel-bound capability token —
+/// cannot be written. `fln-env` is rank 4 and `fln-kernel` is rank 6, so an
+/// `fln-env -> fln-kernel` edge is rejected by this same guard, mechanically. Nor can
+/// fln-env express "only the kernel may call this" without naming the kernel: sealing a
+/// trait excludes fln-kernel by the definition of sealing, an unsealed trait excludes
+/// nobody, and a token minted by fln-env proves nothing about who holds it. A Cargo
+/// feature is worse — features are additive and global, so any dependent re-opens the
+/// hole for the entire graph, silently.
+///
+/// A type-level guarantee therefore requires moving the raw surface above or beside
+/// fln-kernel, which is a plan amendment to section 5 layering, not an implementation
+/// choice. Anyone who reads this rule as a compromise and sets out to "upgrade" it will
+/// spend an hour rediscovering that. It is written down so they do not.
+///
+/// # Why the match is on arity
+///
+/// See [`ledger::method_call_sites`]. A bare name match is wrong here, not merely
+/// imprecise: `fln-hash`'s unrelated `LogicalRootBuilder::add_decl` shares the name.
+fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    for site in ledger::method_call_sites(text, &["add_decl", "plan_add_decl"]) {
+        if site.name == "add_decl" {
+            // Arity 2 is `fln_hash::LogicalRootBuilder::add_decl(name, digest)`, an
+            // unrelated method in a crate that cannot even depend on fln-env. Only the
+            // one-argument `Environment::add_decl(info)` is this rule's subject.
+            if site.arity == Some(2) {
+                continue;
+            }
+            findings.push(Finding {
+                code: "FLN-STRUCT-038",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "`Environment::add_decl` admits a constant with no kernel check{}. \
+                     D6 reserves admission to the kernel; route production admission \
+                     through `plan_add_decl` and a checked-declaration capability.",
+                    unresolved_suffix(site.arity)
+                ),
+            });
+            continue;
+        }
+        if PLANNED_ADMISSION_ALLOWLIST.contains(&source_rel) {
+            continue;
+        }
+        findings.push(Finding {
+            code: "FLN-STRUCT-039",
+            path: format!("{source_rel}:{}", site.line),
+            detail: format!(
+                "`Environment::plan_add_decl` is reachable outside the two reviewed \
+                 kernel call sites{}. The allowlist is {} and a third entry is a \
+                 decision, not an edit.",
+                unresolved_suffix(site.arity),
+                PLANNED_ADMISSION_ALLOWLIST.join(", ")
+            ),
+        });
+    }
+}
+
+/// Name an unresolved call shape in the finding rather than dropping the site.
+///
+/// An arity this scanner could not compute is reported, never skipped: a guard that
+/// silently ignores what it cannot parse has a hole shaped like the thing it failed on.
+fn unresolved_suffix(arity: Option<usize>) -> &'static str {
+    match arity {
+        Some(_) => "",
+        None => " (call shape unresolved; reported rather than skipped)",
+    }
+}
+
+/// Close the kernel's generated-code authority without treating expanded compiler
+/// boilerplate as project-authored TCB source.
+///
+/// Project-defined macros are forbidden in the kernel. Every admitted function-like
+/// macro, attribute, and derive is an exact compiler/std builtin whose invocation line
+/// is already charged by `count_loc`; all other generated-code entrances fail closed.
+/// Together with the manifest ban on build scripts/custom/proc-macro targets and the
+/// source-escape ban on `include!`/`#[path]`, this gives every generated fragment one
+/// reviewed source callsite inside `crates/fln-kernel/src/**`.
+/// FLN-STRUCT-041 — a Python module that can SHADOW an import of the trusted
+/// evidence bootstrap (bead `franken_lean-h40t`).
+///
+/// # The hole this closes
+///
+/// `scripts/evidence.py` computes the governed tree hashes, validates run
+/// records, and publishes the bundle whose verdict every gate depends on.
+/// Python resolves imports from the running script's OWN DIRECTORY first, and
+/// from the process cwd for `python3 -c`. So a file named `scripts/hashlib.py`,
+/// or a repository-root `tomllib.py`, replaces the module that computes the
+/// digests and decides the verdicts — and until this rule, structure-guard
+/// could not see it at all: `GOVERNED_ROOT_DIRS` is `ci`, `contracts`, `crates`,
+/// `tools`, so `scripts/` was outside the governed universe entirely, and
+/// nothing in this file had ever looked at a `.py`.
+///
+/// This is the sibling of a defect already PROVEN live on the CI surface under
+/// `fln-8mj`: with a shadow module on the path, `tomllib.loads("")` returned
+/// `{"toolchain": {"channel": "attacker-chosen-toolchain"}}` through both the
+/// script-directory vector and the `PYTHONPATH` vector.
+///
+/// # Why the shadowable set is DERIVED and not listed
+///
+/// A hand-written list of "dangerous module names" goes stale the moment the
+/// runner imports something new, and the staleness is silent — the guard keeps
+/// passing while the surface grows. So the set is read from the trusted scripts
+/// themselves: whatever they import is what can be shadowed. That is the same
+/// choice FLN-STRUCT-039 made when it derived its scan scope from the declared
+/// graph rather than from a hand-listed set of crates.
+///
+/// # Scope, and why it is per-directory
+///
+/// Python's script-directory resolution makes the hazard LOCAL: a module only
+/// shadows for scripts that live beside it. So the rule pairs each trusted
+/// script's own directory with that script's imports, and additionally treats
+/// the repository root as a resolution directory because inline `python3 -c`
+/// helpers in the shell lanes resolve from the cwd.
+///
+/// It ships with NOTHING to report — the only `.py` in `scripts/` is
+/// `evidence.py` itself and the repository root has none — so the first
+/// violation is a real event rather than a backlog. That is deliberate and is
+/// the same posture FLN-STRUCT-038 ships with.
+///
+/// # What this is NOT
+///
+/// It is not a substitute for interpreter isolation. `python3 -I` is what
+/// actually closes the channel; this rule closes the part isolation cannot,
+/// namely a shadow module committed into the tree where a future invocation
+/// that forgets `-I` would find it. The bead says so in its own words: no claim
+/// that source-level scanning substitutes for interpreter isolation.
+fn audit_python_import_shadowing(root: &Path, findings: &mut Vec<Finding>) {
+    let mut trusted: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    collect_trusted_python(&root.join("scripts"), &mut trusted, findings);
+
+    // The repository root is a resolution directory for the inline `python3 -c`
+    // helpers in the shell lanes, which resolve from the cwd rather than from a
+    // script directory. It has no trusted `.py` of its own, so it inherits the
+    // union of every trusted script's imports.
+    let union: BTreeSet<String> = trusted.values().flatten().cloned().collect();
+    trusted.entry(root.to_path_buf()).or_insert(union);
+
+    for (dir, importable) in &trusted {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        names.sort();
+        for path in names {
+            if path.extension().and_then(OsStr::to_str) != Some("py") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if !importable.contains(stem) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            findings.push(Finding {
+                code: "FLN-STRUCT-041",
+                path: rel,
+                detail: format!(
+                    "`{stem}` shadows a module the trusted evidence bootstrap imports; Python \
+                     resolves the script directory and the cwd BEFORE the standard library, so \
+                     this file replaces `{stem}` for every trusted invocation that reaches it"
+                ),
+            });
+        }
+    }
+}
+
+/// Reads every trusted Python script under `dir`, recording per-directory the
+/// module names it imports. A script that cannot be read is REPORTED, never
+/// skipped silently: an unreadable trusted script is an unestablished authority,
+/// not an absent hazard (FL-INV-07).
+fn collect_trusted_python(
+    dir: &Path,
+    out: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+    findings: &mut Vec<Finding>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_trusted_python(&path, out, findings);
+            continue;
+        }
+        if path.extension().and_then(OsStr::to_str) != Some("py") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            findings.push(Finding {
+                code: "FLN-STRUCT-041",
+                path: path.to_string_lossy().replace('\\', "/"),
+                detail: "a trusted Python script could not be read, so the set of modules it \
+                         can have shadowed is unestablished rather than empty"
+                    .to_string(),
+            });
+            continue;
+        };
+        let parent = path.parent().unwrap_or(dir).to_path_buf();
+        let entry = out.entry(parent).or_default();
+        for module in python_imports(&text) {
+            entry.insert(module);
+        }
+    }
+}
+
+/// The top-level module names a Python source imports: `import X`, `import X.Y`,
+/// `from X import ...`. Only the FIRST path segment matters, because that is the
+/// name Python resolves against the path.
+fn python_imports(text: &str) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = if let Some(rest) = line.strip_prefix("import ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("from ") {
+            rest
+        } else {
+            continue;
+        };
+        for part in rest.split([' ', ',']) {
+            let name = part.trim().split('.').next().unwrap_or("").trim();
+            if name.is_empty() || name == "import" || name.starts_with('_') {
+                continue;
+            }
+            if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                modules.insert(name.to_string());
+            }
+        }
+    }
+    modules
+}
+
+fn audit_kernel_generated_authority(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
+    const FUNCTION_MACROS: [&str; 5] = ["assert", "format", "matches", "unreachable", "vec"];
+    const ATTRIBUTES: [&str; 4] = ["cfg", "derive", "forbid", "test"];
+    const DERIVES: [&str; 6] = ["Clone", "Copy", "Debug", "Default", "Eq", "PartialEq"];
+
+    for site in ledger::macro_definition_sites(text) {
+        findings.push(Finding {
+            code: "FLN-STRUCT-030",
+            path: format!("{source_rel}:{}", site.line),
+            detail: "project-defined macro in fln-kernel has no exact expanded-authority mapping; kernel macros are forbidden".to_string(),
+        });
+    }
+    for site in ledger::macro_invocations(text) {
+        if !FUNCTION_MACROS.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "macro invocation `{}` is outside the reviewed kernel builtin inventory; generated checking authority must map to an admitted LOC-counted callsite",
+                    site.name
+                ),
+            });
+        }
+    }
+    for site in ledger::attribute_invocations(text) {
+        if !ATTRIBUTES.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "attribute `{}` is outside the reviewed kernel builtin inventory; procedural generated authority is forbidden",
+                    site.name
+                ),
+            });
+        }
+    }
+    for site in ledger::derive_macro_invocations(text) {
+        if !DERIVES.contains(&site.name.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-030",
+                path: format!("{source_rel}:{}", site.line),
+                detail: format!(
+                    "derive `{}` is outside the reviewed kernel builtin inventory; generated checking authority is forbidden",
+                    site.name
+                ),
+            });
+        }
+    }
 }
 
 /// Root files whose lint posture is checked: whichever of `src/lib.rs`/`src/main.rs` exist.
@@ -293,12 +1484,62 @@ fn crate_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
+/// Cargo's implicit target roots, distinct from every Rust source that contributes to
+/// those targets. A nested `tests/support/mod.rs` is authority-bearing source and is
+/// scanned by `crate_roots`, but it is not a second integration-test target. Robot
+/// inventory must not inflate target cardinality by conflating those two classes.
+fn cargo_target_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
+    let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
+        .iter()
+        .map(|file| c.dir.join("src").join(file))
+        .filter(|path| is_regular_file(path))
+        .collect();
+    let build_script = c.dir.join("build.rs");
+    if is_regular_file(&build_script) {
+        roots.push(build_script);
+    }
+    for target_dir in ["src/bin", "tests", "examples", "benches"] {
+        let dir = c.dir.join(target_dir);
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+                roots.push(path);
+            } else if file_type.is_dir() {
+                let main = path.join("main.rs");
+                if is_regular_file(&main) {
+                    roots.push(main);
+                }
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) {
     let plan_ranks = [
         ("fln-core", 0),
         ("fln-hash", 1),
         ("fln-bignum", 1),
         ("fln-libm", 1),
+        ("fln-bench", 2),
         ("fln-unsafe-abi", 2),
         ("fln-unsafe-region", 2),
         ("fln-rt", 3),
@@ -366,6 +1607,14 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
         });
     }
 
+    // WHY THE FIRST TWO ARE NOT REDUNDANT WITH LAYERING, recorded here because the deletion
+    // that removes them will be proposed on exactly that ground, and for two of the three
+    // unsafe crates the argument is CORRECT. `fln-unsafe-abi` and `fln-unsafe-region` are
+    // rank 2, far below `fln-kernel` at rank 6, so FLN-STRUCT-007's strict-downward rule
+    // already forbids their edge. `fln-unsafe-jit` is rank 12 — ABOVE the kernel — so
+    // layering PERMITS a jit-to-kernel edge, and only these two lines forbid it. They look
+    // redundant because they are redundant for two crates out of three
+    // (bead `franken_lean-d3-safety-note-unenforced-cdbg`).
     for (source, destination) in [
         ("fln-unsafe-*", "fln-kernel"),
         ("fln-unsafe-*", "fln-checker"),
@@ -384,7 +1633,10 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
                 code: "FLN-STRUCT-024",
                 path: GRAPH_FILE.to_string(),
                 detail: format!(
-                    "constitutional prohibition `{source} ->* {destination}` is missing"
+                    "constitutional prohibition `{source} ->* {destination}` is missing. If this was \
+                     removed as redundant with strict-downward layering, check the ranks \
+                     first: fln-unsafe-jit is rank 12 and fln-kernel is rank 6, so layering \
+                     permits that edge and only this line forbids it"
                 ),
             });
         }
@@ -394,10 +1646,7 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
             "fln-kernel",
             ["fln-core", "fln-hash", "fln-bignum", "fln-env"].as_slice(),
         ),
-        (
-            "fln-checker",
-            ["fln-core", "fln-hash", "fln-bignum"].as_slice(),
-        ),
+        ("fln-checker", ["fln-core", "fln-hash"].as_slice()),
     ] {
         let actual: BTreeSet<&str> = g
             .allow_direct
@@ -457,6 +1706,22 @@ fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) 
 }
 
 pub fn run(root: &Path) -> Result<RunOutcome, String> {
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("cannot resolve authoritative workspace root: {error}"))?;
+    if !canonical_root.is_dir() {
+        return Err(format!(
+            "authoritative workspace root is not a directory: {}",
+            canonical_root.display()
+        ));
+    }
+    let root = canonical_root.as_path();
+    let root_identity = root
+        .to_str()
+        .map(|identity| identity.replace('\\', "/"))
+        .ok_or_else(|| "authoritative workspace root is not UTF-8".to_string())?;
+    let governed_before = governed_snapshot(root);
+    let admitted_environment = admitted_environment();
+    let compiler_identity = compiler_identity(root);
     let mut findings: Vec<Finding> = Vec::new();
 
     // Reject links before any recursive scanner runs. Git can store symlinks, and
@@ -507,10 +1772,18 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     discover(root, "crates", &mut discovered)?;
     discover(root, "tools", &mut discovered)?;
 
+    // Retained for the D18 derivation (bead franken_lean-r2st) so it reuses this read
+    // instead of re-opening every manifest: a second pass would add filesystem work
+    // between the two governed-root snapshots and perturb the concurrency authority
+    // tests that race a writer against the scan window.
+    let mut manifest_texts: BTreeMap<String, String> = BTreeMap::new();
     for c in &mut discovered {
         let manifest_rel = format!("{}/Cargo.toml", c.rel);
-        let text = fs::read_to_string(c.dir.join("Cargo.toml"))
-            .map_err(|e| format!("cannot read {manifest_rel}: {e}"))?;
+        let Some(text) = read_governed(&c.dir.join("Cargo.toml"), &manifest_rel, &mut findings)
+        else {
+            continue;
+        };
+        manifest_texts.insert(c.name.clone(), text.clone());
         match manifest::parse(&text, &manifest_rel) {
             Ok(m) => c.manifest = Some(m),
             Err(e) => findings.push(Finding {
@@ -520,6 +1793,21 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             }),
         }
     }
+    let feature_count = discovered
+        .iter()
+        .filter_map(|crate_| crate_.manifest.as_ref())
+        .map(|manifest| manifest.features.len())
+        .sum();
+    let mut target_count = 0usize;
+    for crate_ in &discovered {
+        target_count = target_count
+            .checked_add(cargo_target_roots(crate_)?.len())
+            .ok_or_else(|| "authority target count overflow".to_string())?;
+    }
+    let target_triple_count = fs::read_to_string(root.join(SUITE_LOCK_FILE))
+        .ok()
+        .and_then(|text| crate::lockfile::parse_suite_lock(&text).ok())
+        .map_or(0, |lock| lock.targets.len());
 
     // ---- snapshot law: crates on disk <-> crates declared ------------------------------
     let on_disk: BTreeMap<&str, &DiscoveredCrate> =
@@ -821,8 +2109,9 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 .to_string_lossy()
                 .replace('\\', "/");
             let rel = format!("{}/{}", c.rel, relative_root);
-            let text =
-                fs::read_to_string(&root_file).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let Some(text) = read_governed(&root_file, &rel, &mut findings) else {
+                continue;
+            };
             let posture = ledger::lint_posture(&text);
             match decl.kind {
                 CrateKind::UnsafeBoundary => {
@@ -861,6 +2150,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // are closed by the `#![forbid(unsafe_code)]` root check above plus rustc itself
     // (forbid cannot be overridden by an inner allow).
     let mut sites: Vec<AllowSite> = Vec::new();
+    let mut unreadable_boundary_sources: Vec<String> = Vec::new();
     for c in &discovered {
         let is_boundary = g
             .crates
@@ -873,8 +2163,19 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             // Every Rust target in a boundary package is project-authored boundary code:
             // library/modules, bins, integration tests, examples, benches, and any
             // auto-discovered build script. None gets an unledgered lowering lane.
-            ledger::scan_allow_sites(&c.dir, &c.rel, &mut sites)?;
+            ledger::scan_allow_sites(&c.dir, &c.rel, &mut sites, &mut unreadable_boundary_sources)?;
         }
+    }
+    // An undecodable file inside a boundary crate is exactly where an unledgered
+    // allow-site would hide, so it is reported and the run is never clean.
+    for rel in unreadable_boundary_sources {
+        findings.push(Finding {
+            code: "FLN-STRUCT-027",
+            path: rel,
+            detail:
+                "boundary-crate source could not be read as UTF-8; it was not scanned for `#[allow(unsafe_code)]` sites, so the unsafe-ledger discipline is inconclusive for this file"
+                    .to_string(),
+        });
     }
     let mut used_ids: BTreeMap<&str, usize> = BTreeMap::new();
     for site in &sites {
@@ -1009,13 +2310,102 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         if !is_boundary {
             continue;
         }
+
+        // FLN-STRUCT-040: D3 requires a SAFETY note at every unsafe site. That half of
+        // the rule is enforced by `clippy::undocumented_unsafe_blocks` and by nothing
+        // else, and the lint is not switched on anywhere — so the requirement rests on
+        // attentiveness in the three crates that exist because attentiveness is not
+        // enough (bead `franken_lean-d3-safety-note-unenforced-cdbg`).
+        //
+        // This does not re-implement the lint. Deciding whether a block is documented
+        // needs a real parser, clippy has one, and a second implementation of one
+        // property is how the two disagree. What it enforces is that each boundary root
+        // either TURNS THE LINT ON, or says out loud that it has not — with the bead
+        // that tracks the outstanding sites. An unenforced rule is survivable; an
+        // unenforced rule nobody can see is the defect.
+        // EVERY target root, not just `src/lib.rs`. A cargo target is its own crate
+        // root, so `#![deny(...)]` in the library reaches neither `examples/` nor
+        // `tests/` nor `benches/` nor `src/bin/`. Checking the library alone reported
+        // `fln-unsafe-region` as ENFORCED while its one undocumented unsafe block sat in
+        // `examples/region_trap_probe.rs`, uncovered by any lint — the posture check
+        // itself producing a false clean (bead
+        // `franken_lean-d3-safety-note-unenforced-cdbg`).
+        let mut target_roots: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for rel in ["src/lib.rs", "src/main.rs"] {
+            let abs = c.dir.join(rel);
+            if abs.is_file() {
+                target_roots.push((format!("{}/{rel}", c.rel), abs));
+            }
+        }
+        for sub in ["examples", "tests", "benches", "src/bin"] {
+            let dir = c.dir.join(sub);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut found: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+                .collect();
+            found.sort();
+            for abs in found {
+                let name = abs.file_name().unwrap_or_default().to_string_lossy();
+                target_roots.push((format!("{}/{sub}/{name}", c.rel), abs));
+            }
+        }
+
+        for (root_rel, root_abs) in target_roots {
+            if let Some(root_text) = read_governed(&root_abs, &root_rel, &mut findings) {
+                let enforced = root_text.lines().any(|line| {
+                    let t = line.trim();
+                    (t.starts_with("#![deny(") || t.starts_with("#![forbid("))
+                        && t.contains("clippy::undocumented_unsafe_blocks")
+                });
+                let waived = root_text
+                    .lines()
+                    .any(|line| safety_note_waiver(line).is_some());
+                if !enforced && !waived {
+                    findings.push(Finding {
+                    code: "FLN-STRUCT-040",
+                    path: root_rel,
+                    detail: format!(
+                        "target root of unsafe boundary `{}` neither enables the SAFETY-note lint nor \
+                         declares that it has not. Add \
+                         `#![deny(clippy::undocumented_unsafe_blocks)]` once the crate is \
+                         clean, or, while sites remain, a crate-root comment \
+                         `// UNSAFE-NOTE-WAIVER: <bead-id>` naming the bead that tracks \
+                         them. D3's SAFETY-note requirement is enforced by that lint and \
+                         by nothing else; a boundary crate that is silent about it leaves \
+                         readers unable to tell an enforced rule from an unenforced one.",
+                        c.name
+                    ),
+                });
+                }
+            }
+        }
+
         let src = c.dir.join("src");
         if !src.is_dir() {
             continue;
         }
         let findings_before = findings.len();
         let mut exports = Vec::new();
-        ledger::scan_external_exports(&src, &format!("{}/src", c.rel), &mut exports)?;
+        let mut unreadable_exports = Vec::new();
+        ledger::scan_external_exports(
+            &src,
+            &format!("{}/src", c.rel),
+            &mut exports,
+            &mut unreadable_exports,
+        )?;
+        for rel in unreadable_exports {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: rel,
+                detail:
+                    "boundary-crate source could not be read as UTF-8; it was not scanned for external export sites, so the D3 law (b) no-admission covenant is inconclusive for this file"
+                        .to_string(),
+            });
+        }
         for site in exports {
             findings.push(Finding {
                 code: "FLN-STRUCT-022",
@@ -1032,8 +2422,14 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         sources.sort();
         let mut source_pub: BTreeSet<(String, String)> = BTreeSet::new();
         for path in &sources {
-            let text = fs::read_to_string(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let source_rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(path, &source_rel, &mut findings) else {
+                continue;
+            };
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(path)
@@ -1075,12 +2471,64 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                     });
                     continue;
                 }
+                // A return type the CALLER chooses is the one laundering vector
+                // the dependency law cannot carry, and no reviewed row can
+                // argue it away — so this fires whether or not the item has a
+                // row (bead `fln-boundary-api-no-admission-argument-discarded-ez07`).
+                // `pub fn forge<T>() -> T` names no kernel type, so
+                // FLN-STRUCT-008 permits it and the admission-token tripwire
+                // sees nothing; the caller instantiates `T` at a checked
+                // declaration and receives one from a crate that cannot name
+                // it. Before this, giving that export a row declaring `() -> T`
+                // made the covenant pass it clean.
+                if let Some(param) = &item.ret_type_param {
+                    findings.push(Finding {
+                        code: "FLN-STRUCT-022",
+                        path: format!("{rel}:{}", item.line),
+                        detail: format!(
+                            "`fn {}` in unsafe boundary `{}` returns `{}`, which names the caller-chosen type parameter `{param}`; the caller may instantiate it at a checked declaration, so the return launders admission out of a crate that never names a kernel type (D3 law b). No {BOUNDARY_API_FILE} row can argue this away",
+                            item.name,
+                            c.name,
+                            item.ret.as_deref().unwrap_or("?"),
+                        ),
+                    });
+                }
                 match boundary_rows
                     .iter()
                     .find(|row| row.path == rel && row.name == item.name && row.kind == item.kind)
                 {
                     Some(row) => {
                         used_api_rows.insert(row.id.as_str());
+                        // D3 law (b)'s no-admission argument is a claim about the
+                        // item's TYPE, so the declared type has to be the real one
+                        // (bead `fln-boundary-api-no-admission-argument-discarded-ez07`).
+                        // Before this, field 4 was checked non-empty and discarded, so a
+                        // row could declare `() -> bool` for a function returning
+                        // anything at all and every argument resting on that type —
+                        // "value copy", "plain-int snapshot" — was unfalsifiable.
+                        // Scoped to `fn` because only those rows are written as a
+                        // signature; the other kinds carry prose and are still unbound.
+                        if item.kind == "fn" {
+                            let declared = boundary_api::declared_return_type(&row.surface);
+                            if declared != item.ret {
+                                let observed = item.ret.as_deref().map_or_else(
+                                    || "no return type".to_string(),
+                                    |found| format!("`{found}`"),
+                                );
+                                let claimed = declared.as_deref().map_or_else(
+                                    || "no return type".to_string(),
+                                    |found| format!("`{found}`"),
+                                );
+                                findings.push(Finding {
+                                    code: "FLN-STRUCT-022",
+                                    path: format!("{rel}:{}", item.line),
+                                    detail: format!(
+                                        "row `{}` declares surface type `{}` for `fn {}` in unsafe boundary `{}` — that is {claimed}, but the signature has {observed}; the row's no-admission argument is a claim about this type, so it must match the source (D3 law b)",
+                                        row.id, row.surface, item.name, c.name
+                                    ),
+                                });
+                            }
+                        }
                         source_pub.insert((item.kind.clone(), item.name.clone()));
                     }
                     None => findings.push(Finding {
@@ -1125,7 +2573,68 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         &abi_export_sites,
     ));
 
+    // ---- fln-checker independence boundary (bead franken_lean-r0xu) --------------------
+    // `fln-checker` carries no LOC covenant, so the covenant walk below never
+    // visits it; it gets its own pass. This is vacuous while the crate is a
+    // charter stub — which is the only honest moment to install it. A constraint
+    // written after the code exists gets written to whatever the code already
+    // does, because by then someone has working code and a deadline.
+    if let Some(c) = on_disk.get("fln-checker") {
+        let src = c.dir.join("src");
+        let mut checker_sources = Vec::new();
+        collect_rs_files(&src, &mut checker_sources)?;
+        for source in checker_sources {
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
+            audit_checker_independence_boundary(&text, &source_rel, &mut findings);
+        }
+    }
+
+    // ---- declaration-admission surface (bead franken_lean-oof9) ------------------------
+    // Scope is DERIVED FROM THE GRAPH, not hand-listed. Only a crate that declares an
+    // edge to fln-env can call these methods at all, and this guard already enforces
+    // rank(from) > rank(to) on every edge — so the scan set stays correct when an edge is
+    // added, instead of a hand-written crate list going stale the way the recorded call
+    // positions did. fln-env itself is excluded: it DEFINES the surface, and a fixture
+    // there legitimately needs raw access.
+    //
+    // `src/**` only, which is what makes this production-scoped. `tests/**` is a separate
+    // target and is deliberately untouched: a fixture needs the raw path, and that is the
+    // sole reason the surface still exists.
+    let mut admission_scanned: BTreeSet<&str> = BTreeSet::new();
+    for (from, to) in &g.edges {
+        if to != "fln-env" || from == "fln-env" || !admission_scanned.insert(from.as_str()) {
+            continue;
+        }
+        let Some(c) = on_disk.get(from.as_str()) else {
+            continue;
+        };
+        let src = c.dir.join("src");
+        let mut admission_sources = Vec::new();
+        collect_rs_files(&src, &mut admission_sources)?;
+        for source in admission_sources {
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
+            audit_declaration_admission_surface(&text, &source_rel, &mut findings);
+        }
+    }
+
+    audit_python_import_shadowing(root, &mut findings);
+
     // ---- line-count covenants ----------------------------------------------------------
+    let mut covenants: Vec<CovenantFact> = Vec::new();
     for (crate_name, limit) in &g.covenants {
         let Some(c) = on_disk.get(crate_name.as_str()) else {
             continue;
@@ -1134,14 +2643,19 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         let mut covenant_sources = Vec::new();
         collect_rs_files(&src, &mut covenant_sources)?;
         for source in covenant_sources {
-            let text = fs::read_to_string(&source)
-                .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
+            if crate_name == "fln-kernel" {
+                audit_kernel_generated_authority(&text, &source_rel, &mut findings);
+            }
             for escape in ledger::source_escape_sites(&text) {
-                let rel = source
-                    .strip_prefix(root)
-                    .unwrap_or(&source)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let rel = source_rel.clone();
                 findings.push(Finding {
                     code: "FLN-STRUCT-015",
                     path: format!("{rel}:{}", escape.line),
@@ -1152,7 +2666,17 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 });
             }
         }
-        let loc = count_loc(&src)?;
+        let loc = count_loc(root, &src, &mut findings)?;
+        // The disclosure and the enforcement are the SAME value, used twice. Not a second
+        // implementation agreeing with the first — there is nothing here that could disagree.
+        // A mutant that moves the real count without moving the disclosure is therefore
+        // unplantable by construction, which is the strongest available outcome and is stated
+        // in the guard below rather than quietly scored as a kill.
+        covenants.push(CovenantFact {
+            crate_name: crate_name.clone(),
+            loc,
+            limit: *limit,
+        });
         if loc > *limit {
             findings.push(Finding {
                 code: "FLN-STRUCT-015",
@@ -1168,13 +2692,141 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // Cargo.lock ⇄ ci/CLOSURE_ALLOWLIST.txt ⇄ SUITE.lock ⇄ rust-toolchain.toml. Missing
     // or malformed governance files degrade to findings, never to a silent skip.
     findings.extend(crate::lockfile::audit(root, &g));
+    findings.extend(crate::contract_inventory::audit(root));
+    let (handoff_findings, contract_handoff) = crate::contract_handoff::audit_with_snapshot(root);
+    findings.extend(handoff_findings);
+    findings.extend(crate::ownership_publication::audit(root));
+    // D18 mode closure (bead franken_lean-r2st). The closure is derived here from the
+    // reviewed graph and real manifests; `fln_core::mode::scan_mode_closure` remains the
+    // sole authority on the traversal and the mode algebra, and its FLN-D18-001..013
+    // codes are emitted unchanged.
+    let (mode_closure_findings, mode_closure) =
+        crate::mode_closure::audit_with_facts(&g, &manifest_texts);
+    findings.extend(mode_closure_findings);
 
+    if compiler_identity.contract_declared && !compiler_identity.contract_match {
+        findings.push(Finding {
+            code: "FLN-STRUCT-029",
+            path: SUITE_LOCK_FILE.to_string(),
+            detail: format!(
+                "effective compiler identity source={} release={} commit={} host={} configuration-match={} does not match the complete SUITE.lock compiler contract; compiler authority is inconclusive",
+                compiler_identity.source,
+                compiler_identity.release.as_deref().unwrap_or("unavailable"),
+                compiler_identity.commit.as_deref().unwrap_or("unavailable"),
+                compiler_identity.host.as_deref().unwrap_or("unavailable"),
+                compiler_identity.configuration_match,
+            ),
+        });
+    }
+
+    let governed_after = governed_snapshot(root);
+    for (path, detail) in governed_before
+        .unreadable
+        .iter()
+        .chain(governed_after.unreadable.iter())
+    {
+        if !findings
+            .iter()
+            .any(|finding| finding.code == "FLN-STRUCT-027" && finding.path == *path)
+        {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: path.clone(),
+                detail: format!(
+                    "{detail}; structural authority is inconclusive and the traversal is incomplete"
+                ),
+            });
+        }
+    }
+    // ubs:ignore — public structural input digests, not secret material.
+    if governed_before.digest != governed_after.digest {
+        findings.push(Finding {
+            code: "FLN-STRUCT-028",
+            path: root_identity.clone(),
+            detail: format!(
+                "governed source root changed during the scan (fnv1a64:{:016x} -> fnv1a64:{:016x}); the run is bound to no single input closure",
+                governed_before.digest, governed_after.digest
+            ),
+        });
+    }
+
+    let inconclusive_paths: BTreeSet<&str> = findings
+        .iter()
+        .filter(|finding| finding.code == "FLN-STRUCT-027")
+        .map(|finding| finding.path.as_str())
+        .collect();
+    let snapshot_unreadable_paths: BTreeSet<&str> = governed_after
+        .unreadable
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let decoded_files_skipped = inconclusive_paths
+        .difference(&snapshot_unreadable_paths)
+        .count();
+    let files_skipped_unreadable = governed_after
+        .files_discovered
+        .saturating_sub(governed_after.files_scanned)
+        .saturating_add(decoded_files_skipped);
+    let files_scanned = governed_after
+        .files_scanned
+        .saturating_sub(decoded_files_skipped);
+    let traversal = TraversalFacts {
+        directories_visited: governed_after.directories_visited,
+        files_discovered: governed_after.files_discovered,
+        files_scanned,
+        files_skipped_unreadable,
+    };
+    if !traversal.count_rule_holds() {
+        findings.push(Finding {
+            code: "FLN-STRUCT-028",
+            path: root_identity.clone(),
+            detail: format!(
+                "authority-count rule `{AUTHORITY_COUNT_RULE}` failed: scanned={} skipped={} discovered={}",
+                traversal.files_scanned,
+                traversal.files_skipped_unreadable,
+                traversal.files_discovered
+            ),
+        });
+    }
+
+    let authority = if findings.iter().any(|finding| {
+        matches!(
+            finding.code,
+            "FLN-STRUCT-027"
+                | "FLN-STRUCT-028"
+                | "FLN-STRUCT-029"
+                | "FLN-STRUCT-031"
+                | "FLN-STRUCT-033"
+                | "FLN-STRUCT-034"
+                | "FLN-STRUCT-036"
+        )
+    }) {
+        Authority::Incomplete
+    } else {
+        Authority::Complete
+    };
     findings.sort_by(|a, b| (a.code, &a.path, &a.detail).cmp(&(b.code, &b.path, &b.detail)));
     Ok(RunOutcome {
         findings,
+        covenants,
         crate_count: discovered.len(),
         edge_count: actual_edges.len(),
         graph_digest,
+        contract_handoff_root: contract_handoff.map(|snapshot| snapshot.handoff_root),
+        root_identity,
+        governed_root_before: governed_before.digest,
+        governed_root_after: governed_after.digest,
+        traversal,
+        authority,
+        authority_inventory: AuthorityInventory {
+            packages: discovered.len(),
+            targets: target_count,
+            features: feature_count,
+            target_triples: target_triple_count,
+        },
+        compiler_identity,
+        admitted_environment,
+        mode_closure,
     })
 }
 
@@ -1497,6 +3149,36 @@ fn c_export_covenant(
 /// builds never contend on the workspace's primary target directory.
 fn run_expansion(root: &Path, package: &str, test_cfg: bool) -> Result<String, String> {
     let mut command = std::process::Command::new("cargo");
+    for name in std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()) {
+        if matches!(
+            name.as_str(),
+            "RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "CARGO_BUILD_RUSTFLAGS"
+                | "CARGO_BUILD_RUSTC"
+                | "CARGO_BUILD_RUSTC_WRAPPER"
+                | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                | "CARGO_BUILD_RUSTDOC"
+                | "CARGO_BUILD_TARGET"
+                | "RUSTC"
+                | "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTDOC"
+                | "RUSTDOCFLAGS"
+        ) || (name != "CARGO_TARGET_DIR"
+            && [
+                "CARGO_TARGET_",
+                "CARGO_ALIAS_",
+                "CARGO_UNSTABLE_",
+                "CARGO_REGISTRIES_",
+                "CARGO_PROFILE_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)))
+        {
+            command.env_remove(name);
+        }
+    }
     command
         .current_dir(root)
         .arg("rustc")
