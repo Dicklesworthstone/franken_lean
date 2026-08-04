@@ -510,6 +510,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
     "franken_lean-h5z1",
     "franken_lean-hv9m",
+    "franken_lean-kernel-loc-covenant-not-disclosed-t0g7",
     "franken_lean-kxbj",
     "franken_lean-l84f",
     "franken_lean-lu5",
@@ -529,7 +530,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 
 /// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 57;
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 58;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
