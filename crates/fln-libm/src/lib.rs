@@ -475,6 +475,12 @@ pub fn log2(x: f64) -> f64 {
     if invalid(x) {
         return canonical_nan();
     }
+    if x > 0.0 && x.is_finite() {
+        let (fraction, exponent) = frexp(x);
+        if fraction == 0.5 {
+            return (exponent - 1) as f64;
+        }
+    }
     log(x) * INV_LN2
 }
 
@@ -889,6 +895,20 @@ mod tests {
             (1024.0, f64::INFINITY),
         ] {
             same_bits(exp2(input), expected);
+        }
+    }
+
+    #[test]
+    fn log2_binary64_powers_are_exact_integers() {
+        for (input, expected) in [
+            (f64::from_bits(1), -1074.0),
+            (f64::MIN_POSITIVE, -1022.0),
+            (0.5, -1.0),
+            (1.0, 0.0),
+            (2.0, 1.0),
+            (1024.0, 10.0),
+        ] {
+            same_bits(log2(input), expected);
         }
     }
 
