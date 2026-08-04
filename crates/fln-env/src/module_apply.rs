@@ -831,6 +831,90 @@ pub fn prepare_module_apply_candidate(
     )
 }
 
+/// Immutable evidence for one successful aggregate transition.
+///
+/// The receipt is created while the plan still holds both exact states, then checked
+/// again immediately before the candidate is released. It records provenance roots,
+/// rather than treating an index projection or a graph lineage binding as a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleApplyReceipt {
+    schema: u16,
+    module: ModuleId,
+    base_provenance_root: ModuleProvenanceRoot,
+    result_provenance_root: ModuleProvenanceRoot,
+}
+
+impl ModuleApplyReceipt {
+    pub const fn schema(&self) -> u16 {
+        self.schema
+    }
+
+    pub fn module(&self) -> &ModuleId {
+        &self.module
+    }
+
+    pub const fn base_provenance_root(&self) -> ModuleProvenanceRoot {
+        self.base_provenance_root
+    }
+
+    pub const fn result_provenance_root(&self) -> ModuleProvenanceRoot {
+        self.result_provenance_root
+    }
+
+    fn verify_for(
+        &self,
+        base: &ModuleApplyState,
+        candidate: &ModuleApplyState,
+    ) -> Result<(), ModuleApplyReceiptError> {
+        if self.schema != MODULE_APPLY_SCHEMA_VERSION {
+            return Err(ModuleApplyReceiptError::SupersededSchema {
+                schema: self.schema,
+            });
+        }
+        let actual_base = base.manifest().root();
+        if self.base_provenance_root != actual_base {
+            return Err(ModuleApplyReceiptError::BaseRoot {
+                expected: self.base_provenance_root,
+                actual: actual_base,
+            });
+        }
+        let actual_result = candidate.manifest().root();
+        if self.result_provenance_root != actual_result {
+            return Err(ModuleApplyReceiptError::ResultRoot {
+                expected: self.result_provenance_root,
+                actual: actual_result,
+            });
+        }
+        if candidate.manifest().record(&self.module).is_none() {
+            return Err(ModuleApplyReceiptError::ModuleAbsent {
+                module: self.module.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A state released by a one-shot aggregate commit and the receipt that binds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedModuleApply {
+    state: ModuleApplyState,
+    receipt: ModuleApplyReceipt,
+}
+
+impl CommittedModuleApply {
+    pub fn state(&self) -> &ModuleApplyState {
+        &self.state
+    }
+
+    pub fn receipt(&self) -> &ModuleApplyReceipt {
+        &self.receipt
+    }
+
+    pub fn into_state(self) -> ModuleApplyState {
+        self.state
+    }
+}
+
 /// A one-shot, non-authoritative aggregate application prepared against one immutable
 /// state. Holding a candidate is not publication; only [`Self::commit`] releases it
 /// after revalidating every base component.
@@ -841,6 +925,7 @@ pub struct PreparedModuleApply {
     base_graph: ModuleGraph,
     base_manifest: Arc<ModuleProvenanceManifest>,
     candidate: ModuleApplyState,
+    receipt: ModuleApplyReceipt,
 }
 
 impl PreparedModuleApply {
@@ -867,7 +952,7 @@ impl PreparedModuleApply {
     pub fn commit(
         self,
         base: &ModuleApplyState,
-    ) -> Result<ModuleApplyState, ModuleApplyCommitError> {
+    ) -> Result<CommittedModuleApply, ModuleApplyCommitError> {
         if self.schema != MODULE_APPLY_SCHEMA_VERSION || !self.is_valid_for(base) {
             return Err(ModuleApplyCommitError::StaleBase);
         }
@@ -875,7 +960,13 @@ impl PreparedModuleApply {
         self.candidate
             .verify()
             .map_err(ModuleApplyCommitError::CandidateState)?;
-        Ok(self.candidate)
+        self.receipt
+            .verify_for(base, &self.candidate)
+            .map_err(ModuleApplyCommitError::Receipt)?;
+        Ok(CommittedModuleApply {
+            state: self.candidate,
+            receipt: self.receipt,
+        })
     }
 }
 
@@ -885,6 +976,26 @@ pub enum ModuleApplyCommitError {
     StaleBase,
     BaseState(ModuleApplyStateError),
     CandidateState(ModuleApplyStateError),
+    Receipt(ModuleApplyReceiptError),
+}
+
+/// A receipt cannot be substituted for the states it reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyReceiptError {
+    SupersededSchema {
+        schema: u16,
+    },
+    BaseRoot {
+        expected: ModuleProvenanceRoot,
+        actual: ModuleProvenanceRoot,
+    },
+    ResultRoot {
+        expected: ModuleProvenanceRoot,
+        actual: ModuleProvenanceRoot,
+    },
+    ModuleAbsent {
+        module: ModuleId,
+    },
 }
 
 /// Prepare one complete aggregate candidate for later one-shot commit.
@@ -899,6 +1010,12 @@ pub fn prepare_module_apply(
             base_environment: base.environment().clone(),
             base_graph: base.graph().clone(),
             base_manifest: Arc::clone(&base.manifest),
+            receipt: ModuleApplyReceipt {
+                schema: preflight.schema(),
+                module: preflight.transaction().contribution().module().id.clone(),
+                base_provenance_root: base.manifest().root(),
+                result_provenance_root: candidate.manifest().root(),
+            },
             candidate,
         })),
         Outcome::Complete(Err(error)) => Outcome::complete(Err(error)),
@@ -1743,11 +1860,33 @@ mod tests {
             Err(ModuleApplyCommitError::StaleBase)
         ));
 
+        let mut tampered_receipt_plan =
+            match prepare_module_apply(&checked, &base, &declaration_candidate) {
+                Outcome::Complete(Ok(plan)) => plan,
+                other => panic!("expected a complete application plan, got {other:?}"),
+            };
+        tampered_receipt_plan.receipt.result_provenance_root = base.manifest().root();
+        assert!(matches!(
+            tampered_receipt_plan.commit(&base),
+            Err(ModuleApplyCommitError::Receipt(
+                ModuleApplyReceiptError::ResultRoot { .. }
+            ))
+        ));
+
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
             Outcome::Complete(Ok(plan)) => plan.commit(&base).expect("base remains current"),
             other => panic!("expected a complete application plan, got {other:?}"),
         };
-        assert_eq!(committed.graph().len(), 1);
+        assert_eq!(committed.state().graph().len(), 1);
+        assert_eq!(committed.receipt().module(), &contribution.module().id);
+        assert_eq!(
+            committed.receipt().base_provenance_root(),
+            base.manifest().root()
+        );
+        assert_eq!(
+            committed.receipt().result_provenance_root(),
+            committed.state().manifest().root()
+        );
         assert_eq!(base.graph().len(), 0);
     }
 }
