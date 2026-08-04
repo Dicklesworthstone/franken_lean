@@ -381,7 +381,9 @@ const LANE_CITED_ROWS: usize = 1;
 /// 95 -> 96 in the FLN-UL-0327 reentrant TLS fallback landing: the new test-only forcing
 /// hook cites `small_heap_reentrant_tls_borrow_uses_individual_fallback`, which drives the
 /// production individual-allocation fallback while its TLS bin is borrowed.
-const SYMBOL_RESOLVED_ROWS: usize = 96;
+/// 96 -> 97 in the FLN-UL-0328 semantic reentrant landing: its helper calls `alloc_small` while
+/// the TLS bin remains borrowed, so the named test pins the production fallback's one-tick law.
+const SYMBOL_RESOLVED_ROWS: usize = 97;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -445,7 +447,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 96;
 /// all-class lifecycle covers; no pre-existing resolving token was removed in that refresh.
 /// 119 -> 120 in the FLN-UL-0327 reentrant TLS fallback landing: its one exact test-function
 /// citation is a new symbol token and no existing row lost a resolving citation.
-const RESOLVING_CITATION_TOKENS: usize = 120;
+/// 120 -> 121 in the FLN-UL-0328 semantic reentrant landing: its one exact test-function
+/// citation is a new symbol token and no existing row lost a resolving citation.
+const RESOLVING_CITATION_TOKENS: usize = 121;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -474,8 +478,8 @@ const PROSE_EVIDENCE_ROWS: usize = 226;
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 323 rows: 1 cites an e2e lane, 96 carry \
-symbol-resolved evidence, and 226 remain prose; 120 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 324 rows: 1 cites an e2e lane, 97 carry \
+symbol-resolved evidence, and 226 remain prose; 121 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\

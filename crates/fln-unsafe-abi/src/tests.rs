@@ -1524,6 +1524,34 @@ fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
 }
 
 #[test]
+fn small_heap_reentrant_tls_borrow_charges_one_semantic_tick() {
+    let _g = lock();
+    use crate::export::{export_lean_free_small, export_lean_small_mem_size};
+
+    let before = crate::membrane::get_num_heartbeats();
+    let block = crate::membrane::reentrant_alloc_small_for_test(17).cast::<core::ffi::c_void>();
+    assert!(!block.is_null(), "the semantic small allocator stays live");
+    assert_eq!(
+        export_lean_small_mem_size(block),
+        24,
+        "alloc_small preserves the aligned small-object size through fallback"
+    );
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 1,
+        "the semantic small-allocation entry charges exactly once despite re-entry"
+    );
+
+    export_lean_free_small(block);
+    assert_eq!(
+        crate::membrane::get_num_heartbeats(),
+        before + 1,
+        "freeing the fallback does not perturb the allocation-linked tick"
+    );
+    crate::membrane::drain_small_bins_for_test();
+}
+
+#[test]
 fn small_allocator_ticks_are_width_invariant_at_1_8_32_threads() {
     let _g = lock();
     use crate::export::{export_lean_alloc_small, export_lean_free_small};

@@ -557,6 +557,23 @@ pub(crate) fn reentrant_small_alloc_for_test(user_size: usize) -> *mut u8 {
 }
 
 #[cfg(test)]
+// UNSAFE-LEDGER: FLN-UL-0328
+#[allow(unsafe_code)]
+pub(crate) fn reentrant_alloc_small_for_test(size: usize) -> *mut LeanObject {
+    assert!(size > 0, "test allocation size must be nonzero");
+    assert!(
+        align_obj_size(size) <= MAX_SMALL_OBJECT_SIZE,
+        "test allocation must remain on the small-object path"
+    );
+    SMALL_BINS.with(|bins| {
+        let _held_bin_borrow = bins.borrow_mut();
+        // SAFETY: the test releases the returned live block only through the
+        // exported small-heap free surface after the held borrow ends.
+        unsafe { alloc_small(size) }
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn small_bin_depth_for_test(user_size: usize) -> usize {
     let Some((class, _)) = small_class(user_size) else {
         return 0;
