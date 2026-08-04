@@ -44,6 +44,7 @@ is an ergonomic repair rather than an enforcement one.
 """
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -159,6 +160,80 @@ def obligation_report(
     return "\n".join(lines)
 
 
+# --- franken_lean-shlw: an unmodelled status is an export-wide blocker --------
+#
+# Measured at br 0.2.19: `br update --status` accepts ARBITRARY text. `nonsense`
+# and `zzzz-not-a-status` were both stored and exported verbatim. The verification
+# validator accepts exactly four values, so ANY other string -- a deliberate
+# `blocked`, or a typo -- refuses every pane's beads export until it is changed or
+# pinned out, and the refusal lands on whoever commits next rather than on whoever
+# set it.
+#
+# This ANNOUNCES; it does not refuse. Refusing would decide the lifecycle question
+# franken_lean-shlw deliberately leaves open -- whether the validator's four states
+# ARE the lifecycle, or whether the lifecycle has states the validator should learn.
+# Reporting what the validator will do decides nothing.
+#
+# The supported set is DERIVED from the validator's own source, never transcribed,
+# and a failed derivation is a typed refusal rather than a silent fallback to a
+# hardcoded list: a stale copy that still looked right is exactly how this check
+# would stop checking.
+
+STATUS_SITE = re.compile(r"status not in \{([^}]*)\}")
+
+
+def validator_status_set(root: Path) -> frozenset[str] | None:
+    """The statuses the validator accepts, read from the validator.
+
+    None when the site cannot be located -- the caller must then say so rather
+    than assume a set.
+    """
+    try:
+        source = (root / VALIDATOR).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = STATUS_SITE.search(source)
+    if match is None:
+        return None
+    found = frozenset(re.findall(r'"([a-z_]+)"', match.group(1)))
+    # Anti-vacuity: an empty or implausibly small parse would silently accept
+    # everything. Refuse it instead.
+    return found if len(found) >= 2 else None
+
+
+def status_warning(requested: str | None, supported: frozenset[str] | None) -> str | None:
+    """Announce an export-blocking status, or None when there is nothing to say."""
+    if requested is None:
+        return None
+    if supported is None:
+        return (
+            "br_obligation: could not derive the validator's supported status set "
+            f"from {VALIDATOR}, so this status was NOT checked. That is a refusal "
+            "to guess, not a clean result."
+        )
+    if requested in supported:
+        return None
+    return (
+        f"br_obligation: STATUS {requested!r} WILL BLOCK EVERY PANE'S BEADS EXPORT.\n"
+        f"The verification validator accepts only: {', '.join(sorted(supported))}.\n"
+        "br accepts arbitrary text here (measured at 0.2.19), so this was stored "
+        "anyway. The pre-commit hook will refuse the next beads commit -- including "
+        "commits by panes that never touched this bead, and they cannot fix it.\n"
+        "See franken_lean-shlw. This is a warning, not a refusal: whether these four "
+        "states ARE the lifecycle is an open decision."
+    )
+
+
+def requested_status(argv: list[str]) -> str | None:
+    """The --status value in a br argv, or None. Handles both spellings."""
+    for index, token in enumerate(argv):
+        if token == "--status" or token == "-s":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if token.startswith("--status="):
+            return token.split("=", 1)[1]
+    return None
+
+
 def self_test() -> int:
     failures: list[str] = []
 
@@ -210,11 +285,50 @@ def self_test() -> int:
                 f"this script must not reimplement the predicate: {forbidden}"
             )
 
+    # --- franken_lean-shlw cells ---------------------------------------------
+    supported = frozenset({"open", "in_progress", "closed", "tombstone"})
+
+    if status_warning(None, supported) is not None:
+        failures.append("no --status must announce nothing")
+    if status_warning("in_progress", supported) is not None:
+        failures.append("a supported status must announce nothing")
+
+    warned = status_warning("blocked", supported)
+    if warned is None:
+        failures.append("an unmodelled status must be announced")
+    elif "blocked" not in warned or "franken_lean-shlw" not in warned:
+        failures.append("the announcement must name the status and the bead")
+
+    # A TYPO must warn exactly as `blocked` does: the defect is not one word.
+    if status_warning("in_progres", supported) is None:
+        failures.append("a typo must be announced too -- the defect is not one word")
+
+    # ANTI-VACUITY: an underivable set must REFUSE, never silently pass.
+    undecided = status_warning("blocked", None)
+    if undecided is None or "refusal to guess" not in undecided:
+        failures.append("an underivable validator set must be reported, not assumed")
+
+    # The set must be DERIVED from the real validator, not transcribed here.
+    derived = validator_status_set(repo_root(Path.cwd().resolve()))
+    if derived is None:
+        failures.append("could not derive the validator status set from its source")
+    elif not {"open", "closed"} <= derived:
+        failures.append(f"derived status set looks wrong: {sorted(derived) if derived else None}")
+
+    for argv, expected in (
+        (["update", "x", "--status", "blocked"], "blocked"),
+        (["update", "x", "--status=blocked"], "blocked"),
+        (["update", "x", "-s", "blocked"], "blocked"),
+        (["close", "x"], None),
+    ):
+        if requested_status(argv) != expected:
+            failures.append(f"requested_status{argv} != {expected!r}")
+
     if failures:
         for failure in failures:
             print(f"br_obligation self-test FAILED: {failure}", file=sys.stderr)
         return 1
-    print("br_obligation self-test: PASS (4 cases)")
+    print("br_obligation self-test: PASS (obligation + status cells)")
     return 0
 
 
@@ -228,7 +342,15 @@ def main(argv: list[str]) -> int:
     root = repo_root(Path.cwd().resolve())
     before = tracker_state(root)
 
+    warning = status_warning(
+        requested_status(argv), validator_status_set(root)
+    )
+
     completed = subprocess.run(["br", *argv], check=False)
+
+    if warning is not None:
+        print("", file=sys.stderr)
+        print(warning, file=sys.stderr)
 
     after = tracker_state(root)
     changed = sorted(
