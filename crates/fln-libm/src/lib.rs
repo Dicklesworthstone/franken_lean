@@ -685,11 +685,11 @@ pub fn pow(x: f64, y: f64) -> f64 {
 
 /// Stable `sqrt(x*x + y*y)` without overflow or spurious underflow.
 pub fn hypot(x: f64, y: f64) -> f64 {
-    if invalid(x) || invalid(y) {
-        return canonical_nan();
-    }
     if x.is_infinite() || y.is_infinite() {
         return f64::INFINITY;
+    }
+    if invalid(x) || invalid(y) {
+        return canonical_nan();
     }
     let a = abs(x);
     let b = abs(y);
@@ -797,6 +797,14 @@ mod tests {
         ] {
             same_bits(pow(f64::NEG_INFINITY, exponent), expected);
         }
+    }
+
+    #[test]
+    fn hypot_infinity_dominates_nan() {
+        let nan = f64::from_bits(CANONICAL_NAN_BITS);
+        same_bits(hypot(f64::INFINITY, nan), f64::INFINITY);
+        same_bits(hypot(nan, f64::NEG_INFINITY), f64::INFINITY);
+        assert_eq!(hypot(nan, 1.0).to_bits(), CANONICAL_NAN_BITS);
     }
 
     #[test]
