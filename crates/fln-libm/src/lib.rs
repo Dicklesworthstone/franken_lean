@@ -350,6 +350,11 @@ pub fn acos(x: f64) -> f64 {
     if x == -1.0 {
         return PI;
     }
+    if x > 0.5 {
+        // pi/2 - asin(x) loses most of the small result near +1.  The
+        // positive atan2 form keeps the endpoint angle as the primary value.
+        return atan2(sqrt((1.0 - x) * (1.0 + x)), x);
+    }
     HALF_PI - asin(x)
 }
 
@@ -841,6 +846,11 @@ mod tests {
         same_bits(cosh(-finite), cosh(finite));
         assert!(sinh(710.5).is_infinite());
         assert!(cosh(710.5).is_infinite());
+    }
+
+    #[test]
+    fn acos_near_positive_one_avoids_subtractive_cancellation() {
+        assert_eq!(acos(0.999_999).to_bits(), 0x3f57_2ba4_6065_af16);
     }
 
     #[test]
