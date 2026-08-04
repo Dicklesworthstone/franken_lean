@@ -5,18 +5,19 @@
 //! those `Arc`-backed values are paired with the validated manifest before later apply
 //! phases can build an immutable committed environment state.
 
+use std::fmt;
 use std::sync::Arc;
 
 use fln_core::name::Name;
 use fln_core::options::KVMap;
-use fln_core::outcome::Outcome;
+use fln_core::outcome::{Inconclusive, Outcome};
 use fln_hash::domain::{Digest, Domain, hash};
 use fln_hash::root::LogicalRoot;
 
 use crate::constants::ConstantInfo;
 use crate::environment::{DeclarationDeltaError, Environment};
 use crate::extensions::ExtensionDescriptor;
-use crate::modules::{ArtifactEvidence, ModuleGraph, ModuleId};
+use crate::modules::{ArtifactEvidence, CancellationProbe, ModuleGraph, ModuleId};
 use crate::provenance::{
     CaptureStatus, DeclarationClass, ExtensionContribution, ExtensionEntryId,
     ModuleContributionRecord, ModuleProvenanceError, ModuleProvenanceIndexes,
@@ -27,6 +28,31 @@ use crate::provenance::{
 /// input: a plan must never be consumed under a payload-binding interpretation it was
 /// not checked against.
 pub const MODULE_APPLY_SCHEMA_VERSION: u16 = 1;
+
+/// Frozen observation points at which module application may report cancellation.
+///
+/// A checkpoint is named rather than inferred from a call count so a non-answer records
+/// exactly how far the transaction progressed. The final checkpoint is sampled only after
+/// base, candidate, and receipt revalidation, immediately before a successful result could
+/// release authoritative state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModuleApplyCheckpoint {
+    BeforePublication,
+}
+
+impl fmt::Display for ModuleApplyCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforePublication => f.write_str("module-apply/before-publication"),
+        }
+    }
+}
+
+fn cancelled_before_module_publication<T>() -> Outcome<T> {
+    Outcome::Inconclusive(Inconclusive::cancelled(
+        ModuleApplyCheckpoint::BeforePublication.to_string(),
+    ))
+}
 
 /// Stable identity for one exact payload-bearing apply transaction.
 ///
@@ -1353,31 +1379,40 @@ impl ModuleApplyPlan {
     }
 
     /// Consume a plan once. Exact retries re-check the held state and return an
-    /// observation; only the prepared arm can publish a new state.
+    /// observation; only the prepared arm can publish a new state. Cancellation is
+    /// sampled after that revalidation, immediately before either success is released.
     pub fn commit(
         self,
         base: &ModuleApplyState,
-    ) -> Result<ModuleApplyCommitResult, ModuleApplyCommitError> {
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<ModuleApplyCommitResult, ModuleApplyCommitError>> {
         match self {
-            Self::Prepared(plan) => plan.commit(base).map(ModuleApplyCommitResult::Published),
+            Self::Prepared(plan) => plan
+                .commit(base, cancellation)
+                .map_complete(|result| result.map(ModuleApplyCommitResult::Published)),
             Self::ExactResultRetry(preflight) => {
                 match classify_exact_result_retry(&preflight, base) {
                     Ok(ModuleApplyRetryDisposition::ExactResult {
                         module,
                         transaction_id,
                         provenance_root,
-                    }) => Ok(ModuleApplyCommitResult::AlreadyApplied(
-                        AlreadyAppliedModuleApply {
-                            state: base.clone(),
-                            module,
-                            transaction_id,
-                            provenance_root,
-                        },
-                    )),
-                    Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {
-                        Err(ModuleApplyCommitError::StaleBase)
+                    }) => {
+                        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                            return cancelled_before_module_publication();
+                        }
+                        Outcome::complete(Ok(ModuleApplyCommitResult::AlreadyApplied(
+                            AlreadyAppliedModuleApply {
+                                state: base.clone(),
+                                module,
+                                transaction_id,
+                                provenance_root,
+                            },
+                        )))
                     }
-                    Err(error) => Err(ModuleApplyCommitError::Retry(error)),
+                    Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {
+                        Outcome::complete(Err(ModuleApplyCommitError::StaleBase))
+                    }
+                    Err(error) => Outcome::complete(Err(ModuleApplyCommitError::Retry(error))),
                 }
             }
         }
@@ -1417,25 +1452,32 @@ impl PreparedModuleApply {
     /// Revalidate the base and release the one prepared aggregate candidate exactly once.
     ///
     /// The state values are immutable, so every refusal leaves `base` unchanged. A caller
-    /// cannot retry the same `PreparedModuleApply` after this method consumes it.
+    /// cannot retry the same `PreparedModuleApply` after this method consumes it. A final
+    /// cancellation reports a typed non-answer and releases no authoritative state.
     pub fn commit(
         self,
         base: &ModuleApplyState,
-    ) -> Result<CommittedModuleApply, ModuleApplyCommitError> {
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<CommittedModuleApply, ModuleApplyCommitError>> {
         if self.schema != MODULE_APPLY_SCHEMA_VERSION || !self.is_valid_for(base) {
-            return Err(ModuleApplyCommitError::StaleBase);
+            return Outcome::complete(Err(ModuleApplyCommitError::StaleBase));
         }
-        base.verify().map_err(ModuleApplyCommitError::BaseState)?;
-        self.candidate
-            .verify()
-            .map_err(ModuleApplyCommitError::CandidateState)?;
-        self.receipt
-            .verify_for(base, &self.candidate)
-            .map_err(ModuleApplyCommitError::Receipt)?;
-        Ok(CommittedModuleApply {
+        if let Err(error) = base.verify() {
+            return Outcome::complete(Err(ModuleApplyCommitError::BaseState(error)));
+        }
+        if let Err(error) = self.candidate.verify() {
+            return Outcome::complete(Err(ModuleApplyCommitError::CandidateState(error)));
+        }
+        if let Err(error) = self.receipt.verify_for(base, &self.candidate) {
+            return Outcome::complete(Err(ModuleApplyCommitError::Receipt(error)));
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return cancelled_before_module_publication();
+        }
+        Outcome::complete(Ok(CommittedModuleApply {
             state: self.candidate,
             receipt: self.receipt,
-        })
+        }))
     }
 }
 
@@ -1820,6 +1862,18 @@ mod tests {
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
+    use fln_core::outcome::InconclusiveCause;
+    use std::sync::atomic::AtomicBool;
+
+    fn completed<T: std::fmt::Debug, E: std::fmt::Debug>(
+        outcome: Outcome<Result<T, E>>,
+        context: &str,
+    ) -> Result<T, E> {
+        match outcome {
+            Outcome::Complete(result) => result,
+            other => panic!("{context}: expected a completed result, got {other:?}"),
+        }
+    }
 
     fn name(value: &str) -> Name {
         Name::str(Name::anonymous(), value)
@@ -2463,9 +2517,42 @@ mod tests {
         )
         .expect("unrelated extension keeps the empty state coherent");
         assert!(matches!(
-            stale_plan.commit(&stale_base),
-            Err(ModuleApplyCommitError::StaleBase)
+            stale_plan.commit(&stale_base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::StaleBase))
         ));
+
+        let cancellable_plan = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(plan)) => plan,
+            other => panic!("expected a complete application plan, got {other:?}"),
+        };
+        let cancellation = AtomicBool::new(true);
+        let cancelled = cancellable_plan.clone().commit(&base, Some(&cancellation));
+        let Outcome::Inconclusive(inconclusive) = cancelled else {
+            panic!("final cancellation must be a typed non-answer, got {cancelled:?}");
+        };
+        assert!(matches!(
+            inconclusive.cause,
+            InconclusiveCause::Cancelled { ref at }
+                if at.text() == ModuleApplyCheckpoint::BeforePublication.to_string()
+        ));
+        assert_eq!(base.graph().len(), 0, "cancelled commit published a module");
+        assert_eq!(
+            base.environment().len(),
+            0,
+            "cancelled commit published declarations"
+        );
+        assert_eq!(
+            base.manifest().records().len(),
+            0,
+            "cancelled commit published provenance"
+        );
+
+        let recovered = completed(
+            cancellable_plan.commit(&base, None),
+            "withdrawn cancellation must permit a clean recovery",
+        )
+        .expect("the unchanged base remains current after cancellation");
+        assert!(matches!(recovered, ModuleApplyCommitResult::Published(_)));
 
         let mut tampered_receipt_plan =
             match prepare_module_apply(&checked, &base, &declaration_candidate) {
@@ -2477,10 +2564,10 @@ mod tests {
             };
         tampered_receipt_plan.receipt.result_provenance_root = base.manifest().root();
         assert!(matches!(
-            tampered_receipt_plan.commit(&base),
-            Err(ModuleApplyCommitError::Receipt(
+            tampered_receipt_plan.commit(&base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::ResultRoot { .. }
-            ))
+            )))
         ));
 
         let mut tampered_logical_root_plan =
@@ -2493,10 +2580,10 @@ mod tests {
             };
         tampered_logical_root_plan.receipt.result_logical_root = base.logical_root();
         assert!(matches!(
-            tampered_logical_root_plan.commit(&base),
-            Err(ModuleApplyCommitError::Receipt(
+            tampered_logical_root_plan.commit(&base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::ResultLogicalRoot { .. }
-            ))
+            )))
         ));
 
         let mut tampered_contribution_plan =
@@ -2522,10 +2609,10 @@ mod tests {
             contribution.completeness().clone(),
         );
         assert!(matches!(
-            tampered_contribution_plan.commit(&base),
-            Err(ModuleApplyCommitError::Receipt(
+            tampered_contribution_plan.commit(&base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::Contribution { .. }
-            ))
+            )))
         ));
 
         let mut tampered_grade_plan =
@@ -2544,10 +2631,10 @@ mod tests {
             ),
         };
         assert!(matches!(
-            tampered_grade_plan.commit(&base),
-            Err(ModuleApplyCommitError::Receipt(
+            tampered_grade_plan.commit(&base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::Grade { .. }
-            ))
+            )))
         ));
 
         let mut tampered_transaction_plan =
@@ -2561,19 +2648,20 @@ mod tests {
         tampered_transaction_plan.receipt.transaction_id =
             ModuleApplyTransactionId(Digest([9; 32]));
         assert!(matches!(
-            tampered_transaction_plan.commit(&base),
-            Err(ModuleApplyCommitError::Receipt(
+            tampered_transaction_plan.commit(&base, None),
+            Outcome::Complete(Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::Transaction { .. }
-            ))
+            )))
         ));
 
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
-            Outcome::Complete(Ok(plan)) => match plan.commit(&base) {
-                Ok(ModuleApplyCommitResult::Published(committed)) => committed,
-                Ok(ModuleApplyCommitResult::AlreadyApplied(other)) => {
+            Outcome::Complete(Ok(plan)) => match plan.commit(&base, None) {
+                Outcome::Complete(Ok(ModuleApplyCommitResult::Published(committed))) => committed,
+                Outcome::Complete(Ok(ModuleApplyCommitResult::AlreadyApplied(other))) => {
                     panic!("first apply unexpectedly observed an existing state: {other:?}")
                 }
-                Err(error) => panic!("base remains current: {error:?}"),
+                Outcome::Complete(Err(error)) => panic!("base remains current: {error:?}"),
+                other => panic!("uncancelled commit must complete, got {other:?}"),
             },
             other => panic!("expected a complete application plan, got {other:?}"),
         };
@@ -2653,9 +2741,23 @@ mod tests {
             }
             other => panic!("expected a complete retry plan, got {other:?}"),
         };
-        let exact_retry = match ModuleApplyPlan::ExactResultRetry(exact_retry_plan)
-            .commit(committed.state())
-            .expect("exact retry revalidates the same immutable state")
+        let retry_cancellation = AtomicBool::new(true);
+        let cancelled_retry = ModuleApplyPlan::ExactResultRetry(exact_retry_plan.clone())
+            .commit(committed.state(), Some(&retry_cancellation));
+        let Outcome::Inconclusive(inconclusive) = cancelled_retry else {
+            panic!("final retry cancellation must be a typed non-answer, got {cancelled_retry:?}");
+        };
+        assert!(matches!(
+            inconclusive.cause,
+            InconclusiveCause::Cancelled { ref at }
+                if at.text() == ModuleApplyCheckpoint::BeforePublication.to_string()
+        ));
+
+        let exact_retry = match completed(
+            ModuleApplyPlan::ExactResultRetry(exact_retry_plan).commit(committed.state(), None),
+            "exact retry must complete without cancellation",
+        )
+        .expect("exact retry revalidates the same immutable state")
         {
             ModuleApplyCommitResult::AlreadyApplied(retry) => retry,
             ModuleApplyCommitResult::Published(other) => {
@@ -2751,9 +2853,11 @@ mod tests {
             .add_decl((*checked.transaction().extra_declarations()[0]).clone())
             .expect("fixture extra declaration is unique");
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
-            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
-                plan.commit(&base).expect("base remains current")
-            }
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(&base, None),
+                "uncancelled partial application must complete",
+            )
+            .expect("base remains current"),
             Outcome::Complete(Ok(ModuleApplyPlan::ExactResultRetry(other))) => {
                 panic!("first partial application unexpectedly retried: {other:?}")
             }
@@ -2826,9 +2930,11 @@ mod tests {
             .add_decl((*checked.transaction().extra_declarations()[0]).clone())
             .expect("fixture extra declaration is unique");
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
-            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
-                plan.commit(&base).expect("base remains current")
-            }
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(&base, None),
+                "uncancelled unresolved-target application must complete",
+            )
+            .expect("base remains current"),
             other => panic!("expected a complete unresolved-target plan, got {other:?}"),
         };
         assert!(matches!(
@@ -2916,9 +3022,11 @@ mod tests {
             .add_decl((*checked.transaction().extra_declarations()[0]).clone())
             .expect("fixture extra declaration is unique");
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
-            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => {
-                plan.commit(&base).expect("base remains current")
-            }
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(&base, None),
+                "uncancelled opaque application must complete",
+            )
+            .expect("base remains current"),
             other => panic!("expected a complete opaque application plan, got {other:?}"),
         };
         assert!(matches!(
@@ -2991,10 +3099,12 @@ mod tests {
             .add_decl((*left_first.transaction().extra_declarations()[0]).clone())
             .expect("left extra declaration is unique");
         let after_left = match prepare_module_apply(&left_first, &base, &left_candidate) {
-            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
-                .commit(&base)
-                .expect("left base remains current")
-                .into_state(),
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(&base, None),
+                "uncancelled left application must complete",
+            )
+            .expect("left base remains current")
+            .into_state(),
             other => panic!("expected a prepared left application, got {other:?}"),
         };
         let right_after_left = preflight_module_apply(transaction_with_target(
@@ -3012,10 +3122,12 @@ mod tests {
             .expect("right extra declaration is unique");
         let final_left_then_right =
             match prepare_module_apply(&right_after_left, &after_left, &right_candidate) {
-                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
-                    .commit(&after_left)
-                    .expect("right-after-left base remains current")
-                    .into_state(),
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                    plan.commit(&after_left, None),
+                    "uncancelled right-after-left application must complete",
+                )
+                .expect("right-after-left base remains current")
+                .into_state(),
                 other => panic!("expected a prepared right-after-left application, got {other:?}"),
             };
 
@@ -3033,10 +3145,12 @@ mod tests {
             .add_decl((*right_first.transaction().extra_declarations()[0]).clone())
             .expect("right extra declaration is unique");
         let after_right = match prepare_module_apply(&right_first, &base, &right_candidate) {
-            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
-                .commit(&base)
-                .expect("right base remains current")
-                .into_state(),
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                plan.commit(&base, None),
+                "uncancelled right application must complete",
+            )
+            .expect("right base remains current")
+            .into_state(),
             other => panic!("expected a prepared right application, got {other:?}"),
         };
         let left_after_right = preflight_module_apply(transaction_with_target(
@@ -3054,10 +3168,12 @@ mod tests {
             .expect("left extra declaration is unique");
         let final_right_then_left =
             match prepare_module_apply(&left_after_right, &after_right, &left_candidate) {
-                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
-                    .commit(&after_right)
-                    .expect("left-after-right base remains current")
-                    .into_state(),
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                    plan.commit(&after_right, None),
+                    "uncancelled left-after-right application must complete",
+                )
+                .expect("left-after-right base remains current")
+                .into_state(),
                 other => panic!("expected a prepared left-after-right application, got {other:?}"),
             };
 
@@ -3188,20 +3304,25 @@ mod tests {
                     )
                 };
 
-            let published = winner_plan
-                .commit(&base)
-                .expect("the winning plan was prepared against the current base")
-                .into_state();
+            let published = completed(
+                winner_plan.commit(&base, None),
+                "uncancelled winning plan must complete",
+            )
+            .expect("the winning plan was prepared against the current base")
+            .into_state();
 
             // (1) The loser was prepared against a base that has since moved. It
             // must be REFUSED, by name, rather than publishing over the winner.
-            match loser_plan.commit(&published) {
-                Err(ModuleApplyCommitError::StaleBase) => {}
-                Ok(_) => panic!(
+            match loser_plan.commit(&published, None) {
+                Outcome::Complete(Err(ModuleApplyCommitError::StaleBase)) => {}
+                Outcome::Complete(Ok(_)) => panic!(
                     "the losing plan published against a base that had already moved; \
                      this is last-writer-wins, which the bead forbids"
                 ),
-                Err(other) => panic!("expected StaleBase for the losing plan, got {other:?}"),
+                Outcome::Complete(Err(other)) => {
+                    panic!("expected StaleBase for the losing plan, got {other:?}")
+                }
+                other => panic!("stale-base classification did not complete: {other:?}"),
             }
 
             // (2) Replaying the loser against the published state converges.
@@ -3219,10 +3340,12 @@ mod tests {
                 .add_decl((*replay.transaction().extra_declarations()[0]).clone())
                 .expect("replayed extra declaration is unique");
             match prepare_module_apply(&replay, &published, &candidate) {
-                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
-                    .commit(&published)
-                    .expect("replay base remains current")
-                    .into_state(),
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => completed(
+                    plan.commit(&published, None),
+                    "uncancelled replay must complete",
+                )
+                .expect("replay base remains current")
+                .into_state(),
                 other => panic!("expected a prepared replay application, got {other:?}"),
             }
         };
