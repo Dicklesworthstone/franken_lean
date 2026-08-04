@@ -1499,7 +1499,7 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
 #[test]
 fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
     let _g = lock();
-    use crate::export::{export_mi_free, export_mi_malloc_small};
+    use crate::export::{export_lean_alloc_small, export_lean_free_small};
 
     const CLASS_COUNT: usize = 512;
 
@@ -1525,6 +1525,7 @@ fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
             let senders = std::sync::Arc::clone(&senders);
             workers.push(std::thread::spawn(move || {
                 let before = crate::membrane::small_page_local_metrics_for_test();
+                crate::membrane::set_heartbeats(0);
                 for (class_index, size) in (8usize..=4096).step_by(8).enumerate() {
                     // One class at a time bounds the peak live-page footprint
                     // to `width`, while still forcing every exact class
@@ -1533,7 +1534,8 @@ fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
                     // class-varying stride keeps one incoming block per
                     // worker while covering more than one fixed neighbor.
                     round_start.wait();
-                    let block = export_mi_malloc_small(size);
+                    let size = u32::try_from(size).expect("small class fits c_uint");
+                    let block = export_lean_alloc_small(size, size / 8 - 1);
                     assert!(!block.is_null(), "class {size} allocation must succeed");
                     allocations_ready.wait();
                     let stride = if width == 1 {
@@ -1547,18 +1549,22 @@ fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
                     let foreign = receiver.recv().expect("ring predecessor is live");
                     let foreign =
                         core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(foreign);
-                    export_mi_free(foreign);
+                    export_lean_free_small(foreign);
                     crate::membrane::drain_small_bins_for_test();
                     round_finished.wait();
                 }
-                (before, crate::membrane::small_page_local_metrics_for_test())
+                (
+                    before,
+                    crate::membrane::small_page_local_metrics_for_test(),
+                    crate::membrane::get_num_heartbeats(),
+                )
             }));
         }
 
         let mut allocated_pages = 0;
         let mut reclaimed_pages = 0;
         for worker in workers {
-            let (before, after) = worker.join().expect("all-class ring handoff worker");
+            let (before, after, heartbeats) = worker.join().expect("all-class ring handoff worker");
             assert_eq!(
                 after.0,
                 before.0 + CLASS_COUNT,
@@ -1569,6 +1575,10 @@ fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
             // rather than the worker that drained the foreign free, so only
             // the matrix-wide sum is a stable semantic observation.
             reclaimed_pages += after.1 - before.1;
+            assert_eq!(
+                heartbeats, CLASS_COUNT as u64,
+                "width {width}: foreign freeing cannot lose, add, or share a semantic small-allocation heartbeat"
+            );
         }
         assert_eq!(
             allocated_pages,
