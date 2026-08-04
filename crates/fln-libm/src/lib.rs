@@ -186,6 +186,10 @@ pub fn sqrt(x: f64) -> f64 {
         return x;
     }
     let (fraction, exponent) = frexp(x);
+    let binary_exponent = exponent - 1;
+    if fraction == 0.5 && binary_exponent % 2 == 0 {
+        return scalbn(1.0, binary_exponent / 2);
+    }
     let (fraction, exponent) = if exponent & 1 == 0 {
         (fraction, exponent)
     } else {
@@ -944,6 +948,20 @@ mod tests {
             (2.0, 1024.0, f64::INFINITY),
         ] {
             same_bits(pow(base, exponent), expected);
+        }
+    }
+
+    #[test]
+    fn sqrt_powers_of_four_cover_binary64_boundaries_exactly() {
+        for (input, expected) in [
+            (f64::from_bits(1), scalbn(1.0, -537)),
+            (f64::MIN_POSITIVE, scalbn(1.0, -511)),
+            (0.25, 0.5),
+            (1.0, 1.0),
+            (4.0, 2.0),
+            (scalbn(1.0, 1022), scalbn(1.0, 511)),
+        ] {
+            same_bits(sqrt(input), expected);
         }
     }
 
