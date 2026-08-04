@@ -80,11 +80,7 @@ pub fn floor(x: f64) -> f64 {
         return x;
     }
     let t = trunc(x);
-    if x < 0.0 && t != x {
-        t - 1.0
-    } else {
-        t
-    }
+    if x < 0.0 && t != x { t - 1.0 } else { t }
 }
 
 /// Ceiling with exact signed-zero handling.
@@ -93,11 +89,7 @@ pub fn ceil(x: f64) -> f64 {
         return x;
     }
     let t = trunc(x);
-    if x > 0.0 && t != x {
-        t + 1.0
-    } else {
-        t
-    }
+    if x > 0.0 && t != x { t + 1.0 } else { t }
 }
 
 /// Round to nearest, with ties away from zero (Lean's `Float.round` rule).
@@ -310,11 +302,7 @@ pub fn atan(x: f64) -> f64 {
     } else {
         atan_kernel(a)
     };
-    if negative {
-        -result
-    } else {
-        result
-    }
+    if negative { -result } else { result }
 }
 
 /// Two-argument arctangent with IEEE signed-zero quadrant rules.
