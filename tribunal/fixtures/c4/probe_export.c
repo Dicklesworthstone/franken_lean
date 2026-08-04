@@ -26,6 +26,7 @@
  */
 
 #include <lean/lean.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -138,6 +139,47 @@ static lean_object *probe_corpus_six_seven(lean_object *u) {
 }
 static lean_object *probe_corpus_succ(lean_object *x) {
     return lean_box(lean_unbox(x) + 1);
+}
+
+/* One worker cell for the real generated-C allocator matrix below. The
+ * counter is thread-local in both runtimes, so each worker records its own
+ * terminal value and the parent only publishes the all-workers predicate. */
+struct heartbeat_worker_cell {
+    long long terminal_heartbeat;
+};
+
+static void *heartbeat_worker(void *opaque) {
+    struct heartbeat_worker_cell *cell = opaque;
+    lean_io_set_heartbeats(lean_uint64_to_nat(UINT64_MAX - 126));
+    for (unsigned size = 8; size < 1024; size += 8) {
+        lean_object *block = lean_alloc_small_object(size);
+        lean_free_small_object(block);
+    }
+    cell->terminal_heartbeat =
+        (long long)lean_unbox(lean_io_get_num_heartbeats());
+    return NULL;
+}
+
+static void run_heartbeat_thread_matrix(unsigned width) {
+    pthread_t threads[32];
+    struct heartbeat_worker_cell cells[32] = {0};
+    int all_wrapped = 1;
+
+    for (unsigned worker = 0; worker < width; worker++) {
+        if (pthread_create(&threads[worker], NULL, heartbeat_worker,
+                           &cells[worker]) != 0) {
+            lean_internal_panic("gauntlet heartbeat worker creation failed");
+        }
+    }
+    for (unsigned worker = 0; worker < width; worker++) {
+        if (pthread_join(threads[worker], NULL) != 0) {
+            lean_internal_panic("gauntlet heartbeat worker join failed");
+        }
+        if (cells[worker].terminal_heartbeat != 0) all_wrapped = 0;
+    }
+    char probe[64];
+    snprintf(probe, sizeof(probe), "heartbeat.inline_classes.width_%u_all_wrapped", width);
+    fact(probe, all_wrapped);
 }
 
 static void facts_mode(void) {
@@ -340,6 +382,15 @@ static void facts_mode(void) {
         lean_free_small_object(block);
     }
     fact("heartbeat.after_inline_mimalloc_classes_wrap", (long long)lean_unbox(lean_io_get_num_heartbeats()));
+
+    /* The Rust unit matrix proves every owned class through 4096. This
+     * generated-C differential independently binds the pin's active inline
+     * window (8..=1016) at the FL-INV-01 widths, with a per-worker near-wrap
+     * seed so a missing or doubled charge is observable without timestamps or
+     * scheduler order entering the fact stream. */
+    run_heartbeat_thread_matrix(1);
+    run_heartbeat_thread_matrix(8);
+    run_heartbeat_thread_matrix(32);
 
     /* ---- slice 3: Name equality (hash at scalar offset 16, prefix walk) */
     {
