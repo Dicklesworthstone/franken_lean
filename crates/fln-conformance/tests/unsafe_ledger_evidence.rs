@@ -373,7 +373,12 @@ const LANE_CITED_ROWS: usize = 1;
 /// 89 -> 90 in the read/write-prims slice (fln-3gv 5b, landed with this movement):
 /// FLN-UL-0320 cites the exact io_file roundtrip cell added with it; the slice's other
 /// six rows are prose.
-const SYMBOL_RESOLVED_ROWS: usize = 90;
+/// 90 -> 95 at `19d47080`: the broad FLN-UL-0202 bins row was retired and its four
+/// resolving citations were distributed across six exact owned-page unsafe-site rows
+/// (FLN-UL-0321 through 0326). Each replacement row retains at least one exact boundary
+/// test for its own bins/page lifecycle path, so this is a measured one-row-to-six-row
+/// refinement, not five prose rows silently gaining a resolving spelling.
+const SYMBOL_RESOLVED_ROWS: usize = 95;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -423,7 +428,19 @@ const SYMBOL_RESOLVED_ROWS: usize = 90;
 /// resolving token; no pre-existing row lost one across the edit.
 /// 101 -> 102 in the read/write-prims slice: FLN-UL-0320's io_file cell citation, again
 /// with no removal from any pre-existing row.
-const RESOLVING_CITATION_TOKENS: usize = 102;
+/// 102 -> 113 across the owned-page series: FLN-UL-0202 first gained the two page-lifecycle
+/// citations at `b22adfdf`, then the width-matrix citation at `e10428f0`; `19d47080` replaced
+/// that one broad row's four tokens with twelve site-specific tokens on FLN-UL-0321 through
+/// 0326. The one-to-many replacement is net +8, and every replacement token names the exact
+/// bins, page-allocation, page-block-release, page-owner-release, page-free, or block-release
+/// test for its ledgered unsafe site.
+/// 113 -> 119 at `cba2a1dc`: FLN-UL-0321 through 0326 each add
+/// `small_heap_pages_reclaim_across_every_size_class`, the test introduced by `2f688b0a`.
+/// It allocates, frees, and drains one block in every 8-byte class through 4096, then requires
+/// all 512 pages to be reclaimed. The six rows respectively name the bins, page construction,
+/// page block release, owner release, page free, and block-release paths that this exact
+/// all-class lifecycle covers; no pre-existing resolving token was removed in that refresh.
+const RESOLVING_CITATION_TOKENS: usize = 119;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -452,8 +469,8 @@ const PROSE_EVIDENCE_ROWS: usize = 226;
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 266 rows: 1 cites an e2e lane, 88 carry \
-symbol-resolved evidence, and 177 remain prose; 100 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 322 rows: 1 cites an e2e lane, 95 carry \
+symbol-resolved evidence, and 226 remain prose; 119 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
