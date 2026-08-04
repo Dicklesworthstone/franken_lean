@@ -14,7 +14,7 @@ use fln_hash::domain::{Digest, Domain, hash};
 use crate::constants::ConstantInfo;
 use crate::environment::{DeclarationDeltaError, Environment};
 use crate::extensions::ExtensionDescriptor;
-use crate::modules::{ModuleGraph, ModuleId};
+use crate::modules::{ArtifactEvidence, ModuleGraph, ModuleId};
 use crate::provenance::{
     DeclarationClass, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
     ModuleProvenanceIndexes, ModuleProvenanceManifest, ModuleProvenanceRoot,
@@ -850,6 +850,11 @@ pub enum ModuleApplyPrepareError {
     ExistingModule {
         module: ModuleId,
     },
+    ArtifactReplacementConflict {
+        module: ModuleId,
+        existing_artifact: Box<ArtifactEvidence>,
+        incoming_artifact: Box<ArtifactEvidence>,
+    },
     TargetEpoch {
         base: crate::modules::ModuleEpoch,
         target: crate::modules::ModuleEpoch,
@@ -890,7 +895,14 @@ pub fn prepare_module_apply_candidate(
     let contribution = transaction.contribution();
     let module = contribution.module().id.clone();
     let target = transaction.manifest();
-    if base.manifest().record(&module).is_some() {
+    if let Some(existing) = base.manifest().record(&module) {
+        if existing.module().artifact != contribution.module().artifact {
+            return Outcome::complete(Err(ModuleApplyPrepareError::ArtifactReplacementConflict {
+                module,
+                existing_artifact: Box::new(existing.module().artifact.clone()),
+                incoming_artifact: Box::new(contribution.module().artifact.clone()),
+            }));
+        }
         return Outcome::complete(Err(ModuleApplyPrepareError::ExistingModule { module }));
     }
     if base.manifest().epoch() != target.epoch() {
@@ -2219,6 +2231,35 @@ mod tests {
             committed.state().manifest().root()
         );
 
+        let mut replacement_module = contribution.module().clone();
+        replacement_module.artifact.content_digest = Digest([8; 32]);
+        let replacement = ModuleContributionRecord::new(
+            replacement_module,
+            contribution.declarations().to_vec(),
+            contribution.extra_declarations().to_vec(),
+            contribution.extension_contributions().to_vec(),
+            contribution.completeness().clone(),
+        );
+        let replacement_preflight = preflight_module_apply(transaction(
+            replacement,
+            checked.transaction().extension_payloads().to_vec(),
+        ))
+        .expect("replacement fixture binds its own canonical manifest");
+        assert!(matches!(
+            prepare_module_apply(
+                &replacement_preflight,
+                committed.state(),
+                committed.state().environment(),
+            ),
+            Outcome::Complete(Err(ModuleApplyPrepareError::ArtifactReplacementConflict {
+                existing_artifact,
+                incoming_artifact,
+                ..
+            })) if existing_artifact.content_digest == contribution.module().artifact.content_digest
+                && incoming_artifact.content_digest == Digest([8; 32])
+        ));
+        assert_eq!(committed.state().graph().len(), 1);
+
         let altered_declaration = match checked.transaction().declarations()[0].as_ref() {
             ConstantInfo::Axiom(axiom) => {
                 let mut altered = axiom.clone();
@@ -2229,7 +2270,7 @@ mod tests {
         };
         let altered = preflight_module_apply(ModuleApplyTransaction::new(
             Arc::clone(&checked.transaction().manifest),
-            contribution,
+            contribution.clone(),
             vec![altered_declaration],
             checked.transaction().extra_declarations().to_vec(),
             checked.transaction().extension_payloads().to_vec(),
