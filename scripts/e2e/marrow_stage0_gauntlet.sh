@@ -499,5 +499,46 @@ if [ "$real_sha_before_m4" != "$real_sha_after_m4" ]; then
 fi
 emit mutant_drill passed "\"mutant\":\"fln-8w8-M4\",\"discriminator\":\"heartbeat.after_small_ctor\",\"real_tree_sha_stable\":true"
 
+# ---- lane 8e: named mutant fln-8w8-M5 ----------------------------------------
+# The paired fuel-parity perturbation: double the same exported increment in
+# a FIFTH isolated copy. The real generated-C constructor observation must
+# become two, proving the differential distinguishes both sides of the exact
+# one-tick law rather than merely a missing update.
+note "lane 8e: mutant drill fln-8w8-M5 (lean_inc_heartbeat double charge in a copy)"
+MUT5_WS="$ART_DIR/mutant-ws-m5"
+mkdir -p "$MUT5_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT5_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT5_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT5_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT5_WS/"
+printf '\n[workspace]\n' >>"$MUT5_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m5=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if ! sed -i 's|membrane::add_heartbeats(1);|membrane::add_heartbeats(2); // fln-8w8-M5: heartbeat double charged|' "$MUT5_WS/fln-unsafe-abi/src/export.rs" \
+    || ! grep -q "fln-8w8-M5: heartbeat double charged" "$MUT5_WS/fln-unsafe-abi/src/export.rs"; then
+    fail mutant_plant_m5 "\"detail\":\"mutation did not apply to the copy\""
+fi
+if ! (cd "$MUT5_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT5_WS/target" cargo rustc --offline -q --crate-type staticlib --release) >"$ART_DIR/mutant5_build.log" 2>&1; then
+    fail mutant_build_m5 "\"artifact\":\"mutant5_build.log\""
+fi
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$MUT5_WS/target/release/libfln_unsafe_abi.a" -lpthread -ldl -lm \
+    -o "$ART_DIR/probe_mutant5" >"$ART_DIR/gcc_mutant5.log" 2>&1; then
+    fail mutant_link_m5 "\"artifact\":\"gcc_mutant5.log\""
+fi
+set +e
+timeout 120 "$ART_DIR/probe_mutant5" >"$ART_DIR/facts_mutant5.ndjson" 2>"$ART_DIR/probe_mutant5.err"
+set -e
+if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant5.ndjson" >/dev/null 2>&1; then
+    fail mutant_drill_m5 "\"detail\":\"fln-8w8-M5 SURVIVED — the gauntlet does not discriminate doubled heartbeat charging\""
+fi
+if ! grep -q '"probe":"heartbeat.after_small_ctor","value":2' "$ART_DIR/facts_mutant5.ndjson"; then
+    fail mutant_drill_m5 "\"detail\":\"mutant diverged but not on the designed heartbeat discriminator\",\"artifact\":\"facts_mutant5.ndjson\""
+fi
+real_sha_after_m5=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m5" != "$real_sha_after_m5" ]; then
+    fail mutant_isolation_m5 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"fln-8w8-M5\",\"discriminator\":\"heartbeat.after_small_ctor\",\"real_tree_sha_stable\":true"
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
