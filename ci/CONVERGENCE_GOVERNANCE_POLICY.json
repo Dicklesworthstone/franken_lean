@@ -32,6 +32,7 @@
     {"id": "fln-private-index-worktree-sync-mbh9", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-d3-safety-note-unenforced-cdbg", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-convergence-wip-governance-149", "class": "verification", "workstream": "W1", "gate": "G0"},
+    {"id": "franken_lean-smk0", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-manifest-complete-row-preflight-gap-77xh", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-census-empty-referent-no-mock-krb0", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-cross-tree-baked-root-k60n", "class": "verification", "workstream": "W1", "gate": "G0"},

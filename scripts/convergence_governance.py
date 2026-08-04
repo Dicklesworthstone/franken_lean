@@ -432,6 +432,7 @@ def next_unblocking_actions(selected, held, earliest):
     """Turn a read-only admission decision into bounded, non-mutating operator actions."""
     held_actions = {
         "dependency-blocked": "complete-blocking-dependencies",
+        "tracker-blocked": "resolve-tracker-block",
         "incident-reservation-exhausted": "obtain-reviewed-incident-exception",
         "verification-reservation-exhausted": "wait-for-verification-reservation",
         "held-over-cap": "reduce-active-workstreams-to-cap",
@@ -493,6 +494,10 @@ def decide(policy, snapshot, now):
         if issue["status"] == "in_progress":
             common["reason"] = "already-active"
             selected.append(common)
+            continue
+        if issue["status"] == "blocked":
+            common["reason"] = "tracker-blocked"
+            held.append(common)
             continue
         if blockers:
             common["reason"] = "dependency-blocked"
@@ -658,6 +663,16 @@ def self_test():
         raise AssertionError("selected work was not given a non-mutating claim action")
     if actions.get("blocked", {}).get("blockers") != ["root"]:
         raise AssertionError("blocked work did not retain exact next unblocking dependencies")
+    explicitly_blocked = copy.deepcopy(first)
+    explicitly_blocked["issues"] = [
+        {**issue, "status": "blocked"} if issue["id"] == "ready" else issue
+        for issue in explicitly_blocked["issues"]
+    ]
+    explicit_decision = decide(policy, explicitly_blocked, now)
+    explicit_held = {row["id"]: row["reason"] for row in explicit_decision["held"]}
+    explicit_actions = {row["id"]: row["action"] for row in explicit_decision["next_unblocking_actions"]}
+    if explicit_held.get("ready") != "tracker-blocked" or explicit_actions.get("ready") != "resolve-tracker-block":
+        raise AssertionError("explicit tracker block was treated as admission permission")
     transitive = decide(
         policy,
         normalize_snapshot(
@@ -932,7 +947,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 28 named model/mutation cells passed"
+    return "convergence-governance self-test: 29 named model/mutation cells passed"
 
 
 def main(argv):
