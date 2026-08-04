@@ -110,4 +110,9 @@ pub const KERNEL_OWNERSHIP_CANDIDATE_FILE: &str = "ci/KERNEL_CONTRACT_OWNERSHIP.
 /// `/5` adds terminal `data_grade` and `unestablished` fields (bead
 /// `fln-census-empty-referent-no-mock-krb0`). They distinguish an audited handoff root from
 /// an audit that established no evidence without promoting the latter to a failure.
-pub const NDJSON_SCHEMA: &str = "structure-guard/5";
+///
+/// `/6` adds terminal `line_count_covenants` (bead
+/// `franken_lean-kernel-loc-covenant-not-disclosed-t0g7`). The enforcing walk already carries
+/// each `count_loc` result; publishing that one value with its reviewed limit and derived
+/// headroom makes the covenant a machine-readable gauge rather than a human-only wall.
+pub const NDJSON_SCHEMA: &str = "structure-guard/6";

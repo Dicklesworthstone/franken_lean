@@ -136,13 +136,10 @@ fn json_string_array(values: &[String]) -> String {
 /// bead (`franken_lean-kernel-loc-covenant-not-disclosed-t0g7`). Tenths of a percent, so a
 /// trend is readable without putting a float in an evidence record.
 ///
-/// **This belongs in the robot `run_end` line and is not there yet.** `structure-guard/5`
-/// was consumed by the independently required `data_grade` and `unestablished` exact-key-set
-/// change (bead `fln-census-empty-referent-no-mock-krb0`). Adding
-/// `line_count_covenants` now requires `/6`, moving the producer, validator, shell contracts,
-/// and fixtures together. The human log is sealed into every bundle
-/// (`terminal_human_log_is_sealed_before_manifest_generation`), so the number is disclosed
-/// and citable today; it is not yet machine-parseable, and no row may claim that it is.
+/// The same facts are emitted as `line_count_covenants` in the robot `run_end` line. The
+/// versioned robot contract binds the producer, its evidence validator, shell contracts, and
+/// fixtures together, so an omission cannot silently turn a machine-readable gauge back into a
+/// human-only wall.
 fn covenant_human_line(covenants: &[crate::checks::CovenantFact]) -> String {
     if covenants.is_empty() {
         // Not "no covenants" — this walk declares at least fln-kernel, so an empty set is a
@@ -167,6 +164,29 @@ fn covenant_human_line(covenants: &[crate::checks::CovenantFact]) -> String {
         ));
     }
     out
+}
+
+/// Render the measured covenants as one terminal robot field.
+///
+/// This reads the facts already carried out of the enforcing walk. `headroom` is derived here
+/// from the same fact rather than counted again: an over-limit crate emits zero headroom and its
+/// finding remains the enforcement verdict. The evidence consumer checks that relation, so a
+/// transcribed number cannot become an independent, drifting producer.
+fn line_count_covenants_json(covenants: &[crate::checks::CovenantFact]) -> String {
+    let rows = covenants
+        .iter()
+        .map(|fact| {
+            format!(
+                "{{\"crate_name\":\"{}\",\"loc\":{},\"limit\":{},\"headroom\":{}}}",
+                json_escape(&fact.crate_name),
+                fact.loc,
+                fact.limit,
+                fact.headroom(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{rows}]")
 }
 
 pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128) -> String {
@@ -199,7 +219,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
     ));
     lines.extend(outcome.findings.iter().map(finding_ndjson));
     lines.push(format!(
-        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"mode_closure\":{},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
+        "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"{}\",\"exit_code\":{},\"findings\":{},\"authority\":\"{}\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":{},\"traversal\":{{\"directories_visited\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped_unreadable\":{}}},\"mode_closure\":{},\"line_count_covenants\":{},\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":{},\"governed_root_before\":\"fnv1a64:{:016x}\",\"governed_root_after\":\"fnv1a64:{:016x}\",\"governed_root_unchanged\":{},\"duration_ms\":{duration_ms}}}",
         outcome.verdict(),
         outcome.exit_code(),
         outcome.findings.len(),
@@ -212,6 +232,7 @@ pub fn render_ndjson(root_display: &str, outcome: &RunOutcome, duration_ms: u128
         outcome.traversal.files_scanned,
         outcome.traversal.files_skipped_unreadable,
         mode_closure_json(&outcome.mode_closure),
+        line_count_covenants_json(&outcome.covenants),
         outcome.traversal.count_rule_holds(),
         outcome.governed_root_before,
         outcome.governed_root_after,
@@ -226,7 +247,7 @@ pub fn render_setup_failure_ndjson(root_display: &str, error: &str, duration_ms:
     let subject = TerminalSubject::NotStarted;
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"line_count_covenants\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"setup_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         subject.data_grade(),
         json_string_array(&subject.unestablished()),
@@ -240,7 +261,7 @@ pub fn render_cli_failure_ndjson(root_display: &str, error: &str, duration_ms: u
     let subject = TerminalSubject::NotStarted;
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":\"{}\",\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"setup_error\",\"exit_code\":2,\"findings\":0,\"authority\":\"not_established\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"line_count_covenants\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"cli_parse_failure\",\"detail\":\"{}\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(root_display),
         subject.data_grade(),
         json_string_array(&subject.unestablished()),
@@ -255,7 +276,7 @@ pub fn render_help_ndjson(usage: &str, duration_ms: u128) -> String {
     format!(
         "{{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_start\",\"root\":null,\"root_identity\":null,\"graph_digest\":null,\"crates\":null,\"edges\":null,\"authority_inventory\":null,\"effective_compiler_identity\":null,\"admitted_environment\":null}}\n\
          {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"help\",\"usage\":\"{}\"}}\n\
-         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
+         {{\"schema\":\"{NDJSON_SCHEMA}\",\"event\":\"run_end\",\"verdict\":\"pass\",\"exit_code\":0,\"findings\":0,\"authority\":\"not_applicable\",\"data_grade\":\"{}\",\"unestablished\":{},\"contract_handoff_root\":null,\"traversal\":null,\"mode_closure\":null,\"line_count_covenants\":null,\"authority_count_rule\":\"{AUTHORITY_COUNT_RULE}\",\"authority_count_rule_holds\":false,\"governed_root_before\":null,\"governed_root_after\":null,\"governed_root_unchanged\":false,\"reason_code\":\"help_requested\",\"duration_ms\":{duration_ms}}}\n",
         json_escape(usage),
         subject.data_grade(),
         json_string_array(&subject.unestablished()),
@@ -316,6 +337,26 @@ mod tests {
     }
 
     #[test]
+    fn robot_covenant_facts_carry_the_measured_value_and_derived_headroom() {
+        let facts = [
+            crate::checks::CovenantFact {
+                crate_name: "fln-kernel".to_string(),
+                loc: 6_112,
+                limit: 12_000,
+            },
+            crate::checks::CovenantFact {
+                crate_name: "fln-over-limit".to_string(),
+                loc: 12_001,
+                limit: 12_000,
+            },
+        ];
+        assert_eq!(
+            line_count_covenants_json(&facts),
+            "[{\"crate_name\":\"fln-kernel\",\"loc\":6112,\"limit\":12000,\"headroom\":5888},{\"crate_name\":\"fln-over-limit\",\"loc\":12001,\"limit\":12000,\"headroom\":0}]"
+        );
+    }
+
+    #[test]
     fn robot_setup_failure_is_terminal_and_escaped() {
         let rendered = render_setup_failure_ndjson("a\"b", "bad\nroot", 7);
         let lines: Vec<_> = rendered.lines().collect();
@@ -325,6 +366,7 @@ mod tests {
         assert!(lines[1].contains("\"exit_code\":2"));
         assert!(lines[1].contains("\"data_grade\":\"not_established\""));
         assert!(lines[1].contains("\"unestablished\":[]"));
+        assert!(lines[1].contains("\"line_count_covenants\":null"));
         assert!(lines[1].contains("bad\\nroot"));
     }
 
@@ -338,6 +380,7 @@ mod tests {
         assert!(lines[1].contains("\"exit_code\":2"));
         assert!(lines[1].contains("\"data_grade\":\"not_established\""));
         assert!(lines[1].contains("\"unestablished\":[]"));
+        assert!(lines[1].contains("\"line_count_covenants\":null"));
     }
 
     #[test]
@@ -353,5 +396,6 @@ mod tests {
         assert!(lines[2].contains("\"exit_code\":0"));
         assert!(lines[2].contains("\"data_grade\":\"not_applicable\""));
         assert!(lines[2].contains("\"unestablished\":[]"));
+        assert!(lines[2].contains("\"line_count_covenants\":null"));
     }
 }

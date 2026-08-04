@@ -31,7 +31,7 @@ const USAGE: &str = "usage: structure-guard [--root <path>] [--robot]\n\
        structure-guard --publish-contract-handoff [--root <path>] [--robot]\n\
        structure-guard --recover-contract-handoff [--root <path>] [--robot]\n\
   --root <path>  workspace root to check (default: current directory)\n\
-  --robot        NDJSON output (schema structure-guard/5) on stdout\n\
+  --robot        NDJSON output (schema structure-guard/6) on stdout\n\
   --publish-contract-inventory  validate, sync, and atomically publish a candidate\n\
   --recover-contract-inventory  validate and atomically promote a leftover candidate\n\
   --publish-contract-handoff  validate every rendered contract output and atomically publish their join\n\

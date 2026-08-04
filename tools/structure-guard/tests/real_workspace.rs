@@ -36,10 +36,9 @@ fn assert_versioned_robot_lines(stdout: &str, expected_lines: usize) {
         "robot mode emitted human output: {stdout}"
     );
     // Bound to the const the producer actually emits, never transcribed. A transcribed
-    // version is a second copy of the answer, and the pending `/5` bump (bead
-    // `fln-census-empty-referent-no-mock-krb0` for `data_grade`, `t0g7` for
-    // `line_count_covenants`) would have had to remember this line to stay green — which is
-    // how a test starts asserting a version the tool stopped emitting.
+    // version is a second copy of the answer. This binds to the producer constant, so the
+    // t0g7 `line_count_covenants` schema move cannot leave this test asserting an obsolete
+    // stream shape.
     let needle = format!("\"schema\":\"{}\"", structure_guard::NDJSON_SCHEMA);
     assert!(
         lines.iter().all(|line| line.contains(&needle)),
@@ -966,7 +965,7 @@ fn the_admission_tripwire_names_what_the_kernel_actually_exports() {
 fn judge_covenant_disclosure(
     declared: &std::collections::BTreeMap<String, usize>,
     measured: &[structure_guard::checks::CovenantFact],
-    human: &str,
+    robot: &str,
 ) -> Result<(), String> {
     // (0) An empty measurement is a counter that stopped counting, not a crate with no
     // covenant: the walk declares at least `fln-kernel`.
@@ -975,6 +974,9 @@ fn judge_covenant_disclosure(
     }
     if declared.is_empty() {
         return Err("no-covenant-declared".to_owned());
+    }
+    if !robot.contains("\"line_count_covenants\":[") {
+        return Err("robot-disclosure-missing-covenant-field".to_owned());
     }
     // (1)/(2) Equality both ways between what the graph DECLARES and what the walk MEASURED.
     // A declared covenant the walk skipped is a cap nobody is enforcing; a measured one
@@ -1009,8 +1011,8 @@ fn judge_covenant_disclosure(
         // (5) The disclosure must carry the measured number. This is the join the bead is
         // about: the value is walked on every run, and until now it was thrown away unless
         // it exceeded the limit.
-        if !human.contains(&format!(
-            "line-count-covenant {} loc={} max-loc={} headroom={}",
+        if !robot.contains(&format!(
+            "\"crate_name\":\"{}\",\"loc\":{},\"limit\":{},\"headroom\":{}",
             fact.crate_name,
             fact.loc,
             fact.limit,
@@ -1048,9 +1050,8 @@ fn judge_covenant_disclosure(
 /// this test must not be read as evidence about kernel size — `fln-8zsq` and
 /// `franken_lean-2ki4` both closed on a disclosure and bought nothing about the thing
 /// disclosed. It buys exactly two things: the correct number is now reachable, and its
-/// movement is now visible. The value is in the sealed human log and **not** in the robot
-/// NDJSON. `structure-guard/5` is now occupied by the independent krb0 data-grade contract,
-/// so adding `line_count_covenants` requires `/6` and the same exact-key consumer move.
+/// movement is now visible in the versioned robot NDJSON. The exact-key consumer and its
+/// mutation suite make omission, malformed arithmetic, or a duplicated crate a refusal.
 #[test]
 fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
     let root = fln_conformance::checked_workspace_root!();
@@ -1060,9 +1061,9 @@ fn the_line_count_covenant_is_disclosed_by_the_walk_that_enforces_it() {
     let declared = structure_guard::graph::parse(&graph_text)
         .expect("the reviewed workspace graph must parse")
         .covenants;
-    let human = structure_guard::report::render_human(&root.display().to_string(), &outcome);
+    let robot = structure_guard::report::render_ndjson(&root.display().to_string(), &outcome, 1);
 
-    if let Err(reason) = judge_covenant_disclosure(&declared, &outcome.covenants, &human) {
+    if let Err(reason) = judge_covenant_disclosure(&declared, &outcome.covenants, &robot) {
         panic!(
             "the line-count covenant is not disclosed by the walk that enforces it ({reason}). \
              A covenant whose number is invisible is a wall, not a gauge, and the last time it \
@@ -1085,12 +1086,12 @@ fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
     let declared = structure_guard::graph::parse(&graph_text)
         .expect("the reviewed workspace graph must parse")
         .covenants;
-    let human = structure_guard::report::render_human(&root.display().to_string(), &outcome);
+    let robot = structure_guard::report::render_ndjson(&root.display().to_string(), &outcome, 1);
     let measured = outcome.covenants.clone();
 
     // The unmutated control, judged first, or every mutant below dies on a broken baseline.
     assert_eq!(
-        judge_covenant_disclosure(&declared, &measured, &human),
+        judge_covenant_disclosure(&declared, &measured, &robot),
         Ok(()),
         "the unmutated covenant disclosure must hold. declared={declared:?} measured={measured:?}"
     );
@@ -1102,7 +1103,7 @@ fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
         m
     };
 
-    // (mutant, declared, measured, human, expected reason) — one gut each.
+    // (mutant, declared, measured, robot, expected reason) — one gut each.
     let cases: Vec<(
         &str,
         _,
@@ -1114,21 +1115,21 @@ fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
             "counter-returned-nothing",
             declared.clone(),
             Vec::new(),
-            human.clone(),
+            robot.clone(),
             "no-covenant-measured".to_owned(),
         ),
         (
             "counter-returned-zero-lines",
             declared.clone(),
             with(|c| c.loc = 0),
-            human.clone(),
+            robot.clone(),
             format!("covenant-counted-zero:{}", first.crate_name),
         ),
         (
             "declared-limit-vanished",
             declared.clone(),
             with(|c| c.limit = 0),
-            human.clone(),
+            robot.clone(),
             format!(
                 "limit-disagrees-with-declaration:{}:0-vs-{}",
                 first.crate_name, first.limit
@@ -1142,43 +1143,46 @@ fn the_covenant_disclosure_guard_kills_each_mutation_it_claims_to() {
                 d
             },
             measured.clone(),
-            human.clone(),
+            robot.clone(),
             "declared-covenant-not-measured:fln-checker".to_owned(),
         ),
         (
             "a-cap-nobody-reviewed",
             std::collections::BTreeMap::new(),
             measured.clone(),
-            human.clone(),
+            robot.clone(),
             "no-covenant-declared".to_owned(),
         ),
         (
             "disclosure-dropped-the-number",
             declared.clone(),
             measured.clone(),
-            human.replace("line-count-covenant", "line-count-covenant-suppressed"),
-            format!("disclosure-omits-measurement:{}", first.crate_name),
+            robot.replace(
+                "\"line_count_covenants\"",
+                "\"suppressed_line_count_covenants\"",
+            ),
+            "robot-disclosure-missing-covenant-field".to_owned(),
         ),
         (
             "disclosure-shows-a-different-number",
             declared.clone(),
             measured.clone(),
-            human.replace(
-                &format!("loc={}", first.loc),
-                &format!("loc={}", first.loc + 1),
+            robot.replace(
+                &format!("\"loc\":{}", first.loc),
+                &format!("\"loc\":{}", first.loc + 1),
             ),
             format!("disclosure-omits-measurement:{}", first.crate_name),
         ),
     ];
 
-    for (name, m_declared, m_measured, m_human, expected) in &cases {
-        let moved = *m_declared != declared || *m_measured != measured || *m_human != human;
+    for (name, m_declared, m_measured, m_robot, expected) in &cases {
+        let moved = *m_declared != declared || *m_measured != measured || *m_robot != robot;
         assert!(
             moved,
             "mutant {name} is identical to the unmutated base, so it did not apply and \
              scoring it proves nothing"
         );
-        let verdict = judge_covenant_disclosure(m_declared, m_measured, m_human);
+        let verdict = judge_covenant_disclosure(m_declared, m_measured, m_robot);
         assert_eq!(
             verdict.as_ref().map_err(String::as_str),
             Err(expected.as_str()),
