@@ -2,7 +2,9 @@
 
 use std::process::Command;
 
-use fln_checker::defeq::{DefEqBudget, DefEqStop, QuickDefEqBudget, QuickDefEqStop};
+use fln_checker::defeq::{
+    DefEqBudget, DefEqOutcome, DefEqStop, QuickDefEqBudget, QuickDefEqStop, def_eq,
+};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
@@ -10,10 +12,10 @@ use fln_checker::environment::{
 use fln_checker::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
     InferenceLimit, InferenceMode, InferenceOutcome, InferencePhase, InferenceRefusal,
-    InferenceResult, InferenceStop, LocalDeclaration, infer, infer_with,
+    InferenceResult, InferenceSortSite, InferenceStop, LocalDeclaration, infer, infer_with,
 };
 use fln_checker::term::{TermBudget, TermLimit, TermStop};
-use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfStop};
+use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfContext, WhnfStop};
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, ExprNode, LevelId, LevelNode, WireExpr, WireName, decode_expr,
     decode_name,
@@ -621,15 +623,6 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
     let sort_zero = Expr::sort(Level::zero());
     let cases = vec![
         (
-            Expr::forall_e(
-                Name::anonymous(),
-                sort_zero.clone(),
-                sort_zero.clone(),
-                BinderInfo::Implicit,
-            ),
-            InferenceDeferred::Forall,
-        ),
-        (
             Expr::let_e(
                 Name::anonymous(),
                 sort_zero.clone(),
@@ -669,6 +662,301 @@ fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requi
             ));
         }
     }
+}
+
+#[test]
+fn forall_telescope_infers_dependent_imax_in_both_modes_and_ignores_binder_style() {
+    let universe_name = primary_name("u");
+    let universe = Level::param(universe_name.clone());
+    let expected = LevelModel::IMax(
+        Box::new(LevelModel::Succ(Box::new(LevelModel::Parameter(
+            checker_name("u"),
+        )))),
+        Box::new(LevelModel::IMax(
+            Box::new(LevelModel::Parameter(checker_name("u"))),
+            Box::new(LevelModel::Parameter(checker_name("u"))),
+        )),
+    );
+    let context = built_context(Vec::new(), vec![checker_name("u")], Vec::new());
+    let modes = [
+        InferenceMode::InferOnly,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+    ];
+    let styles = [
+        BinderInfo::Default,
+        BinderInfo::Implicit,
+        BinderInfo::StrictImplicit,
+        BinderInfo::InstImplicit,
+    ];
+
+    for style in styles {
+        let forall = Expr::forall_e(
+            primary_name("A"),
+            Expr::sort(universe.clone()),
+            Expr::forall_e(
+                primary_name("x"),
+                Expr::bvar(0).expect("outer Forall binder"),
+                Expr::bvar(1).expect("outer Forall binder under x"),
+                style,
+            ),
+            style,
+        );
+        for mode in modes {
+            let result = complete(infer(
+                &decoded(&forall),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(sort_model(&result.type_), expected);
+            assert_eq!(result.progress.forall_telescope_nodes, 2);
+            assert_eq!(result.progress.forall_binders, 2);
+            assert_eq!(result.progress.forall_domain_queries, 2);
+            assert_eq!(result.progress.forall_body_queries, 1);
+            assert_eq!(result.progress.forall_sort_checks, 3);
+            assert_eq!(result.progress.forall_imax_nodes, 2);
+            assert_eq!(result.progress.lambda_binders, 0);
+        }
+    }
+}
+
+#[test]
+fn forall_prop_impredicativity_uses_the_checker_universe_relation() {
+    let prop = Expr::sort(Level::zero());
+    let forall = Expr::forall_e(
+        primary_name("p"),
+        prop.clone(),
+        Expr::bvar(0).expect("Forall proposition binder"),
+        BinderInfo::Default,
+    );
+    let result = complete(infer(
+        &decoded(&forall),
+        &InferenceContext::empty(ConstantEnvironment::empty()),
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        sort_model(&result.type_),
+        LevelModel::IMax(
+            Box::new(LevelModel::Succ(Box::new(LevelModel::Zero))),
+            Box::new(LevelModel::Zero),
+        )
+    );
+    assert!(matches!(
+        def_eq(
+            &result.type_,
+            &decoded(&prop),
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+}
+
+#[test]
+fn forall_domain_and_codomain_sort_validation_is_mode_exact_and_reducible() {
+    let prop = Expr::sort(Level::zero());
+    let type_one = Expr::sort(Level::one());
+    let a = Expr::fvar(FVarId(primary_name("A")));
+    let datum = Expr::fvar(FVarId(primary_name("datum")));
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&prop)),
+            LocalDeclaration::assumption(checker_name("datum"), decoded(&a)),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let bad_domain = Expr::forall_e(
+        primary_name("x"),
+        datum.clone(),
+        a.clone(),
+        BinderInfo::Default,
+    );
+    let bad_codomain = Expr::forall_e(primary_name("x"), a, datum, BinderInfo::Default);
+    let modes = [
+        InferenceMode::InferOnly,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+    ];
+    for mode in modes {
+        assert!(matches!(
+            infer(
+                &decoded(&bad_domain),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::SortExpected {
+                    site: InferenceSortSite::ForallBinder { binder: 0 },
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            infer(
+                &decoded(&bad_codomain),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::SortExpected {
+                    site: InferenceSortSite::ForallCodomain { binders: 1 },
+                },
+                ..
+            }
+        ));
+    }
+
+    let sort_alias = Expr::const_(primary_name("SortAlias"), Vec::new());
+    let domain = Expr::const_(primary_name("T"), Vec::new());
+    let codomain = Expr::const_(primary_name("U"), Vec::new());
+    let reducible_context = built_context(
+        Vec::new(),
+        Vec::new(),
+        vec![
+            definition_with_body(
+                "SortAlias",
+                decoded(&type_one),
+                decoded(&prop),
+                ConstantSafety::Safe,
+                DefinitionSafety::Safe,
+                0,
+            ),
+            header(
+                "T",
+                Vec::new(),
+                decoded(&sort_alias),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+            header(
+                "U",
+                Vec::new(),
+                decoded(&sort_alias),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ],
+    );
+    let reducible = Expr::forall_e(primary_name("x"), domain, codomain, BinderInfo::Default);
+    let result = complete(infer(
+        &decoded(&reducible),
+        &reducible_context,
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        sort_model(&result.type_),
+        LevelModel::IMax(Box::new(LevelModel::Zero), Box::new(LevelModel::Zero))
+    );
+    assert_eq!(result.progress.forall_sort_checks, 2);
+    assert_eq!(result.progress.whnf_queries, 2);
+}
+
+#[test]
+fn forall_locals_avoid_context_and_constant_free_names_with_repeated_display_names() {
+    let (candidate_zero, candidate_zero_wire) = checker_local_candidate(0);
+    let (candidate_one, _) = checker_local_candidate(1);
+    let prop = Expr::sort(Level::zero());
+    let type_one = Expr::sort(Level::one());
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            candidate_zero_wire,
+            decoded(&prop),
+        )],
+        Vec::new(),
+        vec![header(
+            "CarriesFreeName",
+            Vec::new(),
+            decoded(&Expr::fvar(FVarId(candidate_one))),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        )],
+    );
+    let repeated = primary_name("same");
+    let forall = Expr::forall_e(
+        repeated.clone(),
+        type_one,
+        Expr::forall_e(
+            repeated,
+            Expr::bvar(0).expect("outer repeated-name Forall binder"),
+            Expr::bvar(1).expect("outer repeated-name binder below inner Forall"),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Default,
+    );
+    let result = complete(infer(
+        &decoded(&forall),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        sort_model(&result.type_),
+        LevelModel::IMax(
+            Box::new(LevelModel::Succ(Box::new(LevelModel::Succ(Box::new(
+                LevelModel::Zero,
+            ))))),
+            Box::new(LevelModel::IMax(
+                Box::new(LevelModel::Succ(Box::new(LevelModel::Zero))),
+                Box::new(LevelModel::Succ(Box::new(LevelModel::Zero))),
+            )),
+        )
+    );
+    assert!(result.progress.local_identity_candidates >= 4);
+    assert_eq!(result.progress.forall_binders, 2);
+}
+
+#[test]
+fn forall_composes_inside_lambda_and_application_continuations() {
+    let prop = Expr::sort(Level::zero());
+    let proposition = Expr::forall_e(
+        primary_name("p"),
+        prop.clone(),
+        Expr::bvar(0).expect("proposition Forall binder"),
+        BinderInfo::Default,
+    );
+    let identity = Expr::lam(
+        primary_name("Q"),
+        prop.clone(),
+        Expr::bvar(0).expect("proposition identity binder"),
+        BinderInfo::Default,
+    );
+    let nested = Expr::lam(
+        primary_name("unused"),
+        prop.clone(),
+        Expr::app(identity, proposition),
+        BinderInfo::Implicit,
+    );
+    let result = complete(infer(
+        &decoded(&nested),
+        &InferenceContext::empty(ConstantEnvironment::empty()),
+        InferenceMode::Checking {
+            declaration_safety: ConstantSafety::Safe,
+        },
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(
+        result.type_,
+        decoded(&Expr::forall_e(
+            primary_name("unused"),
+            prop.clone(),
+            prop,
+            BinderInfo::Implicit,
+        ))
+    );
+    assert_eq!(result.progress.forall_binders, 1);
+    assert_eq!(result.progress.lambda_binders, 2);
+    assert_eq!(result.progress.application_arguments, 1);
+    assert_eq!(result.progress.defeq_queries, 1);
 }
 
 #[test]
@@ -880,7 +1168,9 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
             InferenceBudget::unlimited(),
         ),
         InferenceOutcome::Refused {
-            refusal: InferenceRefusal::BinderTypeExpected { binder: 0 },
+            refusal: InferenceRefusal::SortExpected {
+                site: InferenceSortSite::LambdaBinder { binder: 0 },
+            },
             ..
         }
     ));
@@ -976,8 +1266,8 @@ fn lambda_domain_validation_is_mode_exact_and_uses_checker_whnf() {
             InferenceBudget::unlimited(),
         ),
         InferenceOutcome::Refused {
-            refusal: InferenceRefusal::BinderReductionRefusal {
-                binder: 0,
+            refusal: InferenceRefusal::SortReductionRefusal {
+                site: InferenceSortSite::LambdaBinder { binder: 0 },
                 refusal: fln_checker::whnf::WhnfRefusal::ProjectionIndexOverflow { .. },
             },
             ..
@@ -1231,8 +1521,8 @@ fn lambda_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() 
                 TermBudget::unlimited(),
             )),
         ),
-        InferenceOutcome::Inconclusive(InferenceStop::BinderWhnf {
-            binder: 0,
+        InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+            site: InferenceSortSite::LambdaBinder { binder: 0 },
             stop,
             ..
         }) if matches!(
@@ -1281,9 +1571,11 @@ fn lambda_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() 
                 stop: TermStop::Cancelled { .. },
                 ..
             }) => saw_nested_inspection = true,
-            InferenceOutcome::Inconclusive(InferenceStop::BinderWhnf { stop, .. })
-                if matches!(*stop, WhnfStop::Cancelled { .. }) =>
-            {
+            InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+                site: InferenceSortSite::LambdaBinder { .. },
+                stop,
+                ..
+            }) if matches!(*stop, WhnfStop::Cancelled { .. }) => {
                 saw_nested_binder_whnf = true;
             }
             InferenceOutcome::Inconclusive(InferenceStop::Materialization {
@@ -2389,7 +2681,13 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 | InferencePhase::BinderSort
                 | InferencePhase::LambdaBody
                 | InferencePhase::CheapBeta
-                | InferencePhase::PiAbstraction => {
+                | InferencePhase::PiAbstraction
+                | InferencePhase::ForallTelescope
+                | InferencePhase::ForallDomain
+                | InferencePhase::ForallDomainSort
+                | InferencePhase::ForallBody
+                | InferencePhase::ForallCodomainSort
+                | InferencePhase::ForallUniverse => {
                     panic!("nested work surfaced as an outer cancellation phase")
                 }
             },

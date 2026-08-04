@@ -311,6 +311,12 @@ pub struct InferenceProgress {
     pub lambda_body_queries: u64,
     pub binder_sort_checks: u64,
     pub cheap_beta_steps: u64,
+    pub forall_telescope_nodes: u64,
+    pub forall_binders: u64,
+    pub forall_domain_queries: u64,
+    pub forall_body_queries: u64,
+    pub forall_sort_checks: u64,
+    pub forall_imax_nodes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +348,41 @@ pub enum InferencePhase {
     LambdaBody,
     CheapBeta,
     PiAbstraction,
+    ForallTelescope,
+    ForallDomain,
+    ForallDomainSort,
+    ForallBody,
+    ForallCodomainSort,
+    ForallUniverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceSortSite {
+    LambdaBinder { binder: usize },
+    ForallBinder { binder: usize },
+    ForallCodomain { binders: usize },
+}
+
+impl InferenceSortSite {
+    const fn phase(self) -> InferencePhase {
+        match self {
+            InferenceSortSite::LambdaBinder { .. } => InferencePhase::BinderSort,
+            InferenceSortSite::ForallBinder { .. } => InferencePhase::ForallDomainSort,
+            InferenceSortSite::ForallCodomain { .. } => InferencePhase::ForallCodomainSort,
+        }
+    }
+
+    const fn at(self) -> usize {
+        match self {
+            InferenceSortSite::LambdaBinder { binder }
+            | InferenceSortSite::ForallBinder { binder } => binder,
+            InferenceSortSite::ForallCodomain { binders } => binders,
+        }
+    }
+
+    const fn is_forall(self) -> bool {
+        !matches!(self, InferenceSortSite::LambdaBinder { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,8 +420,8 @@ pub enum InferenceStop {
         stop: Box<DefEqStop>,
         progress: InferenceProgress,
     },
-    BinderWhnf {
-        binder: usize,
+    SortWhnf {
+        site: InferenceSortSite,
         stop: Box<WhnfStop>,
         progress: InferenceProgress,
     },
@@ -428,11 +469,11 @@ pub enum InferenceRefusal {
         side: DefEqSide,
         refusal: WhnfRefusal,
     },
-    BinderTypeExpected {
-        binder: usize,
+    SortExpected {
+        site: InferenceSortSite,
     },
-    BinderReductionRefusal {
-        binder: usize,
+    SortReductionRefusal {
+        site: InferenceSortSite,
         refusal: WhnfRefusal,
     },
 }
@@ -444,7 +485,6 @@ pub enum InferenceDeferred {
         argument: usize,
         need: DefEqDeferred,
     },
-    Forall,
     Let,
     NatLiteral,
     StringLiteral,
@@ -486,8 +526,8 @@ pub enum InferenceFault {
         argument: usize,
         fault: DefEqFault,
     },
-    BinderWhnf {
-        binder: usize,
+    SortWhnf {
+        site: InferenceSortSite,
         fault: WhnfFault,
     },
     FreshLocalIdentityExhausted,
@@ -499,6 +539,9 @@ pub enum InferenceFault {
     },
     MissingGeneratedArena {
         generation: usize,
+    },
+    RetainedSortExpected {
+        position: usize,
     },
     EmptyWorklist,
 }
@@ -1070,7 +1113,7 @@ impl<'a> ArenaAssembler<'a> {
         })
     }
 
-    fn append(&mut self, source: &WireExpr) -> Result<ExprId, MaterializeHalt> {
+    fn append_levels(&mut self, source: &WireExpr) -> Result<usize, MaterializeHalt> {
         let level_offset = self.levels.len();
         for (index, node) in source.levels().iter().enumerate() {
             let at = self.levels.len();
@@ -1109,7 +1152,20 @@ impl<'a> ArenaAssembler<'a> {
             }
             self.levels.push(mapped);
         }
+        Ok(level_offset)
+    }
 
+    fn append_level_root(
+        &mut self,
+        source: &WireExpr,
+        root: LevelId,
+    ) -> Result<LevelId, MaterializeHalt> {
+        let level_offset = self.append_levels(source)?;
+        Self::mapped_level_root(source, root, level_offset, self.levels.len(), &self.control)
+    }
+
+    fn append(&mut self, source: &WireExpr) -> Result<ExprId, MaterializeHalt> {
+        let level_offset = self.append_levels(source)?;
         let expression_offset = self.nodes.len();
         for (index, node) in source.nodes().iter().enumerate() {
             let at = self.nodes.len();
@@ -1225,6 +1281,59 @@ impl<'a> ArenaAssembler<'a> {
         })
     }
 
+    fn push_level(&mut self, node: LevelNode) -> Result<LevelId, MaterializeHalt> {
+        let at = self.levels.len();
+        self.control.step(at)?;
+        self.control.output(level_owned_units(&node), at)?;
+        let children = match &node {
+            LevelNode::Succ(child) => [Some(*child), None],
+            LevelNode::Max(left, right) | LevelNode::IMax(left, right) => {
+                [Some(*left), Some(*right)]
+            }
+            LevelNode::Zero | LevelNode::Parameter(_) | LevelNode::Meta(_) => [None, None],
+        };
+        for child in children.into_iter().flatten() {
+            validate_materialized_level_child(&self.levels, at, child)?;
+        }
+        self.control.arena_node(self.total_nodes(1), at)?;
+        let id = LevelId::from_index(self.levels.len()).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: self.total_nodes(1),
+                at,
+                completed_steps: self.control.steps,
+            })
+        })?;
+        self.levels.push(node);
+        Ok(id)
+    }
+
+    fn push_sort(&mut self, level: LevelId) -> Result<ExprId, MaterializeHalt> {
+        if self.levels.get(level.index()).is_none() {
+            return Err(MaterializeHalt::Fault(TermFault::MissingLevel {
+                input: TermInput::Subject,
+                index: level.index(),
+            }));
+        }
+        let at = self.nodes.len();
+        let node = ExprNode::Sort { level };
+        self.control.step(at)?;
+        self.control.output(expression_owned_units(&node), at)?;
+        self.control.arena_node(self.total_nodes(1), at)?;
+        let id = ExprId::from_index(self.nodes.len()).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: self.total_nodes(1),
+                at,
+                completed_steps: self.control.steps,
+            })
+        })?;
+        self.nodes.push(node);
+        Ok(id)
+    }
+
     fn push_apply(
         &mut self,
         function: ExprId,
@@ -1294,13 +1403,13 @@ struct TermReference {
     root: ExprId,
 }
 
-struct LambdaBinderSource {
+struct TelescopeBinderSource {
     display_name: WireName,
     style: BinderStyle,
     domain: TermReference,
 }
 
-struct LambdaBinder {
+struct TelescopeBinder {
     display_name: WireName,
     style: BinderStyle,
     local_name: WireName,
@@ -1308,10 +1417,18 @@ struct LambdaBinder {
     domain: Arc<WireExpr>,
 }
 
-struct LambdaState {
-    sources: Vec<LambdaBinderSource>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TelescopeKind {
+    Lambda,
+    Forall,
+}
+
+struct TelescopeState {
+    kind: TelescopeKind,
+    sources: Vec<TelescopeBinderSource>,
     body: TermReference,
-    binders: Vec<LambdaBinder>,
+    binders: Vec<TelescopeBinder>,
+    domain_sorts: Vec<WireExpr>,
     next: usize,
 }
 
@@ -1322,7 +1439,11 @@ enum Dispatch {
         arguments: Vec<TermReference>,
     },
     Lambda {
-        binders: Vec<LambdaBinderSource>,
+        binders: Vec<TelescopeBinderSource>,
+        body: TermReference,
+    },
+    Forall {
+        binders: Vec<TelescopeBinderSource>,
         body: TermReference,
     },
 }
@@ -1339,14 +1460,14 @@ enum Continuation {
         argument: TermReference,
         conversion: ConversionMode,
     },
-    LambdaDomain {
-        state: Box<LambdaState>,
+    TelescopeDomain {
+        state: Box<TelescopeState>,
         domain: Arc<WireExpr>,
         local_name: WireName,
         local_reference: TermReference,
     },
-    LambdaBody {
-        state: Box<LambdaState>,
+    TelescopeBody {
+        state: Box<TelescopeState>,
     },
 }
 
@@ -1395,6 +1516,146 @@ struct DispatchScope<'a> {
     context: &'a InferenceContext,
     scoped_locals: &'a BTreeMap<WireName, Arc<WireExpr>>,
     mode: InferenceMode,
+}
+
+impl TelescopeKind {
+    const fn telescope_phase(self) -> InferencePhase {
+        match self {
+            TelescopeKind::Lambda => InferencePhase::LambdaTelescope,
+            TelescopeKind::Forall => InferencePhase::ForallTelescope,
+        }
+    }
+
+    fn record_binder(self, progress: &mut InferenceProgress) {
+        match self {
+            TelescopeKind::Lambda => {
+                progress.lambda_telescope_nodes = progress.lambda_telescope_nodes.saturating_add(1);
+                progress.lambda_binders = progress.lambda_binders.saturating_add(1);
+            }
+            TelescopeKind::Forall => {
+                progress.forall_telescope_nodes = progress.forall_telescope_nodes.saturating_add(1);
+                progress.forall_binders = progress.forall_binders.saturating_add(1);
+            }
+        }
+    }
+
+    const fn domain_phase(self) -> InferencePhase {
+        match self {
+            TelescopeKind::Lambda => InferencePhase::LambdaDomain,
+            TelescopeKind::Forall => InferencePhase::ForallDomain,
+        }
+    }
+
+    const fn body_phase(self) -> InferencePhase {
+        match self {
+            TelescopeKind::Lambda => InferencePhase::LambdaBody,
+            TelescopeKind::Forall => InferencePhase::ForallBody,
+        }
+    }
+
+    fn record_domain_query(self, progress: &mut InferenceProgress) {
+        match self {
+            TelescopeKind::Lambda => {
+                progress.lambda_domain_queries = progress.lambda_domain_queries.saturating_add(1);
+            }
+            TelescopeKind::Forall => {
+                progress.forall_domain_queries = progress.forall_domain_queries.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_body_query(self, progress: &mut InferenceProgress) {
+        match self {
+            TelescopeKind::Lambda => {
+                progress.lambda_body_queries = progress.lambda_body_queries.saturating_add(1);
+            }
+            TelescopeKind::Forall => {
+                progress.forall_body_queries = progress.forall_body_queries.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn telescope_node(
+    node: &ExprNode,
+    kind: TelescopeKind,
+) -> Option<(WireName, BinderStyle, ExprId, ExprId)> {
+    match (kind, node) {
+        (
+            TelescopeKind::Lambda,
+            ExprNode::Lambda {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            },
+        )
+        | (
+            TelescopeKind::Forall,
+            ExprNode::Forall {
+                binder_name,
+                binder_type,
+                body,
+                style,
+            },
+        ) => Some((binder_name.clone(), *style, *binder_type, *body)),
+        _ => None,
+    }
+}
+
+fn collect_telescope(
+    term: &WireExpr,
+    source: ArenaSource,
+    root: ExprId,
+    kind: TelescopeKind,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(Vec<TelescopeBinderSource>, TermReference), LeafHalt> {
+    let mut cursor = root;
+    let mut binders = Vec::new();
+    loop {
+        let current =
+            term.node(cursor)
+                .ok_or(LeafHalt::Fault(InferenceFault::MissingExpression {
+                    index: cursor.index(),
+                }))?;
+        let Some((display_name, style, binder_type, body)) = telescope_node(current, kind) else {
+            break;
+        };
+        control
+            .step(cancelled, kind.telescope_phase(), cursor.index())
+            .map_err(LeafHalt::stop)?;
+        kind.record_binder(&mut control.progress);
+        binders.push(TelescopeBinderSource {
+            display_name,
+            style,
+            domain: TermReference {
+                source,
+                root: binder_type,
+            },
+        });
+        cursor = body;
+    }
+    if binders.len() > MAX_BVAR_INDEX as usize + 1 {
+        return Err(LeafHalt::stop(InferenceStop::Materialization {
+            phase: kind.telescope_phase(),
+            stop: TermStop::Resource {
+                limit: TermLimit::BoundIndex,
+                allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
+                observed: usize_units(binders.len()),
+                at: cursor.index(),
+                completed_steps: control.progress.steps,
+            },
+            progress: control.progress,
+        }));
+    }
+    Ok((
+        binders,
+        TermReference {
+            source,
+            root: cursor,
+        },
+    ))
 }
 
 fn dispatch_reference(
@@ -1592,61 +1853,27 @@ fn dispatch_reference(
             })
         }
         ExprNode::Lambda { .. } => {
-            let mut cursor = root;
-            let mut binders = Vec::new();
-            loop {
-                let current = term.node(cursor).ok_or(LeafHalt::Fault(
-                    InferenceFault::MissingExpression {
-                        index: cursor.index(),
-                    },
-                ))?;
-                let ExprNode::Lambda {
-                    binder_name,
-                    binder_type,
-                    body,
-                    style,
-                } = current
-                else {
-                    break;
-                };
-                control
-                    .step(cancelled, InferencePhase::LambdaTelescope, cursor.index())
-                    .map_err(LeafHalt::stop)?;
-                control.progress.lambda_telescope_nodes =
-                    control.progress.lambda_telescope_nodes.saturating_add(1);
-                control.progress.lambda_binders = control.progress.lambda_binders.saturating_add(1);
-                binders.push(LambdaBinderSource {
-                    display_name: binder_name.clone(),
-                    style: *style,
-                    domain: TermReference {
-                        source: reference.source,
-                        root: *binder_type,
-                    },
-                });
-                cursor = *body;
-            }
-            if binders.len() > MAX_BVAR_INDEX as usize + 1 {
-                return Err(LeafHalt::stop(InferenceStop::Materialization {
-                    phase: InferencePhase::LambdaTelescope,
-                    stop: TermStop::Resource {
-                        limit: TermLimit::BoundIndex,
-                        allowed: u64::from(MAX_BVAR_INDEX).saturating_add(1),
-                        observed: usize_units(binders.len()),
-                        at: cursor.index(),
-                        completed_steps: control.progress.steps,
-                    },
-                    progress: control.progress,
-                }));
-            }
-            Ok(Dispatch::Lambda {
-                binders,
-                body: TermReference {
-                    source: reference.source,
-                    root: cursor,
-                },
-            })
+            let (binders, body) = collect_telescope(
+                term,
+                reference.source,
+                root,
+                TelescopeKind::Lambda,
+                control,
+                cancelled,
+            )?;
+            Ok(Dispatch::Lambda { binders, body })
         }
-        ExprNode::Forall { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Forall)),
+        ExprNode::Forall { .. } => {
+            let (binders, body) = collect_telescope(
+                term,
+                reference.source,
+                root,
+                TelescopeKind::Forall,
+                control,
+                cancelled,
+            )?;
+            Ok(Dispatch::Forall { binders, body })
+        }
         ExprNode::Let { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Let)),
         ExprNode::NatLiteral { .. } => Err(LeafHalt::Deferred(InferenceDeferred::NatLiteral)),
         ExprNode::StringLiteral(_) => Err(LeafHalt::Deferred(InferenceDeferred::StringLiteral)),
@@ -1670,7 +1897,7 @@ struct InferenceEngine<'a> {
     continuations: Vec<Continuation>,
 }
 
-enum LambdaSchedule {
+enum TelescopeSchedule {
     Query {
         continuation: Continuation,
         reference: TermReference,
@@ -1803,10 +2030,10 @@ impl<'a> InferenceEngine<'a> {
         Ok(self.store_generated(Arc::new(term)))
     }
 
-    fn materialize_lambda_subterm(
+    fn materialize_telescope_subterm(
         &mut self,
         reference: TermReference,
-        binders: &[LambdaBinder],
+        binders: &[TelescopeBinder],
         phase: InferencePhase,
     ) -> Result<WireExpr, LeafHalt> {
         let source = inference_arena(self.input, &self.generated, reference.source)?;
@@ -1869,9 +2096,9 @@ impl<'a> InferenceEngine<'a> {
         Ok(result)
     }
 
-    fn install_lambda_binder(
+    fn install_telescope_binder(
         &mut self,
-        state: &mut LambdaState,
+        state: &mut TelescopeState,
         domain: Arc<WireExpr>,
         local_name: WireName,
         local_reference: TermReference,
@@ -1889,7 +2116,7 @@ impl<'a> InferenceEngine<'a> {
                 name: local_name,
             }));
         }
-        state.binders.push(LambdaBinder {
+        state.binders.push(TelescopeBinder {
             display_name: source.display_name.clone(),
             style: source.style,
             local_name,
@@ -1900,36 +2127,32 @@ impl<'a> InferenceEngine<'a> {
         Ok(())
     }
 
-    fn schedule_lambda(&mut self, mut state: Box<LambdaState>) -> Result<LambdaSchedule, LeafHalt> {
+    fn schedule_telescope(
+        &mut self,
+        mut state: Box<TelescopeState>,
+    ) -> Result<TelescopeSchedule, LeafHalt> {
         while state.next < state.sources.len() {
             let source = state
                 .sources
                 .get(state.next)
                 .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+            let phase = state.kind.domain_phase();
             self.control
-                .step(
-                    self.cancelled,
-                    InferencePhase::LambdaDomain,
-                    source.domain.root.index(),
-                )
+                .step(self.cancelled, phase, source.domain.root.index())
                 .map_err(LeafHalt::stop)?;
-            let domain = Arc::new(self.materialize_lambda_subterm(
+            let domain = Arc::new(self.materialize_telescope_subterm(
                 source.domain,
                 &state.binders,
-                InferencePhase::LambdaDomain,
+                phase,
             )?);
             let domain_reference = self.store_generated(Arc::clone(&domain));
             let local_name = self.fresh_local_name()?;
             let local_reference = self.materialize_free_reference(&local_name)?;
 
-            if self.mode.is_checking() {
-                self.control.progress.lambda_domain_queries = self
-                    .control
-                    .progress
-                    .lambda_domain_queries
-                    .saturating_add(1);
-                return Ok(LambdaSchedule::Query {
-                    continuation: Continuation::LambdaDomain {
+            if state.kind == TelescopeKind::Forall || self.mode.is_checking() {
+                state.kind.record_domain_query(&mut self.control.progress);
+                return Ok(TelescopeSchedule::Query {
+                    continuation: Continuation::TelescopeDomain {
                         state,
                         domain,
                         local_name,
@@ -1939,40 +2162,40 @@ impl<'a> InferenceEngine<'a> {
                 });
             }
 
-            self.install_lambda_binder(&mut state, domain, local_name, local_reference)?;
+            self.install_telescope_binder(&mut state, domain, local_name, local_reference)?;
         }
 
+        let phase = state.kind.body_phase();
         self.control
-            .step(
-                self.cancelled,
-                InferencePhase::LambdaBody,
-                state.body.root.index(),
-            )
+            .step(self.cancelled, phase, state.body.root.index())
             .map_err(LeafHalt::stop)?;
-        let body = Arc::new(self.materialize_lambda_subterm(
-            state.body,
-            &state.binders,
-            InferencePhase::LambdaBody,
-        )?);
+        let body =
+            Arc::new(self.materialize_telescope_subterm(state.body, &state.binders, phase)?);
         let reference = self.store_generated(body);
-        self.control.progress.lambda_body_queries =
-            self.control.progress.lambda_body_queries.saturating_add(1);
-        Ok(LambdaSchedule::Query {
-            continuation: Continuation::LambdaBody { state },
+        state.kind.record_body_query(&mut self.control.progress);
+        Ok(TelescopeSchedule::Query {
+            continuation: Continuation::TelescopeBody { state },
             reference,
         })
     }
 
-    fn ensure_binder_sort(
+    fn ensure_sort(
         &mut self,
-        binder: usize,
+        site: InferenceSortSite,
         inferred_type: &WireExpr,
-    ) -> Result<(), LeafHalt> {
+        retain_sort: bool,
+    ) -> Result<Option<WireExpr>, LeafHalt> {
+        let phase = site.phase();
         self.control
-            .step(self.cancelled, InferencePhase::BinderSort, binder)
+            .step(self.cancelled, phase, site.at())
             .map_err(LeafHalt::stop)?;
-        self.control.progress.binder_sort_checks =
-            self.control.progress.binder_sort_checks.saturating_add(1);
+        if site.is_forall() {
+            self.control.progress.forall_sort_checks =
+                self.control.progress.forall_sort_checks.saturating_add(1);
+        } else {
+            self.control.progress.binder_sort_checks =
+                self.control.progress.binder_sort_checks.saturating_add(1);
+        }
         self.control.progress.whnf_queries = self.control.progress.whnf_queries.saturating_add(1);
         let reduced = match whnf_with(
             inferred_type,
@@ -1982,31 +2205,45 @@ impl<'a> InferenceEngine<'a> {
         ) {
             WhnfOutcome::Complete(result) => result.term,
             WhnfOutcome::Refused(refusal) => {
-                return Err(LeafHalt::Refused(
-                    InferenceRefusal::BinderReductionRefusal { binder, refusal },
-                ));
+                return Err(LeafHalt::Refused(InferenceRefusal::SortReductionRefusal {
+                    site,
+                    refusal,
+                }));
             }
             WhnfOutcome::Inconclusive(stop) => {
-                return Err(LeafHalt::stop(InferenceStop::BinderWhnf {
-                    binder,
+                return Err(LeafHalt::stop(InferenceStop::SortWhnf {
+                    site,
                     stop: Box::new(stop),
                     progress: self.control.progress,
                 }));
             }
             WhnfOutcome::InternalFault(fault) => {
-                return Err(LeafHalt::Fault(InferenceFault::BinderWhnf {
-                    binder,
-                    fault,
-                }));
+                return Err(LeafHalt::Fault(InferenceFault::SortWhnf { site, fault }));
             }
         };
-        if matches!(reduced.node(reduced.root()), Some(ExprNode::Sort { .. })) {
-            Ok(())
-        } else {
-            Err(LeafHalt::Refused(InferenceRefusal::BinderTypeExpected {
-                binder,
-            }))
+        match reduced.node(reduced.root()) {
+            Some(ExprNode::Sort { .. }) => {}
+            Some(_) => return Err(LeafHalt::Refused(InferenceRefusal::SortExpected { site })),
+            None => {
+                return Err(LeafHalt::Fault(InferenceFault::MissingExpression {
+                    index: reduced.root().index(),
+                }));
+            }
         }
+        if !retain_sort {
+            return Ok(None);
+        }
+        map_materialization(
+            copy_compact_subterm_with(
+                &reduced,
+                reduced.root(),
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            phase,
+            self.control.progress,
+        )
+        .map(Some)
     }
 
     fn copy_cheap_beta_subterm(
@@ -2154,19 +2391,24 @@ impl<'a> InferenceEngine<'a> {
         Ok(assembler.finish(root))
     }
 
-    fn complete_lambda(
-        &mut self,
-        state: LambdaState,
-        body_type: WireExpr,
-    ) -> Result<WireExpr, LeafHalt> {
-        let body_type = self.cheap_beta_reduce(body_type)?;
-        for binder in state.binders.iter().rev() {
+    fn remove_telescope_locals(&mut self, binders: &[TelescopeBinder]) -> Result<(), LeafHalt> {
+        for binder in binders.iter().rev() {
             if self.scoped_locals.remove(&binder.local_name).is_none() {
                 return Err(LeafHalt::Fault(InferenceFault::MissingScopedLocal {
                     name: binder.local_name.clone(),
                 }));
             }
         }
+        Ok(())
+    }
+
+    fn complete_lambda(
+        &mut self,
+        state: TelescopeState,
+        body_type: WireExpr,
+    ) -> Result<WireExpr, LeafHalt> {
+        let body_type = self.cheap_beta_reduce(body_type)?;
+        self.remove_telescope_locals(&state.binders)?;
 
         let binder_count = u32::try_from(state.binders.len()).map_err(|_| {
             LeafHalt::stop(InferenceStop::Materialization {
@@ -2246,6 +2488,77 @@ impl<'a> InferenceEngine<'a> {
                 progress,
             )?;
         }
+        Ok(assembler.finish(root))
+    }
+
+    fn complete_forall(
+        &mut self,
+        mut state: TelescopeState,
+        body_type: &WireExpr,
+    ) -> Result<WireExpr, LeafHalt> {
+        let codomain = self
+            .ensure_sort(
+                InferenceSortSite::ForallCodomain {
+                    binders: state.binders.len(),
+                },
+                body_type,
+                true,
+            )?
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        state.domain_sorts.push(codomain);
+        let expected = state.binders.len().saturating_add(1);
+        if state.domain_sorts.len() != expected {
+            return Err(LeafHalt::Fault(InferenceFault::EmptyWorklist));
+        }
+        self.remove_telescope_locals(&state.binders)?;
+
+        for index in 0..state.binders.len() {
+            self.control
+                .step(self.cancelled, InferencePhase::ForallUniverse, index)
+                .map_err(LeafHalt::stop)?;
+            self.control.progress.forall_imax_nodes =
+                self.control.progress.forall_imax_nodes.saturating_add(1);
+        }
+
+        let progress = self.control.progress;
+        let mut assembler =
+            ArenaAssembler::new(self.control.budget.materialization, &mut *self.cancelled);
+        let mut levels = Vec::with_capacity(state.domain_sorts.len());
+        for (position, sort) in state.domain_sorts.iter().enumerate() {
+            let level = match sort.node(sort.root()) {
+                Some(ExprNode::Sort { level }) => *level,
+                Some(_) => {
+                    return Err(LeafHalt::Fault(InferenceFault::RetainedSortExpected {
+                        position,
+                    }));
+                }
+                None => {
+                    return Err(LeafHalt::Fault(InferenceFault::MissingExpression {
+                        index: sort.root().index(),
+                    }));
+                }
+            };
+            levels.push(map_assembly(
+                assembler.append_level_root(sort, level),
+                InferencePhase::ForallUniverse,
+                progress,
+            )?);
+        }
+        let mut level = levels
+            .pop()
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        for domain in levels.into_iter().rev() {
+            level = map_assembly(
+                assembler.push_level(LevelNode::IMax(domain, level)),
+                InferencePhase::ForallUniverse,
+                progress,
+            )?;
+        }
+        let root = map_assembly(
+            assembler.push_sort(level),
+            InferencePhase::ForallUniverse,
+            progress,
+        )?;
         Ok(assembler.finish(root))
     }
 
@@ -2631,16 +2944,34 @@ impl<'a> InferenceEngine<'a> {
                         current = Some(head);
                     }
                     Dispatch::Lambda { binders, body } => {
-                        let state = Box::new(LambdaState {
+                        let state = Box::new(TelescopeState {
+                            kind: TelescopeKind::Lambda,
                             sources: binders,
                             body,
                             binders: Vec::new(),
+                            domain_sorts: Vec::new(),
                             next: 0,
                         });
-                        let LambdaSchedule::Query {
+                        let TelescopeSchedule::Query {
                             continuation,
                             reference,
-                        } = self.schedule_lambda(state)?;
+                        } = self.schedule_telescope(state)?;
+                        self.continuations.push(continuation);
+                        current = Some(reference);
+                    }
+                    Dispatch::Forall { binders, body } => {
+                        let state = Box::new(TelescopeState {
+                            kind: TelescopeKind::Forall,
+                            sources: binders,
+                            body,
+                            binders: Vec::new(),
+                            domain_sorts: Vec::new(),
+                            next: 0,
+                        });
+                        let TelescopeSchedule::Query {
+                            continuation,
+                            reference,
+                        } = self.schedule_telescope(state)?;
                         self.continuations.push(continuation);
                         current = Some(reference);
                     }
@@ -2694,23 +3025,44 @@ impl<'a> InferenceEngine<'a> {
                         current = Some(argument);
                     }
                 }
-                Continuation::LambdaDomain {
+                Continuation::TelescopeDomain {
                     mut state,
                     domain,
                     local_name,
                     local_reference,
                 } => {
-                    self.ensure_binder_sort(state.next, &value)?;
-                    self.install_lambda_binder(&mut state, domain, local_name, local_reference)?;
-                    let LambdaSchedule::Query {
+                    match state.kind {
+                        TelescopeKind::Lambda => {
+                            self.ensure_sort(
+                                InferenceSortSite::LambdaBinder { binder: state.next },
+                                &value,
+                                false,
+                            )?;
+                        }
+                        TelescopeKind::Forall => {
+                            let sort = self
+                                .ensure_sort(
+                                    InferenceSortSite::ForallBinder { binder: state.next },
+                                    &value,
+                                    true,
+                                )?
+                                .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+                            state.domain_sorts.push(sort);
+                        }
+                    }
+                    self.install_telescope_binder(&mut state, domain, local_name, local_reference)?;
+                    let TelescopeSchedule::Query {
                         continuation,
                         reference,
-                    } = self.schedule_lambda(state)?;
+                    } = self.schedule_telescope(state)?;
                     self.continuations.push(continuation);
                     current = Some(reference);
                 }
-                Continuation::LambdaBody { state } => {
-                    inferred = Some(self.complete_lambda(*state, value)?);
+                Continuation::TelescopeBody { state } => {
+                    inferred = Some(match state.kind {
+                        TelescopeKind::Lambda => self.complete_lambda(*state, value)?,
+                        TelescopeKind::Forall => self.complete_forall(*state, &value)?,
+                    });
                 }
             }
         }
