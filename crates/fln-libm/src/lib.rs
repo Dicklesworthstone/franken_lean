@@ -29,6 +29,7 @@ const SQRT_HALF: f64 = f64::from_bits(0x3fe6_a09e_667f_3bcd);
 const SQRT_TWO: f64 = f64::from_bits(0x3ff6_a09e_667f_3bcd);
 const LN10: f64 = f64::from_bits(0x4002_6bb1_bbb5_5516);
 const LOG_MAX: f64 = 709.782_712_893_384;
+const LOG_2_MAX: f64 = 710.475_860_073_943_9;
 const LOG_MIN_SUBNORMAL: f64 = -744.440_071_921_381_2;
 const SCALE_512: f64 = f64::from_bits(0x5ff0_0000_0000_0000);
 const SCALE_NEG_512: f64 = f64::from_bits(0x1ff0_0000_0000_0000);
@@ -462,6 +463,19 @@ pub fn log1p(x: f64) -> f64 {
     }
 }
 
+fn exp_minus_ln2(x: f64) -> f64 {
+    // Keep both parts of x - ln(2): at the top of the finite sinh/cosh
+    // window, discarding the subtraction roundoff moves the final answer by
+    // hundreds of ULPs.
+    let b = -LN2_HI;
+    let head = x + b;
+    let b_virtual = head - x;
+    let x_virtual = head - b_virtual;
+    let tail = (x - x_virtual) + (b - b_virtual) - LN2_LO;
+    let value = exp(head);
+    value + value * tail
+}
+
 /// Hyperbolic sine.
 pub fn sinh(x: f64) -> f64 {
     if invalid(x) {
@@ -482,8 +496,14 @@ pub fn sinh(x: f64) -> f64 {
             sum += term;
         }
         sum
-    } else {
+    } else if a <= LOG_MAX {
         0.5 * (exp(a) - exp(-a))
+    } else if a <= LOG_2_MAX {
+        // exp(a) may overflow although sinh(a) = exp(a) / 2 (to binary64
+        // precision here) is still finite.  Reduce by ln(2) first.
+        exp_minus_ln2(a)
+    } else {
+        f64::INFINITY
     };
     copysign(value, x)
 }
@@ -494,8 +514,12 @@ pub fn cosh(x: f64) -> f64 {
         return canonical_nan();
     }
     let a = abs(x);
-    if a > LOG_MAX {
+    if a > LOG_2_MAX {
         return f64::INFINITY;
+    }
+    if a > LOG_MAX {
+        // As above, exp(a) itself overflows one ln(2) before cosh(a).
+        return exp_minus_ln2(a);
     }
     0.5 * (exp(a) + exp(-a))
 }
@@ -806,6 +830,17 @@ mod tests {
             assert_eq!(log1p(input).to_bits(), expected_log1p);
             assert_eq!(tanh(input).to_bits(), expected_tanh);
         }
+    }
+
+    #[test]
+    fn hyperbolic_overflow_window_is_not_premature() {
+        let finite = 710.0;
+        assert!(sinh(finite).is_finite());
+        assert!(cosh(finite).is_finite());
+        same_bits(sinh(-finite), -sinh(finite));
+        same_bits(cosh(-finite), cosh(finite));
+        assert!(sinh(710.5).is_infinite());
+        assert!(cosh(710.5).is_infinite());
     }
 
     #[test]
