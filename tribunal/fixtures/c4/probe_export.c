@@ -145,12 +145,13 @@ static lean_object *probe_corpus_succ(lean_object *x) {
  * counter is thread-local in both runtimes, so each worker records its own
  * terminal value and the parent only publishes the all-workers predicate. */
 struct heartbeat_worker_cell {
+    uint64_t seed;
     long long terminal_heartbeat;
 };
 
 static void *heartbeat_worker(void *opaque) {
     struct heartbeat_worker_cell *cell = opaque;
-    lean_io_set_heartbeats(lean_uint64_to_nat(UINT64_MAX - 126));
+    lean_io_set_heartbeats(lean_uint64_to_nat(cell->seed));
     for (unsigned size = 8; size < 1024; size += 8) {
         lean_object *block = lean_alloc_small_object(size);
         lean_free_small_object(block);
@@ -160,12 +161,14 @@ static void *heartbeat_worker(void *opaque) {
     return NULL;
 }
 
-static void run_heartbeat_thread_matrix(unsigned width) {
+static void run_heartbeat_thread_matrix(unsigned width, uint64_t seed,
+                                        long long expected, const char *edge) {
     pthread_t threads[32];
     struct heartbeat_worker_cell cells[32] = {0};
-    int all_wrapped = 1;
+    int all_at_expected = 1;
 
     for (unsigned worker = 0; worker < width; worker++) {
+        cells[worker].seed = seed;
         if (pthread_create(&threads[worker], NULL, heartbeat_worker,
                            &cells[worker]) != 0) {
             lean_internal_panic("gauntlet heartbeat worker creation failed");
@@ -175,11 +178,12 @@ static void run_heartbeat_thread_matrix(unsigned width) {
         if (pthread_join(threads[worker], NULL) != 0) {
             lean_internal_panic("gauntlet heartbeat worker join failed");
         }
-        if (cells[worker].terminal_heartbeat != 0) all_wrapped = 0;
+        if (cells[worker].terminal_heartbeat != expected) all_at_expected = 0;
     }
     char probe[64];
-    snprintf(probe, sizeof(probe), "heartbeat.inline_classes.width_%u_all_wrapped", width);
-    fact(probe, all_wrapped);
+    snprintf(probe, sizeof(probe),
+             "heartbeat.inline_classes.%s.width_%u_all_expected", edge, width);
+    fact(probe, all_at_expected);
 }
 
 static void facts_mode(void) {
@@ -388,9 +392,15 @@ static void facts_mode(void) {
      * window (8..=1016) at the FL-INV-01 widths, with a per-worker near-wrap
      * seed so a missing or doubled charge is observable without timestamps or
      * scheduler order entering the fact stream. */
-    run_heartbeat_thread_matrix(1);
-    run_heartbeat_thread_matrix(8);
-    run_heartbeat_thread_matrix(32);
+    run_heartbeat_thread_matrix(1, UINT64_MAX - 126, 0, "wrap");
+    run_heartbeat_thread_matrix(8, UINT64_MAX - 126, 0, "wrap");
+    run_heartbeat_thread_matrix(32, UINT64_MAX - 126, 0, "wrap");
+    /* Adjacent input control: the same 127 allocations from one tick later
+     * end at one. This makes a hidden reset or an off-by-one charge fail a
+     * separate, real generated-C cell at each declared thread width. */
+    run_heartbeat_thread_matrix(1, UINT64_MAX - 125, 1, "one_short");
+    run_heartbeat_thread_matrix(8, UINT64_MAX - 125, 1, "one_short");
+    run_heartbeat_thread_matrix(32, UINT64_MAX - 125, 1, "one_short");
 
     /* ---- slice 3: Name equality (hash at scalar offset 16, prefix walk) */
     {
