@@ -48,4 +48,13 @@ fn windows_functional_workflow_keeps_the_declared_native_scope() {
         !workflow.contains("--reproducible"),
         "the functional Windows lane must not silently claim bit certification"
     );
+
+    let ledger = fs::read_to_string(root().join("ci/PARITY_LEDGER.txt"))
+        .expect("the Parity Ledger must remain readable");
+    assert!(
+        ledger.contains(
+            "row platform | windows-x86-64.functional-workspace | ci-lane | unavailable | L0 | sound | native-ci | real-windows-host-required | .github/workflows/windows-functional.yml | D4 | BLOCKED | crosscheck-x86_64-pc-windows-msvc-20260804"
+        ),
+        "until a real Windows host passes the workspace lane, the ledger must retain its exact L0 BLOCKED row"
+    );
 }

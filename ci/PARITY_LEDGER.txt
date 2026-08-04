@@ -183,6 +183,13 @@ row hash | LogicalRoot.multi-host-identity | property | native | L2 | sound | mu
 row hash | LogicalRoot.cross-platform-identity | property | native | L0 | sound | certified-matrix | not-compared | crates/fln-hash/fixtures/host_attestations.txt | D0 | BLOCKED | suite-lock-declares-one-certified-target
 row hash | Domain.vectors.cross-platform-identity | property | native | L0 | sound | certified-matrix | not-compared | crates/fln-hash/fixtures/host_attestations.txt | D0 | BLOCKED | suite-lock-declares-one-certified-target
 
+# ---- platform: Windows functional CI is declared but does not yet build ----------------
+# This row is deliberately BLOCKED rather than TARGETED: the workflow is a real native-host
+# lane, but the owned Linux mmap primitive rejects the Windows target.  Cross compilation is
+# only the diagnosis; it cannot promote the Windows functional axis, and certification remains
+# a separate D17 decision.
+row platform | windows-x86-64.functional-workspace | ci-lane | unavailable | L0 | sound | native-ci | real-windows-host-required | .github/workflows/windows-functional.yml | D4 | BLOCKED | crosscheck-x86_64-pc-windows-msvc-20260804
+
 # ---- meta-api L1: the hygiene hooks Vellum needs (bead franken_lean-p8a). Implemented
 # ---- against the Prelude grammar `<name>._@.(<module>.<scopes>)*.<mainModule>._hyg.<scopes>`
 # ---- with in-repo tests, including deep-chain bounded-stack coverage. Not oracled: the
