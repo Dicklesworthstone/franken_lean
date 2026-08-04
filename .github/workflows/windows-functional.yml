@@ -26,11 +26,6 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: checkout FrankenLean
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-
       - name: initialize the Windows functional evidence bundle
         run: |
           evidence_dir="$RUNNER_TEMP/fln-windows-functional-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -57,6 +52,11 @@ jobs:
               os.fsync(handle.fileno())
           PY
           echo "FLN_WINDOWS_EVIDENCE_DIR=$evidence_dir" >> "$GITHUB_ENV"
+
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: install the SUITE.lock-pinned Rust toolchain
         run: |

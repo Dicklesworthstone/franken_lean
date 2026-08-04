@@ -48,6 +48,16 @@ fn windows_functional_workflow_keeps_the_declared_native_scope() {
         !workflow.contains("--reproducible"),
         "the functional Windows lane must not silently claim bit certification"
     );
+    let initialization = workflow
+        .find("- name: initialize the Windows functional evidence bundle")
+        .expect("the Windows evidence initializer is present");
+    let checkout = workflow
+        .find("- name: checkout FrankenLean")
+        .expect("the checkout step is present");
+    assert!(
+        initialization < checkout,
+        "the evidence bundle must exist before checkout so an early checkout failure remains diagnosable"
+    );
 
     let ledger = fs::read_to_string(root().join("ci/PARITY_LEDGER.txt"))
         .expect("the Parity Ledger must remain readable");
