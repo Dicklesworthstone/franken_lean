@@ -7,3 +7,10 @@ publish = false
 
 [dependencies]
 fln-hash = { path = "../fln-hash" }
+
+# Integration tests link against this crate plus its dev-dependencies only, and
+# `Digest`/`hash` appear in fln-bench's public signatures without being
+# re-exported. This declares no new workspace edge: `fln-bench -> fln-hash` is
+# already the reviewed edge above and in ci/WORKSPACE_GRAPH.txt.
+[dev-dependencies]
+fln-hash = { path = "../fln-hash" }
