@@ -888,9 +888,9 @@ The green-bar table above says where evidence may be taken from when the *tree* 
 
 ```text
 rch-measured-at: head=c0f2ace5 rch=1.0.52 confidence=0.95 threshold=0.85
-rch-tracker-population: mentions=15 non-reads=3 reads=12
-rch-tracker-reads: crates/fln-conformance/src/naming.rs crates/fln-conformance/src/ownership.rs crates/fln-conformance/tests/agents_enforcement_census.rs crates/fln-conformance/tests/campaign_owner_matrix.rs crates/fln-conformance/tests/ci_execution_join.rs crates/fln-conformance/tests/closure_binding_population.rs crates/fln-conformance/tests/commit_anchor_reachability.rs crates/fln-conformance/tests/done_but_open.rs crates/fln-conformance/tests/w4_macro_join.rs crates/fln-syntax/tests/golden_vellum.rs tools/structure-guard/kernel-ownership-publisher/src/main.rs tools/structure-guard/tests/real_workspace.rs
-rch-tracker-non-reads: crates/fln-conformance/tests/evidence_finalization.rs crates/fln-conformance/tests/vellum_surface_inventory.rs crates/fln-env/src/extensions.rs
+rch-tracker-population: mentions=15 non-reads=2 reads=13
+rch-tracker-reads: crates/fln-conformance/src/naming.rs crates/fln-conformance/src/ownership.rs crates/fln-conformance/tests/agents_enforcement_census.rs crates/fln-conformance/tests/campaign_owner_matrix.rs crates/fln-conformance/tests/ci_execution_join.rs crates/fln-conformance/tests/closure_binding_population.rs crates/fln-conformance/tests/commit_anchor_reachability.rs crates/fln-conformance/tests/done_but_open.rs crates/fln-conformance/tests/evidence_finalization.rs crates/fln-conformance/tests/w4_macro_join.rs crates/fln-syntax/tests/golden_vellum.rs tools/structure-guard/kernel-ownership-publisher/src/main.rs tools/structure-guard/tests/real_workspace.rs
+rch-tracker-non-reads: crates/fln-conformance/tests/vellum_surface_inventory.rs crates/fln-env/src/extensions.rs
 git-shelling-suites: crates/fln-conformance/src/tree_identity.rs crates/fln-conformance/tests/artifact_referent_census.rs crates/fln-conformance/tests/closure_binding_population.rs crates/fln-conformance/tests/commit_anchor_reachability.rs crates/fln-conformance/tests/done_but_open.rs crates/fln-conformance/tests/evidence_field_citations.rs crates/fln-conformance/tests/evidence_finalization.rs crates/fln-conformance/tests/kernel_contract.rs crates/fln-conformance/tests/kernel_replay.rs crates/fln-conformance/tests/mandated_mutants.rs crates/fln-syntax/tests/golden_vellum.rs
 git-shelling-population: files=11
 ```

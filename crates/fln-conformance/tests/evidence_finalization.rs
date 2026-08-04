@@ -5215,3 +5215,128 @@ fn the_git_shelling_population_is_derived_and_reconciled() {
         primary.len()
     );
 }
+
+/// The tracker's status vocabulary and the validator's, bound — `franken_lean-shlw`.
+///
+/// The verification validator models exactly four statuses. `br` writes whatever it is given,
+/// and a status it accepts but the validator refuses stops **every** pane's beads export, at
+/// commit time, for a record the committing pane did not touch. Measured three times on
+/// 2026-08-04 by cc_1, each while trying to land unrelated work.
+///
+/// **`br` HAS NO CLOSED STATUS VOCABULARY, WHICH THE BEAD DID NOT KNOW AND WHICH RESHAPES ITS
+/// CRITERION.** The bead asks for a test failing "in BOTH directions — a status br can write that
+/// the validator refuses, and a status the validator models that br cannot produce". Measured at
+/// `br 0.2.19`: `br update --status=NOTASTATUS` **succeeded** and wrote `notastatus`. There is no
+/// enumerable set on br's side, so the reverse direction is not merely unbuilt, it is undefined —
+/// the set of statuses br can write is every string. (Measured with `--no-auto-flush` so it never
+/// reached the shared export, and reverted within seconds. Recording it because the measurement
+/// cost a live mutation of a real bead and nobody should have to repeat it.)
+///
+/// So the binding that is available, and the one this test makes: the validator's set is read
+/// **from its own source** rather than transcribed, and the committed export is held to it. HEAD
+/// is the right scope, not the working tree — the working export legitimately carries a peer's
+/// in-flight `blocked` records, and reddening every pane for that is the bead's own defect wearing
+/// a new hat. The pre-commit hook is what keeps HEAD clean; this fails if that ever stops being
+/// true, or if the validator's set moves under it.
+#[test]
+fn the_tracker_status_vocabulary_is_bound_to_the_validator() {
+    let repo = fln_conformance::checked_workspace_root!();
+
+    // --- the validator's set, parsed from the producer rather than transcribed --------------
+    let evidence = fs::read_to_string(repo.join("scripts/evidence.py"))
+        .expect("scripts/evidence.py must be readable");
+    let marker = "if status not in {";
+    let at = evidence
+        .find(marker)
+        .expect("scripts/evidence.py must still gate on a literal status set; if that moved, this guard is enforcing a claim that no longer exists and must be updated rather than deleted");
+    let body = &evidence[at + marker.len()..];
+    let body = &body[..body.find('}').expect("the status set literal must close")];
+    let supported: std::collections::BTreeSet<String> = body
+        .split(',')
+        .map(|token| token.trim().trim_matches('"').to_string())
+        .filter(|token| !token.is_empty())
+        .collect();
+    assert!(
+        supported.len() >= 3 && supported.contains("open") && supported.contains("closed"),
+        "the parsed status set is implausible ({supported:?}) — a short or wrong parse would \
+         accept anything below"
+    );
+
+    // --- the committed export, held to it ---------------------------------------------------
+    let export = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["show", "HEAD:.beads/issues.jsonl"])
+        .output()
+        .expect("git show must run: the committed export is derived from it");
+    assert!(
+        export.status.success(),
+        "git show HEAD:.beads/issues.jsonl failed"
+    );
+    let export = String::from_utf8_lossy(&export.stdout);
+
+    let mut offending: Vec<(String, String)> = Vec::new();
+    let mut records = 0usize;
+    for line in export.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        records += 1;
+        let record: serde_free_json::Value = serde_free_json::parse(line);
+        let (id, status) = (record.field("id"), record.field("status"));
+        if !supported.contains(&status) {
+            offending.push((id, status));
+        }
+    }
+    assert!(
+        records >= 100,
+        "only {records} records were read from the committed export, which is a broken read \
+         rather than a small tracker — and an empty read reports every vocabulary as agreeing"
+    );
+
+    // The decoy. Today the committed population is clean, so without a planted member the
+    // assertion below would pass with the comparison deleted.
+    let planted = "notastatus".to_string();
+    assert!(
+        !supported.contains(&planted),
+        "the planted out-of-vocabulary status was accepted by the parsed set, so the check \
+         below proves nothing about the real export"
+    );
+
+    assert!(
+        offending.is_empty(),
+        "the committed beads export carries statuses the verification validator refuses: \
+         {offending:?}. The validator models {supported:?}. This blocks EVERY pane's export, at \
+         commit time, for a record the committing pane may not have touched — so it is repaired \
+         by the bead's owner changing the status, or by the validator growing the state, and \
+         never by hand-editing the export"
+    );
+}
+
+/// A minimal JSON reader for one flat record, so this guard needs no dependency.
+///
+/// The workspace forbids serde (D1), and the two fields wanted here are strings on a flat
+/// object, so a full parser would be more machinery than the claim needs.
+mod serde_free_json {
+    pub struct Value(String);
+
+    pub fn parse(line: &str) -> Value {
+        Value(line.to_string())
+    }
+
+    impl Value {
+        pub fn field(&self, name: &str) -> String {
+            let needle = format!("\"{name}\":");
+            let Some(at) = self.0.find(&needle) else {
+                return String::new();
+            };
+            let rest = &self.0[at + needle.len()..];
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                return String::new();
+            };
+            let end = rest.find('"').unwrap_or(0);
+            rest[..end].to_string()
+        }
+    }
+}
