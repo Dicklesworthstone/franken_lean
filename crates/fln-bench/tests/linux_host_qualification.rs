@@ -37,9 +37,10 @@ use std::path::Path;
 
 use fln_bench::{
     AttemptRecord, AttemptStatus, BENCHMARK_EVIDENCE_VERSION, BenchmarkRefusal, BenchmarkTelemetry,
-    CacheCondition, CacheState, Captured, ConfidenceAlgorithm, HostProfile,
-    HostQualificationPolicy, LocalBuildIdentity, MeasurementUnit, OutlierPolicy, ProfilerState,
-    QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadKind, WorkloadManifest, assemble_bundle,
+    CacheCondition, CacheState, Captured, ClaimBinding, ClaimClass, ClaimState,
+    ConfidenceAlgorithm, HostProfile, HostQualificationPolicy, LocalBuildIdentity, MeasurementUnit,
+    OutlierPolicy, ProfilerState, QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadKind,
+    WorkloadManifest, assemble_bundle, qualify_host,
 };
 use fln_hash::domain::{Digest, Domain, hash};
 
@@ -365,6 +366,137 @@ fn a_host_that_clears_topology_is_still_refused_for_the_attestations_it_cannot_s
             "this host supplies physical topology, yet host admission refused on {check:?}; \
              the topology-only control must pass host admission"
         );
+    }
+}
+
+/// THE ARTIFACT odwj PRESCRIBES FOR THIS HOST.
+///
+/// odwj's acceptance says in as many words: "A missing or invalid host lane
+/// yields a BLOCKED evidence artifact and this task remains open." This cell
+/// produces that artifact from the live host and pins what it must and must not
+/// contain. It is the honest terminal output of the baseline lane here, and it
+/// is deliberately the absence of a measurement made citable.
+#[test]
+fn this_host_yields_a_blocked_qualification_artifact_naming_every_failing_check() {
+    let profile = capture();
+    let blocked = qualify_host(&profile, strict_baseline_policy())
+        .expect_err("this host cannot satisfy the strict baseline policy");
+
+    assert_eq!(
+        blocked.claim,
+        ClaimBinding {
+            class: ClaimClass::Benchmark,
+            state: ClaimState::Blocked,
+        },
+        "a blocked lane may claim no state other than BLOCKED; anything else \
+         would let this artifact read as a weak pass"
+    );
+    assert_eq!(
+        blocked.host_root,
+        profile.root(),
+        "the artifact must bind the host it judged"
+    );
+
+    // EVERY failing check, not the first: an evidence artifact has to say what
+    // would need to change, which `validate_host` cannot because it
+    // short-circuits at the first refusal.
+    assert!(
+        blocked.failing_checks.len() >= 2,
+        "a short-circuited single check is not an evidence artifact; got {:?}",
+        blocked.failing_checks
+    );
+    assert_eq!(
+        blocked.failing_checks,
+        {
+            let mut sorted = blocked.failing_checks.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted
+        },
+        "failing checks must be sorted and duplicate-free"
+    );
+
+    // The artifact must carry no measurement. A blocked lane measured nothing,
+    // and emitting a figure anyway is the manufacture this cell exists to stop.
+    let line = blocked.ndjson();
+    assert!(
+        line.contains("\"benchmark_claim_state\":\"BLOCKED\""),
+        "{line}"
+    );
+    assert!(line.contains("\"valid_samples\":0"), "{line}");
+    assert!(line.contains("\"measurements\":0"), "{line}");
+    assert!(
+        line.ends_with('\n'),
+        "NDJSON records are newline-terminated"
+    );
+
+    // Emit it so a run produces a citable artifact rather than only an
+    // assertion. stdout under --nocapture is the retention surface here; no
+    // host-specific bytes are committed, because binary_hash moves on every
+    // rebuild and a committed copy would be stale the moment it landed.
+    eprintln!("odwj-blocked-host-qualification: {line}");
+}
+
+#[test]
+fn blocked_host_qualification_agrees_with_bundle_admission() {
+    // THE JOIN. `qualify_host` is a second reading of the same policy, and a
+    // second copy of a predicate that can drift from the enforcing one is the
+    // defect this repository names most often. This binds the two: whenever
+    // `qualify_host` refuses, `assemble_bundle` must also refuse for a HOST
+    // reason, and whenever it admits, `assemble_bundle` must not raise a host
+    // refusal. Checked under both a strict and a permissive policy, so it
+    // cannot pass by both sides always refusing.
+    for (label, policy) in [
+        ("strict", strict_baseline_policy()),
+        (
+            "topology-only",
+            HostQualificationPolicy {
+                require_physical_topology: true,
+                require_power_governor: false,
+                require_thermal_sensors: false,
+                require_exclusive_cores: false,
+                require_stable_frequency: false,
+                require_thermal_stability: false,
+                allow_virtualization: false,
+                allow_translation: false,
+                allow_profiler: false,
+            },
+        ),
+    ] {
+        let profile = capture();
+        let report = qualify_host(&profile, policy);
+        let workload = workload_with(policy);
+        let host_root = profile.root();
+        let workload_root = workload.root();
+        let outcome = assemble_bundle(
+            "odwj-qualification-join",
+            profile,
+            workload,
+            one_valid_attempt(host_root, workload_root),
+            empty_telemetry(),
+        );
+        let bundle_refused_host = matches!(outcome, Err(BenchmarkRefusal::HostNotQualified { .. }));
+
+        assert_eq!(
+            report.is_err(),
+            bundle_refused_host,
+            "under the {label:?} policy, qualify_host says blocked={} while \
+             bundle admission says host-refused={} — the two readings of the \
+             same policy have drifted",
+            report.is_err(),
+            bundle_refused_host
+        );
+
+        // Anti-vacuity: the strict policy must refuse and the topology-only one
+        // must not, so this loop cannot agree by refusing everything.
+        match label {
+            "strict" => assert!(report.is_err(), "the strict policy must block this host"),
+            _ => assert!(
+                report.is_ok(),
+                "this host supplies physical topology; blocked on {:?}",
+                report.err().map(|b| b.failing_checks)
+            ),
+        }
     }
 }
 

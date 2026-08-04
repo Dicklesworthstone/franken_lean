@@ -2756,6 +2756,172 @@ fn validate_host(
     Ok(())
 }
 
+/// The artifact `franken_lean-odwj` prescribes for a host that cannot be
+/// qualified: *"A missing or invalid host lane yields a BLOCKED evidence
+/// artifact and this task remains open."*
+///
+/// It is deliberately the **absence** of a measurement made citable. It carries
+/// no sample, no timing and no summary, because a host that failed admission
+/// produced none — and a lane that emitted a figure anyway would be
+/// manufacturing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedHostQualification {
+    pub schema_version: u16,
+    /// Always `{ Benchmark, Blocked }`. A blocked lane may not claim any other
+    /// state, which is what stops this artifact being read as a weak pass.
+    pub claim: ClaimBinding,
+    pub host_root: Digest,
+    /// EVERY policy check the host failed, sorted and duplicate-free — not the
+    /// first one. `validate_host` short-circuits because it only has to decide
+    /// admission; an evidence artifact has to say what would need to change.
+    pub failing_checks: Vec<&'static str>,
+}
+
+impl BlockedHostQualification {
+    pub fn ndjson(&self) -> String {
+        let checks = self
+            .failing_checks
+            .iter()
+            .map(|check| format!("\"{}\"", json_escape(check)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"schema\":\"fln.bench.host-qualification-blocked\",\"version\":{},\
+             \"host_root\":\"{}\",\"benchmark_claim_class\":\"benchmark\",\
+             \"benchmark_claim_state\":\"BLOCKED\",\"failing_checks\":[{}],\
+             \"valid_samples\":0,\"measurements\":0}}\n",
+            self.schema_version, self.host_root, checks,
+        )
+    }
+}
+
+/// Evaluate a host against a policy, collecting every failing check.
+///
+/// The `Ok`/`Err` verdict must agree with the admission `assemble_bundle`
+/// performs; `blocked_host_qualification_agrees_with_bundle_admission` in
+/// `linux_host_qualification` holds the two together, because a second copy of
+/// this predicate that could drift from the enforcing one is the defect this
+/// repository names most often.
+pub fn qualify_host(
+    profile: &HostProfile,
+    policy: HostQualificationPolicy,
+) -> Result<(), BlockedHostQualification> {
+    let mut failing: Vec<&'static str> = Vec::new();
+
+    // The unconditional facts, in validate_host's own order.
+    for (check, ok) in [
+        (
+            "cpu-sku",
+            observed_text(&profile.cpu_sku, "cpu-sku").is_ok(),
+        ),
+        (
+            "architecture",
+            observed_text(&profile.architecture, "architecture").is_ok(),
+        ),
+        (
+            "logical-cores",
+            observed_positive(&profile.enabled_logical_cores, "logical-cores").is_ok(),
+        ),
+        (
+            "ram-bytes",
+            observed_positive(&profile.ram_bytes, "ram-bytes").is_ok(),
+        ),
+        (
+            "storage-device",
+            observed_text(&profile.storage_device, "storage-device").is_ok(),
+        ),
+        (
+            "filesystem",
+            observed_text(&profile.filesystem, "filesystem").is_ok(),
+        ),
+        (
+            "os-release",
+            observed_text(&profile.os_release, "os-release").is_ok(),
+        ),
+        (
+            "kernel-release",
+            observed_text(&profile.kernel_release, "kernel-release").is_ok(),
+        ),
+        (
+            "target-triple",
+            observed_text(&profile.target_triple, "target-triple").is_ok(),
+        ),
+        (
+            "build-profile",
+            observed_text(&profile.build_profile, "build-profile").is_ok(),
+        ),
+        (
+            "monotonic-clock",
+            observed_positive(&profile.monotonic_clock_resolution_ns, "monotonic-clock").is_ok(),
+        ),
+    ] {
+        if !ok {
+            failing.push(check);
+        }
+    }
+
+    if policy.require_physical_topology {
+        if observed_positive(&profile.physical_cores, "physical-topology").is_err() {
+            failing.push("physical-topology");
+        }
+        if profile.smt_enabled.observed_value().is_none() {
+            failing.push("smt");
+        }
+    }
+    if policy.require_power_governor
+        && observed_text(&profile.power_governor, "power-governor").is_err()
+    {
+        failing.push("power-governor");
+    }
+    if policy.require_thermal_sensors
+        && observed_text(&profile.thermal_sensors, "thermal-sensors").is_err()
+    {
+        failing.push("thermal-sensors");
+    }
+    if policy.require_exclusive_cores
+        && observed_true(&profile.isolation.exclusive_cores, "exclusive-cores").is_err()
+    {
+        failing.push("exclusive-cores");
+    }
+    if policy.require_stable_frequency
+        && observed_true(&profile.isolation.stable_frequency, "stable-frequency").is_err()
+    {
+        failing.push("stable-frequency");
+    }
+    if policy.require_thermal_stability
+        && observed_true(&profile.isolation.thermal_stable, "thermal-stability").is_err()
+    {
+        failing.push("thermal-stability");
+    }
+    if !policy.allow_virtualization
+        && profile.virtualization.observed_value().map(String::as_str)
+            == Some("hypervisor-detected")
+    {
+        failing.push("virtualization-forbidden");
+    }
+    if !policy.allow_translation
+        && profile.translation.observed_value().map(String::as_str)
+            != Some("native-target-architecture")
+    {
+        failing.push("translation-forbidden");
+    }
+
+    if failing.is_empty() {
+        return Ok(());
+    }
+    failing.sort_unstable();
+    failing.dedup();
+    Err(BlockedHostQualification {
+        schema_version: BENCHMARK_EVIDENCE_VERSION,
+        claim: ClaimBinding {
+            class: ClaimClass::Benchmark,
+            state: ClaimState::Blocked,
+        },
+        host_root: profile.root(),
+        failing_checks: failing,
+    })
+}
+
 fn validate_workload(workload: &WorkloadManifest) -> Result<(), BenchmarkRefusal> {
     if workload.schema_version.ne(&BENCHMARK_EVIDENCE_VERSION) {
         return Err(BenchmarkRefusal::UnsupportedSchema {
