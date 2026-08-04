@@ -648,7 +648,12 @@ pub fn acosh(x: f64) -> f64 {
     if x == f64::INFINITY {
         return x;
     }
-    if x > 67_108_864.0 {
+    if x < 2.0 {
+        // acosh(1 + t) = log1p(t + sqrt(t * (2 + t))).  Keeping the small
+        // quantity in log1p avoids discarding hundreds of ULPs near +1.
+        let t = x - 1.0;
+        log1p(t + sqrt(t * (x + 1.0)))
+    } else if x > 67_108_864.0 {
         log(x) + LN2_HI + LN2_LO
     } else {
         log(x + sqrt((x - 1.0) * (x + 1.0)))
@@ -668,6 +673,9 @@ pub fn atanh(x: f64) -> f64 {
     }
     if x == 0.0 {
         return x;
+    }
+    if x < 0.0 {
+        return -atanh(-x);
     }
     0.5 * log1p((2.0 * x) / (1.0 - x))
 }
@@ -1286,6 +1294,20 @@ mod tests {
             (atan(-0.1), 0xbfb9_83e2_82e2_cc4d),
             (atan(0.1), 0x3fb9_83e2_82e2_cc4d),
             (acos(0.95), 0x3fd4_52e8_fa93_e43c),
+        ] {
+            assert!(
+                ulp_distance(actual, f64::from_bits(expected)) <= 1,
+                "actual={actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inverse_hyperbolic_near_domain_boundaries_stay_within_one_ulp() {
+        for (actual, expected) in [
+            (acosh(1.000_001), 0x3f57_2ba4_1f96_166c),
+            (atanh(-0.9), 0xbff7_8e36_0604_b32d),
+            (atanh(0.9), 0x3ff7_8e36_0604_b32d),
         ] {
             assert!(
                 ulp_distance(actual, f64::from_bits(expected)) <= 1,
