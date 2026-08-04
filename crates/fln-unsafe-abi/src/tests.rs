@@ -1497,6 +1497,84 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
 }
 
 #[test]
+fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    const CLASS_COUNT: usize = 512;
+
+    for width in [1, 8, 32] {
+        crate::membrane::drain_small_bins_for_test();
+        let round_start = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let allocations_ready = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let round_finished = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let mut senders = Vec::with_capacity(width);
+        let mut receivers = Vec::with_capacity(width);
+        for _ in 0..width {
+            let (sender, receiver) = std::sync::mpsc::channel::<usize>();
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+
+        senders.rotate_left(1);
+        let mut workers = Vec::with_capacity(width);
+        for (receiver, successor) in receivers.into_iter().zip(senders) {
+            let round_start = std::sync::Arc::clone(&round_start);
+            let allocations_ready = std::sync::Arc::clone(&allocations_ready);
+            let round_finished = std::sync::Arc::clone(&round_finished);
+            workers.push(std::thread::spawn(move || {
+                let before = crate::membrane::small_page_local_metrics_for_test();
+                for size in (8usize..=4096).step_by(8) {
+                    // One class at a time bounds the peak live-page footprint
+                    // to `width`, while still forcing every exact class
+                    // through a concurrent owner-to-foreign-free handoff.
+                    round_start.wait();
+                    let block = export_mi_malloc_small(size);
+                    assert!(!block.is_null(), "class {size} allocation must succeed");
+                    allocations_ready.wait();
+                    successor
+                        .send(block.expose_provenance())
+                        .expect("ring successor is live");
+                    let foreign = receiver.recv().expect("ring predecessor is live");
+                    let foreign =
+                        core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(foreign);
+                    export_mi_free(foreign);
+                    crate::membrane::drain_small_bins_for_test();
+                    round_finished.wait();
+                }
+                (before, crate::membrane::small_page_local_metrics_for_test())
+            }));
+        }
+
+        let mut allocated_pages = 0;
+        let mut reclaimed_pages = 0;
+        for worker in workers {
+            let (before, after) = worker.join().expect("all-class ring handoff worker");
+            assert_eq!(
+                after.0,
+                before.0 + CLASS_COUNT,
+                "width {width}: every exact class creates one local page"
+            );
+            allocated_pages += after.0 - before.0;
+            // A page's terminal release may be attributed to its creator
+            // rather than the worker that drained the foreign free, so only
+            // the matrix-wide sum is a stable semantic observation.
+            reclaimed_pages += after.1 - before.1;
+        }
+        assert_eq!(
+            allocated_pages,
+            width * CLASS_COUNT,
+            "width {width}: every exact class creates one page per worker"
+        );
+        assert_eq!(
+            reclaimed_pages,
+            width * CLASS_COUNT,
+            "width {width}: every foreign handoff drains and reclaims each class page exactly once"
+        );
+    }
+}
+
+#[test]
 fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
     let _g = lock();
     use crate::export::{export_lean_small_mem_size, export_mi_free};
