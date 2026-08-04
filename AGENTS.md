@@ -578,7 +578,7 @@ The same correction applies to anything else naming holders by argv — an orche
 | 15 | `macro_txn_no_mock_e2e.sh` | contained |
 | 14 | `parser_corpus_no_mock_e2e.sh` | contained |
 | 13 | `certificate_format_no_mock_e2e.sh`, `dynamic_parser_no_mock_e2e.sh`, `env_snapshots.sh`, `hygiene_no_mock_e2e.sh`, `lexer_no_mock_e2e.sh` | contained — `env_snapshots.sh` is the lane every generalisation here was made from |
-| 12 | `unsafe_note_clippy.sh` | contained |
+| 13 | `unsafe_note_clippy.sh` | contained |
 | 11 | `g0_4_no_mock_e2e.sh` | contained |
 | 10 | `verdict_schema.sh` | governs bare **`scripts`**, so *any* write under `scripts/` voids it; `check.sh` enumerates individual scripts instead |
 | 8 | `kernel_replay.sh` (`AP6_INPUT_PATHS`) | contained |
