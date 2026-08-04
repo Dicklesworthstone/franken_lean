@@ -4188,7 +4188,16 @@ fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
         let findings = granularity_findings(&d);
         assert!(
             !fires(&findings, "granularity-unbound"),
-            "{citation} must resolve: {findings:?}"
+            "{citation} must resolve.\n\nREAD THE NEXT SENTENCE BEFORE ACTING ON THE DUMP BELOW. \
+             This control MUTATES the derivation in memory: it clears the coarse citations of \
+             `{bead}` to simulate a migration, so a `granularity-shrank` naming `{bead}` in this \
+             list is PLANTED BY THIS TEST and is asserted for immediately afterwards. It is not \
+             a live finding, `{bead}` is not stale, and deleting it from \
+             FILE_GRANULAR_EVIDENCE_ALLOWANCE would redden the tree with `granularity-grew` on \
+             the next run. The real failure is the `granularity-unbound` entry or entries, which \
+             ARE live and name the row that owns them. Measured 2026-08-04: this dump was read \
+             as a stale-allowance report and routed as one, and the prescribed repair would have \
+             broken a healthy row.\n\n{findings:?}"
         );
         assert!(
             findings
