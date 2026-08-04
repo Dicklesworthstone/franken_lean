@@ -540,5 +540,41 @@ if [ "$real_sha_before_m5" != "$real_sha_after_m5" ]; then
 fi
 emit mutant_drill passed "\"mutant\":\"fln-8w8-M5\",\"discriminator\":\"heartbeat.after_small_ctor\",\"real_tree_sha_stable\":true"
 
+# ---- lane 8f: named mutant fln-8w8-M6 ----------------------------------------
+# Lost-free perturbation: suppress both small-free wrappers at their shared
+# raw-release call in a SIXTH isolated copy. The production small-page drain
+# unit must fail its bounded deferred-tail contract before it can reach the
+# later page-reclamation assertion; this is a direct allocator test rather
+# than a C fact because allocator addresses and page reuse are not
+# cross-runtime semantic facts.
+note "lane 8f: mutant drill fln-8w8-M6 (small free dropped in a copy)"
+MUT6_WS="$ART_DIR/mutant-ws-m6"
+mkdir -p "$MUT6_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT6_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT6_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT6_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT6_WS/"
+printf '\n[workspace]\n' >>"$MUT6_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m6=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if ! sed -i 's|unsafe { membrane::small_free_raw(p.cast::<u8>()) };|if false { unsafe { membrane::small_free_raw(p.cast::<u8>()) }; } // fln-8w8-M6: small free dropped|' "$MUT6_WS/fln-unsafe-abi/src/export.rs" \
+    || [ "$(grep -c "fln-8w8-M6: small free dropped" "$MUT6_WS/fln-unsafe-abi/src/export.rs")" -ne 2 ]; then
+    fail mutant_plant_m6 "\"detail\":\"mutation did not apply to both small-free wrappers\""
+fi
+set +e
+(cd "$MUT6_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT6_WS/target" cargo test --offline -q small_heap_pages_reclaim_after_deferred_blocks_drain) >"$ART_DIR/mutant6_test.log" 2>&1
+mutant6_rc=$?
+set -e
+if [ "$mutant6_rc" -eq 0 ]; then
+    fail mutant_drill_m6 "\"detail\":\"fln-8w8-M6 SURVIVED — the page-drain test accepted a lost small free\""
+fi
+if ! grep -q "the bounded deferred-free cache retains only its configured tail" "$ART_DIR/mutant6_test.log"; then
+    fail mutant_drill_m6 "\"detail\":\"mutant failed but not on the designed deferred-tail discriminator\",\"artifact\":\"mutant6_test.log\""
+fi
+real_sha_after_m6=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m6" != "$real_sha_after_m6" ]; then
+    fail mutant_isolation_m6 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"fln-8w8-M6\",\"discriminator\":\"deferred_tail_after_small_free\",\"real_tree_sha_stable\":true"
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
