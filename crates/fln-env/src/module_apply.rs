@@ -3075,4 +3075,181 @@ mod tests {
             final_right_then_left.indexes()
         );
     }
+
+    /// The thread-order half of the metamorphic matrix the bead requires
+    /// ("insertion and thread-order metamorphic matrices").
+    ///
+    /// The sibling above varies the order in which two modules are applied
+    /// SEQUENTIALLY: each transaction is prepared against the state the previous
+    /// one published, so no plan is ever prepared against a base that later
+    /// moves. That is the insertion-order half, and cod_2's own landing comment
+    /// marks it as "not a thread-matrix claim".
+    ///
+    /// Concurrency introduces a case sequential ordering cannot: two plans
+    /// prepared against the SAME base, only one of which can publish. This test
+    /// prepares both on real threads against one shared base and then asserts
+    /// the three things that must hold when they race:
+    ///
+    /// 1. the loser is refused as `StaleBase` — the bead requires base/checkpoint
+    ///    drift to be typed before publication and says conflicts are "never
+    ///    last-writer-wins", so a silent success here would be the defect;
+    /// 2. re-preparing the loser against the winner's published state converges;
+    /// 3. the converged state is IDENTICAL whichever thread won — state,
+    ///    provenance root, logical root and both indexes.
+    ///
+    /// Point 3 is the metamorphic proper: the schedule is free, the result is
+    /// not.
+    #[test]
+    fn concurrent_module_apply_resolves_by_stale_base_and_converges_either_way() {
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(Environment::new(), empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let left = named_record(
+            "fixture.left",
+            "fixture.left.decl",
+            "fixture.left.extra",
+            11,
+        );
+        let right = named_record(
+            "fixture.right",
+            "fixture.right.decl",
+            "fixture.right.extra",
+            12,
+        );
+
+        // Prepare BOTH plans against the same base, on real threads. Preparation
+        // is the phase that reads the base, so this is where a schedule can
+        // actually differ; the commits below then model the two resolutions of
+        // that race.
+        let prepare =
+            |record: ModuleContributionRecord, decl: &'static str, extra: &'static str| {
+                let base = base.clone();
+                move || {
+                    let preflight = preflight_module_apply(transaction_with_target(
+                        vec![record.clone()],
+                        record,
+                        decl,
+                        extra,
+                    ))
+                    .expect("transaction preflights");
+                    let candidate = base
+                        .environment()
+                        .add_decl((*preflight.transaction().declarations()[0]).clone())
+                        .expect("declaration is unique")
+                        .add_decl((*preflight.transaction().extra_declarations()[0]).clone())
+                        .expect("extra declaration is unique");
+                    match prepare_module_apply(&preflight, &base, &candidate) {
+                        Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                        other => panic!("expected a prepared application, got {other:?}"),
+                    }
+                }
+            };
+
+        // Run the two resolutions of the race. `winner_first` decides which
+        // thread's plan publishes; the loser must then be refused and replayed.
+        let resolve = |left_wins: bool| {
+            let left_thread = std::thread::spawn(prepare(
+                left.clone(),
+                "fixture.left.decl",
+                "fixture.left.extra",
+            ));
+            let right_thread = std::thread::spawn(prepare(
+                right.clone(),
+                "fixture.right.decl",
+                "fixture.right.extra",
+            ));
+            let left_plan = left_thread.join().expect("left preparation thread");
+            let right_plan = right_thread.join().expect("right preparation thread");
+
+            let (winner_plan, loser_plan, winner_record, loser_record, loser_decl, loser_extra) =
+                if left_wins {
+                    (
+                        left_plan,
+                        right_plan,
+                        left.clone(),
+                        right.clone(),
+                        "fixture.right.decl",
+                        "fixture.right.extra",
+                    )
+                } else {
+                    (
+                        right_plan,
+                        left_plan,
+                        right.clone(),
+                        left.clone(),
+                        "fixture.left.decl",
+                        "fixture.left.extra",
+                    )
+                };
+
+            let published = winner_plan
+                .commit(&base)
+                .expect("the winning plan was prepared against the current base")
+                .into_state();
+
+            // (1) The loser was prepared against a base that has since moved. It
+            // must be REFUSED, by name, rather than publishing over the winner.
+            match loser_plan.commit(&published) {
+                Err(ModuleApplyCommitError::StaleBase) => {}
+                Ok(_) => panic!(
+                    "the losing plan published against a base that had already moved; \
+                     this is last-writer-wins, which the bead forbids"
+                ),
+                Err(other) => panic!("expected StaleBase for the losing plan, got {other:?}"),
+            }
+
+            // (2) Replaying the loser against the published state converges.
+            let replay = preflight_module_apply(transaction_with_target(
+                vec![winner_record, loser_record.clone()],
+                loser_record,
+                loser_decl,
+                loser_extra,
+            ))
+            .expect("replayed transaction preflights");
+            let candidate = published
+                .environment()
+                .add_decl((*replay.transaction().declarations()[0]).clone())
+                .expect("replayed declaration is unique")
+                .add_decl((*replay.transaction().extra_declarations()[0]).clone())
+                .expect("replayed extra declaration is unique");
+            match prepare_module_apply(&replay, &published, &candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
+                    .commit(&published)
+                    .expect("replay base remains current")
+                    .into_state(),
+                other => panic!("expected a prepared replay application, got {other:?}"),
+            }
+        };
+
+        let left_won = resolve(true);
+        let right_won = resolve(false);
+
+        // (3) The metamorphic: which thread won is a scheduling accident and may
+        // not survive into the published evidence.
+        assert_eq!(
+            left_won, right_won,
+            "the committed state depends on which thread won the race"
+        );
+        assert_eq!(
+            left_won.manifest().root(),
+            right_won.manifest().root(),
+            "provenance root depends on the schedule"
+        );
+        assert_eq!(
+            left_won.logical_root(),
+            right_won.logical_root(),
+            "logical root depends on the schedule"
+        );
+        assert_eq!(
+            left_won.indexes(),
+            right_won.indexes(),
+            "bidirectional indexes depend on the schedule"
+        );
+    }
 }
