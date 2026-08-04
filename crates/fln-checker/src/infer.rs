@@ -363,6 +363,9 @@ pub enum InferencePhase {
     LetBody,
     LetZeta,
     LiteralType,
+    ProjectionScrutinee,
+    ProjectionWhnf,
+    ProjectionField,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +506,25 @@ pub enum InferenceRefusal {
         site: InferenceSortSite,
         refusal: WhnfRefusal,
     },
+    /// KR-112: no projection rule is registered for the named structure. The
+    /// rules are CALLER-SUPPLIED through the reduction context, so their absence
+    /// is untrusted input rather than an internal inconsistency.
+    ProjectionRuleMissing {
+        structure: WireName,
+    },
+    /// KR-112: the scrutinee's type did not reduce to an application of the
+    /// structure the projection names.
+    ProjectionStructureMismatch {
+        expected: WireName,
+    },
+    /// KR-112: the rule's parameter_count exceeds the arguments the scrutinee's
+    /// type actually supplies, or the constructor telescope is shorter than the
+    /// parameters plus the requested field.
+    ProjectionArityExceeded {
+        structure: WireName,
+        needed: usize,
+        available: usize,
+    },
     /// KR-109: the let value's inferred type is not definitionally equal to the
     /// declared type. The binder ordinal is retained because a let telescope is
     /// flattened, so "which let" is not recoverable from the term root.
@@ -528,13 +550,14 @@ pub enum InferenceDeferred {
     },
     /// KR-109: the let value / declared type conversion could not be decided
     /// within the definitional-equality budget. Never a rejection.
-    LetValueConversion {
-        binder: usize,
-        need: DefEqDeferred,
-    },
-    NatLiteral,
-    StringLiteral,
-    Projection,
+    LetValueConversion { binder: usize, need: DefEqDeferred },
+    // NatLiteral, StringLiteral and Projection were REMOVED here, not merely left
+    // unconstructed. KR-110 and KR-112 implemented those rules and stopped
+    // building the variants, but the enum went on advertising three rule families
+    // as unimplemented -- a declared set that had quietly become a lie.
+    // `no_rule_family_deferral_remains_reachable` matches this enum EXHAUSTIVELY,
+    // so it failed to COMPILE until they were gone, and a future rule family
+    // added as a deferral fails the same way rather than slipping in unnoticed.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1412,6 +1435,37 @@ impl<'a> ArenaAssembler<'a> {
         Ok(id)
     }
 
+    /// KR-112: the assembler had no projection constructor; this is its only
+    /// caller. Added rather than open-coding an arena, so the node-budget
+    /// accounting stays in one place.
+    fn push_projection(
+        &mut self,
+        structure_name: &WireName,
+        index: u64,
+        expression: ExprId,
+    ) -> Result<ExprId, MaterializeHalt> {
+        let at = self.nodes.len();
+        self.control.step(at)?;
+        self.control
+            .output(1u64.saturating_add(name_owned_units(structure_name)), at)?;
+        self.control.arena_node(self.total_nodes(1), at)?;
+        let id = ExprId::from_index(self.nodes.len()).ok_or_else(|| {
+            MaterializeHalt::Stop(TermStop::Resource {
+                limit: TermLimit::ArenaNodes,
+                allowed: self.control.budget.max_arena_nodes.min(u64::from(u32::MAX)),
+                observed: self.total_nodes(1),
+                at,
+                completed_steps: self.control.steps,
+            })
+        })?;
+        self.nodes.push(ExprNode::Projection {
+            structure_name: structure_name.clone(),
+            index,
+            expression,
+        });
+        Ok(id)
+    }
+
     fn push_forall(
         &mut self,
         binder_name: &WireName,
@@ -1534,6 +1588,16 @@ struct LetState {
     pending: Option<LetPending>,
 }
 
+/// KR-112: a projection awaiting its scrutinee's inferred type.
+///
+/// Boxed in the continuation for the reason `LetState` records: `run` is one
+/// frame on a 64 KiB budget shared by every rule.
+struct ProjectionState {
+    structure_name: WireName,
+    index: u64,
+    scrutinee: TermReference,
+}
+
 /// KR-109: the in-flight binder's materialized parts.
 struct LetPending {
     declared_type: Arc<WireExpr>,
@@ -1568,6 +1632,9 @@ enum Dispatch {
     Let {
         binders: Vec<LetBinderSource>,
         body: TermReference,
+    },
+    Projection {
+        state: Box<ProjectionState>,
     },
 }
 
@@ -1607,6 +1674,11 @@ enum Continuation {
     /// bound value zeta-substituted back in.
     LetBody {
         state: Box<LetState>,
+    },
+    /// KR-112: the projection's scrutinee is being inferred; its type decides the
+    /// structure, its parameters, and therefore the field type.
+    ProjectionScrutinee {
+        state: Box<ProjectionState>,
     },
 }
 
@@ -2149,7 +2221,20 @@ fn dispatch_reference(
         }
         ExprNode::NatLiteral { .. } => literal_type(LITERAL_NAT, context, control, cancelled),
         ExprNode::StringLiteral(_) => literal_type(LITERAL_STRING, context, control, cancelled),
-        ExprNode::Projection { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Projection)),
+        ExprNode::Projection {
+            structure_name,
+            index,
+            expression,
+        } => Ok(Dispatch::Projection {
+            state: Box::new(ProjectionState {
+                structure_name: structure_name.clone(),
+                index: *index,
+                scrutinee: TermReference {
+                    source: reference.source,
+                    root: *expression,
+                },
+            }),
+        }),
         ExprNode::Metadata { .. } => Err(LeafHalt::Fault(InferenceFault::ResidualMetadata {
             index: root.index(),
         })),
@@ -2735,6 +2820,250 @@ impl<'a> InferenceEngine<'a> {
         }
         self.remove_let_locals(&state.binders)?;
         Ok(result)
+    }
+
+    /// KR-112: reduce the scrutinee's inferred type so the structure is visible.
+    #[inline(never)]
+    fn projection_whnf(&mut self, type_: &WireExpr) -> Result<WireExpr, LeafHalt> {
+        self.control
+            .step(self.cancelled, InferencePhase::ProjectionWhnf, 0)
+            .map_err(LeafHalt::stop)?;
+        self.control.progress.whnf_queries = self.control.progress.whnf_queries.saturating_add(1);
+        match whnf_with(
+            type_,
+            self.context.reduction(),
+            self.control.budget.whnf,
+            &mut *self.cancelled,
+        ) {
+            WhnfOutcome::Complete(result) => Ok(result.term),
+            WhnfOutcome::Refused(refusal) => {
+                Err(LeafHalt::Refused(InferenceRefusal::ReductionRefusal {
+                    argument: 0,
+                    refusal,
+                }))
+            }
+            WhnfOutcome::Inconclusive(stop) => Err(LeafHalt::stop(InferenceStop::Whnf {
+                argument: 0,
+                stop: Box::new(stop),
+                progress: self.control.progress,
+            })),
+            WhnfOutcome::InternalFault(fault) => {
+                Err(LeafHalt::Fault(InferenceFault::Whnf { argument: 0, fault }))
+            }
+        }
+    }
+
+    /// KR-112: the field type of a projection.
+    ///
+    /// The structure metadata is CALLER-SUPPLIED through the reduction context's
+    /// projection rules -- not derived from the environment and not validated by
+    /// it -- so every field of a rule is untrusted input here, and each way it can
+    /// be wrong gets its own typed outcome rather than a shared generic rejection.
+    ///
+    /// Reduce the scrutinee's type to an application of the named structure; take
+    /// the rule's constructor and parameter count; instantiate the constructor's
+    /// telescope with the structure's own arguments for the parameters, then with
+    /// a projection of the SAME scrutinee for each earlier field, because a later
+    /// field's type may mention an earlier one. The requested field's domain is
+    /// the answer.
+    ///
+    /// **Not checked, and disclosed rather than faked:** that the constructor is
+    /// declared with `ConstantKind::Constructor`. `ConstantDeclaration` exposes no
+    /// `kind()` accessor, so this rule cannot see it.
+    #[inline(never)]
+    fn complete_projection(
+        &mut self,
+        state: ProjectionState,
+        scrutinee_type: &WireExpr,
+    ) -> Result<WireExpr, LeafHalt> {
+        let reduced = self.projection_whnf(scrutinee_type)?;
+
+        let mut cursor = reduced.root();
+        let mut arguments: Vec<ExprId> = Vec::new();
+        while let Some(ExprNode::Apply { function, argument }) = reduced.node(cursor) {
+            arguments.push(*argument);
+            cursor = *function;
+        }
+        arguments.reverse();
+        let levels: Vec<LevelId> = match reduced.node(cursor) {
+            Some(ExprNode::Constant { name, levels }) if *name == state.structure_name => {
+                levels.clone()
+            }
+            _ => {
+                return Err(LeafHalt::Refused(
+                    InferenceRefusal::ProjectionStructureMismatch {
+                        expected: state.structure_name,
+                    },
+                ));
+            }
+        };
+
+        let rule = self
+            .context
+            .reduction()
+            .projection_rules()
+            .iter()
+            .find(|candidate| *candidate.structure_name() == state.structure_name)
+            .ok_or(LeafHalt::Refused(InferenceRefusal::ProjectionRuleMissing {
+                structure: state.structure_name.clone(),
+            }))?;
+        let parameters = rule.parameter_count();
+        let constructor_name = rule.constructor_name().clone();
+        if parameters > arguments.len() {
+            return Err(LeafHalt::Refused(
+                InferenceRefusal::ProjectionArityExceeded {
+                    structure: state.structure_name,
+                    needed: parameters,
+                    available: arguments.len(),
+                },
+            ));
+        }
+
+        let declaration =
+            self.context
+                .constants()
+                .find(&constructor_name)
+                .ok_or(LeafHalt::Refused(InferenceRefusal::UnknownConstant {
+                    name: constructor_name.clone(),
+                }))?;
+        if declaration.level_parameters().len() != levels.len() {
+            return Err(LeafHalt::Refused(InferenceRefusal::ConstantUniverseArity {
+                name: constructor_name,
+                expected: declaration.level_parameters().len(),
+                actual: levels.len(),
+            }));
+        }
+        let constructor_type = match instantiate_term_parameters_from_level_roots_with(
+            declaration.type_(),
+            declaration.level_parameters(),
+            reduced.levels(),
+            &levels,
+            self.control.budget.materialization,
+            self.cancelled,
+        ) {
+            InstantiationOutcome::Complete(type_) => type_,
+            InstantiationOutcome::Refused(refusal) => {
+                return Err(LeafHalt::Fault(
+                    InferenceFault::ConstantInstantiationRefusal {
+                        name: constructor_name,
+                        refusal,
+                    },
+                ));
+            }
+            InstantiationOutcome::Inconclusive(stop) => {
+                return Err(LeafHalt::stop(InferenceStop::Materialization {
+                    phase: InferencePhase::ProjectionField,
+                    stop,
+                    progress: self.control.progress,
+                }));
+            }
+            InstantiationOutcome::InternalFault(fault) => {
+                return Err(LeafHalt::Fault(InferenceFault::ConstantInstantiation {
+                    name: constructor_name,
+                    fault,
+                }));
+            }
+        };
+
+        let reduced_reference = self.store_generated(Arc::new(reduced));
+        let mut function = FunctionState::new(constructor_type);
+        let requested = usize::try_from(state.index)
+            .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        let total = parameters
+            .checked_add(requested)
+            .ok_or(LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+        for step in 0..total {
+            self.control
+                .step(self.cancelled, InferencePhase::ProjectionField, step)
+                .map_err(LeafHalt::stop)?;
+            let rest = match Self::pi_parts(&function) {
+                Ok((_, rest)) => rest,
+                Err(_) => {
+                    return Err(LeafHalt::Refused(
+                        InferenceRefusal::ProjectionArityExceeded {
+                            structure: state.structure_name,
+                            needed: total.saturating_add(1),
+                            available: step,
+                        },
+                    ));
+                }
+            };
+            let instantiation = if step < parameters {
+                // `.get` rather than `[step]`: the index is derived from a
+                // CALLER-SUPPLIED parameter_count, so a direct index would be a
+                // panic path on untrusted input even though the bound was checked
+                // above. Clippy's needless_range_loop pointed here; the honest
+                // repair removes the panic, not just the lint.
+                let argument = *arguments.get(step).ok_or(LeafHalt::Refused(
+                    InferenceRefusal::ProjectionArityExceeded {
+                        structure: state.structure_name.clone(),
+                        needed: parameters,
+                        available: arguments.len(),
+                    },
+                ))?;
+                TermReference {
+                    source: reduced_reference.source,
+                    root: argument,
+                }
+            } else {
+                let earlier = u64::try_from(step - parameters)
+                    .map_err(|_| LeafHalt::Fault(InferenceFault::EmptyWorklist))?;
+                self.projection_of(&state.structure_name, earlier, state.scrutinee)?
+            };
+            function.root = rest;
+            function.instantiations.push(instantiation);
+        }
+
+        let domain = match Self::pi_parts(&function) {
+            Ok((domain, _)) => domain,
+            Err(_) => {
+                return Err(LeafHalt::Refused(
+                    InferenceRefusal::ProjectionArityExceeded {
+                        structure: state.structure_name,
+                        needed: total.saturating_add(1),
+                        available: total,
+                    },
+                ));
+            }
+        };
+        self.materialize_function_subterm(&function, domain, InferencePhase::ProjectionField)
+    }
+
+    /// KR-112: build `<scrutinee>.<field>`, the term substituted for an earlier
+    /// field when a later field's type mentions it.
+    #[inline(never)]
+    fn projection_of(
+        &mut self,
+        structure_name: &WireName,
+        index: u64,
+        scrutinee: TermReference,
+    ) -> Result<TermReference, LeafHalt> {
+        let source = inference_arena(self.input, &self.generated, scrutinee.source)?;
+        let inner = map_materialization(
+            copy_compact_subterm_with(
+                source,
+                scrutinee.root,
+                self.control.budget.materialization,
+                self.cancelled,
+            ),
+            InferencePhase::ProjectionField,
+            self.control.progress,
+        )?;
+        let progress = self.control.progress;
+        let mut assembler =
+            ArenaAssembler::new(self.control.budget.materialization, &mut *self.cancelled);
+        let inner_root = map_assembly(
+            assembler.append(&inner),
+            InferencePhase::ProjectionField,
+            progress,
+        )?;
+        let root = map_assembly(
+            assembler.push_projection(structure_name, index, inner_root),
+            InferencePhase::ProjectionField,
+            progress,
+        )?;
+        let term = assembler.finish(root);
+        Ok(self.store_generated(Arc::new(term)))
     }
 
     /// KR-109: drop the query-local let bindings.
@@ -3554,6 +3883,12 @@ impl<'a> InferenceEngine<'a> {
                     Dispatch::Let { binders, body } => {
                         current = Some(self.begin_let(binders, body)?);
                     }
+                    Dispatch::Projection { state } => {
+                        let scrutinee = state.scrutinee;
+                        self.continuations
+                            .push(Continuation::ProjectionScrutinee { state });
+                        current = Some(scrutinee);
+                    }
                 }
                 continue;
             }
@@ -3651,6 +3986,9 @@ impl<'a> InferenceEngine<'a> {
                 }
                 Continuation::LetBody { state } => {
                     inferred = Some(self.complete_let(*state, value)?);
+                }
+                Continuation::ProjectionScrutinee { state } => {
+                    inferred = Some(self.complete_projection(*state, &value)?);
                 }
             }
         }

@@ -619,35 +619,6 @@ fn generated_level_constructors_preserve_sort_successor_and_constant_instantiati
 }
 
 #[test]
-fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requirement() {
-    let sort_zero = Expr::sort(Level::zero());
-    // KR-110 removed NatLiteral and StringLiteral from this census; KR-112
-    // projections are the only family left. The population is asserted exactly
-    // rather than loosely, so implementing KR-112 must come back through here.
-    let cases = vec![(
-        Expr::proj(primary_name("S"), 0, sort_zero.clone()),
-        InferenceDeferred::Projection,
-    )];
-    let context = InferenceContext::empty(ConstantEnvironment::empty());
-    for (expression, requirement) in cases {
-        for candidate in [expression.clone(), Expr::mdata(KVMap::new(), expression)] {
-            assert!(matches!(
-                infer(
-                    &decoded(&candidate),
-                    &context,
-                    InferenceMode::InferOnly,
-                    InferenceBudget::unlimited(),
-                ),
-                InferenceOutcome::Deferred {
-                    requirement: seen,
-                    ..
-                } if seen == requirement
-            ));
-        }
-    }
-}
-
-#[test]
 fn forall_telescope_infers_dependent_imax_in_both_modes_and_ignores_binder_style() {
     let universe_name = primary_name("u");
     let universe = Level::param(universe_name.clone());
@@ -2987,6 +2958,9 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 | InferencePhase::LetBody
                 | InferencePhase::LetZeta
                 | InferencePhase::LiteralType
+                | InferencePhase::ProjectionScrutinee
+                | InferencePhase::ProjectionWhnf
+                | InferencePhase::ProjectionField
                 | InferencePhase::ForallDomain
                 | InferencePhase::ForallDomainSort
                 | InferencePhase::ForallBody
@@ -3707,62 +3681,6 @@ fn kr109_a_value_whose_type_mismatches_the_annotation_is_rejected_naming_the_bin
 }
 
 #[test]
-fn kr109_the_deferral_set_shrank_by_exactly_the_let_case() {
-    // The anti-vacuity cell for the KR-109 slice: a repair that emptied the
-    // deferral machinery wholesale, rather than removing one member of it,
-    // fails here.
-    //
-    // **This cell CAUGHT THE NEXT SLICE, which is the argument for writing it
-    // this way.** It originally required NatLiteral and StringLiteral to still
-    // defer, and went red the moment KR-110 implemented them — by the same
-    // author, in the same session. The premise moved, so the cell is narrowed to
-    // what remains true rather than deleted: KR-112 still defers, and the let
-    // case still completes.
-    let sort_zero = Expr::sort(Level::zero());
-    let context = InferenceContext::empty(ConstantEnvironment::empty());
-    let still_deferred = vec![(
-        Expr::proj(primary_name("S"), 0, sort_zero.clone()),
-        InferenceDeferred::Projection,
-    )];
-    for (expression, requirement) in still_deferred {
-        let outcome = infer(
-            &decoded(&expression),
-            &context,
-            InferenceMode::InferOnly,
-            InferenceBudget::unlimited(),
-        );
-        assert!(
-            matches!(
-                outcome,
-                InferenceOutcome::Deferred { requirement: ref got, .. } if *got == requirement
-            ),
-            "{requirement:?} must still defer after the KR-109 slice, got {outcome:?}"
-        );
-    }
-
-    // …and the let case no longer does.
-    let well_typed = Expr::let_e(
-        primary_name("x"),
-        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
-        sort_zero.clone(),
-        sort_zero,
-        false,
-    );
-    assert!(
-        matches!(
-            infer(
-                &decoded(&well_typed),
-                &context,
-                InferenceMode::InferOnly,
-                InferenceBudget::unlimited(),
-            ),
-            InferenceOutcome::Complete(_)
-        ),
-        "a well-typed let must now COMPLETE rather than defer"
-    );
-}
-
-#[test]
 fn kr109_let_resources_and_cancellation_stay_typed_and_recover_cleanly() {
     // The resource and cancellation half of KR-109. Every stop must be an
     // Inconclusive in its own class — never a rejection, never an acceptance —
@@ -4017,43 +3935,383 @@ fn kr110_a_type_constant_declared_with_universe_parameters_is_refused() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// KR-112 — projection inference (bead franken_lean-gii.22)
+//
+// The structure metadata is CALLER-SUPPLIED through the reduction context's
+// projection rules, so every field of a rule is untrusted input. These cells are
+// written against that, and against the one way a wrong implementation still
+// produces a well-formed type: forgetting to substitute earlier fields.
+// ---------------------------------------------------------------------------
+
+/// `S : Sort 1` with constructor `mk : (a : Nat) -> (b : Nat) -> S`.
+/// Non-dependent: field 1's type does not mention field 0.
+fn flat_structure_env() -> Vec<ConstantEntry> {
+    let nat = Expr::const_(primary_name("Nat"), Vec::new());
+    vec![
+        header(
+            "Nat",
+            Vec::new(),
+            sort(Level::one()),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "S",
+            Vec::new(),
+            sort(Level::one()),
+            ConstantKind::Inductive,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "mk",
+            Vec::new(),
+            decoded(&Expr::forall_e(
+                primary_name("a"),
+                nat.clone(),
+                Expr::forall_e(
+                    primary_name("b"),
+                    nat,
+                    Expr::const_(primary_name("S"), Vec::new()),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            )),
+            ConstantKind::Constructor,
+            ConstantSafety::Safe,
+        ),
+    ]
+}
+
+fn projection_context(entries: Vec<ConstantEntry>, rules: Vec<ProjectionRule>) -> InferenceContext {
+    let locals = vec![LocalDeclaration::assumption(
+        checker_name("s"),
+        decoded(&Expr::const_(primary_name("S"), Vec::new())),
+    )];
+    InferenceContext::new_with_projection_rules(locals, Vec::new(), rules, environment(entries))
+        .expect("unique checker inference context")
+}
+
+fn flat_rule() -> ProjectionRule {
+    ProjectionRule::new(checker_name("S"), checker_name("mk"), 0)
+}
+
+fn scrutinee() -> Expr {
+    Expr::fvar(FVarId(primary_name("s")))
+}
+
 #[test]
-fn kr110_only_projection_still_defers() {
-    // The anti-vacuity cell for this slice, and the successor to the KR-109 one.
-    // After KR-110 exactly ONE deferral remains. A repair that emptied the
-    // deferral machinery instead of removing two members of it fails here.
-    let context = built_context(Vec::new(), Vec::new(), literal_env(Vec::new(), Vec::new()));
-    let still_deferred = infer(
-        &decoded(&Expr::proj(primary_name("S"), 0, Expr::sort(Level::zero()))),
+fn kr112_projection_infers_the_field_type_in_both_modes() {
+    let context = projection_context(flat_structure_env(), vec![flat_rule()]);
+    for field in [0u64, 1] {
+        for mode in let_modes() {
+            let result = complete(infer(
+                &decoded(&Expr::proj(primary_name("S"), field, scrutinee())),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(
+                expr_model(&result.type_),
+                ExprModel::Other(format!(
+                    "Constant {{ name: {:?}, levels: [] }}",
+                    checker_name("Nat")
+                )),
+                "field {field} must infer Nat ({mode:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn kr112_a_later_field_type_carries_the_earlier_field_projection() {
+    // `D : Sort 1`, `mk : (a : Nat) -> (b : P a) -> D`.
+    // Field 1's type is `P a`, and `a` is field 0. A KR-112 that forgets to
+    // substitute earlier fields still yields a well-formed type -- it just yields
+    // the WRONG one -- so this is the cell that separates the two.
+    let nat = Expr::const_(primary_name("Nat"), Vec::new());
+    let entries = vec![
+        header(
+            "Nat",
+            Vec::new(),
+            sort(Level::one()),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "D",
+            Vec::new(),
+            sort(Level::one()),
+            ConstantKind::Inductive,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "P",
+            Vec::new(),
+            decoded(&Expr::forall_e(
+                primary_name("x"),
+                nat.clone(),
+                Expr::sort(Level::one()),
+                BinderInfo::Default,
+            )),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "dmk",
+            Vec::new(),
+            decoded(&Expr::forall_e(
+                primary_name("a"),
+                nat,
+                Expr::forall_e(
+                    primary_name("b"),
+                    Expr::app(Expr::const_(primary_name("P"), Vec::new()), bvar(0)),
+                    Expr::const_(primary_name("D"), Vec::new()),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            )),
+            ConstantKind::Constructor,
+            ConstantSafety::Safe,
+        ),
+    ];
+    let locals = vec![LocalDeclaration::assumption(
+        checker_name("d"),
+        decoded(&Expr::const_(primary_name("D"), Vec::new())),
+    )];
+    let context = InferenceContext::new_with_projection_rules(
+        locals,
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name("D"),
+            checker_name("dmk"),
+            0,
+        )],
+        environment(entries),
+    )
+    .expect("unique checker inference context");
+
+    let result = complete(infer(
+        &decoded(&Expr::proj(
+            primary_name("D"),
+            1,
+            Expr::fvar(FVarId(primary_name("d"))),
+        )),
         &context,
         InferenceMode::InferOnly,
         InferenceBudget::unlimited(),
+    ));
+    // Expected: `P (d.0)` -- the application of P to a PROJECTION of the same
+    // scrutinee, not to a loose bound variable and not to the binder name.
+    let rendered = format!("{:?}", result.type_);
+    assert!(
+        rendered.contains("Projection"),
+        "field 1's type must carry a projection of the scrutinee, got {rendered}"
     );
     assert!(
+        !rendered.contains("Bound"),
+        "no loose bound variable may survive into the field type, got {rendered}"
+    );
+}
+
+#[test]
+fn kr112_untrusted_projection_rule_fields_each_get_their_own_refusal() {
+    let entries = flat_structure_env();
+
+    // (a) no rule registered for the named structure
+    let no_rule = projection_context(entries.clone(), Vec::new());
+    assert!(
         matches!(
-            still_deferred,
-            InferenceOutcome::Deferred {
-                requirement: InferenceDeferred::Projection,
+            infer(
+                &decoded(&Expr::proj(primary_name("S"), 0, scrutinee())),
+                &no_rule,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ProjectionRuleMissing { .. },
                 ..
             }
         ),
-        "KR-112 projections must STILL defer after the KR-110 slice, got {still_deferred:?}"
+        "a missing projection rule must be its own typed refusal"
     );
-    for expression in [
-        Expr::lit(Literal::Nat(NatLit::from_u64(7))),
-        Expr::lit(Literal::Str("s".to_owned())),
-    ] {
-        assert!(
-            matches!(
-                infer(
-                    &decoded(&expression),
-                    &context,
-                    InferenceMode::InferOnly,
-                    InferenceBudget::unlimited(),
-                ),
-                InferenceOutcome::Complete(_)
+
+    // (b) the rule names a constructor that is not declared
+    let bad_constructor = projection_context(
+        entries.clone(),
+        vec![ProjectionRule::new(
+            checker_name("S"),
+            checker_name("absent"),
+            0,
+        )],
+    );
+    assert!(
+        matches!(
+            infer(
+                &decoded(&Expr::proj(primary_name("S"), 0, scrutinee())),
+                &bad_constructor,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
             ),
-            "literals must now COMPLETE rather than defer"
-        );
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::UnknownConstant { .. },
+                ..
+            }
+        ),
+        "an undeclared constructor must be a typed refusal"
+    );
+
+    // (c) parameter_count exceeds the arguments the scrutinee's type supplies
+    let bad_arity = projection_context(
+        entries.clone(),
+        vec![ProjectionRule::new(
+            checker_name("S"),
+            checker_name("mk"),
+            3,
+        )],
+    );
+    assert!(
+        matches!(
+            infer(
+                &decoded(&Expr::proj(primary_name("S"), 0, scrutinee())),
+                &bad_arity,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ProjectionArityExceeded { .. },
+                ..
+            }
+        ),
+        "a parameter_count beyond the supplied arguments must refuse on arity"
+    );
+
+    // (d) the field index is past the last field
+    let past_end = projection_context(entries, vec![flat_rule()]);
+    assert!(
+        matches!(
+            infer(
+                &decoded(&Expr::proj(primary_name("S"), 7, scrutinee())),
+                &past_end,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ProjectionArityExceeded { .. },
+                ..
+            }
+        ),
+        "an index past the last field must refuse on arity"
+    );
+}
+
+#[test]
+fn kr112_a_scrutinee_that_is_not_the_named_structure_is_refused() {
+    // The scrutinee is an `S`, but the projection names `Nat`.
+    let context = projection_context(flat_structure_env(), vec![flat_rule()]);
+    assert!(
+        matches!(
+            infer(
+                &decoded(&Expr::proj(primary_name("Nat"), 0, scrutinee())),
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ProjectionStructureMismatch { .. },
+                ..
+            }
+        ),
+        "a scrutinee whose type is not the named structure must be refused"
+    );
+}
+
+/// The successor to the three deferral cells KR-109, KR-110 and KR-112 retired.
+///
+/// **The requirement inverted at KR-112.** Those cells each asserted that a
+/// SHRINKING population of rule families still deferred; after KR-112 the
+/// rule-family deferral set is EMPTY, so there is no smaller population left to
+/// narrow them to. Deleting them would have removed the only thing standing
+/// between a future rule and a silent deferral, so they are replaced here.
+///
+/// Two halves, and the first is the load-bearing one:
+///
+/// 1. **The exhaustive match binds this cell to the enum itself.** Adding a
+///    variant to [`InferenceDeferred`] makes this file fail to COMPILE, not
+///    merely fail to assert — which is the only form that cannot be skipped by a
+///    future author who does not know this cell exists. Each variant must be
+///    classified as a conversion-budget deferral (legitimate: a question left
+///    open by resources) or a rule-family deferral (a rule that is not
+///    implemented). The rule-family set must be empty.
+/// 2. Every expression form the dispatcher accepts is exercised and required not
+///    to defer, so the classification above cannot go stale against the code.
+#[test]
+fn no_rule_family_deferral_remains_reachable() {
+    // --- half 1: the enum's own shape -------------------------------------
+    fn is_rule_family(requirement: &InferenceDeferred) -> bool {
+        match requirement {
+            // Conversion budgets: the question is open, not unimplemented.
+            InferenceDeferred::ApplicationConversion { .. } => false,
+            InferenceDeferred::LetValueConversion { .. } => false,
+            // A new arm here is a NEW RULE-FAMILY DEFERRAL. If you are adding
+            // one, this cell is the place that says so out loud.
+        }
+    }
+    let _ = is_rule_family;
+
+    // --- half 2: no form the dispatcher accepts defers ---------------------
+    let context = projection_context(flat_structure_env(), vec![flat_rule()]);
+    let forms = vec![
+        ("sort", Expr::sort(Level::zero())),
+        ("constant", Expr::const_(primary_name("Nat"), Vec::new())),
+        ("free", scrutinee()),
+        (
+            "lambda",
+            Expr::lam(
+                primary_name("x"),
+                Expr::sort(Level::zero()),
+                bvar(0),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "forall",
+            Expr::forall_e(
+                primary_name("x"),
+                Expr::sort(Level::zero()),
+                Expr::sort(Level::zero()),
+                BinderInfo::Default,
+            ),
+        ),
+        (
+            "let",
+            Expr::let_e(
+                primary_name("x"),
+                Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+                Expr::sort(Level::zero()),
+                Expr::sort(Level::zero()),
+                false,
+            ),
+        ),
+        ("nat literal", Expr::lit(Literal::Nat(NatLit::from_u64(5)))),
+        ("string literal", Expr::lit(Literal::Str("x".to_owned()))),
+        ("projection", Expr::proj(primary_name("S"), 0, scrutinee())),
+    ];
+    for (label, expression) in forms {
+        for candidate in [expression.clone(), Expr::mdata(KVMap::new(), expression)] {
+            let outcome = infer(
+                &decoded(&candidate),
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            );
+            if let InferenceOutcome::Deferred { requirement, .. } = &outcome {
+                assert!(
+                    !is_rule_family(requirement),
+                    "{label} still yields a RULE-FAMILY deferral ({requirement:?}); \
+                     every rule family is implemented, so this is a regression"
+                );
+            }
+        }
     }
 }
