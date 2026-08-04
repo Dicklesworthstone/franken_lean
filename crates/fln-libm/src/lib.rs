@@ -406,6 +406,18 @@ pub fn exp(x: f64) -> f64 {
 
 /// Base-two exponential.
 pub fn exp2(x: f64) -> f64 {
+    if invalid(x) {
+        return canonical_nan();
+    }
+    if x.is_finite() && trunc(x) == x {
+        if x > 1023.0 {
+            return f64::INFINITY;
+        }
+        if x < -1074.0 {
+            return 0.0;
+        }
+        return scalbn(1.0, x as i32);
+    }
     exp(x * LN2_HI + x * LN2_LO)
 }
 
@@ -862,6 +874,22 @@ mod tests {
         let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
         assert_eq!(log2(payload_nan).to_bits(), CANONICAL_NAN_BITS);
         assert_eq!(log10(payload_nan).to_bits(), CANONICAL_NAN_BITS);
+    }
+
+    #[test]
+    fn exp2_integral_exponents_cover_binary64_boundaries_exactly() {
+        for (input, expected) in [
+            (-1075.0, 0.0),
+            (-1074.0, f64::from_bits(1)),
+            (-1022.0, f64::MIN_POSITIVE),
+            (-1.0, 0.5),
+            (0.0, 1.0),
+            (10.0, 1024.0),
+            (1023.0, f64::from_bits(0x7fe0_0000_0000_0000)),
+            (1024.0, f64::INFINITY),
+        ] {
+            same_bits(exp2(input), expected);
+        }
     }
 
     #[test]
