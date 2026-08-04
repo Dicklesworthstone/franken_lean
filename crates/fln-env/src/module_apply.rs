@@ -1920,6 +1920,56 @@ mod tests {
         )
     }
 
+    fn named_record(
+        module: &str,
+        declaration: &str,
+        extra_declaration: &str,
+        artifact_seed: u8,
+    ) -> ModuleContributionRecord {
+        ModuleContributionRecord::new(
+            ModuleRecord::new(
+                ModuleId::new(name(module)),
+                true,
+                vec![],
+                ArtifactEvidence {
+                    epoch: epoch(),
+                    content_digest: Digest([artifact_seed; 32]),
+                    producer: ArtifactProducer::Reference,
+                    grade: ArtifactGrade::Verified,
+                },
+            ),
+            vec![name(declaration)],
+            vec![name(extra_declaration)],
+            vec![],
+            ProvenanceCompleteness::new(
+                CaptureStatus::Complete,
+                PayloadTransparency::Understood,
+                vec![],
+            ),
+        )
+    }
+
+    fn transaction_with_target(
+        target_records: Vec<ModuleContributionRecord>,
+        contribution: ModuleContributionRecord,
+        declaration: &str,
+        extra_declaration: &str,
+    ) -> ModuleApplyTransaction {
+        let manifest = ModuleProvenanceManifest::new(
+            epoch(),
+            target_records,
+            ModuleProvenanceLimits::default(),
+        )
+        .expect("fixture target manifest is valid");
+        ModuleApplyTransaction::new(
+            Arc::new(manifest),
+            contribution,
+            vec![axiom(declaration)],
+            vec![axiom(extra_declaration)],
+            vec![],
+        )
+    }
+
     fn applied_payload(
         contribution: ModuleContributionRecord,
         extension_payloads: Vec<ExtensionPayload>,
@@ -2900,6 +2950,129 @@ mod tests {
                 .expect("opaque payload was replayed")
                 .payload,
             bytes
+        );
+    }
+
+    #[test]
+    fn independent_module_apply_order_converges_on_one_committed_state() {
+        let empty_manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        let base = ModuleApplyState::from_parts(Environment::new(), empty_graph, empty_manifest)
+            .expect("empty aggregate state is coherent");
+        let left = named_record(
+            "fixture.left",
+            "fixture.left.decl",
+            "fixture.left.extra",
+            11,
+        );
+        let right = named_record(
+            "fixture.right",
+            "fixture.right.decl",
+            "fixture.right.extra",
+            12,
+        );
+
+        let left_first = preflight_module_apply(transaction_with_target(
+            vec![left.clone()],
+            left.clone(),
+            "fixture.left.decl",
+            "fixture.left.extra",
+        ))
+        .expect("left transaction preflights");
+        let left_candidate = base
+            .environment()
+            .add_decl((*left_first.transaction().declarations()[0]).clone())
+            .expect("left declaration is unique")
+            .add_decl((*left_first.transaction().extra_declarations()[0]).clone())
+            .expect("left extra declaration is unique");
+        let after_left = match prepare_module_apply(&left_first, &base, &left_candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
+                .commit(&base)
+                .expect("left base remains current")
+                .into_state(),
+            other => panic!("expected a prepared left application, got {other:?}"),
+        };
+        let right_after_left = preflight_module_apply(transaction_with_target(
+            vec![left.clone(), right.clone()],
+            right.clone(),
+            "fixture.right.decl",
+            "fixture.right.extra",
+        ))
+        .expect("right-after-left transaction preflights");
+        let right_candidate = after_left
+            .environment()
+            .add_decl((*right_after_left.transaction().declarations()[0]).clone())
+            .expect("right declaration is unique")
+            .add_decl((*right_after_left.transaction().extra_declarations()[0]).clone())
+            .expect("right extra declaration is unique");
+        let final_left_then_right =
+            match prepare_module_apply(&right_after_left, &after_left, &right_candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
+                    .commit(&after_left)
+                    .expect("right-after-left base remains current")
+                    .into_state(),
+                other => panic!("expected a prepared right-after-left application, got {other:?}"),
+            };
+
+        let right_first = preflight_module_apply(transaction_with_target(
+            vec![right.clone()],
+            right.clone(),
+            "fixture.right.decl",
+            "fixture.right.extra",
+        ))
+        .expect("right transaction preflights");
+        let right_candidate = base
+            .environment()
+            .add_decl((*right_first.transaction().declarations()[0]).clone())
+            .expect("right declaration is unique")
+            .add_decl((*right_first.transaction().extra_declarations()[0]).clone())
+            .expect("right extra declaration is unique");
+        let after_right = match prepare_module_apply(&right_first, &base, &right_candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
+                .commit(&base)
+                .expect("right base remains current")
+                .into_state(),
+            other => panic!("expected a prepared right application, got {other:?}"),
+        };
+        let left_after_right = preflight_module_apply(transaction_with_target(
+            vec![left.clone(), right.clone()],
+            left.clone(),
+            "fixture.left.decl",
+            "fixture.left.extra",
+        ))
+        .expect("left-after-right transaction preflights");
+        let left_candidate = after_right
+            .environment()
+            .add_decl((*left_after_right.transaction().declarations()[0]).clone())
+            .expect("left declaration is unique")
+            .add_decl((*left_after_right.transaction().extra_declarations()[0]).clone())
+            .expect("left extra declaration is unique");
+        let final_right_then_left =
+            match prepare_module_apply(&left_after_right, &after_right, &left_candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan
+                    .commit(&after_right)
+                    .expect("left-after-right base remains current")
+                    .into_state(),
+                other => panic!("expected a prepared left-after-right application, got {other:?}"),
+            };
+
+        assert_eq!(final_left_then_right, final_right_then_left);
+        assert_eq!(
+            final_left_then_right.manifest().root(),
+            final_right_then_left.manifest().root()
+        );
+        assert_eq!(
+            final_left_then_right.logical_root(),
+            final_right_then_left.logical_root()
+        );
+        assert_eq!(
+            final_left_then_right.indexes(),
+            final_right_then_left.indexes()
         );
     }
 }
