@@ -569,6 +569,82 @@ pub fn prepare_module_apply_candidate(
     )
 }
 
+/// A one-shot, non-authoritative aggregate application prepared against one immutable
+/// state. Holding a candidate is not publication; only [`Self::commit`] releases it
+/// after revalidating every base component.
+#[derive(Debug)]
+pub struct PreparedModuleApply {
+    schema: u16,
+    base_environment: Environment,
+    base_graph: ModuleGraph,
+    base_manifest: Arc<ModuleProvenanceManifest>,
+    candidate: ModuleApplyState,
+}
+
+impl PreparedModuleApply {
+    /// Prepared candidates are never cache entries or authoritative state.
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// Whether this exact aggregate base remains current for the one-shot commit.
+    ///
+    /// The manifest comparison is exact-value equality rather than root equality, so a
+    /// hypothetical equal-digest/different-manifest pair cannot consume this plan.
+    pub fn is_valid_for(&self, base: &ModuleApplyState) -> bool {
+        self.schema == MODULE_APPLY_SCHEMA_VERSION
+            && self.base_environment == *base.environment()
+            && self.base_graph == *base.graph()
+            && self.base_manifest.as_ref() == base.manifest()
+    }
+
+    /// Revalidate the base and release the one prepared aggregate candidate exactly once.
+    ///
+    /// The state values are immutable, so every refusal leaves `base` unchanged. A caller
+    /// cannot retry the same `PreparedModuleApply` after this method consumes it.
+    pub fn commit(
+        self,
+        base: &ModuleApplyState,
+    ) -> Result<ModuleApplyState, ModuleApplyCommitError> {
+        if self.schema != MODULE_APPLY_SCHEMA_VERSION || !self.is_valid_for(base) {
+            return Err(ModuleApplyCommitError::StaleBase);
+        }
+        base.verify().map_err(ModuleApplyCommitError::BaseState)?;
+        self.candidate
+            .verify()
+            .map_err(ModuleApplyCommitError::CandidateState)?;
+        Ok(self.candidate)
+    }
+}
+
+/// Completed commit refusals. A stale plan names a changed source, not a rejected module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyCommitError {
+    StaleBase,
+    BaseState(ModuleApplyStateError),
+    CandidateState(ModuleApplyStateError),
+}
+
+/// Prepare one complete aggregate candidate for later one-shot commit.
+pub fn prepare_module_apply(
+    preflight: &PreflightedModuleApply,
+    base: &ModuleApplyState,
+    declaration_candidate: &Environment,
+) -> Outcome<Result<PreparedModuleApply, ModuleApplyPrepareError>> {
+    match prepare_module_apply_candidate(preflight, base, declaration_candidate) {
+        Outcome::Complete(Ok(candidate)) => Outcome::complete(Ok(PreparedModuleApply {
+            schema: MODULE_APPLY_SCHEMA_VERSION,
+            base_environment: base.environment().clone(),
+            base_graph: base.graph().clone(),
+            base_manifest: Arc::clone(&base.manifest),
+            candidate,
+        })),
+        Outcome::Complete(Err(error)) => Outcome::complete(Err(error)),
+        Outcome::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
+        Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+    }
+}
+
 /// Refusals while replaying a preflighted extension contribution onto a verified
 /// declaration candidate. Every arm is raised before a resulting environment is
 /// returned, so the caller cannot observe a successful prefix.
@@ -1321,5 +1397,37 @@ mod tests {
             prepare_module_apply_candidate(&checked, &base, &declaration_candidate),
             Outcome::Complete(Ok(_))
         ));
+
+        let stale_plan = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(plan)) => plan,
+            other => panic!("expected a complete application plan, got {other:?}"),
+        };
+        assert!(!stale_plan.is_cacheable());
+        let stale_environment = base
+            .environment()
+            .register_extension(ExtensionDescriptor {
+                name: name("fixture.unrelated"),
+                merge: MergeSemantics::AppendOrdered,
+                checkpoint: CheckpointSemantics::JournalSuffix,
+                provenance: PayloadProvenance::Understood,
+            })
+            .expect("unrelated fixture extension is unique");
+        let stale_base = ModuleApplyState::from_parts(
+            stale_environment,
+            base.graph().clone(),
+            Arc::clone(&base.manifest),
+        )
+        .expect("unrelated extension keeps the empty state coherent");
+        assert!(matches!(
+            stale_plan.commit(&stale_base),
+            Err(ModuleApplyCommitError::StaleBase)
+        ));
+
+        let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
+            Outcome::Complete(Ok(plan)) => plan.commit(&base).expect("base remains current"),
+            other => panic!("expected a complete application plan, got {other:?}"),
+        };
+        assert_eq!(committed.graph().len(), 1);
+        assert_eq!(base.graph().len(), 0);
     }
 }
