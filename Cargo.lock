@@ -152,6 +152,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-verdict"
 version = "0.0.0"
+dependencies = [
+ "fln-hash",
+]
 
 [[package]]
 name = "fln-vm"

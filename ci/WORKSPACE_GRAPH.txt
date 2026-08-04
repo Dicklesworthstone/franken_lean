@@ -82,6 +82,7 @@ edge fln-conformance -> fln-env    # kernel replay builds environments from deco
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)
 edge fln-conformance -> fln-hash   # kernel-replay evidence hashes fixture inputs canonically (evidence-runner lane)
+edge fln-verdict -> fln-hash       # canonical CNF/model/proof identities and codecs (§12.5)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

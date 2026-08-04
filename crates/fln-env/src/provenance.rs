@@ -1501,7 +1501,7 @@ mod tests {
     fn domain_registry_covers_operational_and_module_provenance_domains() {
         assert!(Domain::ALL.contains(&Domain::OperationalMeta));
         assert!(Domain::ALL.contains(&Domain::ModuleProvenance));
-        assert_eq!(Domain::ALL.len(), 12);
+        assert_eq!(Domain::ALL.len(), 15);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")

@@ -65,6 +65,12 @@ pub enum Domain {
     ModuleProvenance,
     /// Tribunal fixture and corpus identity (test apparatus only).
     Fixture,
+    /// Canonical CNF identity at the untrusted Verdict boundary (§12.5).
+    VerdictCnf,
+    /// Complete SAT-model identity, kept distinct from its bound CNF (§12.5).
+    VerdictSatModel,
+    /// Complete LRAT-shaped proof-stream identity (§12.5).
+    VerdictUnsatProof,
 }
 
 impl Domain {
@@ -83,12 +89,15 @@ impl Domain {
             Domain::CanonicalSchema => "fln 2026 domain canonical-schema/1",
             Domain::ModuleProvenance => "fln 2026 domain module-provenance/1",
             Domain::Fixture => "fln 2026 domain fixture/1",
+            Domain::VerdictCnf => "fln 2026 domain verdict-cnf/1",
+            Domain::VerdictSatModel => "fln 2026 domain verdict-sat-model/1",
+            Domain::VerdictUnsatProof => "fln 2026 domain verdict-unsat-proof/1",
         }
     }
 
     /// Every registered domain, for registry-wide tests (pairwise distinctness,
     /// frozen-vector stability).
-    pub const ALL: [Domain; 12] = [
+    pub const ALL: [Domain; 15] = [
         Domain::DeclContent,
         Domain::LogicalRoot,
         Domain::ExtensionDelta,
@@ -101,6 +110,9 @@ impl Domain {
         Domain::CanonicalSchema,
         Domain::ModuleProvenance,
         Domain::Fixture,
+        Domain::VerdictCnf,
+        Domain::VerdictSatModel,
+        Domain::VerdictUnsatProof,
     ];
 }
 
