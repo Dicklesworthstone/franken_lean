@@ -24,6 +24,7 @@
   "exceptions": [],
   "registry": [
     {"id": "fln-l8f", "class": "prerequisite", "workstream": "W1", "gate": "G0"},
+    {"id": "franken_lean-d3-safety-note-unenforced-cdbg", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-convergence-wip-governance-149", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-census-empty-referent-no-mock-krb0", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-cross-tree-baked-root-k60n", "class": "verification", "workstream": "W1", "gate": "G0"},
@@ -37,6 +38,7 @@
     {"id": "franken_lean-ubs-path-sensitive-baseline-jfb8", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-workspace-graph-producer-edge-drift-8o3o", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-3gv", "class": "implementation", "workstream": "W2", "gate": "G1"},
+    {"id": "fln-8w8", "class": "implementation", "workstream": "W2", "gate": "G1"},
     {"id": "fln-extension-merge-validation-proof-debt-dt5", "class": "implementation", "workstream": "W2", "gate": "G1"},
     {"id": "franken_lean-83r", "class": "implementation", "workstream": "W2", "gate": "G1"},
     {"id": "franken_lean-module-provenance-atomic-apply-as7", "class": "implementation", "workstream": "W2", "gate": "G1"},

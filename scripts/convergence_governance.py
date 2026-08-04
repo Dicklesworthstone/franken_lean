@@ -335,6 +335,9 @@ def decide(policy, snapshot, now):
     earliest = next((gate for gate in gates if gate["state"] != "passed"), None)
     active_workstreams = sorted({row["workstream"] for row in active if row["class"] == "implementation"})
     over_cap = len(active_workstreams) > policy["wip"]["max_active_workstreams"]
+    admitted_workstreams = set(active_workstreams)
+    verification_slots = policy["wip"]["verification_reservation"]
+    incident_slots = min(policy["wip"]["incident_reservation"], len(exceptions))
     selected, held = [], []
     for issue_id in sorted(registry):
         row = registry[issue_id]
@@ -358,22 +361,39 @@ def decide(policy, snapshot, now):
             common["reason"] = "dependency-blocked"
             held.append(common)
             continue
-        if row["class"] == "incident" and exceptions:
+        if row["class"] == "incident" and incident_slots:
+            incident_slots -= 1
             common["reason"] = "bounded-incident-exception"
             selected.append(common)
-        elif earliest and row.get("gate") == earliest["id"] and row["class"] in {"prerequisite", "verification", "implementation"}:
-            if row["class"] == "implementation" and row["workstream"] not in active_workstreams and over_cap:
-                common["reason"] = "held-over-cap"
+        elif row["class"] == "incident" and exceptions:
+            common["reason"] = "incident-reservation-exhausted"
+            held.append(common)
+        elif row["class"] == "verification":
+            if verification_slots:
+                verification_slots -= 1
+                common["reason"] = "reserved-independent-verification"
+                selected.append(common)
+            else:
+                common["reason"] = "verification-reservation-exhausted"
                 held.append(common)
+        elif earliest and row.get("gate") == earliest["id"] and row["class"] in {"prerequisite", "verification", "implementation"}:
+            if row["class"] == "implementation" and row["workstream"] not in admitted_workstreams:
+                if over_cap:
+                    common["reason"] = "held-over-cap"
+                    held.append(common)
+                elif len(admitted_workstreams) >= policy["wip"]["max_active_workstreams"]:
+                    common["reason"] = "held-capacity"
+                    held.append(common)
+                else:
+                    admitted_workstreams.add(row["workstream"])
+                    common["reason"] = "earliest-gate-ready-blocker"
+                    selected.append(common)
             else:
                 common["reason"] = "earliest-gate-ready-blocker"
                 selected.append(common)
         elif earliest and row["class"] == "additive":
             common["reason"] = "frozen-earliest-gate"
             held.append(common)
-        elif row["class"] == "verification":
-            common["reason"] = "reserved-independent-verification"
-            selected.append(common)
         else:
             common["reason"] = "held-priority-order"
             held.append(common)
@@ -514,7 +534,122 @@ def self_test():
             raise AssertionError(f"expired-adoption wrong refusal: {error}") from error
     else:
         raise AssertionError("evergreen-adoption mutant survived")
-    return "convergence-governance self-test: 7 model/mutation cells passed"
+    missing_expiry = copy.deepcopy(policy)
+    missing_expiry["registry"].append(
+        {"id": "adoption-missing", "class": "adoption", "workstream": "adoption"}
+    )
+    try:
+        decide(
+            missing_expiry,
+            normalize_snapshot(
+                {
+                    "issues": issues + [{"id": "adoption-missing", "status": "in_progress"}],
+                    "edges": edges,
+                    "evidence": raw["evidence"],
+                }
+            ),
+            now,
+        )
+    except InputFault as error:
+        if "adoption-missing-expiry" not in str(error):
+            raise AssertionError(f"missing adoption expiry wrong refusal: {error}") from error
+    else:
+        raise AssertionError("missing adoption expiry mutant survived")
+    draining_adoption = copy.deepcopy(policy)
+    draining_adoption["registry"].append(
+        {
+            "id": "adoption-drain",
+            "class": "adoption",
+            "workstream": "adoption",
+            "expiry": "2026-08-04T10:11:00Z",
+        }
+    )
+    drain_decision = decide(
+        draining_adoption,
+        normalize_snapshot(
+            {
+                "issues": issues + [{"id": "adoption-drain", "status": "in_progress"}],
+                "edges": edges,
+                "evidence": raw["evidence"],
+            }
+        ),
+        now,
+    )
+    if not any(row["id"] == "adoption-drain" and row["reason"] == "already-active" for row in drain_decision["selected"]):
+        raise AssertionError("bounded adoption drain was not retained as active")
+    capacity_policy = copy.deepcopy(policy)
+    capacity_policy["registry"].append(
+        {"id": "candidate-w3", "class": "implementation", "workstream": "W3", "gate": "G0"}
+    )
+    capacity_decision = decide(
+        capacity_policy,
+        normalize_snapshot(
+            {
+                "issues": issues + [{"id": "candidate-w3", "status": "open"}],
+                "edges": edges,
+                "evidence": raw["evidence"],
+            }
+        ),
+        now,
+    )
+    if not any(row["id"] == "candidate-w3" and row["reason"] == "held-capacity" for row in capacity_decision["held"]):
+        raise AssertionError("concurrent admission capacity mutant survived")
+    reservation_policy = copy.deepcopy(policy)
+    reservation_policy["wip"] = {"max_active_workstreams": 2, "verification_reservation": 1, "incident_reservation": 1}
+    reservation_policy["exceptions"] = [
+        {"id": "INC-1", "owner": "self-test", "scope": "incident", "expiry": "2026-08-04T10:11:00Z", "review": "2026-08-04T10:11:00Z"}
+    ]
+    reservation_policy["registry"].extend(
+        [
+            {"id": "verification-a", "class": "verification", "workstream": "W1", "gate": "G0"},
+            {"id": "verification-b", "class": "verification", "workstream": "W1", "gate": "G0"},
+            {"id": "incident-a", "class": "incident", "workstream": "W1", "gate": "G0"},
+            {"id": "incident-b", "class": "incident", "workstream": "W1", "gate": "G0"},
+        ]
+    )
+    reservation_decision = decide(
+        reservation_policy,
+        normalize_snapshot(
+            {
+                "issues": issues
+                + [
+                    {"id": "verification-a", "status": "open"},
+                    {"id": "verification-b", "status": "open"},
+                    {"id": "incident-a", "status": "open"},
+                    {"id": "incident-b", "status": "open"},
+                ],
+                "edges": edges,
+                "evidence": raw["evidence"],
+            }
+        ),
+        now,
+    )
+    selected_reservations = {row["id"]: row["reason"] for row in reservation_decision["selected"]}
+    held_reservations = {row["id"]: row["reason"] for row in reservation_decision["held"]}
+    if selected_reservations.get("incident-a") != "bounded-incident-exception" or held_reservations.get("incident-b") != "incident-reservation-exhausted":
+        raise AssertionError("incident reservation was not bounded")
+    if selected_reservations.get("verification-a") != "reserved-independent-verification" or held_reservations.get("verification-b") != "verification-reservation-exhausted":
+        raise AssertionError("verification reservation was not bounded")
+    expired_exception = copy.deepcopy(reservation_policy)
+    expired_exception["exceptions"][0]["expiry"] = "2026-08-04T10:10:00Z"
+    try:
+        decide(
+            expired_exception,
+            normalize_snapshot(
+                {
+                    "issues": issues + [{"id": "incident-a", "status": "open"}],
+                    "edges": edges,
+                    "evidence": raw["evidence"],
+                }
+            ),
+            now,
+        )
+    except InputFault as error:
+        if "exception-expired" not in str(error):
+            raise AssertionError(f"expired exception wrong refusal: {error}") from error
+    else:
+        raise AssertionError("evergreen exception mutant survived")
+    return "convergence-governance self-test: 14 named model/mutation cells passed"
 
 
 def main(argv):
