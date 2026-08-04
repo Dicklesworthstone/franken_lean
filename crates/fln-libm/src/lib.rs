@@ -674,6 +674,24 @@ fn odd_integer(x: f64) -> bool {
     (abs(x) as u64) & 1 == 1
 }
 
+fn pow_integer(mut base: f64, exponent: f64) -> f64 {
+    let mut remaining = abs(exponent) as u64;
+    if exponent < 0.0 {
+        base = 1.0 / base;
+    }
+    let mut value = 1.0;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            value *= base;
+        }
+        remaining >>= 1;
+        if remaining != 0 {
+            base *= base;
+        }
+    }
+    value
+}
+
 /// Power with specified negative-base and integer-exponent behavior.
 pub fn pow(x: f64, y: f64) -> f64 {
     if invalid(x) || invalid(y) {
@@ -718,6 +736,9 @@ pub fn pow(x: f64, y: f64) -> f64 {
             };
         }
         return if odd_integer(y) { x } else { 0.0 };
+    }
+    if x.is_finite() && is_integral(y) && abs(y) < 9_007_199_254_740_992.0 {
+        return pow_integer(x, y);
     }
     if x < 0.0 {
         if !is_integral(y) {
@@ -909,6 +930,20 @@ mod tests {
             (1024.0, 10.0),
         ] {
             same_bits(log2(input), expected);
+        }
+    }
+
+    #[test]
+    fn pow_integral_exponents_use_exact_binary_operations() {
+        for (base, exponent, expected) in [
+            (2.0, 10.0, 1024.0),
+            (0.5, -10.0, 1024.0),
+            (-2.0, 3.0, -8.0),
+            (-2.0, 4.0, 16.0),
+            (2.0, -1074.0, f64::from_bits(1)),
+            (2.0, 1024.0, f64::INFINITY),
+        ] {
+            same_bits(pow(base, exponent), expected);
         }
     }
 
