@@ -22,6 +22,7 @@ fn windows_functional_workflow_keeps_the_declared_native_scope() {
     for required in [
         "name: windows-functional",
         "runs-on: windows-2022",
+        "workflow_dispatch:",
         "shell: bash",
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "persist-credentials: false",
