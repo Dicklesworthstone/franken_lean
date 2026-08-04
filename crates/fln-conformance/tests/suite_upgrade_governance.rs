@@ -3,7 +3,9 @@
 
 #![forbid(unsafe_code)]
 
-use fln_conformance::suite_upgrade::{self, Candidate, LedgerState, LockChange, Waiver};
+use fln_conformance::suite_upgrade::{
+    self, Candidate, CandidateReceipt, LedgerState, LockChange, Waiver,
+};
 
 fn root() -> std::path::PathBuf {
     fln_conformance::checked_workspace_root!()
@@ -12,8 +14,8 @@ fn root() -> std::path::PathBuf {
 fn complete_candidate(change: LockChange) -> Candidate {
     Candidate {
         change,
-        current_lock_root: "old-lock-root".to_string(),
-        candidate_lock_root: "new-lock-root".to_string(),
+        current_lock_root: root_identity('a'),
+        candidate_lock_root: root_identity('b'),
         isolated: true,
         closure_delta: true,
         canonical_contract_and_census_diff: true,
@@ -23,6 +25,26 @@ fn complete_candidate(change: LockChange) -> Candidate {
         current_root_unchanged: true,
         external_evidence_identity: true,
         cancelled: false,
+    }
+}
+
+fn root_identity(digit: char) -> String {
+    digit.to_string().repeat(64)
+}
+
+fn complete_receipt(change: LockChange) -> CandidateReceipt {
+    CandidateReceipt {
+        candidate_id: "suite-upgrade-fixture".to_string(),
+        change,
+        old_lock_root: root_identity('a'),
+        candidate_lock_root: root_identity('b'),
+        closure_root: root_identity('c'),
+        contract_and_census_root: root_identity('d'),
+        tribunal_root: root_identity('e'),
+        migration_root: root_identity('f'),
+        rollback_root: root_identity('1'),
+        external_evidence_root: root_identity('2'),
+        final_current_lock_root: root_identity('a'),
     }
 }
 
@@ -70,12 +92,60 @@ fn suite_upgrade_candidate_model() {
             complete_candidate(change).may_publish(None),
             "complete candidate must publish"
         );
+        assert!(
+            complete_candidate(change)
+                .publication_error_with_receipt(&complete_receipt(change))
+                .is_none(),
+            "complete candidate receipt must publish"
+        );
     }
     let mut partial = complete_candidate(LockChange::Upgrade);
     partial.current_root_unchanged = false;
     assert_eq!(
         partial.publication_error(),
         Some("current authoritative root changed during candidate validation")
+    );
+}
+
+#[test]
+fn candidate_receipt_join_refuses_stale_or_mixed_roots() {
+    let candidate = complete_candidate(LockChange::Upgrade);
+    let mut stale_current = complete_receipt(LockChange::Upgrade);
+    stale_current.final_current_lock_root = root_identity('3');
+    assert_eq!(
+        candidate.publication_error_with_receipt(&stale_current),
+        Some(
+            "candidate receipt observed an authoritative lock root different from its old root"
+                .to_string()
+        ),
+        "a changed authoritative root must fail before publication"
+    );
+
+    let mut mixed_tribunal = complete_receipt(LockChange::Upgrade);
+    mixed_tribunal.tribunal_root = "mixed-root".to_string();
+    assert_eq!(
+        candidate.publication_error_with_receipt(&mixed_tribunal),
+        Some("candidate receipt `tribunal_root` is not a canonical SHA-256 root".to_string()),
+        "a stale or mixed Tribunal receipt must fail"
+    );
+
+    let mut non_hex_root = complete_receipt(LockChange::Upgrade);
+    non_hex_root.closure_root = root_identity('g');
+    assert_eq!(
+        candidate.publication_error_with_receipt(&non_hex_root),
+        Some("candidate receipt `closure_root` is not a canonical SHA-256 root".to_string()),
+        "a non-hex root must not pass as a canonical identity"
+    );
+
+    let mut wrong_change = complete_receipt(LockChange::Reference);
+    wrong_change.candidate_id = "reference-candidate".to_string();
+    assert_eq!(
+        candidate.publication_error_with_receipt(&wrong_change),
+        Some(
+            "candidate change kind `upgrade` does not match receipt change kind `reference`"
+                .to_string()
+        ),
+        "a receipt from another change class must not join"
     );
 }
 
@@ -154,8 +224,10 @@ fn suite_upgrade_no_mock_e2e() {
     );
     candidate.tribunal_diff = true;
     assert!(
-        candidate.may_publish(None),
-        "complete isolated candidate must pass"
+        candidate
+            .publication_error_with_receipt(&complete_receipt(LockChange::Upgrade))
+            .is_none(),
+        "complete isolated candidate receipt must pass"
     );
     candidate.cancelled = true;
     assert!(

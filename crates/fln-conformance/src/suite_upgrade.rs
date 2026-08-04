@@ -171,6 +171,89 @@ pub enum LockChange {
     PathCommitTreeChecksum,
 }
 
+impl LockChange {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Addition => "addition",
+            Self::Removal => "removal",
+            Self::Upgrade => "upgrade",
+            Self::Downgrade => "downgrade",
+            Self::Retarget => "retarget",
+            Self::Nightly => "nightly",
+            Self::TargetFeature => "target-feature",
+            Self::Profile => "profile",
+            Self::Reference => "reference",
+            Self::Corpus => "corpus",
+            Self::PathCommitTreeChecksum => "path-commit-tree-checksum",
+        }
+    }
+}
+
+/// The identity-bearing half of a candidate's retained evidence. A `true`
+/// stage flag alone is not publication evidence: every producer must name the
+/// same candidate and its exact old/proposed lock roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReceipt {
+    pub candidate_id: String,
+    pub change: LockChange,
+    pub old_lock_root: String,
+    pub candidate_lock_root: String,
+    pub closure_root: String,
+    pub contract_and_census_root: String,
+    pub tribunal_root: String,
+    pub migration_root: String,
+    pub rollback_root: String,
+    pub external_evidence_root: String,
+    pub final_current_lock_root: String,
+}
+
+impl CandidateReceipt {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.candidate_id.is_empty()
+            || !self
+                .candidate_id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("candidate receipt needs a canonical candidate id".to_string());
+        }
+        if self.old_lock_root == self.candidate_lock_root {
+            return Err("candidate receipt does not change the lock root".to_string());
+        }
+        if self.final_current_lock_root != self.old_lock_root {
+            return Err(
+                "candidate receipt observed an authoritative lock root different from its old root"
+                    .to_string(),
+            );
+        }
+        for (name, root) in [
+            ("old_lock_root", &self.old_lock_root),
+            ("candidate_lock_root", &self.candidate_lock_root),
+            ("closure_root", &self.closure_root),
+            ("contract_and_census_root", &self.contract_and_census_root),
+            ("tribunal_root", &self.tribunal_root),
+            ("migration_root", &self.migration_root),
+            ("rollback_root", &self.rollback_root),
+            ("external_evidence_root", &self.external_evidence_root),
+            ("final_current_lock_root", &self.final_current_lock_root),
+        ] {
+            if !is_canonical_root(root) {
+                return Err(format!(
+                    "candidate receipt `{name}` is not a canonical SHA-256 root"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_canonical_root(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
     pub change: LockChange,
@@ -224,6 +307,34 @@ impl Candidate {
 
     pub fn may_publish(&self, waiver: Option<&Waiver>) -> bool {
         self.publication_error().is_none() && waiver.is_none()
+    }
+
+    /// Binds the model's stage completion claims to the retained receipt. The
+    /// receipt is deliberately separate so E2E runners can supply exact
+    /// identities without treating an in-memory model as evidence.
+    pub fn publication_error_with_receipt(&self, receipt: &CandidateReceipt) -> Option<String> {
+        if let Some(error) = self.publication_error() {
+            return Some(error.to_string());
+        }
+        if let Err(error) = receipt.validate() {
+            return Some(error);
+        }
+        if self.change != receipt.change {
+            return Some(format!(
+                "candidate change kind `{}` does not match receipt change kind `{}`",
+                self.change.label(),
+                receipt.change.label()
+            ));
+        }
+        if self.current_lock_root != receipt.old_lock_root
+            || self.candidate_lock_root != receipt.candidate_lock_root
+        {
+            return Some(
+                "candidate lock roots do not match the receipt's exact old/proposed roots"
+                    .to_string(),
+            );
+        }
+        None
     }
 }
 
