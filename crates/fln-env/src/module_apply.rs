@@ -68,6 +68,10 @@ impl ExtensionPayload {
         &self.payload
     }
 
+    fn payload_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.payload)
+    }
+
     pub fn shares_payload_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.payload, &other.payload)
     }
@@ -447,6 +451,131 @@ pub fn verify_kernel_declaration_candidate(
     candidate
         .verify_declaration_delta(base, &additions)
         .map_err(ModuleApplyCandidateError::DeclarationDelta)
+}
+
+/// Refusals while replaying a preflighted extension contribution onto a verified
+/// declaration candidate. Every arm is raised before a resulting environment is
+/// returned, so the caller cannot observe a successful prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyReplayError {
+    Candidate(ModuleApplyCandidateError),
+    UnknownExtension {
+        name: Name,
+    },
+    DescriptorMismatch {
+        name: Name,
+    },
+    RangeStart {
+        name: Name,
+        expected: u64,
+        actual: u64,
+    },
+    BaseHistory {
+        name: Name,
+        expected: Digest,
+        actual: Digest,
+    },
+    PayloadStreamExhausted {
+        index: usize,
+    },
+    PayloadDescriptor {
+        index: usize,
+    },
+    PayloadIdentity {
+        index: usize,
+    },
+    PayloadStreamTrailing {
+        consumed: usize,
+        available: usize,
+    },
+    Environment(crate::environment::EnvError),
+}
+
+/// Replay extension bytes privately after the kernel candidate has been bound.
+///
+/// Each contribution rechecks its root-scoped placement witness against the exact
+/// candidate history immediately before appending. The returned environment is an
+/// immutable candidate only; it becomes observable as module-application state only
+/// after the graph, manifest, and indexes join in a later commit phase.
+pub fn replay_preflighted_extensions(
+    preflight: &PreflightedModuleApply,
+    base: &Environment,
+    candidate: &Environment,
+) -> Result<Environment, ModuleApplyReplayError> {
+    verify_kernel_declaration_candidate(preflight, base, candidate)
+        .map_err(ModuleApplyReplayError::Candidate)?;
+
+    let transaction = preflight.transaction();
+    let record = transaction.contribution();
+    let mut next = candidate.clone();
+    let mut payload_index = 0usize;
+    for contribution in record.extension_contributions() {
+        let descriptor = contribution.descriptor();
+        let state = next.extension(&descriptor.name).ok_or_else(|| {
+            ModuleApplyReplayError::UnknownExtension {
+                name: descriptor.name.clone(),
+            }
+        })?;
+        if state.descriptor != *descriptor {
+            return Err(ModuleApplyReplayError::DescriptorMismatch {
+                name: descriptor.name.clone(),
+            });
+        }
+        let actual_start =
+            u64::try_from(state.len()).map_err(|_| ModuleApplyReplayError::RangeStart {
+                name: descriptor.name.clone(),
+                expected: contribution.start(),
+                actual: u64::MAX,
+            })?;
+        if actual_start != contribution.start() {
+            return Err(ModuleApplyReplayError::RangeStart {
+                name: descriptor.name.clone(),
+                expected: contribution.start(),
+                actual: actual_start,
+            });
+        }
+        let actual_history = state.content_digest();
+        if actual_history != contribution.base_history_digest() {
+            return Err(ModuleApplyReplayError::BaseHistory {
+                name: descriptor.name.clone(),
+                expected: contribution.base_history_digest(),
+                actual: actual_history,
+            });
+        }
+        for expected_identity in contribution.entries() {
+            let payload = transaction.extension_payloads().get(payload_index).ok_or(
+                ModuleApplyReplayError::PayloadStreamExhausted {
+                    index: payload_index,
+                },
+            )?;
+            if payload.descriptor() != descriptor {
+                return Err(ModuleApplyReplayError::PayloadDescriptor {
+                    index: payload_index,
+                });
+            }
+            let identity = ExtensionEntryId::derive(
+                preflight.transaction().manifest().epoch(),
+                descriptor,
+                payload.payload(),
+            );
+            if identity != *expected_identity {
+                return Err(ModuleApplyReplayError::PayloadIdentity {
+                    index: payload_index,
+                });
+            }
+            next = next
+                .push_extension_entry(&descriptor.name, payload.payload_arc())
+                .map_err(ModuleApplyReplayError::Environment)?;
+            payload_index = payload_index.saturating_add(1);
+        }
+    }
+    if payload_index != transaction.extension_payloads().len() {
+        return Err(ModuleApplyReplayError::PayloadStreamTrailing {
+            consumed: payload_index,
+            available: transaction.extension_payloads().len(),
+        });
+    }
+    Ok(next)
 }
 
 /// Bind every actual payload to the validated contribution record.
@@ -937,5 +1066,82 @@ mod tests {
                 DeclarationDeltaError::ExtensionStateChanged
             ))
         ));
+    }
+
+    #[test]
+    fn extension_replay_is_private_exact_and_refuses_a_stale_base() {
+        let descriptor = descriptor();
+        let base = Environment::new()
+            .register_extension(descriptor.clone())
+            .expect("fixture extension is unique");
+        let history = base
+            .extension(&descriptor.name)
+            .expect("fixture extension is registered")
+            .content_digest();
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"replay");
+        let contribution = record(vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            history,
+            vec![entry],
+        )]);
+        let checked = preflight_module_apply(transaction(
+            contribution,
+            vec![ExtensionPayload::new(
+                0,
+                descriptor.clone(),
+                0,
+                &b"replay"[..],
+            )],
+        ))
+        .expect("payloads preflight");
+        let candidate = base
+            .add_decl((*checked.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*checked.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique");
+
+        let replayed = replay_preflighted_extensions(&checked, &base, &candidate)
+            .expect("bound replay admits the private candidate");
+        assert_eq!(
+            candidate
+                .extension(&descriptor.name)
+                .expect("candidate extension is registered")
+                .len(),
+            0
+        );
+        assert_eq!(
+            replayed
+                .extension(&descriptor.name)
+                .expect("replayed extension is registered")
+                .entries()
+                .next()
+                .expect("replayed payload exists")
+                .payload
+                .as_ref(),
+            b"replay"
+        );
+
+        let stale = preflight_module_apply(transaction(
+            record(vec![ExtensionContribution::new(
+                descriptor.clone(),
+                0,
+                Digest([0; 32]),
+                vec![entry],
+            )]),
+            vec![ExtensionPayload::new(0, descriptor, 0, &b"replay"[..])],
+        ))
+        .expect("stale history does not alter payload binding");
+        assert!(matches!(
+            replay_preflighted_extensions(&stale, &base, &candidate),
+            Err(ModuleApplyReplayError::BaseHistory { .. })
+        ));
+        assert_eq!(
+            candidate
+                .extension(&name("fixture.ext"))
+                .expect("candidate extension is registered")
+                .len(),
+            0
+        );
     }
 }
