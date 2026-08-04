@@ -1516,23 +1516,32 @@ fn small_heap_all_class_ring_handoffs_reclaim_at_1_8_32_threads() {
             receivers.push(receiver);
         }
 
-        senders.rotate_left(1);
+        let senders = std::sync::Arc::new(senders);
         let mut workers = Vec::with_capacity(width);
-        for (receiver, successor) in receivers.into_iter().zip(senders) {
+        for (worker_index, receiver) in receivers.into_iter().enumerate() {
             let round_start = std::sync::Arc::clone(&round_start);
             let allocations_ready = std::sync::Arc::clone(&allocations_ready);
             let round_finished = std::sync::Arc::clone(&round_finished);
+            let senders = std::sync::Arc::clone(&senders);
             workers.push(std::thread::spawn(move || {
                 let before = crate::membrane::small_page_local_metrics_for_test();
-                for size in (8usize..=4096).step_by(8) {
+                for (class_index, size) in (8usize..=4096).step_by(8).enumerate() {
                     // One class at a time bounds the peak live-page footprint
                     // to `width`, while still forcing every exact class
                     // through a concurrent owner-to-foreign-free handoff.
+                    // Each addition modulo `width` is a permutation, so the
+                    // class-varying stride keeps one incoming block per
+                    // worker while covering more than one fixed neighbor.
                     round_start.wait();
                     let block = export_mi_malloc_small(size);
                     assert!(!block.is_null(), "class {size} allocation must succeed");
                     allocations_ready.wait();
-                    successor
+                    let stride = if width == 1 {
+                        0
+                    } else {
+                        class_index % (width - 1) + 1
+                    };
+                    senders[(worker_index + stride) % width]
                         .send(block.expose_provenance())
                         .expect("ring successor is live");
                     let foreign = receiver.recv().expect("ring predecessor is live");
