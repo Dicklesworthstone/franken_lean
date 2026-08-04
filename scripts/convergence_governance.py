@@ -212,7 +212,7 @@ def parse_policy(path):
     policy = read_json(path, "policy")
     if not isinstance(policy, dict) or policy.get("schema") != POLICY_SCHEMA:
         raise InputFault(f"policy-schema: expected {POLICY_SCHEMA}")
-    for field in ("policy_version", "workstreams", "wip", "review", "gates", "registry", "exceptions"):
+    for field in ("policy_version", "workstreams", "wip", "fairness", "review", "gates", "registry", "exceptions"):
         if field not in policy:
             raise InputFault(f"policy-missing-{field}")
     if not isinstance(policy["policy_version"], str) or not policy["policy_version"]:
@@ -224,6 +224,16 @@ def parse_policy(path):
             raise InputFault(f"policy-wip-{field}")
     if policy["wip"]["max_active_workstreams"] < 1:
         raise InputFault("policy-wip-max-active-workstreams-must-be-positive")
+    fairness = policy["fairness"]
+    if not isinstance(fairness, dict):
+        raise InputFault("policy-fairness-schema")
+    if fairness.get("basis") != "updated-or-created-utc":
+        raise InputFault("policy-fairness-basis")
+    if fairness.get("tie_break") != "oldest-first-id":
+        raise InputFault("policy-fairness-tie-break")
+    threshold = fairness.get("starvation_after_days")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise InputFault("policy-fairness-starvation-after-days")
     workstreams = policy["workstreams"]
     if (
         not isinstance(workstreams, list)
@@ -389,9 +399,35 @@ def starved_days(issue, now):
         return None
 
 
+def fairness_order(registry, issues, now):
+    """Oldest ready item first inside every existing policy priority class.
+
+    This ordering does not bypass an earlier failed gate, a dependency, or either
+    bounded reservation.  It only decides which otherwise-equal candidate receives
+    a scarce slot; missing time authority is therefore an inconclusive input fault.
+    """
+    ages = {}
+    for issue_id in registry:
+        issue = issues.get(issue_id)
+        if issue is None or issue["status"] in ("closed", "tombstone"):
+            continue
+        age = starved_days(issue, now)
+        if age is None:
+            raise InputFault(f"fairness-missing-or-malformed-age: {issue_id}")
+        ages[issue_id] = age
+    return sorted(registry, key=lambda issue_id: (-ages.get(issue_id, -1), issue_id)), ages
+
+
 def decide(policy, snapshot, now):
     registry, gates, active, exceptions = validate(policy, snapshot, now)
+    fairness = policy.get("fairness")
+    if not isinstance(fairness, dict):
+        raise InputFault("policy-fairness-schema")
+    threshold = fairness.get("starvation_after_days")
+    if fairness.get("basis") != "updated-or-created-utc" or fairness.get("tie_break") != "oldest-first-id" or not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise InputFault("policy-fairness-schema")
     issues = {row["id"]: row for row in snapshot["issues"]}
+    ordered_registry, starvation = fairness_order(registry, issues, now)
     earliest = next((gate for gate in gates if gate["state"] != "passed"), None)
     active_workstreams = sorted({row["workstream"] for row in active if row["class"] == "implementation"})
     over_cap = len(active_workstreams) > policy["wip"]["max_active_workstreams"]
@@ -399,7 +435,7 @@ def decide(policy, snapshot, now):
     verification_slots = policy["wip"]["verification_reservation"]
     incident_slots = min(policy["wip"]["incident_reservation"], len(exceptions))
     selected, held = [], []
-    for issue_id in sorted(registry):
+    for issue_id in ordered_registry:
         row = registry[issue_id]
         issue = issues.get(issue_id)
         if issue is None or issue["status"] in ("closed", "tombstone"):
@@ -411,7 +447,12 @@ def decide(policy, snapshot, now):
             "workstream": row["workstream"],
             "status": issue["status"],
             "blockers": blockers,
-            "starvation_days": starved_days(issue, now),
+            "starvation_days": starvation[issue_id],
+            "fairness": (
+                "starved"
+                if starvation[issue_id] >= policy["fairness"]["starvation_after_days"]
+                else "within-window"
+            ),
         }
         if issue["status"] == "in_progress":
             common["reason"] = "already-active"
@@ -464,6 +505,7 @@ def decide(policy, snapshot, now):
         "critical_path": [gate["id"] for gate in gates if earliest is None or gate["ordinal"] <= earliest["ordinal"]],
         "active_workstreams": active_workstreams,
         "wip": policy["wip"],
+        "fairness": fairness,
         "selected": selected,
         "held": held,
         "exceptions": exceptions,
@@ -527,6 +569,7 @@ def self_test():
         "policy_version": "self-test",
         "workstreams": ["W1", "W2", "W3"],
         "wip": {"max_active_workstreams": 2, "verification_reservation": 1, "incident_reservation": 1},
+        "fairness": {"basis": "updated-or-created-utc", "tie_break": "oldest-first-id", "starvation_after_days": 7},
         "review": {"authority": "self-test", "cadence_days": 1, "next_review": "2026-08-05T10:10:00Z"},
         "gates": [
             {"id": "G0", "state": "failed", "root_beads": ["root"]},
@@ -629,7 +672,7 @@ def self_test():
         draining_adoption,
         normalize_snapshot(
             {
-                "issues": issues + [{"id": "adoption-drain", "status": "in_progress"}],
+                "issues": issues + [{"id": "adoption-drain", "status": "in_progress", "created_at": "2026-08-01T00:00:00Z"}],
                 "edges": edges,
                 "evidence": raw["evidence"],
             }
@@ -646,7 +689,7 @@ def self_test():
         capacity_policy,
         normalize_snapshot(
             {
-                "issues": issues + [{"id": "candidate-w3", "status": "open", "labels": ["W3"]}],
+                "issues": issues + [{"id": "candidate-w3", "status": "open", "labels": ["W3"], "created_at": "2026-08-01T00:00:00Z"}],
                 "edges": edges,
                 "evidence": raw["evidence"],
             }
@@ -674,10 +717,10 @@ def self_test():
             {
                 "issues": issues
                 + [
-                    {"id": "verification-a", "status": "open"},
-                    {"id": "verification-b", "status": "open"},
-                    {"id": "incident-a", "status": "open"},
-                    {"id": "incident-b", "status": "open"},
+                    {"id": "verification-a", "status": "open", "created_at": "2026-08-04T00:00:00Z"},
+                    {"id": "verification-b", "status": "open", "created_at": "2026-07-01T00:00:00Z"},
+                    {"id": "incident-a", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
+                    {"id": "incident-b", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
                 ],
                 "edges": edges,
                 "evidence": raw["evidence"],
@@ -689,8 +732,40 @@ def self_test():
     held_reservations = {row["id"]: row["reason"] for row in reservation_decision["held"]}
     if selected_reservations.get("incident-a") != "bounded-incident-exception" or held_reservations.get("incident-b") != "incident-reservation-exhausted":
         raise AssertionError("incident reservation was not bounded")
-    if selected_reservations.get("verification-a") != "reserved-independent-verification" or held_reservations.get("verification-b") != "verification-reservation-exhausted":
-        raise AssertionError("verification reservation was not bounded")
+    if selected_reservations.get("verification-b") != "reserved-independent-verification" or held_reservations.get("verification-a") != "verification-reservation-exhausted":
+        raise AssertionError("oldest verification did not receive the bounded reservation")
+    fairness_tie = copy.deepcopy(reservation_policy)
+    fairness_tie_decision = decide(
+        fairness_tie,
+        normalize_snapshot(
+            {
+                "issues": issues
+                + [
+                    {"id": "verification-a", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
+                    {"id": "verification-b", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
+                    {"id": "incident-a", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
+                    {"id": "incident-b", "status": "open", "created_at": "2026-08-01T00:00:00Z"},
+                ],
+                "edges": edges,
+                "evidence": raw["evidence"],
+            }
+        ),
+        now,
+    )
+    if not any(row["id"] == "verification-a" and row["reason"] == "reserved-independent-verification" for row in fairness_tie_decision["selected"]):
+        raise AssertionError("fairness tie did not use the stable issue-id tie-break")
+    malformed_age = copy.deepcopy(first)
+    malformed_age["issues"] = [
+        {**issue, "created_at": "not-a-timestamp"} if issue["id"] == "ready" else issue
+        for issue in malformed_age["issues"]
+    ]
+    try:
+        decide(policy, malformed_age, now)
+    except InputFault as error:
+        if "fairness-missing-or-malformed-age" not in str(error):
+            raise AssertionError(f"malformed fairness age wrong refusal: {error}") from error
+    else:
+        raise AssertionError("malformed fairness age survived")
     expired_exception = copy.deepcopy(reservation_policy)
     expired_exception["exceptions"][0]["expiry"] = "2026-08-04T10:10:00Z"
     try:
@@ -795,7 +870,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 22 named model/mutation cells passed"
+    return "convergence-governance self-test: 25 named model/mutation cells passed"
 
 
 def main(argv):

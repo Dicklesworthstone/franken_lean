@@ -1,11 +1,16 @@
 {
   "schema": "fln.convergence-governance-policy/1",
-  "policy_version": "2026-08-04.1",
+  "policy_version": "2026-08-04.2",
   "workstreams": ["W1", "W2", "W3"],
   "wip": {
     "max_active_workstreams": 3,
     "verification_reservation": 16,
     "incident_reservation": 1
+  },
+  "fairness": {
+    "basis": "updated-or-created-utc",
+    "tie_break": "oldest-first-id",
+    "starvation_after_days": 7
   },
   "review": {
     "authority": "sequencer",
@@ -27,6 +32,7 @@
     {"id": "fln-private-index-worktree-sync-mbh9", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-d3-safety-note-unenforced-cdbg", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "franken_lean-convergence-wip-governance-149", "class": "verification", "workstream": "W1", "gate": "G0"},
+    {"id": "fln-manifest-complete-row-preflight-gap-77xh", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-census-empty-referent-no-mock-krb0", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-cross-tree-baked-root-k60n", "class": "verification", "workstream": "W1", "gate": "G0"},
     {"id": "fln-h25", "class": "verification", "workstream": "W1", "gate": "G0"},
