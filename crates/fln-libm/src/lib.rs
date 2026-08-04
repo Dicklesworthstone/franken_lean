@@ -63,6 +63,9 @@ pub fn abs(x: f64) -> f64 {
 
 /// Truncation toward zero with no dependency on a platform rounding mode.
 pub fn trunc(x: f64) -> f64 {
+    if invalid(x) {
+        return canonical_nan();
+    }
     let bits = x.to_bits();
     let exponent = ((bits & EXP) >> 52) as i32 - 1023;
     if exponent < 0 {
@@ -77,7 +80,10 @@ pub fn trunc(x: f64) -> f64 {
 
 /// Floor with exact signed-zero handling.
 pub fn floor(x: f64) -> f64 {
-    if invalid(x) || x.is_infinite() || x == 0.0 {
+    if invalid(x) {
+        return canonical_nan();
+    }
+    if x.is_infinite() || x == 0.0 {
         return x;
     }
     let t = trunc(x);
@@ -86,7 +92,10 @@ pub fn floor(x: f64) -> f64 {
 
 /// Ceiling with exact signed-zero handling.
 pub fn ceil(x: f64) -> f64 {
-    if invalid(x) || x.is_infinite() || x == 0.0 {
+    if invalid(x) {
+        return canonical_nan();
+    }
+    if x.is_infinite() || x == 0.0 {
         return x;
     }
     let t = trunc(x);
@@ -95,7 +104,10 @@ pub fn ceil(x: f64) -> f64 {
 
 /// Round to nearest, with ties away from zero (Lean's `Float.round` rule).
 pub fn round(x: f64) -> f64 {
-    if invalid(x) || x.is_infinite() || x == 0.0 {
+    if invalid(x) {
+        return canonical_nan();
+    }
+    if x.is_infinite() || x == 0.0 {
         return x;
     }
     if x > 0.0 {
@@ -814,6 +826,14 @@ mod tests {
     fn expm1_canonicalizes_nan_before_its_series_path() {
         let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
         assert_eq!(expm1(payload_nan).to_bits(), CANONICAL_NAN_BITS);
+    }
+
+    #[test]
+    fn rounding_operations_canonicalize_nan() {
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        for operation in [trunc, floor, ceil, round] {
+            assert_eq!(operation(payload_nan).to_bits(), CANONICAL_NAN_BITS);
+        }
     }
 
     #[test]
