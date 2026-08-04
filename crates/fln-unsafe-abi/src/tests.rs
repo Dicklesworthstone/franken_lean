@@ -1202,27 +1202,30 @@ fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
 #[test]
 fn small_heap_pages_reclaim_after_deferred_blocks_drain() {
     let _g = lock();
-    use crate::export::{export_mi_free, export_mi_malloc_small};
+    let (before, after) = std::thread::spawn(|| {
+        use crate::export::{export_mi_free, export_mi_malloc_small};
 
-    crate::membrane::drain_small_bins_for_test();
-    let before = crate::membrane::small_page_metrics_for_test();
-    let mut blocks = Vec::new();
-    for _ in 0..32 {
-        let block = export_mi_malloc_small(9);
-        assert!(!block.is_null());
-        blocks.push(block);
-    }
-    for block in blocks {
-        export_mi_free(block);
-    }
-    assert_eq!(
-        crate::membrane::small_bin_depth_for_test(9),
-        crate::membrane::small_bin_capacity_for_test(),
-        "the bounded deferred-free cache retains only its configured tail"
-    );
+        let before = crate::membrane::small_page_local_metrics_for_test();
+        let mut blocks = Vec::new();
+        for _ in 0..32 {
+            let block = export_mi_malloc_small(9);
+            assert!(!block.is_null());
+            blocks.push(block);
+        }
+        for block in blocks {
+            export_mi_free(block);
+        }
+        assert_eq!(
+            crate::membrane::small_bin_depth_for_test(9),
+            crate::membrane::small_bin_capacity_for_test(),
+            "the bounded deferred-free cache retains only its configured tail"
+        );
 
-    crate::membrane::drain_small_bins_for_test();
-    let after = crate::membrane::small_page_metrics_for_test();
+        crate::membrane::drain_small_bins_for_test();
+        (before, crate::membrane::small_page_local_metrics_for_test())
+    })
+    .join()
+    .expect("isolated page-reclamation worker");
     assert_eq!(
         after.0,
         before.0 + 1,
@@ -1481,6 +1484,43 @@ fn small_heap_concurrent_ring_handoffs_reclaim_at_1_8_32_threads() {
             "width {width} concurrently returns every peer-owned page"
         );
     }
+}
+
+#[test]
+fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
+    let _g = lock();
+    use crate::export::{export_lean_small_mem_size, export_mi_free};
+
+    crate::membrane::drain_small_bins_for_test();
+    let before = crate::membrane::small_page_metrics_for_test();
+    let block = crate::membrane::reentrant_small_alloc_for_test(17).cast::<core::ffi::c_void>();
+    assert!(
+        !block.is_null(),
+        "a reentrant small allocation keeps the raw heap contract"
+    );
+    assert_eq!(
+        export_lean_small_mem_size(block),
+        17,
+        "the individual fallback retains the logical-size prefix"
+    );
+    assert_eq!(
+        crate::membrane::small_page_metrics_for_test(),
+        before,
+        "a reentrant fallback does not mint a TLS-owned page"
+    );
+
+    export_mi_free(block);
+    assert_eq!(
+        crate::membrane::small_bin_depth_for_test(17),
+        1,
+        "the normal free path may defer the individually-owned fallback"
+    );
+    crate::membrane::drain_small_bins_for_test();
+    assert_eq!(
+        crate::membrane::small_page_metrics_for_test(),
+        before,
+        "draining the fallback cannot affect page ownership metrics"
+    );
 }
 
 #[test]

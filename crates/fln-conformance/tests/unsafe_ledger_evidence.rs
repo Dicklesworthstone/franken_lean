@@ -378,7 +378,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// (FLN-UL-0321 through 0326). Each replacement row retains at least one exact boundary
 /// test for its own bins/page lifecycle path, so this is a measured one-row-to-six-row
 /// refinement, not five prose rows silently gaining a resolving spelling.
-const SYMBOL_RESOLVED_ROWS: usize = 95;
+/// 95 -> 96 in the FLN-UL-0327 reentrant TLS fallback landing: the new test-only forcing
+/// hook cites `small_heap_reentrant_tls_borrow_uses_individual_fallback`, which drives the
+/// production individual-allocation fallback while its TLS bin is borrowed.
+const SYMBOL_RESOLVED_ROWS: usize = 96;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -440,7 +443,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 95;
 /// all 512 pages to be reclaimed. The six rows respectively name the bins, page construction,
 /// page block release, owner release, page free, and block-release paths that this exact
 /// all-class lifecycle covers; no pre-existing resolving token was removed in that refresh.
-const RESOLVING_CITATION_TOKENS: usize = 119;
+/// 119 -> 120 in the FLN-UL-0327 reentrant TLS fallback landing: its one exact test-function
+/// citation is a new symbol token and no existing row lost a resolving citation.
+const RESOLVING_CITATION_TOKENS: usize = 120;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -469,8 +474,8 @@ const PROSE_EVIDENCE_ROWS: usize = 226;
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 322 rows: 1 cites an e2e lane, 95 carry \
-symbol-resolved evidence, and 226 remain prose; 119 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 323 rows: 1 cites an e2e lane, 96 carry \
+symbol-resolved evidence, and 226 remain prose; 120 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\

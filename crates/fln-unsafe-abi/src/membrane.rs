@@ -233,6 +233,16 @@ thread_local! {
 
     /// Bounded deferred-free bins local to the executing runtime thread.
     static SMALL_BINS: RefCell<SmallBins> = const { RefCell::new(SmallBins::new()) };
+
+    /// Test-only page lifecycle telemetry local to the executing thread. The
+    /// process-wide counters below remain useful for cross-thread scenarios,
+    /// while this avoids unrelated TLS destructors perturbing an exact local
+    /// page-reclamation assertion.
+    #[cfg(test)]
+    static SMALL_PAGE_LOCAL_ALLOCS: Cell<usize> = const { Cell::new(0) };
+
+    #[cfg(test)]
+    static SMALL_PAGE_LOCAL_FREES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Add explicit heartbeat ticks with the pin's wrapping unsigned arithmetic.
@@ -318,7 +328,10 @@ unsafe fn alloc_small_page(owner_next: *mut SmallPage, class: usize) -> *mut Sma
             page_layout,
         });
         #[cfg(test)]
-        SMALL_PAGE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        {
+            SMALL_PAGE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            SMALL_PAGE_LOCAL_ALLOCS.with(|allocs| allocs.set(allocs.get() + 1));
+        }
         page
     }
 }
@@ -362,7 +375,10 @@ unsafe fn free_small_page(page: *mut SmallPage) {
     unsafe {
         let layout = (*page).page_layout;
         #[cfg(test)]
-        SMALL_PAGE_FREES.fetch_add(1, Ordering::Relaxed);
+        {
+            SMALL_PAGE_FREES.fetch_add(1, Ordering::Relaxed);
+            SMALL_PAGE_LOCAL_FREES.with(|frees| frees.set(frees.get() + 1));
+        }
         dealloc(page.cast::<u8>(), layout);
     }
 }
@@ -515,8 +531,29 @@ pub(crate) fn small_page_metrics_for_test() -> (usize, usize) {
 }
 
 #[cfg(test)]
+pub(crate) fn small_page_local_metrics_for_test() -> (usize, usize) {
+    (
+        SMALL_PAGE_LOCAL_ALLOCS.with(Cell::get),
+        SMALL_PAGE_LOCAL_FREES.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn drain_small_bins_for_test() {
     SMALL_BINS.with(|bins| bins.borrow_mut().drain());
+}
+
+#[cfg(test)]
+// UNSAFE-LEDGER: FLN-UL-0327
+#[allow(unsafe_code)]
+pub(crate) fn reentrant_small_alloc_for_test(user_size: usize) -> *mut u8 {
+    assert!(user_size > 0, "test allocation size must be nonzero");
+    SMALL_BINS.with(|bins| {
+        let _held_bin_borrow = bins.borrow_mut();
+        // SAFETY: the test returns the live pointer to its caller, which
+        // releases it through the exported small-heap free surface.
+        unsafe { small_alloc_raw(user_size) }
+    })
 }
 
 #[cfg(test)]
