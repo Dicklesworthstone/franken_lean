@@ -362,6 +362,7 @@ pub enum InferencePhase {
     LetValueComparison,
     LetBody,
     LetZeta,
+    LiteralType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +568,10 @@ pub enum InferenceFault {
         argument: usize,
         fault: WhnfFault,
     },
+    /// KR-110: the one-node arena for a literal's type constant could not be
+    /// allocated, or its root index did not construct. A unit variant so the
+    /// fault costs no width in a type returned by value on the hot path.
+    LiteralTypeAllocation,
     /// KR-109: an internal fault raised while comparing a let value against its
     /// declared type. Keyed by binder ordinal, not by argument ordinal.
     LetValueDefEq {
@@ -1856,6 +1861,71 @@ fn collect_let_telescope(
     ))
 }
 
+/// KR-110: the constant a `Nat` literal is typed by.
+const LITERAL_NAT: &str = "Nat";
+/// KR-110: the constant a `String` literal is typed by.
+const LITERAL_STRING: &str = "String";
+
+/// KR-110: the type of a literal is a CONSTANT the term does not contain.
+///
+/// Every other leaf rule copies a type out of an arena it was handed; this one
+/// has to build one, because a literal node carries no type subterm. Two things
+/// about that are load-bearing.
+///
+/// The environment is consulted rather than trusted. A literal whose type
+/// constant is not declared is a typed [`InferenceRefusal::UnknownConstant`] —
+/// not a deferral, because the question is answered rather than open, and not a
+/// panic. The universe arity is checked even though it is always zero here: an
+/// environment declaring `Nat` with level parameters is malformed input and must
+/// refuse rather than silently instantiate nothing.
+///
+/// The constant's own declared type is deliberately NOT re-checked. KR-105 does
+/// not re-check a constant's type either; doing it here would smuggle KR-972's
+/// preamble law into this rule.
+///
+/// `#[inline(never)]`, and the arms above call it rather than inlining their
+/// bodies, for the reason `LetState` records: `run` and `dispatch_reference` sit
+/// on a 64 KiB budget shared by every rule, and KR-109 overran it by growing one
+/// frame with match-arm locals.
+#[inline(never)]
+fn literal_type(
+    constant: &str,
+    context: &InferenceContext,
+    control: &mut Control,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Dispatch, LeafHalt> {
+    let name = WireName::from_parts(vec![NamePart::Text(constant.to_owned())]);
+    control
+        .step(cancelled, InferencePhase::LiteralType, 0)
+        .map_err(LeafHalt::stop)?;
+    let declaration = context.constants().find(&name).ok_or(LeafHalt::Refused(
+        InferenceRefusal::UnknownConstant { name: name.clone() },
+    ))?;
+    let expected = declaration.level_parameters().len();
+    if expected != 0 {
+        return Err(LeafHalt::Refused(InferenceRefusal::ConstantUniverseArity {
+            name,
+            expected,
+            actual: 0,
+        }));
+    }
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(1)
+        .map_err(|_| LeafHalt::Fault(InferenceFault::LiteralTypeAllocation))?;
+    nodes.push(ExprNode::Constant {
+        name,
+        levels: Vec::new(),
+    });
+    let root =
+        ExprId::from_index(0).ok_or(LeafHalt::Fault(InferenceFault::LiteralTypeAllocation))?;
+    Ok(Dispatch::Type(WireExpr::from_parts(
+        nodes,
+        Vec::new(),
+        root,
+    )))
+}
+
 fn dispatch_reference(
     input: &WireExpr,
     generated: &[Arc<WireExpr>],
@@ -2077,8 +2147,8 @@ fn dispatch_reference(
                 collect_let_telescope(term, reference.source, root, control, cancelled)?;
             Ok(Dispatch::Let { binders, body })
         }
-        ExprNode::NatLiteral { .. } => Err(LeafHalt::Deferred(InferenceDeferred::NatLiteral)),
-        ExprNode::StringLiteral(_) => Err(LeafHalt::Deferred(InferenceDeferred::StringLiteral)),
+        ExprNode::NatLiteral { .. } => literal_type(LITERAL_NAT, context, control, cancelled),
+        ExprNode::StringLiteral(_) => literal_type(LITERAL_STRING, context, control, cancelled),
         ExprNode::Projection { .. } => Err(LeafHalt::Deferred(InferenceDeferred::Projection)),
         ExprNode::Metadata { .. } => Err(LeafHalt::Fault(InferenceFault::ResidualMetadata {
             index: root.index(),

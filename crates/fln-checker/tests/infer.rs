@@ -621,20 +621,13 @@ fn generated_level_constructors_preserve_sort_successor_and_constant_instantiati
 #[test]
 fn unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requirement() {
     let sort_zero = Expr::sort(Level::zero());
-    let cases = vec![
-        (
-            Expr::lit(Literal::Nat(NatLit::from_u64(11))),
-            InferenceDeferred::NatLiteral,
-        ),
-        (
-            Expr::lit(Literal::Str("deferred".to_owned())),
-            InferenceDeferred::StringLiteral,
-        ),
-        (
-            Expr::proj(primary_name("S"), 0, sort_zero.clone()),
-            InferenceDeferred::Projection,
-        ),
-    ];
+    // KR-110 removed NatLiteral and StringLiteral from this census; KR-112
+    // projections are the only family left. The population is asserted exactly
+    // rather than loosely, so implementing KR-112 must come back through here.
+    let cases = vec![(
+        Expr::proj(primary_name("S"), 0, sort_zero.clone()),
+        InferenceDeferred::Projection,
+    )];
     let context = InferenceContext::empty(ConstantEnvironment::empty());
     for (expression, requirement) in cases {
         for candidate in [expression.clone(), Expr::mdata(KVMap::new(), expression)] {
@@ -2993,6 +2986,7 @@ fn cancellation_reaches_each_phase_without_partial_output_and_cleanly_recovers()
                 | InferencePhase::LetValueComparison
                 | InferencePhase::LetBody
                 | InferencePhase::LetZeta
+                | InferencePhase::LiteralType
                 | InferencePhase::ForallDomain
                 | InferencePhase::ForallDomainSort
                 | InferencePhase::ForallBody
@@ -3714,25 +3708,22 @@ fn kr109_a_value_whose_type_mismatches_the_annotation_is_rejected_naming_the_bin
 
 #[test]
 fn kr109_the_deferral_set_shrank_by_exactly_the_let_case() {
-    // The anti-vacuity cell for this whole slice. KR-110 and KR-112 must STILL
-    // defer; a repair that replaced the deferral machinery wholesale, rather
-    // than removing one member of it, fails here.
+    // The anti-vacuity cell for the KR-109 slice: a repair that emptied the
+    // deferral machinery wholesale, rather than removing one member of it,
+    // fails here.
+    //
+    // **This cell CAUGHT THE NEXT SLICE, which is the argument for writing it
+    // this way.** It originally required NatLiteral and StringLiteral to still
+    // defer, and went red the moment KR-110 implemented them — by the same
+    // author, in the same session. The premise moved, so the cell is narrowed to
+    // what remains true rather than deleted: KR-112 still defers, and the let
+    // case still completes.
     let sort_zero = Expr::sort(Level::zero());
     let context = InferenceContext::empty(ConstantEnvironment::empty());
-    let still_deferred = vec![
-        (
-            Expr::lit(Literal::Nat(NatLit::from_u64(11))),
-            InferenceDeferred::NatLiteral,
-        ),
-        (
-            Expr::lit(Literal::Str("deferred".to_owned())),
-            InferenceDeferred::StringLiteral,
-        ),
-        (
-            Expr::proj(primary_name("S"), 0, sort_zero.clone()),
-            InferenceDeferred::Projection,
-        ),
-    ];
+    let still_deferred = vec![(
+        Expr::proj(primary_name("S"), 0, sort_zero.clone()),
+        InferenceDeferred::Projection,
+    )];
     for (expression, requirement) in still_deferred {
         let outcome = infer(
             &decoded(&expression),
@@ -3907,4 +3898,162 @@ fn kr109_let_resources_and_cancellation_stay_typed_and_recover_cleanly() {
         expr_model(&baseline.type_),
         "recovery after starvation and cancellation must be clean"
     );
+}
+
+// ---------------------------------------------------------------------------
+// KR-110 — literal inference (bead: next slice of the fln-checker KR train)
+//
+// A literal's type is a CONSTANT the term does not contain, so this rule builds
+// a type rather than copying one. The cells are written against the two ways
+// that goes wrong quietly: naming a constant the environment does not declare,
+// and accepting a malformed declaration of one.
+// ---------------------------------------------------------------------------
+
+fn literal_env(nat_params: Vec<WireName>, string_params: Vec<WireName>) -> Vec<ConstantEntry> {
+    let type_one = sort(Level::one());
+    vec![
+        header(
+            "Nat",
+            nat_params,
+            type_one.clone(),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+        header(
+            "String",
+            string_params,
+            type_one,
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+    ]
+}
+
+#[test]
+fn kr110_literals_infer_their_declared_type_constants_in_both_modes() {
+    let context = built_context(Vec::new(), Vec::new(), literal_env(Vec::new(), Vec::new()));
+    let cases = [
+        (Expr::lit(Literal::Nat(NatLit::from_u64(11))), "Nat"),
+        (Expr::lit(Literal::Str("hello".to_owned())), "String"),
+    ];
+    for (expression, expected) in cases {
+        for mode in let_modes() {
+            let result = complete(infer(
+                &decoded(&expression),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(
+                expr_model(&result.type_),
+                ExprModel::Other(format!(
+                    "Constant {{ name: {:?}, levels: [] }}",
+                    checker_name(expected)
+                )),
+                "a literal must infer the constant {expected} ({mode:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn kr110_a_literal_whose_type_constant_is_undeclared_is_refused_not_deferred() {
+    // The environment is EMPTY. A literal is still well-formed, but its type
+    // names a constant that does not exist — an answered question, so a typed
+    // rejection rather than a deferral.
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    for expression in [
+        Expr::lit(Literal::Nat(NatLit::from_u64(3))),
+        Expr::lit(Literal::Str("x".to_owned())),
+    ] {
+        let outcome = infer(
+            &decoded(&expression),
+            &context,
+            InferenceMode::InferOnly,
+            InferenceBudget::unlimited(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                InferenceOutcome::Refused {
+                    refusal: InferenceRefusal::UnknownConstant { .. },
+                    ..
+                }
+            ),
+            "an undeclared literal type constant must be a typed refusal, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn kr110_a_type_constant_declared_with_universe_parameters_is_refused() {
+    // Trivially zero in a healthy environment, which is exactly why it is worth
+    // a cell: a check that can never fire on well-formed input is the kind that
+    // gets deleted as dead. Feed it malformed input and it fires.
+    let context = built_context(
+        Vec::new(),
+        Vec::new(),
+        literal_env(vec![checker_name("u")], Vec::new()),
+    );
+    let outcome = infer(
+        &decoded(&Expr::lit(Literal::Nat(NatLit::from_u64(1)))),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ConstantUniverseArity {
+                    expected: 1,
+                    actual: 0,
+                    ..
+                },
+                ..
+            }
+        ),
+        "a literal type constant with universe parameters must refuse on arity, got {outcome:?}"
+    );
+}
+
+#[test]
+fn kr110_only_projection_still_defers() {
+    // The anti-vacuity cell for this slice, and the successor to the KR-109 one.
+    // After KR-110 exactly ONE deferral remains. A repair that emptied the
+    // deferral machinery instead of removing two members of it fails here.
+    let context = built_context(Vec::new(), Vec::new(), literal_env(Vec::new(), Vec::new()));
+    let still_deferred = infer(
+        &decoded(&Expr::proj(primary_name("S"), 0, Expr::sort(Level::zero()))),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            still_deferred,
+            InferenceOutcome::Deferred {
+                requirement: InferenceDeferred::Projection,
+                ..
+            }
+        ),
+        "KR-112 projections must STILL defer after the KR-110 slice, got {still_deferred:?}"
+    );
+    for expression in [
+        Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+        Expr::lit(Literal::Str("s".to_owned())),
+    ] {
+        assert!(
+            matches!(
+                infer(
+                    &decoded(&expression),
+                    &context,
+                    InferenceMode::InferOnly,
+                    InferenceBudget::unlimited(),
+                ),
+                InferenceOutcome::Complete(_)
+            ),
+            "literals must now COMPLETE rather than defer"
+        );
+    }
 }
