@@ -211,7 +211,10 @@ impl LockChange {
 /// same candidate and its exact old/proposed lock roots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateReceipt {
+    pub run_id: String,
     pub candidate_id: String,
+    pub component_id: String,
+    pub ledger_transition_id: String,
     pub change: LockChange,
     pub old_lock_root: String,
     pub candidate_lock_root: String,
@@ -221,6 +224,11 @@ pub struct CandidateReceipt {
     pub migration_root: String,
     pub rollback_root: String,
     pub external_evidence_root: String,
+    pub expected_stage: String,
+    pub actual_stage: String,
+    pub rollback_outcome: String,
+    pub publication_authority: String,
+    pub cleanup: String,
     pub final_current_lock_root: String,
 }
 
@@ -241,13 +249,22 @@ pub struct CandidateEvidenceRoots {
 
 impl CandidateReceipt {
     pub fn validate(&self) -> Result<(), String> {
-        if self.candidate_id.is_empty()
-            || !self
-                .candidate_id
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err("candidate receipt needs a canonical candidate id".to_string());
+        for (name, value) in [
+            ("run_id", &self.run_id),
+            ("candidate_id", &self.candidate_id),
+            ("component_id", &self.component_id),
+            ("ledger_transition_id", &self.ledger_transition_id),
+            ("expected_stage", &self.expected_stage),
+            ("actual_stage", &self.actual_stage),
+            ("rollback_outcome", &self.rollback_outcome),
+            ("publication_authority", &self.publication_authority),
+            ("cleanup", &self.cleanup),
+        ] {
+            if !is_canonical_identifier(value) {
+                return Err(format!(
+                    "candidate receipt `{name}` needs a canonical non-empty identifier"
+                ));
+            }
         }
         if self.old_lock_root == self.candidate_lock_root {
             return Err("candidate receipt does not change the lock root".to_string());
@@ -286,10 +303,13 @@ impl CandidateReceipt {
         self.validate()?;
         Ok(format!(
             concat!(
-                r#"{{"schema":"fln-suite-upgrade-candidate/1","candidate_id":"{}","change":"{}","old_lock_root":"{}","candidate_lock_root":"{}","closure_root":"{}","contract_and_census_root":"{}","tribunal_root":"{}","migration_root":"{}","rollback_root":"{}","external_evidence_root":"{}","final_current_lock_root":"{}"}}"#,
+                r#"{{"schema":"fln-suite-upgrade-candidate/2","run_id":"{}","candidate_id":"{}","component_id":"{}","ledger_transition_id":"{}","change":"{}","old_lock_root":"{}","candidate_lock_root":"{}","closure_root":"{}","contract_and_census_root":"{}","tribunal_root":"{}","migration_root":"{}","rollback_root":"{}","external_evidence_root":"{}","expected_stage":"{}","actual_stage":"{}","rollback_outcome":"{}","publication_authority":"{}","cleanup":"{}","final_current_lock_root":"{}"}}"#,
                 "\n"
             ),
+            self.run_id,
             self.candidate_id,
+            self.component_id,
+            self.ledger_transition_id,
             self.change.label(),
             self.old_lock_root,
             self.candidate_lock_root,
@@ -299,25 +319,38 @@ impl CandidateReceipt {
             self.migration_root,
             self.rollback_root,
             self.external_evidence_root,
+            self.expected_stage,
+            self.actual_stage,
+            self.rollback_outcome,
+            self.publication_authority,
+            self.cleanup,
             self.final_current_lock_root,
         ))
     }
 
     pub fn from_ndjson(text: &str) -> Result<Self, String> {
         let values = parse_canonical_receipt_ndjson(text)?;
-        let change = LockChange::parse_label(&values[2])?;
+        let change = LockChange::parse_label(&values[5])?;
         let receipt = Self {
-            candidate_id: values[1].clone(),
+            run_id: values[1].clone(),
+            candidate_id: values[2].clone(),
+            component_id: values[3].clone(),
+            ledger_transition_id: values[4].clone(),
             change,
-            old_lock_root: values[3].clone(),
-            candidate_lock_root: values[4].clone(),
-            closure_root: values[5].clone(),
-            contract_and_census_root: values[6].clone(),
-            tribunal_root: values[7].clone(),
-            migration_root: values[8].clone(),
-            rollback_root: values[9].clone(),
-            external_evidence_root: values[10].clone(),
-            final_current_lock_root: values[11].clone(),
+            old_lock_root: values[6].clone(),
+            candidate_lock_root: values[7].clone(),
+            closure_root: values[8].clone(),
+            contract_and_census_root: values[9].clone(),
+            tribunal_root: values[10].clone(),
+            migration_root: values[11].clone(),
+            rollback_root: values[12].clone(),
+            external_evidence_root: values[13].clone(),
+            expected_stage: values[14].clone(),
+            actual_stage: values[15].clone(),
+            rollback_outcome: values[16].clone(),
+            publication_authority: values[17].clone(),
+            cleanup: values[18].clone(),
+            final_current_lock_root: values[19].clone(),
         };
         receipt.validate()?;
         if receipt.to_ndjson()? != text {
@@ -386,10 +419,20 @@ fn is_canonical_root(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn is_canonical_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 fn parse_canonical_receipt_ndjson(text: &str) -> Result<Vec<String>, String> {
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 20] = [
         "schema",
+        "run_id",
         "candidate_id",
+        "component_id",
+        "ledger_transition_id",
         "change",
         "old_lock_root",
         "candidate_lock_root",
@@ -399,6 +442,11 @@ fn parse_canonical_receipt_ndjson(text: &str) -> Result<Vec<String>, String> {
         "migration_root",
         "rollback_root",
         "external_evidence_root",
+        "expected_stage",
+        "actual_stage",
+        "rollback_outcome",
+        "publication_authority",
+        "cleanup",
         "final_current_lock_root",
     ];
     if !text.ends_with('\n') || text[..text.len() - 1].contains('\n') {
@@ -436,7 +484,7 @@ fn parse_canonical_receipt_ndjson(text: &str) -> Result<Vec<String>, String> {
     if !remaining.is_empty() {
         return Err("candidate receipt row has trailing bytes".to_string());
     }
-    if values[0] != "fln-suite-upgrade-candidate/1" {
+    if values[0] != "fln-suite-upgrade-candidate/2" {
         return Err(format!("unknown candidate receipt schema `{}`", values[0]));
     }
     Ok(values)

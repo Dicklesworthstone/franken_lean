@@ -34,7 +34,10 @@ fn root_identity(digit: char) -> String {
 
 fn complete_receipt(change: LockChange) -> CandidateReceipt {
     CandidateReceipt {
+        run_id: "suite-upgrade-run-fixture".to_string(),
         candidate_id: "suite-upgrade-fixture".to_string(),
+        component_id: "fln-conformance".to_string(),
+        ledger_transition_id: "ledger-transition-fixture".to_string(),
         change,
         old_lock_root: root_identity('a'),
         candidate_lock_root: root_identity('b'),
@@ -44,6 +47,11 @@ fn complete_receipt(change: LockChange) -> CandidateReceipt {
         migration_root: root_identity('f'),
         rollback_root: root_identity('1'),
         external_evidence_root: root_identity('2'),
+        expected_stage: "complete-evidence-join".to_string(),
+        actual_stage: "complete-evidence-join".to_string(),
+        rollback_outcome: "rollback-proven".to_string(),
+        publication_authority: "current-lock-retained".to_string(),
+        cleanup: "candidate-retained".to_string(),
         final_current_lock_root: root_identity('a'),
     }
 }
@@ -189,8 +197,8 @@ fn candidate_receipt_ndjson_is_strict_and_canonical() {
     );
 
     let reordered = ndjson.replacen(
-        r#"{"schema":"fln-suite-upgrade-candidate/1","candidate_id""#,
-        r#"{"candidate_id":"suite-upgrade-fixture","schema""#,
+        r#"{"schema":"fln-suite-upgrade-candidate/2","run_id""#,
+        r#"{"run_id":"suite-upgrade-run-fixture","schema""#,
         1,
     );
     assert!(
@@ -202,6 +210,14 @@ fn candidate_receipt_ndjson_is_strict_and_canonical() {
     assert!(
         CandidateReceipt::from_ndjson(missing_newline).is_err(),
         "a receipt without final newline must refuse"
+    );
+
+    let mut missing_cleanup = receipt;
+    missing_cleanup.cleanup.clear();
+    assert_eq!(
+        missing_cleanup.validate(),
+        Err("candidate receipt `cleanup` needs a canonical non-empty identifier".to_string()),
+        "a receipt must retain its cleanup outcome"
     );
 }
 

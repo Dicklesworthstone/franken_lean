@@ -22,8 +22,10 @@ entry id=frankensqlite-cas-blob-access|state=investigated|owner=W1|repository=fr
 entry id=fln-bignum-second-suite-consumer|state=investigated|owner=W3|repository=franken_lean|link=local-audit:SUITE.lock|rationale=Kernel-adjacent bignum remains in-repo under the kernel covenant.|gate=Second-suite-consumer review|consumer=fln-kernel|fallback=Keep fln-bignum in-repo.|revisit=Revisit only when a second suite member needs arbitrary precision.
 ```
 
-An upgrade candidate records its exact old and proposed lock roots, closure delta,
-contract/census root, Tribunal root, component migration, rollback result, and
-unchanged-current-root check in its retained NDJSON. Cancellation, unavailable
+An upgrade candidate records canonical run, candidate, component, and ledger
+transition identifiers; exact old and proposed lock roots; closure,
+contract/census, Tribunal, migration, rollback, and external-evidence roots;
+expected/actual stage, rollback outcome, publication authority, cleanup, and the
+final current-lock root in one retained NDJSON record. Cancellation, unavailable
 external evidence, source drift, or any incomplete join leaves the current lock
 untouched and the candidate non-authoritative.
