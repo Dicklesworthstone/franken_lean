@@ -61,6 +61,7 @@ pub mod poison;
 pub mod precedence;
 pub mod public_surface;
 mod public_surface_generated;
+pub mod suite_upgrade;
 pub mod syntax_hygiene;
 pub mod trace_replay;
 pub mod tree_identity;
