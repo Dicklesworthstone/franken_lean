@@ -29,3 +29,7 @@ expected/actual stage, rollback outcome, publication authority, cleanup, and the
 final current-lock root in one retained NDJSON record. Cancellation, unavailable
 external evidence, source drift, or any incomplete join leaves the current lock
 untouched and the candidate non-authoritative.
+
+The successful preflight record is intentionally non-promoting: both stage
+values are `complete-evidence-join`, rollback is `rollback-proven`, publication
+authority is `current-lock-retained`, and cleanup is `candidate-retained`.

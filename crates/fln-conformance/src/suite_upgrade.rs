@@ -266,6 +266,35 @@ impl CandidateReceipt {
                 ));
             }
         }
+        for (name, value, expected) in [
+            (
+                "expected_stage",
+                self.expected_stage.as_str(),
+                "complete-evidence-join",
+            ),
+            (
+                "actual_stage",
+                self.actual_stage.as_str(),
+                "complete-evidence-join",
+            ),
+            (
+                "rollback_outcome",
+                self.rollback_outcome.as_str(),
+                "rollback-proven",
+            ),
+            (
+                "publication_authority",
+                self.publication_authority.as_str(),
+                "current-lock-retained",
+            ),
+            ("cleanup", self.cleanup.as_str(), "candidate-retained"),
+        ] {
+            if value != expected {
+                return Err(format!(
+                    "candidate receipt `{name}` is `{value}`, expected `{expected}`"
+                ));
+            }
+        }
         if self.old_lock_root == self.candidate_lock_root {
             return Err("candidate receipt does not change the lock root".to_string());
         }

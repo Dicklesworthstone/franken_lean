@@ -212,12 +212,23 @@ fn candidate_receipt_ndjson_is_strict_and_canonical() {
         "a receipt without final newline must refuse"
     );
 
-    let mut missing_cleanup = receipt;
+    let mut missing_cleanup = receipt.clone();
     missing_cleanup.cleanup.clear();
     assert_eq!(
         missing_cleanup.validate(),
         Err("candidate receipt `cleanup` needs a canonical non-empty identifier".to_string()),
         "a receipt must retain its cleanup outcome"
+    );
+
+    let mut arbitrary_stage = receipt;
+    arbitrary_stage.actual_stage = "banana".to_string();
+    assert_eq!(
+        arbitrary_stage.validate(),
+        Err(
+            "candidate receipt `actual_stage` is `banana`, expected `complete-evidence-join`"
+                .to_string()
+        ),
+        "a lifecycle field must not pass on a merely canonical value"
     );
 }
 

@@ -866,7 +866,6 @@ pub enum ModuleApplyPrepareError {
     },
     Replay(ModuleApplyReplayError),
     Payload(ModuleApplyCandidateError),
-    Retry(ModuleApplyRetryError),
     Graph(crate::modules::ModuleGraphError),
     State(ModuleApplyStateError),
 }
@@ -1069,92 +1068,10 @@ impl CommittedModuleApply {
     }
 }
 
-/// An exact retry that observed the already-published immutable state.
-///
-/// This is deliberately not a receipt for a second publication: no declaration,
-/// extension, graph, manifest, or index is replayed or replaced.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AlreadyAppliedModuleApply {
-    state: ModuleApplyState,
-    module: ModuleId,
-    transaction_id: ModuleApplyTransactionId,
-    provenance_root: ModuleProvenanceRoot,
-}
-
-impl AlreadyAppliedModuleApply {
-    pub fn state(&self) -> &ModuleApplyState {
-        &self.state
-    }
-
-    pub fn module(&self) -> &ModuleId {
-        &self.module
-    }
-
-    pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
-        self.transaction_id
-    }
-
-    pub const fn provenance_root(&self) -> ModuleProvenanceRoot {
-        self.provenance_root
-    }
-}
-
-/// The terminal result of consuming an aggregate apply plan.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModuleApplyCommitResult {
-    Published(CommittedModuleApply),
-    AlreadyApplied(AlreadyAppliedModuleApply),
-}
-
-/// A prepared publication or an exact-result retry awaiting one final base check.
-#[derive(Debug, Clone)]
-pub enum ModuleApplyPlan {
-    Prepared(PreparedModuleApply),
-    ExactResultRetry(PreflightedModuleApply),
-}
-
-impl ModuleApplyPlan {
-    /// Neither an unpublished candidate nor a retry observation is a cache entry.
-    pub const fn is_cacheable(&self) -> bool {
-        false
-    }
-
-    /// Consume a plan once. Exact retries re-check the held state and return an
-    /// observation; only the prepared arm can publish a new state.
-    pub fn commit(
-        self,
-        base: &ModuleApplyState,
-    ) -> Result<ModuleApplyCommitResult, ModuleApplyCommitError> {
-        match self {
-            Self::Prepared(plan) => plan.commit(base).map(ModuleApplyCommitResult::Published),
-            Self::ExactResultRetry(preflight) => {
-                match classify_exact_result_retry(&preflight, base) {
-                    Ok(ModuleApplyRetryDisposition::ExactResult {
-                        module,
-                        transaction_id,
-                        provenance_root,
-                    }) => Ok(ModuleApplyCommitResult::AlreadyApplied(
-                        AlreadyAppliedModuleApply {
-                            state: base.clone(),
-                            module,
-                            transaction_id,
-                            provenance_root,
-                        },
-                    )),
-                    Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {
-                        Err(ModuleApplyCommitError::StaleBase)
-                    }
-                    Err(error) => Err(ModuleApplyCommitError::Retry(error)),
-                }
-            }
-        }
-    }
-}
-
 /// A one-shot, non-authoritative aggregate application prepared against one immutable
 /// state. Holding a candidate is not publication; only [`Self::commit`] releases it
 /// after revalidating every base component.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedModuleApply {
     schema: u16,
     base_environment: Environment,
@@ -1213,7 +1130,6 @@ pub enum ModuleApplyCommitError {
     BaseState(ModuleApplyStateError),
     CandidateState(ModuleApplyStateError),
     Receipt(ModuleApplyReceiptError),
-    Retry(ModuleApplyRetryError),
 }
 
 /// A receipt cannot be substituted for the states it reports.
@@ -1244,31 +1160,22 @@ pub fn prepare_module_apply(
     preflight: &PreflightedModuleApply,
     base: &ModuleApplyState,
     declaration_candidate: &Environment,
-) -> Outcome<Result<ModuleApplyPlan, ModuleApplyPrepareError>> {
-    match classify_exact_result_retry(preflight, base) {
-        Ok(ModuleApplyRetryDisposition::ExactResult { .. }) => {
-            return Outcome::complete(Ok(ModuleApplyPlan::ExactResultRetry(preflight.clone())));
-        }
-        Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {}
-        Err(error) => return Outcome::complete(Err(ModuleApplyPrepareError::Retry(error))),
-    }
+) -> Outcome<Result<PreparedModuleApply, ModuleApplyPrepareError>> {
     match prepare_module_apply_candidate(preflight, base, declaration_candidate) {
-        Outcome::Complete(Ok(candidate)) => {
-            Outcome::complete(Ok(ModuleApplyPlan::Prepared(PreparedModuleApply {
-                schema: MODULE_APPLY_SCHEMA_VERSION,
-                base_environment: base.environment().clone(),
-                base_graph: base.graph().clone(),
-                base_manifest: Arc::clone(&base.manifest),
-                receipt: ModuleApplyReceipt {
-                    schema: preflight.schema(),
-                    module: preflight.transaction().contribution().module().id.clone(),
-                    transaction_id: preflight.transaction_id(),
-                    base_provenance_root: base.manifest().root(),
-                    result_provenance_root: candidate.manifest().root(),
-                },
-                candidate,
-            })))
-        }
+        Outcome::Complete(Ok(candidate)) => Outcome::complete(Ok(PreparedModuleApply {
+            schema: MODULE_APPLY_SCHEMA_VERSION,
+            base_environment: base.environment().clone(),
+            base_graph: base.graph().clone(),
+            base_manifest: Arc::clone(&base.manifest),
+            receipt: ModuleApplyReceipt {
+                schema: preflight.schema(),
+                module: preflight.transaction().contribution().module().id.clone(),
+                transaction_id: preflight.transaction_id(),
+                base_provenance_root: base.manifest().root(),
+                result_provenance_root: candidate.manifest().root(),
+            },
+            candidate,
+        })),
         Outcome::Complete(Err(error)) => Outcome::complete(Err(error)),
         Outcome::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
         Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -2128,10 +2035,7 @@ mod tests {
 
         let mut tampered_receipt_plan =
             match prepare_module_apply(&checked, &base, &declaration_candidate) {
-                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
-                Outcome::Complete(Ok(other)) => {
-                    panic!("expected a prepared application plan, got {other:?}")
-                }
+                Outcome::Complete(Ok(plan)) => plan,
                 other => panic!("expected a complete application plan, got {other:?}"),
             };
         tampered_receipt_plan.receipt.result_provenance_root = base.manifest().root();
@@ -2144,10 +2048,7 @@ mod tests {
 
         let mut tampered_transaction_plan =
             match prepare_module_apply(&checked, &base, &declaration_candidate) {
-                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
-                Outcome::Complete(Ok(other)) => {
-                    panic!("expected a prepared application plan, got {other:?}")
-                }
+                Outcome::Complete(Ok(plan)) => plan,
                 other => panic!("expected a complete application plan, got {other:?}"),
             };
         tampered_transaction_plan.receipt.transaction_id =
@@ -2160,13 +2061,7 @@ mod tests {
         ));
 
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
-            Outcome::Complete(Ok(plan)) => match plan.commit(&base) {
-                Ok(ModuleApplyCommitResult::Published(committed)) => committed,
-                Ok(ModuleApplyCommitResult::AlreadyApplied(other)) => {
-                    panic!("first apply unexpectedly observed an existing state: {other:?}")
-                }
-                Err(error) => panic!("base remains current: {error:?}"),
-            },
+            Outcome::Complete(Ok(plan)) => plan.commit(&base).expect("base remains current"),
             other => panic!("expected a complete application plan, got {other:?}"),
         };
         assert_eq!(committed.state().graph().len(), 1);
@@ -2190,34 +2085,6 @@ mod tests {
                 ..
             }) if transaction_id == checked.transaction_id()
         ));
-
-        let exact_retry_plan = match prepare_module_apply(
-            &checked,
-            committed.state(),
-            committed.state().environment(),
-        ) {
-            Outcome::Complete(Ok(ModuleApplyPlan::ExactResultRetry(plan))) => plan,
-            Outcome::Complete(Ok(other)) => {
-                panic!("expected an exact-result retry plan, got {other:?}")
-            }
-            other => panic!("expected a complete retry plan, got {other:?}"),
-        };
-        let exact_retry = match ModuleApplyPlan::ExactResultRetry(exact_retry_plan)
-            .commit(committed.state())
-            .expect("exact retry revalidates the same immutable state")
-        {
-            ModuleApplyCommitResult::AlreadyApplied(retry) => retry,
-            ModuleApplyCommitResult::Published(other) => {
-                panic!("exact retry must not publish: {other:?}")
-            }
-        };
-        assert_eq!(exact_retry.state(), committed.state());
-        assert_eq!(exact_retry.module(), &contribution.module().id);
-        assert_eq!(exact_retry.transaction_id(), checked.transaction_id());
-        assert_eq!(
-            exact_retry.provenance_root(),
-            committed.state().manifest().root()
-        );
 
         let altered_declaration = match checked.transaction().declarations()[0].as_ref() {
             ConstantInfo::Axiom(axiom) => {
