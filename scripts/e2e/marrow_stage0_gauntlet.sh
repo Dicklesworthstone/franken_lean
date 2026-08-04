@@ -458,5 +458,46 @@ if [ "$real_sha_before_m3" != "$real_sha_after_m3" ]; then
 fi
 emit mutant_drill passed "\"mutant\":\"3gv-M3\",\"discriminator\":\"mgr.promise.resolved_value_is_mt\",\"real_tree_sha_stable\":true"
 
+# ---- lane 8d: named mutant fln-8w8-M4 ----------------------------------------
+# Fuel-parity perturbation: the real generated-C small-object inline calls the
+# exported lean_inc_heartbeat hook before its raw allocation. Drop that one
+# increment in a FOURTH copy; the C probe must reject it at the exact first
+# small-constructor observation, and the real tree must remain untouched.
+note "lane 8d: mutant drill fln-8w8-M4 (lean_inc_heartbeat charge dropped in a copy)"
+MUT4_WS="$ART_DIR/mutant-ws-m4"
+mkdir -p "$MUT4_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT4_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT4_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT4_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT4_WS/"
+printf '\n[workspace]\n' >>"$MUT4_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m4=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if ! sed -i 's|membrane::add_heartbeats(1);|// fln-8w8-M4: heartbeat charge dropped|' "$MUT4_WS/fln-unsafe-abi/src/export.rs" \
+    || ! grep -q "fln-8w8-M4: heartbeat charge dropped" "$MUT4_WS/fln-unsafe-abi/src/export.rs"; then
+    fail mutant_plant_m4 "\"detail\":\"mutation did not apply to the copy\""
+fi
+if ! (cd "$MUT4_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT4_WS/target" cargo rustc --offline -q --crate-type staticlib --release) >"$ART_DIR/mutant4_build.log" 2>&1; then
+    fail mutant_build_m4 "\"artifact\":\"mutant4_build.log\""
+fi
+if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$MUT4_WS/target/release/libfln_unsafe_abi.a" -lpthread -ldl -lm \
+    -o "$ART_DIR/probe_mutant4" >"$ART_DIR/gcc_mutant4.log" 2>&1; then
+    fail mutant_link_m4 "\"artifact\":\"gcc_mutant4.log\""
+fi
+set +e
+timeout 120 "$ART_DIR/probe_mutant4" >"$ART_DIR/facts_mutant4.ndjson" 2>"$ART_DIR/probe_mutant4.err"
+set -e
+if diff -q "$ART_DIR/facts_reference.ndjson" "$ART_DIR/facts_mutant4.ndjson" >/dev/null 2>&1; then
+    fail mutant_drill_m4 "\"detail\":\"fln-8w8-M4 SURVIVED — the gauntlet does not discriminate missed heartbeat charging\""
+fi
+if ! grep -q '"probe":"heartbeat.after_small_ctor","value":0' "$ART_DIR/facts_mutant4.ndjson"; then
+    fail mutant_drill_m4 "\"detail\":\"mutant diverged but not on the designed heartbeat discriminator\",\"artifact\":\"facts_mutant4.ndjson\""
+fi
+real_sha_after_m4=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/export.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m4" != "$real_sha_after_m4" ]; then
+    fail mutant_isolation_m4 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"fln-8w8-M4\",\"discriminator\":\"heartbeat.after_small_ctor\",\"real_tree_sha_stable\":true"
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
