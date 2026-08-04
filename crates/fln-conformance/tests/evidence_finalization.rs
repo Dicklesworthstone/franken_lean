@@ -5103,3 +5103,115 @@ fn the_rch_fuzz_corpus_exclusion_is_still_inert() {
         );
     }
 }
+
+/// The suites that shell out to `git`, derived per commit and reconciled against a second spelling.
+///
+/// Bead `franken_lean-rch-clean-overlay-has-no-git-dir-46pw`. One property — a suite that shells
+/// out to `git` needs a **real `.git` directory** — and two common environments that violate it:
+/// a linked worktree, where `.git` is a `gitdir:` pointer file, and an rch clean-overlay worker,
+/// which has no `.git` at all. Both are recommended routes, so the better a guard follows this
+/// project's derive-your-scope doctrine the less able it is to run in either, and the failure it
+/// gives you — `fatal: not a git repository` — names neither environment.
+///
+/// AGENTS.md used to state the affected set in prose. That is `hugg`'s own recorded open gap:
+/// "the affected-surface list is written down, not derived, so a NEW lane that starts refusing
+/// would go unnamed". This derives it.
+///
+/// **The reconciliation is not ceremony.** On 2026-08-04 alone, three separate populations in
+/// this repository were reported as a false zero by an extractor keyed on one spelling — a
+/// character class that excluded a digit, a line-start rule that excluded an indented
+/// assignment, and a lane governing through a different idiom entirely. So the primary needle is
+/// checked against an independent one, and a file the second finds that the first misses is a
+/// broken scan rather than a clean tree.
+#[test]
+fn the_git_shelling_population_is_derived_and_reconciled() {
+    const FLOOR: usize = 8;
+
+    let repo = fln_conformance::checked_workspace_root!();
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["ls-files", "crates/*.rs", "tools/*.rs", "*.rs"])
+        .output()
+        .expect("git ls-files must run: the population is derived from it");
+    assert!(listed.status.success(), "git ls-files failed");
+
+    let mut primary = std::collections::BTreeSet::new();
+    let mut secondary = std::collections::BTreeSet::new();
+    let mut scanned = 0usize;
+    for path in String::from_utf8_lossy(&listed.stdout).lines() {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(repo.join(path)) else {
+            continue;
+        };
+        scanned += 1;
+        if text.contains(r#"Command::new("git")"#) {
+            primary.insert(path.to_string());
+        }
+        // A different spelling, chosen to overlap rather than to agree by construction.
+        if text.contains("run_git") || text.contains("fn git(") || text.contains(r#""git","#) {
+            secondary.insert(path.to_string());
+        }
+    }
+
+    assert!(
+        scanned >= 200,
+        "only {scanned} Rust files were read, which is a broken walk rather than a small \
+         workspace — and a broken walk reports an empty population as a clean one"
+    );
+    assert!(
+        primary.len() >= FLOOR,
+        "only {} suites were found shelling out to git, below the floor of {FLOOR}. A short \
+         population is a broken extractor, not a repository that stopped using git",
+        primary.len()
+    );
+
+    // The reconciliation, in the direction that catches a false zero: anything the independent
+    // spelling finds must already be in the primary set.
+    let missed: Vec<&String> = secondary.difference(&primary).collect();
+    assert!(
+        missed.is_empty(),
+        "these files reach git by a spelling the primary needle missed: {missed:?}. That is a \
+         broken extractor — the same shape that produced three false zeros on 2026-08-04 — and \
+         a missed file is a suite nobody knows cannot run on a worker"
+    );
+
+    // --- bind AGENTS.md's derived list, both directions --------------------------------------
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let declared_line = agents
+        .lines()
+        .find(|line| line.starts_with("git-shelling-suites: "))
+        .expect(
+            "AGENTS.md must carry the derived `git-shelling-suites:` list; if it moved, this \
+             guard is enforcing a claim that no longer exists and must be updated, not deleted",
+        );
+    let declared: std::collections::BTreeSet<String> = declared_line
+        .trim_start_matches("git-shelling-suites: ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+
+    let arrived: Vec<&String> = primary.difference(&declared).collect();
+    let gone: Vec<&String> = declared.difference(&primary).collect();
+    assert!(
+        arrived.is_empty() && gone.is_empty(),
+        "the git-shelling population moved and AGENTS.md did not. arrived: {arrived:?}, gone: \
+         {gone:?}. A suite that starts shelling out to git silently loses the ability to produce \
+         a remote or worktree green, and nothing else says so"
+    );
+
+    let stated = agents
+        .lines()
+        .find_map(|line| line.strip_prefix("git-shelling-population: files="))
+        .and_then(|rest| rest.trim().parse::<usize>().ok())
+        .expect("AGENTS.md must state the population count alongside the list");
+    assert_eq!(
+        stated,
+        primary.len(),
+        "AGENTS.md declares {stated} git-shelling suites and the tree measures {}. The count and \
+         the list are two places stating one fact, so they move together or not at all",
+        primary.len()
+    );
+}
