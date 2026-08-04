@@ -1267,6 +1267,58 @@ fn small_heap_pages_reclaim_across_every_size_class() {
 }
 
 #[test]
+fn small_heap_pages_reclaim_across_repeated_all_class_epochs() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    const EPOCHS: usize = 8;
+    const CLASS_COUNT: usize = 512;
+
+    crate::membrane::drain_small_bins_for_test();
+    let baseline = crate::membrane::small_page_metrics_for_test();
+    for epoch in 0..EPOCHS {
+        let before = crate::membrane::small_page_metrics_for_test();
+        let mut blocks = Vec::with_capacity(CLASS_COUNT);
+        for size in (8..=4096).step_by(8) {
+            let block = export_mi_malloc_small(size);
+            assert!(
+                !block.is_null(),
+                "epoch {epoch}, class {size} allocation must succeed"
+            );
+            blocks.push(block);
+        }
+        for block in blocks {
+            export_mi_free(block);
+        }
+
+        crate::membrane::drain_small_bins_for_test();
+        let after = crate::membrane::small_page_metrics_for_test();
+        assert_eq!(
+            after.0,
+            before.0 + CLASS_COUNT,
+            "epoch {epoch} allocates one page per exact class"
+        );
+        assert_eq!(
+            after.1,
+            before.1 + CLASS_COUNT,
+            "epoch {epoch} drains every class page before the next epoch"
+        );
+    }
+
+    let final_metrics = crate::membrane::small_page_metrics_for_test();
+    assert_eq!(
+        final_metrics.0,
+        baseline.0 + EPOCHS * CLASS_COUNT,
+        "every epoch allocated the full class set"
+    );
+    assert_eq!(
+        final_metrics.1,
+        baseline.1 + EPOCHS * CLASS_COUNT,
+        "every epoch reclaimed the full class set"
+    );
+}
+
+#[test]
 fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
     let _g = lock();
     use crate::export::{export_mi_free, export_mi_malloc_small};
