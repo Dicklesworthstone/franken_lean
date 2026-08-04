@@ -956,3 +956,141 @@ fn a_scan_that_returns_nothing_is_a_failure_not_a_clean_tree() {
          count instead of trusting this"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The two cardinalities the section states and this guard did not bind — 98np R4
+// ---------------------------------------------------------------------------
+//
+// The table above and its introducing sentence were bound; the *other two* numbers in the
+// same section were not, and both were stale when this was written. That is the failure this
+// file's own doc-comment describes — "a row was added and only two of the three places
+// stating the cardinality were moved" — recurring one paragraph later, in a section whose
+// whole subject is derived counts that rot.
+
+/// The script total the section opens with, bound to the directory it claims to have read.
+///
+/// It read "all 30 scripts in `scripts/e2e/`" while the directory held 31. Nothing noticed,
+/// because the guard bound the per-lane table and the declaring/zero sentence and stopped
+/// there — so the sentence asserting the derivation's *scope* was the one thing in the
+/// paragraph derived from nothing.
+const SCRIPT_TOTAL_ANCHOR: &str = " scripts in `scripts/e2e/` rather than read off one";
+
+#[test]
+fn the_scripts_e2e_total_stated_in_the_section_is_bound_to_the_directory() {
+    let agents = agents_md();
+    let measured = lane_sources().len();
+    assert!(
+        measured >= 20,
+        "only {measured} scripts were read from scripts/e2e/, which is a broken scan rather \
+         than a small directory — and a broken scan would agree with almost any number"
+    );
+    let stated = stated_count_before(&agents, SCRIPT_TOTAL_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "AGENTS.md must state how many scripts the governed-set derivation covers, \
+             immediately before {SCRIPT_TOTAL_ANCHOR:?}"
+        )
+    });
+    assert_eq!(
+        stated, measured,
+        "AGENTS.md says the governed-set table is derived from {stated} scripts in \
+         scripts/e2e/ and the directory holds {measured}. Adding a lane script moves this \
+         number; move it in the same change"
+    );
+}
+
+/// Which lanes take the gate lock themselves — and every lane that does not, named.
+///
+/// The section asserted that "no lane takes the gate lock unless its caller wraps the
+/// invocation". That was true when `franken_lean-gate-lock-producer-optional-o2vz` was filed
+/// and is false now, in the direction that matters: a reader who believes it treats a
+/// `flock -n` FREE probe as uninformative for every lane, when for the majority it is now
+/// informative. The count alone is not enough — the lanes that still do **not** take it must
+/// be named where the reader looks, the same rule
+/// `the_worktree_refusal_scope_is_derived_from_the_lane_population` applies to its own
+/// unmeasured lane, because a reader acts on a specific lane and never on a ratio.
+const GATE_LOCK_ANCHOR: &str = " of the 20 declared lanes source";
+
+#[test]
+fn every_declared_lane_that_does_not_take_the_gate_lock_is_named_in_the_section() {
+    let agents = agents_md();
+    let lanes = lane_sources();
+    let declared_lanes: Vec<&(String, String)> = lanes
+        .iter()
+        .filter(|(_, source)| source.contains("fln.e2e/2"))
+        .collect();
+    assert!(
+        declared_lanes.len() >= 15,
+        "only {} scripts declare the fln.e2e/2 schema, which is a broken scan; every count \
+         below would be vacuous",
+        declared_lanes.len()
+    );
+
+    let takes =
+        |source: &str| source.contains("fln_gate_acquire") || source.contains("gate_lock.sh");
+    let taking = declared_lanes
+        .iter()
+        .filter(|(_, source)| takes(source))
+        .count();
+    let missing: Vec<&String> = declared_lanes
+        .iter()
+        .filter(|(_, source)| !takes(source))
+        .map(|(name, _)| name)
+        .collect();
+
+    // Anti-vacuity in both directions: if every lane took it the named list would be empty
+    // and the naming law below would pass without reading anything, and if none did the
+    // count would be a zero nobody can falsify.
+    assert!(
+        taking > 0 && !missing.is_empty(),
+        "the gate-lock split is degenerate ({taking} taking, {} not), so one of the two \
+         assertions below is unfalsifiable and the section must say so instead of stating a \
+         split that does not exist",
+        missing.len()
+    );
+
+    let stated = stated_count_before(&agents, GATE_LOCK_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "AGENTS.md must state how many declared lanes take the gate lock themselves, \
+             immediately before {GATE_LOCK_ANCHOR:?}"
+        )
+    });
+    assert_eq!(
+        stated, taking,
+        "AGENTS.md says {stated} declared lanes take the gate lock and {taking} do. A lane \
+         sourcing scripts/lib/gate_lock.sh moves this number, and the sentence about what a \
+         FREE probe means moves with it"
+    );
+    // Scoped to the sentence that states the split, NOT to the file. Every one of these
+    // lanes also appears in the governed-set table a few lines above, so a whole-file
+    // `contains` is satisfied by text that says nothing about the gate lock — the assertion
+    // would pass for a lane the sentence never mentions, which is a decorative check wearing
+    // a law's message. The window ends at the paragraph break.
+    let split_at = agents
+        .find(GATE_LOCK_ANCHOR)
+        .expect("the anchor was already located above");
+    let sentence = &agents[split_at..];
+    let sentence = &sentence[..sentence.find("\n\n").unwrap_or(sentence.len())];
+    for lane in &missing {
+        assert!(
+            sentence.contains(lane.as_str()),
+            "`{lane}` does not take the gate lock and the sentence stating the split does not \
+             name it. A reader is told the split by a count and would trust a FREE probe \
+             against this lane: {missing:?}"
+        );
+    }
+}
+
+/// The count immediately preceding `anchor`, in digits.
+fn stated_count_before(agents_md: &str, anchor: &str) -> Option<usize> {
+    let head = &agents_md[..agents_md.find(anchor)?];
+    let digits: String = {
+        let mut d: Vec<char> = head
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        d.reverse();
+        d.into_iter().collect()
+    };
+    digits.parse().ok()
+}
