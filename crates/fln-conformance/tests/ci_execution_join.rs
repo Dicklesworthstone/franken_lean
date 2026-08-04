@@ -296,6 +296,27 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          recorded run and its retention guard are the owner's remainder",
     ),
     (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "whole_mathlib_corpus_resurrection_preflight",
+        "not evidence for any claim — a host-provisioning PRECONDITION for the sweep below, \
+         which is why nothing compensates and nothing needs to: a missing or truncated corpus \
+         emits a typed BLOCKED row and PANICS rather than reporting a green zero-module scan. \
+         Verified rather than assumed: `franken_lean-t6r7`'s coverage row is sparse and no row \
+         anywhere cites either surface, so the guard's own `no coverage row may cite it` \
+         condition is met at this commit",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "whole_mathlib_corpus_resurrection_sweep",
+        "NOTHING per commit, and saying so is the declaration rather than a gap — the walk needs \
+         the pinned built Mathlib corpus this host provisions externally, so it is on demand for \
+         `chosen_set_replays_and_witnesses`'s reason two entries up. What it does carry is an \
+         anti-vacuity floor: >= 8,000 modules and a non-zero decode count, so a truncated corpus \
+         fails instead of passing as a smaller sweep. The first recorded run, a pin-keyed \
+         receipt and its retention guard are `franken_lean-t6r7`'s owner's remainder, declared \
+         from the lane's own docstring after `e81c57fc` landed it undeclared",
+    ),
+    (
         "crates/fln-conformance/tests/mandated_mutants.rs",
         "the_mandated_mutants_are_planted_and_their_killers_die",
         "fln-mandated-mutant-join-unwatched-uagk's per-commit retention receipt, weekly \
@@ -323,7 +344,15 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// whose design is the corpus-matrix retention pattern — with no declaration. The
 /// entry is the repair; the ceiling moves with it, disclosed here, and the lane's
 /// first recorded run plus its retention guard remain the owner's remainder.
-const IGNORED_PRODUCER_CEILING: usize = 6;
+///
+/// 6 -> 8 at `e81c57fc`, which landed `franken_lean-t6r7`'s two whole-Mathlib lanes
+/// `#[ignore]`d and undeclared, reddening `cargo test` for every pane. Same shape as
+/// the `bc4e1b3d` sweep above and the same owner, so it is declared the same way:
+/// from the lanes' own docstrings, with the remainder left where it belongs. **Two
+/// entries, one commit, and the ceiling is stated as 8 rather than bumped twice** —
+/// a ceiling that moves per entry cannot distinguish one author landing two lanes
+/// from two authors landing one each.
+const IGNORED_PRODUCER_CEILING: usize = 8;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -473,6 +502,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-2bn5",
     "fln-46mw",
     "fln-49c",
+    "fln-7vzi",
     "fln-8138",
     "fln-8gz3",
     "fln-8zsq",
@@ -480,6 +510,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-amv.14",
     "fln-bench-apparatus-empty-referent-bkw6",
     "fln-c78c",
+    "fln-census-out-of-git-2ya9",
     "fln-env-merge-resource-envelope-9m74",
     "fln-ffam",
     "fln-glml",
@@ -497,6 +528,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "fln-uc44",
     "fln-um4a",
     "fln-uuuz",
+    "fln-y0f7",
     "fln-yswb",
     "fln-zti3",
     "franken_lean-2ki4",
@@ -530,7 +562,23 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 
 /// The ratchet for [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`], by equality, for the reason
 /// [`UNEXECUTED_EVIDENCE_CEILING`] gives.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 58;
+///
+/// **58 -> 61, and it is a DEBT rather than a repair — the guard's own message says so and
+/// this comment is not going to soften it.** `fln-7vzi`, `fln-census-out-of-git-2ya9` and
+/// `fln-y0f7` did not change: their beads were CLOSED, which turned three long-standing
+/// file-granular rows terminal all at once. So the population this ceiling counts grew
+/// without a single citation moving, which is the one growth vector a set-equality gate
+/// cannot distinguish from someone adding a coarse row — worth knowing before reading the
+/// number as neglect.
+///
+/// **Declared here rather than repaired in place, deliberately, and the reason is forty
+/// lines up in this file's own ruling:** migrating those rows means authoring, under three
+/// other panes' names, the claim that a specific function carries their evidence. *"If you
+/// would not accept another pane silently repairing your row, do not do it to theirs."* A
+/// declaration is visible, reversible and owned; a silent migration is none of the three.
+/// The sanctioned repair is unchanged and belongs to each row's owner: cite the function,
+/// delete the id from this list, and lower this number by one.
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 61;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
@@ -4310,6 +4358,18 @@ fn granularity_mutant_an_empty_ignore_scan_makes_the_join_refuse() {
 
 /// The positive control, and what stops every mutant above being vacuous: a **real** citation
 /// of each flavour resolves, produces no finding, and forces its own declaration edit.
+///
+/// **The `granularity-unbound` assertion is scoped to the citation this control PLANTS, and
+/// the global form it replaces was a wall.** `!fires(&findings, "granularity-unbound")` asks
+/// whether that class fired *anywhere in the tree*, so a live dangling citation in some other
+/// pane's row — `2e02eb4d` deleted three `fln-checker` tests that five `franken_lean-gii` rows
+/// still cite — reddened this control for a cause it does not measure and cannot repair. Two
+/// tests then failed for one defect, and the second named the wrong subject: a control whose
+/// verdict moves with the rest of the tree is measuring the tree, not its own injection. The
+/// long message below already said the live entries belong to their own rows; saying it is not
+/// the same as not asserting it, which is this file's own recurring lesson about a disclosure
+/// standing in for a repair. The companion `granularity-shrank` assertion was already scoped to
+/// `bead` and is unchanged — that asymmetry, in one `assert!` pair, is how it survived review.
 #[test]
 fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
     for (package, target, path_of) in [
@@ -4338,17 +4398,19 @@ fn granularity_control_real_citations_resolve_and_force_their_own_shrink() {
         row.fine.push(citation.clone());
         let findings = granularity_findings(&d);
         assert!(
-            !fires(&findings, "granularity-unbound"),
+            !findings
+                .iter()
+                .any(|f| f.starts_with("granularity-unbound") && f.contains(&citation)),
             "{citation} must resolve.\n\nREAD THE NEXT SENTENCE BEFORE ACTING ON THE DUMP BELOW. \
              This control MUTATES the derivation in memory: it clears the coarse citations of \
              `{bead}` to simulate a migration, so a `granularity-shrank` naming `{bead}` in this \
              list is PLANTED BY THIS TEST and is asserted for immediately afterwards. It is not \
              a live finding, `{bead}` is not stale, and deleting it from \
              FILE_GRANULAR_EVIDENCE_ALLOWANCE would redden the tree with `granularity-grew` on \
-             the next run. The real failure is the `granularity-unbound` entry or entries, which \
-             ARE live and name the row that owns them. Measured 2026-08-04: this dump was read \
-             as a stale-allowance report and routed as one, and the prescribed repair would have \
-             broken a healthy row.\n\n{findings:?}"
+             the next run. Any `granularity-unbound` naming a row OTHER than `{bead}` is likewise \
+             live and belongs to the row that owns it, not to this control. Measured 2026-08-04: \
+             this dump was read as a stale-allowance report and routed as one, and the prescribed \
+             repair would have broken a healthy row.\n\n{findings:?}"
         );
         assert!(
             findings
