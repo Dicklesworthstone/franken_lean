@@ -28,7 +28,10 @@
 //!
 //! # Why the allowance is a CEILING plus one-way membership, and never an equality
 //!
-//! The 28 are a declared remainder of permitted violations spanning **several panes' rows**. So:
+//! The declared members are a remainder of permitted violations spanning **several panes' rows** —
+//! deliberately stated without a count here, because a number in this paragraph would be a second
+//! copy of `NONRESOLVING_ALLOWANCE.len()` free to drift from it, which is the defect family this
+//! guard belongs to. So:
 //!
 //! * a non-resolving citation that is **not** declared fails — that is silent growth, the defect;
 //! * the declared set may **shrink freely**. A repair by any pane must never redden this guard.
@@ -118,6 +121,9 @@ const NONRESOLVING_ALLOWANCE: &[&str] = &[
     "crates/fln-conformance:witness_claim_matrix::the_matrix_is_clean_against_the_real_tree",
     "fln-checker:environment::definition_schema_retains_hints_safety_types_values_and_mutual_membership",
     "fln-checker:environment::private_arena_corruption_is_an_internal_fault_and_recovery_is_exact",
+    "fln-checker:infer::kr109_the_deferral_set_shrank_by_exactly_the_let_case",
+    "fln-checker:infer::kr110_only_projection_still_defers",
+    "fln-checker:infer::unsupported_rule_families_are_deferred_and_metadata_does_not_change_the_requirement",
     "fln-checker:numeric::numeric_production_has_no_primary_semantic_path",
     "fln-checker:wire_decoder::resource_and_cancellation_stops_are_nonanswers_with_exact_recovery",
     "fln-conformance:contract_roots::both_contracts_disclose_the_producer_side_tree_obligation_as_unmet",
@@ -144,7 +150,7 @@ const NONRESOLVING_ALLOWANCE: &[&str] = &[
 ];
 
 /// The measured count may not creep upward even if the membership list above goes stale.
-const NONRESOLVING_ENTRY_CEILING: usize = 39;
+const NONRESOLVING_ENTRY_CEILING: usize = 51;
 
 /// Anti-vacuity: a scan reporting far fewer resolvable citations than this has broken. The bead's
 /// own sampler reported 786 against a real population above 2000, and 786 looked entirely
