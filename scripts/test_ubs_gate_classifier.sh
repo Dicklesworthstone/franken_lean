@@ -394,7 +394,8 @@ CELL_TEXT=$(cd "$baseline_repo" && UBS_PATH_BASELINE_CALLS="$baseline_calls" PAT
 CELL_RC=$?
 check 'an external archive baseline compares the same relative path with completed findings preserved' \
     1 completed_findings "$CELL_RC" "$CELL_TEXT"
-if [ -f "$baseline_out"/*.base.json ] && [ -f "$baseline_out"/*.current.json ] \
+if compgen -G "$baseline_out"'/*.base.json' >/dev/null \
+    && compgen -G "$baseline_out"'/*.current.json' >/dev/null \
     && grep -qF 'delta_critical=0' <<<"$CELL_TEXT"; then
     printf 'ok   path baseline retains machine reports and its zero delta\n'
     PASSES=$((PASSES + 1))
