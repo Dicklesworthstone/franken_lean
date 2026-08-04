@@ -1183,4 +1183,14 @@ mod tests {
         assert_eq!(acosh(0.5).to_bits(), CANONICAL_NAN_BITS);
         assert_eq!(atanh(2.0).to_bits(), CANONICAL_NAN_BITS);
     }
+
+    #[test]
+    fn hypot_scaled_subnormal_and_overflow_boundaries_are_bit_locked() {
+        let smallest = f64::from_bits(1);
+        let largest = f64::MAX;
+        same_bits(hypot(smallest, smallest), smallest);
+        same_bits(hypot(largest, smallest), largest);
+        same_bits(hypot(largest, largest), f64::INFINITY);
+        same_bits(hypot(-largest, largest), f64::INFINITY);
+    }
 }
