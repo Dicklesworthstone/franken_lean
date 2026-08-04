@@ -16,6 +16,15 @@
 set -uo pipefail
 
 CLASSIFIER=${1:?usage: test_ubs_gate_classifier.sh /path/to/ubs_gate_classifier.sh}
+CLASSIFIER_DIR=$(cd "$(dirname "$CLASSIFIER")" && pwd -P) || {
+    printf 'FAIL could not resolve classifier directory: %s\n' "$CLASSIFIER" >&2
+    exit 2
+}
+CLASSIFIER="$CLASSIFIER_DIR/$(basename "$CLASSIFIER")"
+[ -f "$CLASSIFIER" ] || {
+    printf 'FAIL classifier is not a regular file: %s\n' "$CLASSIFIER" >&2
+    exit 2
+}
 PASSES=0
 FAILS=0
 LAB=$(mktemp -d "${TMPDIR:-/tmp}/ubs-gate-lab.XXXXXXXX")
