@@ -318,6 +318,12 @@ def validate(policy, snapshot, now):
                 raise InputFault(f"gate-root-missing-from-tracker: {gate_id}:{root}")
         seen_gates.add(gate_id)
         gates.append({"id": gate_id, "state": state, "root_beads": sorted(roots), "ordinal": ordinal})
+    for issue_id, row in registry.items():
+        if row["class"] == "adoption":
+            continue
+        gate_id = row.get("gate")
+        if not isinstance(gate_id, str) or gate_id not in seen_gates:
+            raise InputFault(f"registry-missing-or-unknown-gate: {issue_id}:{gate_id}")
     active = []
     for issue_id, issue in issues.items():
         if issue["status"] != "in_progress":
@@ -728,6 +734,15 @@ def self_test():
             raise AssertionError(f"relabeling wrong refusal: {error}") from error
     else:
         raise AssertionError("workstream relabel mutant survived")
+    unknown_gate = copy.deepcopy(policy)
+    unknown_gate["registry"][0]["gate"] = "G999"
+    try:
+        decide(unknown_gate, first, now)
+    except InputFault as error:
+        if "registry-missing-or-unknown-gate" not in str(error):
+            raise AssertionError(f"unknown gate wrong refusal: {error}") from error
+    else:
+        raise AssertionError("unknown gate registry mutant survived")
     orphaned = copy.deepcopy(policy)
     orphaned["registry"].append(
         {"id": "orphaned-registry", "class": "verification", "workstream": "W1", "gate": "G0"}
@@ -751,6 +766,19 @@ def self_test():
             raise AssertionError(f"tracker relabel wrong refusal: {error}") from error
     else:
         raise AssertionError("tracker workstream relabel mutant survived")
+    for labels in (["W1", "W1"], ["W1", "W2"]):
+        ambiguous_labels = copy.deepcopy(first)
+        ambiguous_labels["issues"] = [
+            {**issue, "labels": labels} if issue["id"] == "active-w1" else issue
+            for issue in ambiguous_labels["issues"]
+        ]
+        try:
+            decide(policy, ambiguous_labels, now)
+        except InputFault as error:
+            if "registry-tracker-workstream-mismatch" not in str(error):
+                raise AssertionError(f"ambiguous tracker labels wrong refusal: {error}") from error
+        else:
+            raise AssertionError("ambiguous tracker workstream labels survived")
     drifting = copy.deepcopy(raw)
     drifting["issues"] = [
         {**issue, "status": "in_progress"} if issue["id"] == "ready" else issue
@@ -767,7 +795,7 @@ def self_test():
     advisory_absent = normalize_snapshot({**raw, "bv": {"state": "absent", "reason": "self-test"}})
     if decide(policy, advisory_absent, now) != first_decision:
         raise AssertionError("advisory bv absence changed an admission decision")
-    return "convergence-governance self-test: 20 named model/mutation cells passed"
+    return "convergence-governance self-test: 22 named model/mutation cells passed"
 
 
 def main(argv):
