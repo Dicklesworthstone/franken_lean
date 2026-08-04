@@ -44,11 +44,21 @@ run_id="149-governance-e2e-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG="$SCRATCH/run.ndjson"
 POLICY="$SCRATCH/policy.json"
 REPORT="$SCRATCH/report.ndjson"
+START_SECONDS=$SECONDS
+
+sha256_file() {
+  sha256sum -- "$1" | awk '{print $1}'
+}
 
 event() {
   local step="$1"
   local expected="$2"
   local actual="$3"
+  local command="${4:--}"
+  local stdout_path="${5:--}"
+  local stderr_path="${6:--}"
+  local report_path="${7:--}"
+  local elapsed_ms=$((SECONDS * 1000 - START_SECONDS * 1000))
   jq -cn \
     --arg schema 'fln.convergence-governance-e2e/1' \
     --arg run_id "$run_id" \
@@ -57,7 +67,12 @@ event() {
     --arg expected "$expected" \
     --arg actual "$actual" \
     --arg cwd "$SCRATCH" \
-    '{schema:$schema,run_id:$run_id,bead:$bead,step:$step,expected:$expected,actual:$actual,cwd:$cwd,final_state:"retained"}' \
+    --arg command "$command" \
+    --arg stdout_path "$stdout_path" \
+    --arg stderr_path "$stderr_path" \
+    --arg report_path "$report_path" \
+    --argjson elapsed_ms "$elapsed_ms" \
+    '{schema:$schema,run_id:$run_id,bead:$bead,step:$step,expected:$expected,actual:$actual,cwd:$cwd,command:$command,stdout_path:$stdout_path,stderr_path:$stderr_path,report_path:$report_path,elapsed_ms:$elapsed_ms,final_state:"retained"}' \
     >> "$LOG"
 }
 
@@ -84,18 +99,26 @@ write_policy() {
 run_policy() {
   local name="$1"
   local expected_exit="$2"
+  local stdout="$SCRATCH/$name.stdout"
+  local stderr="$SCRATCH/$name.stderr"
+  local retained_report="$SCRATCH/$name.report.ndjson"
   set +e
   python3 -I -S -B "$POLICY_JUDGE" --root "$SCRATCH" --policy "$POLICY" \
     --at 2026-08-04T10:10:00Z --check --ndjson "$REPORT" \
-    > "$SCRATCH/$name.stdout" 2> "$SCRATCH/$name.stderr"
+    > "$stdout" 2> "$stderr"
   local code=$?
   set -e
+  cp -- "$REPORT" "$retained_report"
+  local decision
+  decision="$(jq -c '{verdict,reason:(.reason // "-"),graph_hash:(.graph_hash // "-"),evidence_hash:(.evidence_hash // "-"),config_hash:(.config_hash // "-"),selected:([.selected[]? | {id,reason}]),held:([.held[]? | {id,reason}])}' "$retained_report")"
+  local actual
+  actual="exit=$code stdout_sha256=$(sha256_file "$stdout") stderr_sha256=$(sha256_file "$stderr") report_sha256=$(sha256_file "$retained_report") decision=$decision"
   [[ "$code" == "$expected_exit" ]] || {
-    event "$name" "exit=$expected_exit" "exit=$code"
+    event "$name" "exit=$expected_exit" "$actual" "python3 -I -S -B convergence_governance.py --root <scratch> --policy <scratch>/policy.json --at 2026-08-04T10:10:00Z --check --ndjson <scratch>/$name.report.ndjson" "$stdout" "$stderr" "$retained_report"
     printf 'policy %s returned %s, expected %s\n' "$name" "$code" "$expected_exit" >&2
     exit 1
   }
-  event "$name" "exit=$expected_exit" "exit=$code"
+  event "$name" "exit=$expected_exit" "$actual" "python3 -I -S -B convergence_governance.py --root <scratch> --policy <scratch>/policy.json --at 2026-08-04T10:10:00Z --check --ndjson <scratch>/$name.report.ndjson" "$stdout" "$stderr" "$retained_report"
 }
 
 cd "$SCRATCH"
@@ -103,6 +126,7 @@ br init --prefix cg --json --no-auto-flush --no-auto-import > "$SCRATCH/br-init.
 mkdir "$SCRATCH/ci"
 printf '%s\n' '{"schema":"fln.verification-manifest/2","bead":"e2e","gate_ids":["G0"],"kind":"coverage"}' \
   > "$SCRATCH/ci/VERIFICATION_MANIFEST.jsonl"
+event toolchain 'sealed command identities' "python=$(python3 --version 2>&1) br=$(br --version 2>&1) bv=$(bv --version 2>&1) judge_sha256=$(sha256_file "$POLICY_JUDGE")" 'br/bv/python versions collected before tracker mutation'
 ROOT_BEAD="$(create root-prerequisite)"
 READY_BEAD="$(create ready-g0-blocker)"
 BLOCKED_BEAD="$(create dependency-blocked-g0-blocker)"
@@ -120,7 +144,7 @@ done
 write_policy 2026-08-04T11:00:00Z
 bv --db "$SCRATCH/.beads" --robot-graph --format json --no-cache > "$SCRATCH/bv-robot-graph.json"
 jq -e '.adjacency and .data_hash' "$SCRATCH/bv-robot-graph.json" > /dev/null
-event bv-robot-graph 'real robot graph' 'present'
+event bv-robot-graph 'real robot graph' "present sha256=$(sha256_file "$SCRATCH/bv-robot-graph.json")" 'bv --db <scratch>/.beads --robot-graph --format json --no-cache' "$SCRATCH/bv-robot-graph.json"
 
 run_policy normal 0
 jq -e \
