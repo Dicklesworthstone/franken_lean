@@ -4879,3 +4879,86 @@ fn the_shell_copies_of_the_interpreter_configuration_rule_are_a_named_population
          disappeared is progress and this list must shrink with it"
     );
 }
+
+/// The `fuzz/corpus/` rch exclusion is inert, and AGENTS.md says so — bound in both directions.
+///
+/// Bead `fln-y0f7` R4. The worker sync drops `fuzz/corpus/` as well as `.beads/`. Today that
+/// removes nothing: this repository has no `fuzz/` directory, and its golden corpora live at
+/// `crates/*/tests/corpus`, which the pattern does not match. The trap is what happens when a
+/// §18 fuzzing rig lands at the conventional path — the corpus is silently empty on every
+/// worker, and **an empty corpus passes**. Unlike the tracker case there is no loud reader to
+/// catch it: a harness given nothing to chew simply finds nothing.
+///
+/// So this guard exists to fire on the day the population stops being empty. That is also its
+/// weakness — a check over an empty set is decorative, and would still pass with its detector
+/// gutted — so the detector is exercised against a planted root before the real tree is judged.
+#[test]
+fn the_rch_fuzz_corpus_exclusion_is_still_inert() {
+    /// Every `corpus` directory under `root`, and whether any of them sits beneath `fuzz/`.
+    fn corpus_dirs(root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "--", "*corpus/*"])
+            .output()
+            .expect("git ls-files must run: the corpus population is derived from it");
+        let mut all = std::collections::BTreeSet::new();
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            if let Some(at) = line.find("corpus/") {
+                all.insert(line[..at + "corpus".len()].to_string());
+            }
+        }
+        let under_fuzz: Vec<String> = all
+            .iter()
+            .filter(|path| path.starts_with("fuzz/") || path.contains("/fuzz/"))
+            .cloned()
+            .collect();
+        (all.into_iter().collect(), under_fuzz)
+    }
+
+    let repo = fln_conformance::checked_workspace_root!();
+    let (all, under_fuzz) = corpus_dirs(&repo);
+
+    // Anti-vacuity: a walk that found no corpora at all cannot tell inert from live.
+    assert!(
+        !all.is_empty(),
+        "no corpus directory was found anywhere in the tree, so this guard is measuring \
+         nothing — a broken walk and an inert exclusion are the same green"
+    );
+
+    // The decoy. The real population under `fuzz/` is empty, so without this the assertion
+    // below would pass with the classifier deleted. Plant one and require it to be seen.
+    let planted = vec![
+        "fuzz/corpus".to_string(),
+        "crates/fln-syntax/tests/corpus".to_string(),
+    ];
+    let seen: Vec<&String> = planted
+        .iter()
+        .filter(|path| path.starts_with("fuzz/") || path.contains("/fuzz/"))
+        .collect();
+    assert_eq!(
+        seen,
+        vec!["fuzz/corpus"],
+        "the classifier did not pick the planted fuzz-rooted corpus out of a mixed list, so \
+         the empty result below proves nothing about the real tree"
+    );
+
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let claims_inert = agents.contains("INERT TODAY");
+    if under_fuzz.is_empty() {
+        assert!(
+            claims_inert,
+            "no corpus lives under fuzz/, so the rch `fuzz/corpus/` exclusion removes nothing — \
+             and AGENTS.md no longer records that it is inert. Restore the note: the whole point \
+             is that the trap is written down BEFORE it is discovered by a green"
+        );
+    } else {
+        assert!(
+            !claims_inert,
+            "a corpus now lives under fuzz/ ({under_fuzz:?}), so the rch exclusion is LIVE and \
+             that corpus is silently empty on every worker — an empty corpus passes. AGENTS.md \
+             still calls the exclusion inert. Move the note in the same change that adds the \
+             fuzzing rig, and decide whether the rig may run on a worker at all"
+        );
+    }
+}
