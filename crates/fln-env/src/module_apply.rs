@@ -985,12 +985,15 @@ pub fn prepare_module_apply_candidate(
 /// Immutable evidence for one successful aggregate transition.
 ///
 /// The receipt is created while the plan still holds both exact states, then checked
-/// again immediately before the candidate is released. It records provenance roots,
-/// rather than treating an index projection or a graph lineage binding as a root.
+/// again immediately before the candidate is released. It retains the exact canonical
+/// contribution record (including the resolver-bound artifact evidence) alongside the
+/// provenance roots, rather than treating an index projection or a graph lineage
+/// binding as a root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleApplyReceipt {
     schema: u16,
     module: ModuleId,
+    contribution: ModuleContributionRecord,
     transaction_id: ModuleApplyTransactionId,
     base_provenance_root: ModuleProvenanceRoot,
     result_provenance_root: ModuleProvenanceRoot,
@@ -1003,6 +1006,11 @@ impl ModuleApplyReceipt {
 
     pub fn module(&self) -> &ModuleId {
         &self.module
+    }
+
+    /// Canonical contribution record that was committed, including artifact evidence.
+    pub fn contribution(&self) -> &ModuleContributionRecord {
+        &self.contribution
     }
 
     pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
@@ -1041,8 +1049,13 @@ impl ModuleApplyReceipt {
                 actual: actual_result,
             });
         }
-        if candidate.manifest().record(&self.module).is_none() {
-            return Err(ModuleApplyReceiptError::ModuleAbsent {
+        let actual_contribution = candidate.manifest().record(&self.module).ok_or_else(|| {
+            ModuleApplyReceiptError::ModuleAbsent {
+                module: self.module.clone(),
+            }
+        })?;
+        if actual_contribution != &self.contribution {
+            return Err(ModuleApplyReceiptError::Contribution {
                 module: self.module.clone(),
             });
         }
@@ -1242,6 +1255,9 @@ pub enum ModuleApplyReceiptError {
         expected: ModuleProvenanceRoot,
         actual: ModuleProvenanceRoot,
     },
+    Contribution {
+        module: ModuleId,
+    },
     Transaction {
         expected: ModuleApplyTransactionId,
         actual: ModuleApplyTransactionId,
@@ -1274,6 +1290,7 @@ pub fn prepare_module_apply(
                 receipt: ModuleApplyReceipt {
                     schema: preflight.schema(),
                     module: preflight.transaction().contribution().module().id.clone(),
+                    contribution: preflight.transaction().contribution().clone(),
                     transaction_id: preflight.transaction_id(),
                     base_provenance_root: base.manifest().root(),
                     result_provenance_root: candidate.manifest().root(),
@@ -2154,6 +2171,35 @@ mod tests {
             ))
         ));
 
+        let mut tampered_contribution_plan =
+            match prepare_module_apply(&checked, &base, &declaration_candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                Outcome::Complete(Ok(other)) => {
+                    panic!("expected a prepared application plan, got {other:?}")
+                }
+                other => panic!("expected a complete application plan, got {other:?}"),
+            };
+        let mut forged_artifact = contribution.module().artifact.clone();
+        forged_artifact.content_digest = Digest([8; 32]);
+        tampered_contribution_plan.receipt.contribution = ModuleContributionRecord::new(
+            ModuleRecord::new(
+                contribution.module().id.clone(),
+                contribution.module().is_module,
+                contribution.module().direct_imports().to_vec(),
+                forged_artifact,
+            ),
+            contribution.declarations().to_vec(),
+            contribution.extra_declarations().to_vec(),
+            contribution.extension_contributions().to_vec(),
+            contribution.completeness().clone(),
+        );
+        assert!(matches!(
+            tampered_contribution_plan.commit(&base),
+            Err(ModuleApplyCommitError::Receipt(
+                ModuleApplyReceiptError::Contribution { .. }
+            ))
+        ));
+
         let mut tampered_transaction_plan =
             match prepare_module_apply(&checked, &base, &declaration_candidate) {
                 Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
@@ -2183,6 +2229,7 @@ mod tests {
         };
         assert_eq!(committed.state().graph().len(), 1);
         assert_eq!(committed.receipt().module(), &contribution.module().id);
+        assert_eq!(committed.receipt().contribution(), &contribution);
         assert_eq!(
             committed.receipt().transaction_id(),
             checked.transaction_id()
