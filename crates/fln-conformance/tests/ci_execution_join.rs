@@ -3276,17 +3276,24 @@ fn mutant_a_row_leaving_the_population_without_a_shrink_reddens() {
 /// A suite removed from CI must redden as loudly as a row added to the population — the
 /// second of the two directions this guard exists to bind.
 ///
-/// `scripts/check.sh` is the only link between the workflow files and the workspace suite,
-/// so severing it takes every cited surface out of CI's reach at once. Note which finding
-/// fires: **not** the `scan:` refusal, because `mandated-mutants.yml` still runs one
-/// `--test` target so *some* job still runs *some* cargo test. The first version of this
-/// mutant asserted `scan:` and failed against a guard that was behaving correctly. What
-/// actually catches it is `unrun:`, the empty allowance — which is the assertion that has
-/// no headroom at all and therefore the one that should catch it.
+/// Every route to the workspace suite must be severed for this mutant. `check.sh` supplies
+/// the Linux gate's route, while the Windows functional lane invokes `cargo test --workspace`
+/// directly. Note which finding fires: **not** the `scan:` refusal, because
+/// `mandated-mutants.yml` still runs one `--test` target so *some* job still runs *some*
+/// cargo test. The first version of this mutant asserted `scan:` and failed against a guard
+/// that was behaving correctly. What actually catches it is `unrun:`, the empty allowance —
+/// which is the assertion that has no headroom at all and therefore the one that should catch
+/// it.
 #[test]
-fn mutant_check_sh_stops_running_the_workspace_suite() {
+fn mutant_no_ci_job_reaches_the_workspace_suite() {
     let mut d = baseline();
     d.check_sh_workspace = false;
+    for job in &mut d.jobs {
+        // This leaves the job and its other command shapes intact while removing every direct
+        // `cargo test` reach. Together with the one derived check.sh fact above, it changes
+        // exactly the workspace-suite reachability premise that the mutant names.
+        job.body = job.body.replace("cargo test", "cargo planted-test");
+    }
     let findings = judge(
         &d,
         UNEXECUTED_EVIDENCE_ALLOWANCE,
@@ -3294,7 +3301,7 @@ fn mutant_check_sh_stops_running_the_workspace_suite() {
     );
     assert!(
         has(&findings, "unrun:"),
-        "severing check.sh must report every cited surface as one no CI job runs, against an \
+        "severing every workspace-suite route must report every cited surface as one no CI job runs, against an \
          allowance that is empty and has never been anything else; got {findings:?}"
     );
     // And the population must EMPTY rather than persist: those rows are no longer merely

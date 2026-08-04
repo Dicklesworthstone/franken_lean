@@ -33,6 +33,11 @@ fn windows_functional_workflow_keeps_the_declared_native_scope() {
         "--test fault_boundary_registry",
         "every_capability_has_a_platform_row_chosen_at_compile_time",
         "functional-not-certified boundary",
+        "fln.windows-functional-evidence/1",
+        "finalize Windows functional evidence",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "windows-functional-evidence-${{ github.run_id }}-${{ github.run_attempt }}",
+        "if: always()",
     ] {
         assert!(
             workflow.contains(required),

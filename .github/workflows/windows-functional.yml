@@ -31,6 +31,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: initialize the Windows functional evidence bundle
+        run: |
+          evidence_dir="$RUNNER_TEMP/fln-windows-functional-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$evidence_dir" || -L "$evidence_dir" ]]; then
+            echo "Windows evidence directory already exists: $evidence_dir" >&2
+            exit 2
+          fi
+          mkdir -p "$evidence_dir"
+          python3 -I - "$evidence_dir/attempt-start.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          record = {
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "schema": "fln.windows-functional-evidence/1",
+              "status": "started",
+          }
+          with open(sys.argv[1], "x", encoding="utf-8") as handle:
+              json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+              handle.flush()
+              os.fsync(handle.fileno())
+          PY
+          echo "FLN_WINDOWS_EVIDENCE_DIR=$evidence_dir" >> "$GITHUB_ENV"
+
       - name: install the SUITE.lock-pinned Rust toolchain
         run: |
           channel="$(python3 -I - <<'PY'
@@ -61,8 +88,8 @@ jobs:
           rustup toolchain install "$channel" --profile minimal \
             --component rustfmt --component clippy
           rustup override set "$channel"
-          rustc --version --verbose
-          cargo --version
+          rustc --version --verbose | tee "$FLN_WINDOWS_EVIDENCE_DIR/rustc-version.txt"
+          cargo --version | tee "$FLN_WINDOWS_EVIDENCE_DIR/cargo-version.txt"
 
       - name: build every supported workspace target
         run: cargo check --locked --workspace --all-targets
@@ -80,3 +107,38 @@ jobs:
         run: |
           echo "windows-x86-64 functional lane: passed build and conformance smoke"
           echo "bit-certification is deliberately not attempted by this workflow"
+
+      - name: finalize Windows functional evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 -I - "$FLN_WINDOWS_EVIDENCE_DIR/attempt-final.json" <<'PY'
+          import json
+          import os
+          import platform
+          import sys
+
+          record = {
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "job_status": os.environ["JOB_STATUS"],
+              "platform": platform.platform(),
+              "schema": "fln.windows-functional-evidence/1",
+              "status": "finalized",
+          }
+          with open(sys.argv[1], "x", encoding="utf-8") as handle:
+              json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+              handle.flush()
+              os.fsync(handle.fileno())
+          PY
+
+      - name: archive Windows functional evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-functional-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.FLN_WINDOWS_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 90
