@@ -1351,6 +1351,69 @@ fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
 }
 
 #[test]
+fn small_heap_cross_thread_page_handoffs_reclaim_at_1_8_32_creators() {
+    let _g = lock();
+    use crate::export::{export_mi_free, export_mi_malloc_small};
+
+    // One representative from six distinct 8-byte size classes, including
+    // both ends of Marrow's small-allocation range.
+    const SIZES: [usize; 6] = [1, 9, 17, 255, 1025, 4089];
+
+    for width in [1, 8, 32] {
+        crate::membrane::drain_small_bins_for_test();
+        let before = crate::membrane::small_page_metrics_for_test();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let finish = std::sync::Arc::new(std::sync::Barrier::new(width));
+        let mut creators = Vec::with_capacity(width);
+        for _ in 0..width {
+            let start = std::sync::Arc::clone(&start);
+            let finish = std::sync::Arc::clone(&finish);
+            creators.push(std::thread::spawn(move || {
+                start.wait();
+                let blocks = SIZES.map(|size| {
+                    let block = export_mi_malloc_small(size);
+                    assert!(!block.is_null(), "class {size} allocation must succeed");
+                    block.expose_provenance()
+                });
+                // Keep every creator's page owner live until all peers have
+                // allocated. `join` then proves its TLS destructor releases
+                // that owner before the foreign thread frees the blocks.
+                finish.wait();
+                blocks
+            }));
+        }
+
+        let blocks = creators
+            .into_iter()
+            .flat_map(|creator| creator.join().expect("small-page creator"))
+            .collect::<Vec<_>>();
+        let after_creators = crate::membrane::small_page_metrics_for_test();
+        assert_eq!(
+            after_creators.0,
+            before.0 + width * SIZES.len(),
+            "width {width} creates one page per creator and class"
+        );
+        assert_eq!(
+            after_creators.1, before.1,
+            "width {width} creator exits cannot reclaim live foreign blocks"
+        );
+
+        for address in blocks {
+            let block = core::ptr::with_exposed_provenance_mut::<core::ffi::c_void>(address);
+            export_mi_free(block);
+        }
+        crate::membrane::drain_small_bins_for_test();
+
+        let after = crate::membrane::small_page_metrics_for_test();
+        assert_eq!(
+            after.1,
+            after_creators.1 + width * SIZES.len(),
+            "width {width} reclaims every page created by its foreign handoffs"
+        );
+    }
+}
+
+#[test]
 fn small_allocator_ticks_are_width_invariant_at_1_8_32_threads() {
     let _g = lock();
     use crate::export::{export_lean_alloc_small, export_lean_free_small};
