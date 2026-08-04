@@ -11,10 +11,12 @@ use fln_core::name::Name;
 use fln_hash::domain::Digest;
 
 use crate::constants::ConstantInfo;
+use crate::environment::Environment;
 use crate::extensions::ExtensionDescriptor;
+use crate::modules::{ModuleGraph, ModuleId};
 use crate::provenance::{
     DeclarationClass, ExtensionEntryId, ModuleContributionRecord, ModuleProvenanceError,
-    ModuleProvenanceManifest, ModuleProvenanceRoot,
+    ModuleProvenanceIndexes, ModuleProvenanceManifest, ModuleProvenanceRoot,
 };
 
 /// Schema for the ephemeral payload envelope.  Bumping it invalidates every prepared
@@ -130,6 +132,211 @@ pub struct PreflightedModuleApply {
     transaction: ModuleApplyTransaction,
     manifest_root: ModuleProvenanceRoot,
     declaration_identities: Arc<[Digest]>,
+}
+
+/// The only aggregate value an application path may expose as committed.
+///
+/// The environment, graph, manifest, and bidirectional projections travel together:
+/// callers cannot construct a state with a detached index side store.  The constructor
+/// proves the graph and environment cover exactly the manifest's records, and derives
+/// the indexes itself rather than accepting an independently mutable projection.
+///
+/// This type deliberately does not make a declaration-content claim the current
+/// manifest cannot support.  The payload envelope derives those identities at preflight;
+/// a future manifest commitment can make that comparison part of this invariant without
+/// changing where committed state lives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleApplyState {
+    environment: Environment,
+    graph: ModuleGraph,
+    manifest: Arc<ModuleProvenanceManifest>,
+    indexes: ModuleProvenanceIndexes,
+}
+
+impl ModuleApplyState {
+    /// Join already-published immutable components only after checking their shared
+    /// provenance truth.  `indexes` are never accepted as an argument: accepting them
+    /// would permit an application caller to pair a valid manifest with stale indexes.
+    pub fn from_parts(
+        environment: Environment,
+        graph: ModuleGraph,
+        manifest: Arc<ModuleProvenanceManifest>,
+    ) -> Result<Self, ModuleApplyStateError> {
+        manifest
+            .verify_self_consistency()
+            .map_err(ModuleApplyStateError::ManifestInconsistent)?;
+        if graph.epoch() != manifest.epoch() {
+            return Err(ModuleApplyStateError::GraphEpoch {
+                graph: graph.epoch().clone(),
+                manifest: manifest.epoch().clone(),
+            });
+        }
+        if graph.len() != manifest.records().len() {
+            return Err(ModuleApplyStateError::GraphModuleCount {
+                graph: graph.len(),
+                manifest: manifest.records().len(),
+            });
+        }
+
+        let expected_declarations = manifest
+            .facts()
+            .declarations
+            .checked_add(manifest.facts().extra_declarations)
+            .ok_or(ModuleApplyStateError::ManifestFactOverflow)?;
+        if environment.len() != expected_declarations {
+            return Err(ModuleApplyStateError::EnvironmentDeclarationCount {
+                environment: environment.len(),
+                manifest: expected_declarations,
+            });
+        }
+        for record in manifest.records() {
+            let module = record.module().id.clone();
+            match graph.record(&module) {
+                Some(actual) if actual == record.module() => {}
+                Some(_) => return Err(ModuleApplyStateError::GraphRecordMismatch { module }),
+                None => return Err(ModuleApplyStateError::GraphRecordAbsent { module }),
+            }
+            for name in record
+                .declarations()
+                .iter()
+                .chain(record.extra_declarations())
+            {
+                if !environment.contains(name) {
+                    return Err(ModuleApplyStateError::EnvironmentDeclarationAbsent {
+                        name: name.clone(),
+                    });
+                }
+            }
+            for contribution in record.extension_contributions() {
+                let descriptor = contribution.descriptor();
+                let state = environment.extension(&descriptor.name).ok_or_else(|| {
+                    ModuleApplyStateError::UnknownExtension {
+                        name: descriptor.name.clone(),
+                    }
+                })?;
+                if state.descriptor != *descriptor {
+                    return Err(ModuleApplyStateError::ExtensionDescriptor {
+                        name: descriptor.name.clone(),
+                    });
+                }
+                let start = usize::try_from(contribution.start()).map_err(|_| {
+                    ModuleApplyStateError::ExtensionRange {
+                        name: descriptor.name.clone(),
+                    }
+                })?;
+                let end = start
+                    .checked_add(contribution.entries().len())
+                    .ok_or_else(|| ModuleApplyStateError::ExtensionRange {
+                        name: descriptor.name.clone(),
+                    })?;
+                let entries: Vec<_> = state.entries().collect();
+                let actual = entries.get(start..end).ok_or_else(|| {
+                    ModuleApplyStateError::ExtensionRange {
+                        name: descriptor.name.clone(),
+                    }
+                })?;
+                for (offset, (entry, expected)) in
+                    actual.iter().zip(contribution.entries()).enumerate()
+                {
+                    let identity =
+                        ExtensionEntryId::derive(manifest.epoch(), descriptor, &entry.payload);
+                    if identity != *expected {
+                        return Err(ModuleApplyStateError::ExtensionIdentity {
+                            name: descriptor.name.clone(),
+                            offset,
+                        });
+                    }
+                }
+            }
+        }
+
+        let indexes = ModuleProvenanceIndexes::derive(&manifest)
+            .map_err(ModuleApplyStateError::IndexInconsistent)?;
+        indexes
+            .verify(&manifest)
+            .map_err(ModuleApplyStateError::IndexInconsistent)?;
+        Ok(Self {
+            environment,
+            graph,
+            manifest,
+            indexes,
+        })
+    }
+
+    pub fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    pub fn graph(&self) -> &ModuleGraph {
+        &self.graph
+    }
+
+    pub fn manifest(&self) -> &ModuleProvenanceManifest {
+        &self.manifest
+    }
+
+    pub fn indexes(&self) -> &ModuleProvenanceIndexes {
+        &self.indexes
+    }
+
+    /// Recheck the single-state invariant before a later apply plan consumes it.
+    pub fn verify(&self) -> Result<(), ModuleApplyStateError> {
+        let rebuilt = Self::from_parts(
+            self.environment.clone(),
+            self.graph.clone(),
+            Arc::clone(&self.manifest),
+        )?;
+        if rebuilt.indexes != self.indexes {
+            return Err(ModuleApplyStateError::IndexInconsistent(
+                ModuleProvenanceError::GraphAdmissionFault {
+                    what: "stored provenance indexes disagree with their manifest derivation",
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Refusals while joining the immutable components into one committed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyStateError {
+    ManifestInconsistent(ModuleProvenanceError),
+    GraphEpoch {
+        graph: crate::modules::ModuleEpoch,
+        manifest: crate::modules::ModuleEpoch,
+    },
+    GraphModuleCount {
+        graph: usize,
+        manifest: usize,
+    },
+    GraphRecordAbsent {
+        module: ModuleId,
+    },
+    GraphRecordMismatch {
+        module: ModuleId,
+    },
+    ManifestFactOverflow,
+    EnvironmentDeclarationCount {
+        environment: usize,
+        manifest: usize,
+    },
+    EnvironmentDeclarationAbsent {
+        name: Name,
+    },
+    UnknownExtension {
+        name: Name,
+    },
+    ExtensionDescriptor {
+        name: Name,
+    },
+    ExtensionRange {
+        name: Name,
+    },
+    ExtensionIdentity {
+        name: Name,
+        offset: usize,
+    },
+    IndexInconsistent(ModuleProvenanceError),
 }
 
 impl PreflightedModuleApply {
@@ -355,7 +562,8 @@ mod tests {
     use crate::constants::{AxiomVal, ConstantVal};
     use crate::extensions::{CheckpointSemantics, MergeSemantics, PayloadProvenance};
     use crate::modules::{
-        ArtifactEvidence, ArtifactGrade, ArtifactProducer, ModuleEpoch, ModuleId, ModuleRecord,
+        ArtifactEvidence, ArtifactGrade, ArtifactProducer, ModuleEpoch, ModuleGraphLimits,
+        ModuleId, ModuleRecord,
     };
     use crate::provenance::{
         CaptureStatus, ExtensionContribution, ModuleProvenanceLimits, PayloadTransparency,
@@ -434,6 +642,33 @@ mod tests {
             vec![axiom("fixture.extra")],
             extension_payloads,
         )
+    }
+
+    fn graph_with(record: &ModuleContributionRecord) -> ModuleGraph {
+        let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("fixture graph construction admits");
+        graph
+            .register(record.module().clone())
+            .into_admitted_value()
+            .expect("fixture graph registration admits")
+            .graph
+    }
+
+    fn environment_with_extension(payload: Option<&[u8]>) -> Environment {
+        let environment = Environment::new()
+            .add_decl((*axiom("fixture.decl")).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*axiom("fixture.extra")).clone())
+            .expect("fixture extra declaration is unique")
+            .register_extension(descriptor())
+            .expect("fixture extension is unique");
+        match payload {
+            Some(payload) => environment
+                .push_extension_entry(&name("fixture.ext"), payload)
+                .expect("fixture extension is registered"),
+            None => environment,
+        }
     }
 
     #[test]
@@ -539,5 +774,82 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn committed_state_derives_and_keeps_both_provenance_directions() {
+        let descriptor = descriptor();
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"payload");
+        let contribution = record(vec![ExtensionContribution::new(
+            descriptor,
+            0,
+            Digest([0; 32]),
+            vec![entry],
+        )]);
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(
+                epoch(),
+                vec![contribution.clone()],
+                ModuleProvenanceLimits::default(),
+            )
+            .expect("fixture manifest is valid"),
+        );
+        let state = ModuleApplyState::from_parts(
+            environment_with_extension(Some(b"payload")),
+            graph_with(&contribution),
+            manifest,
+        )
+        .expect("joined state is coherent");
+
+        state.verify().expect("stored state remains coherent");
+        let owner = state
+            .indexes()
+            .owner_of(&name("fixture.decl"))
+            .expect("forward declaration has a reverse owner");
+        assert_eq!(owner.0, contribution.module().id);
+        assert!(
+            state
+                .indexes()
+                .declarations_of(&contribution.module().id)
+                .expect("reverse owner has a forward declaration list")
+                .contains(&name("fixture.decl"))
+        );
+        assert_eq!(
+            state
+                .indexes()
+                .occurrences_of(&entry)
+                .expect("extension entry has reverse occurrences")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn committed_state_refuses_a_late_extension_range_without_constructing_state() {
+        let descriptor = descriptor();
+        let entry = ExtensionEntryId::derive(&epoch(), &descriptor, b"payload");
+        let contribution = record(vec![ExtensionContribution::new(
+            descriptor,
+            0,
+            Digest([0; 32]),
+            vec![entry],
+        )]);
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(
+                epoch(),
+                vec![contribution.clone()],
+                ModuleProvenanceLimits::default(),
+            )
+            .expect("fixture manifest is valid"),
+        );
+        let environment = environment_with_extension(None);
+        let graph = graph_with(&contribution);
+
+        assert!(matches!(
+            ModuleApplyState::from_parts(environment.clone(), graph.clone(), manifest),
+            Err(ModuleApplyStateError::ExtensionRange { .. })
+        ));
+        assert_eq!(environment.len(), 2);
+        assert_eq!(graph.len(), 1);
     }
 }
