@@ -1,0 +1,82 @@
+# Windows is a functional W1 lane, not part of the certified reproducibility
+# matrix.  It exercises the exact locked Rust toolchain against the real Windows
+# filesystem/process surface; bit-identical artifact certification remains a
+# separate declared decision (plan D17 and §18.3).
+name: windows-functional
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/windows-functional
+
+jobs:
+  functional:
+    name: windows-x86-64 functional workspace and conformance smoke
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: install the SUITE.lock-pinned Rust toolchain
+        run: |
+          channel="$(python3 -I - <<'PY'
+          import re
+          from pathlib import Path
+
+          rows = []
+          for raw in Path("SUITE.lock").read_text(encoding="utf-8").splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if line.startswith("rust-nightly "):
+                  rows.append(line.split())
+          if len(rows) != 1 or len(rows[0]) != 2:
+              raise SystemExit("SUITE.lock must contain exactly one rust-nightly row")
+          channel = rows[0][1]
+          if re.fullmatch(r"nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}", channel) is None:
+              raise SystemExit(f"SUITE.lock rust-nightly is not an exact dated pin: {channel!r}")
+          print(channel)
+          PY
+          )"
+          expected="$(python3 -I - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          print(tomllib.loads(Path("rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"])
+          PY
+          )"
+          test "$channel" = "$expected"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+          rustup override set "$channel"
+          rustc --version --verbose
+          cargo --version
+
+      - name: build every supported workspace target
+        run: cargo check --locked --workspace --all-targets
+
+      - name: run the functional unit and conformance workspace lanes
+        run: cargo test --locked --workspace --no-fail-fast
+
+      - name: assert Windows-native fault capability rows
+        run: |
+          cargo test --locked -p fln-conformance --test fault_boundary_registry \
+            every_capability_has_a_platform_row_chosen_at_compile_time \
+            -- --exact --nocapture
+
+      - name: record the functional-not-certified boundary
+        run: |
+          echo "windows-x86-64 functional lane: passed build and conformance smoke"
+          echo "bit-certification is deliberately not attempted by this workflow"
