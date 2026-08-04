@@ -859,6 +859,75 @@ fn forall_domain_and_codomain_sort_validation_is_mode_exact_and_reducible() {
     );
     assert_eq!(result.progress.forall_sort_checks, 2);
     assert_eq!(result.progress.whnf_queries, 2);
+
+    let structure_name = primary_name("ForallOverflowStructure");
+    let constructor_name = primary_name("ForallOverflowConstructor");
+    let overflow_type = Expr::proj(
+        structure_name.clone(),
+        u64::MAX,
+        Expr::app(
+            Expr::const_(constructor_name.clone(), Vec::new()),
+            prop.clone(),
+        ),
+    );
+    let overflow_context = InferenceContext::new_with_projection_rules(
+        Vec::new(),
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name_value(&structure_name),
+            checker_name_value(&constructor_name),
+            usize::MAX,
+        )],
+        environment(vec![header(
+            "ForallOverflowType",
+            Vec::new(),
+            decoded(&overflow_type),
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        )]),
+    )
+    .expect("unique Forall overflow projection context");
+    let overflow_term = Expr::const_(primary_name("ForallOverflowType"), Vec::new());
+    let reduction_bad_domain = Expr::forall_e(
+        primary_name("x"),
+        overflow_term.clone(),
+        prop.clone(),
+        BinderInfo::Default,
+    );
+    let reduction_bad_codomain =
+        Expr::forall_e(primary_name("x"), prop, overflow_term, BinderInfo::Default);
+    for mode in modes {
+        assert!(matches!(
+            infer(
+                &decoded(&reduction_bad_domain),
+                &overflow_context,
+                mode,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::SortReductionRefusal {
+                    site: InferenceSortSite::ForallBinder { binder: 0 },
+                    refusal: fln_checker::whnf::WhnfRefusal::ProjectionIndexOverflow { .. },
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            infer(
+                &decoded(&reduction_bad_codomain),
+                &overflow_context,
+                mode,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::SortReductionRefusal {
+                    site: InferenceSortSite::ForallCodomain { binders: 1 },
+                    refusal: fln_checker::whnf::WhnfRefusal::ProjectionIndexOverflow { .. },
+                },
+                ..
+            }
+        ));
+    }
 }
 
 #[test]

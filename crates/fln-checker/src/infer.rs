@@ -3,8 +3,9 @@
 //! This is the independent checker's typing dispatcher. It implements the
 //! closed-term precondition, the leaf rules KR-100 through KR-105, iterative
 //! KR-111 metadata transparency, worklist-driven KR-106 application inference,
-//! and stack-safe KR-107 lambda-telescope inference. Later rule families are
-//! named by [`InferenceDeferred`] instead of being misreported as rejection.
+//! stack-safe KR-107 lambda-telescope inference, and stack-safe KR-108 Forall
+//! inference with checker-owned right-associated `imax`. Later rule families
+//! are named by [`InferenceDeferred`] instead of being misreported as rejection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -3166,6 +3167,60 @@ mod tests {
         ));
 
         let zero = LevelId::from_index(0).expect("zero level index exists");
+        let healthy_root = ExprId::from_index(0).expect("zero expression index exists");
+        let healthy = WireExpr::from_parts(
+            vec![ExprNode::Sort { level: zero }],
+            vec![LevelNode::Zero],
+            healthy_root,
+        );
+        assert!(matches!(
+            infer(
+                &healthy,
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn private_malformed_forall_child_is_an_internal_fault_and_recovery_is_clean() {
+        let zero = LevelId::from_index(0).expect("zero level index exists");
+        let domain = ExprId::from_index(0).expect("zero expression index exists");
+        let body = ExprId::from_index(7).expect("small expression index exists");
+        let root = ExprId::from_index(1).expect("one expression index exists");
+        let broken = WireExpr::from_parts(
+            vec![
+                ExprNode::Sort { level: zero },
+                ExprNode::Forall {
+                    binder_name: WireName::default(),
+                    binder_type: domain,
+                    body,
+                    style: BinderStyle::Default,
+                },
+            ],
+            vec![LevelNode::Zero],
+            root,
+        );
+        let context = InferenceContext::empty(ConstantEnvironment::empty());
+        assert!(matches!(
+            infer(
+                &broken,
+                &context,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::InternalFault {
+                fault: InferenceFault::Inspection(TermFault::NonBackwardExpressionReference {
+                    input: TermInput::Subject,
+                    parent: 1,
+                    child: 7,
+                }),
+                ..
+            }
+        ));
+
         let healthy_root = ExprId::from_index(0).expect("zero expression index exists");
         let healthy = WireExpr::from_parts(
             vec![ExprNode::Sort { level: zero }],
