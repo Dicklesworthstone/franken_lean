@@ -636,14 +636,33 @@ fn planted_growth_is_refused_and_a_planted_repair_is_not() {
 
     // +1 is enough. A guard that only notices a hundred is a guard that notices nothing until
     // it is far too late.
+    //
+    // The plant is relative to the DECLARED allowance, not to the measured count, and that
+    // distinction is why this cell stopped biting. `allowance_violations` faults only when
+    // `count > allowed`, so a repair that REMOVES backup-only anchors leaves slack: measured
+    // drops below the declared number while the allowance stays put, which the one-way-plus-floor
+    // policy deliberately permits — tightening it to equality would be a wall that reddens the
+    // very repair that shrank the population. Planting `measured + 1` then lands inside that
+    // slack and violates nothing, so the cell reported 0 and read as a guard that had stopped
+    // working. It had not; its plant had.
+    //
+    // Planting `declared + 1` restores the property the comment above asserts — one anchor past
+    // what is allowed must fail — and is invariant under any future repair, because it is keyed
+    // to the allowance rather than to whatever the tree currently happens to carry.
+    let declared_for_manifest = BACKUP_ONLY_ALLOWANCE
+        .iter()
+        .find(|(file, _)| *file == "ci/VERIFICATION_MANIFEST.jsonl")
+        .map(|(_, allowed)| *allowed)
+        .expect("the manifest's allowance row must exist for this plant to mean anything");
     let mut one_more = census.backup_by_file.clone();
-    *one_more
-        .entry("ci/VERIFICATION_MANIFEST.jsonl".to_owned())
-        .or_default() += 1;
+    one_more.insert(
+        "ci/VERIFICATION_MANIFEST.jsonl".to_owned(),
+        declared_for_manifest + 1,
+    );
     assert_eq!(
         allowance_violations(&one_more).len(),
         1,
-        "one more must fail too"
+        "one anchor past the declared allowance must fail"
     );
 
     // A file with no allowance at all, which is how a NEW file joins silently.
