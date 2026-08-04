@@ -37,7 +37,7 @@ use std::path::Path;
 
 use fln_bench::{
     AttemptRecord, AttemptStatus, BENCHMARK_EVIDENCE_VERSION, BenchmarkRefusal, BenchmarkTelemetry,
-    CacheCondition, CacheState, Captured, ClaimBinding, ClaimClass, ClaimState,
+    CacheCondition, CacheState, CaptureSource, Captured, ClaimBinding, ClaimClass, ClaimState,
     ConfidenceAlgorithm, HostProfile, HostQualificationPolicy, LocalBuildIdentity, MeasurementUnit,
     OutlierPolicy, ProfilerState, QuantileAlgorithm, ResourceBounds, SamplePlan, WorkloadKind,
     WorkloadManifest, assemble_bundle, qualify_host,
@@ -558,3 +558,131 @@ fn the_thermal_sensor_fact_reports_the_count_it_actually_found() {
         }
     }
 }
+
+fn profile_with_virtualization(value: &str) -> HostProfile {
+    let mut profile = capture();
+    profile.virtualization = Captured::observed(value.to_string(), CaptureSource::Procfs);
+    profile
+}
+
+fn profile_with_translation(value: &str) -> HostProfile {
+    let mut profile = capture();
+    profile.translation = Captured::observed(value.to_string(), CaptureSource::BuildMetadata);
+    profile
+}
+
+/// A policy that permits everything EXCEPT the proxy-host vectors, so a refusal
+/// can only be attributable to virtualization or translation. Using the strict
+/// baseline policy here would be useless: it already refuses this host for four
+/// environmental checks, and the cell could not tell which check fired.
+fn proxy_only_policy() -> HostQualificationPolicy {
+    HostQualificationPolicy {
+        require_physical_topology: false,
+        require_power_governor: false,
+        require_thermal_sensors: false,
+        require_exclusive_cores: false,
+        require_stable_frequency: false,
+        require_thermal_stability: false,
+        allow_virtualization: false,
+        allow_translation: false,
+        allow_profiler: false,
+    }
+}
+
+#[test]
+fn a_virtualized_host_is_refused_as_a_proxy_and_the_check_is_named() {
+    // MUTATION: proxy host acceptance. A VM or a container with unverifiable
+    // host controls silently substituting for the qualified bare-metal profile
+    // is the shape odwj names first among its mutations.
+    let blocked = qualify_host(
+        &profile_with_virtualization("hypervisor-detected"),
+        proxy_only_policy(),
+    )
+    .expect_err("a hypervisor-detected host must be refused when virtualization is forbidden");
+
+    assert!(
+        blocked.failing_checks.contains(&"virtualization-forbidden"),
+        "the refusal must name virtualization-forbidden; got {:?}",
+        blocked.failing_checks
+    );
+    assert_eq!(
+        blocked.claim,
+        ClaimBinding {
+            class: ClaimClass::Benchmark,
+            state: ClaimState::Blocked
+        },
+        "a proxy host yields BLOCKED, never a weaker state"
+    );
+}
+
+#[test]
+fn a_translated_host_is_refused_as_a_proxy_and_the_check_is_named() {
+    // The second proxy vector: an emulated / translated target (Rosetta-class).
+    // A measurement taken under translation is a measurement of the translator.
+    let blocked = qualify_host(
+        &profile_with_translation("translated-x86-on-arm"),
+        proxy_only_policy(),
+    )
+    .expect_err("a translated target must be refused when translation is forbidden");
+
+    assert!(
+        blocked.failing_checks.contains(&"translation-forbidden"),
+        "the refusal must name translation-forbidden; got {:?}",
+        blocked.failing_checks
+    );
+}
+
+#[test]
+fn the_real_bare_metal_host_is_not_refused_as_a_proxy() {
+    // THE POSITIVE CONTROL, and it is the whole reason the two cells above mean
+    // anything. Under the same proxy-only policy, THIS host — genuinely bare
+    // metal and native — must NOT be refused. Without this, a qualify_host that
+    // rejected every profile would satisfy both cells above while making every
+    // legitimate host unqualifiable, which is a wall rather than a guard.
+    let report = qualify_host(&capture(), proxy_only_policy());
+    assert!(
+        report.is_ok(),
+        "this host is bare metal and native, so the proxy-only policy must admit it; \
+         blocked on {:?}",
+        report.err().map(|b| b.failing_checks)
+    );
+}
+
+#[test]
+fn the_substitution_is_the_only_thing_that_changed() {
+    // Anti-vacuity for the two mutation cells: prove the constructed profiles
+    // differ from the live one in EXACTLY the substituted fact. If a helper
+    // accidentally perturbed something else, the refusals above could be
+    // attributable to that instead, and the cells would be measuring the wrong
+    // thing while looking correct.
+    let live = capture();
+    let virt = profile_with_virtualization("hypervisor-detected");
+    let trans = profile_with_translation("translated-x86-on-arm");
+
+    assert_eq!(live.cpu_sku, virt.cpu_sku);
+    assert_eq!(
+        live.translation, virt.translation,
+        "the virt cell must not touch translation"
+    );
+    assert_ne!(
+        live.virtualization, virt.virtualization,
+        "the virt cell must change virtualization"
+    );
+
+    assert_eq!(live.cpu_sku, trans.cpu_sku);
+    assert_eq!(
+        live.virtualization, trans.virtualization,
+        "the translation cell must not touch virtualization"
+    );
+    assert_ne!(
+        live.translation, trans.translation,
+        "the translation cell must change translation"
+    );
+}
+
+// WHAT THIS DOES NOT EARN: it establishes that a profile DECLARING a hypervisor
+// or a translated target is refused. It does not establish that a real VM would
+// be detected — that depends on `capture_local`'s hypervisor-flag probe, which
+// this host cannot exercise because it has no hypervisor. Detection and refusal
+// are separate properties, and only refusal is covered here. Say so in the
+// commit message rather than letting "proxy host acceptance: killed" imply both.
