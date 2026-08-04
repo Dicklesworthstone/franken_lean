@@ -64,6 +64,211 @@ set -uo pipefail
 
 say() { printf 'ubs-gate: %s\n' "$1" >&2; }
 
+run_path_baseline() {
+    # This is deliberately an opt-in analysis command, not a replacement for the quality gate.
+    # UBS v5.3.7 reduces its scanner set for an ignored copy of a file; a comparison made that
+    # way is confidently false.  The baseline must therefore live in an external snapshot at
+    # the original relative path.  Each path is scanned separately: UBS comparison reports have
+    # only aggregate totals, so one multi-file report cannot attribute a delta to one path.
+    local base='' out='' repo='' base_tree='' timeout='' input_path='' language=''
+    local base_report='' current_report='' base_stdout='' base_stderr=''
+    local current_stdout='' current_stderr='' base_exit=0 current_exit=0 result=0
+    local -a paths=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --base)
+                [ "$#" -ge 2 ] || { say 'REFUSED - --path-baseline --base needs a commit.'; return 2; }
+                base=$2
+                shift 2
+                ;;
+            --out)
+                [ "$#" -ge 2 ] || { say 'REFUSED - --path-baseline --out needs a new absolute directory.'; return 2; }
+                out=$2
+                shift 2
+                ;;
+            --)
+                shift
+                paths=("$@")
+                break
+                ;;
+            *)
+                say "REFUSED - unknown --path-baseline argument: $1"
+                return 2
+                ;;
+        esac
+    done
+    [ -n "$base" ] || { say 'REFUSED - --path-baseline requires --base.'; return 2; }
+    [ -n "$out" ] || { say 'REFUSED - --path-baseline requires --out.'; return 2; }
+    [ "${#paths[@]}" -gt 0 ] || { say 'REFUSED - --path-baseline needs at least one relative .py or .rs path after --.'; return 2; }
+    case "$out" in
+        /*) ;;
+        *) say 'REFUSED - --path-baseline --out must be absolute so the baseline cannot enter the checkout.'; return 2 ;;
+    esac
+    repo=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        say 'REFUSED - --path-baseline must run inside a Git checkout.'
+        return 2
+    }
+    case "$out" in
+        "$repo"|"$repo"/*)
+            say 'REFUSED - --path-baseline output must be outside the checkout.'
+            return 2
+            ;;
+    esac
+    [ ! -e "$out" ] || { say "REFUSED - output already exists and will not be overwritten: $out"; return 2; }
+    base=$(git rev-parse --verify "${base}^{commit}" 2>/dev/null) || {
+        say 'REFUSED - --base is not a resolvable commit.'
+        return 2
+    }
+    timeout=${FLN_UBS_MODULE_TIMEOUT_SECONDS:-${UBS_MODULE_TIMEOUT:-1080}}
+    case "$timeout" in
+        ''|*[!0-9]*|0)
+            say "REFUSED - UBS module timeout must be a positive integer, got: $timeout"
+            return 2
+            ;;
+    esac
+    command -v ubs >/dev/null 2>&1 || { say 'REFUSED - ubs is not on PATH.'; return 2; }
+
+    for input_path in "${paths[@]}"; do
+        case "$input_path" in
+            /*|*'..'*|''|./*|*'//'*)
+                say "REFUSED - baseline paths must be checkout-relative, normalized paths: $input_path"
+                return 2
+                ;;
+            *.py) ;;
+            *.rs) ;;
+            *)
+                say "REFUSED - baseline path is not a UBS-supported .py or .rs file: $input_path"
+                return 2
+                ;;
+        esac
+        git -C "$repo" ls-files --error-unmatch -- "$input_path" >/dev/null 2>&1 || {
+            say "REFUSED - current path is not tracked: $input_path"
+            return 2
+        }
+        [ -f "$repo/$input_path" ] || { say "REFUSED - current path is not a regular file: $input_path"; return 2; }
+        git -C "$repo" cat-file -e "${base}:${input_path}" 2>/dev/null || {
+            say "REFUSED - base commit lacks path: $input_path"
+            return 2
+        }
+    done
+
+    mkdir "$out" || { say "REFUSED - could not create exclusive output directory: $out"; return 2; }
+    base_tree="$out/base-tree"
+    mkdir "$base_tree" || { say 'REFUSED - could not create external baseline tree.'; return 2; }
+    git -C "$repo" archive --format=tar "$base" | tar -x -C "$base_tree" || {
+        say 'REFUSED - could not materialize the explicit base commit outside the checkout.'
+        return 2
+    }
+    {
+        printf 'schema=fln.ubs-path-baseline/1\n'
+        printf 'repository_root=%s\nbase_commit=%s\ncurrent_head_before_scan=%s\n' \
+            "$repo" "$base" "$(git -C "$repo" rev-parse HEAD)"
+        printf 'ubs_path=%s\n' "$(command -v ubs)"
+        ubs --version
+    } > "$out/measurement.txt"
+
+    for input_path in "${paths[@]}"; do
+        case "$input_path" in *.py) language=python ;; *.rs) language=rust ;; esac
+        # A collision-resistant, content-independent filename retains the original path in the
+        # report body while preventing a path component from becoming an output path.
+        local key
+        key=$(printf '%s' "$input_path" | sha256sum | awk '{print $1}')
+        base_report="$out/${key}.base.json"
+        current_report="$out/${key}.current.json"
+        base_stdout="$out/${key}.base.stdout"
+        base_stderr="$out/${key}.base.stderr"
+        current_stdout="$out/${key}.current.stdout"
+        current_stderr="$out/${key}.current.stderr"
+        {
+            printf 'path=%s language=%s\n' "$input_path" "$language"
+            sha256sum "$base_tree/$input_path" "$repo/$input_path"
+        } >> "$out/measurement.txt"
+
+        (cd "$base_tree" && UBS_MODULE_TIMEOUT="$timeout" ubs --only="$language" --ci --format=json \
+            --report-json="$base_report" "$input_path") > "$base_stdout" 2> "$base_stderr"
+        base_exit=$?
+        (cd "$repo" && UBS_MODULE_TIMEOUT="$timeout" ubs --only="$language" --ci --format=json \
+            --comparison="$base_report" --report-json="$current_report" "$input_path") \
+            > "$current_stdout" 2> "$current_stderr"
+        current_exit=$?
+
+        python3 - "$input_path" "$base" "$base_report" "$current_report" "$base_exit" "$current_exit" <<'PY'
+import json
+import sys
+
+path, base, base_report, current_report, base_exit, current_exit = sys.argv[1:]
+
+def load(label, report):
+    try:
+        with open(report, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception as error:
+        print(f"ubs-path-baseline: path={path} class=inconclusive reason={label}_report_unreadable:{type(error).__name__}")
+        raise SystemExit(2)
+    totals = document.get("totals")
+    scanners = document.get("scanners")
+    if not isinstance(totals, dict) or not isinstance(scanners, list) or len(scanners) != 1:
+        print(f"ubs-path-baseline: path={path} class=inconclusive reason={label}_report_shape")
+        raise SystemExit(2)
+    required = ("files", "critical", "warning", "info")
+    if any(not isinstance(totals.get(key), int) for key in required):
+        print(f"ubs-path-baseline: path={path} class=inconclusive reason={label}_totals_shape")
+        raise SystemExit(2)
+    if totals["files"] != 1:
+        print(f"ubs-path-baseline: path={path} class=no_scanner_executed reason={label}_accounted_{totals['files']}_of_1")
+        raise SystemExit(2)
+    return document, totals
+
+base_doc, base_totals = load("base", base_report)
+current_doc, current_totals = load("current", current_report)
+comparison = current_doc.get("comparison")
+if not isinstance(comparison, dict) or comparison.get("baseline_path") != base_report:
+    print(f"ubs-path-baseline: path={path} class=inconclusive reason=comparison_binding_missing")
+    raise SystemExit(2)
+delta = comparison.get("delta")
+if not isinstance(delta, dict):
+    print(f"ubs-path-baseline: path={path} class=inconclusive reason=comparison_delta_missing")
+    raise SystemExit(2)
+expected = {key: current_totals[key] - base_totals[key] for key in ("critical", "warning", "info")}
+if any(delta.get(key) != value for key, value in expected.items()):
+    print(f"ubs-path-baseline: path={path} class=inconclusive reason=comparison_delta_mismatch")
+    raise SystemExit(2)
+if int(base_exit) not in (0, 1) or int(current_exit) not in (0, 1):
+    print(f"ubs-path-baseline: path={path} class=inconclusive reason=unexpected_ubs_exit base_exit={base_exit} current_exit={current_exit}")
+    raise SystemExit(2)
+classification = "completed_clean" if current_totals["critical"] == 0 else "completed_findings"
+print(
+    "ubs-path-baseline:"
+    f" path={path} class={classification} base_commit={base}"
+    f" base_critical={base_totals['critical']} current_critical={current_totals['critical']}"
+    f" delta_critical={expected['critical']} delta_warning={expected['warning']} delta_info={expected['info']}"
+    " base_accounted=1 current_accounted=1"
+)
+raise SystemExit(0 if classification == "completed_clean" else 1)
+PY
+        result=$?
+        if [ "$result" -eq 2 ]; then
+            return 2
+        fi
+        if [ "$result" -eq 1 ]; then
+            current_exit=1
+        fi
+    done
+
+    printf 'retained_artifacts=%s\n' "$out" >> "$out/measurement.txt"
+    # Keep UBS's semantic convention: an attributable completed finding remains non-clean;
+    # this command never turns legacy findings into a green gate merely by subtracting a count.
+    [ "$current_exit" -eq 0 ] && return 0
+    return 1
+}
+
+if [ "${1:-}" = --path-baseline ]; then
+    shift
+    run_path_baseline "$@"
+    exit $?
+fi
+
 if [ "$#" -eq 0 ]; then
     say 'REFUSED - no input paths were supplied.'
     # Backticks name the literal registered command surface in this diagnostic.

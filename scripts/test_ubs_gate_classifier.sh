@@ -58,6 +58,54 @@ stub_ubs_by_language() {
     chmod +x "$STUB_BIN/ubs"
 }
 
+# `--path-baseline` must not create an ignored in-tree copy and call that a baseline.  This
+# controlled UBS fixture writes the machine reports the external tool promises, while its call
+# ledger proves the wrapper scanned the archived base and the assessed checkout at the SAME
+# relative path.  It does not pretend to test UBS itself; the real one-file control is comment
+# 1900 on franken_lean-ubs-path-sensitive-baseline-jfb8.
+stub_ubs_path_baseline() {
+    STUB_INDEX=$((STUB_INDEX + 1))
+    STUB_BIN="$LAB/bin-$STUB_INDEX"
+    mkdir "$STUB_BIN"
+    cat > "$STUB_BIN/ubs" <<'SH'
+#!/usr/bin/env bash
+set -u
+report=''
+comparison=''
+input=''
+for arg in "$@"; do
+    case "$arg" in
+        --report-json=*) report=${arg#--report-json=} ;;
+        --comparison=*) comparison=${arg#--comparison=} ;;
+        --version) printf 'UBS Meta-Runner v5.3.7\n'; exit 0 ;;
+        --*) ;;
+        *) input=$arg ;;
+    esac
+done
+printf '%s|%s|%s|%s\n' "$PWD" "$input" "$report" "$comparison" >> "$UBS_PATH_BASELINE_CALLS"
+python3 - "$report" "$comparison" <<'PY'
+import json
+import sys
+
+report, comparison = sys.argv[1:]
+document = {
+    "scanners": [{"language": "rust"}],
+    "totals": {"files": 1, "critical": 1, "warning": 3, "info": 2},
+}
+if comparison:
+    document["comparison"] = {
+        "baseline_path": comparison,
+        "delta": {"critical": 0, "warning": 0, "info": 0},
+    }
+with open(report, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+PY
+cat "$report"
+exit 1
+SH
+    chmod +x "$STUB_BIN/ubs"
+}
+
 # check <name> <want_exit> <want_class> <got_exit> <got_text>
 check() {
     local name=$1 want_exit=$2 want_class=$3 got_exit=$4 got_text=$5
@@ -316,7 +364,66 @@ else
     FAILS=$((FAILS + 1))
 fi
 
-# ---- 16. THE STUB'S OWN FIDELITY, against the real binary ------------------------------------
+# ---- 16. path baselines preserve the real relative path outside ignored output ---------------
+# Use Git plumbing rather than `git add`: this fixture is a tiny repository whose base and
+# current commits differ in bytes, so `git archive` is exercised rather than faked.
+baseline_repo="$LAB/path-baseline-repo"
+mkdir -p "$baseline_repo/crates/demo/src"
+git -C "$baseline_repo" init -q
+git -C "$baseline_repo" config user.name baseline-fixture
+git -C "$baseline_repo" config user.email baseline-fixture@example.invalid
+printf 'base bytes\n' > "$baseline_repo/crates/demo/src/subject.rs"
+baseline_blob=$(git -C "$baseline_repo" hash-object -w crates/demo/src/subject.rs)
+git -C "$baseline_repo" update-index --add --cacheinfo "100644,$baseline_blob,crates/demo/src/subject.rs"
+baseline_tree=$(git -C "$baseline_repo" write-tree)
+baseline_commit=$(printf 'base\n' | git -C "$baseline_repo" commit-tree "$baseline_tree")
+git -C "$baseline_repo" update-ref refs/heads/main "$baseline_commit"
+git -C "$baseline_repo" checkout -q main
+printf 'current bytes\n' > "$baseline_repo/crates/demo/src/subject.rs"
+current_blob=$(git -C "$baseline_repo" hash-object -w crates/demo/src/subject.rs)
+git -C "$baseline_repo" update-index --cacheinfo "100644,$current_blob,crates/demo/src/subject.rs"
+current_tree=$(git -C "$baseline_repo" write-tree)
+current_commit=$(printf 'current\n' | git -C "$baseline_repo" commit-tree "$current_tree" -p "$baseline_commit")
+git -C "$baseline_repo" update-ref refs/heads/main "$current_commit"
+git -C "$baseline_repo" checkout -q main
+stub_ubs_path_baseline
+baseline_out="$LAB/path-baseline-output"
+baseline_calls="$LAB/path-baseline-calls.txt"
+CELL_TEXT=$(cd "$baseline_repo" && UBS_PATH_BASELINE_CALLS="$baseline_calls" PATH="$STUB_BIN:$PATH" \
+    bash "$CLASSIFIER" --path-baseline --base "$baseline_commit" --out "$baseline_out" -- crates/demo/src/subject.rs 2>&1)
+CELL_RC=$?
+check 'an external archive baseline compares the same relative path with completed findings preserved' \
+    1 completed_findings "$CELL_RC" "$CELL_TEXT"
+if [ -f "$baseline_out"/*.base.json ] && [ -f "$baseline_out"/*.current.json ] \
+    && grep -qF 'delta_critical=0' <<<"$CELL_TEXT"; then
+    printf 'ok   path baseline retains machine reports and its zero delta\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL path baseline did not retain both reports or its aggregate delta\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+base_call=$(sed -n '1p' "$baseline_calls")
+current_call=$(sed -n '2p' "$baseline_calls")
+if [[ "$base_call" == "$baseline_out/base-tree|crates/demo/src/subject.rs|"* ]] \
+    && [[ "$current_call" == "$baseline_repo|crates/demo/src/subject.rs|"* ]]; then
+    printf 'ok   baseline and current scans used identical relative paths from their own roots\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL path baseline changed cwd or relative path\nbase=%s\ncurrent=%s\n' "$base_call" "$current_call"
+    FAILS=$((FAILS + 1))
+fi
+CELL_TEXT=$(cd "$baseline_repo" && UBS_PATH_BASELINE_CALLS="$baseline_calls" PATH="$STUB_BIN:$PATH" \
+    bash "$CLASSIFIER" --path-baseline --base "$baseline_commit" --out "$baseline_repo/target/forbidden" -- crates/demo/src/subject.rs 2>&1)
+CELL_RC=$?
+if [ "$CELL_RC" -eq 2 ] && printf '%s' "$CELL_TEXT" | grep -qF 'output must be outside the checkout'; then
+    printf 'ok   path baseline refuses the ignored in-checkout workaround before scanning\n'
+    PASSES=$((PASSES + 1))
+else
+    printf 'FAIL path baseline accepted an in-checkout output location\n%s\n' "$CELL_TEXT"
+    FAILS=$((FAILS + 1))
+fi
+
+# ---- 17. THE STUB'S OWN FIDELITY, against the real binary ------------------------------------
 # Everything above is a statement about fixtures unless the real tool agrees. This cell is
 # skipped LOUDLY rather than silently when ubs is absent, because a silent skip here would leave
 # the suite green while the only non-fixture cell never ran.
