@@ -1432,13 +1432,18 @@ fn a_feature_gated_marker_is_discovered_and_recorded_ungated() {
         "[package]\nname = \"gated\"\n[features]\ndev-lockstep = []\n",
     )
     .expect("member manifest");
-    // The marker text sits inside a feature-gated module IN THE ENTRY FILE —
-    // the file the target scan actually reads.
+    // The marker lives in a feature-gated, non-entry module. The release scan
+    // must discover it rather than certifying the entry file alone.
     std::fs::write(
         root.join("crates/gated/src/lib.rs"),
-        "#[cfg(feature = \"dev-lockstep\")]\npub mod lockstep {\n    pub const TAG: &str = \"ORACLE_FALLBACK\";\n}\n",
+        "#[cfg(feature = \"dev-lockstep\")]\npub mod lockstep;\n",
     )
     .expect("entry file");
+    std::fs::write(
+        root.join("crates/gated/src/lockstep.rs"),
+        "pub const TAG: &str = \"ORACLE_FALLBACK\";\n",
+    )
+    .expect("non-entry module");
 
     let targets = fln_epoch_lab::derive::derive_targets(&root).expect("targets derive");
     let edges =
@@ -1453,5 +1458,39 @@ fn a_feature_gated_marker_is_discovered_and_recorded_ungated() {
         "a text scan cannot honestly attribute feature gating; requires must be \
          empty (= present in every combination), got {:?}",
         edge.requires
+    );
+}
+
+#[test]
+fn an_oracle_marker_in_a_source_comment_is_not_an_edge() {
+    // The real fln-unsafe-abi instance that exposed 8g7q is a doc comment
+    // mentioning libleanshared. Widening source coverage must not turn that
+    // innocent Tribunal provenance into a release-reaching oracle edge.
+    let root = scratch("comment-only-marker");
+    std::fs::create_dir_all(root.join("crates/comment-only/src")).expect("dirs");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .expect("root manifest");
+    std::fs::write(
+        root.join("crates/comment-only/Cargo.toml"),
+        "[package]\nname = \"comment-only\"\n",
+    )
+    .expect("member manifest");
+    std::fs::write(root.join("crates/comment-only/src/lib.rs"), "mod note;\n").expect("entry file");
+    std::fs::write(
+        root.join("crates/comment-only/src/note.rs"),
+        "//! Tribunal differential against libleanshared.\n/* nested /* libleanshared */ comment */\n",
+    )
+    .expect("comment-only module");
+
+    let targets = fln_epoch_lab::derive::derive_targets(&root).expect("targets derive");
+    let edges =
+        fln_epoch_lab::derive::derive_oracle_edges(&root, targets.value()).expect("edges derive");
+    assert!(
+        edges.value().is_empty(),
+        "comment-only marker manufactured an oracle edge: {:?}",
+        edges.value()
     );
 }

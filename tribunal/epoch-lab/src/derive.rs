@@ -60,7 +60,7 @@ pub mod rules {
     pub const MODULE_SCAN: &str = "fln.derive.module-scan/2";
     pub const EPOCH_TREE: &str = "fln.derive.epoch-tree/1";
     pub const TARGETS: &str = "fln.derive.cargo-targets/1";
-    pub const ORACLE_EDGES: &str = "fln.derive.oracle-edges/1";
+    pub const ORACLE_EDGES: &str = "fln.derive.oracle-edges/2";
     pub const NORMAL_DEPS: &str = "fln.derive.normal-dependencies/1";
 }
 
@@ -1314,39 +1314,333 @@ pub const ORACLE_MARKERS: &[(&str, OracleCapability)] = &[
     ("leanprover--lean4", OracleCapability::SpawnReferenceBinary),
 ];
 
+/// A reviewed marker occurrence in test-only fixture text within `src/`.
+///
+/// The source walker intentionally includes all crate-owned Rust files, so it
+/// also sees `#[cfg(test)]` modules kept beside production code. Each allowance
+/// is bound to one unique fixture substring; a move, removal, or new occurrence
+/// is therefore a typed refusal rather than a silent exemption.
+struct OracleMarkerAllowance {
+    path: &'static str,
+    marker: &'static str,
+    anchor: &'static str,
+    test_scope_path: &'static str,
+    test_scope: &'static str,
+}
+
+const ORACLE_MARKER_ALLOWANCES: &[OracleMarkerAllowance] = &[
+    OracleMarkerAllowance {
+        path: "crates/fln-olean/src/rebuild.rs",
+        marker: ".elan/toolchains",
+        anchor: ".join(\".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean\")",
+        test_scope_path: "crates/fln-olean/src/rebuild.rs",
+        test_scope: "#[cfg(test)]\nmod tests {",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-olean/src/rebuild.rs",
+        marker: "leanprover--lean4",
+        anchor: ".join(\".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean\")",
+        test_scope_path: "crates/fln-olean/src/rebuild.rs",
+        test_scope: "#[cfg(test)]\nmod tests {",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-unsafe-abi/src/tests.rs",
+        marker: ".elan/toolchains",
+        anchor: "std::path::PathBuf::from(&home).join(\".elan/toolchains/leanprover--lean4---v4.32.0/bin\")",
+        test_scope_path: "crates/fln-unsafe-abi/src/lib.rs",
+        test_scope: "#[cfg(test)]\nmod tests;",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-unsafe-abi/src/tests.rs",
+        marker: "leanprover--lean4",
+        anchor: "std::path::PathBuf::from(&home).join(\".elan/toolchains/leanprover--lean4---v4.32.0/bin\")",
+        test_scope_path: "crates/fln-unsafe-abi/src/lib.rs",
+        test_scope: "#[cfg(test)]\nmod tests;",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-vm/src/parity.rs",
+        marker: "libleanshared",
+        anchor: "/x/libleanshared.so(+0x93)",
+        test_scope_path: "crates/fln-vm/src/parity.rs",
+        test_scope: "#[cfg(test)]\nmod tests {",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-vm/src/parity.rs",
+        marker: "libleanshared",
+        anchor: "/x/libleanshared.so(lean_panic_fn+0x2b)",
+        test_scope_path: "crates/fln-vm/src/parity.rs",
+        test_scope: "#[cfg(test)]\nmod tests {",
+    },
+    OracleMarkerAllowance {
+        path: "crates/fln-vm/src/parity.rs",
+        marker: "libleanshared",
+        anchor: "/x/libleanshared.so(+0x1)",
+        test_scope_path: "crates/fln-vm/src/parity.rs",
+        test_scope: "#[cfg(test)]\nmod tests {",
+    },
+];
+
+/// Recursively enumerate Rust source files below `dir` in lexical path order.
+fn rust_files_below(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_files_below(&path));
+        } else if path.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Return the crate-local `src/` directory enclosing a target entry path.
+fn crate_source_dir(path: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if component.as_os_str() == "src" {
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+/// Replace Rust comments with whitespace while retaining executable text.
+///
+/// Oracle markers in comments describe the Tribunal but do not establish a
+/// release edge. Strings are retained because a marker passed to a loader or
+/// dynamic linker is still an executable oracle path. Rust permits nested block
+/// comments, so a line-based filter would be unsound here.
+fn source_without_comments(text: &str) -> Vec<u8> {
+    enum Mode {
+        Code,
+        LineComment,
+        BlockComment(usize),
+        String,
+        RawString(usize),
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut mode = Mode::Code;
+    let mut index = 0;
+    while index < bytes.len() {
+        match mode {
+            Mode::Code if bytes[index..].starts_with(b"//") => {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                mode = Mode::LineComment;
+                index += 2;
+            }
+            Mode::Code if bytes[index..].starts_with(b"/*") => {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                mode = Mode::BlockComment(1);
+                index += 2;
+            }
+            Mode::Code if bytes[index] == b'"' => {
+                mode = Mode::String;
+                index += 1;
+            }
+            Mode::Code if bytes[index] == b'r' => {
+                let mut quote = index + 1;
+                while quote < bytes.len() && bytes[quote] == b'#' {
+                    quote += 1;
+                }
+                if quote < bytes.len() && bytes[quote] == b'"' {
+                    mode = Mode::RawString(quote - index - 1);
+                    index = quote + 1;
+                } else {
+                    index += 1;
+                }
+            }
+            Mode::Code => {
+                index += 1;
+            }
+            Mode::LineComment => {
+                if bytes[index] == b'\n' {
+                    mode = Mode::Code;
+                } else {
+                    out[index] = b' ';
+                }
+                index += 1;
+            }
+            Mode::BlockComment(depth) if bytes[index..].starts_with(b"/*") => {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                mode = Mode::BlockComment(depth + 1);
+                index += 2;
+            }
+            Mode::BlockComment(1) if bytes[index..].starts_with(b"*/") => {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                mode = Mode::Code;
+                index += 2;
+            }
+            Mode::BlockComment(depth) if bytes[index..].starts_with(b"*/") => {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                mode = Mode::BlockComment(depth - 1);
+                index += 2;
+            }
+            Mode::BlockComment(_) => {
+                if bytes[index] != b'\n' {
+                    out[index] = b' ';
+                }
+                index += 1;
+            }
+            Mode::String => {
+                let byte = bytes[index];
+                index += 1;
+                if byte == b'\\' && index < bytes.len() {
+                    index += 1;
+                } else if byte == b'"' {
+                    mode = Mode::Code;
+                }
+            }
+            Mode::RawString(hashes) => {
+                if bytes[index] == b'"'
+                    && bytes.len() >= index + 1 + hashes
+                    && bytes[index + 1..index + 1 + hashes]
+                        .iter()
+                        .all(|byte| *byte == b'#')
+                {
+                    index += 1 + hashes;
+                    mode = Mode::Code;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn marker_positions_outside_comments(text: &str, marker: &str) -> Vec<usize> {
+    let source = source_without_comments(text);
+    source
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == marker.as_bytes()).then_some(index))
+        .collect()
+}
+
+fn validate_oracle_marker_allowances(root: &Path) -> Result<bool, DeriveError> {
+    if !ORACLE_MARKER_ALLOWANCES
+        .iter()
+        .all(|allowance| root.join(allowance.path).exists())
+    {
+        return Ok(false);
+    }
+    for allowance in ORACLE_MARKER_ALLOWANCES {
+        let path = root.join(allowance.path);
+        let text = read(&path)?;
+        let scope = read(&root.join(allowance.test_scope_path))?;
+        if text.match_indices(allowance.anchor).count() != 1
+            || !allowance.anchor.contains(allowance.marker)
+            || scope.match_indices(allowance.test_scope).count() != 1
+        {
+            return Err(DeriveError::ArtifactInconsistent {
+                detail: format!(
+                    "oracle marker allowance is stale at {} for {:?}",
+                    allowance.path, allowance.marker
+                ),
+            });
+        }
+    }
+    Ok(true)
+}
+
+fn is_allowed_oracle_marker(
+    allowances_active: bool,
+    path: &str,
+    marker: &str,
+    offset: usize,
+    source: &str,
+) -> bool {
+    allowances_active
+        && ORACLE_MARKER_ALLOWANCES.iter().any(|allowance| {
+            allowance.path == path
+                && allowance.marker == marker
+                && source.match_indices(allowance.anchor).count() == 1
+                && source
+                    .find(allowance.anchor)
+                    .is_some_and(|start| (start..start + allowance.anchor.len()).contains(&offset))
+        })
+}
+
 /// Scan derived targets' source for oracle markers.
 ///
 /// The edge set was supplied, which meant a real oracle path nobody declared
-/// was invisible to the scan. This finds them. It reads only this repository.
+/// was invisible to the scan. This finds them. Library and binary targets scan
+/// the crate's complete `src/` tree rather than just their entry file: module
+/// resolution is not a safe boundary for an oracle-edge guard, while the
+/// shippability policy is already crate-wide. Test, bench, and example targets
+/// retain their entry-file scan because they are mechanically development-only.
 pub fn derive_oracle_edges(
     root: &Path,
     targets: &[TargetScan],
 ) -> Result<Derived<Vec<OracleEdge>>, DeriveError> {
+    let allowances_active = validate_oracle_marker_allowances(root)?;
     let mut edges: Vec<OracleEdge> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
     for t in targets {
-        let p = root.join(&t.path);
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
+        let entry = root.join(&t.path);
+        let sources = match kind_of(t.kind_str) {
+            TargetKind::Lib | TargetKind::Bin => crate_source_dir(&entry)
+                .map(|dir| rust_files_below(&dir))
+                .filter(|files| !files.is_empty())
+                .unwrap_or_else(|| vec![entry]),
+            TargetKind::Test
+            | TargetKind::Bench
+            | TargetKind::Example
+            | TargetKind::BuildScript => {
+                vec![entry]
+            }
         };
-        for (marker, capability) in ORACLE_MARKERS {
-            // One edge per (target, capability): two markers for the same
-            // capability in one file is one path, not two, and duplicate rows
-            // would inflate every count a reader uses to judge severity.
-            if text.contains(marker)
-                && !edges
-                    .iter()
-                    .any(|e| e.target == t.name && e.capability == *capability)
-            {
-                keys.push(format!("{}\u{1}{}\u{1}{}", t.crate_name, t.name, marker));
-                edges.push(OracleEdge {
-                    target: t.name.clone(),
-                    capability: *capability,
-                    // Feature gating cannot be read from a text scan; an
-                    // ungated edge is the conservative reading, because it is
-                    // reachable in every combination rather than some.
-                    requires: BTreeSet::new(),
-                });
+        for source in sources {
+            let Ok(text) = std::fs::read_to_string(&source) else {
+                continue;
+            };
+            let relative = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .display()
+                .to_string();
+            for (marker, capability) in ORACLE_MARKERS {
+                // One edge per (target, capability): two markers for the same
+                // capability in one file is one path, not two, and duplicate rows
+                // would inflate every count a reader uses to judge severity.
+                if marker_positions_outside_comments(&text, marker)
+                    .into_iter()
+                    .any(|offset| {
+                        !is_allowed_oracle_marker(
+                            allowances_active,
+                            &relative,
+                            marker,
+                            offset,
+                            &text,
+                        )
+                    })
+                    && !edges
+                        .iter()
+                        .any(|edge| edge.target == t.name && edge.capability == *capability)
+                {
+                    keys.push(format!("{}\u{1}{}\u{1}{}", t.crate_name, t.name, marker));
+                    edges.push(OracleEdge {
+                        target: t.name.clone(),
+                        capability: *capability,
+                        // Feature gating cannot be read from a text scan; an
+                        // ungated edge is the conservative reading, because it is
+                        // reachable in every combination rather than some.
+                        requires: BTreeSet::new(),
+                    });
+                }
             }
         }
     }
