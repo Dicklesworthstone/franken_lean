@@ -333,6 +333,20 @@ CHECK_SELF_TEST_ORDER = [*CHECK_STAGE_ORDER, "cancel-term"]
 # dispatch, and `contract_roots.rs` binds the pin-dependent lanes to the
 # scheduled/on-demand pin-bearing workflow.
 E2E_STEP_ORDERS = {
+    "contract_drift": [
+        "vendor_tree",
+        "abi_drift",
+        "olean_drift",
+        "cli_lake_drift",
+        "public_surface_drift",
+        "census_drift",
+        "suite",
+        "mutant_a",
+        "mutant_b",
+        "mutant_c",
+        "public_surface_recovery",
+        "recovery",
+    ],
     "attribute_state_census": [
         "regenerate_and_check",
         "guard_suite",

@@ -451,7 +451,25 @@ jobs:
       - name: run the seeded contract drift lane
         shell: bash
         run: |
-          ./scripts/e2e/contract_drift.sh
+          step_root="target/e2e/contract-drift-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$step_root"
+          FLN_E2E_ART_ROOT="$PWD/$step_root" \
+            FLN_E2E_CACHE_STATE="github-actions-contract-drift" \
+            ./scripts/e2e/contract_drift.sh
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          if (( ${#bundles[@]} != 1 )); then
+            echo "contract-drift lane published ${#bundles[@]} bundles; expected one" >&2
+            exit 2
+          fi
+          artifact="${bundles[0]}"
+          python3 -I -S scripts/evidence.py validate-bundle \
+            --art-dir "$artifact" \
+            --manifest "$artifact/manifest.json" \
+            --digest "$artifact/manifest.digest" \
+            --commit "$artifact/bundle.complete.json" \
+            --artifact-root "$artifact"
           git diff --exit-code -- \
             ABI_CONTRACT.md \
             contracts/PUBLIC_SURFACE_CONTRACT.md \
