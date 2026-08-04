@@ -667,30 +667,57 @@ fn preflight_declaration_expressions(
             Err(report) => report,
         };
 
-        usage.expressions += 1;
-        // Checked, not saturating: a wrapped or clamped total is a usage fact that
-        // silently understates the work, which is worse than refusing to report one.
-        let Some(nodes) = usage.expr_nodes.checked_add(report.distinct_nodes) else {
-            return Some(Outcome::InternalFault(InternalFault::new(
-                "fln-env.declaration-usage.node-total-overflow",
-                "declaration expression node total overflowed u64",
-            )));
-        };
-        let Some(weight) = usage.expanded_weight.checked_add(report.expanded_weight) else {
-            return Some(Outcome::InternalFault(InternalFault::new(
-                "fln-env.declaration-usage.weight-total-overflow",
-                "declaration expanded-weight total overflowed u128",
-            )));
-        };
-        usage.expr_nodes = nodes;
-        usage.expanded_weight = weight;
-        // MAX, not a running total, and not checked-add for that reason: a declaration is
-        // as deep as its deepest expression. There is no overflow to guard — the value
-        // never exceeds one expression's own depth, which `expanded_weight` already
-        // bounded by its distinct-node budget.
-        usage.max_logical_depth = usage.max_logical_depth.max(report.max_logical_depth);
+        if let Err(fault) = add_expression_usage(usage, report) {
+            return Some(Outcome::InternalFault(fault));
+        }
     }
     None
+}
+
+/// Fold one completed term measurement into declaration-wide usage.
+///
+/// All checked totals are calculated before mutating `usage`, so an internal arithmetic
+/// fault cannot leave a partial usage report that a caller might mistake for a complete fact.
+fn add_expression_usage(
+    usage: &mut DeclarationUsage,
+    report: crate::terms::WeightReport,
+) -> Result<(), InternalFault> {
+    let expressions = usage.expressions.checked_add(1).ok_or_else(|| {
+        InternalFault::new(
+            "fln-env.declaration-usage.expression-total-overflow",
+            "declaration expression total overflowed u64",
+        )
+    })?;
+    // Checked, not saturating: a wrapped or clamped total is a usage fact that silently
+    // understates the work, which is worse than refusing to report one.
+    let nodes = usage
+        .expr_nodes
+        .checked_add(report.distinct_nodes)
+        .ok_or_else(|| {
+            InternalFault::new(
+                "fln-env.declaration-usage.node-total-overflow",
+                "declaration expression node total overflowed u64",
+            )
+        })?;
+    let weight = usage
+        .expanded_weight
+        .checked_add(report.expanded_weight)
+        .ok_or_else(|| {
+            InternalFault::new(
+                "fln-env.declaration-usage.weight-total-overflow",
+                "declaration expanded-weight total overflowed u128",
+            )
+        })?;
+
+    usage.expressions = expressions;
+    usage.expr_nodes = nodes;
+    usage.expanded_weight = weight;
+    // MAX, not a running total, and not checked-add for that reason: a declaration is as
+    // deep as its deepest expression. There is no overflow to guard — the value never
+    // exceeds one expression's own depth, which `expanded_weight` already bounded by its
+    // distinct-node budget.
+    usage.max_logical_depth = usage.max_logical_depth.max(report.max_logical_depth);
+    Ok(())
 }
 
 /// The mutual-block members of `info`, or an empty slice for a variant that has none.
@@ -4817,6 +4844,12 @@ mod tests {
         /// Reports an `observed` that does not exceed `allowed`. Killed by
         /// **`is_genuine_exhaustion`**, the typed predicate that exists for this.
         WrongActual,
+        /// Reports a stored-node limit as a different structural resource. Killed on the
+        /// **structural-unit discriminant**, which determines a caller's retry policy.
+        WrongResource,
+        /// Replaces checked declaration-total accumulation with wrapping or saturating
+        /// arithmetic. Killed on the **internal-fault invariant** before partial usage mutates.
+        Overflow,
         /// Reports cancellation as resource exhaustion. Killed on the **inconclusive
         /// cause discriminant**.
         CancellationAsRejection,
@@ -4826,11 +4859,13 @@ mod tests {
     }
 
     impl AdmissionMutant {
-        const ALL: [AdmissionMutant; 6] = [
+        const ALL: [AdmissionMutant; 8] = [
             AdmissionMutant::MissingCheck,
             AdmissionMutant::LateCheck,
             AdmissionMutant::PartialInsert,
             AdmissionMutant::WrongActual,
+            AdmissionMutant::WrongResource,
+            AdmissionMutant::Overflow,
             AdmissionMutant::CancellationAsRejection,
             AdmissionMutant::DigestDrift,
         ];
@@ -4841,6 +4876,8 @@ mod tests {
                 AdmissionMutant::LateCheck => "late_check",
                 AdmissionMutant::PartialInsert => "partial_insert",
                 AdmissionMutant::WrongActual => "wrong_actual",
+                AdmissionMutant::WrongResource => "wrong_resource",
+                AdmissionMutant::Overflow => "overflow",
                 AdmissionMutant::CancellationAsRejection => "cancellation_as_rejection",
                 AdmissionMutant::DigestDrift => "digest_drift",
             }
@@ -4854,6 +4891,8 @@ mod tests {
                 AdmissionMutant::LateCheck => "reported_primary_dimension",
                 AdmissionMutant::PartialInsert => "base_logical_root",
                 AdmissionMutant::WrongActual => "is_genuine_exhaustion",
+                AdmissionMutant::WrongResource => "structural_unit_discriminant",
+                AdmissionMutant::Overflow => "checked_usage_total_internal_fault",
                 AdmissionMutant::CancellationAsRejection => "inconclusive_cause_discriminant",
                 AdmissionMutant::DigestDrift => "published_digest_vs_unbudgeted_encoder",
             }
@@ -4861,7 +4900,7 @@ mod tests {
     }
 
     /// The mutant kinds `j8h`'s acceptance criteria name, each joined to the model that
-    /// kills it — or to `None`, which is the whole point of the mapping.
+    /// kills it.
     ///
     /// # Why a mapping and not a list
     ///
@@ -4870,47 +4909,39 @@ mod tests {
     /// obligation. The obligation is the bead's, which names *eight* mutants, and nothing
     /// joined the two — so a criterion with no model was **silently absent** rather than
     /// named, and the suite stayed green. `AGENTS.md`'s item 7 exactly: a claim and its
-    /// evidence, each locally consistent, with the join unwatched.
+    /// evidence, each locally consistent, with the join unwatched. The table is total now:
+    /// each named criterion must name exactly one killed model.
     ///
     /// Naming the criteria makes a missing model say its own name. `dt5` did the same one
     /// crate over and this goes one step further by carrying the mapping, so the answer to
     /// "which criterion is unmet" is a lookup rather than a re-derivation.
     ///
-    /// **The two `None`s are measured, not assumed.** `wrong-resource` occurs nowhere in
-    /// this crate, and `overflow` is *implemented* — the `checked_add` guards in
-    /// [`preflight_declaration_expressions`] refuse a typed stop rather than wrapping —
-    /// while no mutant *models* an implementation that omits the check. Implemented and
-    /// modelled are different claims and this table keeps them apart.
+    /// `wrong-resource` and `overflow` were the two omissions this join exposed. The former
+    /// now models a stored-node stop reported with the wrong structural unit; the latter
+    /// exercises the production checked-total helper at overflow, where a wrapping or
+    /// saturating replacement would silently understate usage. Implemented and modelled are
+    /// different claims, so both stay explicitly mapped here.
     ///
     /// **Do not read the criteria spelling as the code's.** `partial-publication` is killed
     /// by `PartialInsert`: the criteria name the *effect*, the models name the *mechanism*.
     /// Three separate scans for `partial_publication` returned zero before the model was
     /// found by reading the enum, which is why this table exists rather than a grep.
-    const CRITERIA_NAMED_MUTANTS: [(&str, Option<AdmissionMutant>); 8] = [
-        ("missing-check", Some(AdmissionMutant::MissingCheck)),
-        ("late-check", Some(AdmissionMutant::LateCheck)),
-        ("wrong-resource", None),
-        ("wrong-actual", Some(AdmissionMutant::WrongActual)),
-        ("overflow", None),
-        ("partial-publication", Some(AdmissionMutant::PartialInsert)),
+    const CRITERIA_NAMED_MUTANTS: [(&str, AdmissionMutant); 8] = [
+        ("missing-check", AdmissionMutant::MissingCheck),
+        ("late-check", AdmissionMutant::LateCheck),
+        ("wrong-resource", AdmissionMutant::WrongResource),
+        ("wrong-actual", AdmissionMutant::WrongActual),
+        ("overflow", AdmissionMutant::Overflow),
+        ("partial-publication", AdmissionMutant::PartialInsert),
         (
             "cancellation-as-rejection",
-            Some(AdmissionMutant::CancellationAsRejection),
+            AdmissionMutant::CancellationAsRejection,
         ),
-        ("digest-drift", Some(AdmissionMutant::DigestDrift)),
+        ("digest-drift", AdmissionMutant::DigestDrift),
     ];
 
-    /// The criteria names carrying no model yet — a **shrinking** declared remainder.
-    ///
-    /// Checked one-way (`unmodelled ⊆ declared`) plus a ceiling, deliberately, and not as
-    /// set equality. Equality would redden the moment somebody *models* one of these
-    /// without editing this constant in the same breath — a wall against the exact repair
-    /// the declaration exists to invite. Growth is still refused: a criterion that loses
-    /// its model, or a new criterion arriving unmodelled, is not in this list and fails.
-    const UNMODELLED_CRITERIA: [&str; 2] = ["wrong-resource", "overflow"];
-
     /// The bead's named mutants are joined to the models, in both directions, with the
-    /// unmodelled remainder declared rather than absent.
+    /// table total by construction.
     /// Every way the criteria table and the models can disagree, as readable lines.
     ///
     /// Collected rather than asserted one at a time, and that is not a style choice: a
@@ -4921,30 +4952,10 @@ mod tests {
     /// itself, so every cell dies at its own site or the guard is not doing its job.
     fn criteria_join_findings() -> Vec<String> {
         let mut findings = Vec::new();
-        let modelled: Vec<AdmissionMutant> = CRITERIA_NAMED_MUTANTS
-            .iter()
-            .filter_map(|(_, model)| *model)
-            .collect();
-
-        // Anti-vacuity on the MODELLED count. Note what is deliberately absent: an
-        // assertion that the table has eight rows. The constant is typed
-        // `[(&str, Option<AdmissionMutant>); 8]`, so a dropped row fails to COMPILE — the
-        // campaign proved it, scoring that cell a build abort rather than a kill. A check
-        // the type already carries is decorative, and this comment stands where it stood.
-        if modelled.len() < AdmissionMutant::ALL.len() {
-            findings.push(format!(
-                "only {} criteria are modelled against {} models, so at least one model is \
-                 unreachable from the criterion it exists to discharge",
-                modelled.len(),
-                AdmissionMutant::ALL.len()
-            ));
-        }
 
         // Direction 1: every mapped criterion names a model the campaign actually kills.
         for (criterion, model) in CRITERIA_NAMED_MUTANTS {
-            if let Some(model) = model
-                && !AdmissionMutant::ALL.contains(&model)
-            {
+            if !AdmissionMutant::ALL.contains(&model) {
                 findings.push(format!(
                     "criterion {criterion} maps to {} which is not in AdmissionMutant::ALL, \
                      so the campaign never kills it",
@@ -4959,7 +4970,7 @@ mod tests {
         for model in AdmissionMutant::ALL {
             let claims: Vec<&str> = CRITERIA_NAMED_MUTANTS
                 .iter()
-                .filter(|(_, m)| *m == Some(model))
+                .filter(|(_, mapped)| *mapped == model)
                 .map(|(c, _)| *c)
                 .collect();
             if claims.len() > 1 {
@@ -4976,43 +4987,10 @@ mod tests {
             }
         }
 
-        // Direction 3: the remainder. One-way plus a ceiling, so modelling one of these is
-        // never a wall, while a criterion that quietly LOSES its model still fails.
-        let unmodelled: Vec<&str> = CRITERIA_NAMED_MUTANTS
-            .iter()
-            .filter(|(_, m)| m.is_none())
-            .map(|(c, _)| *c)
-            .collect();
-        for criterion in &unmodelled {
-            if !UNMODELLED_CRITERIA.contains(criterion) {
-                findings.push(format!(
-                    "{criterion} has no model and is not in the declared remainder. Either \
-                     model it, or add it there and say so — an obligation that quietly \
-                     loses its model is what this join exists to catch"
-                ));
-            }
-        }
-        if unmodelled.len() > UNMODELLED_CRITERIA.len() {
-            findings.push(format!(
-                "the unmodelled remainder grew to {} against a declared ceiling of {}",
-                unmodelled.len(),
-                UNMODELLED_CRITERIA.len()
-            ));
-        }
-        for declared in UNMODELLED_CRITERIA {
-            if !CRITERIA_NAMED_MUTANTS.iter().any(|(c, _)| *c == declared) {
-                findings.push(format!(
-                    "{declared} is declared unmodelled but is not one of the criteria; a \
-                     remainder naming nothing reads as maintained and is not"
-                ));
-            }
-        }
-
         findings
     }
 
-    /// The bead's named mutants are joined to the models, in both directions, with the
-    /// unmodelled remainder declared rather than absent.
+    /// The bead's named mutants are joined to the models, in both directions.
     #[test]
     fn every_criteria_named_admission_mutant_maps_to_a_killed_model() {
         let findings = criteria_join_findings();
@@ -5133,6 +5111,84 @@ mod tests {
             "the wrong-actual model must fail the typed exhaustion predicate"
         );
         killed.push(AdmissionMutant::WrongActual);
+
+        // ---- wrong_resource: killed on the STRUCTURAL-UNIT DISCRIMINANT -----------
+        // This reaches the term-measurement refusal rather than the declaration-row
+        // refusal above, so the canonical unit is the stored-node unit selected by the
+        // measured traversal itself.
+        let nodes_only = DeclarationBudget {
+            max_expr_nodes: 0,
+            ..DeclarationBudget::UNBOUNDED
+        };
+        let node_limited = preflight_declaration(&doubly_over, nodes_only, None);
+        let (canonical_usage, _) =
+            resource_stop(&node_limited).expect("the node-only budget must bind");
+        assert_eq!(
+            canonical_usage.reason,
+            ResourceReason::StructuralBudget {
+                unit: StructuralUnit::ProducedNodes
+            },
+            "the traversal must report the resource it actually bounded"
+        );
+        let wrong_resource = ResourceUsage {
+            reason: ResourceReason::StructuralBudget {
+                // The modelled defect: a node stop is labelled as input bytes, sending a
+                // caller toward the wrong retry/remediation path.
+                unit: StructuralUnit::InputBytes,
+            },
+            allowed: canonical_usage.allowed,
+            observed: canonical_usage.observed,
+        };
+        assert_ne!(
+            wrong_resource.reason, canonical_usage.reason,
+            "the wrong-resource model must change the structural-unit discriminant"
+        );
+        killed.push(AdmissionMutant::WrongResource);
+
+        // ---- overflow: killed before a PARTIAL USAGE UPDATE ----------------------
+        // One report exercises each declaration-wide total. A wrapping/saturating
+        // replacement would instead return a plausible-looking usage fact, so the
+        // invariant and unchanged input are both part of this kill.
+        let one = crate::terms::WeightReport {
+            expanded_weight: 1,
+            distinct_nodes: 1,
+            edges: 0,
+            max_logical_depth: 1,
+        };
+        for (usage, invariant) in [
+            (
+                DeclarationUsage {
+                    expressions: u64::MAX,
+                    ..DeclarationUsage::default()
+                },
+                "fln-env.declaration-usage.expression-total-overflow",
+            ),
+            (
+                DeclarationUsage {
+                    expr_nodes: u64::MAX,
+                    ..DeclarationUsage::default()
+                },
+                "fln-env.declaration-usage.node-total-overflow",
+            ),
+            (
+                DeclarationUsage {
+                    expanded_weight: u128::MAX,
+                    ..DeclarationUsage::default()
+                },
+                "fln-env.declaration-usage.weight-total-overflow",
+            ),
+        ] {
+            let before = usage;
+            let mut checked = usage;
+            let fault = add_expression_usage(&mut checked, one)
+                .expect_err("checked declaration totals must refuse overflow");
+            assert_eq!(fault.invariant, invariant);
+            assert_eq!(
+                checked, before,
+                "overflow must not publish a partial declaration usage fact"
+            );
+        }
+        killed.push(AdmissionMutant::Overflow);
 
         // ---- cancellation_as_rejection: killed on the CAUSE DISCRIMINANT ---------
         let probe = TripAt::new(0);
