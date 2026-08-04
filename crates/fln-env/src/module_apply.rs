@@ -3252,4 +3252,76 @@ mod tests {
             "bidirectional indexes depend on the schedule"
         );
     }
+
+    /// The primary-class sibling of this check is killed by
+    /// `declaration_order_is_a_typed_payload_binding_refusal`; this class was
+    /// NOT, and a mutation campaign found it: deleting the
+    /// `DeclarationClass::ExtraDeclaration` call to `verify_declaration_payloads`
+    /// left the whole `fln-env` suite green.
+    ///
+    /// The reason is ordering, and it is why the sibling cannot cover this.
+    /// `verify_declaration_payloads` runs for `Declaration` FIRST, and the
+    /// sibling's fixture swaps the two vectors — so the primary check fires and
+    /// the extra-declaration check is never reached. Binding this class needs a
+    /// transaction whose primary payloads are CORRECT and whose extra payloads
+    /// are not, which is what this cell supplies.
+    #[test]
+    fn extra_declaration_payloads_are_bound_independently_of_the_primary_class() {
+        let contribution = record(vec![]);
+        let manifest = ModuleProvenanceManifest::new(
+            epoch(),
+            vec![contribution.clone()],
+            ModuleProvenanceLimits::default(),
+        )
+        .expect("fixture manifest is valid");
+        let transaction = ModuleApplyTransaction::new(
+            Arc::new(manifest),
+            contribution,
+            vec![axiom("fixture.decl")],
+            vec![axiom("fixture.wrong")],
+            vec![],
+        );
+
+        assert!(matches!(
+            preflight_module_apply(transaction),
+            Err(ModuleApplyPreflightError::DeclarationName {
+                class: DeclarationClass::ExtraDeclaration,
+                index: 0,
+                ..
+            })
+        ));
+    }
+
+    /// The manifest is identity-only, so the count of supplied extension
+    /// payloads is a binding the envelope must satisfy rather than a property of
+    /// the payloads themselves. A mutation campaign found this unguarded:
+    /// deleting the `ExtensionPayloadCount` refusal left the suite green, so a
+    /// transaction could carry fewer payloads than the record it claims to
+    /// implement and reach preparation.
+    #[test]
+    fn an_extension_payload_shortfall_is_a_typed_count_refusal() {
+        let descriptor = descriptor();
+        let first = ExtensionEntryId::derive(&epoch(), &descriptor, b"first");
+        let second = ExtensionEntryId::derive(&epoch(), &descriptor, b"second");
+        let contribution = record(vec![ExtensionContribution::new(
+            descriptor.clone(),
+            0,
+            Digest([0; 32]),
+            vec![first, second],
+        )]);
+
+        // The record declares TWO entries; the envelope supplies ONE.
+        let short = transaction(
+            contribution,
+            vec![ExtensionPayload::new(0, descriptor, 0, &b"first"[..])],
+        );
+
+        assert!(matches!(
+            preflight_module_apply(short),
+            Err(ModuleApplyPreflightError::ExtensionPayloadCount {
+                expected: 2,
+                actual: 1,
+            })
+        ));
+    }
 }
