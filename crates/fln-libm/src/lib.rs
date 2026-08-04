@@ -120,7 +120,10 @@ pub fn round(x: f64) -> f64 {
 /// Decompose a finite non-zero number as `fraction * 2^exponent`, where the
 /// magnitude of `fraction` is in `[0.5, 1)`.
 pub fn frexp(x: f64) -> (f64, i32) {
-    if x == 0.0 || !x.is_finite() {
+    if invalid(x) {
+        return (canonical_nan(), 0);
+    }
+    if x == 0.0 || x.is_infinite() {
         return (x, 0);
     }
     let sign = x.to_bits() & SIGN;
@@ -147,7 +150,10 @@ pub fn frexp(x: f64) -> (f64, i32) {
 /// Exact power-of-two scaling for normal inputs; subnormal boundaries use the
 /// same fixed arithmetic sequence on every IEEE-754 target.
 pub fn scalbn(mut x: f64, mut n: i32) -> f64 {
-    if x == 0.0 || !x.is_finite() || n == 0 {
+    if invalid(x) {
+        return canonical_nan();
+    }
+    if x == 0.0 || x.is_infinite() || n == 0 {
         return x;
     }
     while n > 512 {
@@ -834,6 +840,15 @@ mod tests {
         for operation in [trunc, floor, ceil, round] {
             assert_eq!(operation(payload_nan).to_bits(), CANONICAL_NAN_BITS);
         }
+    }
+
+    #[test]
+    fn decomposition_and_scaling_canonicalize_nan() {
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        let (fraction, exponent) = frexp(payload_nan);
+        assert_eq!(fraction.to_bits(), CANONICAL_NAN_BITS);
+        assert_eq!(exponent, 0);
+        assert_eq!(scalbn(payload_nan, 5).to_bits(), CANONICAL_NAN_BITS);
     }
 
     #[test]
