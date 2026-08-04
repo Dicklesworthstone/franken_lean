@@ -576,5 +576,40 @@ if [ "$real_sha_before_m6" != "$real_sha_after_m6" ]; then
 fi
 emit mutant_drill passed "\"mutant\":\"fln-8w8-M6\",\"discriminator\":\"deferred_tail_after_small_free\",\"real_tree_sha_stable\":true"
 
+# ---- lane 8g: named mutant fln-8w8-M7 ----------------------------------------
+# Capacity drift: growing the per-class deferred-free cache from its reviewed
+# eight-block bound changes the allocator's retained-memory envelope even if
+# the cache remains internally self-consistent. Plant that one-token change in
+# a SEVENTH isolated copy; the semantic allocator test must reject the exact
+# bound, and the real tree must remain untouched.
+note "lane 8g: mutant drill fln-8w8-M7 (small-bin capacity widened in a copy)"
+MUT7_WS="$ART_DIR/mutant-ws-m7"
+mkdir -p "$MUT7_WS"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT7_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT7_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-core" "$MUT7_WS/fln-core"
+cp "$ROOT/rust-toolchain.toml" "$MUT7_WS/"
+printf '\n[workspace]\n' >>"$MUT7_WS/fln-unsafe-abi/Cargo.toml"
+real_sha_before_m7=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/membrane.rs" | cut -d' ' -f1)
+if ! sed -i 's|const SMALL_BIN_CAPACITY: usize = 8;|const SMALL_BIN_CAPACITY: usize = 9; // fln-8w8-M7: cache widened|' "$MUT7_WS/fln-unsafe-abi/src/membrane.rs" \
+    || ! grep -q "fln-8w8-M7: cache widened" "$MUT7_WS/fln-unsafe-abi/src/membrane.rs"; then
+    fail mutant_plant_m7 "\"detail\":\"mutation did not apply to the reviewed small-bin bound\""
+fi
+set +e
+(cd "$MUT7_WS/fln-unsafe-abi" && CARGO_TARGET_DIR="$MUT7_WS/target" cargo test --offline -q small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable) >"$ART_DIR/mutant7_test.log" 2>&1
+mutant7_rc=$?
+set -e
+if [ "$mutant7_rc" -eq 0 ]; then
+    fail mutant_drill_m7 "\"detail\":\"fln-8w8-M7 SURVIVED — the small-heap test accepted a widened cache bound\""
+fi
+if ! grep -q "Marrow's per-class deferred-free cache is fixed at the reviewed eight-block bound" "$ART_DIR/mutant7_test.log"; then
+    fail mutant_drill_m7 "\"detail\":\"mutant failed but not on the designed exact-bound discriminator\",\"artifact\":\"mutant7_test.log\""
+fi
+real_sha_after_m7=$(sha256sum "$ROOT/crates/fln-unsafe-abi/src/membrane.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m7" != "$real_sha_after_m7" ]; then
+    fail mutant_isolation_m7 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"fln-8w8-M7\",\"discriminator\":\"small_bin_capacity_exactly_eight\",\"real_tree_sha_stable\":true"
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"

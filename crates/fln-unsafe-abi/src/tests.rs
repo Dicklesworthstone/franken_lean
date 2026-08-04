@@ -1136,6 +1136,10 @@ fn small_heap_bins_are_bounded_lifo_and_cross_thread_adoptable() {
     }
 
     let capacity = crate::membrane::small_bin_capacity_for_test();
+    assert_eq!(
+        capacity, 8,
+        "Marrow's per-class deferred-free cache is fixed at the reviewed eight-block bound"
+    );
     let mut held = Vec::new();
     for _ in 0..capacity + 3 {
         let block = export_mi_malloc_small(9);
