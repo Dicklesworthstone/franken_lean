@@ -1164,4 +1164,23 @@ mod tests {
         assert_eq!(atan2(f64::NAN, 1.0).to_bits(), CANONICAL_NAN_BITS);
         assert_eq!(atan2(1.0, f64::NAN).to_bits(), CANONICAL_NAN_BITS);
     }
+
+    #[test]
+    fn hyperbolic_endpoint_and_domain_vectors_are_bit_locked() {
+        same_bits(sinh(-0.0), -0.0);
+        same_bits(cosh(-0.0), 1.0);
+        same_bits(tanh(-0.0), -0.0);
+        same_bits(asinh(-0.0), -0.0);
+        same_bits(atanh(-0.0), -0.0);
+        same_bits(sinh(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        same_bits(cosh(f64::NEG_INFINITY), f64::INFINITY);
+        same_bits(tanh(f64::NEG_INFINITY), -1.0);
+        same_bits(asinh(f64::INFINITY), f64::INFINITY);
+        same_bits(acosh(f64::INFINITY), f64::INFINITY);
+        same_bits(atanh(1.0), f64::INFINITY);
+        same_bits(atanh(-1.0), f64::NEG_INFINITY);
+        same_bits(acosh(1.0), 0.0);
+        assert_eq!(acosh(0.5).to_bits(), CANONICAL_NAN_BITS);
+        assert_eq!(atanh(2.0).to_bits(), CANONICAL_NAN_BITS);
+    }
 }
