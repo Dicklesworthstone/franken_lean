@@ -863,7 +863,7 @@ fn forall_domain_and_codomain_sort_validation_is_mode_exact_and_reducible() {
 
 #[test]
 fn forall_locals_avoid_context_and_constant_free_names_with_repeated_display_names() {
-    let (candidate_zero, candidate_zero_wire) = checker_local_candidate(0);
+    let (_, candidate_zero_wire) = checker_local_candidate(0);
     let (candidate_one, _) = checker_local_candidate(1);
     let prop = Expr::sort(Level::zero());
     let type_one = Expr::sort(Level::one());
@@ -944,19 +944,263 @@ fn forall_composes_inside_lambda_and_application_continuations() {
         },
         InferenceBudget::unlimited(),
     ));
-    assert_eq!(
-        result.type_,
-        decoded(&Expr::forall_e(
-            primary_name("unused"),
-            prop.clone(),
-            prop,
-            BinderInfo::Implicit,
-        ))
-    );
+    let expected = decoded(&Expr::forall_e(
+        primary_name("unused"),
+        prop.clone(),
+        prop,
+        BinderInfo::Implicit,
+    ));
+    assert!(matches!(
+        def_eq(
+            &result.type_,
+            &expected,
+            &WhnfContext::default(),
+            DefEqBudget::unlimited(),
+        ),
+        DefEqOutcome::Equal(_)
+    ));
+    assert!(matches!(
+        result.type_.node(result.type_.root()),
+        Some(ExprNode::Forall {
+            binder_name,
+            binder_type,
+            body,
+            style: fln_checker::wire::BinderStyle::Implicit,
+        }) if binder_name == &checker_name("unused")
+            && matches!(result.type_.node(*binder_type), Some(ExprNode::Sort { .. }))
+            && matches!(result.type_.node(*body), Some(ExprNode::Sort { .. }))
+    ));
     assert_eq!(result.progress.forall_binders, 1);
     assert_eq!(result.progress.lambda_binders, 2);
     assert_eq!(result.progress.application_arguments, 1);
     assert_eq!(result.progress.defeq_queries, 1);
+}
+
+#[test]
+fn forall_resources_cancellation_and_recovery_remain_typed_and_failure_atomic() {
+    let prop = Expr::sort(Level::zero());
+    let type_one = Expr::sort(Level::one());
+    let sort_alias = Expr::const_(primary_name("SortAlias"), Vec::new());
+    let context = built_context(
+        vec![LocalDeclaration::assumption(
+            checker_name("body"),
+            decoded(&sort_alias),
+        )],
+        Vec::new(),
+        vec![definition_with_body(
+            "SortAlias",
+            decoded(&type_one),
+            decoded(&prop),
+            ConstantSafety::Safe,
+            DefinitionSafety::Safe,
+            0,
+        )],
+    );
+    let forall = decoded(&Expr::forall_e(
+        primary_name("A"),
+        type_one,
+        Expr::fvar(FVarId(primary_name("body"))),
+        BinderInfo::StrictImplicit,
+    ));
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let baseline = complete(infer(&forall, &context, mode, InferenceBudget::unlimited()));
+    assert_eq!(baseline.progress.forall_binders, 1);
+    assert_eq!(baseline.progress.forall_domain_queries, 1);
+    assert_eq!(baseline.progress.forall_body_queries, 1);
+    assert_eq!(baseline.progress.forall_sort_checks, 2);
+    assert_eq!(baseline.progress.forall_imax_nodes, 1);
+
+    let exact_steps = baseline.progress.steps;
+    assert!(matches!(
+        infer(
+            &forall,
+            &context,
+            mode,
+            InferenceBudget::new(
+                exact_steps - 1,
+                u64::MAX,
+                TermBudget::unlimited(),
+                TermBudget::unlimited(),
+            ),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::Resource {
+            limit: InferenceLimit::Steps,
+            allowed,
+            observed,
+            phase: InferencePhase::ForallUniverse,
+            ..
+        }) if observed == allowed + 1 && observed == exact_steps
+    ));
+    assert_eq!(
+        complete(infer(
+            &forall,
+            &context,
+            mode,
+            InferenceBudget::new(
+                exact_steps,
+                u64::MAX,
+                TermBudget::unlimited(),
+                TermBudget::unlimited(),
+            ),
+        ))
+        .type_,
+        baseline.type_
+    );
+
+    assert!(matches!(
+        infer(
+            &forall,
+            &context,
+            mode,
+            InferenceBudget::unlimited().with_whnf(WhnfBudget::new(
+                0,
+                u64::MAX,
+                TermBudget::unlimited(),
+            )),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+            site: InferenceSortSite::ForallBinder { binder: 0 },
+            stop,
+            ..
+        }) if matches!(
+            *stop,
+            WhnfStop::Resource {
+                allowed: 0,
+                observed: 1,
+                ..
+            }
+        )
+    ));
+    assert!(matches!(
+        infer(
+            &forall,
+            &context,
+            mode,
+            InferenceBudget::unlimited().with_whnf(WhnfBudget::new(
+                u64::MAX,
+                0,
+                TermBudget::unlimited(),
+            )),
+        ),
+        InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+            site: InferenceSortSite::ForallCodomain { binders: 1 },
+            stop,
+            ..
+        }) if matches!(
+            *stop,
+            WhnfStop::Resource {
+                allowed: 0,
+                observed: 1,
+                ..
+            }
+        )
+    ));
+
+    let mut saw_universe_materialization_boundary = false;
+    for allowed in 0..64 {
+        let mut budget = InferenceBudget::unlimited();
+        budget.materialization = TermBudget::new(allowed, u64::MAX).with_max_arena_nodes(u64::MAX);
+        if let InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+            phase: InferencePhase::ForallUniverse,
+            stop:
+                TermStop::Resource {
+                    limit: TermLimit::Steps,
+                    allowed: reported,
+                    observed,
+                    ..
+                },
+            ..
+        }) = infer(&forall, &context, mode, budget)
+        {
+            assert_eq!(reported, allowed);
+            assert_eq!(observed, allowed + 1);
+            saw_universe_materialization_boundary = true;
+            break;
+        }
+    }
+    assert!(saw_universe_materialization_boundary);
+
+    let mut saw_local_identity = false;
+    let mut saw_telescope = false;
+    let mut saw_domain = false;
+    let mut saw_domain_sort = false;
+    let mut saw_body = false;
+    let mut saw_codomain_sort = false;
+    let mut saw_universe = false;
+    let mut saw_nested_inspection = false;
+    let mut saw_binder_whnf = false;
+    let mut saw_codomain_whnf = false;
+    let mut saw_universe_materialization = false;
+    let mut completed = false;
+    for cancellation_poll in 1..4096 {
+        let mut polls = 0usize;
+        let outcome = infer_with(
+            &forall,
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+            || {
+                polls = polls.saturating_add(1);
+                polls == cancellation_poll
+            },
+        );
+        match outcome {
+            InferenceOutcome::Inconclusive(InferenceStop::Cancelled { phase, .. }) => match phase {
+                InferencePhase::LocalIdentity => saw_local_identity = true,
+                InferencePhase::ForallTelescope => saw_telescope = true,
+                InferencePhase::ForallDomain => saw_domain = true,
+                InferencePhase::ForallDomainSort => saw_domain_sort = true,
+                InferencePhase::ForallBody => saw_body = true,
+                InferencePhase::ForallCodomainSort => saw_codomain_sort = true,
+                InferencePhase::ForallUniverse => saw_universe = true,
+                _ => {}
+            },
+            InferenceOutcome::Inconclusive(InferenceStop::Inspection {
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_nested_inspection = true,
+            InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+                site: InferenceSortSite::ForallBinder { .. },
+                stop,
+                ..
+            }) if matches!(*stop, WhnfStop::Cancelled { .. }) => saw_binder_whnf = true,
+            InferenceOutcome::Inconclusive(InferenceStop::SortWhnf {
+                site: InferenceSortSite::ForallCodomain { .. },
+                stop,
+                ..
+            }) if matches!(*stop, WhnfStop::Cancelled { .. }) => saw_codomain_whnf = true,
+            InferenceOutcome::Inconclusive(InferenceStop::Materialization {
+                phase: InferencePhase::ForallUniverse,
+                stop: TermStop::Cancelled { .. },
+                ..
+            }) => saw_universe_materialization = true,
+            InferenceOutcome::Inconclusive(_) => {}
+            InferenceOutcome::Complete(result) => {
+                assert_eq!(result.type_, baseline.type_);
+                completed = true;
+                break;
+            }
+            other => panic!("Forall cancellation became a semantic answer: {other:?}"),
+        }
+    }
+    assert!(completed);
+    assert!(saw_local_identity);
+    assert!(saw_telescope);
+    assert!(saw_domain);
+    assert!(saw_domain_sort);
+    assert!(saw_body);
+    assert!(saw_codomain_sort);
+    assert!(saw_universe);
+    assert!(saw_nested_inspection);
+    assert!(saw_binder_whnf);
+    assert!(saw_codomain_whnf);
+    assert!(saw_universe_materialization);
+    assert_eq!(
+        complete(infer(&forall, &context, mode, InferenceBudget::unlimited(),)).type_,
+        baseline.type_
+    );
 }
 
 #[test]
@@ -2831,6 +3075,134 @@ fn fifty_thousand_binder_lambda_telescope_fits_a_64k_stack() {
     assert!(
         output.status.success(),
         "bounded-stack lambda child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn deep_forall_telescope_child() -> Result<(), String> {
+    const BINDERS: usize = 50_000;
+    let mut writer = CanonWriter::new();
+    writer.schema(SCHEMA_EXPR);
+    for _ in 0..BINDERS {
+        writer.u8(7);
+        writer.u64(0);
+        writer.u8(3);
+        writer.u8(0);
+    }
+    writer.u8(0);
+    writer.u32(0);
+    for _ in 0..BINDERS {
+        writer.u8(0);
+    }
+    let term = match decode_expr(&writer.into_bytes(), DecodeBudget::unlimited()) {
+        DecodeOutcome::Complete(Ok(value)) => value,
+        other => return Err(format!("deep Forall bytes did not decode: {other:?}")),
+    };
+    let result = match infer(
+        &term,
+        &InferenceContext::empty(ConstantEnvironment::empty()),
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    ) {
+        InferenceOutcome::Complete(result) => result,
+        other => return Err(format!("deep Forall inference failed: {other:?}")),
+    };
+    if result.progress.forall_telescope_nodes != BINDERS as u64
+        || result.progress.forall_binders != BINDERS as u64
+        || result.progress.forall_domain_queries != BINDERS as u64
+        || result.progress.forall_body_queries != 1
+        || result.progress.forall_sort_checks != BINDERS as u64 + 1
+        || result.progress.forall_imax_nodes != BINDERS as u64
+    {
+        return Err(format!(
+            "deep Forall progress drifted: telescopes={}, binders={}, domains={}, bodies={}, sorts={}, imax={}",
+            result.progress.forall_telescope_nodes,
+            result.progress.forall_binders,
+            result.progress.forall_domain_queries,
+            result.progress.forall_body_queries,
+            result.progress.forall_sort_checks,
+            result.progress.forall_imax_nodes,
+        ));
+    }
+    if result.type_.nodes().len() != 1 {
+        return Err(format!(
+            "deep Forall result should contain one Sort node, got {}",
+            result.type_.nodes().len()
+        ));
+    }
+    let mut level = match result.type_.node(result.type_.root()) {
+        Some(ExprNode::Sort { level }) => *level,
+        Some(_) => return Err("deep Forall result root was not Sort".to_owned()),
+        None => return Err("deep Forall result root was missing".to_owned()),
+    };
+    for binder in 0..BINDERS {
+        let (domain, body) = match result.type_.level(level) {
+            Some(LevelNode::IMax(domain, body)) => (*domain, *body),
+            Some(_) => {
+                return Err(format!(
+                    "deep Forall universe stopped before binder {binder}"
+                ));
+            }
+            None => return Err(format!("deep Forall universe missing at binder {binder}")),
+        };
+        match result.type_.level(domain) {
+            Some(LevelNode::Succ(zero))
+                if matches!(result.type_.level(*zero), Some(LevelNode::Zero)) => {}
+            Some(_) => {
+                return Err(format!(
+                    "deep Forall domain universe drifted at binder {binder}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "deep Forall domain universe missing at binder {binder}"
+                ));
+            }
+        }
+        level = body;
+    }
+    if !matches!(result.type_.level(level), Some(LevelNode::Zero)) {
+        return Err("deep Forall terminal universe was not zero".to_owned());
+    }
+    let expected_levels = BINDERS * 3 + 1;
+    if result.type_.levels().len() != expected_levels {
+        return Err(format!(
+            "deep Forall level arena drifted: expected {expected_levels}, got {}",
+            result.type_.levels().len()
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn fifty_thousand_binder_forall_telescope_fits_a_64k_stack() {
+    const CHILD_ENV: &str = "FLN_CHECKER_INFER_DEEP_FORALL_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = std::thread::Builder::new()
+            .name("fln-checker-infer-forall-deep".to_owned())
+            .stack_size(64 * 1024)
+            .spawn(deep_forall_telescope_child)
+            .expect("spawn bounded-stack Forall child")
+            .join()
+            .expect("bounded-stack Forall child did not panic");
+        result.expect("bounded-stack Forall work");
+        return;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = Command::new(executable)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "fifty_thousand_binder_forall_telescope_fits_a_64k_stack",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run bounded-stack Forall child process");
+    assert!(
+        output.status.success(),
+        "bounded-stack Forall child failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
