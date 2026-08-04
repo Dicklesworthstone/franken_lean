@@ -1144,4 +1144,24 @@ mod tests {
         assert_eq!(f32::cbrt(8.0).to_bits(), 2.0_f32.to_bits());
         assert_eq!(f32::pow(2.0, 10.0).to_bits(), 1024.0_f32.to_bits());
     }
+
+    #[test]
+    fn atan2_special_quadrants_are_bit_locked() {
+        for (y, x, expected) in [
+            (0.0, 1.0, 0.0),
+            (-0.0, 1.0, -0.0),
+            (0.0, -1.0, PI),
+            (-0.0, -1.0, -PI),
+            (1.0, 0.0, HALF_PI),
+            (-1.0, -0.0, -HALF_PI),
+            (f64::INFINITY, f64::INFINITY, QUARTER_PI),
+            (f64::NEG_INFINITY, f64::INFINITY, -QUARTER_PI),
+            (f64::INFINITY, f64::NEG_INFINITY, 3.0 * QUARTER_PI),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY, -3.0 * QUARTER_PI),
+        ] {
+            same_bits(atan2(y, x), expected);
+        }
+        assert_eq!(atan2(f64::NAN, 1.0).to_bits(), CANONICAL_NAN_BITS);
+        assert_eq!(atan2(1.0, f64::NAN).to_bits(), CANONICAL_NAN_BITS);
+    }
 }
