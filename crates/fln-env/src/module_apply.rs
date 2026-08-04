@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
-use fln_hash::domain::Digest;
+use fln_hash::domain::{Digest, Domain, hash};
 
 use crate::constants::ConstantInfo;
 use crate::environment::{DeclarationDeltaError, Environment};
@@ -24,6 +24,52 @@ use crate::provenance::{
 /// input: a plan must never be consumed under a payload-binding interpretation it was
 /// not checked against.
 pub const MODULE_APPLY_SCHEMA_VERSION: u16 = 1;
+
+/// Stable identity for one exact payload-bearing apply transaction.
+///
+/// The preimage is root-scoped: the manifest root binds the ordered contribution
+/// records and extension entry identities, while the ordered declaration-content
+/// digests bind the Arc-backed values that the manifest intentionally does not copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModuleApplyTransactionId(Digest);
+
+impl ModuleApplyTransactionId {
+    fn derive(manifest_root: ModuleProvenanceRoot, declaration_identities: &[Digest]) -> Self {
+        let mut bytes = Vec::with_capacity(
+            b"fln.env.module-apply.transaction/1"
+                .len()
+                .saturating_add(32)
+                .saturating_add(declaration_identities.len().saturating_mul(32)),
+        );
+        bytes.extend_from_slice(b"fln.env.module-apply.transaction/1");
+        bytes.extend_from_slice(&manifest_root.0.0);
+        for identity in declaration_identities {
+            bytes.extend_from_slice(&identity.0);
+        }
+        Self(hash(Domain::Receipt, &bytes))
+    }
+
+    fn from_state(state: &ModuleApplyState, module: &ModuleId) -> Option<Self> {
+        let payload = state
+            .applied_payloads()
+            .iter()
+            .find(|payload| &payload.contribution().module().id == module)?;
+        let declaration_identities = payload
+            .declarations()
+            .iter()
+            .chain(payload.extra_declarations())
+            .map(|info| Environment::decl_content_digest(info))
+            .collect::<Vec<_>>();
+        Some(Self::derive(
+            state.manifest().root(),
+            &declaration_identities,
+        ))
+    }
+
+    pub const fn digest(&self) -> Digest {
+        self.0
+    }
+}
 
 /// One raw extension payload at its precise source occurrence.
 ///
@@ -137,6 +183,7 @@ pub struct PreflightedModuleApply {
     transaction: ModuleApplyTransaction,
     manifest_root: ModuleProvenanceRoot,
     declaration_identities: Arc<[Digest]>,
+    transaction_id: ModuleApplyTransactionId,
 }
 
 /// The only aggregate value an application path may expose as committed.
@@ -559,6 +606,11 @@ impl PreflightedModuleApply {
     pub fn declaration_identities(&self) -> &[Digest] {
         &self.declaration_identities
     }
+
+    /// Root-scoped identity of the exact values preflight bound.
+    pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
+        self.transaction_id
+    }
 }
 
 /// The payload side of one contribution once its manifest binding has completed.
@@ -840,6 +892,7 @@ pub fn prepare_module_apply_candidate(
 pub struct ModuleApplyReceipt {
     schema: u16,
     module: ModuleId,
+    transaction_id: ModuleApplyTransactionId,
     base_provenance_root: ModuleProvenanceRoot,
     result_provenance_root: ModuleProvenanceRoot,
 }
@@ -851,6 +904,10 @@ impl ModuleApplyReceipt {
 
     pub fn module(&self) -> &ModuleId {
         &self.module
+    }
+
+    pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
+        self.transaction_id
     }
 
     pub const fn base_provenance_root(&self) -> ModuleProvenanceRoot {
@@ -888,6 +945,16 @@ impl ModuleApplyReceipt {
         if candidate.manifest().record(&self.module).is_none() {
             return Err(ModuleApplyReceiptError::ModuleAbsent {
                 module: self.module.clone(),
+            });
+        }
+        let actual_transaction = ModuleApplyTransactionId::from_state(candidate, &self.module)
+            .ok_or_else(|| ModuleApplyReceiptError::ModuleAbsent {
+                module: self.module.clone(),
+            })?;
+        if self.transaction_id != actual_transaction {
+            return Err(ModuleApplyReceiptError::Transaction {
+                expected: self.transaction_id,
+                actual: actual_transaction,
             });
         }
         Ok(())
@@ -993,6 +1060,10 @@ pub enum ModuleApplyReceiptError {
         expected: ModuleProvenanceRoot,
         actual: ModuleProvenanceRoot,
     },
+    Transaction {
+        expected: ModuleApplyTransactionId,
+        actual: ModuleApplyTransactionId,
+    },
     ModuleAbsent {
         module: ModuleId,
     },
@@ -1013,6 +1084,7 @@ pub fn prepare_module_apply(
             receipt: ModuleApplyReceipt {
                 schema: preflight.schema(),
                 module: preflight.transaction().contribution().module().id.clone(),
+                transaction_id: preflight.transaction_id(),
                 base_provenance_root: base.manifest().root(),
                 result_provenance_root: candidate.manifest().root(),
             },
@@ -1257,17 +1329,21 @@ pub fn preflight_module_apply(
         }
     }
 
-    let declaration_identities = transaction
+    let declaration_identities: Arc<[Digest]> = transaction
         .declarations
         .iter()
         .chain(transaction.extra_declarations.iter())
         .map(|info| crate::environment::Environment::decl_content_digest(info))
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
+    let transaction_id =
+        ModuleApplyTransactionId::derive(transaction.manifest.root(), &declaration_identities);
     Ok(PreflightedModuleApply {
         schema: MODULE_APPLY_SCHEMA_VERSION,
         manifest_root: transaction.manifest.root(),
         transaction,
         declaration_identities,
+        transaction_id,
     })
 }
 
@@ -1449,6 +1525,13 @@ mod tests {
         assert!(!checked.is_cacheable());
         assert_eq!(checked.schema(), MODULE_APPLY_SCHEMA_VERSION);
         assert_eq!(checked.declaration_identities().len(), 2);
+        assert_eq!(
+            checked.transaction_id(),
+            ModuleApplyTransactionId::derive(
+                checked.manifest_root(),
+                checked.declaration_identities(),
+            )
+        );
         assert!(Arc::ptr_eq(
             &declaration,
             &checked.transaction().declarations()[0]
@@ -1873,12 +1956,30 @@ mod tests {
             ))
         ));
 
+        let mut tampered_transaction_plan =
+            match prepare_module_apply(&checked, &base, &declaration_candidate) {
+                Outcome::Complete(Ok(plan)) => plan,
+                other => panic!("expected a complete application plan, got {other:?}"),
+            };
+        tampered_transaction_plan.receipt.transaction_id =
+            ModuleApplyTransactionId(Digest([9; 32]));
+        assert!(matches!(
+            tampered_transaction_plan.commit(&base),
+            Err(ModuleApplyCommitError::Receipt(
+                ModuleApplyReceiptError::Transaction { .. }
+            ))
+        ));
+
         let committed = match prepare_module_apply(&checked, &base, &declaration_candidate) {
             Outcome::Complete(Ok(plan)) => plan.commit(&base).expect("base remains current"),
             other => panic!("expected a complete application plan, got {other:?}"),
         };
         assert_eq!(committed.state().graph().len(), 1);
         assert_eq!(committed.receipt().module(), &contribution.module().id);
+        assert_eq!(
+            committed.receipt().transaction_id(),
+            checked.transaction_id()
+        );
         assert_eq!(
             committed.receipt().base_provenance_root(),
             base.manifest().root()
