@@ -8,8 +8,10 @@
 use std::sync::Arc;
 
 use fln_core::name::Name;
+use fln_core::options::KVMap;
 use fln_core::outcome::Outcome;
 use fln_hash::domain::{Digest, Domain, hash};
+use fln_hash::root::LogicalRoot;
 
 use crate::constants::ConstantInfo;
 use crate::environment::{DeclarationDeltaError, Environment};
@@ -201,6 +203,7 @@ pub struct PreflightedModuleApply {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleApplyState {
     environment: Environment,
+    options: KVMap,
     graph: ModuleGraph,
     manifest: Arc<ModuleProvenanceManifest>,
     indexes: ModuleProvenanceIndexes,
@@ -216,7 +219,17 @@ impl ModuleApplyState {
         graph: ModuleGraph,
         manifest: Arc<ModuleProvenanceManifest>,
     ) -> Result<Self, ModuleApplyStateError> {
-        Self::from_parts_with_payloads(environment, graph, manifest, vec![])
+        Self::from_parts_with_options(environment, graph, manifest, KVMap::new())
+    }
+
+    /// Join immutable components with the exact logical-root options they commit.
+    pub fn from_parts_with_options(
+        environment: Environment,
+        graph: ModuleGraph,
+        manifest: Arc<ModuleProvenanceManifest>,
+        options: KVMap,
+    ) -> Result<Self, ModuleApplyStateError> {
+        Self::from_parts_with_options_and_payloads(environment, graph, manifest, options, vec![])
     }
 
     /// Join immutable components with the exact payload carriers they commit.
@@ -228,6 +241,23 @@ impl ModuleApplyState {
         environment: Environment,
         graph: ModuleGraph,
         manifest: Arc<ModuleProvenanceManifest>,
+        payloads: Vec<AppliedModulePayload>,
+    ) -> Result<Self, ModuleApplyStateError> {
+        Self::from_parts_with_options_and_payloads(
+            environment,
+            graph,
+            manifest,
+            KVMap::new(),
+            payloads,
+        )
+    }
+
+    /// Join immutable components with exact payload carriers and logical-root options.
+    pub fn from_parts_with_options_and_payloads(
+        environment: Environment,
+        graph: ModuleGraph,
+        manifest: Arc<ModuleProvenanceManifest>,
+        options: KVMap,
         mut payloads: Vec<AppliedModulePayload>,
     ) -> Result<Self, ModuleApplyStateError> {
         manifest
@@ -355,6 +385,7 @@ impl ModuleApplyState {
             .map_err(ModuleApplyStateError::IndexInconsistent)?;
         Ok(Self {
             environment,
+            options,
             graph,
             manifest,
             indexes,
@@ -364,6 +395,16 @@ impl ModuleApplyState {
 
     pub fn environment(&self) -> &Environment {
         &self.environment
+    }
+
+    /// Options that participate in this state's logical root.
+    pub fn options(&self) -> &KVMap {
+        &self.options
+    }
+
+    /// The semantic root of this aggregate state, excluding graph and provenance topology.
+    pub fn logical_root(&self) -> LogicalRoot {
+        self.environment.logical_root(&self.options)
     }
 
     pub fn graph(&self) -> &ModuleGraph {
@@ -385,10 +426,11 @@ impl ModuleApplyState {
 
     /// Recheck the single-state invariant before a later apply plan consumes it.
     pub fn verify(&self) -> Result<(), ModuleApplyStateError> {
-        let rebuilt = Self::from_parts_with_payloads(
+        let rebuilt = Self::from_parts_with_options_and_payloads(
             self.environment.clone(),
             self.graph.clone(),
             Arc::clone(&self.manifest),
+            self.options.clone(),
             self.payloads.to_vec(),
         )?;
         if rebuilt.indexes != self.indexes {
@@ -973,10 +1015,11 @@ pub fn prepare_module_apply_candidate(
     let mut payloads = base.applied_payloads().to_vec();
     payloads.push(payload);
     Outcome::complete(
-        ModuleApplyState::from_parts_with_payloads(
+        ModuleApplyState::from_parts_with_options_and_payloads(
             replayed,
             graph,
             Arc::clone(&transaction.manifest),
+            base.options().clone(),
             payloads,
         )
         .map_err(ModuleApplyPrepareError::State),
@@ -1043,6 +1086,8 @@ pub struct ModuleApplyReceipt {
     contribution: ModuleContributionRecord,
     grade: ModuleApplyGrade,
     transaction_id: ModuleApplyTransactionId,
+    base_logical_root: LogicalRoot,
+    result_logical_root: LogicalRoot,
     base_provenance_root: ModuleProvenanceRoot,
     result_provenance_root: ModuleProvenanceRoot,
 }
@@ -1068,6 +1113,14 @@ impl ModuleApplyReceipt {
 
     pub const fn transaction_id(&self) -> ModuleApplyTransactionId {
         self.transaction_id
+    }
+
+    pub const fn base_logical_root(&self) -> LogicalRoot {
+        self.base_logical_root
+    }
+
+    pub const fn result_logical_root(&self) -> LogicalRoot {
+        self.result_logical_root
     }
 
     pub const fn base_provenance_root(&self) -> ModuleProvenanceRoot {
@@ -1116,6 +1169,20 @@ impl ModuleApplyReceipt {
         if self.grade != actual_grade {
             return Err(ModuleApplyReceiptError::Grade {
                 module: self.module.clone(),
+            });
+        }
+        let actual_base_logical_root = base.logical_root();
+        if self.base_logical_root != actual_base_logical_root {
+            return Err(ModuleApplyReceiptError::BaseLogicalRoot {
+                expected: self.base_logical_root,
+                actual: actual_base_logical_root,
+            });
+        }
+        let actual_result_logical_root = candidate.logical_root();
+        if self.result_logical_root != actual_result_logical_root {
+            return Err(ModuleApplyReceiptError::ResultLogicalRoot {
+                expected: self.result_logical_root,
+                actual: actual_result_logical_root,
             });
         }
         let actual_transaction = ModuleApplyTransactionId::from_state(candidate, &self.module)
@@ -1310,9 +1377,17 @@ pub enum ModuleApplyReceiptError {
         expected: ModuleProvenanceRoot,
         actual: ModuleProvenanceRoot,
     },
+    BaseLogicalRoot {
+        expected: LogicalRoot,
+        actual: LogicalRoot,
+    },
     ResultRoot {
         expected: ModuleProvenanceRoot,
         actual: ModuleProvenanceRoot,
+    },
+    ResultLogicalRoot {
+        expected: LogicalRoot,
+        actual: LogicalRoot,
     },
     Contribution {
         module: ModuleId,
@@ -1357,6 +1432,8 @@ pub fn prepare_module_apply(
                         preflight.transaction().contribution().completeness(),
                     ),
                     transaction_id: preflight.transaction_id(),
+                    base_logical_root: base.logical_root(),
+                    result_logical_root: candidate.logical_root(),
                     base_provenance_root: base.manifest().root(),
                     result_provenance_root: candidate.manifest().root(),
                 },
@@ -1660,6 +1737,7 @@ mod tests {
     };
     use fln_core::expr::Expr;
     use fln_core::level::Level;
+    use fln_core::options::DataValue;
 
     fn name(value: &str) -> Name {
         Name::str(Name::anonymous(), value)
@@ -2151,8 +2229,15 @@ mod tests {
         let empty_graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
             .into_admitted_value()
             .expect("empty graph construction admits");
-        let base = ModuleApplyState::from_parts(environment.clone(), empty_graph, empty_manifest)
-            .expect("empty aggregate state is coherent");
+        let mut options = KVMap::new();
+        options.insert(name("fixture.option"), DataValue::OfBool(true));
+        let base = ModuleApplyState::from_parts_with_options(
+            environment.clone(),
+            empty_graph,
+            empty_manifest,
+            options.clone(),
+        )
+        .expect("empty aggregate state is coherent");
         let history = environment
             .extension(&descriptor.name)
             .expect("fixture extension is registered")
@@ -2189,6 +2274,8 @@ mod tests {
         assert_eq!(prepared.graph().len(), 1);
         assert_eq!(prepared.manifest().records().len(), 1);
         assert_eq!(prepared.applied_payloads().len(), 1);
+        assert_eq!(prepared.options(), &options);
+        assert_ne!(prepared.logical_root(), base.logical_root());
         assert!(prepared.applied_payloads()[0].shares_storage_with_preflight(&checked));
         assert_eq!(
             prepared
@@ -2219,10 +2306,11 @@ mod tests {
                 provenance: PayloadProvenance::Understood,
             })
             .expect("unrelated fixture extension is unique");
-        let stale_base = ModuleApplyState::from_parts(
+        let stale_base = ModuleApplyState::from_parts_with_options(
             stale_environment,
             base.graph().clone(),
             Arc::clone(&base.manifest),
+            base.options().clone(),
         )
         .expect("unrelated extension keeps the empty state coherent");
         assert!(matches!(
@@ -2243,6 +2331,22 @@ mod tests {
             tampered_receipt_plan.commit(&base),
             Err(ModuleApplyCommitError::Receipt(
                 ModuleApplyReceiptError::ResultRoot { .. }
+            ))
+        ));
+
+        let mut tampered_logical_root_plan =
+            match prepare_module_apply(&checked, &base, &declaration_candidate) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+                Outcome::Complete(Ok(other)) => {
+                    panic!("expected a prepared application plan, got {other:?}")
+                }
+                other => panic!("expected a complete application plan, got {other:?}"),
+            };
+        tampered_logical_root_plan.receipt.result_logical_root = base.logical_root();
+        assert!(matches!(
+            tampered_logical_root_plan.commit(&base),
+            Err(ModuleApplyCommitError::Receipt(
+                ModuleApplyReceiptError::ResultLogicalRoot { .. }
             ))
         ));
 
@@ -2348,6 +2452,15 @@ mod tests {
         assert_eq!(
             committed.receipt().result_provenance_root(),
             committed.state().manifest().root()
+        );
+        assert_eq!(committed.receipt().base_logical_root(), base.logical_root());
+        assert_eq!(
+            committed.receipt().result_logical_root(),
+            committed.state().logical_root()
+        );
+        assert_ne!(
+            committed.receipt().base_logical_root(),
+            committed.receipt().result_logical_root()
         );
         assert!(matches!(
             classify_exact_result_retry(&checked, committed.state()),
