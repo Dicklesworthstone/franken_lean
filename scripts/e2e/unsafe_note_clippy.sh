@@ -45,6 +45,8 @@ RAW_REPORT="$ART_DIR/clippy-report.jsonl"
 OBSERVED="$ART_DIR/observed-sites.txt"
 UNDECLARED_OBSERVED="$ART_DIR/undeclared-observed-sites.txt"
 STALE_DECLARED="$ART_DIR/stale-declared-sites.txt"
+VENDOR_PATH="vendor/lean4-src"
+VENDOR_BINDING="$ART_DIR/vendor-binding.json"
 BUILD_TARGET="${CARGO_TARGET_DIR:-$ROOT/target/cargo}/e2e-unsafe-note-clippy"
 CAPTURE_BYTES="${FLN_E2E_CAPTURE_BYTES:-262144}"
 OUTPUT_BUDGET_BYTES="${FLN_E2E_OUTPUT_BUDGET_BYTES:-16777216}"
@@ -60,7 +62,7 @@ FINAL_EXIT=2
 TERMINAL_EMITTED=0
 
 INPUT_PATHS=(
-  Cargo.toml Cargo.lock rust-toolchain.toml
+  Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml
   ci/UNSAFE_NOTE_CLIPPY_SITES.txt ci/VERIFICATION_MANIFEST.jsonl
   crates/fln-unsafe-abi crates/fln-unsafe-region crates/fln-unsafe-jit
   scripts/e2e/unsafe_note_clippy.sh scripts/evidence.py scripts/check.sh
@@ -74,7 +76,8 @@ for input_path in "${INPUT_PATHS[@]}"; do
 done
 
 if ! INPUT_ROOT="$(
-  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
 )"; then
   echo "[unsafe_note_clippy] setup failure: cannot hash governed inputs" >&2
   exit 2
@@ -103,7 +106,8 @@ set_final() {
 }
 
 hash_governed() {
-  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}"
+  "${PYTHON[@]}" "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}" \
+    --vendor-path "$VENDOR_PATH"
 }
 
 read_meta() {
@@ -166,7 +170,8 @@ finalize() {
     "${PYTHON[@]}" "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$ROOT" \
-      "${GOVERNED_ARGS[@]}" --expected-root "$final_root" || bundle_rc=$?
+      "${GOVERNED_ARGS[@]}" --vendor-path "$VENDOR_PATH" \
+      --expected-root "$final_root" || bundle_rc=$?
     "${PYTHON[@]}" "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
@@ -208,6 +213,8 @@ if ! mkdir "$ART_DIR" 2>/dev/null; then
   exit 2
 fi
 : > "$HUMAN"
+"${PYTHON[@]}" "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR"
 
 emit_event --new-log --string event run_start \
   --json-value argv '["scripts/e2e/unsafe_note_clippy.sh"]' \
@@ -217,9 +224,11 @@ emit_event --new-log --string event run_start \
   --string parity_ledger_row not_applicable_static_unsafe_boundary_census \
   --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
   --string platform "$(uname -srm)" --integer thread_count 1 \
+  --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"system":platform.system(),"release":platform.release(),"machine":platform.machine(),"python":platform.python_version()},sort_keys=True,separators=(",",":")))')" \
   --string seed "$DECLARED_ROOT" \
   --string cache_state "${FLN_E2E_CACHE_STATE:-unspecified}" \
   --string input_root "$INPUT_ROOT" \
+  --string vendor_binding vendor-binding.json \
   --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS}"
 
@@ -277,6 +286,7 @@ run_step() {
     --string expected_supervisor_classification "$expected_class" \
     --integer expected_wrapper_exit "$expected_wrapper" \
     --integer expected_child_exit "$expected_child" \
+    --string subject_root "$before" --string subject_final_state "$after" \
     --json-file supervisor "$meta"
   if [ "$assertion" != pass ]; then
     set_final fail "$step:assertion_failed" 1
