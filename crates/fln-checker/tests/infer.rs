@@ -3770,3 +3770,141 @@ fn kr109_the_deferral_set_shrank_by_exactly_the_let_case() {
         "a well-typed let must now COMPLETE rather than defer"
     );
 }
+
+#[test]
+fn kr109_let_resources_and_cancellation_stay_typed_and_recover_cleanly() {
+    // The resource and cancellation half of KR-109. Every stop must be an
+    // Inconclusive in its own class — never a rejection, never an acceptance —
+    // and the exact-budget run must reproduce the unbudgeted answer, so a
+    // budget that merely truncated the work would be visible.
+    let term = Expr::let_e(
+        primary_name("A"),
+        Expr::sort(Level::succ(Level::zero()).expect("level depth within range")),
+        Expr::sort(Level::zero()),
+        Expr::lam(primary_name("a"), bvar(0), bvar(0), BinderInfo::Default),
+        false,
+    );
+    let decoded_term = decoded(&term);
+    let context = built_context(Vec::new(), Vec::new(), Vec::new());
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+
+    let baseline = complete(infer(
+        &decoded_term,
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    let exact_steps = baseline.progress.steps;
+    assert!(exact_steps > 1, "the let query must consume steps to bound");
+
+    // One step short: a typed resource Inconclusive, in a Let phase.
+    let starved = infer(
+        &decoded_term,
+        &context,
+        mode,
+        InferenceBudget::new(
+            exact_steps - 1,
+            u64::MAX,
+            TermBudget::unlimited(),
+            TermBudget::unlimited(),
+        ),
+    );
+    assert!(
+        matches!(
+            starved,
+            InferenceOutcome::Inconclusive(InferenceStop::Resource {
+                limit: InferenceLimit::Steps,
+                allowed,
+                observed,
+                ..
+            }) if observed == allowed + 1 && observed == exact_steps
+        ),
+        "an exhausted let budget must be a typed resource Inconclusive, got {starved:?}"
+    );
+
+    // Exactly enough: the same answer as the unbudgeted run. Without this the
+    // cell above would pass against an implementation that simply never finished.
+    assert_eq!(
+        expr_model(
+            &complete(infer(
+                &decoded_term,
+                &context,
+                mode,
+                InferenceBudget::new(
+                    exact_steps,
+                    u64::MAX,
+                    TermBudget::unlimited(),
+                    TermBudget::unlimited(),
+                ),
+            ))
+            .type_
+        ),
+        expr_model(&baseline.type_),
+        "the exact-budget let run must reproduce the unbudgeted type"
+    );
+
+    // Cancellation at every step boundary: always typed Cancelled, and every
+    // observed phase must belong to this rule's own vocabulary.
+    let mut saw_let_phase = false;
+    for cancellation_poll in 1..=exact_steps {
+        let mut polls = 0u64;
+        let outcome = infer_with(
+            &decoded_term,
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+            || {
+                polls += 1;
+                polls == cancellation_poll
+            },
+        );
+        match outcome {
+            // Any Inconclusive is a TYPED non-answer, which is the property
+            // under test: cancellation lands in several stop classes, not only
+            // `Cancelled` — an inspection or materialization walk observing the
+            // same flag reports its own. The first version of this cell matched
+            // only `Cancelled` and failed on a perfectly correct `Inspection`.
+            InferenceOutcome::Inconclusive(stop) => {
+                if let InferenceStop::Cancelled { phase, .. } = stop
+                    && matches!(
+                        phase,
+                        InferencePhase::LetTelescope
+                            | InferencePhase::LetDeclaredType
+                            | InferencePhase::LetDeclaredTypeSort
+                            | InferencePhase::LetValue
+                            | InferencePhase::LetValueComparison
+                            | InferencePhase::LetBody
+                            | InferencePhase::LetZeta
+                    )
+                {
+                    saw_let_phase = true;
+                }
+            }
+            InferenceOutcome::Complete(_) => {}
+            // A rejection, a deferral or a fault from a CANCELLED run would be
+            // FL-INV-07 broken: cancellation must never be rendered as a verdict.
+            other => panic!("cancelling a let must stay typed, got {other:?}"),
+        }
+    }
+    assert!(
+        saw_let_phase,
+        "cancellation never landed in a KR-109 phase; the sweep did not reach the rule"
+    );
+
+    // Clean recovery: after all that, an unbudgeted uncancelled run is unchanged.
+    assert_eq!(
+        expr_model(
+            &complete(infer(
+                &decoded_term,
+                &context,
+                mode,
+                InferenceBudget::unlimited()
+            ))
+            .type_
+        ),
+        expr_model(&baseline.type_),
+        "recovery after starvation and cancellation must be clean"
+    );
+}
