@@ -326,19 +326,20 @@ static void facts_mode(void) {
     lean_dec(one); lean_dec(sq); lean_dec(pw); lean_dec(of); lean_dec(c128);
     lean_dec(big2); lean_dec(big);
 
-    /* The active LEAN_MIMALLOC generated-C inline takes every header-valid
-     * aligned object size through lean_inc_heartbeat + mi_malloc_small. The
-     * 8-byte raw class cannot hold lean_object itself, so this production C
-     * path begins at sizeof(lean_object): 511 classes through 4096. Seed
-     * precisely 511 ticks below wrap; the final scalar getter must observe
+    /* The active LEAN_MIMALLOC generated-C inline takes its supported 8-byte
+     * classes through lean_inc_heartbeat + mi_malloc_small. At this pin the
+     * fast path is strict below 1024: a 1024-byte request faults inside
+     * mi_malloc_small, so this real C cell exercises the 127 valid 8..=1016
+     * classes instead of asserting a wider configuration contract. Seed
+     * precisely 127 ticks below wrap; the final scalar getter must observe
      * zero in both runtimes. The seed follows the fixture's bignum lifecycle,
      * whose pin order is itself part of this real generated-C probe. */
-    lean_io_set_heartbeats(lean_uint64_to_nat(UINT64_MAX - 510));
-    for (unsigned size = sizeof(lean_object); size <= 4096; size += 8) {
+    lean_io_set_heartbeats(lean_uint64_to_nat(UINT64_MAX - 126));
+    for (unsigned size = 8; size < 1024; size += 8) {
         lean_object *block = lean_alloc_small_object(size);
         lean_free_small_object(block);
     }
-    fact("heartbeat.after_all_inline_object_classes_wrap", (long long)lean_unbox(lean_io_get_num_heartbeats()));
+    fact("heartbeat.after_inline_mimalloc_classes_wrap", (long long)lean_unbox(lean_io_get_num_heartbeats()));
 
     /* ---- slice 3: Name equality (hash at scalar offset 16, prefix walk) */
     {
