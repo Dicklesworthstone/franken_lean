@@ -646,6 +646,23 @@ pub mod f32 {
         sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh, exp, exp2, expm1,
         log, log2, log10, log1p, sqrt, cbrt, floor, ceil, trunc, round
     );
+    /// Absolute value by binary32 sign-bit clearing.
+    pub fn abs(x: f32) -> f32 {
+        f32::from_bits(x.to_bits() & !(1_u32 << 31))
+    }
+    /// Copy a binary32 sign bit without delegating to platform math.
+    pub fn copysign(x: f32, sign: f32) -> f32 {
+        f32::from_bits((x.to_bits() & !(1_u32 << 31)) | (sign.to_bits() & (1_u32 << 31)))
+    }
+    /// Binary32 decomposition through the owned binary64 bit-level routine.
+    pub fn frexp(x: f32) -> (f32, i32) {
+        let (fraction, exponent) = super::frexp(x as f64);
+        (fraction as f32, exponent)
+    }
+    /// Exact binary32 power-of-two scaling through the owned binary64 routine.
+    pub fn scalbn(x: f32, exponent: i32) -> f32 {
+        super::scalbn(x as f64, exponent) as f32
+    }
     pub fn atan2(y: f32, x: f32) -> f32 {
         super::atan2(y as f64, x as f64) as f32
     }
@@ -751,5 +768,20 @@ mod tests {
         assert_eq!(trunc(-1.25), -1.0);
         let (fraction, exponent) = frexp(f64::from_bits(1));
         same_bits(scalbn(fraction, exponent), f64::from_bits(1));
+    }
+
+    #[test]
+    fn binary32_facade_preserves_bit_level_boundaries() {
+        assert_eq!(f32::abs(-0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(f32::copysign(1.0, -0.0).to_bits(), (-1.0_f32).to_bits());
+        let smallest = f32::from_bits(1);
+        let (fraction, exponent) = f32::frexp(smallest);
+        assert_eq!(fraction.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(exponent, -148);
+        assert_eq!(
+            f32::scalbn(fraction, exponent).to_bits(),
+            smallest.to_bits()
+        );
+        assert_eq!(f32::sin(f32::NAN).to_bits(), 0x7fc0_0000);
     }
 }
