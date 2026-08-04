@@ -33,6 +33,25 @@ if [ -L "$CANDIDATE_DIR" ] || [ ! -d "$CANDIDATE_DIR" ]; then
   exit 1
 fi
 
+CANDIDATE_ROOT="$(cd "$CANDIDATE_DIR" && pwd -P)"
+is_within() {
+  local child="$1"
+  local parent="$2"
+  if [[ "$parent" == / ]]; then
+    [[ "$child" == /* ]]
+  else
+    [[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+  fi
+}
+
+if is_within "$CANDIDATE_ROOT" "$ROOT" || is_within "$ROOT" "$CANDIDATE_ROOT"; then
+  printf '%s\n' \
+    '[suite_upgrade_candidate_preflight] refused: candidate root overlaps the authoritative checkout' >&2
+  exit 1
+fi
+
+CANDIDATE_DIR="$CANDIDATE_ROOT"
+
 for artifact in "${REQUIRED_ARTIFACTS[@]}"; do
   artifact_path="$CANDIDATE_DIR/$artifact"
   if [ -L "$artifact_path" ] || [ ! -f "$artifact_path" ] || [ ! -s "$artifact_path" ]; then
