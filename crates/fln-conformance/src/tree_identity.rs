@@ -616,6 +616,14 @@ impl ResidueBreach {
 /// slot, and that one path could then regress up to its old count silently. With the rows
 /// gone, a raw site returning to either file is [`ResidueBreach::Undeclared`] and is named.
 pub const RAW_SITE_RESIDUE: &[(&str, usize)] = &[
+    // KR-974's declaration-admission rig (`franken_lean-gii.23`), landed unprotected and
+    // reddening every pane. Declared rather than converted for the reason this module's
+    // AGENTS.md row already gives about its crate: `fln-checker` is one of the three that
+    // cannot reach the checked macro without a NEW dependency edge, and its case also
+    // touches the §8 allowlist. That is a graph decision belonging to the graph's owner,
+    // not something to take while unblocking a red workspace. The row is the honest
+    // holding position and it costs a slot that a conversion reclaims.
+    ("crates/fln-checker/tests/admit.rs", 1),
     ("crates/fln-checker/tests/charter_citations.rs", 1),
     ("crates/fln-conformance/src/tree_identity.rs", 4),
     ("crates/fln-core/tests/pin_ext_observables.rs", 1),
