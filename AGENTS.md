@@ -999,7 +999,7 @@ elsewhere, here pointed at the durability rule itself.
 
 ```text
 povo-adopted: no
-povo-nondurable-terminal: 271
+povo-nondurable-terminal: 262
 ```
 
 That is what adoption would refuse **today**, derived per commit by
@@ -1028,17 +1028,19 @@ rather than a script.
 **Re-derived on 2026-08-05: the number is 271, and the count MOVES BOTH WAYS, which the "may only
 fall" reading of a migration does not predict.** 276 → 262 by repair, then back to 271 as other
 panes closed beads carrying non-durable citations — the growth this section already says is
-unwatched, now observed rather than merely permitted. Today it is **271 across 112 beads and 10
-owners**, still at most 9 per bead: `cod_1` 52 · `cc_1` 37 · `cod_2` 34 · `cod_3` 32 ·
-`FoggyForge` 31 · `cc_2` 30 · `CobaltLantern` 30 · `MistyEagle` 11 · `cc_3` 9 · `TurquoisePine` 5.
+unwatched, now observed rather than merely permitted. Today it is **262 across 111 beads and 9
+owners**, at most 7 per bead: `cod_1` 52 · `cc_1` 37 · `cod_2` 34 · `cod_3` 32 ·
+`FoggyForge` 31 · `cc_2` 30 · `CobaltLantern` 30 · `MistyEagle` 11 · `TurquoisePine` 5. **cc_3 is
+at zero**: the last nine were a lane run's output filenames on `franken_lean-rps`, replaced by the
+tracked producer that made them with the lost bytes recorded as lost.
 
 **The breakdown by KIND is the thing that decides the ordering, and nobody had it.** The
-population is not one problem: `short_commit` **78** · `ignored` **77** · `missing` **38** ·
-`invalid_bead` **35** · `glob` **20** · `directory` **7** · `unknown_structured` **7** ·
-`target_path` **6** · `invalid_comment` **3**. The largest class is *mechanically* repairable by
+population is not one problem: `short_commit` **78** · `ignored` **73** · `missing` **37** ·
+`invalid_bead` **35** · `glob` **20** · `directory` **7** · `target_path` **6** ·
+`unknown_structured` **3** · `invalid_comment` **3**. The largest class is *mechanically* repairable by
 the two-check expansion recorded above — resolve the short sha to a commit object **and** prove it
 an ancestor of `HEAD`, so an unreachable commit cannot be laundered into a durable-looking
-citation. That is **29% of the whole population removable by a script its owner can run**, which
+citation. That is **30% of the whole population removable by a script its owner can run**, which
 makes "migrate first" cheaper than the raw 271 suggests and is the fact the adopt-now-versus-
 migrate-first decision was missing.
 
@@ -1047,7 +1049,7 @@ the disclosure to the derivation with a tolerance of **±25** — deliberately, 
 reddens on exactly the commits that record good work, which is the paragraph below. The
 consequence is that the figure can be silently stale by up to 25 and the tree stays green: it
 **was** stale by 9 when this re-derivation found it, at 262 against a measured 271, and nothing
-was wrong. So the number is honest about its order of magnitude and nothing more, and anyone
+was wrong. It moved again in the same session when nine were repaired. So the number is honest about its order of magnitude and nothing more, and anyone
 quoting it as exact — in a route, a bead, or a decision — is over-reading it. Re-derive with
 `scripts/povo_population.py` before citing it.
 
