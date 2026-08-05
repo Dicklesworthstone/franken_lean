@@ -987,7 +987,7 @@ elsewhere, here pointed at the durability rule itself.
 
 ```text
 povo-adopted: no
-povo-nondurable-terminal: 276
+povo-nondurable-terminal: 266
 ```
 
 That is what adoption would refuse **today**, derived per commit by
@@ -998,6 +998,15 @@ manifest reported **154** by counting tracked directories as missing, and the re
 with a hand-built authority reported **430**, because an empty `reachable_commits` forces all 154
 commit citations to classify `unreachable_commit`. Same code, fabricated input, confident wrong
 answer — twice, before the right instrument produced 276.
+
+**The migration has started, by its own author first.** The 276 live in **113 beads across 10
+owners** — a long tail, at most 9 per bead — so it parcels out rather than landing on anyone.
+**24 were cc_3's own**, and the 11 that were short commit shas are expanded: a short sha is
+non-durable because it can become ambiguous as the object store grows, and each was verified to
+resolve to a commit object AND to be an ancestor of `HEAD` before being widened. 276 -> 266.
+The rest of cc_3's share is not mechanical — bare run-artifact filenames with no durable
+referent, and one path that never existed in any commit — and those need judgement per row
+rather than a script.
 
 **This is a declared remainder, and it is deliberately NOT gated on growth — that is the honest
 part.** The obvious shape is one-way-plus-a-floor: may fall, may not rise. That was written first
