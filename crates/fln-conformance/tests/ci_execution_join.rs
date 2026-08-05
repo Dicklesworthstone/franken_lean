@@ -317,6 +317,17 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          from the lane's own docstring after `e81c57fc` landed it undeclared",
     ),
     (
+        "crates/fln-conformance/tests/mutation_kill_ledger_model.rs",
+        "the_module_apply_mutants_are_killed_for_their_recipe_bound_reasons",
+        "its per-commit sibling `module_apply_receipts_are_canonical_current_complete_and_\
+         classify_as_kills`, which reads the retained receipt and fails when it is absent, \
+         non-canonical, stale or does not classify as kills — and refuses a bead comment as a \
+         substitute in as many words. This one is ignored for a reason stronger than cost: it \
+         EDITS PRODUCTION SOURCE and additionally refuses to run outside a clean linked worktree, \
+         because a panic must never leave a shared pane with a production precondition deleted. \
+         Declared from the test's own docstring after it landed undeclared",
+    ),
+    (
         "crates/fln-conformance/tests/mandated_mutants.rs",
         "the_mandated_mutants_are_planted_and_their_killers_die",
         "fln-mandated-mutant-join-unwatched-uagk's per-commit retention receipt, weekly \
@@ -352,7 +363,16 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// entries, one commit, and the ceiling is stated as 8 rather than bumped twice** —
 /// a ceiling that moves per entry cannot distinguish one author landing two lanes
 /// from two authors landing one each.
-const IGNORED_PRODUCER_CEILING: usize = 8;
+///
+/// 8 -> 9 for as7's module-apply campaign, landed undeclared the same evening. **Three
+/// undeclared arrivals in one day is not three careless authors, it is a missing
+/// affordance** — the identical shape `sso4` measured for the D3 root attribute, where
+/// compliance among existing files was total and every failure was a NEW one. The guard
+/// is correct and it fires *after* the commit, in the shared workspace, at whoever runs
+/// `cargo test` next rather than at the author. Recorded here rather than filed, because
+/// the repair is `sso4`'s — a pre-commit affordance — and the count is the evidence for
+/// it.
+const IGNORED_PRODUCER_CEILING: usize = 9;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1687,7 +1707,7 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=4 rows=7 citations=8 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=5 rows=7 citations=8 all-rows-declared=true
     //
     // `rows` and `citations` fell 10 -> 7 and 11 -> 8 when `fln-7odd`, `fln-corpus-thread-matrix-93te`
     // and `fln-kx3y` were migrated off file-granular citations; `surfaces` is unmoved because
