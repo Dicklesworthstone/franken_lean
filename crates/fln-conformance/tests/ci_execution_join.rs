@@ -560,6 +560,7 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
     "franken_lean-eh0c",
     "franken_lean-ex54",
     "franken_lean-ext-observable-fixture-drift-gap-vqnu",
+    "franken_lean-h40t",
     "franken_lean-h5z1",
     "franken_lean-hv9m",
     "franken_lean-kernel-loc-covenant-not-disclosed-t0g7",
@@ -598,7 +599,25 @@ const FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// declaration is visible, reversible and owned; a silent migration is none of the three.
 /// The sanctioned repair is unchanged and belongs to each row's owner: cite the function,
 /// delete the id from this list, and lower this number by one.
-const FILE_GRANULAR_EVIDENCE_CEILING: usize = 61;
+///
+/// **61 -> 62 for `franken_lean-h40t`, and this member is NOT a debt — for it the sanctioned
+/// repair above is FORBIDDEN, which is the first entry here that inverts the rule.** My own
+/// close of that bead turned its row terminal and this guard correctly flagged four
+/// citations of the form `scripts/tribunal/python_isolation_probe.sh: <outcome>`. Migrating
+/// them to `test:<pkg>::<target>::<fn>` would look like a repair and would silently break a
+/// working mechanism: `evidence_finalization`'s
+/// `the_interpreter_isolation_probe_runs_and_produces_every_outcome_cited_for_it` scans the
+/// manifest for exactly that `<probe path>: ` prefix, extracts the outcome names, RUNS the
+/// probe, and requires equality in BOTH directions between what the row cites and what the
+/// run produced. The file-granular form is that guard's INPUT. So these citations are a
+/// citation *kind this guard does not model* — a shell probe's named outcome, bound to a real
+/// run by a sibling guard — rather than a row that never got around to naming its function.
+///
+/// **Two guards in this repository want opposite things about the same four strings**, and
+/// the one that would lose is the one actually executing a probe. Recorded here rather than
+/// left for the next pane to discover by "repairing" it: if this entry is ever removed, check
+/// that the probe binding still has citations to parse before believing the green.
+const FILE_GRANULAR_EVIDENCE_CEILING: usize = 62;
 
 // ---------------------------------------------------------------------------
 // The residue list, bound to the premises it rests on
