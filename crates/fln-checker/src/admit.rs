@@ -80,6 +80,8 @@ use crate::infer::{
 };
 use crate::universe::{NormalNode, normalize};
 use crate::whnf::{WhnfBudget, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_with};
+use std::collections::BTreeSet;
+
 use crate::wire::{ExprNode, WireExpr, WireLevel, WireName};
 
 /// The schema tag a council quotes when it records one of these observations.
@@ -928,4 +930,281 @@ fn body_matches_declared_type(
 
 fn stopped_err(name: &WireName, phase: AdmissionPhase) -> Verdict {
     stopped(name, phase)
+}
+
+// ---------------------------------------------------------------- KR-977
+
+/// KR-977 — why a mutual BLOCK was refused, as distinct from why one member was.
+///
+/// Block-level defects are properties of the set, so none of them names a
+/// verdict: there is no member whose own admission failed. A member whose
+/// admission failed is a different outcome entirely, and [`BlockVerdict`] keeps
+/// the two apart.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockRejection {
+    /// KR-977a — a mutual block with no members. The empty block is not a
+    /// degenerate success: nothing has been checked, so nothing is admitted.
+    EmptyBlock,
+    /// KR-977a — a member appears twice in the supplied block.
+    RepeatedMember {
+        member: WireName,
+        first: usize,
+        second: usize,
+    },
+    /// KR-977a — a member carries no mutual list, so it is not part of a block
+    /// at all and was supplied to a block entry point by mistake.
+    MemberDeclaresNoBlock { member: WireName },
+    /// KR-977a — membership is not symmetric: this member's mutual list differs
+    /// from the block actually supplied. Membership is a property of the SET, so
+    /// a per-declaration opinion that disagrees with its peers is a defect rather
+    /// than a preference.
+    AsymmetricMembership { member: WireName },
+    /// KR-977b — the block's members do not share one safety class.
+    NonUniformSafety {
+        member: WireName,
+        expected: Quarantine,
+        found: Quarantine,
+    },
+    /// KR-977b — **mutual definitions are unsafe-only.** A block whose members
+    /// are all ordinary safe definitions is refused: mutual recursion is admitted
+    /// on the strength of the quarantine, never on the strength of a check this
+    /// checker has not performed.
+    SafeBlock { member: WireName },
+}
+
+/// The observation that a whole mutual block passed KR-977.
+///
+/// Same non-capability discipline as [`Admission`]: no public constructor, no
+/// public field, no `Clone`, and no conversion out.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockAdmission {
+    members: Vec<WireName>,
+    ground: AdmissionGround,
+}
+
+impl BlockAdmission {
+    /// Every member this observation covers, in the order supplied.
+    pub fn members(&self) -> &[WireName] {
+        &self.members
+    }
+
+    /// Which quarantine the block landed in. Never an ordinary ground — KR-977b
+    /// refuses a safe block, so a mutual admission is a quarantined one by rule.
+    pub const fn ground(&self) -> AdmissionGround {
+        self.ground
+    }
+
+    pub const fn schema(&self) -> &'static str {
+        ADMISSION_SCHEMA
+    }
+}
+
+/// What this checker observed about one mutual block.
+///
+/// The four `Member*` arms exist instead of one "a member failed" arm because
+/// FL-INV-07 distinguishes a member that was REJECTED from one that DEFERRED,
+/// ran out of resources, or faulted — and collapsing them at the block level
+/// would throw that distinction away at exactly the layer a caller consults.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockVerdict {
+    Admitted(BlockAdmission),
+    /// A property of the SET failed. No member's own admission is implicated.
+    Rejected(BlockRejection),
+    MemberRejected {
+        member: WireName,
+        rejection: Box<AdmissionRejection>,
+    },
+    MemberDeferred {
+        member: WireName,
+        deferred: Box<AdmissionDeferred>,
+    },
+    MemberInconclusive {
+        member: WireName,
+        stop: Box<AdmissionStop>,
+    },
+    MemberFault {
+        member: WireName,
+        fault: Box<AdmissionFault>,
+    },
+}
+
+impl BlockVerdict {
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self, BlockVerdict::Admitted(_))
+    }
+
+    /// The three arms that are not decisions, at the block layer.
+    ///
+    /// `MemberRejected` is a decision; the other three member arms are not, and
+    /// a caller must not fold them together — the same reason
+    /// [`Verdict::is_inconclusive_family`] exists one layer down.
+    pub const fn is_inconclusive_family(&self) -> bool {
+        matches!(
+            self,
+            BlockVerdict::MemberDeferred { .. }
+                | BlockVerdict::MemberInconclusive { .. }
+                | BlockVerdict::MemberFault { .. }
+        )
+    }
+}
+
+/// Run KR-977 over a mutual block.
+///
+/// # Atomicity, and an honest note about what it costs here
+///
+/// The bead asked that a refused block admit NO member. That holds, and it holds
+/// **by construction rather than by a rollback**: `admit_block` takes
+/// `&ConstantEnvironment` and returns an observation, exactly as `admit` does —
+/// there is no environment mutation anywhere in this module to undo. So the
+/// property is real and the mechanism protecting it is the signature.
+/// `kr977_a_refused_block_admits_no_member` asserts it anyway, and the value of
+/// that cell is prospective: it fails on the day admission becomes stateful,
+/// which is the only day the property could be lost.
+pub fn admit_block(
+    environment: &ConstantEnvironment,
+    block: &[ConstantEntry],
+    budget: AdmissionBudget,
+) -> BlockVerdict {
+    admit_block_with(environment, block, budget, || false)
+}
+
+/// [`admit_block`], with a cancellation poll shared by every member.
+pub fn admit_block_with(
+    environment: &ConstantEnvironment,
+    block: &[ConstantEntry],
+    budget: AdmissionBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> BlockVerdict {
+    // KR-977a — the block's own shape, checked BEFORE any member is admitted.
+    // A block that is not a block cannot have its members judged as one, and
+    // spending a full body check per member first would report the expensive
+    // cause rather than the real one.
+    if let Err(rejection) = block_shape(block) {
+        return BlockVerdict::Rejected(rejection);
+    }
+
+    // KR-977b — one safety class, and not the safe one.
+    if let Err(rejection) = block_safety(block) {
+        return BlockVerdict::Rejected(rejection);
+    }
+
+    // Every member is admitted under the ordinary rules. The block's verdict is
+    // the conjunction: one member short of admitted and the block is not
+    // admitted, with that member's own outcome carried at its own FL-INV-07
+    // class rather than flattened.
+    let mut members = Vec::new();
+    for entry in block {
+        match admit_with(environment, entry, budget, &mut cancelled) {
+            Verdict::Admitted(admission) => members.push(admission.name().clone()),
+            Verdict::Rejected(rejection) => {
+                return BlockVerdict::MemberRejected {
+                    member: entry.name().clone(),
+                    rejection: Box::new(rejection),
+                };
+            }
+            Verdict::Deferred(deferred) => {
+                return BlockVerdict::MemberDeferred {
+                    member: entry.name().clone(),
+                    deferred: Box::new(deferred),
+                };
+            }
+            Verdict::Inconclusive(stop) => {
+                return BlockVerdict::MemberInconclusive {
+                    member: entry.name().clone(),
+                    stop: Box::new(stop),
+                };
+            }
+            Verdict::InternalFault(fault) => {
+                return BlockVerdict::MemberFault {
+                    member: entry.name().clone(),
+                    fault: Box::new(fault),
+                };
+            }
+        }
+    }
+
+    // KR-977b already refused a safe block, so this is a quarantine ground by
+    // rule rather than by coincidence. Taken from the first member, whose class
+    // uniformity `block_safety` has already established.
+    let ground = ground_for(
+        block
+            .first()
+            .map(|entry| quarantine_of(entry.declaration()))
+            .unwrap_or(Quarantine::None),
+        AdmissionGround::BodyCheckedAgainstDeclaredType,
+    );
+    BlockVerdict::Admitted(BlockAdmission { members, ground })
+}
+
+/// KR-977a — the block is a well-formed set.
+fn block_shape(block: &[ConstantEntry]) -> Result<(), BlockRejection> {
+    if block.is_empty() {
+        return Err(BlockRejection::EmptyBlock);
+    }
+
+    for (second, entry) in block.iter().enumerate() {
+        for (first, earlier) in block.iter().enumerate().take(second) {
+            if earlier.name() == entry.name() {
+                return Err(BlockRejection::RepeatedMember {
+                    member: entry.name().clone(),
+                    first,
+                    second,
+                });
+            }
+        }
+    }
+
+    // Membership is symmetric: every member's own mutual list must name exactly
+    // the block supplied. Compared as SETS rather than sequences, because the
+    // order a declaration lists its peers in is not a semantic fact and refusing
+    // a permutation would be a wall against a correct block.
+    let supplied: BTreeSet<&WireName> = block.iter().map(ConstantEntry::name).collect();
+    for entry in block {
+        let Some(body) = entry.declaration().definition_body() else {
+            return Err(BlockRejection::MemberDeclaresNoBlock {
+                member: entry.name().clone(),
+            });
+        };
+        if body.mutual().is_empty() {
+            return Err(BlockRejection::MemberDeclaresNoBlock {
+                member: entry.name().clone(),
+            });
+        }
+        let declared: BTreeSet<&WireName> = body.mutual().iter().collect();
+        if declared != supplied {
+            return Err(BlockRejection::AsymmetricMembership {
+                member: entry.name().clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// KR-977b — one safety class across the block, and not the safe one.
+fn block_safety(block: &[ConstantEntry]) -> Result<(), BlockRejection> {
+    // Emptiness is `block_shape`'s to refuse and it runs FIRST, so this returns
+    // cleanly rather than checking again. A second check here would be
+    // SUBSUMED -- and it was: a planted mutant deleting `block_shape`'s check
+    // survived, because this one caught the same case and the campaign scored a
+    // rule as tested that nothing tested. One property, one owner.
+    let Some(first) = block.first() else {
+        return Ok(());
+    };
+    let expected = quarantine_of(first.declaration());
+    for entry in block {
+        let found = quarantine_of(entry.declaration());
+        if found != expected {
+            return Err(BlockRejection::NonUniformSafety {
+                member: entry.name().clone(),
+                expected,
+                found,
+            });
+        }
+    }
+    if expected == Quarantine::None {
+        return Err(BlockRejection::SafeBlock {
+            member: first.name().clone(),
+        });
+    }
+    Ok(())
 }

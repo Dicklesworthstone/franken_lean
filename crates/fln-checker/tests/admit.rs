@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use fln_checker::admit::{
     ADMISSION_SCHEMA, AdmissionBudget, AdmissionDeferred, AdmissionGround, AdmissionPhase,
-    AdmissionRejection, AdmissionStop, Verdict, admit, admit_with,
+    AdmissionRejection, AdmissionStop, BlockRejection, BlockVerdict, Quarantine, Verdict, admit,
+    admit_block, admit_with,
 };
 use fln_checker::defeq::{DefEqBudget, QuickDefEqBudget};
 use fln_checker::environment::{
@@ -1272,4 +1273,300 @@ fn kr975b_the_reference_gate_is_keyed_on_the_header_and_fires_in_both_directions
              marking only the body unlocks unsafe references: got {other:?}"
         ),
     }
+}
+
+// ---------------------------------------------------------------- KR-977
+
+/// One member of a mutual block: an unsafe definition naming the whole block.
+fn member(name: &str, block: &[&str], safety: DefinitionSafety) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                nat_constant(),
+                ReducibilityHint::Regular(0),
+                safety,
+                block.iter().map(|n| checker_name(*n)).collect(),
+            ),
+        ),
+    )
+}
+
+fn unsafe_pair() -> Vec<ConstantEntry> {
+    vec![
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+        member("B", &["A", "B"], DefinitionSafety::Unsafe),
+    ]
+}
+
+#[test]
+fn kr977_an_unsafe_mutual_block_is_admitted_into_the_quarantine() {
+    match admit_block(
+        &nat_environment(),
+        &unsafe_pair(),
+        AdmissionBudget::unlimited(),
+    ) {
+        BlockVerdict::Admitted(admission) => {
+            assert_eq!(
+                admission.members(),
+                &[checker_name("A"), checker_name("B")],
+                "the admission must cover EVERY member, in the order supplied"
+            );
+            assert_eq!(
+                admission.ground(),
+                AdmissionGround::UnsafeQuarantine,
+                "KR-977b refuses a safe block, so a mutual admission is a quarantined \
+                 one BY RULE and never an ordinary ground"
+            );
+        }
+        other => panic!("an unsafe mutual block must be admitted, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr977b_a_block_of_safe_definitions_is_refused_because_mutual_is_unsafe_only() {
+    // The rule the inventory's title names, and the one that makes KR-977 a
+    // quarantine rule rather than bookkeeping: mutual recursion is admitted on
+    // the strength of the quarantine, never on a check this checker has not run.
+    let safe_block = vec![
+        member("A", &["A", "B"], DefinitionSafety::Safe),
+        member("B", &["A", "B"], DefinitionSafety::Safe),
+    ];
+    match admit_block(
+        &nat_environment(),
+        &safe_block,
+        AdmissionBudget::unlimited(),
+    ) {
+        BlockVerdict::Rejected(BlockRejection::SafeBlock { member }) => {
+            assert_eq!(member, checker_name("A"));
+        }
+        other => panic!("a SAFE mutual block must be refused, got {other:?}"),
+    }
+
+    // Control: the identical block marked Unsafe IS admitted, so the refusal is
+    // attributable to the safety class and not to the block's shape.
+    assert!(
+        admit_block(
+            &nat_environment(),
+            &unsafe_pair(),
+            AdmissionBudget::unlimited()
+        )
+        .is_admitted(),
+        "the unsafe control must be admitted"
+    );
+}
+
+#[test]
+fn kr977b_a_block_whose_members_disagree_on_safety_is_refused_naming_both_classes() {
+    let mixed = vec![
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+        member("B", &["A", "B"], DefinitionSafety::Partial),
+    ];
+    match admit_block(&nat_environment(), &mixed, AdmissionBudget::unlimited()) {
+        BlockVerdict::Rejected(BlockRejection::NonUniformSafety {
+            member,
+            expected,
+            found,
+        }) => {
+            assert_eq!(member, checker_name("B"));
+            assert_eq!(expected, Quarantine::Unsafe);
+            assert_eq!(found, Quarantine::Partial);
+        }
+        other => panic!("a mixed-safety block must be refused naming both, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr977a_each_shape_defect_is_refused_on_its_own_variant() {
+    let env = nat_environment();
+    let budget = AdmissionBudget::unlimited();
+
+    // Empty: nothing checked, so nothing admitted. Not a degenerate success.
+    assert!(
+        matches!(
+            admit_block(&env, &[], budget),
+            BlockVerdict::Rejected(BlockRejection::EmptyBlock)
+        ),
+        "an empty block must be refused on its own variant"
+    );
+
+    // Repeated member, naming BOTH positions.
+    let repeated = vec![
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+        member("B", &["A", "B"], DefinitionSafety::Unsafe),
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+    ];
+    match admit_block(&env, &repeated, budget) {
+        BlockVerdict::Rejected(BlockRejection::RepeatedMember {
+            member: name,
+            first,
+            second,
+        }) => {
+            assert_eq!(name, checker_name("A"));
+            assert_eq!((first, second), (0, 2), "both positions are carried");
+        }
+        other => panic!("a repeated member must be refused on its own variant, got {other:?}"),
+    }
+
+    // Asymmetric membership: B thinks the block is {B, C}, but {A, B} was supplied.
+    let asymmetric = vec![
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+        member("B", &["B", "C"], DefinitionSafety::Unsafe),
+    ];
+    match admit_block(&env, &asymmetric, budget) {
+        BlockVerdict::Rejected(BlockRejection::AsymmetricMembership { member: name }) => {
+            assert_eq!(name, checker_name("B"));
+        }
+        other => panic!("asymmetric membership must be refused on its own variant, got {other:?}"),
+    }
+
+    // A declaration carrying no mutual list is not part of a block at all.
+    let lone = vec![definition("A", a_type(), nat_constant())];
+    assert!(
+        matches!(
+            admit_block(&env, &lone, budget),
+            BlockVerdict::Rejected(BlockRejection::MemberDeclaresNoBlock { .. })
+        ),
+        "a member declaring no block must be refused on its own variant"
+    );
+}
+
+#[test]
+fn kr977a_membership_is_compared_as_a_set_so_a_permutation_is_not_a_defect() {
+    // The order a declaration lists its peers in is not a semantic fact, and
+    // refusing a permutation would be a wall against a correct block. This is
+    // the direction a set-vs-sequence comparison gets wrong silently.
+    let permuted = vec![
+        member("A", &["B", "A"], DefinitionSafety::Unsafe),
+        member("B", &["A", "B"], DefinitionSafety::Unsafe),
+    ];
+    assert!(
+        admit_block(&nat_environment(), &permuted, AdmissionBudget::unlimited()).is_admitted(),
+        "a permuted membership list names the same SET and must be admitted"
+    );
+}
+
+#[test]
+fn kr977_a_member_whose_own_admission_fails_carries_its_fl_inv_07_class_up() {
+    // The four Member* arms exist so a member that DEFERRED is not reported the
+    // same way as one that was REJECTED. This cell fails if they are collapsed.
+    let env = nat_environment();
+
+    // A member whose body does not match its declared type: a REJECTION.
+    let mismatched = vec![
+        ConstantEntry::new(
+            checker_name("A"),
+            ConstantDeclaration::definition(
+                Vec::new(),
+                a_type(),
+                ConstantSafety::Safe,
+                DefinitionBody::new(
+                    a_type(), // type is Sort 1, declared is Sort 0
+                    ReducibilityHint::Regular(0),
+                    DefinitionSafety::Unsafe,
+                    vec![checker_name("A"), checker_name("B")],
+                ),
+            ),
+        ),
+        member("B", &["A", "B"], DefinitionSafety::Unsafe),
+    ];
+    match admit_block(&env, &mismatched, AdmissionBudget::unlimited()) {
+        BlockVerdict::MemberRejected {
+            member: name,
+            rejection,
+        } => {
+            assert_eq!(name, checker_name("A"));
+            assert!(
+                matches!(*rejection, AdmissionRejection::BodyTypeMismatch { .. }),
+                "the member's own rejection must be carried verbatim, got {rejection:?}"
+            );
+        }
+        other => panic!("expected MemberRejected, got {other:?}"),
+    }
+
+    // A starved conversion budget: the member is INCONCLUSIVE, and the block must
+    // report that class rather than folding it into a rejection.
+    let verdict = admit_block(&env, &unsafe_pair(), starved_conversion());
+    assert!(
+        !matches!(verdict, BlockVerdict::MemberRejected { .. }),
+        "an exhausted budget must NEVER surface as a member rejection, got {verdict:?}"
+    );
+    assert!(
+        verdict.is_inconclusive_family(),
+        "an exhausted budget must be a non-answer at the block layer too, got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr977_a_refused_block_admits_no_member() {
+    // The atomicity property, and an honest note about what asserting it costs.
+    //
+    // It holds BY CONSTRUCTION rather than by a rollback: `admit_block` takes
+    // `&ConstantEnvironment` and returns an observation, so there is no
+    // environment mutation anywhere in this module to undo. The value of this
+    // cell is therefore PROSPECTIVE -- it fails on the day admission becomes
+    // stateful, which is the only day the property could be lost. Recorded that
+    // way rather than presented as evidence that a rollback works, because there
+    // is no rollback.
+    let environment = nat_environment();
+    let before = environment.clone();
+    let safe_block = vec![
+        member("A", &["A", "B"], DefinitionSafety::Safe),
+        member("B", &["A", "B"], DefinitionSafety::Safe),
+    ];
+    let verdict = admit_block(&environment, &safe_block, AdmissionBudget::unlimited());
+    assert!(!verdict.is_admitted(), "this block must be refused");
+    assert_eq!(
+        environment, before,
+        "a refused block must leave the environment untouched"
+    );
+    assert_eq!(
+        environment.len(),
+        before.len(),
+        "and in particular must not have admitted a member"
+    );
+
+    // Anti-vacuity: an ADMITTED block leaves it untouched too, so the assertion
+    // above is not passing because admission is a no-op for refusals only.
+    let ok = admit_block(&environment, &unsafe_pair(), AdmissionBudget::unlimited());
+    assert!(ok.is_admitted());
+    assert_eq!(
+        environment, before,
+        "admission produces an OBSERVATION, never an environment -- if this ever \
+         fails, the atomicity property above has lost its mechanism"
+    );
+}
+
+#[test]
+fn kr977_the_max_mutual_members_budget_still_binds() {
+    // The one part of this machinery that already worked before KR-977: the
+    // environment's own meter. A slice that replaced metering with judgement
+    // while silently dropping the meter would be a regression nothing else
+    // watches, so the meter is asserted here rather than assumed.
+    let entries = vec![
+        member("A", &["A", "B"], DefinitionSafety::Unsafe),
+        member("B", &["A", "B"], DefinitionSafety::Unsafe),
+    ];
+    // max_mutual_members = 1, everything else unlimited: the meter is the only
+    // variable, so a refusal is attributable to it.
+    let starved = EnvironmentBudget::new(u64::MAX, u64::MAX, u64::MAX, 1, u64::MAX, u64::MAX);
+    assert!(
+        !matches!(
+            ConstantEnvironment::build(entries.clone(), starved),
+            EnvironmentOutcome::Complete { .. }
+        ),
+        "max_mutual_members must still refuse a block that exceeds it"
+    );
+    // Control: the same entries under an unlimited budget build cleanly, so the
+    // refusal above is the meter and not the entries.
+    assert!(
+        matches!(
+            ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()),
+            EnvironmentOutcome::Complete { .. }
+        ),
+        "the same entries must build when the budget allows it"
+    );
 }
