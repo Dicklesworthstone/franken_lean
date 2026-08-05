@@ -202,7 +202,12 @@ use fln_conformance::execution::{Field, record_field};
 const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("rootless_leaf", 99),
     ("glob", 20),
-    ("never_existed", 15),
+    // 15 -> 13 at 8042d789: two citations of `crates/fln-syntax/src/syntax.rs`, a path with
+    // zero commits in the object store, repointed to `crates/fln-syntax/src/tree.rs`, which
+    // carries the `pub enum Syntax` and the kind/atom/node/missing forms those two beads name.
+    // A repair shrinks this census, and the disclosure owes the same commit -- I did not, and
+    // this guard caught it.
+    ("never_existed", 13),
     ("commit_unreachable", 0),
     ("present_but_untracked", 9),
     ("under_target_ephemeral", 8),
