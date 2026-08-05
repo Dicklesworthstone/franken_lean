@@ -98,6 +98,7 @@ fn workload_with(policy: HostQualificationPolicy) -> WorkloadManifest {
         // A placeholder kind: this probe measures no workload at all, and the
         // host-admission verdict under test is independent of the operation.
         workload_kind: WorkloadKind::CorpusBuild,
+        oracle_tools: Vec::new(),
         corpus_root: hash(
             Domain::OperationalMeta,
             b"odwj-host-qualification-probe/corpus",

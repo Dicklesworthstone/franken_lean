@@ -77,6 +77,7 @@ fn preregistered() -> WorkloadManifest {
         schema_version: BENCHMARK_EVIDENCE_VERSION,
         workload_id: "odwj-reference-baseline".to_string(),
         workload_kind: WorkloadKind::KernelRecheck,
+        oracle_tools: Vec::new(),
         corpus_root: digest("corpus/mathlib4@pin"),
         input_order_root: digest("input-order/declared"),
         warmup_iterations: 3,

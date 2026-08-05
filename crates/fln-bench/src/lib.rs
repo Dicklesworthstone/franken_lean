@@ -25,7 +25,8 @@ use std::time::Instant;
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
 use fln_hash::domain::{Digest, Domain, hash};
 
-/// Bumped 1 -> 2 by `franken_lean-odwj` when [`WorkloadKind`] was added.
+/// Bumped 1 -> 2 by `franken_lean-odwj` when [`WorkloadKind`] was added, and
+/// 2 -> 3 by the same bead when [`OracleToolIdentity`] was added.
 ///
 /// All six schema ids below share this version deliberately, so the durable
 /// shapes move together and `read_supported_evidence_version` refuses any other
@@ -33,7 +34,7 @@ use fln_hash::domain::{Digest, Domain, hash};
 /// therefore rejected rather than silently reinterpreted — there are no
 /// persisted v1 bundles, which is exactly why the discriminator was added now
 /// rather than after baselines existed.
-pub const BENCHMARK_EVIDENCE_VERSION: u16 = 2;
+pub const BENCHMARK_EVIDENCE_VERSION: u16 = 3;
 
 pub const BENCHMARK_HOST_PROFILE_SCHEMA: SchemaId = SchemaId {
     name: "fln.bench.host-profile",
@@ -481,6 +482,33 @@ impl WorkloadKind {
     }
 }
 
+/// Identity of one external, oracle-side tool a workload's measurement depends
+/// on.
+///
+/// Added by `franken_lean-odwj`. odwj requires the "CaDiCaL identity loss"
+/// mutation to be killed, and before this type existed there was nowhere for
+/// that identity to live: the only semantic identity slots in the substrate were
+/// [`HostProfile::toolchain_hash`] (the *Rust* toolchain) and `binary_hash` (the
+/// measurement executable), neither of which can name an external solver. The
+/// obvious alternative — recording it in [`AttemptTelemetry`] — is worse than
+/// nothing, because telemetry is *non-semantic by this crate's own stated law*:
+/// changing it must move the telemetry and bundle roots **without** moving the
+/// semantic root. An identity recorded there could be swapped with no semantic
+/// consequence, which is precisely the mutation.
+///
+/// **D4/Tribunal-side only.** These are tools the *oracle* runs. Recording one
+/// here does not admit it into FrankenLean: D2's two inherited tools are
+/// unchanged, and nothing in this crate executes anything named here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OracleToolIdentity {
+    /// Stable tool name, e.g. `"cadical"`.
+    pub name: String,
+    /// Digest of the tool **binary**, not of its version string. A version
+    /// string is a claim the tool makes about itself; the binary hash is a fact
+    /// about the bytes that produced the oracle's side of the comparison.
+    pub binary_hash: Digest,
+}
+
 /// Frozen before the first attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadManifest {
@@ -488,6 +516,12 @@ pub struct WorkloadManifest {
     pub workload_id: String,
     /// What this workload measures. See [`WorkloadKind`].
     pub workload_kind: WorkloadKind,
+    /// Oracle-side tools this workload's measurement depends on, sorted by name
+    /// and duplicate-free.
+    ///
+    /// **Empty is a positive declaration**, not an absence of information: it
+    /// states that no external tool participated. Most workloads carry none.
+    pub oracle_tools: Vec<OracleToolIdentity>,
     pub corpus_root: Digest,
     pub input_order_root: Digest,
     pub warmup_iterations: u32,
@@ -1820,6 +1854,14 @@ fn write_workload_body(writer: &mut CanonWriter, workload: &WorkloadManifest) {
     // The measured operation is SEMANTIC: it must move the workload root, so a
     // module import cannot share an identity with a kernel recheck.
     writer.u8(workload.workload_kind.tag());
+    // Oracle-side tool identities are SEMANTIC for the same reason: swapping the
+    // solver that produced the oracle's side of a comparison must move the
+    // workload root, or "CaDiCaL identity loss" is undetectable.
+    writer.u32(workload.oracle_tools.len() as u32);
+    for tool in &workload.oracle_tools {
+        writer.str(&tool.name);
+        write_digest(writer, tool.binary_hash);
+    }
     write_digest(writer, workload.corpus_root);
     write_digest(writer, workload.input_order_root);
     writer.u32(workload.warmup_iterations);
@@ -1856,6 +1898,23 @@ fn read_workload_body(reader: &mut CanonReader<'_>) -> Result<WorkloadManifest, 
     }
     let workload_kind = WorkloadKind::from_tag(reader.u8()?)
         .ok_or_else(|| decode_problem("unknown benchmark workload kind"))?;
+    let oracle_tool_count = reader.u32()?;
+    if oracle_tool_count as usize > MAX_FEATURES {
+        return Err(decode_problem("benchmark oracle tool count exceeds limit"));
+    }
+    let mut oracle_tools = Vec::with_capacity(oracle_tool_count as usize);
+    for _ in 0..oracle_tool_count {
+        let name = reader.str()?.to_string();
+        if name.is_empty() || name.len() > MAX_TEXT_BYTES {
+            return Err(decode_problem(
+                "benchmark oracle tool name is out of bounds",
+            ));
+        }
+        oracle_tools.push(OracleToolIdentity {
+            name,
+            binary_hash: read_digest(reader)?,
+        });
+    }
     let corpus_root = read_digest(reader)?;
     let input_order_root = read_digest(reader)?;
     let warmup_iterations = reader.u32()?;
@@ -1886,6 +1945,7 @@ fn read_workload_body(reader: &mut CanonReader<'_>) -> Result<WorkloadManifest, 
         schema_version,
         workload_id,
         workload_kind,
+        oracle_tools,
         corpus_root,
         input_order_root,
         warmup_iterations,
@@ -2935,6 +2995,24 @@ fn validate_workload(workload: &WorkloadManifest) -> Result<(), BenchmarkRefusal
             field: "workload-id",
         });
     }
+    // Sorted and duplicate-free, or two orderings of the SAME oracle tool set
+    // would produce different workload roots and a re-registration could be
+    // passed off as a different workload. Each name and digest is bounded for
+    // the same reason every other text field here is.
+    if workload.oracle_tools.len() > MAX_FEATURES
+        || workload
+            .oracle_tools
+            .iter()
+            .any(|tool| tool.name.is_empty() || tool.name.len() > MAX_TEXT_BYTES)
+        || !workload
+            .oracle_tools
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
+    {
+        return Err(BenchmarkRefusal::MalformedWorkload {
+            field: "oracle-tools",
+        });
+    }
     let max_valid = match workload.sample_plan {
         SamplePlan::FixedValidSamples { samples } if samples > 0 => samples,
         SamplePlan::FixedValidSamples { .. } => {
@@ -3678,6 +3756,7 @@ mod tests {
             schema_version: BENCHMARK_EVIDENCE_VERSION,
             workload_id: "fixture-workload".to_string(),
             workload_kind: WorkloadKind::CorpusBuild,
+            oracle_tools: Vec::new(),
             corpus_root: digest("corpus"),
             input_order_root: digest("input-order"),
             warmup_iterations: 2,
@@ -3937,8 +4016,8 @@ mod tests {
         // original, and this assertion fails for the wrong reason on every
         // legitimate version bump. Moved 1->2 to 2->3 with the odwj bump.
         let version_drift_source = source.replacen(
-            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 2;",
             "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 3;",
+            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 4;",
             1,
         );
         assert_ne!(

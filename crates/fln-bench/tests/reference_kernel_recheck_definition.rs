@@ -91,6 +91,7 @@ fn workload_under(cache: CacheState) -> WorkloadManifest {
         schema_version: BENCHMARK_EVIDENCE_VERSION,
         workload_id: "reference-kernel-recheck".to_string(),
         workload_kind: WorkloadKind::KernelRecheck,
+        oracle_tools: Vec::new(),
         corpus_root: hash(Domain::OperationalMeta, b"olean-set/reference@pin"),
         input_order_root: hash(Domain::OperationalMeta, b"olean-set/declared-order"),
         warmup_iterations: 0,
