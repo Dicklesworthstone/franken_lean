@@ -72,7 +72,7 @@ use crate::defeq::{
 };
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome,
 };
 use crate::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
@@ -276,6 +276,12 @@ pub enum AdmissionFault {
     /// The declared type reduced to a `Sort` whose universe could not be
     /// normalized, so KR-974b cannot decide whether it is a proposition.
     UniverseNotNormalizable { name: WireName },
+    /// KR-977 — the peers-only predeclared environment would not build.
+    ///
+    /// A FAULT and not a rejection: by the time this runs, KR-977a's shape rules
+    /// have already established that the block is well formed and its members
+    /// distinct, so a failure here is this module's defect rather than bad input.
+    PredeclarationUnbuildable { name: WireName },
 }
 
 /// KR-975 / KR-976 — which quarantine a declaration lands in.
@@ -1088,13 +1094,59 @@ pub fn admit_block_with(
         return BlockVerdict::Rejected(rejection);
     }
 
+    // KR-970 for the WHOLE block, against the BASE environment, before anything
+    // is predeclared.
+    //
+    // This ordering is a repair, and the defect it fixes was found by a gut
+    // mutant rather than by reading. Predeclaring member i's peers puts those
+    // peers' names in an environment that already contains the base; if ANY
+    // member collides with the base, that duplicate appears while checking a
+    // DIFFERENT member, and the collision surfaced as
+    // `PredeclarationUnbuildable` blaming the wrong member -- an internal fault
+    // for what is plainly untrusted input, which is the FL-INV-07 line this
+    // module exists to hold. Checking every member up front means a collision is
+    // reported as KR-970, on the member that actually collides, and
+    // predeclaration never sees a duplicate at all.
+    for entry in block {
+        if environment.find(entry.name()).is_some() {
+            return BlockVerdict::MemberRejected {
+                member: entry.name().clone(),
+                rejection: Box::new(AdmissionRejection::NameAlreadyDeclared {
+                    name: entry.name().clone(),
+                }),
+            };
+        }
+    }
+
     // Every member is admitted under the ordinary rules. The block's verdict is
     // the conjunction: one member short of admitted and the block is not
     // admitted, with that member's own outcome carried at its own FL-INV-07
     // class rather than flattened.
     let mut members = Vec::new();
-    for entry in block {
-        match admit_with(environment, entry, budget, &mut cancelled) {
+    for (index, entry) in block.iter().enumerate() {
+        // KR-977's predeclaration half. Each member is checked in an environment
+        // holding its PEERS' headers -- name and declared type, never a body, so
+        // a peer can be referenced but not unfolded, and a body is checked
+        // against declared types rather than against other bodies.
+        //
+        // PEERS-ONLY rather than the whole block, and this is the load-bearing
+        // detail. Predeclaring every member INCLUDING self would put each member
+        // in its own environment and KR-970 -- one name, one constant -- would
+        // refuse every one of them for colliding with itself. Excluding self
+        // leaves KR-970 firing correctly against the base environment, with no
+        // flag, no skip-list, and no weakening of the rule.
+        let scoped = match predeclare_peers(environment, block, index) {
+            Ok(scoped) => scoped,
+            Err(()) => {
+                return BlockVerdict::MemberFault {
+                    member: entry.name().clone(),
+                    fault: Box::new(AdmissionFault::PredeclarationUnbuildable {
+                        name: entry.name().clone(),
+                    }),
+                };
+            }
+        };
+        match admit_with(&scoped, entry, budget, &mut cancelled) {
             Verdict::Admitted(admission) => members.push(admission.name().clone()),
             Verdict::Rejected(rejection) => {
                 return BlockVerdict::MemberRejected {
@@ -1134,6 +1186,46 @@ pub fn admit_block_with(
         AdmissionGround::BodyCheckedAgainstDeclaredType,
     );
     BlockVerdict::Admitted(BlockAdmission { members, ground })
+}
+
+/// KR-977 — the environment a member is checked in: everything already there,
+/// plus every OTHER member's header.
+///
+/// A predeclared peer is built with `ConstantDeclaration::header`, which hardcodes
+/// an absent body, so a peer is visible by name and declared type and cannot be
+/// delta-unfolded while checking against it. That is not a precaution this
+/// function takes; it is what `header` is.
+///
+/// Built through `ConstantEnvironment::build` rather than a second construction
+/// path, so a predeclared environment cannot drift from an ordinary one.
+fn predeclare_peers(
+    environment: &ConstantEnvironment,
+    block: &[ConstantEntry],
+    skip: usize,
+) -> Result<ConstantEnvironment, ()> {
+    let mut entries: Vec<ConstantEntry> = environment
+        .constants()
+        .map(|(name, declaration)| ConstantEntry::new(name.clone(), declaration.clone()))
+        .collect();
+    for (index, entry) in block.iter().enumerate() {
+        if index == skip {
+            continue;
+        }
+        let declaration = entry.declaration();
+        entries.push(ConstantEntry::new(
+            entry.name().clone(),
+            ConstantDeclaration::header(
+                declaration.level_parameters().to_vec(),
+                declaration.type_().clone(),
+                declaration.kind(),
+                declaration.safety(),
+            ),
+        ));
+    }
+    match ConstantEnvironment::build(entries, EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => Ok(environment),
+        _ => Err(()),
+    }
 }
 
 /// KR-977a — the block is a well-formed set.

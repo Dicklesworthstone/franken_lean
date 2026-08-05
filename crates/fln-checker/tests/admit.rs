@@ -1570,3 +1570,171 @@ fn kr977_the_max_mutual_members_budget_still_binds() {
         "the same entries must build when the budget allows it"
     );
 }
+
+/// A member whose BODY references its peer by name — the defining shape of a
+/// mutual block, and the one gii.26 could not admit.
+fn recursive_member(name: &str, peer: &str, block: &[&str]) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                decoded(&Expr::const_(primary_name(peer), Vec::new())),
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Unsafe,
+                block.iter().map(|n| checker_name(*n)).collect(),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn kr977_a_genuinely_mutually_recursive_block_is_admitted() {
+    // THE CELL THIS BEAD EXISTS FOR. Two members whose bodies each reference the
+    // other. Under gii.26 this failed on UnknownConstant for the peer, because
+    // members were admitted independently against an environment that did not
+    // contain them — so the shape rules gated an admission that could not happen.
+    //
+    // Each member's declared type is `Sort 0` and each body is the peer constant,
+    // whose predeclared type is `Sort 0`, so the bodies type-check against the
+    // peers' DECLARED types rather than against their bodies.
+    let block = vec![
+        recursive_member("A", "B", &["A", "B"]),
+        recursive_member("B", "A", &["A", "B"]),
+    ];
+    match admit_block(&nat_environment(), &block, AdmissionBudget::unlimited()) {
+        BlockVerdict::Admitted(admission) => {
+            assert_eq!(admission.members(), &[checker_name("A"), checker_name("B")]);
+            assert_eq!(admission.ground(), AdmissionGround::UnsafeQuarantine);
+        }
+        other => panic!(
+            "a mutually-recursive block must be ADMITTED once its peers are \
+             predeclared; this is the case gii.26 could not reach: {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn kr977_predeclaration_leaves_kr970_unweakened_in_both_directions() {
+    // Predeclaring the whole block INCLUDING self would put every member in its
+    // own environment, and KR-970 would refuse each one for colliding with
+    // itself. Excluding self is what keeps the rule intact — and a cell covering
+    // only that direction would also pass against an implementation that had
+    // simply DELETED KR-970, which is why both directions are here.
+    let block = vec![
+        recursive_member("A", "B", &["A", "B"]),
+        recursive_member("B", "A", &["A", "B"]),
+    ];
+
+    // Direction 1: a member is NOT refused for colliding with its own
+    // predeclaration.
+    assert!(
+        admit_block(&nat_environment(), &block, AdmissionBudget::unlimited()).is_admitted(),
+        "a member must not collide with its own predeclared header"
+    );
+
+    // Direction 2: KR-970 still fires. `A` already exists in the base
+    // environment, so the block must be refused naming it.
+    let occupied = environment_of(vec![
+        ConstantEntry::new(
+            checker_name("Nat"),
+            header(
+                Vec::new(),
+                a_type(),
+                ConstantKind::Inductive,
+                ConstantSafety::Safe,
+            ),
+        ),
+        axiom("A"),
+    ]);
+    match admit_block(&occupied, &block, AdmissionBudget::unlimited()) {
+        BlockVerdict::MemberRejected { member, rejection } => {
+            assert_eq!(member, checker_name("A"));
+            assert!(
+                matches!(*rejection, AdmissionRejection::NameAlreadyDeclared { .. }),
+                "KR-970 must still refuse a member whose name is already taken in the \
+                 BASE environment, got {rejection:?}"
+            );
+        }
+        other => panic!("KR-970 must still fire through predeclaration, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr977_a_predeclared_peer_carries_no_body_so_it_cannot_be_unfolded() {
+    // Predeclaration exposes TYPES, not definitions. A peer is built with
+    // `ConstantDeclaration::header`, which hardcodes an absent body, so nothing
+    // can delta-unfold a peer while checking against it.
+    //
+    // Measured through the same predicate the reduction path uses rather than
+    // asserted about the code: `is_delta_unfoldable` is `delta_body().is_some()`,
+    // and a header-built peer has no body at all.
+    let peer = recursive_member("B", "A", &["A", "B"]);
+    let declaration = peer.declaration();
+    let predeclared = ConstantDeclaration::header(
+        declaration.level_parameters().to_vec(),
+        declaration.type_().clone(),
+        declaration.kind(),
+        declaration.safety(),
+    );
+    assert!(
+        predeclared.definition_body().is_none(),
+        "a predeclared peer must carry NO body"
+    );
+    assert!(
+        !predeclared.is_delta_unfoldable(),
+        "a predeclared peer must not be delta-unfoldable"
+    );
+
+    // Anti-vacuity: the ORIGINAL declaration does have a body, so the assertions
+    // above are about predeclaration and not about this declaration being empty.
+    assert!(
+        declaration.definition_body().is_some(),
+        "the original member must have a body, or the assertions above are vacuous"
+    );
+}
+
+#[test]
+fn kr977_a_collision_on_any_member_is_kr970_on_that_member_not_a_fault_on_another() {
+    // Found by a gut mutant, not by reading. Predeclaring member i's peers puts
+    // those names into an environment that already holds the base, so a member
+    // colliding with the base created a duplicate while checking a DIFFERENT
+    // member — and the collision surfaced as PredeclarationUnbuildable blaming
+    // the wrong member: an internal fault for what is plainly untrusted input.
+    //
+    // The SECOND member is the colliding one deliberately. With the first member
+    // colliding, the old code happened to report KR-970 correctly, so a cell
+    // built that way would have passed against the defect.
+    let occupied = environment_of(vec![
+        ConstantEntry::new(
+            checker_name("Nat"),
+            header(
+                Vec::new(),
+                a_type(),
+                ConstantKind::Inductive,
+                ConstantSafety::Safe,
+            ),
+        ),
+        axiom("B"),
+    ]);
+    let block = vec![
+        recursive_member("A", "B", &["A", "B"]),
+        recursive_member("B", "A", &["A", "B"]),
+    ];
+    match admit_block(&occupied, &block, AdmissionBudget::unlimited()) {
+        BlockVerdict::MemberRejected { member, rejection } => {
+            assert_eq!(
+                member,
+                checker_name("B"),
+                "the rejection must name the member that actually collides"
+            );
+            assert!(
+                matches!(*rejection, AdmissionRejection::NameAlreadyDeclared { .. }),
+                "a collision is KR-970, never an internal fault, got {rejection:?}"
+            );
+        }
+        other => panic!("expected KR-970 on the colliding member, got {other:?}"),
+    }
+}
