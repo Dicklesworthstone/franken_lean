@@ -987,7 +987,7 @@ elsewhere, here pointed at the durability rule itself.
 
 ```text
 povo-adopted: no
-povo-nondurable-terminal: 266
+povo-nondurable-terminal: 262
 ```
 
 That is what adoption would refuse **today**, derived per commit by
@@ -1003,7 +1003,12 @@ answer — twice, before the right instrument produced 276.
 owners** — a long tail, at most 9 per bead — so it parcels out rather than landing on anyone.
 **24 were cc_3's own**, and the 11 that were short commit shas are expanded: a short sha is
 non-durable because it can become ambiguous as the object store grows, and each was verified to
-resolve to a commit object AND to be an ancestor of `HEAD` before being widened. 276 -> 266.
+resolve to a commit object AND to be an ancestor of `HEAD` before being widened. 276 -> 262 across two commits. The second slice was per-row judgement rather than a script: two
+cross-bead `bead-comment:` citations removed (the classifier requires the comment to name its own
+bead, so a cross-bead reference is structurally invalid — the prose keeps it), and two citations of
+`crates/fln-syntax/src/syntax.rs`, a path with **zero commits in the entire object store**,
+repointed to `crates/fln-syntax/src/tree.rs`, which carries the `pub enum Syntax` and the
+kind/atom/node/missing forms those two beads name.
 The rest of cc_3's share is not mechanical — bare run-artifact filenames with no durable
 referent, and one path that never existed in any commit — and those need judgement per row
 rather than a script.
