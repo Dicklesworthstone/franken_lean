@@ -56,11 +56,76 @@ fln_gate_confirm_inherited() {
 }
 
 # o2vz Finding 2: "held" with no producer is the empty referent. Name what holds it.
+# Name what actually HOLDS the gate lock.
+#
+# NOT `fuser`, and not `lsof`. AGENTS.md measured both false at `f5359c22`, in the
+# direction that manufactures the phantom freeze this function exists to prevent:
+# a lock belongs to the open file DESCRIPTION, while those tools report every
+# process holding a DESCRIPTOR. Against a process that had merely done
+# `exec 7>><lock>` and never locked — with the gate FREE by ground truth —
+# `fuser -v` and `lsof` each named it a holder. `fuser`'s own ACCESS column reads
+# `F`, meaning open for writing; it never claimed to mean locked.
+#
+# `/proc/locks` is the kernel's record of actual holdings: one FLOCK row per held
+# lock, carrying the holding pid and the file's MAJOR:MINOR:INODE. Match on the
+# inode and exclude our own process tree.
+#
+# THREE OUTCOMES, NOT TWO, and that is the structural part rather than an edge
+# case. `/proc/<pid>/cwd` is unreadable for a process owned by another user, which
+# on this shared box is the COMMON case — so a two-bucket classifier must put
+# every such holder somewhere and is wrong whichever it picks. An unattributed
+# holder is reported as neither a lane nor a stray.
+#
+# What this does not earn: `/proc/locks` and `/proc/<pid>/cwd` are Linux-specific;
+# a process that chdirs after launch reports where it IS, not where it started;
+# and where a lock is held through a shared open file description the kernel
+# records one pid while others hold it too, so naming the recorded holder is a
+# judgement rather than a measurement.
+# The checkout this gate belongs to. Derived from this script's own location, so
+# a copy of the library in another repository compares against ITS root rather
+# than against a transcribed path.
+: "${FLN_GATE_REPO_ROOT:=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
+
 fln_gate_name_holder() {
-  local pid named=0
-  for pid in $(/usr/bin/fuser "$FLN_GATE_LOCKFILE" 2>/dev/null); do
-    ps -o pid=,stat=,args= -p "$pid" 2>/dev/null && named=1
-  done
+  local inode named=0 line pid cwd
+  inode=$(stat -c '%i' "$FLN_GATE_LOCKFILE" 2>/dev/null) || {
+    echo "  (the lockfile could not be stat'd — INDETERMINATE, not free)"
+    return
+  }
+  while IFS= read -r line; do
+    # Blocked WAITER rows begin with `->` and shift every column, so they are
+    # skipped deliberately: a waiter is not a holder, and misreading one as a
+    # holder reports a freeze that does not exist.
+    case "$line" in *"->"*) continue ;; esac
+    case "$line" in *FLOCK*) : ;; *) continue ;; esac
+    # Columns: N: FLOCK ADVISORY WRITE <pid> MAJ:MIN:INO <start> <end>
+    # Split into NAMED fields rather than positional `set --`: the intent is
+    # readable, and shellcheck does not have to be told that the word-splitting
+    # is deliberate.
+    local _idx _kind _mode _rw range
+    read -r _idx _kind _mode _rw pid range _ <<<"$line"
+    case "$range" in *:*:"$inode") : ;; *) continue ;; esac
+    # Our own process tree holds nothing here and would self-match through any
+    # probe we run; excluding it is what stops this reporting itself.
+    [ "$pid" = "$$" ] && continue
+    [ "$pid" = "$PPID" ] && continue
+    named=1
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    if [ -z "$cwd" ]; then
+      # Unreadable cwd: another user's process. Neither lane nor stray.
+      echo "  pid $pid holds the gate — UNATTRIBUTED (cwd unreadable; likely another user)"
+      ps -o pid=,stat=,args= -p "$pid" 2>/dev/null || true
+    elif [ "$cwd" != "$FLN_GATE_REPO_ROOT" ]; then
+      # A different checkout on this host. `scripts/check.sh` is not a unique
+      # name on a machine hosting a dozen FrankenSuite repositories, so argv
+      # alone would score this a lane and freeze a pane for nothing.
+      echo "  pid $pid holds the gate from a FOREIGN checkout ($cwd) — not our lane"
+      ps -o pid=,stat=,args= -p "$pid" 2>/dev/null || true
+    else
+      echo "  pid $pid holds the gate, cwd=$cwd"
+      ps -o pid=,stat=,args= -p "$pid" 2>/dev/null || true
+    fi
+  done < /proc/locks
   [ "$named" = 1 ] || echo "  (no holder could be named — treat as INDETERMINATE, not as free)"
 }
 
