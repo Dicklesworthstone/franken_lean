@@ -4315,3 +4315,54 @@ fn no_rule_family_deferral_remains_reachable() {
         }
     }
 }
+
+#[test]
+fn kr112_a_rule_naming_a_non_constructor_is_refused() {
+    // The check KR-112 originally disclosed as unenforceable. That disclosure was
+    // FALSE: `ConstantDeclaration::kind` existed all along, and the search that
+    // "established" its absence (`pub fn kind`) could not match `pub const fn`.
+    // This cell is the repair -- the work the excuse excused.
+    //
+    // The projection rule is caller-supplied, so a rule pointing at a constant
+    // that is not a constructor is untrusted input with its own typed refusal,
+    // not a generic rejection and not a panic.
+    let entries = flat_structure_env();
+    let context = projection_context(
+        entries,
+        // `S` is an Inductive, not a Constructor -- a plausible mistake, since it
+        // is the very structure being projected.
+        vec![ProjectionRule::new(checker_name("S"), checker_name("S"), 0)],
+    );
+    let outcome = infer(
+        &decoded(&Expr::proj(primary_name("S"), 0, scrutinee())),
+        &context,
+        InferenceMode::InferOnly,
+        InferenceBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ProjectionConstructorKind { .. },
+                ..
+            }
+        ),
+        "a rule naming a non-constructor must get its OWN typed refusal, got {outcome:?}"
+    );
+
+    // Control: the same shape with the REAL constructor still infers, so the cell
+    // above is not passing because projection is broken generally.
+    let ok = projection_context(flat_structure_env(), vec![flat_rule()]);
+    assert!(
+        matches!(
+            infer(
+                &decoded(&Expr::proj(primary_name("S"), 0, scrutinee())),
+                &ok,
+                InferenceMode::InferOnly,
+                InferenceBudget::unlimited(),
+            ),
+            InferenceOutcome::Complete(_)
+        ),
+        "the control must still infer -- otherwise the refusal above proves nothing"
+    );
+}

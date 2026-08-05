@@ -14,7 +14,7 @@ use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
     QuickDefEqBudget, def_eq_with,
 };
-use crate::environment::{ConstantEnvironment, ConstantSafety, DefinitionSafety};
+use crate::environment::{ConstantEnvironment, ConstantKind, ConstantSafety, DefinitionSafety};
 use crate::instantiate::{
     InstantiationFault, InstantiationOutcome, InstantiationRefusal,
     instantiate_term_parameters_from_level_roots_with,
@@ -516,6 +516,11 @@ pub enum InferenceRefusal {
     /// structure the projection names.
     ProjectionStructureMismatch {
         expected: WireName,
+    },
+    /// KR-112: the projection rule names a constant that is not declared as a
+    /// constructor. Caller-supplied metadata, so this is untrusted input.
+    ProjectionConstructorKind {
+        constructor: WireName,
     },
     /// KR-112: the rule's parameter_count exceeds the arguments the scrutinee's
     /// type actually supplies, or the constructor telescope is shorter than the
@@ -2867,9 +2872,16 @@ impl<'a> InferenceEngine<'a> {
     /// field's type may mention an earlier one. The requested field's domain is
     /// the answer.
     ///
-    /// **Not checked, and disclosed rather than faked:** that the constructor is
-    /// declared with `ConstantKind::Constructor`. `ConstantDeclaration` exposes no
-    /// `kind()` accessor, so this rule cannot see it.
+    /// The rule's constructor must be declared with `ConstantKind::Constructor`.
+    ///
+    /// **KR-112 originally disclosed this as unenforceable, and that disclosure was
+    /// FALSE.** `ConstantDeclaration::kind` exists (`environment.rs:161`) and always
+    /// did; the search that "established" its absence was `pub fn kind`, which
+    /// cannot match a `pub const fn`. A scan that could not find the thing was read
+    /// as proof the thing was missing, and the wrong conclusion travelled into a
+    /// code comment, a bead, a coverage row and a routed message. The check is
+    /// implemented below rather than merely un-disclosed: the honest repair for an
+    /// excuse that was never true is the work it excused.
     #[inline(never)]
     fn complete_projection(
         &mut self,
@@ -2926,6 +2938,16 @@ impl<'a> InferenceEngine<'a> {
                 .ok_or(LeafHalt::Refused(InferenceRefusal::UnknownConstant {
                     name: constructor_name.clone(),
                 }))?;
+        // KR-112: the projection rule is CALLER-SUPPLIED, so a rule naming a
+        // constant that is not a constructor is untrusted input rather than an
+        // internal inconsistency. Refuse it in its own right.
+        if declaration.kind() != ConstantKind::Constructor {
+            return Err(LeafHalt::Refused(
+                InferenceRefusal::ProjectionConstructorKind {
+                    constructor: constructor_name,
+                },
+            ));
+        }
         if declaration.level_parameters().len() != levels.len() {
             return Err(LeafHalt::Refused(InferenceRefusal::ConstantUniverseArity {
                 name: constructor_name,
