@@ -5000,6 +5000,311 @@ def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
     )
 
 
+GRANULARITY_DELTA_SCHEMA = "fln.coverage-granularity-delta/1"
+
+
+def workspace_member_dirs(root: Path) -> list[str]:
+    """Expand the root manifest's own ``[workspace] members`` globs.
+
+    Derived, never listed. A pattern this cannot expand contributes no members, and that is the
+    permitting direction: an unrecognised member shape leaves its files unclassified, so the
+    delta check below cannot refuse on one.
+    """
+    try:
+        manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    match = re.search(r"(?m)^members\s*=\s*\[([^\]]*)\]", manifest)
+    if match is None:
+        return []
+    members: set[str] = set()
+    for pattern in re.findall(r'"([^"]+)"', match.group(1)):
+        prefix = pattern[: -len("/*")] if pattern.endswith("/*") else None
+        if prefix is None:
+            if (root / pattern).is_dir():
+                members.add(pattern)
+            continue
+        try:
+            entries = list((root / prefix).iterdir())
+        except OSError:
+            continue
+        members.update(f"{prefix}/{entry.name}" for entry in entries if entry.is_dir())
+    return sorted(members)
+
+
+def autodiscovery_override_reasons(manifest: str) -> list[str]:
+    """Why cargo's integration-test auto-discovery no longer describes a member's layout.
+
+    The Python side of ``crates/fln-conformance/src/execution.rs``'s
+    ``autodiscovery_overrides``. A second reader of the same two keys, deliberately: the
+    alternative is to GUESS which files are targets in an overridden member, and every use of
+    that answer below is a refusal, so a guess there refuses a row the Rust guard permits.
+    """
+    reasons: list[str] = []
+    for line in manifest.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith("#"):
+            continue
+        if trimmed == "[[test]]":
+            reasons.append("declares an explicit [[test]] target section")
+        if trimmed.startswith("autotests") and trimmed[len("autotests") :].lstrip().startswith(
+            "="
+        ):
+            reasons.append("sets `autotests`, which turns auto-discovery off")
+    return sorted(set(reasons))
+
+
+def integration_test_targets(root: Path) -> tuple[set[str], dict[str, str], list[str]]:
+    """Every path cargo auto-discovers as an integration-test target, by path and by stem.
+
+    A target is a top-level ``<member>/tests/<name>.rs``: ``tests/common/mod.rs`` is a module and
+    not a target, and a directory-style ``tests/<dir>/main.rs`` is a target this layout rule does
+    not model. The third value carries everything that was NOT modelled, and every entry in it
+    narrows the refusal rather than widening it.
+
+    The stem map is checked for injectivity before it is used as one. Two members owning the same
+    file stem makes ``cargo-test:<stem>`` stop denoting a single target, which is a key used as an
+    identity without one — so the colliding stems are dropped and disclosed instead.
+    """
+    targets: set[str] = set()
+    by_stem: dict[str, str] = {}
+    collided: set[str] = set()
+    unmodelled: list[str] = []
+    for member in workspace_member_dirs(root):
+        try:
+            manifest = (root / member / "Cargo.toml").read_text(encoding="utf-8")
+        except OSError:
+            unmodelled.append(f"{member}/Cargo.toml is unreadable")
+            continue
+        reasons = autodiscovery_override_reasons(manifest)
+        if reasons:
+            unmodelled.extend(f"{member}/Cargo.toml {reason}" for reason in reasons)
+            continue
+        try:
+            entries = list((root / member / "tests").iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                if (entry / "main.rs").is_file():
+                    unmodelled.append(
+                        f"{member}/tests/{entry.name}/main.rs is a directory-style "
+                        f"integration target this layout rule does not model"
+                    )
+                continue
+            if not entry.name.endswith(".rs"):
+                continue
+            path = f"{member}/tests/{entry.name}"
+            targets.add(path)
+            stem = entry.name[: -len(".rs")]
+            if by_stem.setdefault(stem, path) != path:
+                collided.add(stem)
+    for stem in sorted(collided):
+        unmodelled.append(
+            f"the file stem {stem!r} is owned by more than one member, so "
+            f"`cargo-test:{stem}` has stopped denoting one target"
+        )
+        by_stem.pop(stem, None)
+    return targets, by_stem, sorted(set(unmodelled))
+
+
+def coverage_rows_by_bead(manifest_path: Path) -> dict[str, dict[str, Any]]:
+    """Coverage rows keyed by bead, read WITHOUT the adoption header's authority checks.
+
+    Deliberately tolerant, because this reader is handed a PROSPECTIVE manifest at commit time and
+    a delta check that refused a header it could not authorise would refuse for a reason that is
+    not its question. ``validate-verification-manifest`` — which the same hook already runs — is
+    the authority on shape; this one answers only what moved.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict) or record.get("kind") != "coverage":
+            continue
+        bead = record.get("bead")
+        if isinstance(bead, str) and bead:
+            rows[bead] = record
+    return rows
+
+
+def cited_integration_targets(
+    record: Mapping[str, Any], targets: set[str], by_stem: Mapping[str, str]
+) -> set[str]:
+    """The row's citations that name a compiled integration-test target.
+
+    Both spellings the Rust guard resolves: the bare tracked path, and ``cargo-test:<stem>``,
+    whose stem cargo binds to the file stem under ``tests/`` — the build system's binding, not a
+    local habit. A ``test:`` citation names a FUNCTION and is the migration's destination, so it
+    is never coarse here.
+    """
+    cited: set[str] = set()
+    for artifact in record.get("artifacts") or []:
+        if not isinstance(artifact, str):
+            continue
+        if artifact in targets:
+            cited.add(artifact)
+            continue
+        if artifact.startswith("cargo-test:"):
+            resolved = by_stem.get(artifact[len("cargo-test:") :])
+            if resolved is not None:
+                cited.add(resolved)
+    return cited
+
+
+def parse_granularity_allowance(path: Path | None) -> tuple[frozenset[str], str]:
+    """The declared file-granular allowance, read from the Rust guard's own constant.
+
+    The second value is why the answer is what it is, and it is load-bearing: a pass on an
+    allowance this could not locate must be distinguishable from a pass on one that parsed and
+    was empty. The caller declines to refuse at all in the first case.
+    """
+    if path is None:
+        return frozenset(), "no allowance path was given"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        return frozenset(), f"the allowance file could not be read: {error}"
+    at = text.find("FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &[")
+    if at < 0:
+        return frozenset(), (
+            f"FILE_GRANULAR_EVIDENCE_ALLOWANCE is not declared in {path.as_posix()} in the "
+            f"shape this parser reads"
+        )
+    closed = text.find("];", at)
+    if closed < 0:
+        return frozenset(), "FILE_GRANULAR_EVIDENCE_ALLOWANCE has no closing bracket"
+    declared = frozenset(re.findall(r'"([^"]+)"', text[at:closed]))
+    if not declared:
+        return frozenset(), "FILE_GRANULAR_EVIDENCE_ALLOWANCE parsed to zero ids"
+    return declared, "parsed"
+
+
+def coverage_granularity_delta(
+    manifest_path: Path,
+    beads_path: Path,
+    *,
+    root: Path,
+    head_manifest_path: Path | None = None,
+    granularity_allowance_path: Path | None = None,
+) -> dict[str, Any]:
+    """Beads whose terminal row gains its FIRST integration-target citation in this commit.
+
+    **Keyed on ENTRY, not on ADDITION, and that distinction is the whole repair** (bead
+    ``fln-ehb5``, comment 1565). ``judge_granularity``'s population is a set of BEAD IDS: a row is
+    a member while it carries ANY coarse citation, so a row that is ALREADY coarse and gains
+    another moves that population not at all and is GREEN there. A commit-time rule keyed on
+    addition would refuse that commit, leaving its author no compliant path at close time — and
+    the only escape is ``--no-verify``, which is unscoped and takes the projection guard with it.
+    A rule that leaves no compliant path is a bypass generator.
+
+    **The allowance is honoured for the same reason.** Declaring the bead in
+    ``FILE_GRANULAR_EVIDENCE_ALLOWANCE`` and raising ``FILE_GRANULAR_EVIDENCE_CEILING`` in one
+    commit is the sanctioned debt-admission path; refusing it would refuse the one legal route.
+
+    **This is strictly weaker than ``judge_granularity`` and must stay so.** It reaches only the
+    integration-target shape, never the ``src/*.rs``-carrying-``#[test]`` shape; it drops any
+    member whose manifest overrides auto-discovery; and it declines to decide at all when it has
+    no HEAD manifest or cannot locate the allowance. Anything it refuses, that guard refuses too,
+    so the two cannot contradict. It can only ever be stale and permit something the Rust guard
+    then catches, which is exactly today's behaviour and therefore not a regression.
+    """
+    targets, by_stem, unmodelled = integration_test_targets(root)
+    if not targets:
+        raise EvidenceError(
+            f"granularity-delta: no integration-test target was found under any member of "
+            f"{root.as_posix()}. Cargo auto-discovers one per top-level `tests/*.rs`, so zero is "
+            f"this scan breaking, not a workspace that stopped testing"
+        )
+    states = bead_tracker_projection(beads_path)
+    if not states:
+        raise EvidenceError(
+            f"granularity-delta: {beads_path.as_posix()} resolved no tracker records at all — "
+            f"a broken reader, not an empty tracker"
+        )
+    now = coverage_rows_by_bead(manifest_path)
+    if not now:
+        raise EvidenceError(
+            f"granularity-delta: {manifest_path.as_posix()} resolved no coverage rows at all — "
+            f"a broken reader, not a manifest with no coverage"
+        )
+
+    disclosures = list(unmodelled)
+    allowance, allowance_note = parse_granularity_allowance(granularity_allowance_path)
+    # **Both missing inputs are typed INCONCLUSIVE rather than passed, and neither is a
+    # refusal.** In the real invocation the hook holds both — a HEAD manifest and the Rust
+    # guard's own file — so their absence is a setup fault, not a normal state. Passing would
+    # make a check that has stopped deciding indistinguishable from one that decided cleanly,
+    # which is this repository's hollow-green shape; refusing would wall the author, which is the
+    # defect this whole repair exists to remove. Exit 3 is visible at every commit and blocks
+    # nobody.
+    decidable = True
+    if head_manifest_path is None:
+        disclosures.append(
+            "no --head-manifest was given, so entry cannot be told from a citation that was "
+            "already there; nothing is decided"
+        )
+        decidable = False
+    if allowance_note != "parsed":
+        disclosures.append(
+            f"{allowance_note}, so the sanctioned debt-admission path cannot be recognised; "
+            f"nothing is decided"
+        )
+        decidable = False
+
+    before = (
+        coverage_rows_by_bead(head_manifest_path)
+        if head_manifest_path is not None
+        else {}
+    )
+    entries: list[dict[str, Any]] = []
+    terminal = 0
+    for bead, record in sorted(now.items()):
+        state = states.get(bead)
+        if state is None:
+            # A row naming no tracker record is `validate-verification-manifest`'s finding, and
+            # it runs in this same hook. Answering it twice, in the weaker reader, is how two
+            # copies of one rule start disagreeing.
+            continue
+        skip = record.get("skip")
+        if not isinstance(skip, str):
+            continue
+        # `is_terminal` in `crates/fln-conformance/src/execution.rs` is closed/tombstone AND
+        # skip=="none". The derived state alone is coarser — it calls a skipped closed row
+        # complete — and using it here would refuse a row that guard never judges.
+        if skip != "none":
+            continue
+        if (
+            derived_verification_coverage_state(str(state.get("status", "")), skip)
+            != "complete"
+        ):
+            continue
+        terminal += 1
+        gained = cited_integration_targets(record, targets, by_stem)
+        if not gained:
+            continue
+        if cited_integration_targets(before.get(bead, {}), targets, by_stem):
+            continue  # already coarse before this commit: not an entry
+        if bead in allowance:
+            continue  # the sanctioned debt admission
+        entries.append({"bead": bead, "targets": sorted(gained)})
+
+    return {
+        "schema": GRANULARITY_DELTA_SCHEMA,
+        "decidable": decidable,
+        "entries": entries if decidable else [],
+        "observed_entries": entries,
+        "terminal_rows": terminal,
+        "coverage_rows": len(now),
+        "tracker_records": len(states),
+        "targets_modelled": len(targets),
+        "allowance_declared": len(allowance),
+        "allowance_note": allowance_note,
+        "disclosures": disclosures,
+    }
+
+
 def verification_legacy_pair_id(bead_id: str, artifact: str) -> str:
     digest = hashlib.sha256()
     digest.update(b"fln.verification-evidence.legacy-pair/1")
@@ -20244,6 +20549,65 @@ def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_verify_coverage_granularity_delta(args: argparse.Namespace) -> int:
+    manifest = Path(args.manifest)
+    root = Path(args.root) if args.root else lexical_absolute(manifest).parent.parent
+    try:
+        report = coverage_granularity_delta(
+            manifest,
+            Path(args.beads),
+            root=root,
+            head_manifest_path=(
+                Path(args.head_manifest) if args.head_manifest else None
+            ),
+            granularity_allowance_path=(
+                Path(args.granularity_allowance)
+                if args.granularity_allowance
+                else None
+            ),
+        )
+    except (
+        EvidenceError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+    ) as error:
+        print(f"granularity-delta: {error}", file=sys.stderr)
+        return INCONCLUSIVE
+    for note in report["disclosures"]:
+        print(f"granularity-delta: {note}", file=sys.stderr)
+    if not report["decidable"]:
+        if args.output:
+            write_new(Path(args.output), canonical_json(report))
+        else:
+            sys.stdout.buffer.write(canonical_json(report))
+        return INCONCLUSIVE
+    if report["entries"]:
+        named = ", ".join(
+            f"{entry['bead']} -> {', '.join(entry['targets'])}"
+            for entry in report["entries"]
+        )
+        print(
+            f"granularity-delta: REFUSED — these terminal rows gain their FIRST "
+            f"file-granular citation in this commit: {named}. Cargo compiles a target; libtest "
+            f"runs a FUNCTION, so a file citation cannot say which test carries the claim, and a "
+            f"run in which that test was `#[ignore]`d or filtered out is indistinguishable from "
+            f"one in which it ran. Cite the function — `test:<pkg>::<target>::<path>` or "
+            f"`test:<pkg>::lib::<module::path::fn>` — or declare the bead in "
+            f"FILE_GRANULAR_EVIDENCE_ALLOWANCE and raise FILE_GRANULAR_EVIDENCE_CEILING in this "
+            f"same commit, which is the sanctioned debt-admission path and is honoured here.",
+            file=sys.stderr,
+        )
+        return FAIL
+    if args.output:
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_bead_status(args: argparse.Namespace) -> int:
     """Judge one prospective tracker status through the manifest validator's vocabulary."""
     if not bead_lifecycle_status_is_supported(args.status):
@@ -32012,6 +32376,32 @@ def build_parser() -> argparse.ArgumentParser:
     verification_manifest_parser.add_argument("--output")
     verification_manifest_parser.set_defaults(
         func=cmd_validate_verification_manifest
+    )
+
+    granularity_delta_parser = subparsers.add_parser(
+        "verify-coverage-granularity-delta",
+        help=(
+            "refuse a terminal coverage row gaining its FIRST file-granular citation "
+            "(bead fln-ehb5)"
+        ),
+    )
+    granularity_delta_parser.add_argument("--manifest", required=True)
+    granularity_delta_parser.add_argument("--beads", required=True)
+    granularity_delta_parser.add_argument(
+        "--head-manifest",
+        help="the manifest at HEAD; without it entry cannot be told from what was already there",
+    )
+    granularity_delta_parser.add_argument(
+        "--granularity-allowance",
+        help="the Rust guard's own file declaring FILE_GRANULAR_EVIDENCE_ALLOWANCE",
+    )
+    granularity_delta_parser.add_argument(
+        "--root",
+        help="workspace root for the member/target derivation (defaults above the manifest)",
+    )
+    granularity_delta_parser.add_argument("--output")
+    granularity_delta_parser.set_defaults(
+        func=cmd_verify_coverage_granularity_delta
     )
 
     private_index_sync_parser = subparsers.add_parser(
