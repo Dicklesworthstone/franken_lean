@@ -1107,6 +1107,55 @@ fn every_declared_lane_that_does_not_take_the_gate_lock_is_named_in_the_section(
              against this lane: {missing:?}"
         );
     }
+
+    // --- the two holes this guard had, both measured on 2026-08-05 ------------------------
+    //
+    // Containment above passes on a SUPERSET, and the denominator was never read at all. Both
+    // were live: the sentence said "of 22" and named NINE lanes, one of which
+    // (`suite_upgrade_candidate_preflight.sh`) declares no `fln.e2e/2` schema and so is not a
+    // lane by the definition used two paragraphs earlier. 13 + 9 = 22 stayed internally
+    // consistent for two days while being externally false, because both halves shared one
+    // wrong member — a count that adds up is not thereby derived.
+    // `/` is kept INSIDE the token so a path can be rejected. Dropping it as a separator makes
+    // `scripts/lib/gate_lock.sh` — the sentence's own anchor — decompose to a bare
+    // `gate_lock.sh` that reads as a lane name, and this assertion failed on exactly that the
+    // first time it ran: the guard's needle appearing in the prose the guard reads.
+    let named: BTreeSet<String> = sentence
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/'))
+        .filter(|token| token.ends_with(".sh") && !token.contains('/'))
+        .map(str::to_string)
+        .collect();
+    let expected: BTreeSet<String> = missing.iter().map(|name| (*name).clone()).collect();
+    assert_eq!(
+        named,
+        expected,
+        "the sentence names a different SET of gate-lock-less lanes than the scripts declare. \
+         Containment alone passes on a superset, which is exactly how a non-lane was carried \
+         here for two days: extra={:?} absent={:?}",
+        named.difference(&expected).collect::<Vec<_>>(),
+        expected.difference(&named).collect::<Vec<_>>()
+    );
+
+    let denominator = sentence
+        .split_once(" of ")
+        .and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<usize>().ok()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the sentence must state the lane population as `of <N>` immediately after the \
+                 gate-lock count; without it the split is a numerator with no denominator"
+            )
+        });
+    assert_eq!(
+        denominator,
+        declared_lanes.len(),
+        "the sentence says {} declared lanes exist and {} declare the fln.e2e/2 schema. This \
+         denominator went unread until it was wrong",
+        denominator,
+        declared_lanes.len()
+    );
 }
 
 /// The count immediately preceding `anchor`, in digits.
