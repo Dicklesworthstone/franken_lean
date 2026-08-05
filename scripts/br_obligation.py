@@ -46,6 +46,7 @@ remains the backstop.
 """
 
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -88,6 +89,34 @@ def repo_root(start: Path) -> Path:
         "br_obligation: not inside a franken_lean checkout "
         f"(no {TRACKER} + {VALIDATOR} above {start})"
     )
+
+
+SUBJECT_LINE = re.compile(
+    r"^\s*(?:[^\w\s]\s*)?(?:Created|Closed|Updated|Reopened)\s+([A-Za-z0-9][\w.\-]*)\s*:",
+)
+
+
+def acted_on(br_output: str) -> list[str]:
+    """The bead ids `br` itself says it acted on.
+
+    THE DIFF ALONE IS NOT THE ANSWER, and this is the defect franken_lean-xjjr
+    is about arriving inside its own repair. `tracker_state` diffs the WHOLE
+    shared tracker across the br invocation, and in a live swarm a peer's
+    ordinary `br` command auto-flushes into that same file inside the window. So
+    the diff reports beads the caller never touched: measured on 2026-08-05, one
+    `create` of `franken_lean-gii.25` announced three beads, two of them other
+    panes' (`fln-ehb5`, `franken_lean-ephemeral-manifest-artifact-povo`).
+
+    `br` names its own subject on stdout, so it is recoverable exactly rather
+    than inferred. Parsed permissively -- the leading glyph is optional, since a
+    decorated tick is a presentation detail this must not depend on.
+    """
+    found = []
+    for line in br_output.splitlines():
+        match = SUBJECT_LINE.match(line)
+        if match and match.group(1) not in found:
+            found.append(match.group(1))
+    return found
 
 
 def tracker_state(root: Path) -> dict[str, str]:
@@ -384,7 +413,15 @@ def execute_br_command(
             return 2
 
     before = tracker_state(root)
-    completed = invoke_br(["br", *argv], check=False)
+    # Captured so `br`'s own report of its subject can be read, then re-emitted
+    # VERBATIM so the caller sees exactly what bare `br` would have shown. A
+    # wrapper that swallows or reformats its subject's output is a worse tool
+    # than the announcement is worth.
+    completed = invoke_br(["br", *argv], check=False, capture_output=True, text=True)
+    if getattr(completed, "stdout", None):
+        sys.stdout.write(completed.stdout)
+    if getattr(completed, "stderr", None):
+        sys.stderr.write(completed.stderr)
 
     after = tracker_state(root)
     changed = sorted(
@@ -392,6 +429,29 @@ def execute_br_command(
         for identifier in set(after) | set(before)
         if before.get(identifier) != after.get(identifier)
     )
+    mine = [i for i in acted_on(getattr(completed, "stdout", "") or "") if i in changed]
+    # A bead that moved in the window and is NOT this act's subject belongs to
+    # another pane. It is NAMED rather than dropped: a peer's bead crossing the
+    # adoption boundary inside your window is precisely what will refuse YOUR
+    # next commit, and hiding it would trade one confusing diagnosis for another.
+    theirs = [i for i in changed if i not in mine]
+
+    if theirs:
+        print(file=sys.stderr)
+        print(
+            "br_obligation: ATTRIBUTION -- this act moved "
+            + (", ".join(mine) if mine else "no bead this wrapper could name")
+            + ".",
+            file=sys.stderr,
+        )
+        print(
+            "br_obligation: the tracker ALSO changed for "
+            + ", ".join(theirs)
+            + " inside the same window. Those are another pane's, arriving by "
+            "auto-flush into the shared export. You do not owe their rows -- but "
+            "an unmet obligation of theirs WILL refuse your next commit.",
+            file=sys.stderr,
+        )
 
     status, output = run_validator(root)
     report = obligation_report(status, output, changed)
@@ -582,10 +642,10 @@ def self_test() -> int:
     invocations: list[list[str]] = []
 
     def forbidden_br(
-        command: list[str], *, check: bool
+        command: list[str], *, check: bool, capture_output: bool = False, text: bool = False
     ) -> subprocess.CompletedProcess[str]:
         invocations.append(command)
-        return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     refusal_status = execute_br_command(
         root,
@@ -603,10 +663,10 @@ def self_test() -> int:
     admitted_invocations: list[list[str]] = []
 
     def admitted_br(
-        command: list[str], *, check: bool
+        command: list[str], *, check: bool, capture_output: bool = False, text: bool = False
     ) -> subprocess.CompletedProcess[str]:
         admitted_invocations.append(command)
-        return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     admitted_argv = ["update", "fixture", "--status", "open"]
     admitted_status = execute_br_command(root, admitted_argv, invoke_br=admitted_br)
@@ -616,6 +676,36 @@ def self_test() -> int:
         failures.append(
             f"an admitted status did not invoke br exactly once: {admitted_invocations!r}"
         )
+
+    # ATTRIBUTION (franken_lean-xjjr): `br`'s own subject line is parsed, so the
+    # announcement can separate the bead THIS act moved from beads a peer's
+    # concurrent auto-flush moved in the same window.
+    for rendered, expected in (
+        ("\u2713 Created franken_lean-gii.30: a title", ["franken_lean-gii.30"]),
+        ("Updated fln-abc1: a title", ["fln-abc1"]),
+        ("\u2713 Closed franken_lean-gii.29: reason here", ["franken_lean-gii.29"]),
+        ("Reopened fln-x9: t", ["fln-x9"]),
+    ):
+        if acted_on(rendered) != expected:
+            failures.append(
+                f"the subject parser read {acted_on(rendered)!r} from {rendered!r}, "
+                f"expected {expected!r}"
+            )
+
+    # NEGATIVE CONTROL: output naming no subject must yield nothing, or the
+    # parser would attribute every act to whatever id happened to appear.
+    for noise in (
+        "Nothing to export (no dirty issues)",
+        "  1486 labels",
+        "franken_lean-gii.30 is mentioned but not acted on",
+    ):
+        if acted_on(noise):
+            failures.append(f"the subject parser invented {acted_on(noise)!r} from {noise!r}")
+
+    # And a multi-line report names each subject once, in order.
+    multi = "\u2713 Created a-1: x\nnoise\n\u2713 Created a-1: x\nUpdated b-2: y"
+    if acted_on(multi) != ["a-1", "b-2"]:
+        failures.append(f"multi-subject parse read {acted_on(multi)!r}")
 
     if failures:
         for failure in failures:
