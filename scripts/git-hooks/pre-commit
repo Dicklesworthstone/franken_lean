@@ -508,7 +508,7 @@ if git rev-parse --verify --quiet HEAD >/dev/null \
            coverage_say 'Refusing HERE rather than in cargo test, where the red lands on'
            coverage_say 'whoever runs the suite next instead of on the author (fln-ehb5).'
            exit 1 ;;
-        *) coverage_say "granularity delta undecided (exit ${granularity_status}), passing: ${granularity_output}" ;;
+        *) coverage_say "granularity delta undecided (status ${granularity_status}), passing: ${granularity_output}" ;;
     esac
 fi
 

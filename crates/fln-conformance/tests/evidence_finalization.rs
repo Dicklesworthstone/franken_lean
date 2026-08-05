@@ -245,6 +245,168 @@ fn private_index_worktree_sync_preserves_foreign_lines_and_repairs_only_containe
     }
 }
 
+/// The commit-time granularity delta: its three clauses, its floors, and the hook that
+/// reaches it — bead `fln-ehb5`.
+///
+/// `judge_granularity` refuses file-granular evidence in a terminal row correctly and
+/// fires only in `cargo test`, which is *after* the commit has landed, so it reddens five
+/// other panes and never the author. `verify-coverage-granularity-delta` is the same
+/// refusal moved to the moment of the mistake, deliberately WEAKER than that guard rather
+/// than a second copy of it: it reaches the integration-target shape only, so anything it
+/// refuses that guard refuses too and the two cannot contradict.
+///
+/// **The two clauses that are not obvious are the two this binds hardest, because each
+/// exists to stop a WALL rather than to catch a defect.** `judge_granularity`'s population
+/// is a set of BEAD IDS, so a row that is *already* coarse and gains another coarse
+/// citation moves it not at all and is GREEN there — a commit-time rule keyed on ADDITION
+/// would refuse that commit and leave its author no compliant path, whose only escape is
+/// `--no-verify`, which is unscoped and takes the projection guard with it. And declaring
+/// the bead in `FILE_GRANULAR_EVIDENCE_ALLOWANCE` while raising the ceiling in one commit
+/// is the SANCTIONED debt-admission path, so refusing it would refuse the one legal route.
+///
+/// **The entry cell has to plant a RED head, and that is a fact about this tree rather
+/// than a convenience.** `granularity-grew` and `granularity-shrank` hold
+/// `measured == declared` in both directions, so on any green tree every already-coarse
+/// row is also declared — the allowance clause subsumes the entry clause and a cell
+/// planted only in the prospective manifest passes through the wrong one. Measured while
+/// building this: with the cell planted that way, gutting the entry clause flipped
+/// NOTHING. The state the entry clause exists for is a head mid-repair.
+///
+/// `is_terminal` is `closed|tombstone` AND `skip == "none"`, and those halves need
+/// separate cells for the same reason: a non-terminal cell chosen for its *status* leaves
+/// the *skip* half riding it, and gutting the skip check flipped nothing until the two
+/// were split.
+const GRANULARITY_DELTA_PROBE: &str = r#"
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+evidence, root = Path(sys.argv[1]), Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("fln_evidence_ehb5_probe", evidence)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+manifest_path = root / "ci/VERIFICATION_MANIFEST.jsonl"
+beads_path = root / ".beads/issues.jsonl"
+allowance_path = root / "crates/fln-conformance/tests/ci_execution_join.rs"
+
+# The DERIVATION first, floored. A zero here makes every cell below vacuous.
+targets, by_stem, unmodelled = module.integration_test_targets(root)
+print(f"targets={len(targets)}")
+print(f"unmodelled={len(unmodelled)}")
+allowance, note = module.parse_granularity_allowance(allowance_path)
+print(f"allowance_note={note}")
+print(f"allowance={len(allowance)}")
+
+# The subsumption, stated as a PARTITION rather than as a promise. Every terminal row this
+# weaker rule calls coarse must already be declared -- if one is not, this check is
+# refusing something `judge_granularity` has not yet been told about, which is the only
+# direction in which the two can disagree.
+states = module.bead_tracker_projection(beads_path)
+rows = module.coverage_rows_by_bead(manifest_path)
+coarse = set()
+for bead, row in rows.items():
+    state = states.get(bead)
+    if state is None or row.get("skip") != "none":
+        continue
+    if module.derived_verification_coverage_state(str(state.get("status", "")), "none") != "complete":
+        continue
+    if module.cited_integration_targets(row, targets, by_stem):
+        coarse.add(bead)
+print(f"coarse_terminal={len(coarse)}")
+print(f"coarse_undeclared={len(coarse - set(allowance))}")
+print(f"declared_beyond_reach={len(set(allowance) - coarse)}")
+
+TARGET = "crates/fln-conformance/tests/evidence_finalization.rs"
+TARGET2 = "crates/fln-conformance/tests/ci_execution_join.rs"
+NON_TARGET = "crates/fln-conformance/src/naming.rs"
+
+base = [json.loads(l) for l in manifest_path.read_text().splitlines() if l.strip()]
+clean = coarse_row = nonterminal = None
+for record in base:
+    bead = record.get("bead")
+    if not bead or record.get("kind") != "coverage":
+        continue
+    terminal = (
+        states.get(bead) is not None
+        and record.get("skip") == "none"
+        and module.derived_verification_coverage_state(str(states[bead].get("status", "")), "none") == "complete"
+    )
+    cited = module.cited_integration_targets(record, targets, by_stem)
+    if terminal and not cited and clean is None:
+        clean = bead
+    if terminal and cited and coarse_row is None:
+        coarse_row = bead
+    if not terminal and nonterminal is None:
+        nonterminal = bead
+print(f"plants={'ok' if clean and coarse_row and nonterminal else 'MISSING'}")
+
+
+def write(scratch, name, records):
+    path = scratch / name
+    path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
+    return path
+
+
+def plant(bead, artifact, records=None, skip=None):
+    out = []
+    for record in (records if records is not None else base):
+        if record.get("bead") == bead:
+            record = dict(record)
+            record["artifacts"] = sorted(set((record.get("artifacts") or []) + [artifact]))
+            if skip is not None:
+                record["skip"] = skip
+        out.append(record)
+    return out
+
+
+def cell(scratch, name, manifest, head, allowance_file):
+    done = subprocess.run(
+        [sys.executable, "-I", "-S", str(evidence), "verify-coverage-granularity-delta",
+         "--manifest", str(manifest), "--beads", str(beads_path),
+         "--root", str(root)]
+        + (["--head-manifest", str(head)] if head else [])
+        + (["--granularity-allowance", str(allowance_file)] if allowance_file else []),
+        capture_output=True, text=True,
+    )
+    if "Traceback (most recent call last)" in done.stderr:
+        verdict = "CRASH"
+    else:
+        verdict = {0: "PASS", 1: "REFUSE", 3: "INCONCLUSIVE"}.get(done.returncode, "UNEXPECTED")
+    named = "named" if (verdict != "REFUSE" or (clean in done.stderr or coarse_row in done.stderr or nonterminal in done.stderr)) else "unnamed"
+    print(f"{name}={verdict}/{named}")
+
+
+with tempfile.TemporaryDirectory() as scratch:
+    scratch = Path(scratch)
+    head = write(scratch, "head.jsonl", base)
+    cell(scratch, "base", head, head, allowance_path)
+    cell(scratch, "entry", write(scratch, "p1.jsonl", plant(clean, TARGET)), head, allowance_path)
+    cell(scratch, "non_target", write(scratch, "n1.jsonl", plant(clean, NON_TARGET)), head, allowance_path)
+    cell(scratch, "status", write(scratch, "n3a.jsonl", plant(nonterminal, TARGET)), head, allowance_path)
+    cell(scratch, "skip", write(scratch, "n3b.jsonl", plant(clean, TARGET, skip="blocked")), head, allowance_path)
+
+    # The entry cell: coarse in the HEAD manifest AND undeclared, which no green tree holds.
+    already = write(scratch, "n4_head.jsonl", plant(clean, TARGET))
+    cell(scratch, "already_coarse",
+         write(scratch, "n4.jsonl", plant(clean, TARGET2, plant(clean, TARGET))), already, allowance_path)
+
+    # The allowance cell: the entry plant, with the bead declared.
+    widened = scratch / "allowance.rs"
+    marker = "FILE_GRANULAR_EVIDENCE_ALLOWANCE: &[&str] = &["
+    widened.write_text(allowance_path.read_text().replace(marker, marker + f'\n    "{clean}",', 1))
+    cell(scratch, "declared", scratch / "p1.jsonl", head, widened)
+
+    # Both undecidable shapes: reported, never refused, never silently passed.
+    cell(scratch, "no_head", scratch / "p1.jsonl", None, allowance_path)
+    cell(scratch, "no_allowance", scratch / "p1.jsonl", head, None)
+
+print("PROBE-COMPLETE")
+"#;
+
 /// The artifact kinds a publishable evidence root may not contain, exercised against
 /// real filesystem shapes rather than against the prose that used to hold them apart.
 ///
@@ -402,6 +564,204 @@ fn a_forbidden_artifact_kind_is_refused_by_the_publisher_and_named_before_public
     assert!(
         scanned > 0,
         "the clean-root scan walked nothing, so every refusal cell above is vacuous: {stdout}"
+    );
+}
+
+#[test]
+fn the_granularity_delta_refuses_an_entry_and_honours_both_escapes() {
+    let root = fln_conformance::checked_workspace_root!();
+    let evidence = root.join("scripts/evidence.py");
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", GRANULARITY_DELTA_PROBE])
+        .arg(&evidence)
+        .arg(&root)
+        .output()
+        .expect("the sealed interpreter must run the granularity-delta probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "granularity-delta probe did not complete: status={:?} stderr={stderr}",
+        run.status.code()
+    );
+
+    let value = |key: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("the probe must report {key}: {stdout}"))
+            .to_string()
+    };
+    let count = |key: &str| -> usize {
+        value(key)
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be a count: {stdout}"))
+    };
+
+    // --- the derivation's own floors, before any cell is believed ------------
+    //
+    // Cargo auto-discovers one integration target per top-level `tests/*.rs`. Zero is
+    // this scan breaking, not a workspace that stopped testing — and with zero targets
+    // every refusal cell below passes for the wrong reason.
+    assert!(
+        count("targets") > 0,
+        "the target derivation found nothing, so every cell below is vacuous: {stdout}"
+    );
+    assert_eq!(
+        value("plants"),
+        "ok",
+        "the probe could not find all three row shapes to plant on, so the cells it ran \
+         measure nothing: {stdout}"
+    );
+    assert_eq!(
+        value("allowance_note"),
+        "parsed",
+        "the allowance could not be read out of ci_execution_join.rs, so the sanctioned \
+         debt-admission path is invisible to this check: {stdout}"
+    );
+    assert!(
+        count("allowance") > 0,
+        "the allowance parsed to zero ids, which would make the `declared` cell pass \
+         because nothing is declared rather than because the clause works: {stdout}"
+    );
+
+    // --- the subsumption, in the ONE direction where the two can disagree ----
+    //
+    // This rule is strictly weaker than `judge_granularity`, so it reaches a SUBSET of
+    // the declared population. What must never happen is a terminal row this calls
+    // coarse that the allowance has not been told about: that is this check refusing
+    // something the Rust guard has not yet been asked about. The `declared_beyond_reach`
+    // figure is deliberately NOT bound to a number — it is the `src/*.rs`-carrying-
+    // `#[test]` shape this rule does not model, and binding it would make every
+    // migration in that half redden a correct tree.
+    assert_eq!(
+        count("coarse_undeclared"),
+        0,
+        "a terminal row cites an integration target and is NOT in \
+         FILE_GRANULAR_EVIDENCE_ALLOWANCE. Either the allowance is stale, or this weaker \
+         rule has started reaching rows the stronger one has not classified: {stdout}"
+    );
+    assert!(
+        count("coarse_terminal") > 0,
+        "no terminal row cites an integration target at all, so `coarse_undeclared == 0` \
+         above holds because the population is EMPTY. A repaired population's live guard \
+         is unkillable — if this ever fires legitimately, the check has become decorative \
+         and the planted cells below are the only thing still measuring it: {stdout}"
+    );
+
+    // --- the cells, one clause decidable per cell ----------------------------
+    for (cell, expected) in [
+        // today's tree is not walled
+        ("base", "PASS/named"),
+        // the defect itself, and the refusal must NAME the row it is about
+        ("entry", "REFUSE/named"),
+        // the shape rule: a file that is not a compiled target is not this rule's business
+        ("non_target", "PASS/named"),
+        // both halves of `is_terminal`, separately
+        ("status", "PASS/named"),
+        ("skip", "PASS/named"),
+        // the two walls, each with exactly one clause able to cause the pass
+        ("already_coarse", "PASS/named"),
+        ("declared", "PASS/named"),
+        // a missing input is reported, never passed and never refused
+        ("no_head", "INCONCLUSIVE/named"),
+        ("no_allowance", "INCONCLUSIVE/named"),
+    ] {
+        assert_eq!(
+            value(cell),
+            expected,
+            "granularity-delta cell {cell:?} disagreed: {stdout}"
+        );
+    }
+}
+
+/// The hook must still REACH the subcommand, with the inputs that make it honest.
+///
+/// Item 7's shape: the predicate above and the hook that invokes it are two artifacts,
+/// and nothing joined them. A hook that stopped calling it — or called it with HEAD's
+/// allowance instead of the prospective one — would leave every cell above green while
+/// the author saw nothing at commit time, which is the state this bead was filed for.
+#[test]
+fn the_pre_commit_hook_reaches_the_granularity_delta_with_prospective_inputs() {
+    let root = fln_conformance::checked_workspace_root!();
+    let hook = fs::read_to_string(root.join("scripts/git-hooks/pre-commit"))
+        .expect("the pre-commit hook must be readable");
+    assert!(
+        hook.contains("verify-coverage-granularity-delta"),
+        "the hook no longer invokes the granularity delta, so the refusal has gone back \
+         to arriving only in `cargo test` — the defect fln-ehb5 was filed for"
+    );
+    for (flag, why) in [
+        (
+            "--head-manifest",
+            "without HEAD's manifest, ENTRY cannot be told from a citation that was \
+             already there, and the check refuses a row already carrying one",
+        ),
+        (
+            "--granularity-allowance",
+            "without the allowance the sanctioned debt-admission path is invisible, and \
+             the check refuses the one legal route",
+        ),
+        (
+            "--tracked-paths",
+            "without the prospective path set the target derivation reads the working \
+             tree, and a test file absent from the commit is modelled as a target here \
+             but not by judge_granularity — a refusal of something that guard permits",
+        ),
+    ] {
+        assert!(
+            hook.contains(flag),
+            "the hook invokes the granularity delta without {flag}: {why}"
+        );
+    }
+    // The allowance must come from the INDEX (`:path`), never from HEAD. This is the one
+    // input whose wrong source is silent: reading HEAD's copy still parses, still reports
+    // a plausible count, and refuses exactly the commits that admit the debt correctly.
+    assert!(
+        hook.contains("git cat-file blob \":$GRANULARITY_ALLOWANCE_RELATIVE\""),
+        "the hook must read the PROSPECTIVE allowance from the index; HEAD's copy cannot \
+         see a bead declared in this same commit"
+    );
+    // The two arms are bound TOGETHER, because each alone admits the other's defect: a
+    // check that never refuses is decoration, and one that refuses when it could not
+    // decide is a wall. The `case` block is read structurally rather than by scanning the
+    // whole hook, so a stray `exit` elsewhere cannot satisfy either half.
+    //
+    // **The first version of this assertion failed against the hook's own message text.**
+    // It scanned the undecided arm for `exit` and matched the word inside
+    // `"(exit ${granularity_status})"` — the guard's needle appearing in the prose the
+    // guard reads, which is AGENTS.md's recorded self-exclusion trap arriving in a
+    // freshly written check. The hook now says `status` there and this reads the arms.
+    let case = hook
+        .split_once("case \"$granularity_status\" in")
+        .expect("the hook must dispatch on the granularity delta's status")
+        .1
+        .split_once("esac")
+        .expect("the granularity case block must terminate")
+        .0;
+    let refusing = case
+        .split_once("1)")
+        .expect("the hook must carry an arm for a refusal")
+        .1
+        .split_once(";;")
+        .expect("the refusing arm must terminate")
+        .0;
+    assert!(
+        refusing.contains("exit 1"),
+        "the hook no longer stops the commit on a granularity refusal, so the check runs \
+         and announces nothing: {refusing}"
+    );
+    let undecided = case
+        .split_once("*)")
+        .expect("the hook must carry a default arm")
+        .1
+        .split_once(";;")
+        .expect("the default arm must terminate")
+        .0;
+    assert!(
+        !undecided.contains("exit"),
+        "an undecided granularity delta must be reported and PASSED: a check that has \
+         stopped deciding must never block a correct commit: {undecided}"
     );
 }
 
