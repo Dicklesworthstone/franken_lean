@@ -1050,6 +1050,22 @@ citation. That is **30% of the whole population removable by a script its owner 
 makes "migrate first" cheaper than the raw 271 suggests and is the fact the adopt-now-versus-
 migrate-first decision was missing.
 
+**And that aggregate is misleading per owner, which is the half a total cannot show.** The
+mechanical class is *concentrated*, not spread: `CobaltLantern` **30/30** and `MistyEagle`
+**11/11** — their entire remaining share is one command — against `cod_1` **1/52**, `cod_3`
+**0/32** and `TurquoisePine` **0/5**, for whom the script buys nothing at all. `cc_2` is 22/30,
+`cc_1` 8/37, `FoggyForge` 5/31, `cod_2` 1/34. So "30% is free" is true of the population and false
+of most owners in it: two are finished by running `scripts/povo_expand_shas.py --owner <you>
+--write`, and three must do per-row judgement for every one of theirs. **A percentage over a
+population whose members are independent actors tells each of them almost nothing** — this one was
+published as an aggregate first, and the per-owner column is what makes it actionable.
+
+The tool verifies each widening **twice** before writing — the short form must resolve to a commit
+object, *and* the full form must be an ancestor of `HEAD`. Without the second check it would
+launder an `unreachable_commit` into a durable-looking citation, which is the neighbouring defect
+wearing this repair as a disguise and invisible afterwards, since the result would classify
+`commit` and look repaired. A sha failing either check is reported and left alone.
+
 **Read the disclosed number as a BAND, not a point, because its guard is one.** The check binds
 the disclosure to the derivation with a tolerance of **±25** — deliberately, since a one-way floor
 reddens on exactly the commits that record good work, which is the paragraph below. The
