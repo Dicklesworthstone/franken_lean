@@ -4848,6 +4848,14 @@ def require_manifest_string_array(
     return value
 
 
+BEAD_LIFECYCLE_STATUSES = frozenset({"open", "in_progress", "closed", "tombstone"})
+
+
+def bead_lifecycle_status_is_supported(status: object) -> bool:
+    """Whether one value belongs to the lifecycle vocabulary this validator owns."""
+    return isinstance(status, str) and status in BEAD_LIFECYCLE_STATUSES
+
+
 def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
     """Status, closure instant, and comment instants — the tracker facts a row is judged against.
 
@@ -4863,13 +4871,11 @@ def bead_tracker_projection(path: Path) -> dict[str, dict[str, Any]]:
         status = record.get("status")
         if not isinstance(bead_id, str) or not bead_id:
             raise EvidenceError(f"{path}:{number}: bead id is missing")
-        # `blocked` is accepted PROVISIONALLY — bead franken_lean-px33, cc_2, 2026-08-04. `br`
-        # sets it (it refuses only the terminal states), four beads carried it, and refusing it
-        # here took `real_verification_manifest_covers_the_live_tracker` down for every pane while
-        # the owner was quota-blocked and could not clear them. See
-        # `derived_verification_coverage_state` for the mapping and for the word's OTHER meaning
-        # on this side, which px33 exists to have decided properly.
-        if status not in {"open", "in_progress", "blocked", "closed", "tombstone"}:
+        # This is the project lifecycle authority exposed to scripts/br_obligation.py through
+        # `validate-bead-status`. `br` accepts arbitrary text for --status, so the wrapper calls
+        # that validator command and refuses an unsupported value before invoking br
+        # (bead franken_lean-shlw).
+        if not bead_lifecycle_status_is_supported(status):
             raise EvidenceError(
                 f"{path}:{number}: bead {bead_id!r} has unsupported status {status!r}"
             )
@@ -4979,15 +4985,11 @@ def closure_citation_diagnosis(
 def derived_verification_coverage_state(bead_status: str, skip: str) -> str:
     """Derive lifecycle state from the tracker; coverage rows never declare it.
 
-    A bead at status ``blocked`` derives EXACTLY as ``open`` does, and that is the conservative
-    choice rather than an opinion: a blocked bead is unfinished work, so it must not reach
-    ``complete`` (which would owe evidence and invoke the closure-binding law) and must not escape
-    anything an open bead owes. Note the collision this sits on — ``blocked`` is ALSO a derived
-    state here, meaning the ROW declared ``skip: blocked``, which is an evidence disposition rather
-    than a work state. One word, two concepts, and bead ``franken_lean-px33`` exists to have that
-    decided deliberately. Until it is, this mapping adds no obligation and removes none.
+    ``blocked`` here remains a coverage-row disposition derived from ``skip``. It is deliberately
+    not a bead lifecycle status: using one word for both concepts was the provisional repair that
+    franken_lean-shlw replaced with point-of-setting refusal.
     """
-    if bead_status in {"open", "blocked"}:
+    if bead_status == "open":
         return "blocked" if skip == "blocked" else "planned"
     if bead_status == "in_progress":
         return "active"
@@ -20242,6 +20244,28 @@ def cmd_validate_verification_manifest(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_bead_status(args: argparse.Namespace) -> int:
+    """Judge one prospective tracker status through the manifest validator's vocabulary."""
+    if not bead_lifecycle_status_is_supported(args.status):
+        print(
+            f"bead-status: unsupported status {args.status!r}; accepted statuses: "
+            f"{', '.join(sorted(BEAD_LIFECYCLE_STATUSES))}",
+            file=sys.stderr,
+        )
+        return FAIL
+    sys.stdout.buffer.write(
+        canonical_json(
+            {
+                "schema": "fln.bead-status-validation/1",
+                "status": args.status,
+                "valid": True,
+                "validator": "fln.verification-manifest/2",
+            }
+        )
+    )
+    return PASS
+
+
 def cmd_render_check_human(args: argparse.Namespace) -> int:
     artifact_root = lexical_absolute(Path(args.artifact_root))
     run_path = require_exact_artifact_path(
@@ -31967,6 +31991,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--test-guardian-child-ready", help=argparse.SUPPRESS)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     run_parser.set_defaults(func=cmd_run)
+
+    bead_status_parser = subparsers.add_parser(
+        "validate-bead-status",
+        help="validate one prospective bead lifecycle status",
+    )
+    bead_status_parser.add_argument("--status", required=True)
+    bead_status_parser.set_defaults(func=cmd_validate_bead_status)
 
     verification_manifest_parser = subparsers.add_parser(
         "validate-verification-manifest",

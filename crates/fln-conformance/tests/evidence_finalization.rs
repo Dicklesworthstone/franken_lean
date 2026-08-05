@@ -5234,10 +5234,9 @@ fn the_git_shelling_population_is_derived_and_reconciled() {
 ///
 /// So the binding that is available, and the one this test makes: the validator's set is read
 /// **from its own source** rather than transcribed, and the committed export is held to it. HEAD
-/// is the right scope, not the working tree — the working export legitimately carries a peer's
-/// in-flight `blocked` records, and reddening every pane for that is the bead's own defect wearing
-/// a new hat. The pre-commit hook is what keeps HEAD clean; this fails if that ever stops being
-/// true, or if the validator's set moves under it.
+/// is the right scope: a peer's in-flight tracker state is not a committed compatibility claim.
+/// The pre-commit hook is what keeps HEAD clean; this fails if that ever stops being true, or if
+/// the validator's set moves under it.
 #[test]
 fn the_tracker_status_vocabulary_is_bound_to_the_validator() {
     let repo = fln_conformance::checked_workspace_root!();
@@ -5245,10 +5244,10 @@ fn the_tracker_status_vocabulary_is_bound_to_the_validator() {
     // --- the validator's set, parsed from the producer rather than transcribed --------------
     let evidence = fs::read_to_string(repo.join("scripts/evidence.py"))
         .expect("scripts/evidence.py must be readable");
-    let marker = "if status not in {";
+    let marker = "BEAD_LIFECYCLE_STATUSES = frozenset({";
     let at = evidence
         .find(marker)
-        .expect("scripts/evidence.py must still gate on a literal status set; if that moved, this guard is enforcing a claim that no longer exists and must be updated rather than deleted");
+        .expect("scripts/evidence.py must still own one literal lifecycle status set; if that moved, this guard is enforcing a claim that no longer exists and must be updated rather than deleted");
     let body = &evidence[at + marker.len()..];
     let body = &body[..body.find('}').expect("the status set literal must close")];
     let supported: std::collections::BTreeSet<String> = body
@@ -5310,6 +5309,38 @@ fn the_tracker_status_vocabulary_is_bound_to_the_validator() {
          commit time, for a record the committing pane may not have touched — so it is repaired \
          by the bead's owner changing the status, or by the validator growing the state, and \
          never by hand-editing the export"
+    );
+}
+
+/// The wrapper's self-test calls the validator's status-only entry point, injects
+/// a br runner, and proves an unsupported status returns nonzero without calling
+/// br. This is the point-of-setting half of `franken_lean-shlw`; the committed-
+/// export test above remains the backstop for callers that bypass the wrapper.
+#[test]
+fn the_tracker_status_wrapper_refuses_before_invoking_br() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(repo.join("scripts/br_obligation.py"))
+        .arg("--self-test")
+        .current_dir(&repo)
+        .output()
+        .expect("br_obligation self-test must launch");
+    assert!(
+        output.status.success(),
+        "br_obligation self-test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("br_obligation self-test: PASS (obligation + status cells)"),
+        "br_obligation self-test did not report its positive completion"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("REFUSED BEFORE br")
+            && String::from_utf8_lossy(&output.stderr).contains("bead-status: unsupported status"),
+        "the negative cell did not carry the validator's pre-action refusal"
     );
 }
 

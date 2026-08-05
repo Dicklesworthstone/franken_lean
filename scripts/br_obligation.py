@@ -1,5 +1,5 @@
 #!/usr/bin/env -S python3 -I -S
-"""Announce the coverage-row obligation AT THE MOMENT br create/br close creates it.
+"""Announce coverage obligations and refuse unsupported statuses at the creating act.
 
 Bead `franken_lean-xjjr`. The obligation is created by `br create` and `br close`
 and reported by a git pre-commit hook an unbounded number of actions later, to
@@ -31,27 +31,30 @@ weakened; this only moves the ANNOUNCEMENT earlier.
 USAGE
     scripts/br_obligation.py create --title "..." --type task --priority 1
     scripts/br_obligation.py close  <id> --reason "..."
+    scripts/br_obligation.py update <id> --status <status>
     scripts/br_obligation.py --self-test
 
 Every argument after the subcommand is forwarded to `br` through an argv list, so
 no shell expansion is possible -- the same hazard `br_comment.py` exists for.
 
-WHAT THIS DOES NOT DO. It does not block: br has already acted by the time the
-validator runs, and refusing afterwards would leave the tracker and the message
-disagreeing. It reports. It also cannot see an obligation created by a bare `br`
-invocation that bypasses this wrapper, which is a real limit and the reason this
-is an ergonomic repair rather than an enforcement one.
+WHAT THIS DOES AND DOES NOT BLOCK. Coverage-row obligations are still announced
+after br acts: refusing then would leave the tracker and the message disagreeing.
+An explicit --status is different because it can be checked before the act; an
+unsupported or underivable value is refused before br runs. A bare `br` invocation
+can bypass this wrapper, which is a real limit and why the committed-export guard
+remains the backstop.
 """
 
 import json
-import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 VALIDATOR = "scripts/evidence.py"
 MANIFEST = "ci/VERIFICATION_MANIFEST.jsonl"
 TRACKER = ".beads/issues.jsonl"
+STATUS_VALIDATOR_TIMEOUT_SECONDS = 30
 
 # The producer's own words when an obligation is outstanding. Keyed on the
 # validator's message rather than re-derived, so this script cannot disagree
@@ -139,15 +142,19 @@ def obligation_report(
             f"classifying it:\n{output}"
         )
     lines = [
-        "br_obligation: THIS ACT CREATED A COVERAGE-ROW OBLIGATION, and the "
-        "pre-commit hook will refuse the next commit until it is met.",
+        (
+            "br_obligation: THIS ACT CREATED A COVERAGE-ROW OBLIGATION, and the "
+            "pre-commit hook will refuse the next commit until it is met."
+        ),
         "",
         "The verification validator says:",
         output,
         "",
-        "Filing owes a SPARSE row (every evidence array empty, notes carrying the "
-        "measurement). Closing owes a COMPLETE row citing a bead comment created "
-        "at or after the bead's closed_at.",
+        (
+            "Filing owes a SPARSE row (every evidence array empty, notes carrying the "
+            "measurement). Closing owes a COMPLETE row citing a bead comment created "
+            "at or after the bead's closed_at."
+        ),
     ]
     if changed:
         lines += ["", "Beads this invocation moved: " + ", ".join(changed)]
@@ -169,69 +176,136 @@ def obligation_report(
 # pinned out, and the refusal lands on whoever commits next rather than on whoever
 # set it.
 #
-# This ANNOUNCES; it does not refuse. Refusing would decide the lifecycle question
-# franken_lean-shlw deliberately leaves open -- whether the validator's four states
-# ARE the lifecycle, or whether the lifecycle has states the validator should learn.
-# Reporting what the validator will do decides nothing.
+# The lifecycle decision is criterion 2 of franken_lean-shlw: this wrapper refuses
+# any value outside the validator's set BEFORE invoking br. That makes the pane
+# setting the value see the refusal and leaves the shared tracker unchanged.
 #
-# The supported set is DERIVED from the validator's own source, never transcribed,
-# and a failed derivation is a typed refusal rather than a silent fallback to a
-# hardcoded list: a stale copy that still looked right is exactly how this check
-# would stop checking.
-
-STATUS_SITE = re.compile(r"status not in \{([^}]*)\}")
+# The wrapper CALLS the validator's status-only entry point before br. It does not
+# parse or transcribe the vocabulary. A validator fault is a refusal rather than a
+# silent fallback: a stale local copy that still looked right is exactly how this
+# check would stop checking.
 
 
-def validator_status_set(root: Path) -> frozenset[str] | None:
-    """The statuses the validator accepts, read from the validator.
-
-    None when the site cannot be located -- the caller must then say so rather
-    than assume a set.
-    """
-    try:
-        source = (root / VALIDATOR).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = STATUS_SITE.search(source)
-    if match is None:
-        return None
-    found = frozenset(re.findall(r'"([a-z_]+)"', match.group(1)))
-    # Anti-vacuity: an empty or implausibly small parse would silently accept
-    # everything. Refuse it instead.
-    return found if len(found) >= 2 else None
-
-
-def status_warning(requested: str | None, supported: frozenset[str] | None) -> str | None:
-    """Announce an export-blocking status, or None when there is nothing to say."""
-    if requested is None:
-        return None
-    if supported is None:
-        return (
-            "br_obligation: could not derive the validator's supported status set "
-            f"from {VALIDATOR}, so this status was NOT checked. That is a refusal "
-            "to guess, not a clean result."
-        )
-    if requested in supported:
-        return None
-    return (
-        f"br_obligation: STATUS {requested!r} WILL BLOCK EVERY PANE'S BEADS EXPORT.\n"
-        f"The verification validator accepts only: {', '.join(sorted(supported))}.\n"
-        "br accepts arbitrary text here (measured at 0.2.19), so this was stored "
-        "anyway. The pre-commit hook will refuse the next beads commit -- including "
-        "commits by panes that never touched this bead, and they cannot fix it.\n"
-        "See franken_lean-shlw. This is a warning, not a refusal: whether these four "
-        "states ARE the lifecycle is an open decision."
+def run_status_validator(
+    root: Path,
+    requested: str,
+    *,
+    invoke_validator: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    """Call the existing evidence validator for one prospective lifecycle value."""
+    return invoke_validator(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(root / VALIDATOR),
+            "validate-bead-status",
+            "--status",
+            requested,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=STATUS_VALIDATOR_TIMEOUT_SECONDS,
+        check=False,
     )
 
 
-def requested_status(argv: list[str]) -> str | None:
-    """The --status value in a br argv, or None. Handles both spellings."""
-    for index, token in enumerate(argv):
+def status_refusal(
+    root: Path,
+    requested: str | None,
+    *,
+    invoke_validator: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str | None:
+    """Explain a pre-action validator refusal, or None when br may run."""
+    if requested is None:
+        return None
+    try:
+        completed = run_status_validator(
+            root,
+            requested,
+            invoke_validator=invoke_validator,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "br_obligation: REFUSED BEFORE br: validate-bead-status timed out "
+            f"after {STATUS_VALIDATOR_TIMEOUT_SECONDS}s while judging {requested!r}.\n"
+            "The shared tracker is unchanged; a validator non-answer is never permission "
+            "to invoke br. See franken_lean-shlw."
+        )
+    except OSError as error:
+        return (
+            "br_obligation: REFUSED BEFORE br: validate-bead-status could not run "
+            f"while judging {requested!r} ({error}).\n"
+            "The shared tracker is unchanged; a validator launch failure is never permission "
+            "to invoke br. See franken_lean-shlw."
+        )
+    if completed.returncode == 0:
+        return None
+    detail = (completed.stdout + completed.stderr).strip()
+    if not detail:
+        detail = f"validator exited {completed.returncode} without a diagnostic"
+    return (
+        f"br_obligation: REFUSED BEFORE br: validate-bead-status rejected "
+        f"{requested!r} (exit {completed.returncode}).\n"
+        f"{detail}\n"
+        "br accepts arbitrary text here (measured at 0.2.19), but this wrapper did "
+        "not invoke br, so the shared tracker is unchanged and the refusal reaches "
+        "the pane that requested the status. See franken_lean-shlw."
+    )
+
+
+def requested_statuses(argv: list[str]) -> list[str]:
+    """Every explicit status value in a br argv, including attached spellings."""
+    found: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
         if token == "--status" or token == "-s":
-            return argv[index + 1] if index + 1 < len(argv) else None
+            # Missing values are invalid too. Represent one as the empty string so
+            # the validator refuses before br instead of silently skipping the check.
+            found.append(argv[index + 1] if index + 1 < len(argv) else "")
+            index += 2
+            continue
         if token.startswith("--status="):
-            return token.split("=", 1)[1]
-    return None
+            found.append(token.split("=", 1)[1])
+        elif token.startswith("-s") and len(token) > 2:
+            found.append(token[2:].removeprefix("="))
+        index += 1
+    return found
+
+
+def execute_br_command(
+    root: Path,
+    argv: list[str],
+    *,
+    invoke_br: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    """Run br only after an explicit status is admitted by the validator's set."""
+    for requested in requested_statuses(argv):
+        refusal = status_refusal(root, requested)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 2
+
+    before = tracker_state(root)
+    completed = invoke_br(["br", *argv], check=False)
+
+    after = tracker_state(root)
+    changed = sorted(
+        identifier
+        for identifier in set(after) | set(before)
+        if before.get(identifier) != after.get(identifier)
+    )
+
+    status, output = run_validator(root)
+    report = obligation_report(status, output, changed)
+    if report is not None:
+        print(file=sys.stderr)
+        print(report, file=sys.stderr)
+
+    return completed.returncode
 
 
 def self_test() -> int:
@@ -271,7 +345,10 @@ def self_test() -> int:
 
     # The producer must be the hook's, not a reimplementation.
     source = Path(__file__).read_text(encoding="utf-8")
-    if "validate-verification-manifest" not in source:
+    if (
+        "validate-verification-manifest" not in source
+        or "validate-bead-status" not in source
+    ):
         failures.append("this script must invoke the real validator")
     # The needles are ASSEMBLED, so this scanner's own body does not contain
     # them. The first version wrote them as literals and failed against itself:
@@ -286,43 +363,107 @@ def self_test() -> int:
             )
 
     # --- franken_lean-shlw cells ---------------------------------------------
-    supported = frozenset({"open", "in_progress", "closed", "tombstone"})
+    root = repo_root(Path.cwd().resolve())
+    if status_refusal(root, None) is not None:
+        failures.append("no --status must be admitted")
+    if status_refusal(root, "open") is not None:
+        failures.append("a supported status must be admitted")
 
-    if status_warning(None, supported) is not None:
-        failures.append("no --status must announce nothing")
-    if status_warning("in_progress", supported) is not None:
-        failures.append("a supported status must announce nothing")
+    refused = status_refusal(root, "blocked")
+    if refused is None:
+        failures.append("an unmodelled status must be refused")
+    elif (
+        "blocked" not in refused
+        or "franken_lean-shlw" not in refused
+        or "bead-status: unsupported status" not in refused
+    ):
+        failures.append("the refusal must carry the validator's status diagnosis")
 
-    warned = status_warning("blocked", supported)
-    if warned is None:
-        failures.append("an unmodelled status must be announced")
-    elif "blocked" not in warned or "franken_lean-shlw" not in warned:
-        failures.append("the announcement must name the status and the bead")
+    # A TYPO must refuse exactly as `blocked` does: the defect is not one word.
+    if status_refusal(root, "in_progres") is None:
+        failures.append("a typo must be refused too -- the defect is not one word")
 
-    # A TYPO must warn exactly as `blocked` does: the defect is not one word.
-    if status_warning("in_progres", supported) is None:
-        failures.append("a typo must be announced too -- the defect is not one word")
+    # ANTI-VACUITY: a validator fault must REFUSE, never silently pass.
+    def broken_validator(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 2, stdout="", stderr="validator fault")
 
-    # ANTI-VACUITY: an underivable set must REFUSE, never silently pass.
-    undecided = status_warning("blocked", None)
-    if undecided is None or "refusal to guess" not in undecided:
-        failures.append("an underivable validator set must be reported, not assumed")
+    undecided = status_refusal(
+        root,
+        "blocked",
+        invoke_validator=broken_validator,
+    )
+    if undecided is None or "validator fault" not in undecided:
+        failures.append("a faulting validator must be reported, not assumed")
 
-    # The set must be DERIVED from the real validator, not transcribed here.
-    derived = validator_status_set(repo_root(Path.cwd().resolve()))
-    if derived is None:
-        failures.append("could not derive the validator status set from its source")
-    elif not {"open", "closed"} <= derived:
-        failures.append(f"derived status set looks wrong: {sorted(derived) if derived else None}")
+    def timed_out_validator(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, STATUS_VALIDATOR_TIMEOUT_SECONDS)
+
+    timed_out = status_refusal(
+        root,
+        "blocked",
+        invoke_validator=timed_out_validator,
+    )
+    if timed_out is None or "timed out" not in timed_out:
+        failures.append("a timed-out validator must refuse before br with a diagnosis")
 
     for argv, expected in (
-        (["update", "x", "--status", "blocked"], "blocked"),
-        (["update", "x", "--status=blocked"], "blocked"),
-        (["update", "x", "-s", "blocked"], "blocked"),
-        (["close", "x"], None),
+        (["update", "x", "--status", "blocked"], ["blocked"]),
+        (["update", "x", "--status=blocked"], ["blocked"]),
+        (["update", "x", "-s", "blocked"], ["blocked"]),
+        (["update", "x", "-sblocked"], ["blocked"]),
+        (
+            ["update", "x", "--status", "open", "--status=blocked"],
+            ["open", "blocked"],
+        ),
+        (["update", "--", "--status"], []),
+        (["close", "x"], []),
     ):
-        if requested_status(argv) != expected:
-            failures.append(f"requested_status{argv} != {expected!r}")
+        if requested_statuses(argv) != expected:
+            failures.append(f"requested_statuses{argv} != {expected!r}")
+
+    # The before-action property, not merely the wording: a refused status must
+    # return nonzero without reaching the injected br runner.
+    invocations: list[list[str]] = []
+
+    def forbidden_br(
+        command: list[str], *, check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        invocations.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    refusal_status = execute_br_command(
+        root,
+        ["update", "fixture", "--status", "blocked"],
+        invoke_br=forbidden_br,
+    )
+    if refusal_status == 0:
+        failures.append("a refused status must return nonzero")
+    if invocations:
+        failures.append(f"a refused status invoked br anyway: {invocations!r}")
+
+    # GREEN CONTROL: the injected runner must remain reachable for a status the
+    # real validator admits. Otherwise the negative cell could pass because this
+    # wrapper had become a blanket refusal that never invokes br at all.
+    admitted_invocations: list[list[str]] = []
+
+    def admitted_br(
+        command: list[str], *, check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        admitted_invocations.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    admitted_argv = ["update", "fixture", "--status", "open"]
+    admitted_status = execute_br_command(root, admitted_argv, invoke_br=admitted_br)
+    if admitted_status != 0:
+        failures.append(f"an admitted status returned {admitted_status}, not zero")
+    if admitted_invocations != [["br", *admitted_argv]]:
+        failures.append(
+            f"an admitted status did not invoke br exactly once: {admitted_invocations!r}"
+        )
 
     if failures:
         for failure in failures:
@@ -340,34 +481,7 @@ def main(argv: list[str]) -> int:
         return self_test()
 
     root = repo_root(Path.cwd().resolve())
-    before = tracker_state(root)
-
-    warning = status_warning(
-        requested_status(argv), validator_status_set(root)
-    )
-
-    completed = subprocess.run(["br", *argv], check=False)
-
-    if warning is not None:
-        print("", file=sys.stderr)
-        print(warning, file=sys.stderr)
-
-    after = tracker_state(root)
-    changed = sorted(
-        identifier
-        for identifier in set(after) | set(before)
-        if before.get(identifier) != after.get(identifier)
-    )
-
-    status, output = run_validator(root)
-    report = obligation_report(status, output, changed)
-    if report is not None:
-        print("", file=sys.stderr)
-        print(report, file=sys.stderr)
-
-    # br's own exit status is what the caller asked for; the announcement is
-    # advisory and must not change it.
-    return completed.returncode
+    return execute_br_command(root, argv)
 
 
 if __name__ == "__main__":
