@@ -78,21 +78,22 @@ impl ModuleApplyTransactionId {
         Self(hash(Domain::Receipt, &bytes))
     }
 
-    fn from_state(state: &ModuleApplyState, module: &ModuleId) -> Option<Self> {
-        let payload = state
-            .applied_payloads()
-            .iter()
-            .find(|payload| &payload.contribution().module().id == module)?;
+    fn from_payload(manifest_root: ModuleProvenanceRoot, payload: &AppliedModulePayload) -> Self {
         let declaration_identities = payload
             .declarations()
             .iter()
             .chain(payload.extra_declarations())
             .map(|info| Environment::decl_content_digest(info))
             .collect::<Vec<_>>();
-        Some(Self::derive(
-            state.manifest().root(),
-            &declaration_identities,
-        ))
+        Self::derive(manifest_root, &declaration_identities)
+    }
+
+    fn from_state(state: &ModuleApplyState, module: &ModuleId) -> Option<Self> {
+        let payload = state
+            .applied_payloads()
+            .iter()
+            .find(|payload| &payload.contribution().module().id == module)?;
+        Some(Self::from_payload(state.manifest().root(), payload))
     }
 
     pub const fn digest(&self) -> Digest {
@@ -877,26 +878,48 @@ pub enum ModuleApplyCandidateError {
     DeclarationDelta(DeclarationDeltaError),
 }
 
-/// Classify whether one preflight is the exact already-published result.
+/// How the current aggregate state relates to the result named by a retry.
 ///
-/// This is intentionally narrower than descendant retry: it does not infer
-/// ancestry from matching roots or permit a later state to stand in for the
-/// original result. Those cases require the lifecycle-owned ancestry witness.
+/// `ManifestDescendant` is an exact canonical-record containment statement, not a
+/// claim about unrecorded process history. The current manifest has strictly more
+/// records, contains every target record by exact value, and retains the retried
+/// module's exact payload values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleApplyRetryRelation {
+    ExactResult,
+    ManifestDescendant,
+}
+
+/// Additional evidence supplied for an already-applied observation.
+///
+/// Both arms recheck exact manifest and payload values. `PublicationReceipt` adds
+/// the private receipt issued by the original successful transition; it never
+/// substitutes for those value checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleApplyRetryEvidence {
+    ExactValues,
+    PublicationReceipt,
+}
+
+/// Classify whether one preflight is already represented by the current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleApplyRetryDisposition {
     NotCurrentResult {
         requested: ModuleProvenanceRoot,
         current: ModuleProvenanceRoot,
     },
-    ExactResult {
+    AlreadyApplied {
         module: ModuleId,
         transaction_id: ModuleApplyTransactionId,
-        provenance_root: ModuleProvenanceRoot,
+        result_provenance_root: ModuleProvenanceRoot,
+        current_provenance_root: ModuleProvenanceRoot,
+        relation: ModuleApplyRetryRelation,
+        evidence: ModuleApplyRetryEvidence,
     },
 }
 
-/// A same-root retry is never silently treated as exact when its canonical value or
-/// retained declaration values differ.
+/// A retry is never silently treated as already applied when canonical records or
+/// retained values differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleApplyRetryError {
     SupersededPreflightSchema {
@@ -914,17 +937,50 @@ pub enum ModuleApplyRetryError {
         expected: ModuleApplyTransactionId,
         actual: ModuleApplyTransactionId,
     },
+    PayloadIdentityCollision {
+        module: ModuleId,
+        transaction_id: ModuleApplyTransactionId,
+    },
+    Payload(ModuleApplyCandidateError),
+    Receipt(ModuleApplyRetryReceiptError),
 }
 
-/// Recognize only an exact retry against its already-published result.
+/// Refusals while binding an optional publication receipt to a retry preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleApplyRetryReceiptError {
+    SupersededSchema {
+        schema: u16,
+    },
+    Module {
+        expected: ModuleId,
+        actual: ModuleId,
+    },
+    Contribution {
+        module: ModuleId,
+    },
+    Grade {
+        module: ModuleId,
+    },
+    Transaction {
+        expected: ModuleApplyTransactionId,
+        actual: ModuleApplyTransactionId,
+    },
+    ResultRoot {
+        expected: ModuleProvenanceRoot,
+        actual: ModuleProvenanceRoot,
+    },
+}
+
+/// Recognize an exact-result or strict manifest-descendant retry.
 ///
-/// A different current root is a normal non-idempotent result rather than a refusal;
-/// it may be an earlier base, a later descendant, or an unrelated state. This function
-/// deliberately exposes none of those as an accepted retry without a separate
-/// ancestry proof.
-pub fn classify_exact_result_retry(
+/// Digest equality is only a fast locator. An accepted result requires exact target
+/// record containment and exact equality of the retried module's retained declaration
+/// and extension payload values. A different current root that does not satisfy strict
+/// containment remains a normal non-current result.
+pub fn classify_module_apply_retry(
     preflight: &PreflightedModuleApply,
     current: &ModuleApplyState,
+    receipt: Option<&ModuleApplyReceipt>,
 ) -> Result<ModuleApplyRetryDisposition, ModuleApplyRetryError> {
     if preflight.schema != MODULE_APPLY_SCHEMA_VERSION {
         return Err(ModuleApplyRetryError::SupersededPreflightSchema {
@@ -932,22 +988,46 @@ pub fn classify_exact_result_retry(
         });
     }
     current.verify().map_err(ModuleApplyRetryError::State)?;
+    if let Some(receipt) = receipt {
+        receipt
+            .verify_retry_for(preflight)
+            .map_err(ModuleApplyRetryError::Receipt)?;
+    }
+
+    let target = preflight.transaction().manifest();
     let current_root = current.manifest().root();
-    if current_root != preflight.manifest_root() {
-        return Ok(ModuleApplyRetryDisposition::NotCurrentResult {
-            requested: preflight.manifest_root(),
-            current: current_root,
-        });
-    }
-    if current.manifest() != preflight.transaction().manifest() {
-        return Err(ModuleApplyRetryError::RootCollision { root: current_root });
-    }
-    let module = preflight.transaction().contribution().module().id.clone();
-    let actual = ModuleApplyTransactionId::from_state(current, &module).ok_or_else(|| {
-        ModuleApplyRetryError::MissingPayload {
-            module: module.clone(),
+    let relation = if current_root == preflight.manifest_root() {
+        if current.manifest() != target {
+            return Err(ModuleApplyRetryError::RootCollision { root: current_root });
         }
-    })?;
+        ModuleApplyRetryRelation::ExactResult
+    } else {
+        let is_strict_manifest_descendant = current.manifest().epoch() == target.epoch()
+            && current.manifest().records().len() > target.records().len()
+            && target
+                .records()
+                .iter()
+                .all(|record| current.manifest().record(&record.module().id) == Some(record));
+        if !is_strict_manifest_descendant {
+            return Ok(ModuleApplyRetryDisposition::NotCurrentResult {
+                requested: preflight.manifest_root(),
+                current: current_root,
+            });
+        }
+        ModuleApplyRetryRelation::ManifestDescendant
+    };
+
+    let module = preflight.transaction().contribution().module().id.clone();
+    let actual_payload = current
+        .applied_payloads()
+        .iter()
+        .find(|payload| payload.contribution().module().id == module)
+        .ok_or_else(|| ModuleApplyRetryError::MissingPayload {
+            module: module.clone(),
+        })?;
+    let expected_payload =
+        AppliedModulePayload::from_preflight(preflight).map_err(ModuleApplyRetryError::Payload)?;
+    let actual = ModuleApplyTransactionId::from_payload(preflight.manifest_root(), actual_payload);
     let expected = preflight.transaction_id();
     if actual != expected {
         return Err(ModuleApplyRetryError::PayloadConflict {
@@ -956,10 +1036,23 @@ pub fn classify_exact_result_retry(
             actual,
         });
     }
-    Ok(ModuleApplyRetryDisposition::ExactResult {
+    if actual_payload != &expected_payload {
+        return Err(ModuleApplyRetryError::PayloadIdentityCollision {
+            module,
+            transaction_id: expected,
+        });
+    }
+    Ok(ModuleApplyRetryDisposition::AlreadyApplied {
         module,
         transaction_id: expected,
-        provenance_root: current_root,
+        result_provenance_root: preflight.manifest_root(),
+        current_provenance_root: current_root,
+        relation,
+        evidence: if receipt.is_some() {
+            ModuleApplyRetryEvidence::PublicationReceipt
+        } else {
+            ModuleApplyRetryEvidence::ExactValues
+        },
     })
 }
 
@@ -1305,6 +1398,57 @@ impl ModuleApplyReceipt {
         }
         Ok(())
     }
+
+    /// Bind this privately issued publication receipt to the exact retry target.
+    ///
+    /// The receipt adds evidence that this transaction once completed its original
+    /// publication. It does not replace the classifier's exact current-manifest and
+    /// payload checks, nor does it claim a process-history edge to the current state.
+    fn verify_retry_for(
+        &self,
+        preflight: &PreflightedModuleApply,
+    ) -> Result<(), ModuleApplyRetryReceiptError> {
+        if self.schema != MODULE_APPLY_SCHEMA_VERSION {
+            return Err(ModuleApplyRetryReceiptError::SupersededSchema {
+                schema: self.schema,
+            });
+        }
+        let expected_module = &preflight.transaction().contribution().module().id;
+        if &self.module != expected_module {
+            return Err(ModuleApplyRetryReceiptError::Module {
+                expected: expected_module.clone(),
+                actual: self.module.clone(),
+            });
+        }
+        if self.contribution != *preflight.transaction().contribution() {
+            return Err(ModuleApplyRetryReceiptError::Contribution {
+                module: self.module.clone(),
+            });
+        }
+        let expected_grade = ModuleApplyGrade::from_completeness(
+            preflight.transaction().contribution().completeness(),
+        );
+        if self.grade != expected_grade {
+            return Err(ModuleApplyRetryReceiptError::Grade {
+                module: self.module.clone(),
+            });
+        }
+        let expected_transaction = preflight.transaction_id();
+        if self.transaction_id != expected_transaction {
+            return Err(ModuleApplyRetryReceiptError::Transaction {
+                expected: expected_transaction,
+                actual: self.transaction_id,
+            });
+        }
+        let expected_result = preflight.manifest_root();
+        if self.result_provenance_root != expected_result {
+            return Err(ModuleApplyRetryReceiptError::ResultRoot {
+                expected: expected_result,
+                actual: self.result_provenance_root,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A state released by a one-shot aggregate commit and the receipt that binds it.
@@ -1328,7 +1472,7 @@ impl CommittedModuleApply {
     }
 }
 
-/// An exact retry that observed the already-published immutable state.
+/// A retry that observed the requested module in an already-published immutable state.
 ///
 /// This is deliberately not a receipt for a second publication: no declaration,
 /// extension, graph, manifest, or index is replayed or replaced.
@@ -1337,7 +1481,10 @@ pub struct AlreadyAppliedModuleApply {
     state: ModuleApplyState,
     module: ModuleId,
     transaction_id: ModuleApplyTransactionId,
-    provenance_root: ModuleProvenanceRoot,
+    result_provenance_root: ModuleProvenanceRoot,
+    current_provenance_root: ModuleProvenanceRoot,
+    relation: ModuleApplyRetryRelation,
+    evidence: ModuleApplyRetryEvidence,
 }
 
 impl AlreadyAppliedModuleApply {
@@ -1353,8 +1500,20 @@ impl AlreadyAppliedModuleApply {
         self.transaction_id
     }
 
-    pub const fn provenance_root(&self) -> ModuleProvenanceRoot {
-        self.provenance_root
+    pub const fn result_provenance_root(&self) -> ModuleProvenanceRoot {
+        self.result_provenance_root
+    }
+
+    pub const fn current_provenance_root(&self) -> ModuleProvenanceRoot {
+        self.current_provenance_root
+    }
+
+    pub const fn relation(&self) -> ModuleApplyRetryRelation {
+        self.relation
+    }
+
+    pub const fn evidence(&self) -> ModuleApplyRetryEvidence {
+        self.evidence
     }
 }
 
@@ -1365,11 +1524,67 @@ pub enum ModuleApplyCommitResult {
     AlreadyApplied(AlreadyAppliedModuleApply),
 }
 
-/// A prepared publication or an exact-result retry awaiting one final base check.
+/// An already-applied observation bound to the exact immutable state seen at prepare.
+#[derive(Debug, Clone)]
+pub struct ModuleApplyRetryPlan {
+    preflight: PreflightedModuleApply,
+    observed_state: ModuleApplyState,
+    receipt: Option<Box<ModuleApplyReceipt>>,
+}
+
+impl ModuleApplyRetryPlan {
+    pub const fn is_cacheable(&self) -> bool {
+        false
+    }
+
+    /// Retry observations are one-shot and cannot move across immutable states.
+    pub fn is_valid_for(&self, current: &ModuleApplyState) -> bool {
+        self.observed_state == *current
+    }
+
+    fn commit(
+        self,
+        current: &ModuleApplyState,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Outcome<Result<AlreadyAppliedModuleApply, ModuleApplyCommitError>> {
+        if !self.is_valid_for(current) {
+            return Outcome::complete(Err(ModuleApplyCommitError::StaleBase));
+        }
+        match classify_module_apply_retry(&self.preflight, current, self.receipt.as_deref()) {
+            Ok(ModuleApplyRetryDisposition::AlreadyApplied {
+                module,
+                transaction_id,
+                result_provenance_root,
+                current_provenance_root,
+                relation,
+                evidence,
+            }) => {
+                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return cancelled_before_module_publication();
+                }
+                Outcome::complete(Ok(AlreadyAppliedModuleApply {
+                    state: current.clone(),
+                    module,
+                    transaction_id,
+                    result_provenance_root,
+                    current_provenance_root,
+                    relation,
+                    evidence,
+                }))
+            }
+            Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {
+                Outcome::complete(Err(ModuleApplyCommitError::StaleBase))
+            }
+            Err(error) => Outcome::complete(Err(ModuleApplyCommitError::Retry(error))),
+        }
+    }
+}
+
+/// A prepared publication or already-applied observation awaiting one final base check.
 #[derive(Debug, Clone)]
 pub enum ModuleApplyPlan {
-    Prepared(PreparedModuleApply),
-    ExactResultRetry(PreflightedModuleApply),
+    Prepared(Box<PreparedModuleApply>),
+    Retry(Box<ModuleApplyRetryPlan>),
 }
 
 impl ModuleApplyPlan {
@@ -1378,7 +1593,7 @@ impl ModuleApplyPlan {
         false
     }
 
-    /// Consume a plan once. Exact retries re-check the held state and return an
+    /// Consume a plan once. Retries re-check the held state and return an
     /// observation; only the prepared arm can publish a new state. Cancellation is
     /// sampled after that revalidation, immediately before either success is released.
     pub fn commit(
@@ -1390,31 +1605,9 @@ impl ModuleApplyPlan {
             Self::Prepared(plan) => plan
                 .commit(base, cancellation)
                 .map_complete(|result| result.map(ModuleApplyCommitResult::Published)),
-            Self::ExactResultRetry(preflight) => {
-                match classify_exact_result_retry(&preflight, base) {
-                    Ok(ModuleApplyRetryDisposition::ExactResult {
-                        module,
-                        transaction_id,
-                        provenance_root,
-                    }) => {
-                        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                            return cancelled_before_module_publication();
-                        }
-                        Outcome::complete(Ok(ModuleApplyCommitResult::AlreadyApplied(
-                            AlreadyAppliedModuleApply {
-                                state: base.clone(),
-                                module,
-                                transaction_id,
-                                provenance_root,
-                            },
-                        )))
-                    }
-                    Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {
-                        Outcome::complete(Err(ModuleApplyCommitError::StaleBase))
-                    }
-                    Err(error) => Outcome::complete(Err(ModuleApplyCommitError::Retry(error))),
-                }
-            }
+            Self::Retry(plan) => plan
+                .commit(base, cancellation)
+                .map_complete(|result| result.map(ModuleApplyCommitResult::AlreadyApplied)),
         }
     }
 }
@@ -1534,16 +1727,49 @@ pub fn prepare_module_apply(
     base: &ModuleApplyState,
     declaration_candidate: &Environment,
 ) -> Outcome<Result<ModuleApplyPlan, ModuleApplyPrepareError>> {
-    match classify_exact_result_retry(preflight, base) {
-        Ok(ModuleApplyRetryDisposition::ExactResult { .. }) => {
-            return Outcome::complete(Ok(ModuleApplyPlan::ExactResultRetry(preflight.clone())));
+    prepare_module_apply_inner(preflight, base, declaration_candidate, None)
+}
+
+/// Prepare an application while retaining an original publication receipt as
+/// additional retry evidence.
+///
+/// The receipt is validated even when `base` is not yet the requested result. A
+/// matching receipt can therefore accompany a legitimate apply on another branch,
+/// but a substituted or stale receipt can never be silently ignored.
+pub fn prepare_module_apply_with_receipt(
+    preflight: &PreflightedModuleApply,
+    receipt: &ModuleApplyReceipt,
+    base: &ModuleApplyState,
+    declaration_candidate: &Environment,
+) -> Outcome<Result<ModuleApplyPlan, ModuleApplyPrepareError>> {
+    prepare_module_apply_inner(
+        preflight,
+        base,
+        declaration_candidate,
+        Some(receipt.clone()),
+    )
+}
+
+fn prepare_module_apply_inner(
+    preflight: &PreflightedModuleApply,
+    base: &ModuleApplyState,
+    declaration_candidate: &Environment,
+    receipt: Option<ModuleApplyReceipt>,
+) -> Outcome<Result<ModuleApplyPlan, ModuleApplyPrepareError>> {
+    match classify_module_apply_retry(preflight, base, receipt.as_ref()) {
+        Ok(ModuleApplyRetryDisposition::AlreadyApplied { .. }) => {
+            return Outcome::complete(Ok(ModuleApplyPlan::Retry(Box::new(ModuleApplyRetryPlan {
+                preflight: preflight.clone(),
+                observed_state: base.clone(),
+                receipt: receipt.map(Box::new),
+            }))));
         }
         Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. }) => {}
         Err(error) => return Outcome::complete(Err(ModuleApplyPrepareError::Retry(error))),
     }
     match prepare_module_apply_candidate(preflight, base, declaration_candidate) {
-        Outcome::Complete(Ok(candidate)) => {
-            Outcome::complete(Ok(ModuleApplyPlan::Prepared(PreparedModuleApply {
+        Outcome::Complete(Ok(candidate)) => Outcome::complete(Ok(ModuleApplyPlan::Prepared(
+            Box::new(PreparedModuleApply {
                 schema: MODULE_APPLY_SCHEMA_VERSION,
                 base_environment: base.environment().clone(),
                 base_graph: base.graph().clone(),
@@ -1562,8 +1788,8 @@ pub fn prepare_module_apply(
                     result_provenance_root: candidate.manifest().root(),
                 }),
                 candidate,
-            })))
-        }
+            }),
+        ))),
         Outcome::Complete(Err(error)) => Outcome::complete(Err(error)),
         Outcome::Inconclusive(inconclusive) => Outcome::Inconclusive(inconclusive),
         Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -2061,6 +2287,82 @@ mod tests {
         }
     }
 
+    fn empty_apply_state() -> ModuleApplyState {
+        let manifest = Arc::new(
+            ModuleProvenanceManifest::new(epoch(), vec![], ModuleProvenanceLimits::default())
+                .expect("empty manifest is valid"),
+        );
+        let graph = ModuleGraph::new(epoch(), ModuleGraphLimits::default())
+            .into_admitted_value()
+            .expect("empty graph construction admits");
+        ModuleApplyState::from_parts(Environment::new(), graph, manifest)
+            .expect("empty aggregate state is coherent")
+    }
+
+    fn declaration_candidate_for(
+        preflight: &PreflightedModuleApply,
+        base: &ModuleApplyState,
+    ) -> Environment {
+        base.environment()
+            .add_decl((*preflight.transaction().declarations()[0]).clone())
+            .expect("fixture declaration is unique")
+            .add_decl((*preflight.transaction().extra_declarations()[0]).clone())
+            .expect("fixture extra declaration is unique")
+    }
+
+    fn publish_fixture(
+        preflight: &PreflightedModuleApply,
+        base: &ModuleApplyState,
+    ) -> CommittedModuleApply {
+        let candidate = declaration_candidate_for(preflight, base);
+        let plan = match prepare_module_apply(preflight, base, &candidate) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Prepared(plan))) => plan,
+            other => panic!("expected a prepared fixture application, got {other:?}"),
+        };
+        completed(
+            plan.commit(base, None),
+            "uncancelled fixture publication must complete",
+        )
+        .expect("fixture base remains current")
+    }
+
+    fn descendant_retry_fixture() -> (
+        PreflightedModuleApply,
+        CommittedModuleApply,
+        ModuleApplyState,
+    ) {
+        let base = empty_apply_state();
+        let left = named_record(
+            "fixture.retry-left",
+            "fixture.retry-left.decl",
+            "fixture.retry-left.extra",
+            21,
+        );
+        let right = named_record(
+            "fixture.retry-right",
+            "fixture.retry-right.decl",
+            "fixture.retry-right.extra",
+            22,
+        );
+        let left_preflight = preflight_module_apply(transaction_with_target(
+            vec![left.clone()],
+            left.clone(),
+            "fixture.retry-left.decl",
+            "fixture.retry-left.extra",
+        ))
+        .expect("left retry fixture preflights");
+        let left_publication = publish_fixture(&left_preflight, &base);
+        let right_preflight = preflight_module_apply(transaction_with_target(
+            vec![left, right.clone()],
+            right,
+            "fixture.retry-right.decl",
+            "fixture.retry-right.extra",
+        ))
+        .expect("right descendant fixture preflights");
+        let descendant = publish_fixture(&right_preflight, left_publication.state()).into_state();
+        (left_preflight, left_publication, descendant)
+    }
+
     #[test]
     fn preflight_binds_arc_payloads_without_publishing_or_copying() {
         let descriptor = descriptor();
@@ -2458,7 +2760,7 @@ mod tests {
         ))
         .expect("payloads preflight");
         assert!(matches!(
-            classify_exact_result_retry(&checked, &base),
+            classify_module_apply_retry(&checked, &base, None),
             Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. })
         ));
         let declaration_candidate = base
@@ -2723,9 +3025,11 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            classify_exact_result_retry(&checked, committed.state()),
-            Ok(ModuleApplyRetryDisposition::ExactResult {
+            classify_module_apply_retry(&checked, committed.state(), None),
+            Ok(ModuleApplyRetryDisposition::AlreadyApplied {
                 transaction_id,
+                relation: ModuleApplyRetryRelation::ExactResult,
+                evidence: ModuleApplyRetryEvidence::ExactValues,
                 ..
             }) if transaction_id == checked.transaction_id()
         ));
@@ -2735,14 +3039,14 @@ mod tests {
             committed.state(),
             committed.state().environment(),
         ) {
-            Outcome::Complete(Ok(ModuleApplyPlan::ExactResultRetry(plan))) => plan,
+            Outcome::Complete(Ok(ModuleApplyPlan::Retry(plan))) => plan,
             Outcome::Complete(Ok(other)) => {
                 panic!("expected an exact-result retry plan, got {other:?}")
             }
             other => panic!("expected a complete retry plan, got {other:?}"),
         };
         let retry_cancellation = AtomicBool::new(true);
-        let cancelled_retry = ModuleApplyPlan::ExactResultRetry(exact_retry_plan.clone())
+        let cancelled_retry = ModuleApplyPlan::Retry(exact_retry_plan.clone())
             .commit(committed.state(), Some(&retry_cancellation));
         let Outcome::Inconclusive(inconclusive) = cancelled_retry else {
             panic!("final retry cancellation must be a typed non-answer, got {cancelled_retry:?}");
@@ -2754,7 +3058,7 @@ mod tests {
         ));
 
         let exact_retry = match completed(
-            ModuleApplyPlan::ExactResultRetry(exact_retry_plan).commit(committed.state(), None),
+            ModuleApplyPlan::Retry(exact_retry_plan).commit(committed.state(), None),
             "exact retry must complete without cancellation",
         )
         .expect("exact retry revalidates the same immutable state")
@@ -2768,8 +3072,20 @@ mod tests {
         assert_eq!(exact_retry.module(), &contribution.module().id);
         assert_eq!(exact_retry.transaction_id(), checked.transaction_id());
         assert_eq!(
-            exact_retry.provenance_root(),
+            exact_retry.current_provenance_root(),
             committed.state().manifest().root()
+        );
+        assert_eq!(
+            exact_retry.result_provenance_root(),
+            committed.state().manifest().root()
+        );
+        assert_eq!(
+            exact_retry.relation(),
+            ModuleApplyRetryRelation::ExactResult
+        );
+        assert_eq!(
+            exact_retry.evidence(),
+            ModuleApplyRetryEvidence::ExactValues
         );
 
         let mut replacement_module = contribution.module().clone();
@@ -2818,10 +3134,340 @@ mod tests {
         ))
         .expect("same-name fixture mutation remains preflight-valid");
         assert!(matches!(
-            classify_exact_result_retry(&altered, committed.state()),
+            classify_module_apply_retry(&altered, committed.state(), None),
             Err(ModuleApplyRetryError::PayloadConflict { .. })
         ));
         assert_eq!(base.graph().len(), 0);
+    }
+
+    #[test]
+    fn later_descendant_retry_without_receipt_observes_exact_values_without_publication() {
+        let (preflight, original, descendant) = descendant_retry_fixture();
+        let disposition = classify_module_apply_retry(&preflight, &descendant, None)
+            .expect("exact target containment is a completed retry classification");
+        assert!(matches!(
+            disposition,
+            ModuleApplyRetryDisposition::AlreadyApplied {
+                transaction_id,
+                result_provenance_root,
+                current_provenance_root,
+                relation: ModuleApplyRetryRelation::ManifestDescendant,
+                evidence: ModuleApplyRetryEvidence::ExactValues,
+                ..
+            } if transaction_id == preflight.transaction_id()
+                && result_provenance_root == original.state().manifest().root()
+                && current_provenance_root == descendant.manifest().root()
+        ));
+
+        let retry_plan =
+            match prepare_module_apply(&preflight, &descendant, descendant.environment()) {
+                Outcome::Complete(Ok(ModuleApplyPlan::Retry(plan))) => plan,
+                other => panic!("expected a descendant retry plan, got {other:?}"),
+            };
+        assert!(!retry_plan.is_cacheable());
+        assert!(retry_plan.is_valid_for(&descendant));
+        assert!(!retry_plan.is_valid_for(original.state()));
+        assert!(matches!(
+            ModuleApplyPlan::Retry(retry_plan.clone()).commit(original.state(), None),
+            Outcome::Complete(Err(ModuleApplyCommitError::StaleBase))
+        ));
+
+        let cancellation = AtomicBool::new(true);
+        let cancelled =
+            ModuleApplyPlan::Retry(retry_plan.clone()).commit(&descendant, Some(&cancellation));
+        assert!(matches!(
+            cancelled,
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::Cancelled { ref at },
+                ..
+            }) if at.text() == ModuleApplyCheckpoint::BeforePublication.to_string()
+        ));
+
+        let observed = match completed(
+            ModuleApplyPlan::Retry(retry_plan).commit(&descendant, None),
+            "uncancelled descendant retry must complete",
+        )
+        .expect("the exact observed state remains current")
+        {
+            ModuleApplyCommitResult::AlreadyApplied(observed) => observed,
+            ModuleApplyCommitResult::Published(other) => {
+                panic!("descendant retry must not publish: {other:?}")
+            }
+        };
+        assert_eq!(observed.state(), &descendant);
+        assert_eq!(
+            observed.relation(),
+            ModuleApplyRetryRelation::ManifestDescendant
+        );
+        assert_eq!(observed.evidence(), ModuleApplyRetryEvidence::ExactValues);
+        assert_eq!(
+            observed.result_provenance_root(),
+            original.state().manifest().root()
+        );
+        assert_eq!(
+            observed.current_provenance_root(),
+            descendant.manifest().root()
+        );
+        descendant
+            .verify()
+            .expect("retry observation leaves the descendant unchanged");
+    }
+
+    #[test]
+    fn exact_and_descendant_retries_revalidate_optional_publication_receipts() {
+        let (preflight, original, descendant) = descendant_retry_fixture();
+        let receipt = original.receipt();
+
+        let exact_plan = match prepare_module_apply_with_receipt(
+            &preflight,
+            receipt,
+            original.state(),
+            original.state().environment(),
+        ) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Retry(plan))) => plan,
+            other => panic!("expected a receipt-bound exact retry plan, got {other:?}"),
+        };
+        let exact = completed(
+            ModuleApplyPlan::Retry(exact_plan).commit(original.state(), None),
+            "receipt-bound exact retry must complete",
+        )
+        .expect("the exact result remains current");
+        let ModuleApplyCommitResult::AlreadyApplied(exact) = exact else {
+            panic!("receipt-bound exact retry must not publish")
+        };
+        assert_eq!(exact.relation(), ModuleApplyRetryRelation::ExactResult);
+        assert_eq!(
+            exact.evidence(),
+            ModuleApplyRetryEvidence::PublicationReceipt
+        );
+
+        let descendant_plan = match prepare_module_apply_with_receipt(
+            &preflight,
+            receipt,
+            &descendant,
+            descendant.environment(),
+        ) {
+            Outcome::Complete(Ok(ModuleApplyPlan::Retry(plan))) => plan,
+            other => panic!("expected a receipt-bound descendant retry plan, got {other:?}"),
+        };
+        let observed = completed(
+            ModuleApplyPlan::Retry(descendant_plan).commit(&descendant, None),
+            "receipt-bound descendant retry must complete",
+        )
+        .expect("the descendant remains current");
+        let ModuleApplyCommitResult::AlreadyApplied(observed) = observed else {
+            panic!("receipt-bound descendant retry must not publish")
+        };
+        assert_eq!(
+            observed.relation(),
+            ModuleApplyRetryRelation::ManifestDescendant
+        );
+        assert_eq!(
+            observed.evidence(),
+            ModuleApplyRetryEvidence::PublicationReceipt
+        );
+        assert_eq!(observed.state(), &descendant);
+
+        let mut substituted_receipt = receipt.clone();
+        substituted_receipt.result_provenance_root = descendant.manifest().root();
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&substituted_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::ResultRoot { .. }
+            ))
+        ));
+
+        let mut superseded_receipt = receipt.clone();
+        superseded_receipt.schema = MODULE_APPLY_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&superseded_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::SupersededSchema { .. }
+            ))
+        ));
+
+        let mut wrong_module_receipt = receipt.clone();
+        wrong_module_receipt.module = ModuleId::new(name("fixture.other-receipt"));
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&wrong_module_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::Module { .. }
+            ))
+        ));
+
+        let mut wrong_contribution_receipt = receipt.clone();
+        let held_contribution = receipt.contribution();
+        let mut wrong_artifact = held_contribution.module().artifact.clone();
+        wrong_artifact.content_digest = Digest([31; 32]);
+        wrong_contribution_receipt.contribution = ModuleContributionRecord::new(
+            ModuleRecord::new(
+                held_contribution.module().id.clone(),
+                held_contribution.module().is_module,
+                held_contribution.module().direct_imports().to_vec(),
+                wrong_artifact,
+            ),
+            held_contribution.declarations().to_vec(),
+            held_contribution.extra_declarations().to_vec(),
+            held_contribution.extension_contributions().to_vec(),
+            held_contribution.completeness().clone(),
+        );
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&wrong_contribution_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::Contribution { .. }
+            ))
+        ));
+
+        let mut wrong_grade_receipt = receipt.clone();
+        wrong_grade_receipt.grade = ModuleApplyGrade::AppliedIncomplete {
+            completeness: receipt.grade().completeness().clone(),
+        };
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&wrong_grade_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::Grade { .. }
+            ))
+        ));
+
+        let mut wrong_transaction_receipt = receipt.clone();
+        wrong_transaction_receipt.transaction_id = ModuleApplyTransactionId(Digest([32; 32]));
+        assert!(matches!(
+            classify_module_apply_retry(&preflight, &descendant, Some(&wrong_transaction_receipt)),
+            Err(ModuleApplyRetryError::Receipt(
+                ModuleApplyRetryReceiptError::Transaction { .. }
+            ))
+        ));
+        descendant
+            .verify()
+            .expect("receipt substitution refusal leaves the descendant unchanged");
+    }
+
+    #[test]
+    fn module_presence_without_full_target_containment_is_not_a_descendant_retry() {
+        let base = empty_apply_state();
+        let subject = named_record(
+            "fixture.retry-subject",
+            "fixture.retry-subject.decl",
+            "fixture.retry-subject.extra",
+            41,
+        );
+        let unrelated_one = named_record(
+            "fixture.unrelated-one",
+            "fixture.unrelated-one.decl",
+            "fixture.unrelated-one.extra",
+            42,
+        );
+        let unrelated_two = named_record(
+            "fixture.unrelated-two",
+            "fixture.unrelated-two.decl",
+            "fixture.unrelated-two.extra",
+            43,
+        );
+        let required = named_record(
+            "fixture.required-base",
+            "fixture.required-base.decl",
+            "fixture.required-base.extra",
+            44,
+        );
+
+        let subject_first = preflight_module_apply(transaction_with_target(
+            vec![subject.clone()],
+            subject.clone(),
+            "fixture.retry-subject.decl",
+            "fixture.retry-subject.extra",
+        ))
+        .expect("subject-first transaction preflights");
+        let after_subject = publish_fixture(&subject_first, &base).into_state();
+        let unrelated_one_next = preflight_module_apply(transaction_with_target(
+            vec![subject.clone(), unrelated_one.clone()],
+            unrelated_one.clone(),
+            "fixture.unrelated-one.decl",
+            "fixture.unrelated-one.extra",
+        ))
+        .expect("first unrelated transaction preflights");
+        let after_unrelated_one = publish_fixture(&unrelated_one_next, &after_subject).into_state();
+        let unrelated_two_next = preflight_module_apply(transaction_with_target(
+            vec![subject.clone(), unrelated_one, unrelated_two.clone()],
+            unrelated_two,
+            "fixture.unrelated-two.decl",
+            "fixture.unrelated-two.extra",
+        ))
+        .expect("second unrelated transaction preflights");
+        let current = publish_fixture(&unrelated_two_next, &after_unrelated_one).into_state();
+
+        let requested = preflight_module_apply(transaction_with_target(
+            vec![required, subject.clone()],
+            subject.clone(),
+            "fixture.retry-subject.decl",
+            "fixture.retry-subject.extra",
+        ))
+        .expect("subject-after-required transaction preflights");
+        assert!(
+            current.manifest().records().len() > requested.transaction().manifest().records().len()
+        );
+        assert_eq!(
+            current.manifest().record(&subject.module().id),
+            Some(&subject),
+            "the negative must hold module presence and exact module-record equality fixed"
+        );
+        assert!(matches!(
+            classify_module_apply_retry(&requested, &current, None),
+            Ok(ModuleApplyRetryDisposition::NotCurrentResult { .. })
+        ));
+        assert!(matches!(
+            prepare_module_apply(&requested, &current, current.environment()),
+            Outcome::Complete(Err(ModuleApplyPrepareError::ExistingModule { .. }))
+        ));
+        current
+            .verify()
+            .expect("non-descendant classification leaves the current state unchanged");
+    }
+
+    /// Bounded model: this injects the equality that a declaration-content digest
+    /// collision would create. It neither finds nor claims a cryptographic collision.
+    #[test]
+    fn retry_payload_identity_collision_is_reported_not_resolved() {
+        let base = empty_apply_state();
+        let contribution = record(vec![]);
+        let checked = preflight_module_apply(transaction(contribution.clone(), vec![]))
+            .expect("baseline retry fixture preflights");
+        let committed = publish_fixture(&checked, &base);
+
+        let altered_declaration = match checked.transaction().declarations()[0].as_ref() {
+            ConstantInfo::Axiom(axiom) => {
+                let mut altered = axiom.clone();
+                altered.is_unsafe = true;
+                Arc::new(ConstantInfo::Axiom(altered))
+            }
+            other => panic!("fixture declaration changed kind: {other:?}"),
+        };
+        let mut injected = preflight_module_apply(ModuleApplyTransaction::new(
+            Arc::clone(&checked.transaction().manifest),
+            contribution,
+            vec![altered_declaration],
+            checked.transaction().extra_declarations().to_vec(),
+            vec![],
+        ))
+        .expect("the unequal declaration remains structurally preflight-valid");
+        assert_ne!(
+            injected.transaction_id(),
+            checked.transaction_id(),
+            "the unmodified digest derivation distinguishes the unequal values"
+        );
+
+        injected.declaration_identities = Arc::clone(&checked.declaration_identities);
+        injected.transaction_id = checked.transaction_id();
+        assert!(matches!(
+            classify_module_apply_retry(&injected, committed.state(), None),
+            Err(ModuleApplyRetryError::PayloadIdentityCollision {
+                transaction_id,
+                ..
+            }) if transaction_id == checked.transaction_id()
+        ));
+        committed
+            .state()
+            .verify()
+            .expect("collision refusal leaves the committed state unchanged");
     }
 
     #[test]
@@ -2858,7 +3504,7 @@ mod tests {
                 "uncancelled partial application must complete",
             )
             .expect("base remains current"),
-            Outcome::Complete(Ok(ModuleApplyPlan::ExactResultRetry(other))) => {
+            Outcome::Complete(Ok(ModuleApplyPlan::Retry(other))) => {
                 panic!("first partial application unexpectedly retried: {other:?}")
             }
             other => panic!("expected a complete partial application plan, got {other:?}"),
