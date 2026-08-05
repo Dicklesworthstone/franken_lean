@@ -55,6 +55,7 @@
     {"id": "franken_lean-eikp", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-npl", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "franken_lean-gii.23", "class": "implementation", "workstream": "W3", "gate": "G1"},
+    {"id": "franken_lean-gii.26", "class": "implementation", "workstream": "W3", "gate": "G1"},
     {"id": "fln-ehb5", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
     {"id": "fln-nhf5", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
     {"id": "fln-odva", "class": "adoption", "workstream": "adoption", "expiry": "2026-08-11T00:00:00Z"},
