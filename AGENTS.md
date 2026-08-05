@@ -426,6 +426,15 @@ GIT_INDEX_FILE=$IDX git commit -F <msg>
 
 **The resync is mandatory, and skipping it hands the next pane a deletion to commit.** A private-index commit leaves the shared index with no entry for the new file while `HEAD` has one, which a later `git status` reads as a staged **deletion**. Repair it immediately with `git read-tree HEAD`, which is safe precisely because the gate refused unless nothing was staged.
 
+**That precondition is almost never true in this checkout, and the recipe as written then has no next step — so it forces a choice between blocking forever and destroying a peer's staging.** Measured on 2026-08-05 while landing a new file: the shared index held a peer's staged `.beads/issues.jsonl` throughout, so `git read-tree HEAD` would have discarded it, and waiting for a ten-pane tracker to have nothing staged is waiting for a state that does not arrive. **Repair only YOUR paths instead**, which needs no precondition at all:
+
+```bash
+test "$(git hash-object <path>)" = "$(git rev-parse HEAD:<path>)"   # prove it first
+git update-index --add -- <each path you committed>
+```
+
+The proof is the whole safety argument: after a private-index commit your worktree copy is *already* byte-identical to `HEAD` for the paths you landed, so refreshing those entries cannot introduce content — while `read-tree` rewrites entries for every path in the tree, including ones you never touched. Verified in both directions: the phantom staged **deletion** of the new file cleared, and the peer's staged `.beads/issues.jsonl` survived. The same targeted form fixes a **modified** path, whose stale entry reads as a staged *revert* of what you just landed rather than as a deletion — less alarming, equally wrong, and easy to leave behind because `git status` on the file alone looks clean.
+
 **That resync repairs the INDEX. The WORKTREE half is a separate command, it is the one everybody forgets, and forgetting it has reddened the workspace on two consecutive mornings.** A private-index commit never touches the working tree, so every path it lands keeps its pre-commit copy on disk — *older than `HEAD` from the instant the commit succeeds*. That is the second residual above, arriving as a consequence of the technique that fixes the first. It is not hypothetical: `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl` was left stale this way on 2026-08-04 and again on 2026-08-05, each time turning four `kernel_contract` tests red for **every** pane on `bead-evidence/stale-binding … reason=source-projection`, and each time the fix was one command that nobody had run (bead `fln-private-index-worktree-sync-mbh9`).
 
 > **After a private-index commit, run `python3 -I -S scripts/evidence.py private-index-worktree-sync --root . --path <each path you committed>`.** The mechanism landed at `819892fe`; the gap was never the tool, it was the invocation.
