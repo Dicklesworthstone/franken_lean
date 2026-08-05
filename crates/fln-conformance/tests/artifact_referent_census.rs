@@ -217,7 +217,15 @@ const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
     ("never_existed", 13),
     ("commit_unreachable", 0),
     ("present_but_untracked", 9),
-    ("under_target_ephemeral", 8),
+    // 8 -> 7 at this commit: `dt5`'s coverage row cited
+    // `target/e2e/env-snapshots-20260727T001352Z-4170014`, which I measured ABSENT (bead
+    // comment 2064) and then recorded as LOST at 4fce219b, since `target/` is gitignored
+    // and the bundle is ephemeral by construction. That repair lowered the population and
+    // I did not lower the disclosure with it, so this guard reddened `cargo test` for
+    // every pane until this line moved. Third author in a row to learn it from the guard
+    // rather than from the rule two comments above -- which is an argument for the guard,
+    // not against the rule: a repair is exactly the moment nobody is looking for a red.
+    ("under_target_ephemeral", 7),
     ("existed_then_removed", 0),
 ];
 
