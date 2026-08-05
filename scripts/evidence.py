@@ -5054,13 +5054,21 @@ def autodiscovery_override_reasons(manifest: str) -> list[str]:
     return sorted(set(reasons))
 
 
-def integration_test_targets(root: Path) -> tuple[set[str], dict[str, str], list[str]]:
+def integration_test_targets(
+    root: Path, tracked: frozenset[str] | None = None
+) -> tuple[set[str], dict[str, str], list[str]]:
     """Every path cargo auto-discovers as an integration-test target, by path and by stem.
 
     A target is a top-level ``<member>/tests/<name>.rs``: ``tests/common/mod.rs`` is a module and
     not a target, and a directory-style ``tests/<dir>/main.rs`` is a target this layout rule does
     not model. The third value carries everything that was NOT modelled, and every entry in it
     narrows the refusal rather than widening it.
+
+    ``tracked`` narrows the layout to a path set the caller supplies — at commit time, the
+    PROSPECTIVE one. Without it a file present in the working tree but absent from the commit
+    would be modelled as a target here and not by the Rust guard, which resolves surfaces from
+    the committed tree: this check would refuse a citation that guard permits, which is a wall
+    and the exact failure this repair exists to remove.
 
     The stem map is checked for injectivity before it is used as one. Two members owning the same
     file stem makes ``cargo-test:<stem>`` stop denoting a single target, which is a key used as an
@@ -5095,6 +5103,8 @@ def integration_test_targets(root: Path) -> tuple[set[str], dict[str, str], list
             if not entry.name.endswith(".rs"):
                 continue
             path = f"{member}/tests/{entry.name}"
+            if tracked is not None and path not in tracked:
+                continue
             targets.add(path)
             stem = entry.name[: -len(".rs")]
             if by_stem.setdefault(stem, path) != path:
@@ -5188,6 +5198,7 @@ def coverage_granularity_delta(
     root: Path,
     head_manifest_path: Path | None = None,
     granularity_allowance_path: Path | None = None,
+    tracked_paths_path: Path | None = None,
 ) -> dict[str, Any]:
     """Beads whose terminal row gains its FIRST integration-target citation in this commit.
 
@@ -5210,7 +5221,17 @@ def coverage_granularity_delta(
     so the two cannot contradict. It can only ever be stale and permit something the Rust guard
     then catches, which is exactly today's behaviour and therefore not a regression.
     """
-    targets, by_stem, unmodelled = integration_test_targets(root)
+    tracked: frozenset[str] | None = None
+    if tracked_paths_path is not None:
+        listed = tracked_paths_path.read_text(encoding="utf-8").split("\n")
+        tracked = frozenset(path for path in listed if path)
+        if not tracked:
+            raise EvidenceError(
+                f"granularity-delta: {tracked_paths_path.as_posix()} listed no paths at all — "
+                f"an empty prospective tree is a broken caller, not a commit that deletes "
+                f"everything"
+            )
+    targets, by_stem, unmodelled = integration_test_targets(root, tracked)
     if not targets:
         raise EvidenceError(
             f"granularity-delta: no integration-test target was found under any member of "
@@ -5301,6 +5322,7 @@ def coverage_granularity_delta(
         "targets_modelled": len(targets),
         "allowance_declared": len(allowance),
         "allowance_note": allowance_note,
+        "tracked_paths": len(tracked) if tracked is not None else None,
         "disclosures": disclosures,
     }
 
@@ -20565,6 +20587,9 @@ def cmd_verify_coverage_granularity_delta(args: argparse.Namespace) -> int:
                 if args.granularity_allowance
                 else None
             ),
+            tracked_paths_path=(
+                Path(args.tracked_paths) if args.tracked_paths else None
+            ),
         )
     except (
         EvidenceError,
@@ -32398,6 +32423,10 @@ def build_parser() -> argparse.ArgumentParser:
     granularity_delta_parser.add_argument(
         "--root",
         help="workspace root for the member/target derivation (defaults above the manifest)",
+    )
+    granularity_delta_parser.add_argument(
+        "--tracked-paths",
+        help="newline-delimited PROSPECTIVE path set; targets outside it are not modelled",
     )
     granularity_delta_parser.add_argument("--output")
     granularity_delta_parser.set_defaults(

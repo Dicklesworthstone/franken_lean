@@ -102,6 +102,7 @@ MANIFEST_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl'
 CANDIDATE_RELATIVE='ci/KERNEL_CONTRACT_OWNERSHIP.jsonl.candidate'
 VERIFICATION_MANIFEST_RELATIVE='ci/VERIFICATION_MANIFEST.jsonl'
 VERIFICATION_VALIDATOR_RELATIVE='scripts/evidence.py'
+GRANULARITY_ALLOWANCE_RELATIVE='crates/fln-conformance/tests/ci_execution_join.rs'
 PUBLISHER_DIR='tools/structure-guard/kernel-ownership-publisher'
 PUBLISHER_BIN_NAME='kernel-ownership-publisher'
 WAIT_MS=30000
@@ -447,6 +448,68 @@ coverage_output=$(
 ) || coverage_status=$?
 if [ "$coverage_status" -ne 0 ]; then
     coverage_refuse "prospective verification coverage is invalid (exit ${coverage_status}): ${coverage_output}"
+fi
+
+# --- fln-ehb5: the granularity delta, judged on the PROSPECTIVE tree ----------
+#
+# The Rust guard that refuses file-granular evidence in a terminal row fires only in
+# `cargo test`, so it reddens five other panes and never the author. This is the same
+# refusal moved to the moment of the mistake, and it is PURE EXTRACTION: every
+# predicate lives in the validator this block invokes.
+#
+# Three inputs decide it and each is deliberately sourced:
+#
+#   * the manifest and tracker are the PROSPECTIVE ones already extracted above;
+#   * the allowance is the PROSPECTIVE `ci_execution_join.rs`, never HEAD's, because
+#     declaring the bead and raising the ceiling happens IN THIS COMMIT — reading
+#     HEAD's copy would refuse the one sanctioned debt-admission path;
+#   * the path set is the prospective index, so a test file present in the working
+#     tree but absent from the commit is not modelled as a target. The Rust guard
+#     resolves surfaces from the COMMITTED tree, and refusing what it permits is a
+#     wall.
+#
+# The workspace layout itself (member manifests) is read from the working tree, which
+# is the one impurity and it lies in the permitting direction: an override edited but
+# not committed makes this model FEWER targets, never more.
+#
+# **A missing input is not a refusal.** Exit 3 means the check could not decide — no
+# HEAD to compare against, or no allowance to read — and it is reported and passed.
+# The Rust guard remains the enforcement point; this only moves the announcement
+# earlier, so a check that has stopped deciding must not block a correct commit.
+granularity_status=0
+if git rev-parse --verify --quiet HEAD >/dev/null \
+    && git cat-file -e ":$GRANULARITY_ALLOWANCE_RELATIVE" 2>/dev/null; then
+    git cat-file blob "HEAD:$VERIFICATION_MANIFEST_RELATIVE" \
+        > "$coverage_scratch/head-manifest.jsonl" 2>/dev/null \
+        || : > "$coverage_scratch/head-manifest.jsonl"
+    git cat-file blob ":$GRANULARITY_ALLOWANCE_RELATIVE" \
+        > "$coverage_scratch/allowance.rs" \
+        || undecided "cannot read the prospective $GRANULARITY_ALLOWANCE_RELATIVE"
+    git ls-files --cached > "$coverage_scratch/tracked.txt" \
+        || undecided 'cannot list the prospective path set'
+    granularity_output=$(
+        python3 -I -S "$coverage_scratch/$VERIFICATION_VALIDATOR_RELATIVE" \
+            verify-coverage-granularity-delta \
+            --manifest "$coverage_scratch/$VERIFICATION_MANIFEST_RELATIVE" \
+            --beads "$coverage_scratch/$SOURCE_RELATIVE" \
+            --head-manifest "$coverage_scratch/head-manifest.jsonl" \
+            --granularity-allowance "$coverage_scratch/allowance.rs" \
+            --tracked-paths "$coverage_scratch/tracked.txt" \
+            --root "$(git rev-parse --show-toplevel)" 2>&1 >/dev/null
+    ) || granularity_status=$?
+    rm -f -- \
+        "$coverage_scratch/head-manifest.jsonl" \
+        "$coverage_scratch/allowance.rs" \
+        "$coverage_scratch/tracked.txt" >/dev/null 2>&1 || true
+    case "$granularity_status" in
+        0) ;;
+        1) coverage_say "$granularity_output"
+           coverage_say ''
+           coverage_say 'Refusing HERE rather than in cargo test, where the red lands on'
+           coverage_say 'whoever runs the suite next instead of on the author (fln-ehb5).'
+           exit 1 ;;
+        *) coverage_say "granularity delta undecided (exit ${granularity_status}), passing: ${granularity_output}" ;;
+    esac
 fi
 
 coverage_cleanup

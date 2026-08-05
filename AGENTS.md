@@ -528,7 +528,7 @@ about intent; it simply could not be checked.
 
 | # | mechanism | where | scope | measured |
 |---|---|---|---|---|
-| **M1** | `repository_state() -> (head, tree)` sampled **three times**, with `scan_index_and_worktree()` between samples | `repository_state` is defined inside `verify_vendor_binding` at `scripts/evidence.py:18195`; reached by every `hash-tree --vendor-path` and by `vendor-binding` | the **`HEAD` commit, repo-wide** — plus content **scoped to `vendor/lean4-src`** | a commit landing in the sample window: **12/12 killed**, `Reference repository state changed during verification`. Continuous churn of a tracked file **outside** `vendor/`: **12/12 passed**. Untracked creation outside `vendor/`: **12/12 passed** |
+| **M1** | `repository_state() -> (head, tree)` sampled **three times**, with `scan_index_and_worktree()` between samples | `repository_state` is defined inside `verify_vendor_binding` at `scripts/evidence.py:18217`; reached by every `hash-tree --vendor-path` and by `vendor-binding` | the **`HEAD` commit, repo-wide** — plus content **scoped to `vendor/lean4-src`** | a commit landing in the sample window: **12/12 killed**, `Reference repository state changed during verification`. Continuous churn of a tracked file **outside** `vendor/`: **12/12 passed**. Untracked creation outside `vendor/`: **12/12 passed** |
 | **M2** | governed root, **start vs end** | `scripts/check.sh` → `final_workspace_changed`, exit 3 | that lane's `INPUT_PATHS` | root moves for an in-set write, not for an out-of-set one; a write **reverted before finalization is invisible** |
 | **M3** | governed root at **every step boundary** vs run start | `require_unchanged` in the lane script → `governed_inputs_changed`, exit 3 | that lane's `INPUT_PATHS` | same content semantics as M2, caught a step earlier instead of at the end |
 | **M4** | `stable_file_facts` `fstat`s each governed file **before and after reading it** | `scripts/evidence.py` → `file changed while being read`; `check.sh` names it `governed_input_mutation_during_initial_hash` | the paths being hashed | churn of a **governed** file during the hash: **8/8 killed**. Churn of an ungoverned file: **8/8 passed** |
@@ -1140,7 +1140,7 @@ cite ci/BOUNDARY_API.txt:13 :: no-admission ground
 cite scripts/check.sh:197 :: INPUT_PATHS=(
 cite scripts/e2e/vellum_naming_no_mock_e2e.sh:83 :: INPUT_PATHS=(
 cite scripts/evidence.py:2122 :: def stable_symlink_facts
-cite scripts/evidence.py:18195 :: def repository_state
+cite scripts/evidence.py:18217 :: def repository_state
 ```
 
 `crates/fln-conformance/tests/agents_enforcement_census.rs` **fails the build** on any disagreement, in both directions plus conservation: every row's cited region must still contain its named construct; every `path:line` in the prose must have a row, so a new citation cannot be added unbound; and every row must be cited by the prose, so a row cannot outlive the sentence it served. A citation that deliberately names a **past** state is marked `(historical)` and excluded — which is how the `ApiRow` range in D3's paragraph, describing that struct before field 4 was retained, stays in the narrative without claiming to be current.
