@@ -54,7 +54,9 @@ from pathlib import Path
 VALIDATOR = "scripts/evidence.py"
 MANIFEST = "ci/VERIFICATION_MANIFEST.jsonl"
 TRACKER = ".beads/issues.jsonl"
+CONVERGENCE = "scripts/convergence_governance.py"
 STATUS_VALIDATOR_TIMEOUT_SECONDS = 30
+CONVERGENCE_TIMEOUT_SECONDS = 60
 
 # The producer's own words when an obligation is outstanding. Keyed on the
 # validator's message rather than re-derived, so this script cannot disagree
@@ -64,6 +66,18 @@ OBLIGATION_NEEDLES = (
     "must not be empty",
     "closure",
 )
+
+# The R15 producer's own word for the same shape one registry over. Keyed on its
+# message for the same reason as above: this script must not be able to disagree
+# with the producer about WHAT is owed.
+#
+# **The filing obligation has FOUR parts and this announcer named three.** A bead,
+# its regenerated ownership projection, its coverage row -- and, since R15, a
+# convergence-registry row for any bead that reaches `in_progress`. The fourth was
+# reported only by `cargo test`, which is the exact lateness `franken_lean-xjjr`
+# exists to remove, and it reddened the tree three times in one day (`a0324ca4` is
+# the third) before any author could act on it.
+CONVERGENCE_NEEDLES = ("active-unclassified",)
 
 
 def repo_root(start: Path) -> Path:
@@ -163,6 +177,86 @@ def obligation_report(
         "Check it yourself with the same producer the hook uses:",
         f"  python3 -I -S {VALIDATOR} validate-verification-manifest \\",
         f"    --manifest {MANIFEST} --beads {TRACKER}",
+    ]
+    return "\n".join(lines)
+
+
+def run_convergence(root: Path) -> tuple[int, str]:
+    """The SAME invocation the R15 lane and `convergence_governance.rs` make.
+
+    Timed out rather than trusted to return: it reads the whole tracker and the whole
+    manifest, and a producer that hangs must not wedge every `br` call in the swarm.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(root / CONVERGENCE),
+                "--root",
+                str(root),
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CONVERGENCE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return 2, (
+            f"convergence-governance did not answer within "
+            f"{CONVERGENCE_TIMEOUT_SECONDS}s"
+        )
+    except OSError as error:
+        return 2, f"convergence-governance could not be run: {error}"
+    return completed.returncode, (completed.stdout + completed.stderr).strip()
+
+
+def convergence_report(
+    status: int, output: str, changed: list[str]
+) -> str | None:
+    """Format the R15 announcement, or None when the producer reported none.
+
+    Pure, and separate from `obligation_report`, because the two obligations are met
+    in DIFFERENT FILES by different edits: a coverage row lands in the manifest, a
+    registry row in the policy. One banner covering both would send an author to the
+    wrong file, which is this repository's own recorded misdirection shape.
+    """
+    if status == 0:
+        return None
+    if not any(needle in output for needle in CONVERGENCE_NEEDLES):
+        # Every other convergence refusal -- an expired adoption, an unknown gate, a
+        # malformed policy -- is somebody else's, and announcing it as YOUR filing
+        # obligation would be worse than silence. Reported verbatim, unclassified.
+        return (
+            "br_obligation: convergence governance refused for a reason that is NOT "
+            "an unregistered-bead obligation. Reporting it verbatim rather than "
+            f"classifying it:\n{output}"
+        )
+    lines = [
+        (
+            "br_obligation: THIS ACT CREATED AN R15 REGISTRY OBLIGATION, and "
+            "`cargo test` will redden the tree for EVERY pane until it is met."
+        ),
+        "",
+        "The convergence-governance producer says:",
+        output,
+        "",
+        (
+            "Every bead at `in_progress` needs one row in "
+            "ci/CONVERGENCE_GOVERNANCE_POLICY.json, whose class is one of "
+            "implementation, prerequisite, verification, incident, additive or "
+            "adoption. Insert the row as TEXT beside its neighbours -- "
+            "re-serializing the file reformats every other pane's rows."
+        ),
+    ]
+    if changed:
+        lines += ["", "Beads this invocation moved: " + ", ".join(changed)]
+    lines += [
+        "",
+        "Check it yourself with the same producer the lane uses:",
+        f"  python3 -I -S {CONVERGENCE} --root . --check",
     ]
     return "\n".join(lines)
 
@@ -305,6 +399,16 @@ def execute_br_command(
         print(file=sys.stderr)
         print(report, file=sys.stderr)
 
+    # Announced independently of the coverage one, and after it, because an act can
+    # owe BOTH: claiming a bead you just filed crosses the adoption boundary and
+    # enters the convergence registry's active set in one motion. Suppressing the
+    # second when the first fires would hide exactly the case that costs most.
+    r15_status, r15_output = run_convergence(root)
+    r15_report = convergence_report(r15_status, r15_output, changed)
+    if r15_report is not None:
+        print(file=sys.stderr)
+        print(r15_report, file=sys.stderr)
+
     return completed.returncode
 
 
@@ -343,6 +447,52 @@ def self_test() -> int:
     elif unrelated not in other:
         failures.append("a non-obligation refusal must be reported verbatim")
 
+    # --- the R15 registry obligation, the fourth part of a filing ------------
+    if convergence_report(0, "", []) is not None:
+        failures.append("a passing convergence run must announce no obligation")
+
+    r15_refusal = "convergence-governance: inconclusive; reason=active-unclassified: fln-example"
+    r15 = convergence_report(2, r15_refusal, ["fln-example"])
+    if r15 is None:
+        failures.append("an active-unclassified refusal must be announced")
+    else:
+        if r15_refusal not in r15:
+            failures.append("the R15 producer's own words must be repeated verbatim")
+        if "fln-example" not in r15:
+            failures.append("the moved bead must be named in the R15 announcement")
+        if "CONVERGENCE_GOVERNANCE_POLICY.json" not in r15:
+            failures.append(
+                "the R15 announcement must name the file the row goes in — the two "
+                "obligations are met in different files"
+            )
+
+    # ANTI-VACUITY, and it is the cell that does the work: every OTHER convergence
+    # refusal must NOT be dressed up as this author's filing obligation. Without it
+    # the classifier could return one banner for everything and both cells above
+    # would still pass — which is how the coverage half's own anti-vacuity cell was
+    # justified, and the same trap is available here one registry over.
+    r15_unrelated = (
+        "convergence-governance: inconclusive; reason=adoption-expired: fln-other:2026-01-01"
+    )
+    r15_other = convergence_report(2, r15_unrelated, [])
+    if r15_other is None:
+        failures.append("a non-obligation convergence refusal must still be reported")
+    elif "THIS ACT CREATED AN R15 REGISTRY OBLIGATION" in r15_other:
+        failures.append(
+            "a non-obligation convergence refusal was mislabelled as an R15 obligation"
+        )
+    elif r15_unrelated not in r15_other:
+        failures.append("a non-obligation convergence refusal must be reported verbatim")
+
+    # The two announcements must stay DISTINGUISHABLE. A single banner would send an
+    # author to the wrong file, and nothing else in this self-test would notice.
+    coverage_banner = obligation_report(
+        1, "beads crossed the adoption boundary without coverage rows: ['x']", []
+    )
+    if coverage_banner is not None and r15 is not None:
+        if coverage_banner.splitlines()[0] == r15.splitlines()[0]:
+            failures.append("the coverage and R15 announcements must not share a banner")
+
     # The producer must be the hook's, not a reimplementation.
     source = Path(__file__).read_text(encoding="utf-8")
     if (
@@ -350,6 +500,8 @@ def self_test() -> int:
         or "validate-bead-status" not in source
     ):
         failures.append("this script must invoke the real validator")
+    if "convergence_governance.py" not in source:
+        failures.append("this script must invoke the real convergence producer")
     # The needles are ASSEMBLED, so this scanner's own body does not contain
     # them. The first version wrote them as literals and failed against itself:
     # a source-reading guard whose needle appears in its own text is the
