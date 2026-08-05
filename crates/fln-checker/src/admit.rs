@@ -66,6 +66,10 @@
 //! *outside* the engine: it calls the public [`infer_with`] and [`whnf_with`]
 //! entry points and never joins their recursion.
 
+use crate::defeq::{
+    DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
+    def_eq_with,
+};
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
 };
@@ -73,8 +77,9 @@ use crate::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
     InferenceMode, InferenceOutcome, InferenceRefusal, InferenceStop, infer_with,
 };
-use crate::whnf::{WhnfBudget, WhnfFault, WhnfOutcome, WhnfStop, whnf_with};
-use crate::wire::{ExprNode, WireExpr, WireName};
+use crate::universe::{NormalNode, normalize};
+use crate::whnf::{WhnfBudget, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_with};
+use crate::wire::{ExprNode, WireExpr, WireLevel, WireName};
 
 /// The schema tag a council quotes when it records one of these observations.
 pub const ADMISSION_SCHEMA: &str = "fln.checker-admission/1";
@@ -95,6 +100,10 @@ pub enum AdmissionPhase {
     DeclaredTypeSort,
     /// KR-973 — the terminal rule for the declaration's kind.
     Terminal,
+    /// KR-974 — inferring the definition body's type.
+    Body,
+    /// KR-974 — converting the body's type against the declared type.
+    BodyConversion,
 }
 
 /// The four preamble rules' decisions, each on its own variant.
@@ -125,6 +134,56 @@ pub enum AdmissionRejection {
     /// KR-972 — the declared type's own type does not reduce to a `Sort`, so the
     /// declared type is not a type.
     DeclaredTypeIsNotASort { name: WireName },
+    /// KR-972 — reduction of the declared type's own type REFUSED, which is a
+    /// different event from that type not being a sort.
+    ///
+    /// **This variant is a repair.** gii.23 mapped `WhnfOutcome::Refused` onto
+    /// `DeclaredTypeIsNotASort` and discarded the refusal, so a malformed
+    /// reduction context — a duplicate free binding, a free-binding cycle, a
+    /// projection index overflow — was reported as a statement about the
+    /// declaration's type. Every `WhnfRefusal` variant is malformed *reduction
+    /// input*; none of them means "not a sort". `infer.rs` already keeps the two
+    /// apart (`SortReductionRefusal` beside `SortExpected`), and admission
+    /// disagreeing with inference about the same event is worse than either
+    /// choice. The refusal is carried rather than summarised.
+    DeclaredTypeReductionRefused {
+        name: WireName,
+        refusal: Box<WhnfRefusal>,
+    },
+    /// KR-974 — inferring the definition body's type refused on its own terms.
+    BodyTypeRefused {
+        name: WireName,
+        refusal: Box<InferenceRefusal>,
+    },
+    /// KR-974 — the body's inferred type is not definitionally equal to the
+    /// DECLARED type. The nested mismatch is carried, not flattened.
+    BodyTypeMismatch {
+        name: WireName,
+        mismatch: Box<DefEqMismatch>,
+    },
+    /// KR-974 — conversion REFUSED while comparing the two types, which is not the
+    /// same event as the two types differing. Same distinction as
+    /// `DeclaredTypeReductionRefused`, made once rather than rediscovered.
+    BodyConversionRefused {
+        name: WireName,
+        side: DefEqSide,
+        refusal: Box<WhnfRefusal>,
+    },
+    /// KR-974 — a body-carrying kind was declared with NO body.
+    ///
+    /// A REJECTION rather than an internal fault, and the classification was
+    /// measured rather than assumed: `ConstantDeclaration::header` accepts any
+    /// `ConstantKind` and hardcodes `definition: None`, so a caller can build a
+    /// bodyless `Definition`, `Theorem` or `Opaque`. That is malformed
+    /// caller-supplied input, and FL-INV-07 reserves the fault arm for invariant
+    /// failures, never user diagnostics.
+    DeclarationCarriesNoBody { name: WireName, kind: ConstantKind },
+    /// KR-974 — a theorem's declared type is not a proposition.
+    ///
+    /// A theorem proves a Prop. The preamble already reduced the declared type's
+    /// own type to a `Sort`; a theorem additionally requires that universe to
+    /// normalize to zero. Without this, `theorem` and `def` are the same rule.
+    TheoremTypeIsNotAProposition { name: WireName },
 }
 
 /// A requirement this slice has not built. Never a rejection.
@@ -142,6 +201,17 @@ pub enum AdmissionDeferred {
     DeclaredTypeInference {
         name: WireName,
         requirement: Box<InferenceDeferred>,
+    },
+    /// KR-974 — inference deferred while checking the body's type.
+    BodyTypeInference {
+        name: WireName,
+        requirement: Box<InferenceDeferred>,
+    },
+    /// KR-974 — conversion deferred. NOT a mismatch: the comparison did not
+    /// finish, so nothing is known about whether the two types agree.
+    BodyConversion {
+        name: WireName,
+        need: Box<DefEqDeferred>,
     },
 }
 
@@ -161,6 +231,17 @@ pub enum AdmissionStop {
     DeclaredTypeSortWhnf {
         name: WireName,
         stop: Box<WhnfStop>,
+    },
+    BodyTypeInference {
+        name: WireName,
+        stop: Box<InferenceStop>,
+    },
+    /// A conversion that ran out of budget is INCONCLUSIVE. It is never a
+    /// mismatch — a body check that could not finish looks exactly like a body
+    /// check that failed, and this is the arm where that confusion would land.
+    BodyConversion {
+        name: WireName,
+        stop: Box<DefEqStop>,
     },
 }
 
@@ -185,6 +266,17 @@ pub enum AdmissionFault {
     },
     /// The reduced type had no node at its own root.
     MissingSortRoot { name: WireName },
+    BodyTypeInference {
+        name: WireName,
+        fault: Box<InferenceFault>,
+    },
+    BodyConversion {
+        name: WireName,
+        fault: Box<DefEqFault>,
+    },
+    /// The declared type reduced to a `Sort` whose universe could not be
+    /// normalized, so KR-974b cannot decide whether it is a proposition.
+    UniverseNotNormalizable { name: WireName },
 }
 
 /// Why a declaration was admitted.
@@ -197,6 +289,14 @@ pub enum AdmissionGround {
     /// KR-973 — an axiom whose KR-970/971/972 preamble passed. There is no body,
     /// so nothing else was owed.
     AxiomPreamble,
+    /// KR-974 — the preamble passed AND the body's inferred type was found
+    /// definitionally equal to the declared type.
+    ///
+    /// A separate variant rather than a reuse of `AxiomPreamble`, so a caller
+    /// matching exhaustively fails to COMPILE rather than silently treating a
+    /// body-checked admission as a preamble-only one. The two are different
+    /// claims and an enum is the cheapest place to keep them apart.
+    BodyCheckedAgainstDeclaredType,
 }
 
 /// The observation that a declaration passed every rule this module implements.
@@ -273,18 +373,30 @@ impl Verdict {
 pub struct AdmissionBudget {
     pub inference: InferenceBudget,
     pub sort_whnf: WhnfBudget,
+    /// KR-974's conversion bound. Separate again, and for the same reason the
+    /// sort reduction is: a body may infer cheaply and convert expensively.
+    pub conversion: DefEqBudget,
 }
 
 impl AdmissionBudget {
-    pub const fn new(inference: InferenceBudget, sort_whnf: WhnfBudget) -> AdmissionBudget {
+    pub const fn new(
+        inference: InferenceBudget,
+        sort_whnf: WhnfBudget,
+        conversion: DefEqBudget,
+    ) -> AdmissionBudget {
         AdmissionBudget {
             inference,
             sort_whnf,
+            conversion,
         }
     }
 
     pub const fn unlimited() -> AdmissionBudget {
-        AdmissionBudget::new(InferenceBudget::unlimited(), WhnfBudget::unlimited())
+        AdmissionBudget::new(
+            InferenceBudget::unlimited(),
+            WhnfBudget::unlimited(),
+            InferenceBudget::unlimited().defeq,
+        )
     }
 }
 
@@ -336,16 +448,36 @@ pub fn admit_with(
     if cancelled() {
         return stopped(name, AdmissionPhase::DeclaredType);
     }
-    match declared_type_is_a_type(environment, name, declaration, &budget, &mut cancelled) {
-        Ok(()) => {}
-        Err(verdict) => return verdict,
-    }
+    let declared =
+        match declared_type_is_a_type(environment, name, declaration, &budget, &mut cancelled) {
+            Ok(facts) => facts,
+            Err(verdict) => return verdict,
+        };
 
-    // KR-973 — the terminal rule for this declaration's kind.
+    // KR-973 and KR-974 — the terminal rule for this declaration's kind.
     if cancelled() {
         return stopped(name, AdmissionPhase::Terminal);
     }
-    terminal_rule(name, declaration)
+    terminal_rule(
+        environment,
+        name,
+        declaration,
+        &declared,
+        &budget,
+        &mut cancelled,
+    )
+}
+
+/// What KR-972 learned about the declared type, carried forward instead of
+/// recomputed.
+///
+/// KR-974b needs to know whether the declared type is a proposition, and the
+/// preamble has already reduced its type to a `Sort`. Re-deriving that in the
+/// terminal rule would be a second reduction that could disagree with the first.
+struct DeclaredTypeFacts {
+    /// The declared type's own type reduced to `Sort u` with `u` normalizing to
+    /// zero — i.e. the declared type is a `Prop`.
+    is_proposition: bool,
 }
 
 fn stopped(name: &WireName, phase: AdmissionPhase) -> Verdict {
@@ -387,7 +519,7 @@ fn declared_type_is_a_type(
     declaration: &ConstantDeclaration,
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
-) -> Result<(), Verdict> {
+) -> Result<DeclaredTypeFacts, Verdict> {
     // The candidate is not yet in the environment, so this context is exactly the
     // one KR-970 just proved does not already hold the name: a declaration cannot
     // use itself to justify its own type.
@@ -456,7 +588,7 @@ fn reduces_to_a_sort(
     context: &InferenceContext,
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
-) -> Result<(), Verdict> {
+) -> Result<DeclaredTypeFacts, Verdict> {
     if cancelled() {
         return Err(stopped(name, AdmissionPhase::DeclaredTypeSort));
     }
@@ -471,9 +603,16 @@ fn reduces_to_a_sort(
         &mut *cancelled,
     ) {
         WhnfOutcome::Complete(result) => result.term,
-        WhnfOutcome::Refused(_) => {
+        // REPAIRED. This arm used to discard the refusal and report
+        // DeclaredTypeIsNotASort -- a false statement about the declaration for a
+        // cause that is actually malformed reduction input. See
+        // AdmissionRejection::DeclaredTypeReductionRefused.
+        WhnfOutcome::Refused(refusal) => {
             return Err(Verdict::Rejected(
-                AdmissionRejection::DeclaredTypeIsNotASort { name: name.clone() },
+                AdmissionRejection::DeclaredTypeReductionRefused {
+                    name: name.clone(),
+                    refusal: Box::new(refusal),
+                },
             ));
         }
         WhnfOutcome::Inconclusive(stop) => {
@@ -493,7 +632,25 @@ fn reduces_to_a_sort(
     };
 
     match reduced.node(reduced.root()) {
-        Some(ExprNode::Sort { .. }) => Ok(()),
+        Some(ExprNode::Sort { level }) => {
+            // KR-974b needs the universe, and it must be NORMALIZED rather than
+            // matched syntactically: `Sort (max 0 0)` is `Prop` and a check that
+            // only recognises a literal `Zero` node would call it a type. The
+            // normalizer is the crate's one producer for that question.
+            let level = *level;
+            let carrier = WireLevel::from_parts(reduced.levels().to_vec(), level);
+            match normalize(&carrier) {
+                Ok(normal) => Ok(DeclaredTypeFacts {
+                    is_proposition: matches!(
+                        normal.nodes().get(normal.root().index()),
+                        Some(NormalNode::Zero)
+                    ),
+                }),
+                Err(_) => Err(Verdict::InternalFault(
+                    AdmissionFault::UniverseNotNormalizable { name: name.clone() },
+                )),
+            }
+        }
         Some(_) => Err(Verdict::Rejected(
             AdmissionRejection::DeclaredTypeIsNotASort { name: name.clone() },
         )),
@@ -508,7 +665,14 @@ fn reduces_to_a_sort(
 /// The `match` is exhaustive over `ConstantKind` on purpose. When KR-974 lands,
 /// moving `Theorem` out of the deferral arm is a compile error here rather than a
 /// silent behaviour change somewhere else.
-fn terminal_rule(name: &WireName, declaration: &ConstantDeclaration) -> Verdict {
+fn terminal_rule(
+    environment: &ConstantEnvironment,
+    name: &WireName,
+    declaration: &ConstantDeclaration,
+    declared: &DeclaredTypeFacts,
+    budget: &AdmissionBudget,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Verdict {
     if declaration.safety() == ConstantSafety::Unsafe {
         return Verdict::Deferred(AdmissionDeferred::UnsafeQuarantine {
             name: name.clone(),
@@ -532,10 +696,41 @@ fn terminal_rule(name: &WireName, declaration: &ConstantDeclaration) -> Verdict 
             name: name.clone(),
             ground: AdmissionGround::AxiomPreamble,
         }),
-        kind @ (ConstantKind::Theorem
-        | ConstantKind::Opaque
-        | ConstantKind::Definition
-        | ConstantKind::Inductive
+        // KR-974. These three carry a body, and the body is what this rule
+        // checks. The inductive family below does not, so folding it in here
+        // would be scope creep wearing a match arm.
+        kind @ (ConstantKind::Theorem | ConstantKind::Opaque | ConstantKind::Definition) => {
+            // KR-974b, checked BEFORE the body: a theorem whose statement is not
+            // a proposition is not a theorem, whatever its body proves. Checking
+            // it after would spend a full conversion to reach the same refusal
+            // and report the more expensive cause.
+            if kind == ConstantKind::Theorem && !declared.is_proposition {
+                return Verdict::Rejected(AdmissionRejection::TheoremTypeIsNotAProposition {
+                    name: name.clone(),
+                });
+            }
+            let Some(body) = declaration.definition_body() else {
+                return Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody {
+                    name: name.clone(),
+                    kind,
+                });
+            };
+            match body_matches_declared_type(
+                environment,
+                name,
+                declaration,
+                body.value(),
+                budget,
+                cancelled,
+            ) {
+                Ok(()) => Verdict::Admitted(Admission {
+                    name: name.clone(),
+                    ground: AdmissionGround::BodyCheckedAgainstDeclaredType,
+                }),
+                Err(verdict) => verdict,
+            }
+        }
+        kind @ (ConstantKind::Inductive
         | ConstantKind::Constructor
         | ConstantKind::Recursor
         | ConstantKind::Quotient) => Verdict::Deferred(AdmissionDeferred::BodyNotChecked {
@@ -543,4 +738,124 @@ fn terminal_rule(name: &WireName, declaration: &ConstantDeclaration) -> Verdict 
             kind,
         }),
     }
+}
+
+/// KR-974a — the body's inferred type is checked definitionally equal to the
+/// DECLARED type.
+///
+/// Two descents again, and the FL-INV-07 discipline is sharpest here: a
+/// conversion that runs out of budget, is cancelled, or faults is INCONCLUSIVE,
+/// never a mismatch. A body check that could not finish looks exactly like a
+/// body check that failed, and only this function decides which one a caller is
+/// told about.
+#[allow(clippy::too_many_arguments)]
+fn body_matches_declared_type(
+    environment: &ConstantEnvironment,
+    name: &WireName,
+    declaration: &ConstantDeclaration,
+    body: &WireExpr,
+    budget: &AdmissionBudget,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), Verdict> {
+    let context = match InferenceContext::new(
+        Vec::new(),
+        declaration.level_parameters().to_vec(),
+        environment.clone(),
+    ) {
+        Ok(context) => context,
+        Err(refusal) => {
+            return Err(Verdict::InternalFault(AdmissionFault::ContextUnbuildable {
+                name: name.clone(),
+                refusal: Box::new(refusal),
+            }));
+        }
+    };
+
+    let body_type = match infer_with(
+        body,
+        &context,
+        InferenceMode::Checking {
+            declaration_safety: declaration.safety(),
+        },
+        budget.inference,
+        &mut *cancelled,
+    ) {
+        InferenceOutcome::Complete(result) => result.type_,
+        InferenceOutcome::Refused { refusal, .. } => {
+            return Err(Verdict::Rejected(AdmissionRejection::BodyTypeRefused {
+                name: name.clone(),
+                refusal: Box::new(refusal),
+            }));
+        }
+        InferenceOutcome::Deferred { requirement, .. } => {
+            return Err(Verdict::Deferred(AdmissionDeferred::BodyTypeInference {
+                name: name.clone(),
+                requirement: Box::new(requirement),
+            }));
+        }
+        InferenceOutcome::Inconclusive(stop) => {
+            return Err(Verdict::Inconclusive(AdmissionStop::BodyTypeInference {
+                name: name.clone(),
+                stop: Box::new(stop),
+            }));
+        }
+        InferenceOutcome::InternalFault { fault, .. } => {
+            return Err(Verdict::InternalFault(AdmissionFault::BodyTypeInference {
+                name: name.clone(),
+                fault: Box::new(fault),
+            }));
+        }
+    };
+
+    if cancelled() {
+        return Err(stopped_err(name, AdmissionPhase::BodyConversion));
+    }
+    match def_eq_with(
+        &body_type,
+        declaration.type_(),
+        // Again the context that INFERRED, not one rebuilt from the same inputs.
+        context.reduction(),
+        budget.conversion,
+        &mut *cancelled,
+    ) {
+        DefEqOutcome::Equal(_) => Ok(()),
+        DefEqOutcome::NotEqual { mismatch, .. } => {
+            Err(Verdict::Rejected(AdmissionRejection::BodyTypeMismatch {
+                name: name.clone(),
+                mismatch: Box::new(mismatch),
+            }))
+        }
+        // A conversion REFUSAL is malformed reduction input, not a disagreement
+        // between the two types -- the same distinction the declared-type path
+        // makes, and made here rather than rediscovered later.
+        DefEqOutcome::Refused { side, refusal, .. } => Err(Verdict::Rejected(
+            AdmissionRejection::BodyConversionRefused {
+                name: name.clone(),
+                side,
+                refusal: Box::new(refusal),
+            },
+        )),
+        DefEqOutcome::Deferred { need, .. } => {
+            Err(Verdict::Deferred(AdmissionDeferred::BodyConversion {
+                name: name.clone(),
+                need: Box::new(need),
+            }))
+        }
+        DefEqOutcome::Inconclusive(stop) => {
+            Err(Verdict::Inconclusive(AdmissionStop::BodyConversion {
+                name: name.clone(),
+                stop: Box::new(stop),
+            }))
+        }
+        DefEqOutcome::InternalFault(fault) => {
+            Err(Verdict::InternalFault(AdmissionFault::BodyConversion {
+                name: name.clone(),
+                fault: Box::new(fault),
+            }))
+        }
+    }
+}
+
+fn stopped_err(name: &WireName, phase: AdmissionPhase) -> Verdict {
+    stopped(name, phase)
 }

@@ -14,9 +14,10 @@ use fln_checker::admit::{
     ADMISSION_SCHEMA, AdmissionBudget, AdmissionDeferred, AdmissionGround, AdmissionPhase,
     AdmissionRejection, AdmissionStop, Verdict, admit, admit_with,
 };
+use fln_checker::defeq::{DefEqBudget, QuickDefEqBudget};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    EnvironmentBudget, EnvironmentOutcome,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
 };
 use fln_checker::infer::InferenceBudget;
 use fln_checker::term::TermBudget;
@@ -100,6 +101,23 @@ fn nat_environment() -> ConstantEnvironment {
             ConstantSafety::Safe,
         ),
     )])
+}
+
+/// A conversion budget of zero. Named once rather than repeated, so the two
+/// cells that need it cannot drift apart.
+fn starved_conversion() -> AdmissionBudget {
+    AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget::new(
+            QuickDefEqBudget::new(0, 0),
+            0,
+            0,
+            0,
+            0,
+            WhnfBudget::new(0, 0, TermBudget::unlimited()),
+        ),
+    )
 }
 
 // ---------------------------------------------------------------- KR-970
@@ -305,15 +323,13 @@ fn kr973_an_axiom_whose_preamble_passes_is_admitted_end_to_end() {
 }
 
 #[test]
-fn every_non_axiom_kind_defers_rather_than_rejecting_or_admitting() {
-    // The deferral arm is the one that keeps this slice honest: a definition's
-    // preamble is checkable here and its body is not, so a verdict either way
-    // would be false. Swept over EVERY non-axiom kind, so a kind added to
-    // `ConstantKind` and quietly routed to admission is caught.
+fn the_inductive_family_still_defers_after_kr974() {
+    // KR-974 moved Theorem, Opaque and Definition OUT of this arm. The inductive
+    // family stays, and this cell exists in the direction that matters: it fails
+    // if a later slice quietly absorbs a kind it has not built the rule for.
+    // Inductive, Constructor, Recursor and Quotient do not carry a body, so
+    // folding them into the body check would be scope creep wearing a match arm.
     for kind in [
-        ConstantKind::Theorem,
-        ConstantKind::Opaque,
-        ConstantKind::Definition,
         ConstantKind::Inductive,
         ConstantKind::Constructor,
         ConstantKind::Recursor,
@@ -467,6 +483,7 @@ fn an_exhausted_declared_type_budget_is_inconclusive_never_rejected() {
     let starved = AdmissionBudget::new(
         InferenceBudget::new(0, 0, TermBudget::unlimited(), TermBudget::unlimited()),
         WhnfBudget::unlimited(),
+        InferenceBudget::unlimited().defeq,
     );
     let verdict = admit(&ConstantEnvironment::empty(), &axiom("A"), starved);
     match verdict {
@@ -497,6 +514,7 @@ fn the_three_non_answers_are_never_reported_as_admitted() {
     let starved = AdmissionBudget::new(
         InferenceBudget::new(0, 0, TermBudget::unlimited(), TermBudget::unlimited()),
         WhnfBudget::unlimited(),
+        InferenceBudget::unlimited().defeq,
     );
     let unsafe_axiom = ConstantEntry::new(
         checker_name("U"),
@@ -524,6 +542,23 @@ fn the_three_non_answers_are_never_reported_as_admitted() {
             AdmissionBudget::unlimited(),
         ),
         admit(&ConstantEnvironment::empty(), &axiom("A"), starved),
+        // KR-974's outcomes, so conservation covers the body check and not only
+        // the preamble.
+        admit(
+            &nat_environment(),
+            &definition("D", a_type(), nat_constant()),
+            AdmissionBudget::unlimited(),
+        ),
+        admit(
+            &nat_environment(),
+            &definition("D", a_type(), a_type()),
+            AdmissionBudget::unlimited(),
+        ),
+        admit(
+            &nat_environment(),
+            &definition("D", a_type(), nat_constant()),
+            starved_conversion(),
+        ),
     ];
     let mut admitted = 0;
     for verdict in &verdicts {
@@ -536,9 +571,11 @@ fn the_three_non_answers_are_never_reported_as_admitted() {
         }
     }
     assert_eq!(
-        admitted, 1,
-        "exactly one of these four is a genuine admission; a cell where nothing \
-         is ever admitted satisfies the property above vacuously"
+        admitted, 2,
+        "exactly two of these seven are genuine admissions -- the axiom preamble \
+         and the body-checked definition. A cell where nothing is ever admitted \
+         satisfies the property above vacuously, and this count moves DELIBERATELY \
+         when an outcome is added rather than being loosened to a floor"
     );
 }
 
@@ -695,5 +732,315 @@ fn an_axiom_cannot_be_constructed_with_a_body() {
     assert!(
         declaration_impl.contains("kind: ConstantKind::Definition,"),
         "the definition constructor no longer hardcodes the Definition kind"
+    );
+}
+
+// ---------------------------------------------------------------- KR-974
+
+/// A definition whose body's type matches its declared type.
+///
+/// Declared type `Sort 0`; body `Sort 0`... would be circular, so the honest
+/// smallest pair is a declared type that IS a type and a body inhabiting it.
+/// `Nat : Sort 0` in `nat_environment`, so a definition declared `Sort 0` with
+/// body `Nat` type-checks: `Nat`'s inferred type is `Sort 0`, definitionally
+/// equal to the declared `Sort 0`.
+/// Builds a DEFINITION. It takes no `kind` on purpose: measured,
+/// `ConstantDeclaration::definition` hardcodes `ConstantKind::Definition` and
+/// ignores any kind you think you are choosing. An earlier version of this
+/// helper accepted one, and three cells silently tested a Definition while
+/// their names said Theorem and Opaque.
+fn definition(name: &str, declared: WireExpr, body: WireExpr) -> ConstantEntry {
+    ConstantEntry::new(
+        checker_name(name),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            declared,
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                body,
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    )
+}
+
+fn nat_constant() -> WireExpr {
+    decoded(&Expr::const_(primary_name("Nat"), Vec::new()))
+}
+
+#[test]
+fn kr974_a_definition_whose_body_matches_its_declared_type_is_admitted() {
+    let candidate = definition("D", a_type(), nat_constant());
+    match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => {
+            assert_eq!(admission.name(), &checker_name("D"));
+            assert_eq!(
+                admission.ground(),
+                AdmissionGround::BodyCheckedAgainstDeclaredType,
+                "a body-checked admission must NOT report the axiom preamble's ground; \
+                 the two are different claims and reusing one variant hides that"
+            );
+        }
+        other => panic!("expected a body-checked admission, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr974_a_body_whose_type_does_not_match_is_rejected_carrying_the_mismatch() {
+    // Declared `Sort 0`, body `Sort 0` -- whose type is `Sort 1`. Two sorts at
+    // different levels, which conversion DECIDES.
+    //
+    // The first version of this cell used body `7`, whose type is the constant
+    // `Nat`, against a declared `Sort 0`. That is Constant-vs-Sort, and this
+    // checker's conversion DEFERS on it rather than deciding -- correctly, since
+    // nothing it has implemented rules out `Nat` reducing to a sort. The code
+    // returned Deferred and the cell demanded a mismatch. The code was right:
+    // a comparison that did not finish is not a disagreement, which is the exact
+    // FL-INV-07 line this rule exists to hold. Cell corrected, not the rule.
+    let candidate = definition("D", a_type(), a_type());
+    match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
+        Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { name, mismatch }) => {
+            assert_eq!(name, checker_name("D"));
+            // The nested mismatch is CARRIED, not summarised into a boolean --
+            // the gii.23 lesson, where flattening was planted as a mutant.
+            assert!(
+                !format!("{mismatch:?}").is_empty(),
+                "the conversion mismatch must be carried"
+            );
+        }
+        other => panic!("expected KR-974's own mismatch rejection, got {other:?}"),
+    }
+
+    // Control: the same shape with a matching body IS admitted, so the rejection
+    // is about the body and not about body-checking being broken.
+    assert!(
+        admit(
+            &nat_environment(),
+            &definition("D", a_type(), nat_constant()),
+            AdmissionBudget::unlimited()
+        )
+        .is_admitted(),
+        "the matching control must still be admitted"
+    );
+}
+
+#[test]
+fn kr974b_a_theorem_whose_declared_type_is_not_a_proposition_is_rejected() {
+    // `Sort 0`'s own type is `Sort 1`, which does not normalize to zero, so a
+    // theorem declared `Sort 0` has a non-Prop statement.
+    //
+    // Built with `header`, NOT with the `definition` helper: measured,
+    // `ConstantDeclaration::definition` hardcodes `kind: ConstantKind::Definition`,
+    // so the helper cannot produce a Theorem at all and the first version of this
+    // cell was silently admitting a Definition. KR-974b is checked BEFORE the
+    // body-presence rule precisely so a bodyless theorem still reaches it.
+    let candidate = ConstantEntry::new(
+        checker_name("T"),
+        header(
+            Vec::new(),
+            a_type(),
+            ConstantKind::Theorem,
+            ConstantSafety::Safe,
+        ),
+    );
+    match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
+        Verdict::Rejected(AdmissionRejection::TheoremTypeIsNotAProposition { name }) => {
+            assert_eq!(name, checker_name("T"));
+        }
+        other => panic!("expected KR-974b's own rejection, got {other:?}"),
+    }
+
+    // Control: the identical shape as a DEFINITION is not refused by KR-974b, so
+    // the rejection above is attributable to the theorem rule and not to the
+    // declared type. (It is refused for carrying no body, which is a different
+    // rule and the point: a different variant, not a different message.)
+    let as_definition = ConstantEntry::new(
+        checker_name("T"),
+        header(
+            Vec::new(),
+            a_type(),
+            ConstantKind::Definition,
+            ConstantSafety::Safe,
+        ),
+    );
+    assert!(
+        matches!(
+            admit(
+                &nat_environment(),
+                &as_definition,
+                AdmissionBudget::unlimited()
+            ),
+            Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody { .. })
+        ),
+        "the same shape as a Definition must fail the BODY rule, not KR-974b"
+    );
+}
+
+#[test]
+fn kr974b_a_theorem_whose_statement_is_a_proposition_reaches_the_body_check() {
+    // `Nat : Sort 0`, so a theorem DECLARED `Nat` has a Prop statement (the
+    // declared type's own type is `Sort 0`, which normalizes to zero). It then
+    // reaches the body check and is rejected there on the BODY, not on KR-974b --
+    // which is what makes this the positive control for the Prop test rather
+    // than a second copy of the cell above.
+    let candidate = ConstantEntry::new(
+        checker_name("T"),
+        header(
+            Vec::new(),
+            nat_constant(),
+            ConstantKind::Theorem,
+            ConstantSafety::Safe,
+        ),
+    );
+    let verdict = admit(&nat_environment(), &candidate, AdmissionBudget::unlimited());
+    assert!(
+        !matches!(
+            verdict,
+            Verdict::Rejected(AdmissionRejection::TheoremTypeIsNotAProposition { .. })
+        ),
+        "a theorem whose statement IS a proposition must get past KR-974b, got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr974c_a_body_checked_opaque_is_unreachable_by_construction() {
+    // KR-974c as the bead scoped it -- "an opaque is body-checked and STAYS
+    // OPAQUE" -- CANNOT BE EXERCISED TODAY, and shipping a cell that appeared to
+    // exercise it would be worse than not having one.
+    //
+    // Measured: `ConstantDeclaration` has exactly two constructors. `header`
+    // hardcodes `definition: None`; `definition` hardcodes
+    // `kind: ConstantKind::Definition`. So the ONLY kind constructible WITH a
+    // body is `Definition` -- an Opaque carrying a body is unconstructible, and
+    // `is_delta_unfoldable` is `delta_body().is_some()`, which is therefore
+    // trivially false for every Opaque. A cell asserting "admitting an opaque did
+    // not make it unfoldable" would pass without admission having run at all.
+    //
+    // This is the SECOND instance of this shape in this module: the same two
+    // constructors already made an axiom-with-a-body unreachable
+    // (`an_axiom_cannot_be_constructed_with_a_body`). The environment's
+    // constructor surface cannot express three of the eight declaration kinds
+    // this checker has rules for, and that is a finding about environment.rs, not
+    // about KR-974.
+    //
+    // Bound here so it cannot rot: the day a kind-preserving body constructor
+    // lands, this fails and KR-974c becomes owed for real.
+    let source =
+        std::fs::read_to_string(workspace_root().join("crates/fln-checker/src/environment.rs"))
+            .expect("the environment module is readable");
+    let declaration_impl = source
+        .split_once("impl ConstantDeclaration {")
+        .expect("ConstantDeclaration has an impl block")
+        .1
+        .split_once("\n}\n")
+        .expect("that impl block ends")
+        .0;
+    assert!(
+        declaration_impl.contains("kind: ConstantKind::Definition,"),
+        "the body-carrying constructor no longer forces the Definition kind, so an \
+         Opaque CAN now carry a body and KR-974c is owed a real body-check cell"
+    );
+    assert!(
+        declaration_impl.contains("definition: None,"),
+        "the header constructor no longer forces an absent body"
+    );
+
+    // The reachable half, asserted rather than assumed: a declarable Opaque is
+    // refused for having no body, and it is not delta-unfoldable.
+    let opaque = ConstantEntry::new(
+        checker_name("O"),
+        header(
+            Vec::new(),
+            a_type(),
+            ConstantKind::Opaque,
+            ConstantSafety::Safe,
+        ),
+    );
+    assert!(!opaque.declaration().is_delta_unfoldable());
+    assert!(
+        matches!(
+            admit(&nat_environment(), &opaque, AdmissionBudget::unlimited()),
+            Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody {
+                kind: ConstantKind::Opaque,
+                ..
+            })
+        ),
+        "a bodyless opaque must be refused by the body rule, naming its kind"
+    );
+
+    // Anti-vacuity for the unfoldability assertion above: a Definition WITH a
+    // body IS delta-unfoldable, so "not unfoldable" is a real property here and
+    // not something true of every declaration.
+    assert!(
+        definition("O", a_type(), nat_constant())
+            .declaration()
+            .is_delta_unfoldable(),
+        "the control must be unfoldable, or the assertion above is vacuous"
+    );
+}
+
+#[test]
+fn kr974_a_body_carrying_kind_declared_with_no_body_is_rejected_not_faulted() {
+    // `ConstantDeclaration::header` accepts any kind and hardcodes an absent
+    // body, so a bodyless Definition is CONSTRUCTIBLE caller input -- measured,
+    // which is why this is a rejection and not an internal fault. FL-INV-07
+    // reserves the fault arm for invariant failures, never user diagnostics.
+    for kind in [
+        ConstantKind::Definition,
+        ConstantKind::Theorem,
+        ConstantKind::Opaque,
+    ] {
+        let declared = if kind == ConstantKind::Theorem {
+            nat_constant() // a Prop statement, so KR-974b does not fire first
+        } else {
+            a_type()
+        };
+        let candidate = ConstantEntry::new(
+            checker_name("B"),
+            header(Vec::new(), declared, kind, ConstantSafety::Safe),
+        );
+        match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
+            Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody {
+                name,
+                kind: rejected,
+            }) => {
+                assert_eq!(name, checker_name("B"));
+                assert_eq!(rejected, kind);
+            }
+            other => panic!("{kind:?} with no body must be REJECTED, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn kr974_an_exhausted_conversion_budget_is_inconclusive_never_a_mismatch() {
+    // The arm most likely to be got wrong: a body check that could not finish
+    // looks exactly like a body check that failed. A starved CONVERSION budget
+    // must never be reported as a mismatch.
+    let candidate = definition("D", a_type(), nat_constant());
+    let verdict = admit(&nat_environment(), &candidate, starved_conversion());
+    assert!(
+        !matches!(
+            verdict,
+            Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { .. })
+        ),
+        "an exhausted conversion budget must NEVER be reported as a mismatch, got {verdict:?}"
+    );
+    assert!(
+        verdict.is_inconclusive_family(),
+        "an exhausted conversion budget must be a non-answer, got {verdict:?}"
+    );
+
+    // Control: the identical candidate under an unlimited budget is admitted.
+    assert!(
+        admit(
+            &nat_environment(),
+            &definition("D", a_type(), nat_constant()),
+            AdmissionBudget::unlimited()
+        )
+        .is_admitted(),
+        "the same candidate must be admitted when the budget allows it"
     );
 }
