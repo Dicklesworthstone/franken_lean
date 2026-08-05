@@ -245,6 +245,151 @@ fn private_index_worktree_sync_preserves_foreign_lines_and_repairs_only_containe
     }
 }
 
+/// A PRIVATE-INDEX close is judged by the installed hook — bead
+/// `fln-manifest-complete-row-preflight-gap-77xh`.
+///
+/// A terminal coverage row with `requirement_ids: []` is refused by the strict validator, and
+/// twice the refusal surfaced *after* a close rather than at author time. The bead named four
+/// candidate causes — the hook is bypassed, receives the wrong index, is absent in the committing
+/// environment, or correctly refuses and the earlier diagnosis targeted stale worktree bytes —
+/// and asked for the question to be decided by execution rather than by reading.
+///
+/// **It is the fourth.** The mechanism this pins is the one the swarm actually uses for a new
+/// file: an index built from `HEAD` in a file OUTSIDE the repository, `GIT_INDEX_FILE` exported,
+/// and `git commit` with no pathspec. The refusal is what proves the hook read the PRIVATE index:
+/// had it read the shared one it would have seen an unplanted manifest and passed. So the
+/// "receives the wrong index" candidate is falsified by the positive cell itself.
+///
+/// **Cell C is the one that makes cell B mean anything.** A successful hook prints nothing, so a
+/// green commit and a hook that never ran are indistinguishable from the outside. C re-plants the
+/// empty row in B's OWN repository, after B's successful commit, and requires a refusal there —
+/// that is what establishes the hook was live when B passed.
+///
+/// Scope, stated because it is narrower than the bead's wording: the plant carries the manifest
+/// alone, on a base commit whose bead is already closed, so the ownership-projection guard is not
+/// in the path and no publisher binary is needed. The tracker-carrying form was measured
+/// separately with a real publisher present and behaves identically; that measurement is
+/// `bounded_model` and lives in the bead, not here.
+const PRIVATE_INDEX_PREFLIGHT_PROBE: &str = r#"
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+evidence, hook, manifest_src, beads_src = (Path(a) for a in sys.argv[1:5])
+
+
+def git(repo, *args, env=None, check=True):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=check,
+        env={**os.environ, **(env or {})},
+    )
+
+
+with tempfile.TemporaryDirectory() as scratch:
+    scratch = Path(scratch)
+    repo = scratch / "repo"
+    (repo / "ci").mkdir(parents=True)
+    (repo / ".beads").mkdir(parents=True)
+    (repo / "scripts/git-hooks").mkdir(parents=True)
+
+    # The tracker is planted CLOSED in the base commit, so the plant below carries the manifest
+    # alone and the projection guard stays out of the path.
+    bead = None
+    rows = [l for l in manifest_src.read_text().splitlines() if l.strip()]
+    states = {}
+    for line in beads_src.read_text().splitlines():
+        if line.strip():
+            record = json.loads(line)
+            states[record["id"]] = record["status"]
+    for line in rows:
+        row = json.loads(line)
+        if row.get("kind") == "coverage" and states.get(row.get("bead")) == "open" and not row.get("unit"):
+            bead = row["bead"]
+            break
+    if bead is None:
+        print("plant=MISSING")
+        raise SystemExit(0)
+
+    tracker_lines = []
+    for line in beads_src.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("id") == bead:
+            record["status"] = "closed"
+            record["closed_at"] = "2026-08-05T18:00:00.000000000Z"
+            record.setdefault("comments", []).append(
+                {"id": 999001, "created_at": "2026-08-05T18:00:05Z", "text": "77xh proof"}
+            )
+            # Compact, because the ownership publisher refuses a tracker line that does not begin
+            # with an unescaped canonical id and json.dumps' default separators break that.
+            line = json.dumps(record, separators=(",", ":"))
+        tracker_lines.append(line)
+    (repo / ".beads/issues.jsonl").write_text("\n".join(tracker_lines) + "\n")
+
+    COMPLETE = {
+        "boundary": ["77xh proof boundary"], "claim_ids": ["FLN-77XH-PROOF-CLAIM"],
+        "cancellation": ["77xh proof cancellation"], "error": ["77xh proof error"],
+        "failure_atomicity": ["77xh proof atomicity"], "gate_ids": ["W1"],
+        "negative_recovery": ["77xh proof recovery"], "resource": ["77xh proof resource"],
+        "scenarios": ["quality_gate"], "skip": "none",
+        "unit": ["test:fln-conformance::evidence_finalization::the_evidence_surface_refuses_a_gitdir_pointer_root"],
+        "artifacts": sorted([f"bead-comment:{bead}:999001", "scripts/evidence.py"]),
+    }
+
+    def manifest_text(requirement_ids):
+        out = []
+        for line in rows:
+            row = json.loads(line)
+            if row.get("bead") == bead and row.get("kind") == "coverage":
+                row.update(COMPLETE)
+                row["requirement_ids"] = requirement_ids
+                line = json.dumps(row, sort_keys=True, separators=(", ", ": "))
+            out.append(line)
+        return "\n".join(out) + "\n"
+
+    # The base carries a DIFFERENT non-empty value from the control's, so the control is a real
+    # change. With the same value the control staged NOTHING, git reported nothing to commit, and
+    # the cell read as a refusal — a green that looks exactly like the hook rejecting it.
+    (repo / "ci/VERIFICATION_MANIFEST.jsonl").write_text(
+        manifest_text(["FLN-77XH-BASE-REQUIREMENT"])
+    )
+    for source, dest in ((evidence, "scripts/evidence.py"), (hook, "scripts/git-hooks/pre-commit")):
+        (repo / dest).write_bytes(source.read_bytes())
+    os.chmod(repo / "scripts/git-hooks/pre-commit", 0o755)
+
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "proof@example.invalid")
+    git(repo, "config", "user.name", "proof")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "--no-verify", "-m", "77xh base")
+    git(repo, "config", "core.hooksPath", "scripts/git-hooks")
+
+    def attempt(label, requirement_ids):
+        (repo / "ci/VERIFICATION_MANIFEST.jsonl").write_text(manifest_text(requirement_ids))
+        index = scratch / f"{label}.index"      # OUTSIDE the repository, as the recipe requires
+        env = {"GIT_INDEX_FILE": str(index)}
+        git(repo, "read-tree", "HEAD", env=env)
+        git(repo, "add", "--", "ci/VERIFICATION_MANIFEST.jsonl", env=env)
+        staged = git(repo, "diff", "--cached", "--name-only", "HEAD", env=env).stdout.split()
+        before = git(repo, "rev-parse", "HEAD").stdout.strip()
+        done = git(repo, "commit", "-m", f"77xh {label}", env=env, check=False)
+        after = git(repo, "rev-parse", "HEAD").stdout.strip()
+        text = done.stdout + done.stderr
+        print(f"{label}_staged={','.join(staged)}")
+        print(f"{label}_moved={'yes' if before != after else 'no'}")
+        print(f"{label}_names_requirement_ids={'yes' if 'requirement_ids must not be empty' in text else 'no'}")
+
+    attempt("plant", [])                                   # A
+    attempt("control", ["FLN-77XH-PROOF-REQUIREMENT"])     # B
+    attempt("replant", [])                                 # C, in B's own repository
+
+print("PROBE-COMPLETE")
+"#;
+
 /// The commit-time granularity delta: its three clauses, its floors, and the hook that
 /// reaches it — bead `fln-ehb5`.
 ///
@@ -565,6 +710,49 @@ fn a_forbidden_artifact_kind_is_refused_by_the_publisher_and_named_before_public
         scanned > 0,
         "the clean-root scan walked nothing, so every refusal cell above is vacuous: {stdout}"
     );
+}
+
+#[test]
+fn a_private_index_close_with_empty_requirement_ids_is_refused_before_head_moves() {
+    let root = fln_conformance::checked_workspace_root!();
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", PRIVATE_INDEX_PREFLIGHT_PROBE])
+        .arg(root.join("scripts/evidence.py"))
+        .arg(root.join("scripts/git-hooks/pre-commit"))
+        .arg(root.join("ci/VERIFICATION_MANIFEST.jsonl"))
+        .arg(root.join(".beads/issues.jsonl"))
+        .output()
+        .expect("the sealed interpreter must run the private-index preflight probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success() && stdout.contains("PROBE-COMPLETE"),
+        "private-index preflight probe did not complete: status={:?} stderr={stderr}",
+        run.status.code()
+    );
+    assert!(
+        !stdout.contains("plant=MISSING"),
+        "the probe found no open bead with a sparse row to plant on, so it measured nothing: \
+         {stdout}"
+    );
+    for expected in [
+        // A — the defect: refused, HEAD unmoved, and the refusal names the field. The refusal
+        // itself is what proves the hook read the PRIVATE index rather than the shared one.
+        "plant_staged=ci/VERIFICATION_MANIFEST.jsonl",
+        "plant_moved=no",
+        "plant_names_requirement_ids=yes",
+        // B — the control. Without it a hook that refused everything would pass cell A.
+        "control_moved=yes",
+        // C — the control of the control. A successful hook is SILENT, so B's green alone cannot
+        // distinguish a pass from a hook that never ran; C re-plants in B's own repository.
+        "replant_moved=no",
+        "replant_names_requirement_ids=yes",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "private-index preflight probe omitted {expected:?}: {stdout}"
+        );
+    }
 }
 
 #[test]
