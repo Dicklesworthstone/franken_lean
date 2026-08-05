@@ -44,6 +44,32 @@
 //! `the_admission_verdict_is_not_a_capability` in `tests/admit.rs` binds the
 //! dependency half to the manifest and the surface half to this file.
 //!
+//! # KR-978 — the unchecked door, and why this crate satisfies it INVERTED
+//!
+//! The judgment inventory states KR-978 as a negative: *every admitted
+//! declaration passed the one authority; nothing entered unchecked.* For
+//! `fln-kernel` that is a claim about a GATE — its environment can only be
+//! extended through `check`, so the door is guarded.
+//!
+//! **This crate has no such gate and must not have one.**
+//! `ConstantEnvironment::build` takes declarations and a budget. It does not
+//! take a [`Verdict`], an [`Admission`], or anything `admit` produces, and
+//! `environment.rs` does not name those types at all. So a caller may build a
+//! checker environment containing declarations this checker would REJECT, and
+//! nothing here stops them.
+//!
+//! That is FL-INV-02 and not an oversight. If `build` required a verdict, this
+//! crate would become a second admission authority — the precise thing the
+//! invariant forbids. **KR-978 holds here not because the door is guarded but
+//! because there is no door: this crate has no admission authority to leave
+//! unchecked.**
+//!
+//! The direction matters and is easy to get backwards. `the_admission_verdict_is_not_a_capability`
+//! covers a verdict being laundered OUT; `kr978_the_environment_does_not_require_a_verdict`
+//! covers the converse, which is the half KR-978 names — nothing fails on the day
+//! someone "improves" `build` to demand an `Admission`, which would read like
+//! tightening a safety property while actually violating the invariant.
+//!
 //! # FL-INV-07 is why there are five verdicts and not two
 //!
 //! Accepted and Rejected are *decisions*. Resource exhaustion, cancellation, a

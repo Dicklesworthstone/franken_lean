@@ -1738,3 +1738,138 @@ fn kr977_a_collision_on_any_member_is_kr970_on_that_member_not_a_fault_on_anothe
         other => panic!("expected KR-970 on the colliding member, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------- KR-978
+
+#[test]
+fn kr978_the_environment_does_not_require_a_verdict() {
+    // KR-978, satisfied INVERTED from the kernel's. There, the door is guarded:
+    // the environment extends only through `check`. Here there is no door at
+    // all, deliberately — FL-INV-02 forbids this crate from being a second
+    // admission authority, so `ConstantEnvironment::build` takes declarations and
+    // a budget and nothing this module produces.
+    //
+    // BOTH halves are asserted. A cell showing only that `build` accepts a
+    // declaration would pass against a crate where nothing is ever rejected.
+    let environment = nat_environment();
+    let refused = ConstantEntry::new(
+        checker_name("D"),
+        header(
+            Vec::new(),
+            not_a_type(), // `7`, whose type is Nat — not a sort
+            ConstantKind::Axiom,
+            ConstantSafety::Safe,
+        ),
+    );
+
+    // Half 1: this checker REJECTS it.
+    assert!(
+        matches!(
+            admit(&environment, &refused, AdmissionBudget::unlimited()),
+            Verdict::Rejected(AdmissionRejection::DeclaredTypeIsNotASort { .. })
+        ),
+        "the declaration must actually be rejected, or half 2 proves nothing"
+    );
+
+    // Half 2: an environment containing it builds anyway. The checker is
+    // ADVISORY. If this ever fails, `build` has grown a verdict requirement and
+    // fln-checker has become an alternative admission authority — which reads
+    // like tightening a safety property and is FL-INV-02's exact prohibition.
+    match ConstantEnvironment::build(vec![refused], EnvironmentBudget::unlimited()) {
+        EnvironmentOutcome::Complete { environment, .. } => {
+            assert_eq!(
+                environment.len(),
+                1,
+                "the rejected declaration is in the environment; this crate gates nothing"
+            );
+        }
+        other => panic!(
+            "building an environment must not consult a verdict -- if this now \
+             refuses, fln-checker has become an admission authority: {other:?}"
+        ),
+    }
+}
+
+/// Needles assembled from parts so this scanner's own source cannot satisfy it.
+fn admission_type_needles() -> Vec<String> {
+    let prefix = String::from("Admis") + "sion";
+    vec![
+        prefix.clone(),
+        String::from("Ver") + "dict",
+        String::from("admit") + "_with",
+    ]
+}
+
+fn admission_type_hits(source: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for line in source.lines() {
+        let code = match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        for needle in admission_type_needles() {
+            if code.contains(&needle) {
+                hits.push(format!("{needle} :: {}", code.trim()));
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn kr978_the_environment_module_names_no_admission_type() {
+    // The structural half, derived from the file rather than asserted. If
+    // `environment.rs` ever names a verdict type, the separation this crate is
+    // shaped around has started to erode, and it will erode by looking like an
+    // improvement.
+    let source =
+        std::fs::read_to_string(workspace_root().join("crates/fln-checker/src/environment.rs"))
+            .expect("the environment module is readable");
+    let hits = admission_type_hits(&source);
+    assert!(
+        hits.is_empty(),
+        "environment.rs must name no admission type -- FL-INV-02 keeps the \
+         environment independent of any verdict: {hits:?}"
+    );
+
+    // The scan must be shown CAPABLE of firing, or its empty result is vacuous.
+    let decoy = admission_type_needles()
+        .iter()
+        .map(|needle| format!("    fn gate(v: {needle}) {{}}\n"))
+        .collect::<String>();
+    assert_eq!(
+        admission_type_hits(&decoy).len(),
+        admission_type_needles().len(),
+        "the scan did not fire on a planted decoy, so its clean result means nothing"
+    );
+
+    // And prose must not be scored, or the guard reddens on a doc comment.
+    let commented = admission_type_needles()
+        .iter()
+        .map(|needle| format!("    // this module never mentions {needle}\n"))
+        .collect::<String>();
+    assert!(
+        admission_type_hits(&commented).is_empty(),
+        "a comment naming an admission type must not be scored as a use"
+    );
+}
+
+#[test]
+fn kr978_the_module_doc_still_records_why_there_is_no_door() {
+    // A property whose reason is unwritten is one the next reader repairs. The
+    // inversion -- guarded in K1, absent here, and BOTH correct -- is exactly
+    // what will not survive a context restart unless it is held.
+    let source = std::fs::read_to_string(workspace_root().join("crates/fln-checker/src/admit.rs"))
+        .expect("the admission module is readable");
+    for required in [
+        "there is no door",
+        "would become a second admission authority",
+        "satisfies it INVERTED",
+    ] {
+        assert!(
+            source.contains(required),
+            "admit.rs's module doc must keep recording WHY there is no gate; \
+             missing: {required:?}"
+        );
+    }
+}
