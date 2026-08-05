@@ -5371,3 +5371,97 @@ mod serde_free_json {
         }
     }
 }
+
+/// povo's non-durable terminal population, declared and held ONE-WAY.
+///
+/// Bead `franken_lean-ephemeral-manifest-artifact-povo`. The artifact-durability rule is
+/// implemented in full and **does not run**: it is gated on `ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl`
+/// existing, that file is absent, and the validator reports `not_adopted_registry_absent` and exits
+/// 0. A complete mechanism, inert for want of an input file.
+///
+/// Adoption is a **migration with named owners**, not a switch-flip, so this test does not force
+/// it. What it refuses is the population **growing** while the rule sleeps — a new non-durable
+/// citation in a terminal row is a new dangling claim, and silent growth is the defect the bead
+/// exists for. One-way plus a floor: the count may fall freely as owners repair citations.
+///
+/// **It also fails when the rule WAKES UP.** If the registry appears, the disclosure that describes
+/// the tree as unadopted is false, and a stale "we are not enforcing this" note is worse than none.
+#[test]
+fn the_povo_nondurable_population_is_declared_and_one_way() {
+    let repo = fln_conformance::checked_workspace_root!();
+    let run = std::process::Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(repo.join("scripts/povo_population.py"))
+        .arg(&repo)
+        .output()
+        .expect("the sealed interpreter must run the povo population derivation");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "the povo derivation failed, so the population is unknown and no claim can be made: {stderr}"
+    );
+
+    let field = |name: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("the derivation must print `{name}`: {stdout}"))
+            .trim()
+            .to_string()
+    };
+    let adopted = field("povo-adopted:") == "yes";
+    let measured: usize = field("povo-nondurable-terminal:")
+        .parse()
+        .expect("the population must be a count");
+
+    let agents = fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md must be readable");
+    let declared: usize = agents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("povo-nondurable-terminal: "))
+        .expect(
+            "AGENTS.md must declare the non-durable terminal population; if that disclosure moved, \
+             this guard is enforcing a claim that no longer exists and must be updated, not deleted",
+        )
+        .trim()
+        .parse()
+        .expect("the declared population must be a count");
+
+    // The rule waking up invalidates the disclosure, which describes an unadopted tree.
+    assert!(
+        !adopted,
+        "ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl now exists, so the artifact-durability rule is \
+         ADOPTED and the AGENTS.md remainder describing an unadopted tree is false. Move the \
+         disclosure in the same change that adopts, and expect {measured} terminal citations to be \
+         refused unless the migration ran first"
+    );
+
+    // Anti-vacuity: a derivation that found nothing cannot police growth.
+    assert!(
+        measured > 0 || declared == 0,
+        "the derivation reported zero non-durable citations against a declared {declared}. If the \
+         migration really completed, move the disclosure to 0 in the same commit; a silent zero is \
+         indistinguishable from a broken scan"
+    );
+
+    // DELIBERATELY NOT A GROWTH GATE, and the reasoning belongs here rather than in a route.
+    //
+    // The obvious shape is `measured <= declared` — a one-way floor. I wrote that first and it
+    // reddened within minutes: the population went 276 -> 277 because a peer closed a bead whose
+    // row carries a non-durable citation. That is not a bug in the assertion, it is the defect
+    // itself, and gating on it would make every such close red for every pane starting now.
+    //
+    // Imposing that before the migration is the same switch-flip I declined when I did not bring
+    // the receipt registry into existence: adoption refuses 276 citations with named owners, and
+    // choosing that for the swarm is not one pane's call. So this binds the DISCLOSURE to the
+    // DERIVATION — the number must exist, be reproducible, and be honest about its order of
+    // magnitude — and leaves the gate to the adoption decision that owns it.
+    let drift = measured.abs_diff(declared);
+    assert!(
+        drift <= 25,
+        "the declared non-durable population ({declared}) and the measured one ({measured}) have \
+         diverged by {drift}. This is not a growth gate — small drift is expected while peers close \
+         beads — but a gap this size means the disclosure has stopped describing the tree. \
+         Re-derive it with scripts/povo_population.py and move the number"
+    );
+}

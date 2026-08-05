@@ -970,6 +970,50 @@ The FrankenLean W4 parser/syntax/hygiene/macro subsystem is named **Vellum** (cr
 
 ---
 
+## The artifact-durability rule is BUILT AND NOT ADOPTED — a declared remainder
+
+**`franken_lean-ephemeral-manifest-artifact-povo`'s repair exists in full and does not run.**
+`verification_artifact_classification` classifies every manifest citation, `durable_classes` is
+`{tracked_file, bead_comment, bead, commit, receipt, test_function_claim}`, `target_path` would be refused
+by name, and a non-durable citation in a **terminal** row would need an explicit legacy allowance.
+**Would**, throughout: none of these refusals happens today. All of that is implemented and none of it executes: the whole artifact-reference
+validation is gated on `ci/VERIFICATION_EVIDENCE_RECEIPTS.jsonl` existing, inside `validate_verification_manifest`,
+that file is absent, there are no receipt claims so the absence raises nothing, and the validator
+reports `artifact_reference_validation: not_adopted_registry_absent` and **exits 0**. The one string
+that discloses this appears in a JSON field nobody reads.
+
+**A complete mechanism, inert for want of an input file, exiting 0** — the shape this file names
+elsewhere, here pointed at the durability rule itself.
+
+```text
+povo-adopted: no
+povo-nondurable-terminal: 276
+```
+
+That is what adoption would refuse **today**, derived per commit by
+`the_povo_nondurable_population_is_declared_and_one_way` from
+`scripts/povo_population.py`, which uses the validator's **own** classifier *and* its **own**
+`build_verification_artifact_authority`. Both are load-bearing: a hand-rolled scan of the same
+manifest reported **154** by counting tracked directories as missing, and the real classifier driven
+with a hand-built authority reported **430**, because an empty `reachable_commits` forces all 154
+commit citations to classify `unreachable_commit`. Same code, fabricated input, confident wrong
+answer — twice, before the right instrument produced 276.
+
+**This is a declared remainder, and it is deliberately NOT gated on growth — that is the honest
+part.** The obvious shape is one-way-plus-a-floor: may fall, may not rise. That was written first
+and it reddened **within minutes**, 276 -> 277, because a peer closed a bead whose row carries a
+non-durable citation. The assertion was not wrong; it was the defect firing. But switching it on now
+makes every such close red for every pane, which is the same switch-flip as bringing the receipt
+registry into existence before the migration — 276 citations with named owners, and not one pane's
+call. So the guard binds the **disclosure to the derivation** (the number must exist, be
+reproducible, and still describe the tree) and leaves the gate to the adoption decision that owns
+it. **Growth is therefore currently unwatched, and that is a stated gap rather than an oversight.** Adoption is a **migration with 276 named owners**, not
+a switch-flip — the bead's own repair decision requires each dead citation to be repaired,
+downgraded, or recorded as lost by its owner — so flipping the registry into existence before that
+migration would redden the workspace for everyone at once. The 13 non-durable citations in
+**non-terminal** rows are exempt today and become live as their beads close, so 276 is a floor for
+the migration rather than its size.
+
 ## Evidence & Census Pins — Operational Gotchas
 
 Hard-won facts that will bite you if unknown:
