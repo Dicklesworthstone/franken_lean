@@ -361,10 +361,11 @@ fn the_inductive_family_still_defers_after_kr974() {
 }
 
 #[test]
-fn an_unsafe_declaration_is_deferred_even_when_its_preamble_is_clean() {
-    // KR-975/976 are not built. An unsafe axiom has a clean preamble and must
-    // still get no decision — the direction that matters, since admitting it
-    // would be the quarantine leaking.
+fn kr975_an_unsafe_declaration_is_admitted_into_the_quarantine_not_deferred() {
+    // This cell replaces `an_unsafe_declaration_is_deferred_even_when_its_preamble_
+    // is_clean`, which asserted the behaviour KR-975 exists to remove. Before this
+    // slice the checker DEFERRED every unsafe declaration before its kind was even
+    // examined, so it could say nothing at all about one.
     let candidate = ConstantEntry::new(
         checker_name("U"),
         header(
@@ -379,23 +380,120 @@ fn an_unsafe_declaration_is_deferred_even_when_its_preamble_is_clean() {
         &candidate,
         AdmissionBudget::unlimited(),
     ) {
-        Verdict::Deferred(AdmissionDeferred::UnsafeQuarantine { name, kind }) => {
-            assert_eq!(name, checker_name("U"));
-            assert_eq!(kind, ConstantKind::Axiom);
+        Verdict::Admitted(admission) => {
+            assert_eq!(admission.name(), &checker_name("U"));
+            assert_eq!(
+                admission.ground(),
+                AdmissionGround::UnsafeQuarantine,
+                "an unsafe admission must report the QUARANTINE ground; reusing the \
+                 ordinary one would make a council unable to tell them apart"
+            );
         }
-        other => panic!("an unsafe axiom must defer to the quarantine, got {other:?}"),
+        other => {
+            panic!("an unsafe declaration must be admitted into the quarantine, got {other:?}")
+        }
     }
 
-    // Control: the identical declaration marked Safe IS admitted, so the
-    // deferral is attributable to the safety class alone.
+    // Control: the identical declaration marked Safe reports the ORDINARY ground,
+    // so the assertion above is about the safety mark and not about every
+    // admission reporting a quarantine.
+    match admit(
+        &ConstantEnvironment::empty(),
+        &axiom("U"),
+        AdmissionBudget::unlimited(),
+    ) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::AxiomPreamble,
+            "a safe declaration must NOT report a quarantine ground"
+        ),
+        other => panic!("the safe control must be admitted, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr976_a_partial_body_lands_in_its_own_quarantine_not_the_unsafe_one() {
+    // Two different quarantines. One ground for both would leave the verdict
+    // unable to say which, which is the whole reason they are separate variants.
+    let partial = ConstantEntry::new(
+        checker_name("P"),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                nat_constant(),
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Partial,
+                Vec::new(),
+            ),
+        ),
+    );
+    match admit(&nat_environment(), &partial, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::PartialQuarantine,
+            "a partial body must land in the PARTIAL quarantine, not the unsafe one"
+        ),
+        other => panic!("a partial definition must be admitted, got {other:?}"),
+    }
+
+    // Control: the identical definition with a Safe body reports the ordinary
+    // ground, so the quarantine above is attributable to the body's safety mark.
+    match admit(
+        &nat_environment(),
+        &definition("P", a_type(), nat_constant()),
+        AdmissionBudget::unlimited(),
+    ) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::BodyCheckedAgainstDeclaredType,
+            "the safe-bodied control must report the ordinary ground"
+        ),
+        other => panic!("the safe control must be admitted, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr975_a_safe_header_over_an_unsafe_body_lands_in_the_unsafe_quarantine() {
+    // THE DECISION gii.25 WAS FILED TO MAKE. The two safety marks disagree, and
+    // the quarantine is keyed on the WEAKEST of them.
+    //
+    // The argument is consistency, not taste, and this cell pins BOTH halves of
+    // it so the reasoning cannot rot into a bare choice: `delta_body` already
+    // treats such a declaration as non-unfoldable, and inference already refuses
+    // references to it. Admission keying on the header alone would be a third
+    // behaviour disagreeing with two existing ones, silently.
+    let mixed = ConstantEntry::new(
+        checker_name("M"),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe, // the HEADER says safe
+            DefinitionBody::new(
+                nat_constant(),
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Unsafe, // the BODY says otherwise
+                Vec::new(),
+            ),
+        ),
+    );
+    match admit(&nat_environment(), &mixed, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::UnsafeQuarantine,
+            "a safe header over an unsafe body must be quarantined as UNSAFE"
+        ),
+        other => panic!("expected an unsafe-quarantined admission, got {other:?}"),
+    }
+
+    // The two existing mechanisms this decision is consistent WITH, asserted
+    // rather than cited, so the argument above is measured and not remembered.
     assert!(
-        admit(
-            &ConstantEnvironment::empty(),
-            &axiom("U"),
-            AdmissionBudget::unlimited()
-        )
-        .is_admitted(),
-        "the same shape marked Safe must be admitted"
+        !mixed.declaration().is_delta_unfoldable(),
+        "delta_body already treats a safe header over an unsafe body as \
+         non-unfoldable; if that ever stops being true the argument for this \
+         quarantine choice has lost one of its two legs"
     );
 }
 
@@ -571,11 +669,14 @@ fn the_three_non_answers_are_never_reported_as_admitted() {
         }
     }
     assert_eq!(
-        admitted, 2,
-        "exactly two of these seven are genuine admissions -- the axiom preamble \
-         and the body-checked definition. A cell where nothing is ever admitted \
-         satisfies the property above vacuously, and this count moves DELIBERATELY \
-         when an outcome is added rather than being loosened to a floor"
+        admitted, 3,
+        "exactly three of these seven are genuine admissions -- the axiom preamble, \
+         the body-checked definition, and (since KR-975) the UNSAFE axiom, which \
+         this list previously expected to defer. A cell where nothing is ever \
+         admitted satisfies the property above vacuously, and this count moves \
+         DELIBERATELY when an outcome changes rather than being loosened to a \
+         floor: it caught KR-975 moving one verdict from Deferred to Admitted, \
+         which is exactly the event a floor would have hidden"
     );
 }
 
@@ -1043,4 +1144,132 @@ fn kr974_an_exhausted_conversion_budget_is_inconclusive_never_a_mismatch() {
         .is_admitted(),
         "the same candidate must be admitted when the budget allows it"
     );
+}
+
+#[test]
+fn kr975b_the_reference_gate_is_keyed_on_the_header_and_fires_in_both_directions() {
+    // The gate `infer.rs` already enforces: a SAFE declaration may not reference
+    // an unsafe constant. That half predates this slice and is correct — but
+    // nothing asserted it from admission, so a slice that "tightened" the mode
+    // would silently make every unsafe declaration unadmittable and no cell
+    // would notice. Both directions are pinned here.
+    let unsafe_constant = ConstantEntry::new(
+        checker_name("Danger"),
+        header(
+            Vec::new(),
+            a_type(),
+            ConstantKind::Axiom,
+            ConstantSafety::Unsafe,
+        ),
+    );
+    let environment = environment_of(vec![
+        unsafe_constant,
+        ConstantEntry::new(
+            checker_name("Nat"),
+            header(
+                Vec::new(),
+                a_type(),
+                ConstantKind::Inductive,
+                ConstantSafety::Safe,
+            ),
+        ),
+    ]);
+    let referencing_body = decoded(&Expr::const_(primary_name("Danger"), Vec::new()));
+
+    // SAFE header: the gate is ON, and the reference is refused carrying
+    // inference's own typed refusal rather than a generic rejection.
+    let safe_referrer = ConstantEntry::new(
+        checker_name("S"),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            DefinitionBody::new(
+                referencing_body.clone(),
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Safe,
+                Vec::new(),
+            ),
+        ),
+    );
+    match admit(&environment, &safe_referrer, AdmissionBudget::unlimited()) {
+        Verdict::Rejected(AdmissionRejection::BodyTypeRefused { name, refusal }) => {
+            assert_eq!(name, checker_name("S"));
+            let rendered = format!("{refusal:?}");
+            assert!(
+                rendered.contains("UnsafeConstant"),
+                "a safe declaration referencing an unsafe constant must be refused \
+                 carrying UnsafeConstant, got {rendered}"
+            );
+        }
+        other => panic!("the safe referrer must be refused by the gate, got {other:?}"),
+    }
+
+    // UNSAFE header: the gate is OFF, and the SAME reference is permitted. This
+    // is the direction that is currently accidental — `admit` keys the mode on
+    // the header, so `checks_safe_declaration()` is false here.
+    let unsafe_referrer = ConstantEntry::new(
+        checker_name("S"),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Unsafe,
+            DefinitionBody::new(
+                referencing_body,
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Unsafe,
+                Vec::new(),
+            ),
+        ),
+    );
+    let verdict = admit(&environment, &unsafe_referrer, AdmissionBudget::unlimited());
+    assert!(
+        !matches!(
+            &verdict,
+            Verdict::Rejected(AdmissionRejection::BodyTypeRefused { refusal, .. })
+                if format!("{refusal:?}").contains("UnsafeConstant")
+        ),
+        "an UNSAFE declaration must be allowed to reference an unsafe constant; \
+         the gate is keyed on the header and this is the direction a mode \
+         'tightening' would silently break: got {verdict:?}"
+    );
+
+    // THE THIRD COMBINATION, and it is the one that separates keying the gate on
+    // the HEADER from keying it on effective safety. A SAFE header over an UNSAFE
+    // body: the quarantine says unsafe, but the gate must still be ON, or a
+    // caller unlocks unsafe references by marking only the body -- the mark the
+    // header does not advertise.
+    //
+    // Added because a planted mutant that keyed the mode on effective safety
+    // SURVIVED the two cases above: both agree under either keying, so the cell
+    // was testing the property its own doc comment argues for in exactly the two
+    // places where the argument does not bite.
+    let mixed_referrer = ConstantEntry::new(
+        checker_name("S"),
+        ConstantDeclaration::definition(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe, // header: safe, so the gate stays ON
+            DefinitionBody::new(
+                decoded(&Expr::const_(primary_name("Danger"), Vec::new())),
+                ReducibilityHint::Regular(0),
+                DefinitionSafety::Unsafe, // body: unsafe, so the QUARANTINE is unsafe
+                Vec::new(),
+            ),
+        ),
+    );
+    match admit(&environment, &mixed_referrer, AdmissionBudget::unlimited()) {
+        Verdict::Rejected(AdmissionRejection::BodyTypeRefused { refusal, .. }) => {
+            let rendered = format!("{refusal:?}");
+            assert!(
+                rendered.contains("UnsafeConstant"),
+                "a SAFE-header declaration must not reach an unsafe constant even \
+                 when its own body is marked unsafe, got {rendered}"
+            );
+        }
+        other => panic!(
+            "a safe header over an unsafe body must still be GATED -- otherwise \
+             marking only the body unlocks unsafe references: got {other:?}"
+        ),
+    }
 }

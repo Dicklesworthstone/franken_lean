@@ -72,6 +72,7 @@ use crate::defeq::{
 };
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
+    DefinitionBody, DefinitionSafety,
 };
 use crate::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
@@ -193,10 +194,6 @@ pub enum AdmissionDeferred {
     /// inductive family: the preamble passed and the *body* is unchecked, which
     /// is a different slice.
     BodyNotChecked { name: WireName, kind: ConstantKind },
-    /// KR-975 / KR-976 — the unsafe and partial quarantines are not built, so an
-    /// unsafe declaration gets no verdict from this module even when its
-    /// preamble is clean.
-    UnsafeQuarantine { name: WireName, kind: ConstantKind },
     /// Inference itself deferred while checking the declared type.
     DeclaredTypeInference {
         name: WireName,
@@ -279,6 +276,42 @@ pub enum AdmissionFault {
     UniverseNotNormalizable { name: WireName },
 }
 
+/// KR-975 / KR-976 — which quarantine a declaration lands in.
+///
+/// # The decision this slice was filed to make, and its argument
+///
+/// A declaration carries TWO safety marks: the header's `ConstantSafety` and, if
+/// it has a body, that body's `DefinitionSafety`. They can disagree, and
+/// `franken_lean-gii.25` was filed with that case explicitly undecided.
+///
+/// **The quarantine is keyed on the WEAKEST of the two.** A `Safe` header over an
+/// `Unsafe` body is admitted into the *unsafe* quarantine, not the safe world.
+/// The argument is consistency rather than taste: two mechanisms already treat
+/// that declaration as unsafe — `ConstantDeclaration::delta_body` returns `None`
+/// unless the kind, the constant AND the body are all safe, so it is already
+/// non-unfoldable; and `infer.rs`'s reference gate already raises
+/// `InferenceRefusal::UnsafeConstant` when *either* mark is unsafe. Admission
+/// keying on the header alone would be a third behaviour disagreeing with both,
+/// and the disagreement would be silent.
+///
+/// **The reference GATE stays keyed on the header, and that is deliberate and
+/// separate.** `admit` passes `InferenceMode::Checking { declaration_safety }`
+/// from the header, so a `Safe`-header declaration is checked with the gate ON
+/// even when its body marks it unsafe — otherwise a caller could unlock unsafe
+/// references by marking only the body, which is the mark the header does not
+/// advertise. So both keys are conservative, in opposite directions: the gate
+/// takes the STRONGER claim about what the declaration may reference, and the
+/// quarantine takes the WEAKER claim about what may reference it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quarantine {
+    /// Neither mark is weakened.
+    None,
+    /// KR-976 — the body is `DefinitionSafety::Partial`.
+    Partial,
+    /// KR-975 — either mark is unsafe.
+    Unsafe,
+}
+
 /// Why a declaration was admitted.
 ///
 /// One variant today, and it is an enum rather than a unit so that KR-974's
@@ -297,6 +330,15 @@ pub enum AdmissionGround {
     /// body-checked admission as a preamble-only one. The two are different
     /// claims and an enum is the cheapest place to keep them apart.
     BodyCheckedAgainstDeclaredType,
+    /// KR-975 — admitted INTO THE UNSAFE QUARANTINE. Everything the ordinary
+    /// grounds claim, plus the fact that this declaration is not safe: a council
+    /// reading this ground must not treat it as an ordinary admission, and the
+    /// separate variant is what stops that being a matter of remembering.
+    UnsafeQuarantine,
+    /// KR-976 — admitted into the PARTIAL quarantine. Distinct from the unsafe
+    /// one because they are different quarantines, and one variant for both
+    /// would leave the verdict unable to say which.
+    PartialQuarantine,
 }
 
 /// The observation that a declaration passed every rule this module implements.
@@ -673,12 +715,10 @@ fn terminal_rule(
     budget: &AdmissionBudget,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Verdict {
-    if declaration.safety() == ConstantSafety::Unsafe {
-        return Verdict::Deferred(AdmissionDeferred::UnsafeQuarantine {
-            name: name.clone(),
-            kind: declaration.kind(),
-        });
-    }
+    // KR-975 / KR-976. This used to DEFER every unsafe declaration before the
+    // kind was even examined, so the checker could say nothing at all about one.
+    // It now runs the same rules and records the quarantine in the ground.
+    let quarantine = quarantine_of(declaration);
 
     match declaration.kind() {
         // KR-973. There is deliberately no "an axiom must not carry a body"
@@ -694,7 +734,7 @@ fn terminal_rule(
         // quietly becoming false.
         ConstantKind::Axiom => Verdict::Admitted(Admission {
             name: name.clone(),
-            ground: AdmissionGround::AxiomPreamble,
+            ground: ground_for(quarantine, AdmissionGround::AxiomPreamble),
         }),
         // KR-974. These three carry a body, and the body is what this rule
         // checks. The inductive family below does not, so folding it in here
@@ -725,7 +765,7 @@ fn terminal_rule(
             ) {
                 Ok(()) => Verdict::Admitted(Admission {
                     name: name.clone(),
-                    ground: AdmissionGround::BodyCheckedAgainstDeclaredType,
+                    ground: ground_for(quarantine, AdmissionGround::BodyCheckedAgainstDeclaredType),
                 }),
                 Err(verdict) => verdict,
             }
@@ -737,6 +777,36 @@ fn terminal_rule(
             name: name.clone(),
             kind,
         }),
+    }
+}
+
+/// KR-975 / KR-976 — classify a declaration's quarantine from BOTH safety marks.
+///
+/// Unsafe dominates Partial dominates None, which is the "weakest of the two"
+/// rule argued at [`Quarantine`]. Written as an explicit match rather than an
+/// ordering trick so that a fourth `DefinitionSafety` variant fails to compile
+/// here instead of silently landing in whichever arm a `>=` put it in.
+fn quarantine_of(declaration: &ConstantDeclaration) -> Quarantine {
+    if declaration.safety() == ConstantSafety::Unsafe {
+        return Quarantine::Unsafe;
+    }
+    match declaration.definition_body().map(DefinitionBody::safety) {
+        Some(DefinitionSafety::Unsafe) => Quarantine::Unsafe,
+        Some(DefinitionSafety::Partial) => Quarantine::Partial,
+        Some(DefinitionSafety::Safe) | None => Quarantine::None,
+    }
+}
+
+/// The ground a quarantined admission reports.
+///
+/// A quarantine REPLACES the ordinary ground rather than annotating it, so there
+/// is no way to read a quarantined admission as an ordinary one by ignoring a
+/// field — the only thing a caller can match on already carries the quarantine.
+const fn ground_for(quarantine: Quarantine, ordinary: AdmissionGround) -> AdmissionGround {
+    match quarantine {
+        Quarantine::None => ordinary,
+        Quarantine::Partial => AdmissionGround::PartialQuarantine,
+        Quarantine::Unsafe => AdmissionGround::UnsafeQuarantine,
     }
 }
 
