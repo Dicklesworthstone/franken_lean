@@ -479,6 +479,20 @@ fn the_twelve_evidence_fields_resolve_to_tests_that_exist() {
         NONRESOLVING_ENTRY_CEILING,
         &ws,
     );
+    // Report the census on the GREEN path too, the way `ci_execution_join` does. Until now
+    // these three numbers existed only inside the panic message, so the only way to read the
+    // population was to break the guard — and a figure you can obtain solely by inducing a
+    // failure is one nobody cites, or one cited from a stale failure someone happened to see.
+    // A bead close or a row that wants to state this population should take it from here.
+    println!(
+        "evidence-field-citations: entries={} resolvable={} non-resolving={} \
+         declared={} ceiling={}",
+        buckets.total,
+        buckets.resolvable(),
+        nonresolving.len(),
+        NONRESOLVING_ALLOWANCE.len(),
+        NONRESOLVING_ENTRY_CEILING,
+    );
     assert!(
         faults.is_empty(),
         "the twelve evidence fields no longer resolve as this file declares:\n\n{}\n\n\
