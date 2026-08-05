@@ -48,6 +48,7 @@ remains the backstop.
 import json
 import re
 import subprocess
+import tempfile
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -399,6 +400,92 @@ def requested_statuses(argv: list[str]) -> list[str]:
     return found
 
 
+def named_bead(argv: list[str]) -> str | None:
+    """The bead id a `br update`/`close` names, or None when the shape is not one this reads."""
+    for token in argv[1:]:
+        if not token.startswith("-") and "-" in token:
+            return token
+    return None
+
+
+def prospective_status_refusal(root: Path, argv: list[str], status: str) -> str | None:
+    """Refuse a status change that would make the SHARED export invalid, before `br` acts.
+
+    **A third obligation nobody had written down.** Filing a bead owes a coverage row and
+    closing owes a complete one; both are documented. **Claiming owes a row whose `skip` is
+    `none`** — because `in_progress` derives `active`, and the validator refuses an active or
+    complete row that is skipped. Measured on 2026-08-05: `fln-d18-product-half-rgsg` sat in
+    `br ready` at P1 with `skip: blocked`, and claiming it turns every pane's export invalid
+    with `active coverage cannot be skipped` — discovered only after `br` has mutated the
+    tracker and auto-flushed it into the shared working copy.
+
+    This decides nothing itself. It applies the requested status to a COPY of the tracker and
+    asks the real validator, so there is one predicate and one producer.
+
+    **The differential is what makes it honest.** The live pair is frequently invalid for
+    somebody else's in-flight reason, and refusing on that would be a wall built out of a
+    peer's work. So the check runs the validator BEFORE as well, and refuses only when the
+    requested change itself flips valid -> invalid. If the tree is already invalid, this says
+    so and gets out of the way.
+    """
+    bead = named_bead(argv)
+    if bead is None:
+        return None
+    tracker = root / TRACKER
+    try:
+        lines = tracker.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    def validate(text: str) -> int:
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
+            handle.write(text)
+            path = handle.name
+        try:
+            return subprocess.run(
+                [
+                    sys.executable, "-I", "-S", str(root / VALIDATOR),
+                    "validate-verification-manifest",
+                    "--manifest", str(root / MANIFEST),
+                    "--beads", path,
+                ],
+                capture_output=True, text=True, check=False,
+            ).returncode
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    before = "\n".join(lines) + "\n"
+    if validate(before) != 0:
+        return None  # already invalid for someone else's reason; not this act's to answer for
+
+    changed, found = [], False
+    for line in lines:
+        if line.strip():
+            record = json.loads(line)
+            if record.get("id") == bead:
+                record["status"] = status
+                line = json.dumps(record, separators=(",", ":"))
+                found = True
+        changed.append(line)
+    if not found:
+        return None
+    if validate("\n".join(changed) + "\n") == 0:
+        return None
+
+    return (
+        f"br_obligation: REFUSED BEFORE br: setting {bead} to {status!r} would make the SHARED "
+        f"verification export INVALID, and the tracker is valid right now — so this act, not a "
+        f"peer's, would redden every pane.\n"
+        f"Almost always this is a coverage row whose `skip` is not `none`: `in_progress` derives "
+        f"`active` and `closed` derives `complete`, and the validator refuses either when the row "
+        f"is skipped. Set that row's `skip` to `none` in the same commit as the claim, or fix "
+        f"whatever the validator names below, then retry.\n"
+        f"Check it yourself with the producer the hook uses:\n"
+        f"  python3 -I -S {VALIDATOR} validate-verification-manifest \\\n"
+        f"    --manifest {MANIFEST} --beads {TRACKER}"
+    )
+
+
 def execute_br_command(
     root: Path,
     argv: list[str],
@@ -410,6 +497,10 @@ def execute_br_command(
         refusal = status_refusal(root, requested)
         if refusal is not None:
             print(refusal, file=sys.stderr)
+            return 2
+        prospective = prospective_status_refusal(root, argv, requested)
+        if prospective is not None:
+            print(prospective, file=sys.stderr)
             return 2
 
     before = tracker_state(root)
