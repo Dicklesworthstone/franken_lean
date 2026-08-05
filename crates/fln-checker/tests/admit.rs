@@ -1873,3 +1873,83 @@ fn kr978_the_module_doc_still_records_why_there_is_no_door() {
         );
     }
 }
+
+#[test]
+fn the_admission_module_contains_no_panicking_construct() {
+    // Three closed rows CLAIM this -- "src/admit.rs contains zero panicking
+    // constructs, counted independently" -- and until now nothing enforced it.
+    // A claim counted by hand at close time is a claim with no producer: it
+    // cannot fail when it stops being true.
+    //
+    // FL-INV-07's reason for caring: a panic in this module would be an
+    // invariant failure surfacing as a process abort rather than as a typed
+    // Inconclusive or InternalFault, which is precisely the outcome the five-arm
+    // verdict exists to make impossible.
+    let source = std::fs::read_to_string(workspace_root().join("crates/fln-checker/src/admit.rs"))
+        .expect("the admission module is readable");
+    let mut sites = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        // Strip the comment tail: this module's doc comments discuss panics and
+        // FL-INV-07 at length, and scoring prose would make the guard redden on
+        // its own explanation.
+        let code = match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        };
+        for needle in [
+            "panic!",
+            ".unwrap()",
+            ".expect(",
+            "unreachable!",
+            "todo!",
+            "unimplemented!",
+        ] {
+            if code.contains(needle) {
+                sites.push(format!("{}:{} {needle}", "src/admit.rs", number + 1));
+            }
+        }
+    }
+    assert!(
+        sites.is_empty(),
+        "the admission module must contain no panicking construct; FL-INV-07 wants a \
+         typed Inconclusive or InternalFault, never an abort: {sites:?}"
+    );
+
+    // Anti-vacuity: the scan must be shown capable of finding one, or an empty
+    // result means nothing. Every needle is planted and every needle must hit.
+    let decoy: String = [
+        "panic!",
+        ".unwrap()",
+        ".expect(",
+        "unreachable!",
+        "todo!",
+        "unimplemented!",
+    ]
+    .iter()
+    .map(|n| format!("    let x = y{n};\n"))
+    .collect();
+    let found = decoy
+        .lines()
+        .filter(|line| {
+            let code = match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            };
+            [
+                "panic!",
+                ".unwrap()",
+                ".expect(",
+                "unreachable!",
+                "todo!",
+                "unimplemented!",
+            ]
+            .iter()
+            .any(|n| code.contains(n))
+        })
+        .count();
+    assert_eq!(
+        found, 6,
+        "the panicking-construct scan did not fire on a planted decoy, so its clean \
+         result on the real module is vacuous"
+    );
+}
