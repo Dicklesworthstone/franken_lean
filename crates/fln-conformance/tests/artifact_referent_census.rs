@@ -200,7 +200,14 @@ use fln_conformance::execution::{Field, record_field};
 /// already measured once when an enforcement census drifted 26 → 27 → 28 while the live
 /// population stood still.
 const UNRESOLVABLE_CENSUS: &[(&str, usize)] = &[
-    ("rootless_leaf", 99),
+    // 99 -> 94 at this commit: five bare run-artifact filenames on `franken_lean-rps`
+    // (`run.ndjson`, `human.log`, `human.semantic.log`, `manifest.json`,
+    // `bundle.complete.json`) replaced by the tracked producer that made them,
+    // `scripts/e2e/hash_identity.sh`, with the run's own bytes recorded as lost. A repair
+    // lowers this census and owes the same commit -- and this guard is what said so, on a
+    // commit whose author had already re-derived two other populations and still missed
+    // this one.
+    ("rootless_leaf", 94),
     ("glob", 20),
     // 15 -> 13 at 8042d789: two citations of `crates/fln-syntax/src/syntax.rs`, a path with
     // zero commits in the object store, repointed to `crates/fln-syntax/src/tree.rs`, which
