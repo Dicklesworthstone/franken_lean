@@ -3,14 +3,15 @@
 //!
 //! # The laws proven here
 //!
-//! Handle authenticity (a handle resolves only to its own live, same-generation,
-//! same-type allocation), ABA retirement (a freed slot's generation advances; at
-//! the maximum the slot retires rather than re-issue a stale generation), the
-//! persistent arm of the tri-state law (immutable, never freed individually),
-//! total interning (structural dedup with full-value comparison on a hit, and a
-//! freed interned slot leaving the index), and close-reclaims (every handle
-//! refuses afterwards, with the refusal typed). Every misuse is a typed
-//! `HeapError`, never UB and never a wrong value.
+//! Handle authenticity (a handle resolves only in its originating heap and to
+//! its own live, same-generation, same-type allocation), ABA retirement (a
+//! freed slot's generation advances; at the maximum the slot retires rather
+//! than re-issue a stale generation), the persistent arm of the tri-state law
+//! (immutable, never freed individually), total interning (structural dedup
+//! with full-value comparison on a hit, and a freed interned slot leaving the
+//! index), and close-reclaims (every handle refuses afterwards, with the
+//! refusal typed). Every misuse is a typed `HeapError`, never UB and never a
+//! wrong value.
 
 #![forbid(unsafe_code)]
 
@@ -41,12 +42,47 @@ fn a_handle_resolves_to_its_own_allocation_only() {
 fn a_type_mismatch_is_typed_not_a_panic() {
     let mut heap = NativeHeap::new();
     let handle = heap.alloc(42u64);
-    // The same slot addressed as a different type, planted through the public
-    // parts constructor: the heap says so, typed, never a panic and never UB.
-    let as_string =
-        fln_rt::native_heap::NativeHandle::<String>::from_parts(handle.slot(), handle.generation());
+    // The same handle addressed as a different type while retaining its
+    // unforgeable heap namespace: typed refusal, never a panic and never UB.
+    let as_string = handle.retype::<String>();
     assert_eq!(heap.get(as_string), Err(HeapError::TypeMismatch));
     assert_eq!(*heap.get(handle).unwrap(), 42u64);
+}
+
+#[test]
+fn a_handle_from_another_heap_is_refused_even_when_slot_generation_and_type_match() {
+    let mut first = NativeHeap::new();
+    let mut second = NativeHeap::new();
+    let first_handle = first.alloc(String::from("first"));
+    let second_handle = second.alloc(String::from("second"));
+
+    assert_eq!(first_handle.slot(), second_handle.slot());
+    assert_eq!(first_handle.generation(), second_handle.generation());
+    assert_ne!(
+        first_handle, second_handle,
+        "heap identity participates in handle identity"
+    );
+    assert_eq!(
+        second.get(first_handle),
+        Err(HeapError::WrongHeap),
+        "a foreign heap's matching slot must not resolve"
+    );
+    assert_eq!(
+        second.get_mut(first_handle),
+        Err(HeapError::WrongHeap),
+        "a foreign heap's matching slot must not become mutable"
+    );
+    assert_eq!(
+        second.free(first_handle),
+        Err(HeapError::WrongHeap),
+        "a foreign heap's matching slot must not free the local allocation"
+    );
+    assert_eq!(second.get(second_handle).unwrap(), "second");
+    assert_eq!(
+        second.live(),
+        1,
+        "every refusal leaves the local heap intact"
+    );
 }
 
 // ---------------------------------------------------------------------------

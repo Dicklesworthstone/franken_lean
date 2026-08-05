@@ -10,11 +10,11 @@
 //! transactions, Crucible terms, Ledger records live here as typed handles,
 //! persistent/immutable where semantics allow. It is deliberately NOT the
 //! ABI: no layout contract, no RC word, no membrane discipline — a handle is
-//! a `(slot, generation, type)` triple, and every resolution misuse is a
-//! typed error, never a raw pointer and never UB. The one assertion is the
-//! programmer invariant, not a runtime fact: allocating on a closed heap is
-//! a caller bug (the converters' region discipline), asserted rather than
-//! modelled as a typed outcome.
+//! an opaque heap namespace plus a `(slot, generation, type)` triple, and
+//! every resolution misuse is a typed error, never a raw pointer and never
+//! UB. The one assertion is the programmer invariant, not a runtime fact:
+//! allocating on a closed heap is a caller bug (the converters' region
+//! discipline), asserted rather than modelled as a typed outcome.
 //!
 //! The handle semantics mirror asupersync's `RegionHeap`
 //! (`HeapIndex{index, generation, type_id}` with ABA retirement at
@@ -26,9 +26,10 @@
 //!
 //! # The laws
 //!
-//! * **Handle authenticity.** A handle resolves only to its own live,
-//!   same-generation, same-type allocation. A stale handle (freed, wrong
-//!   generation, closed heap) is a typed error, never a wrong value.
+//! * **Handle authenticity.** A handle resolves only in its originating heap
+//!   and only to its own live, same-generation, same-type allocation. A
+//!   foreign or stale handle (freed, wrong generation, closed heap) is a
+//!   typed error, never a wrong value.
 //! * **ABA retirement.** A freed slot's generation advances; at `u32::MAX`
 //!   the slot retires permanently rather than re-issue a generation a stale
 //!   handle could still hold.
@@ -48,6 +49,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Every way the heap can refuse, each typed and naming its cause. No misuse
 /// is ever a panic or a wrong value (the panic law, on this side of the
@@ -57,8 +59,11 @@ use std::marker::PhantomData;
 pub enum HeapError {
     /// The heap is closed: nothing allocates, nothing resolves.
     Closed,
+    /// The handle belongs to a different heap, even if its slot, generation,
+    /// and type happen to match a live allocation here.
+    WrongHeap,
     /// The handle names no live allocation (freed, wrong generation, or
-    /// never issued by this heap).
+    /// never issued at this slot).
     StaleHandle,
     /// The handle's type does not match the requested type.
     TypeMismatch,
@@ -70,6 +75,7 @@ impl fmt::Display for HeapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "the heap is closed"),
+            Self::WrongHeap => write!(f, "the handle belongs to a different heap"),
             Self::StaleHandle => {
                 write!(f, "the handle names no live allocation")
             }
@@ -85,30 +91,25 @@ impl fmt::Display for HeapError {
 
 impl std::error::Error for HeapError {}
 
-/// A typed handle into the NativeHeap. `Copy` by construction (a handle is a
+/// A typed handle into one NativeHeap. `Copy` by construction (a handle is a
 /// fact, not an ownership claim); resolution goes through the heap, which is
-/// where the laws live.
+/// where the laws live. The heap namespace is intentionally opaque and is
+/// omitted from debug and hash output so construction order is not semantic.
 pub struct NativeHandle<T> {
+    heap_id: u64,
     index: u32,
     generation: u32,
     _type: PhantomData<fn() -> T>,
 }
 
 impl<T> NativeHandle<T> {
-    fn new(index: u32, generation: u32) -> Self {
+    fn new(heap_id: u64, index: u32, generation: u32) -> Self {
         Self {
+            heap_id,
             index,
             generation,
             _type: PhantomData,
         }
-    }
-
-    /// Reconstitute a handle from its parts — for receipts, diagnostics, and
-    /// tests that must plant a handle of a chosen shape. The heap's laws do
-    /// not relax: a fabricated handle resolves only if it names a live,
-    /// same-generation, same-type allocation.
-    pub fn from_parts(index: u32, generation: u32) -> Self {
-        Self::new(index, generation)
     }
 
     /// The slot index (diagnostics only; never an address).
@@ -119,6 +120,15 @@ impl<T> NativeHandle<T> {
     /// The generation this handle was issued at (diagnostics only).
     pub fn generation(self) -> u32 {
         self.generation
+    }
+
+    /// Rebind only the compile-time type marker while retaining the opaque
+    /// originating-heap namespace and stable slot/generation. This supports
+    /// typed receipt decoders and adversarial type checks without providing
+    /// any way to forge a handle for another heap; resolution still verifies
+    /// the stored value's real type.
+    pub fn retype<U>(self) -> NativeHandle<U> {
+        NativeHandle::new(self.heap_id, self.index, self.generation)
     }
 }
 
@@ -143,12 +153,18 @@ impl<T> Clone for NativeHandle<T> {
 impl<T> Copy for NativeHandle<T> {}
 impl<T> PartialEq for NativeHandle<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.index == other.index && self.generation == other.generation
+        self.heap_id == other.heap_id
+            && self.index == other.index
+            && self.generation == other.generation
     }
 }
 impl<T> Eq for NativeHandle<T> {}
 impl<T> Hash for NativeHandle<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The opaque heap token is deliberately omitted. It exists only to
+        // refuse cross-heap resolution; hashing it would let concurrent heap
+        // construction order perturb otherwise stable slot/generation hashes.
+        // Unequal handles may collide, while equal handles still hash alike.
         self.index.hash(state);
         self.generation.hash(state);
     }
@@ -182,11 +198,26 @@ struct InternEntry {
     slot: u32,
 }
 
+/// Opaque process-local heap identities are never rendered, hashed, or
+/// serialized. They only keep matching `(slot, generation, type)` triples
+/// from different live heaps from aliasing. Refuse exhaustion rather than
+/// wrap and reissue an identity to a stale handle.
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_heap_id() -> u64 {
+    NEXT_HEAP_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("NativeHeap identity space exhausted")
+}
+
 /// The NativeHeap: a region-backed, handle-addressed store with total
 /// interning and persistent semantics. Not thread-safe, by design and like
 /// the substrate it mirrors: a region owns its heap during use; sharing is
 /// through the handles, not through the heap object.
 pub struct NativeHeap {
+    heap_id: u64,
     slots: Vec<Slot>,
     free_head: Option<u32>,
     live: usize,
@@ -203,12 +234,21 @@ impl Default for NativeHeap {
 impl NativeHeap {
     pub fn new() -> Self {
         Self {
+            heap_id: fresh_heap_id(),
             slots: Vec::new(),
             free_head: None,
             live: 0,
             intern: HashMap::new(),
             closed: false,
         }
+    }
+
+    fn handle<T>(&self, index: u32, generation: u32) -> NativeHandle<T> {
+        NativeHandle::new(self.heap_id, index, generation)
+    }
+
+    fn owns<T>(&self, handle: NativeHandle<T>) -> bool {
+        handle.heap_id == self.heap_id
     }
 
     /// Live allocations (persistent included).
@@ -257,7 +297,7 @@ impl NativeHeap {
             "alloc on a closed heap is a caller bug — the converters' region discipline, not a runtime state to model"
         );
         let (index, generation) = self.alloc_slot(Box::new(value), false);
-        NativeHandle::new(index, generation)
+        self.handle(index, generation)
     }
 
     /// Allocate a persistent value: immutable and never freed individually
@@ -270,7 +310,7 @@ impl NativeHeap {
             "alloc_persistent on a closed heap is a caller bug"
         );
         let (index, generation) = self.alloc_slot(Box::new(value), true);
-        NativeHandle::new(index, generation)
+        self.handle(index, generation)
     }
 
     /// Store a value with total interning: an equal value already live in
@@ -317,7 +357,7 @@ impl NativeHeap {
                     Slot::Occupied { generation, .. } => *generation,
                     Slot::Vacant { .. } => unreachable!(),
                 };
-                return NativeHandle::new(slot, generation);
+                return self.handle(slot, generation);
             }
             // The indexed slot died under the entry (freed) or holds a
             // different value under a colliding hash: the index is stale,
@@ -325,13 +365,16 @@ impl NativeHeap {
         }
         let (index, generation) = self.alloc_slot(Box::new(value), false);
         self.intern.insert(map_key, InternEntry { slot: index });
-        NativeHandle::new(index, generation)
+        self.handle(index, generation)
     }
 
     /// Resolve a handle for reading. Every refusal is typed.
     pub fn get<T: 'static>(&self, handle: NativeHandle<T>) -> Result<&T, HeapError> {
         if self.closed {
             return Err(HeapError::Closed);
+        }
+        if !self.owns(handle) {
+            return Err(HeapError::WrongHeap);
         }
         let Some(slot) = self.slots.get(handle.index as usize) else {
             return Err(HeapError::StaleHandle);
@@ -354,6 +397,9 @@ impl NativeHeap {
     pub fn get_mut<T: 'static>(&mut self, handle: NativeHandle<T>) -> Result<&mut T, HeapError> {
         if self.closed {
             return Err(HeapError::Closed);
+        }
+        if !self.owns(handle) {
+            return Err(HeapError::WrongHeap);
         }
         let Some(slot) = self.slots.get_mut(handle.index as usize) else {
             return Err(HeapError::StaleHandle);
@@ -381,6 +427,9 @@ impl NativeHeap {
     pub fn free<T: 'static>(&mut self, handle: NativeHandle<T>) -> Result<(), HeapError> {
         if self.closed {
             return Err(HeapError::Closed);
+        }
+        if !self.owns(handle) {
+            return Err(HeapError::WrongHeap);
         }
         let Some(slot) = self.slots.get_mut(handle.index as usize) else {
             return Err(HeapError::StaleHandle);

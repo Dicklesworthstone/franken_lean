@@ -611,5 +611,41 @@ if [ "$real_sha_before_m7" != "$real_sha_after_m7" ]; then
 fi
 emit mutant_drill passed "\"mutant\":\"fln-8w8-M7\",\"discriminator\":\"small_bin_capacity_exactly_eight\",\"real_tree_sha_stable\":true"
 
+# ---- lane 8h: named mutant fln-8w8-M8 ----------------------------------------
+# Cross-heap authority drift: bypass the one NativeHeap ownership predicate
+# in an EIGHTH isolated copy. Two fresh heaps deliberately mint the same
+# slot/generation/type triple; the production test must still refuse all
+# resolution, mutation, and free attempts as WrongHeap.
+note "lane 8h: mutant drill fln-8w8-M8 (NativeHeap ownership check bypassed in a copy)"
+MUT8_WS="$ART_DIR/mutant-ws-m8"
+mkdir -p "$MUT8_WS"
+cp -r "$ROOT/crates/fln-rt" "$MUT8_WS/fln-rt"
+cp -r "$ROOT/crates/fln-core" "$MUT8_WS/fln-core"
+cp -r "$ROOT/crates/fln-unsafe-region" "$MUT8_WS/fln-unsafe-region"
+cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT8_WS/fln-unsafe-abi"
+cp -r "$ROOT/crates/fln-bignum" "$MUT8_WS/fln-bignum"
+cp "$ROOT/rust-toolchain.toml" "$MUT8_WS/"
+printf '\n[workspace]\n' >>"$MUT8_WS/fln-rt/Cargo.toml"
+real_sha_before_m8=$(sha256sum "$ROOT/crates/fln-rt/src/native_heap.rs" | cut -d' ' -f1)
+if ! sed -i 's|handle.heap_id == self.heap_id|let _ = handle; true // fln-8w8-M8: heap ownership check bypassed|' "$MUT8_WS/fln-rt/src/native_heap.rs" \
+    || ! grep -q "fln-8w8-M8: heap ownership check bypassed" "$MUT8_WS/fln-rt/src/native_heap.rs"; then
+    fail mutant_plant_m8 "\"detail\":\"mutation did not apply to the NativeHeap ownership predicate\""
+fi
+set +e
+(cd "$MUT8_WS/fln-rt" && CARGO_TARGET_DIR="$MUT8_WS/target" cargo test --offline -q --test native_heap a_handle_from_another_heap_is_refused_even_when_slot_generation_and_type_match) >"$ART_DIR/mutant8_test.log" 2>&1
+mutant8_rc=$?
+set -e
+if [ "$mutant8_rc" -eq 0 ]; then
+    fail mutant_drill_m8 "\"detail\":\"fln-8w8-M8 SURVIVED — a matching cross-heap handle resolved locally\""
+fi
+if ! grep -q "a foreign heap's matching slot must not resolve" "$ART_DIR/mutant8_test.log"; then
+    fail mutant_drill_m8 "\"detail\":\"mutant failed but not on the designed cross-heap discriminator\",\"artifact\":\"mutant8_test.log\""
+fi
+real_sha_after_m8=$(sha256sum "$ROOT/crates/fln-rt/src/native_heap.rs" | cut -d' ' -f1)
+if [ "$real_sha_before_m8" != "$real_sha_after_m8" ]; then
+    fail mutant_isolation_m8 "\"detail\":\"the REAL tree changed during the drill\""
+fi
+emit mutant_drill passed "\"mutant\":\"fln-8w8-M8\",\"discriminator\":\"cross_heap_handle_refusal\",\"real_tree_sha_stable\":true"
+
 emit run_end passed "\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\""
 note "PASS — artifacts in $ART_DIR"
