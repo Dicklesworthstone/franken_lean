@@ -11144,8 +11144,22 @@ mod tests {
                                  (c) all of it bounds STAGE 1. Stage 2's own 'exact \
                                  compared entries and bytes' clause is now carried by \
                                  validate_branch_ancestry and the last five rows of \
-                                 REFUSAL_FACT_MUTANTS — what remains open there is the \
-                                 walk's COST, which is unbounded.",
+                                 REFUSAL_FACT_MUTANTS. CORRECTED, and the correction is \
+                                 the point: this clause used to end 'what remains open \
+                                 there is the walk's COST, which is unbounded'. That was \
+                                 TRUE when written at 8f539b85 and was falsified by the \
+                                 VERY NEXT COMMIT — 9m74 bounded and cancelled every \
+                                 merge stage at 5b6158ad, charging the ancestry walk the \
+                                 same ProofBudget its checkpoint sibling already paid. \
+                                 9m74 had written its disclosure so a correct repair \
+                                 would redden it, and in that commit it duly flipped to \
+                                 the_ancestry_walk_is_bounded_like_its_checkpoint_sibling. \
+                                 That mechanism protected 9m74's sentence and could not \
+                                 protect this one: ONE FACT WITH TWO HOMES, only one of \
+                                 them joined to a producer. Nothing failed, extensions.rs \
+                                 moved four more times including under this bead, and the \
+                                 stale half survived every one. Corrected rather than \
+                                 deleted, because deleting it hides that the claim moved.",
             },
         ),
     ];
