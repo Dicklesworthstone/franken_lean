@@ -30,6 +30,7 @@
 //! value and was finally fixed by moving three `match` arms out of `run`'s
 //! single frame.
 
+use fln_checker::admit::Verdict;
 use fln_checker::infer::{InferenceOutcome, InferenceProgress, InferenceResult, InferenceStop};
 
 /// Measured at the KR-109 landing. `InferenceProgress` is embedded by value in
@@ -39,6 +40,8 @@ const PROGRESS_CEILING: usize = 176;
 const STOP_CEILING: usize = 224;
 const OUTCOME_CEILING: usize = 256;
 const RESULT_CEILING: usize = 232;
+/// Measured at the KR-970..973 landing.
+const VERDICT_CEILING: usize = 96;
 
 fn assert_ceiling(name: &str, actual: usize, ceiling: usize) {
     assert!(
@@ -85,5 +88,35 @@ fn the_ceilings_are_tight_enough_to_bind() {
         "InferenceProgress has {slack} bytes of unused ceiling; a ceiling that far \
          above the measured size no longer refuses the growth it exists to refuse. \
          Lower it to the measured size."
+    );
+}
+
+/// KR-970…KR-973's verdict is NOT on the inference path, and this cell says so
+/// rather than leaving the reader to assume either way.
+///
+/// `admit` calls the public `infer_with` and `whnf_with` entry points and never
+/// joins their recursion, so `Verdict` is never returned by value through the
+/// engine's single frame and does not spend the 64 KiB budget the four ceilings
+/// above are rationing. It gets a ceiling anyway, for a different reason: it
+/// embeds `InferenceStop` and `InferenceFault` behind boxes, and the day someone
+/// unboxes one to save an allocation, `Verdict` inherits their whole size. That
+/// is a change worth noticing at the moment it is made.
+#[test]
+fn the_admission_verdict_is_boxed_away_from_the_inference_budget() {
+    let verdict = size_of::<Verdict>();
+    assert!(
+        verdict <= VERDICT_CEILING,
+        "Verdict is {verdict} bytes, over its {VERDICT_CEILING}-byte ceiling. \
+         The usual cause is a nested engine's Stop or Fault being carried inline \
+         instead of boxed."
+    );
+    // The binding half: it must stay materially SMALLER than the stop it
+    // carries, which is exactly what boxing buys. Equality would mean the box is
+    // gone and the ceiling above had simply been raised to accommodate it.
+    assert!(
+        verdict < size_of::<InferenceStop>(),
+        "Verdict ({verdict}) is no smaller than InferenceStop ({}), so the nested \
+         stop is no longer boxed",
+        size_of::<InferenceStop>()
     );
 }

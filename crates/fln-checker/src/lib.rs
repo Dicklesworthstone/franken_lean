@@ -212,6 +212,25 @@
 //!   universe, and term algorithms. `FLN-STRUCT-037` scans those production sources, so the
 //!   boundary is no longer exercised only by planted fixtures. The checker still has
 //!   no declaration-admission authority and cannot acquire one through this crate.
+//! * **AND THAT SENTENCE NOW HAS A MODULE STANDING NEXT TO IT CALLED `admit`, so it
+//!   is restated rather than left to look contradicted.** `admit` implements KR-970
+//!   … KR-973 and produces a `Verdict` — an *observation a council may consult*, not
+//!   a capability. Three properties hold it there: `Admission` has no public
+//!   constructor and no public field, so it can only come from this crate saying
+//!   yes; neither it nor `Verdict` is `Clone` or `Copy`, so a verdict cannot be
+//!   duplicated into something stored and presented later as authority; and there is
+//!   no conversion out — `admit` takes a `&ConstantEntry` and never hands one back.
+//!   Underneath all three sits the fact that makes them worth stating: this crate
+//!   does not depend on `fln-kernel`, so no type that kernel's admission path
+//!   consumes is nameable here at all. `the_admission_verdict_is_not_a_capability`
+//!   binds the dependency half to the real manifest and the surface half to
+//!   `admit.rs`, with a planted decoy proving the scan can fire — an empty result
+//!   from a scan nobody showed capable of matching is this crate's own recorded
+//!   defect, and it cost `gii.22` a false disclosure two commits ago.
+//!   **What that does NOT earn:** it is a lexical guard over one file plus one
+//!   manifest edge, so a laundering path assembled in a *different* module is
+//!   outside it, and the argument that a `Verdict` cannot be laundered remains
+//!   prose that no check reads.
 //!
 //! Nobody should read the existence of this section as evidence that the whole
 //! boundary holds; read the two bullets above for which half does.
@@ -341,6 +360,7 @@
 //! registry exists to prevent.
 #![forbid(unsafe_code)]
 
+pub mod admit;
 pub mod defeq;
 pub mod environment;
 pub mod infer;

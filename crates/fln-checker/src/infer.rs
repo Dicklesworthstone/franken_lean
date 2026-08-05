@@ -210,7 +210,13 @@ impl InferenceContext {
         self.level_parameter_set.contains(name)
     }
 
-    fn reduction(&self) -> &WhnfContext {
+    /// The reduction context this inference context reduces in.
+    ///
+    /// Public so that `admit`'s KR-972 sort check reduces in the **same** context
+    /// the declared type was inferred in. The alternative — rebuilding a
+    /// `WhnfContext` from the same inputs at the call site — is a second copy of
+    /// this construction, free to drift from it the moment either grows a field.
+    pub fn reduction(&self) -> &WhnfContext {
         &self.reduction
     }
 }
