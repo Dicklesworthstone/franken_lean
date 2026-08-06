@@ -25,16 +25,17 @@ use std::time::Instant;
 use fln_hash::canon::{CanonError, CanonReader, CanonWriter, Canonical, SchemaId};
 use fln_hash::domain::{Digest, Domain, hash};
 
-/// Bumped 1 -> 2 by `franken_lean-odwj` when [`WorkloadKind`] was added, and
-/// 2 -> 3 by the same bead when [`OracleToolIdentity`] was added.
+/// Bumped 1 -> 2 by `franken_lean-odwj` when [`WorkloadKind`] was added,
+/// 2 -> 3 by the same bead when [`OracleToolIdentity`] was added, and 3 -> 4
+/// by `fln-odva` when the thermal-zone population became a typed host fact.
 ///
 /// All six schema ids below share this version deliberately, so the durable
 /// shapes move together and `read_supported_evidence_version` refuses any other
 /// version outright rather than guessing at a layout. Version 1 bytes are
 /// therefore rejected rather than silently reinterpreted — there are no
-/// persisted v1 bundles, which is exactly why the discriminator was added now
-/// rather than after baselines existed.
-pub const BENCHMARK_EVIDENCE_VERSION: u16 = 3;
+/// persisted older-version bundles, which is exactly why each discriminator
+/// was added now rather than after baselines existed.
+pub const BENCHMARK_EVIDENCE_VERSION: u16 = 4;
 
 pub const BENCHMARK_HOST_PROFILE_SCHEMA: SchemaId = SchemaId {
     name: "fln.bench.host-profile",
@@ -274,6 +275,10 @@ pub struct HostProfile {
     pub kernel_release: Captured<String>,
     pub power_governor: Captured<String>,
     pub thermal_policy: Captured<String>,
+    /// Number of `thermal_zone*` entries observed by the same sysfs read that
+    /// produced [`Self::thermal_sensors`]. Admission consumes this typed fact;
+    /// the display text is never parsed back into policy.
+    pub thermal_sensor_count: Captured<u64>,
     pub thermal_sensors: Captured<String>,
     pub virtualization: Captured<String>,
     pub translation: Captured<String>,
@@ -1324,27 +1329,50 @@ fn mount_facts() -> (Captured<String>, Captured<String>) {
     }
 }
 
-fn thermal_sensors() -> Captured<String> {
-    match fs::read_dir("/sys/class/thermal") {
-        Ok(entries) => {
-            let count = entries
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("thermal_zone")
-                })
-                .count();
-            Captured::observed(
-                format!("{count} thermal zones exposed"),
-                CaptureSource::Sysfs,
-            )
-        }
+fn unavailable_thermal_sensor_facts(reason: String) -> (Captured<u64>, Captured<String>) {
+    (
+        Captured::unavailable(CaptureSource::Sysfs, reason.clone()),
+        Captured::unavailable(CaptureSource::Sysfs, reason),
+    )
+}
+
+fn thermal_sensor_facts() -> (Captured<u64>, Captured<String>) {
+    let entries = match fs::read_dir("/sys/class/thermal") {
+        Ok(entries) => entries,
         Err(error) => {
-            Captured::unavailable(CaptureSource::Sysfs, format!("/sys/class/thermal: {error}"))
+            return unavailable_thermal_sensor_facts(format!("/sys/class/thermal: {error}"));
+        }
+    };
+    let mut count = 0_u64;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return unavailable_thermal_sensor_facts(format!(
+                    "/sys/class/thermal entry: {error}"
+                ));
+            }
+        };
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("thermal_zone")
+        {
+            let Some(next) = count.checked_add(1) else {
+                return unavailable_thermal_sensor_facts(
+                    "/sys/class/thermal contains more entries than u64 can count".to_string(),
+                );
+            };
+            count = next;
         }
     }
+    (
+        Captured::observed(count, CaptureSource::Sysfs),
+        Captured::observed(
+            format!("{count} thermal zones exposed"),
+            CaptureSource::Sysfs,
+        ),
+    )
 }
 
 fn clock_resolution_ns() -> Captured<u64> {
@@ -1407,6 +1435,7 @@ impl HostProfile {
                 Captured::unavailable(CaptureSource::Sysfs, "frequency governor is unavailable")
             }
         };
+        let (thermal_sensor_count, thermal_sensors) = thermal_sensor_facts();
         let virtualization = if cpuinfo.lines().any(|line| {
             line.starts_with("flags") && line.split_whitespace().any(|flag| flag == "hypervisor")
         }) {
@@ -1471,7 +1500,8 @@ impl HostProfile {
                 "kernel/default".to_string(),
                 CaptureSource::OperatingSystem,
             ),
-            thermal_sensors: thermal_sensors(),
+            thermal_sensor_count,
+            thermal_sensors,
             virtualization,
             translation: Captured::observed(
                 "native-target-architecture".to_string(),
@@ -1692,6 +1722,7 @@ fn write_host_body(writer: &mut CanonWriter, profile: &HostProfile) {
     write_text_fact(writer, &profile.kernel_release);
     write_text_fact(writer, &profile.power_governor);
     write_text_fact(writer, &profile.thermal_policy);
+    write_u64_fact(writer, &profile.thermal_sensor_count);
     write_text_fact(writer, &profile.thermal_sensors);
     write_text_fact(writer, &profile.virtualization);
     write_text_fact(writer, &profile.translation);
@@ -1725,6 +1756,7 @@ fn read_host_body(reader: &mut CanonReader<'_>) -> Result<HostProfile, CanonErro
         kernel_release: read_text_fact(reader)?,
         power_governor: read_text_fact(reader)?,
         thermal_policy: read_text_fact(reader)?,
+        thermal_sensor_count: read_u64_fact(reader)?,
         thermal_sensors: read_text_fact(reader)?,
         virtualization: read_text_fact(reader)?,
         translation: read_text_fact(reader)?,
@@ -2788,7 +2820,7 @@ fn validate_host(
         observed_text(&profile.power_governor, "power-governor")?;
     }
     if policy.require_thermal_sensors {
-        observed_text(&profile.thermal_sensors, "thermal-sensors")?;
+        observed_positive(&profile.thermal_sensor_count, "thermal-sensors")?;
     }
     if policy.require_exclusive_cores {
         observed_true(&profile.isolation.exclusive_cores, "exclusive-cores")?;
@@ -2934,7 +2966,7 @@ pub fn qualify_host(
         failing.push("power-governor");
     }
     if policy.require_thermal_sensors
-        && observed_text(&profile.thermal_sensors, "thermal-sensors").is_err()
+        && observed_positive(&profile.thermal_sensor_count, "thermal-sensors").is_err()
     {
         failing.push("thermal-sensors");
     }
@@ -3707,6 +3739,7 @@ mod tests {
             kernel_release: text("6.12.fixture"),
             power_governor: text("performance"),
             thermal_policy: text("fixture-stable"),
+            thermal_sensor_count: number(2),
             thermal_sensors: text("2 thermal zones exposed"),
             virtualization: text("no-hypervisor-flag"),
             translation: text("native-target-architecture"),
@@ -4014,10 +4047,11 @@ mod tests {
         // The planted mutant must name the version the source ACTUALLY carries,
         // or `replacen` matches nothing, the "mutated" source equals the
         // original, and this assertion fails for the wrong reason on every
-        // legitimate version bump. Moved 1->2 to 2->3 with the odwj bump.
+        // legitimate version bump. Moved 1->2 to 2->3 with the odwj bump,
+        // then 3->4 to 4->5 with fln-odva's typed thermal-zone count.
         let version_drift_source = source.replacen(
-            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 3;",
             "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 4;",
+            "pub const BENCHMARK_EVIDENCE_VERSION: u16 = 5;",
             1,
         );
         assert_ne!(
@@ -4164,6 +4198,14 @@ mod tests {
             host.root(),
             other.root(),
             "a CPU substitution must change host identity"
+        );
+
+        let mut different_thermal_population = host.clone();
+        different_thermal_population.thermal_sensor_count = number(1);
+        assert_ne!(
+            host.root(),
+            different_thermal_population.root(),
+            "the typed thermal-zone population must participate in host identity"
         );
 
         let mut missing = host.clone();

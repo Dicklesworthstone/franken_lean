@@ -61,6 +61,51 @@ fn capture() -> HostProfile {
         .expect("the local host profile must be capturable on a Linux measurement host")
 }
 
+fn observed_text(value: &str) -> Captured<String> {
+    Captured::observed(value.to_string(), CaptureSource::RuntimeProbe)
+}
+
+fn observed_number(value: u64) -> Captured<u64> {
+    Captured::observed(value, CaptureSource::RuntimeProbe)
+}
+
+/// A deterministic host whose unconditional admission facts are all present.
+/// Thermal tests mutate only the two sensor facts, so a refusal cannot ride a
+/// missing fact from whichever machine happens to run the suite.
+fn profile_with_thermal_sensor_facts(count: u64, description: &str) -> HostProfile {
+    let mut profile = capture();
+    profile.cpu_sku = observed_text("thermal-policy-fixture-cpu");
+    profile.architecture = observed_text("x86_64");
+    profile.enabled_logical_cores = observed_number(1);
+    profile.ram_bytes = observed_number(1);
+    profile.storage_device = observed_text("thermal-policy-fixture-storage");
+    profile.filesystem = observed_text("thermal-policy-fixture-fs");
+    profile.os_release = observed_text("thermal-policy-fixture-os");
+    profile.kernel_release = observed_text("thermal-policy-fixture-kernel");
+    profile.target_triple = observed_text("x86_64-unknown-linux-gnu");
+    profile.build_profile = observed_text("test");
+    profile.monotonic_clock_resolution_ns = observed_number(1);
+    profile.enabled_features.clear();
+    profile.counter_capabilities.clear();
+    profile.thermal_sensor_count = Captured::observed(count, CaptureSource::Sysfs);
+    profile.thermal_sensors = Captured::observed(description.to_string(), CaptureSource::Sysfs);
+    profile
+}
+
+fn thermal_sensor_only_policy() -> HostQualificationPolicy {
+    HostQualificationPolicy {
+        require_physical_topology: false,
+        require_power_governor: false,
+        require_thermal_sensors: true,
+        require_exclusive_cores: false,
+        require_stable_frequency: false,
+        require_thermal_stability: false,
+        allow_virtualization: true,
+        allow_translation: true,
+        allow_profiler: false,
+    }
+}
+
 /// odwj's host policy: every environmental control the bead names must be
 /// attested.  This is the policy a real Reference-baseline workload must carry;
 /// a lane that relaxes it is measuring a different host than the one odwj
@@ -172,17 +217,18 @@ fn physical_cores_from_sysfs() -> Option<u64> {
 /// Count `thermal_zone*` entries directly, independently of the substrate.
 fn thermal_zone_count() -> Option<usize> {
     let entries = fs::read_dir("/sys/class/thermal").ok()?;
-    Some(
-        entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("thermal_zone")
-            })
-            .count(),
-    )
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("thermal_zone")
+        {
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
 }
 
 #[test]
@@ -426,6 +472,17 @@ fn this_host_yields_a_blocked_qualification_artifact_naming_every_failing_check(
     );
     assert!(line.contains("\"valid_samples\":0"), "{line}");
     assert!(line.contains("\"measurements\":0"), "{line}");
+    if profile.thermal_sensor_count.observed_value() == Some(&0) {
+        assert!(
+            blocked.failing_checks.contains(&"thermal-sensors"),
+            "the live zero-zone host's BLOCKED artifact must name thermal-sensors; got {:?}",
+            blocked.failing_checks
+        );
+        assert!(
+            line.contains("\"thermal-sensors\""),
+            "the rendered BLOCKED artifact lost the typed zero-zone refusal: {line}"
+        );
+    }
     assert!(
         line.ends_with('\n'),
         "NDJSON records are newline-terminated"
@@ -524,16 +581,9 @@ fn virtualization_and_translation_are_attested_rather_than_assumed() {
     );
 }
 
-/// The thermal-sensor fact is captured from a directory that exists on every
-/// modern Linux host, so its *presence* says nothing about whether any sensor
-/// does.  This cell pins the producer's contract — the captured text must
-/// report the count it actually found — which is the fact a consumer needs in
-/// order to decide admission.
-///
-/// It deliberately asserts the producer, not the policy: whether
-/// `require_thermal_sensors` should refuse a zero-sensor host is a substrate
-/// question filed separately, and encoding today's answer here would wall the
-/// repair.
+/// The typed count and human-readable description come from one directory
+/// read. This cross-check binds both to an independent sysfs census without
+/// making policy parse the prose back into a number.
 #[test]
 fn the_thermal_sensor_fact_reports_the_count_it_actually_found() {
     let profile = capture();
@@ -542,22 +592,103 @@ fn the_thermal_sensor_fact_reports_the_count_it_actually_found() {
         return;
     };
 
-    match &profile.thermal_sensors {
-        Captured::Observed { value, .. } => {
+    match (&profile.thermal_sensor_count, &profile.thermal_sensors) {
+        (
+            Captured::Observed {
+                value: captured_count,
+                ..
+            },
+            Captured::Observed { value, .. },
+        ) => {
+            assert_eq!(
+                *captured_count, zones as u64,
+                "typed thermal-zone count disagrees with the independent sysfs census"
+            );
             assert!(
                 value.starts_with(&format!("{zones} ")),
                 "captured thermal fact {value:?} disagrees with the {zones} zones \
                  independently counted in /sys/class/thermal"
             );
         }
-        Captured::Unavailable { reason, .. } => {
+        (Captured::Unavailable { reason, .. }, Captured::Unavailable { .. }) => {
             assert!(
                 !Path::new("/sys/class/thermal").is_dir(),
                 "thermal sensors reported Unavailable ({reason}) while \
-                 /sys/class/thermal is readable and holds {zones} zones"
+                /sys/class/thermal is readable and holds {zones} zones"
             );
         }
+        facts => panic!(
+            "the typed count and display fact came from one read but disagree on availability: {facts:?}"
+        ),
     }
+}
+
+#[test]
+fn a_zero_thermal_sensor_count_is_refused_and_named() {
+    // MUTATION fln-odva-M1: restore the former `observed_text` check. The
+    // description deliberately claims 99 zones, so that mutant accepts this
+    // host and this named cell dies specifically at the refusal assertion.
+    let profile = profile_with_thermal_sensor_facts(0, "99 thermal zones exposed");
+    let policy = thermal_sensor_only_policy();
+    let blocked = qualify_host(&profile, policy)
+        .expect_err("a typed zero thermal-zone population must fail host qualification");
+
+    assert_eq!(
+        blocked.failing_checks,
+        vec!["thermal-sensors"],
+        "the isolated zero-zone refusal must name thermal-sensors and nothing else"
+    );
+    let line = blocked.ndjson();
+    assert!(
+        line.contains("\"failing_checks\":[\"thermal-sensors\"]"),
+        "the BLOCKED artifact must retain the named zero-zone refusal: {line}"
+    );
+
+    let workload = workload_with(policy);
+    let host_root = profile.root();
+    let workload_root = workload.root();
+    assert_eq!(
+        assemble_bundle(
+            "fln-odva-zero-zone",
+            profile,
+            workload,
+            one_valid_attempt(host_root, workload_root),
+            empty_telemetry(),
+        ),
+        Err(BenchmarkRefusal::HostNotQualified {
+            check: "thermal-sensors"
+        }),
+        "the bundle admission path must enforce the same typed zero-zone refusal"
+    );
+}
+
+#[test]
+fn a_positive_thermal_sensor_count_passes_without_parsing_display_text() {
+    // The display text deliberately says zero. Admission must follow the typed
+    // positive count, proving both that a real sensor remains admissible and
+    // that the repair did not reproduce the old prose coupling.
+    let profile = profile_with_thermal_sensor_facts(1, "0 thermal zones exposed");
+    let policy = thermal_sensor_only_policy();
+    assert_eq!(
+        qualify_host(&profile, policy),
+        Ok(()),
+        "one typed thermal zone must satisfy require_thermal_sensors"
+    );
+
+    let workload = workload_with(policy);
+    let host_root = profile.root();
+    let workload_root = workload.root();
+    let outcome = assemble_bundle(
+        "fln-odva-positive-zone",
+        profile,
+        workload,
+        one_valid_attempt(host_root, workload_root),
+        empty_telemetry(),
+    );
+    assert!(
+        !matches!(outcome, Err(BenchmarkRefusal::HostNotQualified { .. })),
+        "the positive control must pass bundle host admission; got {outcome:?}"
+    );
 }
 
 fn profile_with_virtualization(value: &str) -> HostProfile {
