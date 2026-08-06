@@ -20,6 +20,7 @@ import hmac
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 
@@ -87,9 +88,30 @@ def command(argv, cwd):
         raise InputFault(f"command-non-json: {' '.join(argv)}: {error}") from error
 
 
-def issues_from_br(root):
+def exact_explicit_executable(value, label):
+    """Validate one caller-selected command once, before the live snapshot starts.
+
+    The ordinary interactive surface still uses command discovery.  The explicit
+    form exists for compiler-sealed test environments: it names one executable,
+    rather than widening PATH to the directory that happens to contain it.
+    """
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        raise InputFault(f"{label}-not-absolute: {value}")
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise InputFault(f"{label}-unreadable: {path}: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise InputFault(f"{label}-not-regular-file: {path}")
+    if not os.access(path, os.X_OK):
+        raise InputFault(f"{label}-not-executable: {path}")
+    return str(path)
+
+
+def issues_from_br(root, br_bin):
     envelope = command(
-        ["br", "list", "--all", "--format", "json", "--no-auto-flush", "--no-auto-import"], root
+        [br_bin, "list", "--all", "--format", "json", "--no-auto-flush", "--no-auto-import"], root
     )
     if not isinstance(envelope, dict) or not isinstance(envelope.get("issues"), list):
         raise InputFault("br-list-schema: expected object with issues array")
@@ -99,12 +121,12 @@ def issues_from_br(root):
     return issues
 
 
-def edges_from_br(root, issues):
+def edges_from_br(root, issues, br_bin):
     # ``br list`` intentionally omits dependency edges.  ``br graph --all --json`` is the
     # tracker-owned, non-TUI graph projection for the mutable (open/in-progress/blocked)
     # surface; unlike bv it is authoritative here.  Its pair is [dependent, prerequisite].
     graph = command(
-        ["br", "graph", "--all", "--json", "--no-auto-flush", "--no-auto-import"], root
+        [br_bin, "graph", "--all", "--json", "--no-auto-flush", "--no-auto-import"], root
     )
     components = graph.get("components") if isinstance(graph, dict) else None
     if not isinstance(components, list):
@@ -137,9 +159,9 @@ def advisory_bv(root):
     return {"state": "present", "hash": digest(value)}
 
 
-def load_live(root, evidence_path):
-    issues = issues_from_br(root)
-    edges = edges_from_br(root, issues)
+def load_live(root, evidence_path, br_bin):
+    issues = issues_from_br(root, br_bin)
+    edges = edges_from_br(root, issues, br_bin)
     evidence = read_jsonl(evidence_path, "evidence")
     return {"issues": issues, "edges": edges, "evidence": evidence, "bv": advisory_bv(root)}
 
@@ -972,6 +994,10 @@ def main(argv):
     parser.add_argument("--issues")
     parser.add_argument("--edges")
     parser.add_argument("--evidence")
+    parser.add_argument(
+        "--br-bin",
+        help="absolute real br executable for live mode; ordinary callers use PATH discovery",
+    )
     parser.add_argument("--at", default=dt.datetime.now(dt.timezone.utc).isoformat())
     parser.add_argument("--ndjson", help="write exactly one canonical newline-terminated report row")
     parser.add_argument("--check", action="store_true", help="return nonzero for policy refusal")
@@ -994,7 +1020,12 @@ def main(argv):
             second = first
         else:
             evidence_path = root / "ci/VERIFICATION_MANIFEST.jsonl"
-            second = stable_snapshot(lambda: load_live(root, evidence_path))
+            br_bin = (
+                exact_explicit_executable(args.br_bin, "br-bin")
+                if args.br_bin
+                else "br"
+            )
+            second = stable_snapshot(lambda: load_live(root, evidence_path, br_bin))
         value = report(policy, second, decide(policy, second, now), now)
         code = 0 if (not args.check or value["verdict"] == "complete") else 2
     except InputFault as error:
