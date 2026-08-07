@@ -1248,7 +1248,11 @@ fn small_heap_pages_reclaim_across_every_size_class() {
     use crate::export::{export_mi_free, export_mi_malloc_small};
 
     crate::membrane::drain_small_bins_for_test();
-    let before = crate::membrane::small_page_metrics_for_test();
+    // THIS thread's counters: the process-wide pair admits a foreign
+    // thread's TLS-teardown page release between the two reads (measured
+    // flaky at 80 tests), which is exactly what the local metrics were
+    // built to exclude.
+    let before = crate::membrane::small_page_local_metrics_for_test();
     let mut blocks = Vec::new();
     for size in (8..=4096).step_by(8) {
         let block = export_mi_malloc_small(size);
@@ -1260,7 +1264,7 @@ fn small_heap_pages_reclaim_across_every_size_class() {
     }
 
     crate::membrane::drain_small_bins_for_test();
-    let after = crate::membrane::small_page_metrics_for_test();
+    let after = crate::membrane::small_page_local_metrics_for_test();
     assert_eq!(
         after.0,
         before.0 + 512,
@@ -1282,9 +1286,9 @@ fn small_heap_pages_reclaim_across_repeated_all_class_epochs() {
     const CLASS_COUNT: usize = 512;
 
     crate::membrane::drain_small_bins_for_test();
-    let baseline = crate::membrane::small_page_metrics_for_test();
+    let baseline = crate::membrane::small_page_local_metrics_for_test();
     for epoch in 0..EPOCHS {
-        let before = crate::membrane::small_page_metrics_for_test();
+        let before = crate::membrane::small_page_local_metrics_for_test();
         let mut blocks = Vec::with_capacity(CLASS_COUNT);
         for size in (8..=4096).step_by(8) {
             let block = export_mi_malloc_small(size);
@@ -1299,7 +1303,7 @@ fn small_heap_pages_reclaim_across_repeated_all_class_epochs() {
         }
 
         crate::membrane::drain_small_bins_for_test();
-        let after = crate::membrane::small_page_metrics_for_test();
+        let after = crate::membrane::small_page_local_metrics_for_test();
         assert_eq!(
             after.0,
             before.0 + CLASS_COUNT,
@@ -1312,7 +1316,7 @@ fn small_heap_pages_reclaim_across_repeated_all_class_epochs() {
         );
     }
 
-    let final_metrics = crate::membrane::small_page_metrics_for_test();
+    let final_metrics = crate::membrane::small_page_local_metrics_for_test();
     assert_eq!(
         final_metrics.0,
         baseline.0 + EPOCHS * CLASS_COUNT,
@@ -1331,10 +1335,16 @@ fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
     use crate::export::{export_mi_free, export_mi_malloc_small};
 
     crate::membrane::drain_small_bins_for_test();
-    let before = crate::membrane::small_page_metrics_for_test();
+    let before = crate::membrane::small_page_local_metrics_for_test();
     let address = std::thread::spawn(|| {
+        let creator_before = crate::membrane::small_page_local_metrics_for_test();
         let block = export_mi_malloc_small(24);
         assert!(!block.is_null());
+        assert_eq!(
+            crate::membrane::small_page_local_metrics_for_test().0,
+            creator_before.0 + 1,
+            "the creator minted one class page (its own thread's counter)"
+        );
         block.expose_provenance()
     })
     .join()
@@ -1348,8 +1358,11 @@ fn small_heap_page_outlives_creator_until_foreign_deferred_free_drains() {
     assert_eq!(crate::membrane::small_bin_depth_for_test(24), 1);
     crate::membrane::drain_small_bins_for_test();
 
-    let after = crate::membrane::small_page_metrics_for_test();
-    assert_eq!(after.0, before.0 + 1, "the creator minted one class page");
+    let after = crate::membrane::small_page_local_metrics_for_test();
+    assert_eq!(
+        after.0, before.0,
+        "this thread minted no page; the creator's is counted on its own thread"
+    );
     assert_eq!(
         after.1,
         before.1 + 1,
@@ -1603,7 +1616,7 @@ fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
     use crate::export::{export_lean_small_mem_size, export_mi_free};
 
     crate::membrane::drain_small_bins_for_test();
-    let before = crate::membrane::small_page_metrics_for_test();
+    let before = crate::membrane::small_page_local_metrics_for_test();
     let block = crate::membrane::reentrant_small_alloc_for_test(17).cast::<core::ffi::c_void>();
     assert!(
         !block.is_null(),
@@ -1615,7 +1628,7 @@ fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
         "the individual fallback retains the logical-size prefix"
     );
     assert_eq!(
-        crate::membrane::small_page_metrics_for_test(),
+        crate::membrane::small_page_local_metrics_for_test(),
         before,
         "a reentrant fallback does not mint a TLS-owned page"
     );
@@ -1628,7 +1641,7 @@ fn small_heap_reentrant_tls_borrow_uses_individual_fallback() {
     );
     crate::membrane::drain_small_bins_for_test();
     assert_eq!(
-        crate::membrane::small_page_metrics_for_test(),
+        crate::membrane::small_page_local_metrics_for_test(),
         before,
         "draining the fallback cannot affect page ownership metrics"
     );
@@ -4478,4 +4491,135 @@ fn export_stdio_reproduces_the_metadata_family_with_symlink_split() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the metadata cell");
     std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn export_stdio_reproduces_the_env_misc_family() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_app_path, export_lean_io_get_random_bytes, export_lean_io_get_tid,
+        export_lean_io_getenv, export_lean_io_initializing, export_lean_io_mark_end_initialization,
+        export_lean_io_mono_ms_now, export_lean_io_mono_nanos_now, export_lean_io_process_get_pid,
+    };
+
+    // The env/misc family (fln-3gv slice 7a): getenv's three arms, the
+    // monotone clocks, tid/pid, app_path, the init flag, and random bytes.
+    crate::stdio::initialize_streams();
+    let probe_var = format!("FLN_ENV_PROBE_{}", std::process::id());
+    // SAFETY: single-threaded at this point under the suite lock; no
+    // other thread reads the environment.
+    // UNSAFE-LEDGER: FLN-UL-0399
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var(&probe_var, "probe value \u{2200}")
+    };
+
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here.
+    // UNSAFE-LEDGER: FLN-UL-0398
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+
+        // getenv: present -> some with the exact bytes.
+        let name_obj = mk(&probe_var);
+        let some = export_lean_io_getenv(name_obj);
+        assert!(!crate::tagged::is_scalar(some), "present var answers some");
+        let val = crate::object::ctor_get(some, 0);
+        let (vs, _, _, vb) = crate::object::string_fields(val);
+        assert_eq!(
+            &vb[..vs - 1],
+            "probe value \u{2200}".as_bytes(),
+            "the exact env bytes through the validating constructor"
+        );
+        crate::rc::dec_ref(some);
+        crate::rc::dec_ref(name_obj);
+        // absent -> none; embedded NUL -> none, NOT an error.
+        let absent = mk("FLN_ENV_PROBE_DEFINITELY_ABSENT");
+        assert_eq!(
+            export_lean_io_getenv(absent),
+            crate::tagged::boxi(0),
+            "absent var answers none"
+        );
+        crate::rc::dec_ref(absent);
+        let nul_name = crate::object::mk_string_unchecked(b"A\0B", 3);
+        assert_eq!(
+            export_lean_io_getenv(nul_name),
+            crate::tagged::boxi(0),
+            "embedded NUL answers none (io.cpp:966-968), never an error"
+        );
+        crate::rc::dec_ref(nul_name);
+
+        // The monotone clocks: two reads never go backwards, and the nanos
+        // read dominates the ms read's grain.
+        let ms1 = crate::tagged::unbox(export_lean_io_mono_ms_now());
+        let ns = crate::tagged::unbox(export_lean_io_mono_nanos_now());
+        let ms2 = crate::tagged::unbox(export_lean_io_mono_ms_now());
+        assert!(ms1 <= ms2, "mono ms never goes backwards");
+        assert!(ns / 1_000_000 >= ms1, "nanos and ms share the clock");
+
+        // tid/pid.
+        assert_ne!(export_lean_io_get_tid(), 0, "tid nonzero");
+        assert_eq!(
+            export_lean_io_process_get_pid(),
+            std::process::id(),
+            "pid equals the process's own"
+        );
+
+        // app_path resolves to this very test binary.
+        let ap = export_lean_io_app_path();
+        assert_eq!((&raw const (*ap).m_tag).read(), 0, "app_path: ok arm");
+        let ap_s = crate::object::ctor_get(ap, 0);
+        let (asz, _, _, ab) = crate::object::string_fields(ap_s);
+        let ap_path = String::from_utf8(ab[..asz - 1].to_vec()).expect("path UTF-8");
+        assert_eq!(
+            std::fs::canonicalize(&ap_path).expect("app path exists"),
+            std::env::current_exe()
+                .and_then(std::fs::canonicalize)
+                .expect("current exe"),
+            "readlink /proc/pid/exe names this binary"
+        );
+        crate::rc::dec_ref(ap);
+
+        // The init flag reads true until the flip, false after —
+        // restored so no other cell observes the flip.
+        assert_eq!(export_lean_io_initializing(), 1, "initializing starts true");
+        export_lean_io_mark_end_initialization();
+        assert_eq!(export_lean_io_initializing(), 0, "the flip sticks");
+        crate::fs::reset_initializing_for_tests();
+
+        // Random bytes: exact fill, zero-byte fast path, and two draws
+        // that differ (2^-256 flake bound).
+        let z = export_lean_io_get_random_bytes(0);
+        assert_eq!((&raw const (*z).m_tag).read(), 0, "zero-byte arm ok");
+        assert_eq!(
+            crate::object::sarray_fields(crate::object::ctor_get(z, 0)).1,
+            0,
+            "empty array"
+        );
+        crate::rc::dec_ref(z);
+        let draw = |n: usize| -> Vec<u8> {
+            let r = export_lean_io_get_random_bytes(n);
+            assert_eq!((&raw const (*r).m_tag).read(), 0, "random ok");
+            let ba = crate::object::ctor_get(r, 0);
+            let (_, sz, _, data) = crate::object::sarray_fields(ba);
+            assert_eq!(sz, n, "exact fill");
+            let out = core::slice::from_raw_parts(data, sz).to_vec();
+            crate::rc::dec_ref(r);
+            out
+        };
+        assert_ne!(draw(32), draw(32), "two 32-byte draws differ");
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the env-misc cell");
+    // Release this thread's cached small-heap pages inside the lock, so
+    // thread-teardown page release cannot race a later census cell's two
+    // snapshots.
+    crate::membrane::drain_small_bins_for_test();
+    // SAFETY: as the set_var above — still under the suite lock.
+    // UNSAFE-LEDGER: FLN-UL-0400
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var(&probe_var)
+    };
 }

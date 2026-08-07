@@ -28,6 +28,7 @@
 #include <lean/lean.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -91,6 +92,15 @@ extern lean_object *lean_io_create_tempfile(lean_object *w);
 extern lean_object *lean_io_create_tempdir(lean_object *w);
 extern lean_object *lean_io_metadata(lean_object *filename);
 extern lean_object *lean_io_symlink_metadata(lean_object *filename);
+extern lean_object *lean_io_getenv(lean_object *env_var);
+extern lean_object *lean_io_mono_ms_now(void);
+extern lean_object *lean_io_mono_nanos_now(void);
+extern uint64_t lean_io_get_tid(void);
+extern uint32_t lean_io_process_get_pid(void);
+extern lean_object *lean_io_app_path(void);
+extern uint8_t lean_io_initializing(void);
+extern void lean_io_mark_end_initialization(void);
+extern lean_object *lean_io_get_random_bytes(size_t nbytes);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -1213,6 +1223,60 @@ static void facts_mode(void) {
     lean_dec(imd_file_obj);
     remove(imd_sym);
     remove(imd_file);
+
+    /* ---- fln-3gv slice 7a: the env/misc family (io.cpp:81-83, 843-857,
+     * 865-925, 964-1000, 1354-1407; process.cpp:330-352). */
+    fact("corpus.env.setenv_ok",
+         setenv("FLN_PROBE_ENV", "probe value", 1) == 0);
+    lean_object *ienv_name = lean_mk_string("FLN_PROBE_ENV");
+    lean_object *ienv_some = lean_io_getenv(ienv_name);
+    fact("corpus.env.getenv_present_is_some", !lean_is_scalar(ienv_some));
+    {
+        lean_object *v = lean_ctor_get(ienv_some, 0);
+        fact("corpus.env.getenv_bytes", (long long)lean_string_size(v) - 1);
+    }
+    lean_dec(ienv_some);
+    lean_dec(ienv_name);
+    lean_object *ienv_absent = lean_mk_string("FLN_PROBE_ENV_ABSENT");
+    fact("corpus.env.getenv_absent_is_none",
+         lean_io_getenv(ienv_absent) == lean_box(0));
+    lean_dec(ienv_absent);
+    {
+        long long ms1 = (long long)lean_unbox(lean_io_mono_ms_now());
+        long long ns = (long long)lean_unbox(lean_io_mono_nanos_now());
+        long long ms2 = (long long)lean_unbox(lean_io_mono_ms_now());
+        fact("corpus.env.mono_ms_monotone", ms1 <= ms2);
+        fact("corpus.env.mono_ns_dominates", ns / 1000000 >= ms1);
+    }
+    fact("corpus.env.tid_nonzero", lean_io_get_tid() != 0);
+    fact("corpus.env.pid_matches", lean_io_process_get_pid() == (uint32_t)getpid());
+    {
+        lean_object *ap = lean_io_app_path();
+        fact("corpus.env.app_path_ok", lean_ptr_tag(ap) == 0);
+        fact("corpus.env.app_path_nonempty",
+             lean_string_size(lean_ctor_get(ap, 0)) > 1);
+        lean_dec(ap);
+    }
+    fact("corpus.env.initializing_starts_true", lean_io_initializing() == 1);
+    lean_io_mark_end_initialization();
+    fact("corpus.env.initializing_flips", lean_io_initializing() == 0);
+    {
+        lean_object *rz = lean_io_get_random_bytes(0);
+        fact("corpus.env.random_zero_ok", lean_ptr_tag(rz) == 0);
+        fact("corpus.env.random_zero_empty",
+             (long long)lean_sarray_size(lean_ctor_get(rz, 0)));
+        lean_dec(rz);
+        lean_object *r1 = lean_io_get_random_bytes(32);
+        lean_object *r2 = lean_io_get_random_bytes(32);
+        fact("corpus.env.random_fill",
+             lean_sarray_size(lean_ctor_get(r1, 0)) == 32 &&
+                 lean_sarray_size(lean_ctor_get(r2, 0)) == 32);
+        fact("corpus.env.random_draws_differ",
+             memcmp(lean_sarray_cptr(lean_ctor_get(r1, 0)),
+                    lean_sarray_cptr(lean_ctor_get(r2, 0)), 32) != 0);
+        lean_dec(r1);
+        lean_dec(r2);
+    }
 }
 
 int main(int argc, char **argv) {

@@ -523,6 +523,11 @@ pub(crate) fn small_bin_metadata_bytes_for_test() -> usize {
 }
 
 #[cfg(test)]
+// Retained diagnostics: the census tests migrated to the thread-local pair
+// (a foreign thread's TLS-teardown page release between two process-wide
+// reads was measured flaky), and the process-wide reader stays for future
+// cross-thread telemetry.
+#[allow(dead_code)]
 pub(crate) fn small_page_metrics_for_test() -> (usize, usize) {
     (
         SMALL_PAGE_ALLOCS.load(Ordering::Relaxed),

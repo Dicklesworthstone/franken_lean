@@ -761,3 +761,264 @@ pub(crate) unsafe fn prim_symlink_metadata(filename: *mut LeanObject) -> *mut Le
         }
     }
 }
+
+// ---------------------------------------------------- the env/misc family
+
+// UNSAFE-LEDGER: FLN-UL-0379
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn getenv(name: *const c_char) -> *mut c_char;
+    fn clock_gettime(clockid: c_int, tp: *mut i64) -> c_int;
+    fn gettid() -> c_int;
+    fn getpid() -> c_int;
+    fn readlink(path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
+    fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+}
+
+const CLOCK_MONOTONIC: c_int = 1;
+const O_RDONLY: c_int = 0;
+
+/// `lean_uint64_to_nat`'s law (`lean.h:1640-1646`): box iff the value fits
+/// the small Nat, else the big constructor Marrow already exports.
+fn uint64_to_nat(n: u64) -> *mut LeanObject {
+    #[allow(clippy::cast_possible_truncation)]
+    if n as usize <= tagged::MAX_SMALL_NAT && u64::try_from(usize::MAX).is_ok_and(|m| n <= m) {
+        tagged::boxi(n as usize)
+    } else {
+        crate::export::export_lean_big_uint64_to_nat(n)
+    }
+}
+
+/// The pin's `userError` result (`io_result_mk_error(char const *)`,
+/// object.h): the bare tag-18 string error the misc family uses.
+///
+/// # Safety
+/// Caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0380
+#[allow(unsafe_code)]
+unsafe fn io_user_error(msg: &str) -> *mut LeanObject {
+    // SAFETY: fresh ctor, slot initialized before escape.
+    unsafe {
+        let e = object::alloc_ctor(18, 1, 0);
+        object::ctor_set(e, 0, mk_string(msg));
+        io_result_mk_error(e)
+    }
+}
+
+/// `lean_io_getenv` (`io.cpp:964-1000`, the POSIX arm): an embedded NUL
+/// answers `none` (NOT an error — the pin's arm differs from the fs
+/// family's here); a present variable answers `some` through the
+/// validating string constructor.
+///
+/// # Safety
+/// `env_var` is borrowed and live; caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0381
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_getenv(env_var: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live string per contract; the env value is copied before any
+    // later libc call could invalidate it.
+    unsafe {
+        let Some(bytes) = cstr_of(env_var) else {
+            return tagged::boxi(0);
+        };
+        let val = getenv(bytes.as_ptr().cast::<c_char>());
+        if val.is_null() {
+            tagged::boxi(0)
+        } else {
+            let mut len = 0usize;
+            while *val.add(len) != 0 {
+                len += 1;
+            }
+            let s = crate::export::mk_string_from_bytes_impl(val, len);
+            let some = object::alloc_ctor(1, 1, 0);
+            object::ctor_set(some, 0, s);
+            some
+        }
+    }
+}
+
+/// The steady-clock read both mono prims share (`io.cpp:843-857`:
+/// std::chrono::steady_clock, which is CLOCK_MONOTONIC on this platform).
+///
+/// # Safety
+/// Infallible on a valid clock id per POSIX; a failure is an invariant
+/// fault.
+// UNSAFE-LEDGER: FLN-UL-0382
+#[allow(unsafe_code)]
+unsafe fn mono_now_ns() -> u64 {
+    // SAFETY: the two-slot timespec is stack-local; CLOCK_MONOTONIC is
+    // valid on every supported kernel.
+    unsafe {
+        let mut ts = [0i64; 2];
+        if clock_gettime(CLOCK_MONOTONIC, ts.as_mut_ptr()) != 0 {
+            crate::export::internal_panic_impl("clock_gettime(CLOCK_MONOTONIC) failed");
+        }
+        #[allow(clippy::cast_sign_loss)]
+        {
+            (ts[0] as u64) * 1_000_000_000 + (ts[1] as u64)
+        }
+    }
+}
+
+/// `lean_io_mono_ms_now` (`io.cpp:843-849`).
+///
+/// # Safety
+/// Caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0383
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_mono_ms_now() -> *mut LeanObject {
+    // SAFETY: pure construction over the clock read.
+    unsafe { uint64_to_nat(mono_now_ns() / 1_000_000) }
+}
+
+/// `lean_io_mono_nanos_now` (`io.cpp:851-857`).
+///
+/// # Safety
+/// Caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0384
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_mono_nanos_now() -> *mut LeanObject {
+    // SAFETY: pure construction over the clock read.
+    unsafe { uint64_to_nat(mono_now_ns()) }
+}
+
+/// `lean_io_get_tid` (`process.cpp:340-352`, the Linux arm: gettid).
+///
+/// # Safety
+/// Trivially safe syscall wrapper.
+// UNSAFE-LEDGER: FLN-UL-0385
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_get_tid() -> u64 {
+    // SAFETY: gettid cannot fail.
+    #[allow(clippy::cast_sign_loss)]
+    unsafe {
+        gettid() as u64
+    }
+}
+
+/// `lean_io_process_get_pid` (`process.cpp:330-333`).
+///
+/// # Safety
+/// Trivially safe syscall wrapper.
+// UNSAFE-LEDGER: FLN-UL-0386
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_get_pid() -> u32 {
+    // SAFETY: getpid cannot fail.
+    #[allow(clippy::cast_sign_loss)]
+    unsafe {
+        getpid() as u32
+    }
+}
+
+/// `lean_io_app_path` (`io.cpp:1354-1407`, the Linux arm): readlink of
+/// `/proc/<pid>/exe`; failure is the pin's bare userError.
+///
+/// # Safety
+/// Caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0387
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_app_path() -> *mut LeanObject {
+    // SAFETY: both buffers are stack-local and NUL-clean per the memset
+    // the pin performs; readlink writes at most PATH_MAX - 1 bytes.
+    unsafe {
+        let path = format!("/proc/{}/exe\0", prim_get_pid());
+        let mut dest = [0u8; PATH_MAX];
+        let n = readlink(
+            path.as_ptr().cast::<c_char>(),
+            dest.as_mut_ptr().cast::<c_char>(),
+            PATH_MAX - 1,
+        );
+        if n == -1 {
+            io_user_error("failed to locate application")
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            io_result_mk_ok(crate::export::mk_string_from_bytes_impl(
+                dest.as_ptr().cast::<c_char>(),
+                n as usize,
+            ))
+        }
+    }
+}
+
+/// The pin's initialization flag pair (`io.cpp:76-83`): a process-global
+/// bool generated main flips after the module initializers run.
+static INITIALIZING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn mark_end_initialization() {
+    INITIALIZING.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_initializing_for_tests() {
+    INITIALIZING.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn initializing() -> u8 {
+    u8::from(INITIALIZING.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// `lean_io_get_random_bytes` (`io.cpp:865-925`, the POSIX arm):
+/// `/dev/urandom` with O_CLOEXEC, the zero-byte fast path, the overflow
+/// refusal as ENOMEM, and the EINTR-retrying read loop; the open failure
+/// decodes errno WITH the device path, a read failure without.
+///
+/// # Safety
+/// Caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0388
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_get_random_bytes(nbytes: usize) -> *mut LeanObject {
+    // SAFETY: the sarray is freshly allocated with capacity nbytes and its
+    // size set only after every byte is written; the fd closes on every
+    // arm.
+    unsafe {
+        if nbytes == 0 {
+            return io_result_mk_ok(object::alloc_sarray(1, 0, 0));
+        }
+        let fd = open(
+            c"/dev/urandom".as_ptr(),
+            O_RDONLY | crate::stdio::O_CLOEXEC,
+            0,
+        );
+        if fd < 0 {
+            let dev = mk_string("/dev/urandom");
+            let err = io_result_mk_error(decode_io_error(errno(), dev));
+            rc::dec_ref(dev);
+            return err;
+        }
+        if nbytes
+            .checked_add(size_of::<crate::layout::LeanSarrayObject>())
+            .is_none()
+        {
+            close(fd);
+            return io_result_mk_error(decode_io_error(
+                crate::stdio::ENOMEM,
+                core::ptr::null_mut(),
+            ));
+        }
+        let res = object::alloc_sarray(1, 0, nbytes);
+        let (_, _, _, data) = object::sarray_fields(res);
+        let mut remain = nbytes;
+        let mut dst = data;
+        while remain > 0 {
+            let nread = read(fd, dst.cast::<c_void>(), remain);
+            if nread < 0 {
+                if errno() != crate::stdio::EINTR {
+                    close(fd);
+                    rc::dec_ref(res);
+                    return io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()));
+                }
+            } else {
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    remain -= nread as usize;
+                    dst = dst.add(nread as usize);
+                }
+            }
+        }
+        close(fd);
+        (&raw mut (*res.cast::<crate::layout::LeanSarrayObject>()).m_size).write(nbytes);
+        io_result_mk_ok(res)
+    }
+}

@@ -3419,6 +3419,96 @@ pub(crate) extern "C" fn export_lean_io_symlink_metadata(
     unsafe { crate::fs::prim_symlink_metadata(filename) }
 }
 
+/// `lean_io_getenv` (`io.cpp:964-1000`; extern census `IO.getEnv`): the
+/// bare Option, exactly the pin's BaseIO shape — an embedded NUL answers
+/// `none`, never an error.
+// UNSAFE-LEDGER: FLN-UL-0389
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_getenv")]
+pub(crate) extern "C" fn export_lean_io_getenv(env_var: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_getenv(env_var) }
+}
+
+/// `lean_io_mono_ms_now` (`io.cpp:843-849`; extern census
+/// `IO.monoMsNow`): the bare Nat, the pin's BaseIO shape.
+// UNSAFE-LEDGER: FLN-UL-0390
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_mono_ms_now")]
+pub(crate) extern "C" fn export_lean_io_mono_ms_now() -> *mut LeanObject {
+    // SAFETY: no arguments; the prim owns every object it builds.
+    unsafe { crate::fs::prim_mono_ms_now() }
+}
+
+/// `lean_io_mono_nanos_now` (`io.cpp:851-857`; extern census
+/// `IO.monoNanosNow`).
+// UNSAFE-LEDGER: FLN-UL-0391
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_mono_nanos_now")]
+pub(crate) extern "C" fn export_lean_io_mono_nanos_now() -> *mut LeanObject {
+    // SAFETY: no arguments; the prim owns every object it builds.
+    unsafe { crate::fs::prim_mono_nanos_now() }
+}
+
+/// `lean_io_get_tid` (`process.cpp:340-352`; extern census `IO.getTID`).
+// UNSAFE-LEDGER: FLN-UL-0392
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_tid")]
+pub(crate) extern "C" fn export_lean_io_get_tid() -> u64 {
+    // SAFETY: trivially safe syscall wrapper.
+    unsafe { crate::fs::prim_get_tid() }
+}
+
+/// `lean_io_process_get_pid` (`process.cpp:330-333`; extern census
+/// `IO.Process.getPID`).
+// UNSAFE-LEDGER: FLN-UL-0393
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_process_get_pid")]
+pub(crate) extern "C" fn export_lean_io_process_get_pid() -> u32 {
+    // SAFETY: trivially safe syscall wrapper.
+    unsafe { crate::fs::prim_get_pid() }
+}
+
+/// `lean_io_app_path` (`io.cpp:1354-1407`, the Linux arm; extern census
+/// `IO.appPath`): readlink of `/proc/<pid>/exe`; failure the pin's bare
+/// userError.
+// UNSAFE-LEDGER: FLN-UL-0394
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_app_path")]
+pub(crate) extern "C" fn export_lean_io_app_path() -> *mut LeanObject {
+    // SAFETY: no arguments; the prim owns every object it builds.
+    unsafe { crate::fs::prim_app_path() }
+}
+
+/// `lean_io_initializing` (`io.cpp:81-83`; extern census
+/// `IO.initializing`) and its census-rowed setter twin below.
+// UNSAFE-LEDGER: FLN-UL-0396
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_initializing")]
+pub(crate) extern "C" fn export_lean_io_initializing() -> u8 {
+    crate::fs::initializing()
+}
+
+/// `lean_io_mark_end_initialization` (`io.cpp:77-79`; lean.h census row):
+/// the flag flip generated main performs after module initializers.
+// UNSAFE-LEDGER: FLN-UL-0397
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_mark_end_initialization")]
+pub(crate) extern "C" fn export_lean_io_mark_end_initialization() {
+    crate::fs::mark_end_initialization();
+}
+
+/// `lean_io_get_random_bytes` (`io.cpp:865-925`, the POSIX arm; extern
+/// census `IO.getRandomBytes`): `/dev/urandom` with the pin's zero-byte,
+/// overflow and EINTR arms.
+// UNSAFE-LEDGER: FLN-UL-0395
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_random_bytes")]
+pub(crate) extern "C" fn export_lean_io_get_random_bytes(nbytes: usize) -> *mut LeanObject {
+    // SAFETY: the prim owns every object it builds.
+    unsafe { crate::fs::prim_get_random_bytes(nbytes) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302
