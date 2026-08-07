@@ -4300,3 +4300,87 @@ fn export_stdio_reproduces_the_uv_decoded_pair_with_negative_codes() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the uv-pair cell");
 }
+
+#[test]
+fn export_stdio_reproduces_the_temp_family_pair_and_dir() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_create_tempdir, export_lean_io_create_tempfile,
+        export_lean_io_prim_handle_put_str, export_lean_io_remove_file,
+    };
+
+    // The temp family (fln-3gv slice 6c): createTempFile answers the pin's
+    // (Handle x FilePath) pair over mkostemp; createTempDir answers the
+    // created path over mkdtemp; both under the uv_os_tmpdir probe order
+    // with the pin's tmp.XXXXXXXX template.
+    crate::stdio::initialize_streams();
+    let tmp_base = std::env::temp_dir();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here.
+    // UNSAFE-LEDGER: FLN-UL-0371
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+
+        // -- createTempFile: pair shape, live handle, template-shaped path.
+        let tf = export_lean_io_create_tempfile(crate::tagged::boxi(0));
+        assert_eq!((&raw const (*tf).m_tag).read(), 0, "tempfile: ok arm");
+        let pair = crate::object::ctor_get(tf, 0);
+        let handle = crate::object::ctor_get(pair, 0);
+        let path_obj = crate::object::ctor_get(pair, 1);
+        let (psz, _, _, pbytes) = crate::object::string_fields(path_obj);
+        let path = String::from_utf8(pbytes[..psz - 1].to_vec()).expect("temp path UTF-8");
+        let fname = std::path::Path::new(&path)
+            .file_name()
+            .expect("has a filename")
+            .to_str()
+            .expect("UTF-8");
+        assert!(
+            fname.starts_with("tmp.") && fname.len() == 12,
+            "the pin's tmp.XXXXXXXX template shape, got {fname:?}"
+        );
+        assert!(
+            std::path::Path::new(&path).starts_with(&tmp_base),
+            "under the resolved tmpdir"
+        );
+        // The handle is live: write through the stdio prim and verify on
+        // disk after the flush the finalizer performs.
+        let payload = mk("temp payload");
+        let put = export_lean_io_prim_handle_put_str(handle, payload);
+        assert_eq!(
+            (&raw const (*put).m_tag).read(),
+            0,
+            "putStr on the pair handle"
+        );
+        crate::rc::dec_ref(put);
+        crate::rc::dec_ref(payload);
+        crate::rc::inc_ref_n(path_obj, 1);
+        crate::rc::dec_ref(tf); // drops pair + handle -> fclose publishes
+        assert_eq!(
+            std::fs::read(&path).expect("temp file readable"),
+            b"temp payload",
+            "the pair's handle wrote the pair's path"
+        );
+        let rm = export_lean_io_remove_file(path_obj);
+        assert_eq!((&raw const (*rm).m_tag).read(), 0, "temp file removed");
+        crate::rc::dec_ref(rm);
+        crate::rc::dec_ref(path_obj);
+
+        // -- createTempDir: created, template-shaped, writable, removed.
+        let td = export_lean_io_create_tempdir(crate::tagged::boxi(0));
+        assert_eq!((&raw const (*td).m_tag).read(), 0, "tempdir: ok arm");
+        let dpath_obj = crate::object::ctor_get(td, 0);
+        let (dsz, _, _, dbytes) = crate::object::string_fields(dpath_obj);
+        let dpath = String::from_utf8(dbytes[..dsz - 1].to_vec()).expect("dir path UTF-8");
+        assert!(
+            std::path::Path::new(&dpath).is_dir(),
+            "the answered path exists as a directory"
+        );
+        std::fs::write(format!("{dpath}/probe"), b"x").expect("dir writable");
+        std::fs::remove_file(format!("{dpath}/probe")).expect("probe removed");
+        crate::rc::dec_ref(td);
+        std::fs::remove_dir(&dpath).expect("tempdir removed");
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the temp-family cell");
+}

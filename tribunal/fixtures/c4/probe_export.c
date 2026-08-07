@@ -86,6 +86,8 @@ extern lean_object *lean_io_realpath(lean_object *filename);
 extern lean_object *lean_io_read_dir(lean_object *dirname);
 extern lean_object *lean_io_remove_file(lean_object *filename);
 extern lean_object *lean_io_hard_link(lean_object *orig, lean_object *link);
+extern lean_object *lean_io_create_tempfile(lean_object *w);
+extern lean_object *lean_io_create_tempdir(lean_object *w);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -1089,6 +1091,65 @@ static void facts_mode(void) {
     lean_dec(iuv_rm3);
     lean_dec(iuv_link_obj);
     lean_dec(iuv_orig_obj);
+
+    /* ---- fln-3gv slice 6c: the temp family (io.cpp:1248-1337). The
+     * template paths are random, so the facts are the SHAPE invariants:
+     * the pair structure, the tmp.XXXXXXXX basename, a write-read
+     * roundtrip through the pair's own handle, and the tempdir's
+     * existence — identical values from both runtimes. */
+    lean_object *itmp_tf = lean_io_create_tempfile(lean_box(0));
+    fact("corpus.temp.tempfile_ok", lean_ptr_tag(itmp_tf) == 0);
+    {
+        lean_object *itmp_pair = lean_ctor_get(itmp_tf, 0);
+        lean_object *itmp_h = lean_ctor_get(itmp_pair, 0);
+        lean_object *itmp_p = lean_ctor_get(itmp_pair, 1);
+        const char *tp = lean_string_cstr(itmp_p);
+        const char *base = strrchr(tp, '/');
+        fact("corpus.temp.tempfile_basename_shape",
+             base != NULL && strncmp(base + 1, "tmp.", 4) == 0 &&
+                 strlen(base + 1) == 12);
+        lean_object *itmp_body = lean_mk_string("temp payload");
+        lean_object *itmp_put = lean_io_prim_handle_put_str(itmp_h, itmp_body);
+        fact("corpus.temp.tempfile_put_ok", lean_ptr_tag(itmp_put) == 0);
+        lean_dec(itmp_put);
+        lean_dec(itmp_body);
+        char itmp_path_copy[512];
+        snprintf(itmp_path_copy, sizeof itmp_path_copy, "%s", tp);
+        lean_dec(itmp_tf); /* handle finalizer fcloses -> publish */
+        FILE *rb = fopen(itmp_path_copy, "r");
+        long long rn = 0, rsum = 0;
+        int rc_;
+        while ((rc_ = fgetc(rb)) != EOF) {
+            rn++;
+            rsum += rc_;
+        }
+        fclose(rb);
+        fact("corpus.temp.tempfile_roundtrip_bytes", rn);
+        fact("corpus.temp.tempfile_roundtrip_bytesum", rsum);
+        remove(itmp_path_copy);
+    }
+    lean_object *itmp_td = lean_io_create_tempdir(lean_box(0));
+    fact("corpus.temp.tempdir_ok", lean_ptr_tag(itmp_td) == 0);
+    {
+        lean_object *itmp_dp = lean_ctor_get(itmp_td, 0);
+        const char *dp = lean_string_cstr(itmp_dp);
+        const char *dbase = strrchr(dp, '/');
+        fact("corpus.temp.tempdir_basename_shape",
+             dbase != NULL && strncmp(dbase + 1, "tmp.", 4) == 0 &&
+                 strlen(dbase + 1) == 12);
+        char probe_path[512];
+        snprintf(probe_path, sizeof probe_path, "%s/probe", dp);
+        FILE *pw = fopen(probe_path, "w");
+        fact("corpus.temp.tempdir_writable", pw != NULL);
+        if (pw) {
+            fclose(pw);
+            remove(probe_path);
+        }
+        char dcopy[512];
+        snprintf(dcopy, sizeof dcopy, "%s", dp);
+        lean_dec(itmp_td);
+        rmdir(dcopy);
+    }
 }
 
 int main(int argc, char **argv) {

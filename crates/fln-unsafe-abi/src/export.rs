@@ -3375,6 +3375,27 @@ pub(crate) extern "C" fn export_lean_io_hard_link(
     unsafe { crate::fs::prim_hard_link(orig, link_path) }
 }
 
+/// `lean_io_create_tempfile` (`io.cpp:1248-1291`; extern census
+/// `IO.FS.createTempFile`): the `(Handle × FilePath)` pair over mkostemp
+/// with O_CLOEXEC (libuv's own call), failure through the uv decoder.
+// UNSAFE-LEDGER: FLN-UL-0369
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_create_tempfile")]
+pub(crate) extern "C" fn export_lean_io_create_tempfile(_w: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: the world token is unused exactly as the pin's signature.
+    unsafe { crate::fs::prim_create_tempfile() }
+}
+
+/// `lean_io_create_tempdir` (`io.cpp:1294-1337`; extern census
+/// `IO.FS.createTempDir`): the created path over mkdtemp.
+// UNSAFE-LEDGER: FLN-UL-0370
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_create_tempdir")]
+pub(crate) extern "C" fn export_lean_io_create_tempdir(_w: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: the world token is unused exactly as the pin's signature.
+    unsafe { crate::fs::prim_create_tempdir() }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302

@@ -5,11 +5,12 @@
 //! `io.cpp:1002-1055` non-Windows arm (`realpath`), and `io.cpp:1409-1417`
 //! (`current_dir`) at the pin.
 //!
-//! Deliberately NOT here, named rather than implied: the uv-decoded members
-//! — `remove_file`, `hard_link`, `metadata`/`symlink_metadata`,
-//! `create_tempfile`/`create_tempdir` — whose observable error shape is
-//! libuv's (negative codes, `uv_strerror` details), a different decoder a
-//! later slice ports; and `app_path`/`getenv`, the env/misc family.
+//! The uv-decoded members — whose observable error shape is libuv's
+//! (negative codes, `uv_strerror` details) — run through the MEASURED
+//! decoder below: `remove_file`/`hard_link` (slice 6b) and the temp family
+//! (slice 6c). Deliberately NOT here, named rather than implied:
+//! `metadata`/`symlink_metadata` (the uv_stat shapes, a later slice) and
+//! `app_path`/`getenv`, the env/misc family.
 //!
 //! Mechanism deviations, disclosed:
 //! - **`rename`'s errno is captured at the failure site.** The pin builds
@@ -47,6 +48,9 @@ unsafe extern "C" {
     fn opendir(name: *const c_char) -> *mut c_void;
     fn readdir(dirp: *mut c_void) -> *mut c_void;
     fn closedir(dirp: *mut c_void) -> c_int;
+    fn mkostemp(template: *mut c_char, flags: c_int) -> c_int;
+    fn mkdtemp(template: *mut c_char) -> *mut c_char;
+    fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
     fn unlink(path: *const c_char) -> c_int;
     fn link(orig: *const c_char, new_path: *const c_char) -> c_int;
 }
@@ -426,7 +430,14 @@ unsafe fn decode_uv_error(neg: c_int, fname: *mut LeanObject) -> *mut LeanObject
         let details = mk_string(&details_text);
         match tag {
             // (filename : String) families — interrupted, noFileOrDirectory.
+            // The pin lean_asserts fname non-null here (io.cpp:262/278); a
+            // null in release is the pin's own UB, refused typed instead.
             10 | 11 => {
+                if fname.is_null() {
+                    crate::export::internal_panic_impl(
+                        "decode_uv_error: bare-String variant with no filename",
+                    );
+                }
                 rc::inc_ref_n(fname, 1);
                 err_file_code_details(tag, fname, code, details)
             }
@@ -491,5 +502,97 @@ pub(crate) unsafe fn prim_hard_link(
         } else {
             io_result_mk_error(decode_uv_error(-errno(), orig))
         }
+    }
+}
+
+// ---------------------------------------------------- the temp family
+
+/// The `uv_os_tmpdir` twin (libuv `unix/core.c`, reached from
+/// `io.cpp:1252/1298`): TMPDIR, then TMP, TEMP, TEMPDIR, else `/tmp`,
+/// with one trailing slash trimmed when the path is longer than root —
+/// libuv's exact probe order and trim rule.
+fn os_tmpdir() -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut dir = ["TMPDIR", "TMP", "TEMP", "TEMPDIR"]
+        .iter()
+        .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()))
+        .map_or_else(|| b"/tmp".to_vec(), |s| s.as_bytes().to_vec());
+    if dir.len() > 1 && dir.last() == Some(&b'/') {
+        dir.pop();
+    }
+    dir
+}
+
+/// The shared template builder (`io.cpp:1258-1276`): base + `/` when the
+/// base does not already end with one + the pin's `tmp.XXXXXXXX` pattern,
+/// NUL-terminated for the C template calls.
+fn temp_template() -> Vec<u8> {
+    let mut path = os_tmpdir();
+    if path.last() != Some(&b'/') {
+        path.push(b'/');
+    }
+    path.extend_from_slice(b"tmp.XXXXXXXX");
+    path.push(0);
+    path
+}
+
+/// `lean_io_create_tempfile` (`io.cpp:1248-1291`): mkostemp with
+/// O_CLOEXEC (libuv's own call under `uv_fs_mkstemp`), the fd fdopened
+/// `r+`, answered as the pin's `(Handle x FilePath)` pair ctor; failure
+/// decodes through the uv decoder with a NULL fname exactly as the pin's.
+///
+/// # Safety
+/// Caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0367
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_create_tempfile() -> *mut LeanObject {
+    // SAFETY: the template buffer is NUL-terminated and mutated in place by
+    // mkostemp; the resulting fd is owned by the wrapped handle; fresh
+    // objects settle before escape. The pin performs no fdopen null check
+    // (io.cpp:1286) and this mirrors it.
+    unsafe {
+        let mut template = temp_template();
+        let fd = mkostemp(
+            template.as_mut_ptr().cast::<c_char>(),
+            crate::stdio::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return io_result_mk_error(decode_uv_error(-errno(), core::ptr::null_mut()));
+        }
+        let handle = fdopen(fd, c"r+".as_ptr());
+        let pair = object::alloc_ctor(0, 2, 0);
+        object::ctor_set(pair, 0, crate::stdio::io_wrap_handle(handle));
+        object::ctor_set(
+            pair,
+            1,
+            crate::export::mk_string_from_bytes_impl(
+                template.as_ptr().cast::<c_char>(),
+                template.len() - 1,
+            ),
+        );
+        io_result_mk_ok(pair)
+    }
+}
+
+/// `lean_io_create_tempdir` (`io.cpp:1294-1337`): mkdtemp over the same
+/// template, answering the created path; failure decodes through the uv
+/// decoder with a NULL fname exactly as the pin's.
+///
+/// # Safety
+/// Caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0368
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_create_tempdir() -> *mut LeanObject {
+    // SAFETY: the template buffer is NUL-terminated and mutated in place by
+    // mkdtemp; fresh objects settle before escape.
+    unsafe {
+        let mut template = temp_template();
+        if mkdtemp(template.as_mut_ptr().cast::<c_char>()).is_null() {
+            return io_result_mk_error(decode_uv_error(-errno(), core::ptr::null_mut()));
+        }
+        io_result_mk_ok(crate::export::mk_string_from_bytes_impl(
+            template.as_ptr().cast::<c_char>(),
+            template.len() - 1,
+        ))
     }
 }
