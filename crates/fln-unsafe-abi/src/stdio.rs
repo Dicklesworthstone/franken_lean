@@ -494,6 +494,195 @@ pub(crate) unsafe fn mk_embedded_nul_error(fname: *mut LeanObject) -> *mut LeanO
     }
 }
 
+// ------------------------------------------------------- the pretty-printer
+
+/// `String.decapitalize`'s observable (`Init/Data/String/Modify.lean:264-265`
+/// over `Char.toLower`, `Init/Data/Char/Basic.lean:156-160`): `toLower` moves
+/// only `'A'..'Z'`, so the first BYTE decides — an ASCII upper first byte
+/// gains 32, and any other first char (including every multi-byte one) is
+/// untouched. Byte length, char count and UTF-8 validity are all preserved.
+fn down_case_first(s: String) -> String {
+    let mut bytes = s.into_bytes();
+    if let Some(b) = bytes.first_mut()
+        && b.is_ascii_uppercase()
+    {
+        *b += b'a' - b'A';
+    }
+    String::from_utf8(bytes).expect("an ASCII case flip preserves UTF-8")
+}
+
+/// `IO.Error.fopenErrorToString` (`Init/System/IOError.lean:264-266`).
+fn fopen_error_to_string(gist: &str, fname: &str, code: u32, details: Option<&str>) -> String {
+    match details {
+        Some(d) => format!(
+            "{} (error code: {code}, {})\n  file: {fname}",
+            down_case_first(gist.to_owned()),
+            down_case_first(d.to_owned())
+        ),
+        None => format!(
+            "{} (error code: {code})\n  file: {fname}",
+            down_case_first(gist.to_owned())
+        ),
+    }
+}
+
+/// `IO.Error.otherErrorToString` (`Init/System/IOError.lean:268-270`).
+fn other_error_to_string(gist: &str, code: u32, details: Option<&str>) -> String {
+    match details {
+        Some(d) => format!(
+            "{} (error code: {code}, {})",
+            down_case_first(gist.to_owned()),
+            down_case_first(d.to_owned())
+        ),
+        None => format!("{} (error code: {code})", down_case_first(gist.to_owned())),
+    }
+}
+
+/// A live string's content bytes as UTF-8 (the salient `m_size - 1` bytes,
+/// the terminator dropped). Lossy decode so a hostile object cannot panic
+/// this path (FL-INV-07); a well-formed string is valid UTF-8 by the string
+/// law, for which lossy is the identity.
+///
+/// # Safety
+/// `s` is a borrowed live string.
+// UNSAFE-LEDGER: FLN-UL-0411
+#[allow(unsafe_code)]
+unsafe fn string_content(s: *mut LeanObject) -> String {
+    // SAFETY: string fields read within the live object.
+    unsafe {
+        let (m_size, _, _, bytes) = object::string_fields(s);
+        String::from_utf8_lossy(&bytes[..m_size - 1]).into_owned()
+    }
+}
+
+/// `lean_io_error_to_string` — the pin's Lean-compiled `IO.Error.toString`
+/// (`Init/System/IOError.lean:271-298`; generated dispatch at
+/// IOError.c:1409-1695), arm-for-arm over the ctor tags this module's
+/// builders write. The gist table, the details-dropping arms (hardwareFault,
+/// unsatisfiedConstraints, noFileOrDirectory), permissionDenied's
+/// details-as-gist shape, and `userError` answering its OWN msg object
+/// (inc field, dec ctor — the generated default arm exactly) are each the
+/// pin's. One disclosed mechanism deviation: the pin's `unexpectedEof` arm
+/// answers a persistent constant string ("end of file", IOError.c closed__15)
+/// where ours allocates a fresh exclusive one — identical bytes, and no
+/// value-semantics observable distinguishes them (a mutation of the pin's
+/// copies it; a mutation of ours reuses it; both yield the same string).
+///
+/// # Safety
+/// `err` is a consumed live `IO.Error` (or `box(17)`); caller owns the
+/// resulting string.
+// UNSAFE-LEDGER: FLN-UL-0412
+#[allow(unsafe_code)]
+pub(crate) unsafe fn error_to_string(err: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: tag-directed field reads within the live object; the argument
+    // is settled exactly once on every arm.
+    unsafe {
+        let tag = if tagged::is_scalar(err) {
+            tagged::unbox(err) as u8
+        } else {
+            (&raw const (*err).m_tag).read()
+        };
+        // unexpectedEof carries no fields and arrives boxed; nothing to settle.
+        if tag == 17 {
+            debug_assert!(tagged::is_scalar(err), "unexpectedEof is box(17)");
+            return mk_string("end of file");
+        }
+        // userError: answer the msg object itself, the generated default arm.
+        if tag == 18 {
+            let msg = object::ctor_get(err, 0);
+            rc::inc_ref_n(msg, 1);
+            rc::dec_ref(err);
+            return msg;
+        }
+        // The gist for each remaining arm, with which fields it carries and
+        // whether details print (Init/System/IOError.lean:271-298).
+        let (gist, has_fname_slot, fname_is_bare, details_print) = match tag {
+            ERR_ALREADY_EXISTS => ("already exists", true, false, true),
+            ERR_OTHER => ("", false, false, false), // gist = details (1 obj field)
+            ERR_RESOURCE_BUSY => ("resource busy", false, false, true),
+            ERR_RESOURCE_VANISHED => ("resource vanished", false, false, true),
+            ERR_UNSUPPORTED_OPERATION => ("unsupported operation", false, false, true),
+            ERR_HARDWARE_FAULT => ("hardware fault", false, false, false),
+            ERR_UNSATISFIED_CONSTRAINTS => ("directory not empty", false, false, false),
+            ERR_ILLEGAL_OPERATION => ("illegal operation", false, false, true),
+            ERR_PROTOCOL => ("protocol error", false, false, true),
+            ERR_TIME_EXPIRED => ("time expired", false, false, true),
+            ERR_INTERRUPTED => ("interrupted system call", true, true, true),
+            ERR_NO_FILE_OR_DIRECTORY => ("no such file or directory", true, true, false),
+            ERR_INVALID_ARGUMENT => ("invalid argument", true, false, true),
+            ERR_PERMISSION_DENIED => ("", true, false, false), // gist = details
+            ERR_RESOURCE_EXHAUSTED => ("resource exhausted", true, false, true),
+            ERR_INAPPROPRIATE_TYPE => ("inappropriate type", true, false, true),
+            ERR_NO_SUCH_THING => ("no such thing", true, false, true),
+            _ => unreachable!("IO.Error carries tags 0-18 only"),
+        };
+        let out = if tag == ERR_OTHER {
+            // otherError (osCode, details): 1 obj field, details AS the gist.
+            let details = string_content(object::ctor_get(err, 0));
+            let code = object::ctor_get_scalar::<u32>(err, size_of::<usize>());
+            other_error_to_string(&details, code, None)
+        } else if !has_fname_slot {
+            // The (osCode, details) family: 1 obj field.
+            let details = string_content(object::ctor_get(err, 0));
+            let code = object::ctor_get_scalar::<u32>(err, size_of::<usize>());
+            other_error_to_string(gist, code, details_print.then_some(details.as_str()))
+        } else {
+            // The 2-obj-field families: fname (bare or Option) then details.
+            let code = object::ctor_get_scalar::<u32>(err, 2 * size_of::<usize>());
+            let details = string_content(object::ctor_get(err, 1));
+            let gist_s: &str = if tag == ERR_PERMISSION_DENIED {
+                &details
+            } else {
+                gist
+            };
+            let details_opt = details_print.then_some(details.as_str());
+            let f0 = object::ctor_get(err, 0);
+            if fname_is_bare {
+                let fname = string_content(f0);
+                fopen_error_to_string(gist_s, &fname, code, details_opt)
+            } else if tagged::is_scalar(f0) {
+                other_error_to_string(gist_s, code, details_opt)
+            } else {
+                let fname = string_content(object::ctor_get(f0, 0));
+                fopen_error_to_string(gist_s, &fname, code, details_opt)
+            }
+        };
+        rc::dec_ref(err);
+        mk_string(&out)
+    }
+}
+
+/// `lean_io_result_show_error`'s core (`io.cpp:61-67`): the error read from
+/// the borrowed result (tag 1, field 0), duplicated into the owned
+/// `error_to_string` call, and `"uncaught exception: " + msg + '\n'` written
+/// to `sink` in one call. The pin writes `std::cerr << … << std::endl` —
+/// newline plus flush on fd 2 — so the export below hands this the process
+/// stderr and flushes; the seam exists so the native cell can bind the exact
+/// bytes without stealing the test harness's stderr.
+///
+/// # Safety
+/// `r` is a borrowed live error-arm IO result.
+// UNSAFE-LEDGER: FLN-UL-0413
+#[allow(unsafe_code)]
+pub(crate) unsafe fn io_result_show_error_core(r: *mut LeanObject, sink: &mut dyn std::io::Write) {
+    // SAFETY: result field read within the live object; the duplicated
+    // error token is consumed by error_to_string; the string is settled.
+    unsafe {
+        debug_assert_eq!((&raw const (*r).m_tag).read(), 1, "error-arm result");
+        let err = object::ctor_get(r, 0);
+        rc::inc_ref_n(err, 1);
+        let s = error_to_string(err);
+        let (m_size, _, _, bytes) = object::string_fields(s);
+        let mut out = Vec::with_capacity(m_size + 21);
+        out.extend_from_slice(b"uncaught exception: ");
+        out.extend_from_slice(&bytes[..m_size - 1]);
+        out.push(b'\n');
+        let _ = sink.write_all(&out);
+        let _ = sink.flush();
+        rc::dec_ref(s);
+    }
+}
+
 // ---------------------------------------------------------------- prims
 
 /// `lean_io_prim_handle_mk` (`io.cpp:385-418`), arm-for-arm: mode 0-4 to

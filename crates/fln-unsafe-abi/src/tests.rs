@@ -4742,3 +4742,159 @@ fn export_runtime_skins_and_byte_array_copy_slice() {
     );
     crate::membrane::drain_small_bins_for_test();
 }
+
+#[test]
+fn export_stdio_reproduces_the_error_to_string_arms() {
+    let _g = lock();
+    use crate::export::export_lean_io_error_to_string;
+
+    // The IO.Error pretty-printer (fln-3gv slice 8a): every arm shape of
+    // Init/System/IOError.lean:271-298, with the ctor objects built here by
+    // an INDEPENDENT transcription of the generated layout (raw tags and
+    // offsets from IOError.c), so a drift in the module's tag constants
+    // cannot silently agree with itself.
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; each error is
+    // consumed exactly once by the printer.
+    // UNSAFE-LEDGER: FLN-UL-0416
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let take = |e: *mut crate::layout::LeanObject| -> String {
+            let s = export_lean_io_error_to_string(e);
+            let (sz, _, _, b) = crate::object::string_fields(s);
+            let out = String::from_utf8(b[..sz - 1].to_vec()).expect("printer output is UTF-8");
+            crate::rc::dec_ref(s);
+            out
+        };
+        // The (osCode, details) family: 1 obj field, u32 after it.
+        let err1 = |tag: u8, details: &str, code: u32| {
+            let r = crate::object::alloc_ctor(tag, 1, 4);
+            crate::object::ctor_set(r, 0, mk(details));
+            crate::object::ctor_set_scalar::<u32>(r, size_of::<usize>(), code);
+            r
+        };
+        // The (filename : String) and (filename : Option String) families:
+        // 2 obj fields, u32 after them.
+        let err2 = |tag: u8, f0: *mut crate::layout::LeanObject, details: &str, code: u32| {
+            let r = crate::object::alloc_ctor(tag, 2, 4);
+            crate::object::ctor_set(r, 0, f0);
+            crate::object::ctor_set(r, 1, mk(details));
+            crate::object::ctor_set_scalar::<u32>(r, 2 * size_of::<usize>(), code);
+            r
+        };
+        let some = |s: &str| {
+            let c = crate::object::alloc_ctor(1, 1, 0);
+            crate::object::ctor_set(c, 0, mk(s));
+            c
+        };
+
+        // unexpectedEof arrives boxed and prints the constant.
+        assert_eq!(take(crate::tagged::boxi(17)), "end of file");
+
+        // userError answers its OWN msg object, bytes untouched — never
+        // decapitalized (the generated default arm, IOError.c:1683-1690).
+        let msg = mk("Msg Stays Capitalized");
+        crate::rc::inc_ref_n(msg, 1);
+        let ue = crate::object::alloc_ctor(18, 1, 0);
+        crate::object::ctor_set(ue, 0, msg);
+        let s = export_lean_io_error_to_string(ue);
+        assert_eq!(s, msg, "userError answers the msg object itself");
+        let (usz, _, _, ub) = crate::object::string_fields(s);
+        assert_eq!(&ub[..usz - 1], b"Msg Stays Capitalized");
+        crate::rc::dec_ref(s);
+        crate::rc::dec_ref(msg);
+
+        // otherError: the DETAILS is the gist, decapitalized first char only.
+        assert_eq!(
+            take(err1(1, "Some Odd Error", 5)),
+            "some Odd Error (error code: 5)"
+        );
+        // resourceBusy: literal gist, details decapitalized and printed.
+        assert_eq!(
+            take(err1(2, "Device Or Resource Busy", 16)),
+            "resource busy (error code: 16, device Or Resource Busy)"
+        );
+        // hardwareFault and unsatisfiedConstraints DROP their details.
+        assert_eq!(
+            take(err1(5, "Dropped Details", 5)),
+            "hardware fault (error code: 5)"
+        );
+        assert_eq!(
+            take(err1(6, "Dropped Too", 39)),
+            "directory not empty (error code: 39)"
+        );
+        // A non-ASCII first char is untouched; an empty details prints empty.
+        assert_eq!(
+            take(err1(1, "\u{2200} Details", 0)),
+            "\u{2200} Details (error code: 0)"
+        );
+        assert_eq!(
+            take(err1(3, "", 32)),
+            "resource vanished (error code: 32, )"
+        );
+
+        // The bare-filename family: interrupted prints details, noFileOr-
+        // Directory drops them, both carry the "\n  file: " trailer.
+        assert_eq!(
+            take(err2(10, mk("F.txt"), "Interrupted System Call", 4)),
+            "interrupted system call (error code: 4, interrupted System Call)\n  file: F.txt"
+        );
+        assert_eq!(
+            take(err2(11, mk("/nope/x"), "Ignored", 2)),
+            "no such file or directory (error code: 2)\n  file: /nope/x"
+        );
+
+        // The Option-filename family, both arms.
+        assert_eq!(
+            take(err2(12, some("cfg.txt"), "Invalid Argument", 22)),
+            "invalid argument (error code: 22, invalid Argument)\n  file: cfg.txt"
+        );
+        assert_eq!(
+            take(err2(12, crate::tagged::boxi(0), "Invalid Argument", 22)),
+            "invalid argument (error code: 22, invalid Argument)"
+        );
+        // permissionDenied: the details IS the gist — decapitalized on its
+        // FIRST char only — and never reprints as a details clause.
+        assert_eq!(
+            take(err2(13, some("/root/f"), "Permission Denied", 13)),
+            "permission Denied (error code: 13)\n  file: /root/f"
+        );
+        assert_eq!(
+            take(err2(13, crate::tagged::boxi(0), "Permission Denied", 13)),
+            "permission Denied (error code: 13)"
+        );
+        assert_eq!(
+            take(err2(0, some("f"), "File Exists", 17)),
+            "already exists (error code: 17, file Exists)\n  file: f"
+        );
+
+        // End to end through the LIVE errno decoder: the arm a real prim
+        // produces prints the pin's exact shape (glibc details dropped by
+        // the noFileOrDirectory arm, so the string is host-independent).
+        let fname = mk("/fln/errstr/nope");
+        let live_err = crate::stdio::decode_io_error(2, fname);
+        crate::rc::dec_ref(fname);
+        assert_eq!(
+            take(live_err),
+            "no such file or directory (error code: 2)\n  file: /fln/errstr/nope"
+        );
+
+        // show_error's core: the borrowed error-arm result, the exact
+        // prefix, the pretty-printed error, one newline. The export hands
+        // this the process stderr; the gauntlet probe binds those bytes
+        // cross-runtime through a captured fd 2.
+        let res = crate::stdio::io_result_mk_error(err1(1, "Boom Goes The Error", 7));
+        let mut sink: Vec<u8> = Vec::new();
+        crate::stdio::io_result_show_error_core(res, &mut sink);
+        assert_eq!(
+            sink, b"uncaught exception: boom Goes The Error (error code: 7)\n",
+            "io.cpp:61-67's exact bytes"
+        );
+        crate::rc::dec_ref(res);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the pretty-printer cell");
+    crate::membrane::drain_small_bins_for_test();
+}

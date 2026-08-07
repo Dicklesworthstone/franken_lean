@@ -3719,3 +3719,27 @@ pub(crate) extern "C" fn export_lean_byte_array_copy_slice(
         r
     }
 }
+
+/// `lean_io_error_to_string` (`Init/System/IOError.lean:271`; extern census
+/// `IO.Error.toString`): the pin's Lean-compiled pretty-printer, ported
+/// arm-for-arm in `stdio::error_to_string`.
+// UNSAFE-LEDGER: FLN-UL-0414
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_error_to_string")]
+pub(crate) extern "C" fn export_lean_io_error_to_string(err: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned live IO.Error per the obj_arg contract.
+    unsafe { crate::stdio::error_to_string(err) }
+}
+
+/// `lean_io_result_show_error` (`io.cpp:61-67`): "uncaught exception: " plus
+/// the pretty-printed error and a newline on the process stderr, flushed —
+/// `std::cerr << ... << std::endl`'s exact bytes on fd 2.
+// UNSAFE-LEDGER: FLN-UL-0415
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_result_show_error")]
+pub(crate) extern "C" fn export_lean_io_result_show_error(r: *mut LeanObject) {
+    // SAFETY: borrowed live error-arm result per the b_obj_arg contract.
+    unsafe {
+        crate::stdio::io_result_show_error_core(r, &mut std::io::stderr().lock());
+    }
+}

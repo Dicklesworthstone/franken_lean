@@ -26,6 +26,7 @@
  */
 
 #include <lean/lean.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +120,46 @@ extern lean_object *lean_io_wait(lean_object *t);
 extern lean_object *lean_io_wait_any(lean_object *task_list);
 extern lean_object *lean_io_get_num_heartbeats(void);
 extern lean_object *lean_io_set_heartbeats(lean_object *count);
+
+/* fln-3gv slice 8a extern (extern-census class): the Lean-compiled IO.Error
+ * pretty-printer, declared exactly as util/io.h:13 declares it
+ * (lean_io_result_show_error is already in lean.h:2950). */
+extern lean_object *lean_io_error_to_string(lean_object *err);
+
+/* Slice 8a fixture builders: every IO.Error ctor shape synthesized directly
+ * over the generated layout (IOError.c: 1-obj-field families u32 at
+ * sizeof(void*)*1, 2-obj-field families at sizeof(void*)*2), so the arm
+ * sweep below is deterministic on both runtimes. */
+static lean_object *errstr_err1(uint8_t tag, const char *details, uint32_t code) {
+    lean_object *r = lean_alloc_ctor(tag, 1, 4);
+    lean_ctor_set(r, 0, lean_mk_string(details));
+    lean_ctor_set_uint32(r, sizeof(void *) * 1, code);
+    return r;
+}
+static lean_object *errstr_err2(uint8_t tag, lean_object *f0, const char *details,
+                                uint32_t code) {
+    lean_object *r = lean_alloc_ctor(tag, 2, 4);
+    lean_ctor_set(r, 0, f0);
+    lean_ctor_set(r, 1, lean_mk_string(details));
+    lean_ctor_set_uint32(r, sizeof(void *) * 2, code);
+    return r;
+}
+static lean_object *errstr_some(const char *s) {
+    lean_object *c = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(c, 0, lean_mk_string(s));
+    return c;
+}
+/* Emit the pretty-printed string's content length and bytesum for one arm;
+ * consumes err. */
+static void errstr_facts(const char *arm, lean_object *err) {
+    lean_object *s = lean_io_error_to_string(err);
+    char name[96];
+    snprintf(name, sizeof name, "corpus.errstr.%s_bytes", arm);
+    fact(name, (long long)lean_string_size(s) - 1);
+    snprintf(name, sizeof name, "corpus.errstr.%s_sum", arm);
+    fact(name, bytesum(lean_string_cstr(s), lean_string_size(s) - 1));
+    lean_dec(s);
+}
 
 /* Apply targets for the task facts, closured exactly as generated C does. */
 static lean_object *probe_double(lean_object *x) {
@@ -1319,6 +1360,110 @@ static void facts_mode(void) {
         }
         lean_dec(cres);
         lean_dec(csrc);
+    }
+
+    /* ---- fln-3gv slice 8a: the IO.Error pretty-printer + result_show_error
+     * (Init/System/IOError.lean:271-298 through the generated IOError.c
+     * dispatch; io.cpp:61-67). The full arm sweep is synthesized so it is
+     * deterministic; one error rides the LIVE errno decoder end to end; and
+     * show_error's stderr bytes are captured through a dup2'd fd 2. */
+    {
+        /* The Reference's printer is LEAN-COMPILED: its Nat.repr once-cells
+         * live in module globals only initialize_Init_System_IOError fills
+         * in (measured: without it l_Nat_reprFast faults inside
+         * lean_obj_once_cold). Marrow's printer is native and carries no
+         * such initializer, so the symbol is resolved dynamically — present
+         * means run it, absent means nothing to run. One probe source, both
+         * links, and NO fact is emitted about which case ran. */
+        void *self = dlopen(NULL, RTLD_LAZY);
+        void *init_sym = self ? dlsym(self, "initialize_Init_System_IOError") : NULL;
+        if (init_sym) {
+            lean_object *(*init_ioerror)(uint8_t) = (lean_object * (*)(uint8_t)) init_sym;
+            lean_dec(init_ioerror(1));
+        }
+
+        errstr_facts("eof", lean_box(17));
+        {
+            lean_object *ue = lean_alloc_ctor(18, 1, 0);
+            lean_ctor_set(ue, 0, lean_mk_string("Boom Msg"));
+            errstr_facts("user", ue);
+        }
+        errstr_facts("already_some", errstr_err2(0, errstr_some("f"), "File Exists", 17));
+        errstr_facts("already_none", errstr_err2(0, lean_box(0), "File Exists", 17));
+        errstr_facts("other", errstr_err1(1, "Some Odd Error", 5));
+        errstr_facts("busy", errstr_err1(2, "Device Or Resource Busy", 16));
+        errstr_facts("vanished", errstr_err1(3, "Resource Vanished Here", 32));
+        errstr_facts("unsupported", errstr_err1(4, "Not Supported Today", 95));
+        errstr_facts("hardware", errstr_err1(5, "Dropped Details", 5));
+        errstr_facts("unsatisfied", errstr_err1(6, "Dropped Too", 39));
+        errstr_facts("illegal", errstr_err1(7, "Illegal Op Details", 25));
+        errstr_facts("protocol", errstr_err1(8, "Protocol Details", 71));
+        errstr_facts("time", errstr_err1(9, "Timed Out Details", 62));
+        errstr_facts("interrupted",
+                     errstr_err2(10, lean_mk_string("F.txt"), "Interrupted System Call", 4));
+        errstr_facts("nofile",
+                     errstr_err2(11, lean_mk_string("/nope/x"), "Ignored Details", 2));
+        errstr_facts("invalid_some",
+                     errstr_err2(12, errstr_some("cfg.txt"), "Invalid Argument", 22));
+        errstr_facts("invalid_none",
+                     errstr_err2(12, lean_box(0), "Invalid Argument", 22));
+        errstr_facts("perm_some",
+                     errstr_err2(13, errstr_some("/root/f"), "Permission Denied", 13));
+        errstr_facts("perm_none", errstr_err2(13, lean_box(0), "Permission Denied", 13));
+        errstr_facts("exhausted_some",
+                     errstr_err2(14, errstr_some("q"), "Quota Exceeded", 122));
+        errstr_facts("exhausted_none",
+                     errstr_err2(14, lean_box(0), "Quota Exceeded", 122));
+        errstr_facts("inapp_some", errstr_err2(15, errstr_some("d"), "Is A Directory", 21));
+        errstr_facts("inapp_none", errstr_err2(15, lean_box(0), "Is A Directory", 21));
+        errstr_facts("nosuch_some", errstr_err2(16, errstr_some("s"), "No Such Device", 6));
+        errstr_facts("nosuch_none", errstr_err2(16, lean_box(0), "No Such Device", 6));
+        /* Decapitalization edges: a non-ASCII first char is untouched, an
+         * empty details prints empty, a digit first char is untouched. */
+        errstr_facts("unicode_first", errstr_err1(1, "\xe2\x88\x80 Unicode First", 0));
+        errstr_facts("empty_details", errstr_err1(3, "", 32));
+        errstr_facts("digit_first", errstr_err1(1, "9 Numbers First", 1));
+
+        /* End to end through the LIVE errno decoder: chmod on a missing
+         * path; the noFileOrDirectory arm drops the glibc details, so the
+         * string is host-independent. */
+        {
+            lean_object *cf = lean_mk_string("/fln-gauntlet-errstr-nope");
+            lean_object *cr = lean_chmod(cf, 0);
+            fact("corpus.errstr.live_is_error", lean_ptr_tag(cr) == 1);
+            lean_object *le = lean_ctor_get(cr, 0);
+            lean_inc(le);
+            errstr_facts("live_chmod", le);
+            lean_dec(cr);
+            lean_dec(cf);
+        }
+
+        /* show_error: "uncaught exception: " + toString + '\n' on fd 2,
+         * captured through a temp file so the bytes are a fact. */
+        {
+            lean_object *res =
+                lean_io_result_mk_error(errstr_err1(1, "Boom Goes The Error", 7));
+            char tmpl[] = "/tmp/fln-errstr-XXXXXX";
+            int tf = mkstemp(tmpl);
+            fact("corpus.errstr.show_error_capture_ready", tf >= 0);
+            fflush(stderr);
+            int saved = dup(2);
+            dup2(tf, 2);
+            lean_io_result_show_error(res);
+            fflush(stderr);
+            dup2(saved, 2);
+            close(saved);
+            long long n = (long long)lseek(tf, 0, SEEK_END);
+            lseek(tf, 0, SEEK_SET);
+            char buf[256];
+            long long rd = (long long)read(tf, buf, sizeof buf);
+            close(tf);
+            unlink(tmpl);
+            fact("corpus.errstr.show_error_bytes", n);
+            fact("corpus.errstr.show_error_sum",
+                 bytesum(buf, (size_t)(rd > 0 ? rd : 0)));
+            lean_dec(res);
+        }
     }
 }
 
