@@ -77,6 +77,13 @@ extern lean_object *lean_io_prim_handle_truncate(lean_object *h);
 extern lean_object *lean_io_prim_handle_lock(lean_object *h, uint8_t x);
 extern lean_object *lean_io_prim_handle_try_lock(lean_object *h, uint8_t x);
 extern lean_object *lean_io_prim_handle_unlock(lean_object *h);
+extern lean_object *lean_chmod(lean_object *filename, uint32_t mode);
+extern lean_object *lean_io_create_dir(lean_object *p);
+extern lean_object *lean_io_remove_dir(lean_object *p);
+extern lean_object *lean_io_rename(lean_object *from, lean_object *to);
+extern lean_object *lean_io_current_dir(void);
+extern lean_object *lean_io_realpath(lean_object *filename);
+extern lean_object *lean_io_read_dir(lean_object *dirname);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -928,6 +935,110 @@ static void facts_mode(void) {
     lean_dec(ictl_h2);
     lean_dec(ictl_h1);
     remove(ictl_path);
+
+    /* ---- fln-3gv slice 6a: the errno-decoded fs family (io.cpp:372-382,
+     * 1002-1227, 1409-1417) — create_dir with its EEXIST arm, read_dir's
+     * DirEntry shape over planted names, rename, realpath (OWNED argument;
+     * the missing arm is noFileOrDirectory with EMPTY details), chmod,
+     * current_dir, remove_dir. */
+    char ifs_base[128];
+    snprintf(ifs_base, sizeof ifs_base, "/tmp/fln-fs-dir-%lld",
+             (long long)getpid());
+    char ifs_sub[160], ifs_sub2[160], ifs_file[192];
+    snprintf(ifs_sub, sizeof ifs_sub, "%s/child", ifs_base);
+    snprintf(ifs_sub2, sizeof ifs_sub2, "%s/renamed", ifs_base);
+    lean_object *ifs_base_obj = lean_mk_string(ifs_base);
+    lean_object *ifs_mk0 = lean_io_create_dir(ifs_base_obj);
+    fact("corpus.fs_dir.mkbase_ok", lean_ptr_tag(ifs_mk0) == 0);
+    lean_dec(ifs_mk0);
+    lean_object *ifs_sub_obj = lean_mk_string(ifs_sub);
+    lean_object *ifs_mk1 = lean_io_create_dir(ifs_sub_obj);
+    fact("corpus.fs_dir.mksub_ok", lean_ptr_tag(ifs_mk1) == 0);
+    lean_dec(ifs_mk1);
+    lean_object *ifs_dup = lean_io_create_dir(ifs_sub_obj);
+    fact("corpus.fs_dir.mkdup_err", lean_ptr_tag(ifs_dup) == 1);
+    fact("corpus.fs_dir.mkdup_variant",
+         lean_ptr_tag(lean_ctor_get(ifs_dup, 0)));
+    lean_dec(ifs_dup);
+    snprintf(ifs_file, sizeof ifs_file, "%s/alpha.txt", ifs_sub);
+    {
+        FILE *pf = fopen(ifs_file, "w");
+        fputc('a', pf);
+        fclose(pf);
+    }
+    snprintf(ifs_file, sizeof ifs_file, "%s/beta.txt", ifs_sub);
+    {
+        FILE *pf = fopen(ifs_file, "w");
+        fputc('b', pf);
+        fclose(pf);
+    }
+    lean_object *ifs_rd = lean_io_read_dir(ifs_sub_obj);
+    fact("corpus.fs_dir.readdir_ok", lean_ptr_tag(ifs_rd) == 0);
+    {
+        lean_object *ifs_arr = lean_ctor_get(ifs_rd, 0);
+        long long ifs_n = (long long)lean_array_size(ifs_arr);
+        long long ifs_namesum = 0;
+        for (long long i = 0; i < ifs_n; i++) {
+            lean_object *ifs_e = lean_array_cptr(ifs_arr)[i];
+            lean_object *ifs_nm = lean_ctor_get(ifs_e, 1);
+            const uint8_t *np = (const uint8_t *)lean_string_cstr(ifs_nm);
+            long long nn = (long long)lean_string_size(ifs_nm) - 1;
+            for (long long j = 0; j < nn; j++) {
+                ifs_namesum += np[j];
+            }
+        }
+        fact("corpus.fs_dir.readdir_count", ifs_n);
+        fact("corpus.fs_dir.readdir_namesum", ifs_namesum);
+    }
+    lean_dec(ifs_rd);
+    lean_object *ifs_sub2_obj = lean_mk_string(ifs_sub2);
+    lean_object *ifs_rn = lean_io_rename(ifs_sub_obj, ifs_sub2_obj);
+    fact("corpus.fs_dir.rename_ok", lean_ptr_tag(ifs_rn) == 0);
+    lean_dec(ifs_rn);
+    lean_inc(ifs_sub2_obj); /* realpath consumes its argument */
+    lean_object *ifs_rp = lean_io_realpath(ifs_sub2_obj);
+    fact("corpus.fs_dir.realpath_ok", lean_ptr_tag(ifs_rp) == 0);
+    {
+        lean_object *ifs_rps = lean_ctor_get(ifs_rp, 0);
+        const char *rp = lean_string_cstr(ifs_rps);
+        size_t rl = strlen(rp);
+        fact("corpus.fs_dir.realpath_tail",
+             rl >= 8 && strcmp(rp + rl - 8, "/renamed") == 0);
+    }
+    lean_dec(ifs_rp);
+    lean_object *ifs_missing = lean_mk_string("/tmp/fln-fs-dir-definitely-missing");
+    lean_inc(ifs_missing);
+    lean_object *ifs_rpm = lean_io_realpath(ifs_missing);
+    fact("corpus.fs_dir.realpath_missing_err", lean_ptr_tag(ifs_rpm) == 1);
+    {
+        lean_object *ifs_err = lean_ctor_get(ifs_rpm, 0);
+        fact("corpus.fs_dir.realpath_missing_variant", lean_ptr_tag(ifs_err));
+        fact("corpus.fs_dir.realpath_missing_details_size",
+             (long long)lean_string_size(lean_ctor_get(ifs_err, 1)));
+    }
+    lean_dec(ifs_rpm);
+    lean_dec(ifs_missing);
+    lean_object *ifs_ch = lean_chmod(ifs_sub2_obj, 0755);
+    fact("corpus.fs_dir.chmod_ok", lean_ptr_tag(ifs_ch) == 0);
+    lean_dec(ifs_ch);
+    lean_object *ifs_cwd = lean_io_current_dir();
+    fact("corpus.fs_dir.cwd_ok", lean_ptr_tag(ifs_cwd) == 0);
+    fact("corpus.fs_dir.cwd_nonempty",
+         lean_string_size(lean_ctor_get(ifs_cwd, 0)) > 1);
+    lean_dec(ifs_cwd);
+    snprintf(ifs_file, sizeof ifs_file, "%s/alpha.txt", ifs_sub2);
+    remove(ifs_file);
+    snprintf(ifs_file, sizeof ifs_file, "%s/beta.txt", ifs_sub2);
+    remove(ifs_file);
+    lean_object *ifs_rm = lean_io_remove_dir(ifs_sub2_obj);
+    fact("corpus.fs_dir.rmsub_ok", lean_ptr_tag(ifs_rm) == 0);
+    lean_dec(ifs_rm);
+    lean_object *ifs_rm2 = lean_io_remove_dir(ifs_base_obj);
+    fact("corpus.fs_dir.rmbase_ok", lean_ptr_tag(ifs_rm2) == 0);
+    lean_dec(ifs_rm2);
+    lean_dec(ifs_sub2_obj);
+    lean_dec(ifs_sub_obj);
+    lean_dec(ifs_base_obj);
 }
 
 int main(int argc, char **argv) {

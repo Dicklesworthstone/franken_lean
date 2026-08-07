@@ -165,7 +165,7 @@ const LOCK_UN: c_int = 8;
 // EWOULDBLOCK == EAGAIN on Linux (asm-generic); the try_lock arm keys on it.
 const EWOULDBLOCK: c_int = EAGAIN;
 
-fn errno() -> c_int {
+pub(crate) fn errno() -> c_int {
     // SAFETY: glibc guarantees a valid thread-local location.
     // UNSAFE-LEDGER: FLN-UL-0268
     #[allow(unsafe_code)]
@@ -234,7 +234,7 @@ unsafe fn io_get_handle(h: *mut LeanObject) -> *mut c_void {
 /// Caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0273
 #[allow(unsafe_code)]
-unsafe fn mk_string(s: &str) -> *mut LeanObject {
+pub(crate) unsafe fn mk_string(s: &str) -> *mut LeanObject {
     // SAFETY: byte/char counts are computed from the same str.
     unsafe { object::mk_string_unchecked(s.as_bytes(), s.chars().count()) }
 }
@@ -316,7 +316,7 @@ unsafe fn err_optfile_code_details(
 /// `fname` and `details` are consumed; caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0278
 #[allow(unsafe_code)]
-unsafe fn err_file_code_details(
+pub(crate) unsafe fn err_file_code_details(
     tag: u8,
     fname: *mut LeanObject,
     code: u32,
@@ -366,7 +366,7 @@ const ERR_ILLEGAL_OPERATION: u8 = 7;
 const ERR_PROTOCOL: u8 = 8;
 const ERR_TIME_EXPIRED: u8 = 9;
 const ERR_INTERRUPTED: u8 = 10;
-const ERR_NO_FILE_OR_DIRECTORY: u8 = 11;
+pub(crate) const ERR_NO_FILE_OR_DIRECTORY: u8 = 11;
 const ERR_INVALID_ARGUMENT: u8 = 12;
 const ERR_PERMISSION_DENIED: u8 = 13;
 const ERR_RESOURCE_EXHAUSTED: u8 = 14;
@@ -466,19 +466,21 @@ pub(crate) unsafe fn decode_io_error(errnum: c_int, fname: *mut LeanObject) -> *
     }
 }
 
-/// `mk_embedded_nul_error` (`io.cpp`, `handle_mk`'s pre-open check): a
-/// filename whose byte size disagrees with its C-string length carries an
-/// embedded NUL; the pin refuses it as `invalidArgument` before touching
-/// the filesystem.
+/// `mk_embedded_nul_error` (`io.cpp:366-369`, the global helper `handle_mk`
+/// and the fs family share): a string whose byte size disagrees with its
+/// C-string length carries an embedded NUL; the pin refuses it as
+/// `invalidArgument` before touching the filesystem. Slice 6a corrected the
+/// details text to the pin's exact "string contains NUL bytes" (the first
+/// version paraphrased it, a divergence in the observable details string).
 ///
 /// # Safety
 /// `fname` is borrowed and live; caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0281
 #[allow(unsafe_code)]
-unsafe fn mk_embedded_nul_error(fname: *mut LeanObject) -> *mut LeanObject {
+pub(crate) unsafe fn mk_embedded_nul_error(fname: *mut LeanObject) -> *mut LeanObject {
     // SAFETY: fresh objects; the option cell duplicates fname.
     unsafe {
-        let details = mk_string("file name contains a NUL byte");
+        let details = mk_string("string contains NUL bytes");
         io_result_mk_error(err_optfile_code_details(
             ERR_INVALID_ARGUMENT,
             opt_of_borrowed(fname),

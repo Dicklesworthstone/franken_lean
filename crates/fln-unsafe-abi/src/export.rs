@@ -3273,6 +3273,81 @@ pub(crate) extern "C" fn export_lean_io_prim_handle_unlock(h: *mut LeanObject) -
     unsafe { crate::stdio::prim_handle_unlock(h) }
 }
 
+/// `lean_chmod` (`io.cpp:372-382`; extern census `IO.setAccessRights`).
+// UNSAFE-LEDGER: FLN-UL-0353
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_chmod")]
+pub(crate) extern "C" fn export_lean_chmod(
+    filename: *mut LeanObject,
+    mode: u32,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_chmod(filename, mode) }
+}
+
+/// `lean_io_create_dir` (`io.cpp:1169-1183`; extern census
+/// `IO.FS.createDir`).
+// UNSAFE-LEDGER: FLN-UL-0354
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_create_dir")]
+pub(crate) extern "C" fn export_lean_io_create_dir(p: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_create_dir(p) }
+}
+
+/// `lean_io_remove_dir` (`io.cpp:1185-1195`; extern census
+/// `IO.FS.removeDir`).
+// UNSAFE-LEDGER: FLN-UL-0355
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_remove_dir")]
+pub(crate) extern "C" fn export_lean_io_remove_dir(p: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_remove_dir(p) }
+}
+
+/// `lean_io_rename` (`io.cpp:1197-1227`; extern census `IO.FS.rename`).
+// UNSAFE-LEDGER: FLN-UL-0356
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_rename")]
+pub(crate) extern "C" fn export_lean_io_rename(
+    from: *mut LeanObject,
+    to: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::fs::prim_rename(from, to) }
+}
+
+/// `lean_io_current_dir` (`io.cpp:1409-1417`; extern census
+/// `IO.currentDir`).
+// UNSAFE-LEDGER: FLN-UL-0357
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_current_dir")]
+pub(crate) extern "C" fn export_lean_io_current_dir() -> *mut LeanObject {
+    // SAFETY: no arguments; the prim owns every object it builds.
+    unsafe { crate::fs::prim_current_dir() }
+}
+
+/// `lean_io_realpath` (`io.cpp:1002-1055`; extern census
+/// `IO.FS.realPath`). The pin's own signature takes `filename` OWNED
+/// (`obj_arg`), unlike every sibling.
+// UNSAFE-LEDGER: FLN-UL-0358
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_realpath")]
+pub(crate) extern "C" fn export_lean_io_realpath(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned live string per the pin's obj_arg contract.
+    unsafe { crate::fs::prim_realpath(filename) }
+}
+
+/// `lean_io_read_dir` (`io.cpp:1064-1086`; extern census
+/// `IO.FS.readDir`): an Array of two-field DirEntry ctors.
+// UNSAFE-LEDGER: FLN-UL-0359
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_read_dir")]
+pub(crate) extern "C" fn export_lean_io_read_dir(dirname: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_read_dir(dirname) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302

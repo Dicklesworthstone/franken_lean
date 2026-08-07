@@ -279,18 +279,18 @@ extern lean_io_prim_handle_truncate | CompatWrapper | crates/fln-unsafe-abi/src/
 extern lean_io_prim_handle_lock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | blocking flock, exclusive or shared (io.cpp:480-488 non-Windows arm; fln-3gv slice 5d)
 extern lean_io_prim_handle_try_lock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | non-blocking flock; held elsewhere (EWOULDBLOCK) is ok-false, never an error (io.cpp:490-502 non-Windows arm; fln-3gv slice 5d)
 extern lean_io_prim_handle_unlock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | flock LOCK_UN; failure decodes errno (io.cpp:504-512 non-Windows arm; fln-3gv slice 5d)
-extern lean_chmod | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice (ordinary syscalls, no D2 involvement)
-extern lean_io_create_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_chmod | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | chmod(2); failure decodes errno with the filename (io.cpp:372-382; fln-3gv slice 6a)
+extern lean_io_create_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | mkdir 0777 under the umask (io.cpp:1169-1183; fln-3gv slice 6a)
 extern lean_io_create_tempdir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_create_tempfile | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
-extern lean_io_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_current_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | getcwd; failure is the pin's bare userError, never an errno decode (io.cpp:1409-1417; fln-3gv slice 6a)
 extern lean_io_hard_link | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
-extern lean_io_read_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
-extern lean_io_realpath | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
-extern lean_io_remove_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_read_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | opendir/readdir with dot entries skipped; DirEntry ctors over the validating string constructor (io.cpp:1064-1086; fln-3gv slice 6a)
+extern lean_io_realpath | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | realpath; filename arrives OWNED per the pin's own obj_arg signature; failure is noFileOrDirectory with EMPTY details (io.cpp:1002-1055 non-Windows arm; fln-3gv slice 6a)
+extern lean_io_remove_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | rmdir (io.cpp:1185-1195; fln-3gv slice 6a)
 extern lean_io_remove_file | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
-extern lean_io_rename | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_rename | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | rename(2); failure decodes errno against the pin's synthesized A-and/or-B filename (io.cpp:1197-1227 non-Windows arm; fln-3gv slice 6a)
 extern lean_io_symlink_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_app_path | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_process_spawn | Unsupported | fln-3gv | stage0 IO.c demand audit | process family — the D2 subprocess seam, designed before implemented, routed when reached

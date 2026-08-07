@@ -70,6 +70,7 @@ mod contract;
 #[cfg(all(test, target_os = "linux"))]
 mod door;
 mod export;
+mod fs;
 pub mod handle;
 mod layout;
 mod membrane;

@@ -1,10 +1,14 @@
 /* Derivation program for the stdio.rs platform constants (fln-3gv slice 5a):
  * prints every constant the io.cpp decoder and handle_mk use, measured from
  * this host's own headers rather than transcribed from memory. */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <sys/file.h>
 #define P(n) printf("pub(crate) const %s: c_int = %d;\n", #n, n)
 int main(void) {
     P(EINTR); P(ELOOP); P(ENAMETOOLONG); P(EDESTADDRREQ); P(EBADF); P(EDOM);
@@ -24,5 +28,11 @@ int main(void) {
     P(O_APPEND); P(O_CLOEXEC);
     P(SIGPIPE);
     printf("SIG_IGN=%p\n", (void *)SIG_IGN);
+    /* fln-3gv slices 5d/6a: seek/flock and the fs plane's layout facts. */
+    P(SEEK_SET); P(LOCK_SH); P(LOCK_EX); P(LOCK_NB); P(LOCK_UN);
+    printf("pub(crate) const PATH_MAX: usize = %d;\n", PATH_MAX);
+    printf(
+        "pub(crate) const DIRENT_D_NAME_OFFSET: usize = %zu;\n",
+        offsetof(struct dirent, d_name));
     return 0;
 }

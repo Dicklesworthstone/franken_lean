@@ -4043,3 +4043,177 @@ fn export_stdio_reproduces_the_handle_ctl_arms_with_lock_contention() {
     assert_eq!(live, 0, "RC balance across the handle-ctl cell");
     std::fs::remove_file(&scratch).ok();
 }
+
+#[test]
+fn export_stdio_reproduces_the_fs_dir_family_with_error_arms() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_chmod, export_lean_io_create_dir, export_lean_io_current_dir,
+        export_lean_io_read_dir, export_lean_io_realpath, export_lean_io_remove_dir,
+        export_lean_io_rename,
+    };
+
+    // The errno-decoded fs family (fln-3gv slice 6a) over one scratch tree:
+    // create_dir, read_dir (dot entries skipped, DirEntry shape), rename,
+    // realpath (OWNED argument), chmod, current_dir, remove_dir — plus the
+    // error arms the pin distinguishes: create-existing (EEXIST ->
+    // alreadyExists), read-missing (errno decode), realpath-missing
+    // (noFileOrDirectory with EMPTY details, io.cpp:85-90), and the shared
+    // embedded-NUL refusal.
+    let base = std::env::temp_dir().join(format!("fln-fs-dir-{}", std::process::id()));
+    let base_str = base.to_str().expect("temp path is UTF-8").to_string();
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::create_dir(&base).expect("scratch base");
+
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the family runs
+    // through the exports exactly as compiled IO.FS code would drive them,
+    // with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0360
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let take_str = |res: *mut crate::layout::LeanObject, what: &str| -> Vec<u8> {
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "{what}: ok arm");
+            let s = crate::object::ctor_get(res, 0);
+            let (m_size, _, _, bytes) = crate::object::string_fields(s);
+            let out = bytes[..m_size - 1].to_vec();
+            crate::rc::dec_ref(res);
+            out
+        };
+        let expect_unit = |r: *mut crate::layout::LeanObject, what: &str| {
+            assert_eq!((&raw const (*r).m_tag).read(), 0, "{what}: ok arm");
+            crate::rc::dec_ref(r);
+        };
+
+        // create_dir + the EEXIST arm (alreadyExists, tag 0 of IO.Error).
+        let sub = format!("{base_str}/child");
+        let sub_obj = mk(&sub);
+        expect_unit(export_lean_io_create_dir(sub_obj), "create_dir");
+        let dup = export_lean_io_create_dir(sub_obj);
+        assert_eq!(
+            (&raw const (*dup).m_tag).read(),
+            1,
+            "create-existing: error arm"
+        );
+        let dup_err = crate::object::ctor_get(dup, 0);
+        assert_eq!(
+            (&raw const (*dup_err).m_tag).read(),
+            0,
+            "EEXIST decodes to alreadyExists (io.cpp:decode, EEXIST family)"
+        );
+        crate::rc::dec_ref(dup);
+
+        // Plant two files, then read_dir: exactly the two entries, no dot
+        // entries, each a two-field DirEntry whose root is the dirname.
+        std::fs::write(format!("{sub}/alpha.txt"), b"a").expect("planted alpha");
+        std::fs::write(format!("{sub}/beta.txt"), b"b").expect("planted beta");
+        let rd = export_lean_io_read_dir(sub_obj);
+        assert_eq!((&raw const (*rd).m_tag).read(), 0, "read_dir: ok arm");
+        let arr = crate::object::ctor_get(rd, 0);
+        let (n_entries, _) = crate::object::array_fields(arr);
+        assert_eq!(n_entries, 2, "two planted entries, dot entries skipped");
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..n_entries {
+            let e = crate::object::array_get(arr, i);
+            let root = crate::object::ctor_get(e, 0);
+            let (rs, _, _, rb) = crate::object::string_fields(root);
+            assert_eq!(
+                &rb[..rs - 1],
+                sub.as_bytes(),
+                "DirEntry.root is the dirname"
+            );
+            let fname = crate::object::ctor_get(e, 1);
+            let (fs_, _, _, fb) = crate::object::string_fields(fname);
+            names.push(String::from_utf8(fb[..fs_ - 1].to_vec()).expect("entry name"));
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            ["alpha.txt", "beta.txt"],
+            "exactly the planted names"
+        );
+        crate::rc::dec_ref(rd);
+
+        // read_dir on a missing path: errno decode with the dirname.
+        let missing = mk(&format!("{base_str}/nope"));
+        let rd_err = export_lean_io_read_dir(missing);
+        assert_eq!(
+            (&raw const (*rd_err).m_tag).read(),
+            1,
+            "read-missing: error arm"
+        );
+        crate::rc::dec_ref(rd_err);
+
+        // rename + realpath of the renamed path (realpath consumes OWNED).
+        let sub2 = format!("{base_str}/renamed");
+        let sub2_obj = mk(&sub2);
+        expect_unit(export_lean_io_rename(sub_obj, sub2_obj), "rename");
+        crate::rc::inc_ref_n(sub2_obj, 1); // realpath consumes one token
+        let rp = take_str(export_lean_io_realpath(sub2_obj), "realpath");
+        assert!(
+            rp.ends_with(b"/renamed"),
+            "realpath resolves the renamed path"
+        );
+        // realpath of a missing path: noFileOrDirectory with EMPTY details.
+        let rp_err = export_lean_io_realpath(missing);
+        assert_eq!(
+            (&raw const (*rp_err).m_tag).read(),
+            1,
+            "realpath-missing: error arm"
+        );
+        let rp_e = crate::object::ctor_get(rp_err, 0);
+        assert_eq!(
+            (&raw const (*rp_e).m_tag).read(),
+            crate::stdio::ERR_NO_FILE_OR_DIRECTORY,
+            "the pin's mk_file_not_found_error variant (io.cpp:85-90)"
+        );
+        let rp_details = crate::object::ctor_get(rp_e, 1);
+        assert_eq!(
+            crate::object::string_fields(rp_details).0,
+            1,
+            "EMPTY details, never a strerror decode"
+        );
+        crate::rc::dec_ref(rp_err);
+
+        // chmod: read-only then restored, both ok arms.
+        expect_unit(export_lean_chmod(sub2_obj, 0o500), "chmod 0500");
+        expect_unit(export_lean_chmod(sub2_obj, 0o755), "chmod 0755");
+
+        // current_dir agrees with the process's own answer.
+        let cwd = take_str(export_lean_io_current_dir(), "current_dir");
+        assert_eq!(
+            cwd,
+            std::env::current_dir()
+                .expect("process cwd")
+                .to_str()
+                .expect("cwd is UTF-8")
+                .as_bytes(),
+            "getcwd equals the process's own view"
+        );
+
+        // The shared embedded-NUL refusal, through one representative.
+        let nul_path = crate::object::mk_string_unchecked(b"bad\0path", 8);
+        let nul_err = export_lean_io_create_dir(nul_path);
+        assert_eq!(
+            (&raw const (*nul_err).m_tag).read(),
+            1,
+            "embedded NUL: error arm"
+        );
+        crate::rc::dec_ref(nul_err);
+        crate::rc::dec_ref(nul_path);
+
+        // remove_dir after clearing the planted files.
+        std::fs::remove_file(format!("{sub2}/alpha.txt")).expect("clear alpha");
+        std::fs::remove_file(format!("{sub2}/beta.txt")).expect("clear beta");
+        expect_unit(export_lean_io_remove_dir(sub2_obj), "remove_dir");
+
+        crate::rc::dec_ref(sub2_obj);
+        crate::rc::dec_ref(missing);
+        crate::rc::dec_ref(sub_obj);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the fs-dir cell");
+    std::fs::remove_dir_all(&base).ok();
+}
