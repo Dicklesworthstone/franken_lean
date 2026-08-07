@@ -101,6 +101,11 @@ extern lean_object *lean_io_app_path(void);
 extern uint8_t lean_io_initializing(void);
 extern void lean_io_mark_end_initialization(void);
 extern lean_object *lean_io_get_random_bytes(size_t nbytes);
+extern lean_object *lean_runtime_mark_multi_threaded(lean_object *a);
+extern lean_object *lean_runtime_mark_persistent(lean_object *a);
+extern lean_object *lean_runtime_forget(lean_object *o);
+extern uint8_t lean_string_validate_utf8(lean_object *a);
+extern lean_object *lean_byte_array_copy_slice(lean_object *src, lean_object *src_off, lean_object *dest, lean_object *dest_off, lean_object *len, bool exact);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -1276,6 +1281,44 @@ static void facts_mode(void) {
                     lean_sarray_cptr(lean_ctor_get(r2, 0)), 32) != 0);
         lean_dec(r1);
         lean_dec(r2);
+    }
+
+    /* ---- fln-3gv slice 7b: the runtime skins and the byte-array slice
+     * (io.cpp:1602-1626; object.cpp:2037-2040, 2584-2603). */
+    {
+        lean_object *ma = lean_alloc_ctor(0, 0, 8);
+        fact("corpus.rt.mark_mt_identity",
+             lean_runtime_mark_multi_threaded(ma) == ma);
+        lean_object *mp = lean_alloc_ctor(0, 0, 8);
+        fact("corpus.rt.mark_persistent_identity",
+             lean_runtime_mark_persistent(mp) == mp);
+        lean_object *fg = lean_alloc_ctor(0, 0, 8);
+        fact("corpus.rt.forget_unit", lean_runtime_forget(fg) == lean_box(0));
+        lean_object *vok = lean_alloc_sarray(1, 3, 3);
+        memcpy(lean_sarray_cptr(vok), "abc", 3);
+        fact("corpus.rt.validate_ok", lean_string_validate_utf8(vok));
+        lean_sarray_cptr(vok)[1] = 0xFF;
+        fact("corpus.rt.validate_bad", lean_string_validate_utf8(vok));
+        lean_dec(vok);
+        lean_object *csrc = lean_alloc_sarray(1, 10, 10);
+        for (int i = 0; i < 10; i++) {
+            lean_sarray_cptr(csrc)[i] = (uint8_t)(i + 1);
+        }
+        lean_object *cdst = lean_alloc_sarray(1, 4, 4);
+        memset(lean_sarray_cptr(cdst), 0, 4);
+        lean_object *cres = lean_byte_array_copy_slice(
+            csrc, lean_box(2), cdst, lean_box(1), lean_box(5), true);
+        {
+            long long cn = (long long)lean_sarray_size(cres);
+            long long csum = 0;
+            for (long long i = 0; i < cn; i++) {
+                csum += lean_sarray_cptr(cres)[i];
+            }
+            fact("corpus.rt.copy_slice_size", cn);
+            fact("corpus.rt.copy_slice_bytesum", csum);
+        }
+        lean_dec(cres);
+        lean_dec(csrc);
     }
 }
 

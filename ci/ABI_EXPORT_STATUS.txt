@@ -313,9 +313,9 @@ extern lean_io_mono_nanos_now | CompatWrapper | crates/fln-unsafe-abi/src/export
 extern lean_io_error_to_string | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
 extern lean_io_allocprof | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
 extern lean_io_timeit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
-extern lean_runtime_forget | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
-extern lean_runtime_mark_multi_threaded | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice (the mark_mt core is live; this is its Runtime.* extern skin)
-extern lean_runtime_mark_persistent | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice (the mark_persistent core is live; this is its Runtime.* extern skin)
-extern lean_string_validate_utf8 | Unsupported | fln-3gv | stage0 IO.c demand audit | string family, later slice
-extern lean_byte_array_copy_slice | Unsupported | fln-3gv | stage0 IO.c demand audit | byte-array family, later slice
+extern lean_runtime_forget | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 IO.c demand audit | the owned argument DELIBERATELY leaked, unit answered; the pin's ASAN ignore has no observable (io.cpp:1618-1626; fln-3gv slice 7b)
+extern lean_runtime_mark_multi_threaded | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 IO.c demand audit | the live mark_mt core's Runtime.* skin: mark and answer the owned argument (io.cpp:1602-1605; fln-3gv slice 7b)
+extern lean_runtime_mark_persistent | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 IO.c demand audit | the live mark_persistent core's Runtime.* skin (io.cpp:1607-1610; fln-3gv slice 7b)
+extern lean_string_validate_utf8 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 IO.c demand audit | the utf8 validator over a borrowed ByteArray (object.cpp:2037-2040; fln-3gv slice 7b)
+extern lean_byte_array_copy_slice | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 IO.c demand audit | arm-for-arm: src-offset early return, length and dest-offset clamps, grow-to-max, ensure-capacity(exact)/ensure-exclusive, non-overlapping copy (object.cpp:2584-2603; fln-3gv slice 7b)
 extern lean_initialize_runtime_module | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stream trio suites; gauntlet corpus facts | the generated-main init entry (init_module.cpp:19-29); Marrow's eager half is the io stream trio + SIGPIPE disposition, every other pin plane static or lazily seeded

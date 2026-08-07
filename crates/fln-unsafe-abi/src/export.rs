@@ -3546,3 +3546,176 @@ pub(crate) extern "C" fn export_lean_stream_of_handle(h: *mut LeanObject) -> *mu
 pub(crate) extern "C" fn export_lean_initialize_runtime_module() {
     crate::stdio::initialize_streams();
 }
+
+/// `lean_nat_to_size_t` (`object.cpp:2496-2508`): a scalar unboxes; a big
+/// Nat that fits `size_t` yields its value and releases the object; one
+/// that does not is the pin's internal out-of-memory panic.
+///
+/// # Safety
+/// `n` is a live Nat, consumed exactly as the pin's `obj_arg`.
+// UNSAFE-LEDGER: FLN-UL-0401
+#[allow(unsafe_code)]
+unsafe fn nat_to_usize(n: *mut LeanObject) -> usize {
+    if is_scalar(n) {
+        return crate::tagged::unbox(n);
+    }
+    // SAFETY: live mpz Nat per contract; the view does not escape.
+    let value = unsafe {
+        with_nat_view(n, |v| {
+            let limbs = v.limbs_le();
+            match limbs.len() {
+                0 => Some(0usize),
+                1 => usize::try_from(limbs[0]).ok(),
+                _ => None,
+            }
+        })
+    };
+    let Some(value) = value else {
+        internal_panic_impl("out of memory");
+    };
+    // SAFETY: the pin releases the consumed big Nat after reading it.
+    unsafe {
+        rc::dec_ref(n);
+    }
+    value
+}
+
+/// `lean_sarray_ensure_capacity` (`object.cpp:2534-2542`): at least
+/// `min_cap`, doubling on copy unless `exact`.
+///
+/// # Safety
+/// `a` live scalar array whose reference the caller yields.
+// UNSAFE-LEDGER: FLN-UL-0402
+#[allow(unsafe_code)]
+unsafe fn sarray_ensure_capacity(
+    a: *mut LeanObject,
+    min_cap: usize,
+    exact: bool,
+) -> *mut LeanObject {
+    // SAFETY: delegated salient reads and copies.
+    unsafe {
+        let (_, _, cap, _) = object::sarray_fields(a);
+        if min_cap <= cap {
+            a
+        } else {
+            copy_sarray(a, if exact { min_cap } else { min_cap * 2 })
+        }
+    }
+}
+
+/// `lean_sarray_ensure_exclusive` (`object.cpp:2525-2531`).
+///
+/// # Safety
+/// `a` live scalar array whose reference the caller yields.
+// UNSAFE-LEDGER: FLN-UL-0408
+#[allow(unsafe_code)]
+unsafe fn sarray_ensure_exclusive(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: delegated salient reads and copies.
+    unsafe {
+        if is_exclusive(a) {
+            a
+        } else {
+            let (_, _, cap, _) = object::sarray_fields(a);
+            copy_sarray(a, cap)
+        }
+    }
+}
+
+/// `lean_runtime_mark_multi_threaded` (`io.cpp:1602-1605`; extern census
+/// `Runtime.markMultiThreaded`): the live mark_mt core's Runtime.* skin.
+// UNSAFE-LEDGER: FLN-UL-0403
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_runtime_mark_multi_threaded")]
+pub(crate) extern "C" fn export_lean_runtime_mark_multi_threaded(
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned live object; marking never frees.
+    unsafe {
+        rc::mark_mt(a);
+    }
+    a
+}
+
+/// `lean_runtime_mark_persistent` (`io.cpp:1607-1610`; extern census
+/// `Runtime.markPersistent`).
+// UNSAFE-LEDGER: FLN-UL-0404
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_runtime_mark_persistent")]
+pub(crate) extern "C" fn export_lean_runtime_mark_persistent(
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned live object; marking never frees.
+    unsafe {
+        rc::mark_persistent(a);
+    }
+    a
+}
+
+/// `lean_runtime_forget` (`io.cpp:1618-1626`; extern census
+/// `Runtime.forget`): the owned argument is DELIBERATELY leaked — that is
+/// the operation — and unit is answered. The pin's ASAN ignore is a
+/// sanitizer-build detail with no observable.
+// UNSAFE-LEDGER: FLN-UL-0405
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_runtime_forget")]
+pub(crate) extern "C" fn export_lean_runtime_forget(_o: *mut LeanObject) -> *mut LeanObject {
+    crate::tagged::boxi(0)
+}
+
+/// `lean_string_validate_utf8` (`object.cpp:2037-2040`; extern census
+/// `String.validateUTF8`): the validator over a borrowed ByteArray.
+// UNSAFE-LEDGER: FLN-UL-0406
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_validate_utf8")]
+pub(crate) extern "C" fn export_lean_string_validate_utf8(a: *mut LeanObject) -> u8 {
+    // SAFETY: borrowed live sarray per the b_obj_arg contract.
+    unsafe {
+        let (_, sz, _, data) = object::sarray_fields(a);
+        let bytes = if sz == 0 {
+            &[][..]
+        } else {
+            core::slice::from_raw_parts(data, sz)
+        };
+        let mut pos = 0usize;
+        let mut i = 0usize;
+        u8::from(validate_utf8(bytes, &mut pos, &mut i))
+    }
+}
+
+/// `lean_byte_array_copy_slice` (`object.cpp:2584-2603`), arm-for-arm:
+/// the src-offset early return, the length clamp, the dest-offset clamp,
+/// the grow-to-max sizing, ensure-capacity(exact)/ensure-exclusive, and
+/// the non-overlapping copy the exclusivity guarantees.
+// UNSAFE-LEDGER: FLN-UL-0407
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_byte_array_copy_slice")]
+pub(crate) extern "C" fn export_lean_byte_array_copy_slice(
+    src: *mut LeanObject,
+    o_src_off: *mut LeanObject,
+    dest: *mut LeanObject,
+    o_dest_off: *mut LeanObject,
+    o_len: *mut LeanObject,
+    exact: bool,
+) -> *mut LeanObject {
+    // SAFETY: src borrowed, dest and the three Nats consumed per the pin's
+    // signature; the copy targets an exclusive array sized to hold it.
+    unsafe {
+        let (_, ssz, _, sdata) = object::sarray_fields(src);
+        let (_, dsz, _, _) = object::sarray_fields(dest);
+        let src_off = nat_to_usize(o_src_off);
+        if src_off > ssz {
+            return dest;
+        }
+        let len = nat_to_usize(o_len).min(ssz - src_off);
+        let mut dest_off = nat_to_usize(o_dest_off);
+        if dest_off > dsz {
+            dest_off = dsz;
+        }
+        let new_dsz = dsz.max(dest_off + len);
+        let r = sarray_ensure_exclusive(sarray_ensure_capacity(dest, new_dsz, exact));
+        (&raw mut (*r.cast::<crate::layout::LeanSarrayObject>()).m_size).write(new_dsz);
+        let (_, _, _, rdata) = object::sarray_fields(r);
+        core::ptr::copy_nonoverlapping(sdata.add(src_off), rdata.add(dest_off), len);
+        r
+    }
+}

@@ -4623,3 +4623,122 @@ fn export_stdio_reproduces_the_env_misc_family() {
         std::env::remove_var(&probe_var)
     };
 }
+
+#[test]
+fn export_runtime_skins_and_byte_array_copy_slice() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_byte_array_copy_slice, export_lean_runtime_forget,
+        export_lean_runtime_mark_multi_threaded, export_lean_runtime_mark_persistent,
+        export_lean_string_validate_utf8,
+    };
+
+    crate::stdio::initialize_streams();
+    // The mark skins run pre-shadow: a persistent object is immortal by
+    // design (process-lifetime residue, like the initial stream trio).
+    // SAFETY: fresh objects; marking never frees.
+    // UNSAFE-LEDGER: FLN-UL-0409
+    #[allow(unsafe_code)]
+    unsafe {
+        let a = crate::object::alloc_ctor(0, 0, 8);
+        assert_eq!(
+            export_lean_runtime_mark_multi_threaded(a),
+            a,
+            "the mt skin answers its own argument (io.cpp:1602-1605)"
+        );
+        let b = crate::object::alloc_ctor(0, 0, 8);
+        assert_eq!(
+            export_lean_runtime_mark_persistent(b),
+            b,
+            "the persistent skin answers its own argument"
+        );
+    }
+
+    shadow::enable();
+    // SAFETY: every object below is settled or DELIBERATELY leaked where
+    // the pin's operation is the leak.
+    // UNSAFE-LEDGER: FLN-UL-0410
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk_ba = |bytes: &[u8]| -> *mut crate::layout::LeanObject {
+            let a = crate::object::alloc_sarray(1, bytes.len(), bytes.len().max(1));
+            let (_, _, _, data) = crate::object::sarray_fields(a);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+            a
+        };
+
+        // validate_utf8: both verdicts over borrowed ByteArrays.
+        let ok = mk_ba("payload \u{2200}".as_bytes());
+        assert_eq!(export_lean_string_validate_utf8(ok), 1, "valid bytes");
+        let bad = mk_ba(&[b'a', 0xFF, b'b']);
+        assert_eq!(export_lean_string_validate_utf8(bad), 0, "invalid byte");
+        crate::rc::dec_ref(bad);
+        crate::rc::dec_ref(ok);
+
+        // copy_slice: the main arm — clamps, grow-to-max, exclusive copy.
+        let src = mk_ba(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let dest = mk_ba(&[0, 0, 0, 0]);
+        let r = export_lean_byte_array_copy_slice(
+            src,
+            crate::tagged::boxi(2),
+            dest,
+            crate::tagged::boxi(1),
+            crate::tagged::boxi(5),
+            true,
+        );
+        let (_, rsz, _, rdata) = crate::object::sarray_fields(r);
+        assert_eq!(rsz, 6, "new size = max(dsz, dest_off + len)");
+        assert_eq!(
+            core::slice::from_raw_parts(rdata, rsz),
+            &[0, 3, 4, 5, 6, 7],
+            "prefix preserved, five source bytes from offset 2"
+        );
+        // src-offset beyond the source answers dest unchanged.
+        let dest2 = mk_ba(&[9, 9]);
+        let r2 = export_lean_byte_array_copy_slice(
+            src,
+            crate::tagged::boxi(100),
+            dest2,
+            crate::tagged::boxi(0),
+            crate::tagged::boxi(1),
+            true,
+        );
+        assert_eq!(r2, dest2, "out-of-range src offset is the identity arm");
+        let (_, r2sz, _, r2data) = crate::object::sarray_fields(r2);
+        assert_eq!(core::slice::from_raw_parts(r2data, r2sz), &[9, 9]);
+        // length clamps to the source remainder.
+        let dest3 = mk_ba(&[]);
+        let r3 = export_lean_byte_array_copy_slice(
+            src,
+            crate::tagged::boxi(8),
+            dest3,
+            crate::tagged::boxi(0),
+            crate::tagged::boxi(100),
+            false,
+        );
+        let (_, r3sz, _, r3data) = crate::object::sarray_fields(r3);
+        assert_eq!(
+            core::slice::from_raw_parts(r3data, r3sz),
+            &[9, 10],
+            "len clamps to ssz - src_off"
+        );
+        crate::rc::dec_ref(r3);
+        crate::rc::dec_ref(r2);
+        crate::rc::dec_ref(r);
+        crate::rc::dec_ref(src);
+
+        // forget: unit answered, the argument LEAKED — the operation.
+        let leaked = crate::object::alloc_ctor(0, 0, 8);
+        assert_eq!(
+            export_lean_runtime_forget(leaked),
+            crate::tagged::boxi(0),
+            "forget answers unit"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 1,
+        "exactly the forgotten object survives — the leak IS the observable"
+    );
+    crate::membrane::drain_small_bins_for_test();
+}
