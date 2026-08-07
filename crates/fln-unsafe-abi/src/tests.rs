@@ -3950,3 +3950,96 @@ fn export_stdio_reproduces_the_get_line_arms_with_lossy_recovery() {
     assert_eq!(live, 0, "RC balance across the get_line cell");
     std::fs::remove_file(&scratch).ok();
 }
+
+#[test]
+fn export_stdio_reproduces_the_handle_ctl_arms_with_lock_contention() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_io_prim_handle_lock, export_lean_io_prim_handle_mk,
+        export_lean_io_prim_handle_put_str, export_lean_io_prim_handle_read,
+        export_lean_io_prim_handle_rewind, export_lean_io_prim_handle_truncate,
+        export_lean_io_prim_handle_try_lock, export_lean_io_prim_handle_unlock,
+    };
+
+    // The remaining handle prims (fln-3gv slice 5d): rewind and truncate as
+    // a roundtrip on one r+ handle (io.cpp:560-582), and the flock family
+    // as a REAL contention pair — flock is per open file description, so a
+    // second open of the same path observes the first's exclusive lock
+    // (io.cpp:480-512, non-Windows arms).
+    let scratch = std::env::temp_dir().join(format!("fln-handle-ctl-{}", std::process::id()));
+    let scratch_str = scratch.to_str().expect("temp path is UTF-8").to_string();
+
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the arms run
+    // through the exports exactly as compiled Handle code would drive them,
+    // with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0343
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let open = |path: &str, mode: u8, what: &str| -> *mut crate::layout::LeanObject {
+            let fname = mk(path);
+            let r = export_lean_io_prim_handle_mk(fname, mode);
+            assert_eq!((&raw const (*r).m_tag).read(), 0, "{what}: mk ok");
+            let h = crate::object::ctor_get(r, 0);
+            crate::rc::inc_ref_n(h, 1);
+            crate::rc::dec_ref(r);
+            crate::rc::dec_ref(fname);
+            h
+        };
+        let expect_unit = |r: *mut crate::layout::LeanObject, what: &str| {
+            assert_eq!((&raw const (*r).m_tag).read(), 0, "{what}: ok arm");
+            crate::rc::dec_ref(r);
+        };
+
+        // -- rewind + truncate roundtrip on one r+ handle (mode 3).
+        std::fs::write(&scratch, b"").expect("scratch seeded");
+        let h = open(&scratch_str, 3, "ctl handle");
+        let payload = mk("hello world");
+        expect_unit(export_lean_io_prim_handle_put_str(h, payload), "putStr");
+        crate::rc::dec_ref(payload);
+        expect_unit(export_lean_io_prim_handle_rewind(h), "rewind");
+        let chunk = export_lean_io_prim_handle_read(h, 5);
+        assert_eq!((&raw const (*chunk).m_tag).read(), 0, "read-5 ok");
+        let ba = crate::object::ctor_get(chunk, 0);
+        let (_, n, _, data) = crate::object::sarray_fields(ba);
+        assert_eq!(core::slice::from_raw_parts(data, n), b"hello", "seek+read");
+        crate::rc::dec_ref(chunk);
+        expect_unit(export_lean_io_prim_handle_truncate(h), "truncate");
+        crate::rc::dec_ref(h); // finalizer fcloses
+        assert_eq!(
+            std::fs::read(&scratch).expect("truncated file"),
+            b"hello",
+            "truncate cut at the current offset (io.cpp:570-582)"
+        );
+
+        // -- the flock contention pair over two opens of one path.
+        let h1 = open(&scratch_str, 0, "lock holder");
+        let h2 = open(&scratch_str, 0, "lock prober");
+        expect_unit(export_lean_io_prim_handle_lock(h1, 1), "exclusive lock");
+        let busy = export_lean_io_prim_handle_try_lock(h2, 1);
+        assert_eq!((&raw const (*busy).m_tag).read(), 0, "tryLock held: ok arm");
+        assert_eq!(
+            crate::object::ctor_get(busy, 0),
+            crate::tagged::boxi(0),
+            "held elsewhere is ok FALSE, never an error (io.cpp:495-499)"
+        );
+        crate::rc::dec_ref(busy);
+        expect_unit(export_lean_io_prim_handle_unlock(h1), "unlock");
+        let free = export_lean_io_prim_handle_try_lock(h2, 1);
+        assert_eq!((&raw const (*free).m_tag).read(), 0, "tryLock free: ok arm");
+        assert_eq!(
+            crate::object::ctor_get(free, 0),
+            crate::tagged::boxi(1),
+            "acquisition is ok TRUE"
+        );
+        crate::rc::dec_ref(free);
+        expect_unit(export_lean_io_prim_handle_unlock(h2), "prober unlock");
+        crate::rc::dec_ref(h2);
+        crate::rc::dec_ref(h1);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the handle-ctl cell");
+    std::fs::remove_file(&scratch).ok();
+}

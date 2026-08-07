@@ -72,6 +72,11 @@ extern lean_object *lean_io_prim_handle_mk(lean_object *filename, uint8_t mode);
 extern lean_object *lean_io_prim_handle_put_str(lean_object *h, lean_object *s);
 extern lean_object *lean_io_prim_handle_read(lean_object *h, size_t nbytes);
 extern lean_object *lean_io_prim_handle_get_line(lean_object *h);
+extern lean_object *lean_io_prim_handle_rewind(lean_object *h);
+extern lean_object *lean_io_prim_handle_truncate(lean_object *h);
+extern lean_object *lean_io_prim_handle_lock(lean_object *h, uint8_t x);
+extern lean_object *lean_io_prim_handle_try_lock(lean_object *h, uint8_t x);
+extern lean_object *lean_io_prim_handle_unlock(lean_object *h);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -834,6 +839,95 @@ static void facts_mode(void) {
     }
     lean_dec(igl_rh);
     remove(igl_path);
+
+    /* ---- fln-3gv slice 5d: the remaining handle prims (io.cpp:480-582,
+     * non-Windows arms) — rewind/truncate as a roundtrip on one r+ handle,
+     * and the flock family as a real contention pair across two opens of
+     * one path (flock is per open file description). */
+    char ictl_path[128];
+    snprintf(ictl_path, sizeof ictl_path, "/tmp/fln-handle-ctl-%lld",
+             (long long)getpid());
+    remove(ictl_path);
+    {
+        FILE *seed = fopen(ictl_path, "w");
+        fclose(seed);
+    }
+    lean_object *ictl_fname = lean_mk_string(ictl_path);
+    lean_object *ictl_hres = lean_io_prim_handle_mk(ictl_fname, 3);
+    fact("corpus.handle_ctl.mk_ok", lean_ptr_tag(ictl_hres) == 0);
+    lean_object *ictl_h = lean_ctor_get(ictl_hres, 0);
+    lean_inc(ictl_h);
+    lean_dec(ictl_hres);
+    lean_object *ictl_payload = lean_mk_string("hello world");
+    lean_object *ictl_pres = lean_io_prim_handle_put_str(ictl_h, ictl_payload);
+    fact("corpus.handle_ctl.put_ok", lean_ptr_tag(ictl_pres) == 0);
+    lean_dec(ictl_pres);
+    lean_dec(ictl_payload);
+    lean_object *ictl_rw = lean_io_prim_handle_rewind(ictl_h);
+    fact("corpus.handle_ctl.rewind_ok", lean_ptr_tag(ictl_rw) == 0);
+    lean_dec(ictl_rw);
+    lean_object *ictl_chunk = lean_io_prim_handle_read(ictl_h, 5);
+    fact("corpus.handle_ctl.read_ok", lean_ptr_tag(ictl_chunk) == 0);
+    {
+        lean_object *ictl_ba = lean_ctor_get(ictl_chunk, 0);
+        long long ictl_n = (long long)lean_sarray_size(ictl_ba);
+        uint8_t *ictl_p = lean_sarray_cptr(ictl_ba);
+        long long ictl_sum = 0;
+        for (long long i = 0; i < ictl_n; i++) {
+            ictl_sum += ictl_p[i];
+        }
+        fact("corpus.handle_ctl.read_bytes", ictl_n);
+        fact("corpus.handle_ctl.read_bytesum", ictl_sum);
+    }
+    lean_dec(ictl_chunk);
+    lean_object *ictl_tr = lean_io_prim_handle_truncate(ictl_h);
+    fact("corpus.handle_ctl.truncate_ok", lean_ptr_tag(ictl_tr) == 0);
+    lean_dec(ictl_tr);
+    lean_dec(ictl_h); /* fclose */
+    {
+        FILE *check = fopen(ictl_path, "r");
+        long long csum = 0, cn = 0;
+        int cc;
+        while ((cc = fgetc(check)) != EOF) {
+            csum += cc;
+            cn++;
+        }
+        fclose(check);
+        fact("corpus.handle_ctl.post_truncate_bytes", cn);
+        fact("corpus.handle_ctl.post_truncate_bytesum", csum);
+    }
+    lean_object *ictl_f1 = lean_mk_string(ictl_path);
+    lean_object *ictl_h1res = lean_io_prim_handle_mk(ictl_f1, 0);
+    lean_object *ictl_h1 = lean_ctor_get(ictl_h1res, 0);
+    lean_inc(ictl_h1);
+    lean_dec(ictl_h1res);
+    lean_object *ictl_h2res = lean_io_prim_handle_mk(ictl_f1, 0);
+    lean_object *ictl_h2 = lean_ctor_get(ictl_h2res, 0);
+    lean_inc(ictl_h2);
+    lean_dec(ictl_h2res);
+    lean_dec(ictl_f1);
+    lean_dec(ictl_fname);
+    lean_object *ictl_lk = lean_io_prim_handle_lock(ictl_h1, 1);
+    fact("corpus.handle_ctl.lock_ok", lean_ptr_tag(ictl_lk) == 0);
+    lean_dec(ictl_lk);
+    lean_object *ictl_busy = lean_io_prim_handle_try_lock(ictl_h2, 1);
+    fact("corpus.handle_ctl.trylock_held_ok", lean_ptr_tag(ictl_busy) == 0);
+    fact("corpus.handle_ctl.trylock_held_value",
+         lean_unbox(lean_ctor_get(ictl_busy, 0)));
+    lean_dec(ictl_busy);
+    lean_object *ictl_un = lean_io_prim_handle_unlock(ictl_h1);
+    fact("corpus.handle_ctl.unlock_ok", lean_ptr_tag(ictl_un) == 0);
+    lean_dec(ictl_un);
+    lean_object *ictl_free = lean_io_prim_handle_try_lock(ictl_h2, 1);
+    fact("corpus.handle_ctl.trylock_free_ok", lean_ptr_tag(ictl_free) == 0);
+    fact("corpus.handle_ctl.trylock_free_value",
+         lean_unbox(lean_ctor_get(ictl_free, 0)));
+    lean_dec(ictl_free);
+    lean_object *ictl_un2 = lean_io_prim_handle_unlock(ictl_h2);
+    lean_dec(ictl_un2);
+    lean_dec(ictl_h2);
+    lean_dec(ictl_h1);
+    remove(ictl_path);
 }
 
 int main(int argc, char **argv) {
