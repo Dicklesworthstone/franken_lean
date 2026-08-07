@@ -4898,3 +4898,85 @@ fn export_stdio_reproduces_the_error_to_string_arms() {
     assert_eq!(live, 0, "RC balance across the pretty-printer cell");
     crate::membrane::drain_small_bins_for_test();
 }
+
+#[test]
+fn export_stdio_reproduces_get_line_over_the_process_stdin() {
+    let _g = lock();
+    use crate::export::{export_lean_io_prim_handle_get_line, export_lean_io_prim_handle_mk};
+
+    // The stdin cell (fln-3gv slice 8c): the subject is FD 0 ITSELF. A
+    // fixture is dup2'd onto stdin under the suite lock, the handle opens
+    // /dev/stdin through the real mk prim, and getLine's four arms run
+    // against the process's own standard input — the path the stdin
+    // stream's getLine field wraps, minus the closure hop that is 7xe's.
+    crate::stdio::initialize_streams();
+    // UNSAFE-LEDGER: FLN-UL-0421
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn dup2(old: i32, new: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    let base = std::env::temp_dir().join(format!("fln-stdin-cell-rs-{}", std::process::id()));
+    std::fs::write(&base, b"stdin one\nb\xFFr\nend").expect("seed fixture");
+
+    shadow::enable();
+    // SAFETY: fd 0 is process-global; the suite lock serializes the swap,
+    // and the saved descriptor restores it before the cell ends. Every
+    // object is settled.
+    // UNSAFE-LEDGER: FLN-UL-0422
+    #[allow(unsafe_code)]
+    unsafe {
+        use std::os::unix::io::IntoRawFd;
+        let fixture = std::fs::File::open(&base)
+            .expect("open fixture")
+            .into_raw_fd();
+        let saved0 = dup(0);
+        assert!(saved0 >= 0 && fixture >= 0, "descriptor apparatus ready");
+        assert_eq!(dup2(fixture, 0), 0, "fixture onto fd 0");
+        close(fixture);
+
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let fname = mk("/dev/stdin");
+        let mres = export_lean_io_prim_handle_mk(fname, 0);
+        assert_eq!((&raw const (*mres).m_tag).read(), 0, "/dev/stdin opens");
+        let h = crate::object::ctor_get(mres, 0);
+        crate::rc::inc_ref_n(h, 1);
+        crate::rc::dec_ref(mres);
+        crate::rc::dec_ref(fname);
+
+        let take_line = |h: *mut crate::layout::LeanObject| -> Vec<u8> {
+            let res = export_lean_io_prim_handle_get_line(h);
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "getLine ok arm");
+            let s = crate::object::ctor_get(res, 0);
+            let (sz, _, _, b) = crate::object::string_fields(s);
+            let out = b[..sz - 1].to_vec();
+            crate::rc::dec_ref(res);
+            out
+        };
+        assert_eq!(
+            take_line(h),
+            b"stdin one\n",
+            "terminated line, newline retained"
+        );
+        assert_eq!(
+            take_line(h),
+            "b\u{FFFD}r\n".as_bytes(),
+            "the raw 0xFF recovers lossily as U+FFFD on stdin exactly as on a file"
+        );
+        assert_eq!(take_line(h), b"end", "EOF partial line answers ok");
+        assert_eq!(
+            take_line(h),
+            b"",
+            "read at EOF is the empty string, still ok"
+        );
+        crate::rc::dec_ref(h);
+
+        assert_eq!(dup2(saved0, 0), 0, "fd 0 restored");
+        close(saved0);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the stdin cell");
+    std::fs::remove_file(&base).ok();
+    crate::membrane::drain_small_bins_for_test();
+}
