@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void fact(const char *probe, long long value) {
@@ -88,6 +89,8 @@ extern lean_object *lean_io_remove_file(lean_object *filename);
 extern lean_object *lean_io_hard_link(lean_object *orig, lean_object *link);
 extern lean_object *lean_io_create_tempfile(lean_object *w);
 extern lean_object *lean_io_create_tempdir(lean_object *w);
+extern lean_object *lean_io_metadata(lean_object *filename);
+extern lean_object *lean_io_symlink_metadata(lean_object *filename);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -1150,6 +1153,66 @@ static void facts_mode(void) {
         lean_dec(itmp_td);
         rmdir(dcopy);
     }
+
+    /* ---- fln-3gv slice 6d: the metadata family (io.cpp:1107-1165) — a
+     * planted 137-byte file's size/nlink/type, the stat-vs-lstat symlink
+     * split, and the missing arm's uv variant. Timestamps differ between
+     * the two runtimes' runs, so the time fact is window membership, not
+     * the raw value. */
+    char imd_file[160], imd_sym[160];
+    snprintf(imd_file, sizeof imd_file, "/tmp/fln-md-%lld-file",
+             (long long)getpid());
+    snprintf(imd_sym, sizeof imd_sym, "/tmp/fln-md-%lld-sym",
+             (long long)getpid());
+    remove(imd_sym);
+    remove(imd_file);
+    {
+        FILE *pf = fopen(imd_file, "w");
+        for (int i = 0; i < 137; i++) {
+            fputc(7, pf);
+        }
+        fclose(pf);
+    }
+    long long imd_before = (long long)time(NULL);
+    fact("corpus.metadata.symlink_planted", symlink(imd_file, imd_sym) == 0);
+    lean_object *imd_file_obj = lean_mk_string(imd_file);
+    lean_object *imd_md = lean_io_metadata(imd_file_obj);
+    fact("corpus.metadata.file_ok", lean_ptr_tag(imd_md) == 0);
+    {
+        lean_object *md = lean_ctor_get(imd_md, 0);
+        fact("corpus.metadata.file_size",
+             (long long)lean_ctor_get_uint64(md, 2 * sizeof(void *)));
+        fact("corpus.metadata.file_nlink",
+             (long long)lean_ctor_get_uint64(md, 2 * sizeof(void *) + 8));
+        fact("corpus.metadata.file_type",
+             lean_ctor_get_uint8(md, 2 * sizeof(void *) + 16));
+        lean_object *mtime = lean_ctor_get(md, 1);
+        long long sec = (long long)(int)(unsigned)lean_unbox(lean_ctor_get(mtime, 0));
+        long long imd_after = (long long)time(NULL);
+        fact("corpus.metadata.file_mtime_in_window",
+             sec >= imd_before - 5 && sec <= imd_after);
+    }
+    lean_dec(imd_md);
+    lean_object *imd_sym_obj = lean_mk_string(imd_sym);
+    lean_object *imd_smd = lean_io_metadata(imd_sym_obj);
+    fact("corpus.metadata.sym_stat_type",
+         lean_ctor_get_uint8(lean_ctor_get(imd_smd, 0), 2 * sizeof(void *) + 16));
+    lean_dec(imd_smd);
+    lean_object *imd_lmd = lean_io_symlink_metadata(imd_sym_obj);
+    fact("corpus.metadata.sym_lstat_type",
+         lean_ctor_get_uint8(lean_ctor_get(imd_lmd, 0), 2 * sizeof(void *) + 16));
+    lean_dec(imd_lmd);
+    lean_object *imd_missing = lean_mk_string("/tmp/fln-md-definitely-missing");
+    lean_object *imd_err = lean_io_metadata(imd_missing);
+    fact("corpus.metadata.missing_err", lean_ptr_tag(imd_err) == 1);
+    fact("corpus.metadata.missing_variant",
+         lean_ptr_tag(lean_ctor_get(imd_err, 0)));
+    lean_dec(imd_err);
+    lean_dec(imd_missing);
+    lean_dec(imd_sym_obj);
+    lean_dec(imd_file_obj);
+    remove(imd_sym);
+    remove(imd_file);
 }
 
 int main(int argc, char **argv) {

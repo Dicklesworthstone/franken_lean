@@ -4384,3 +4384,98 @@ fn export_stdio_reproduces_the_temp_family_pair_and_dir() {
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the temp-family cell");
 }
+
+#[test]
+fn export_stdio_reproduces_the_metadata_family_with_symlink_split() {
+    let _g = lock();
+    use crate::export::{export_lean_io_metadata, export_lean_io_symlink_metadata};
+
+    // The metadata family (fln-3gv slice 6d): byteSize/nlink/type over a
+    // planted file, type-dir over a directory, and the stat-vs-lstat split
+    // over a symlink — metadata follows (file, 1), symlink_metadata does
+    // not (symlink, 2). Timestamps land inside the test's own clock window.
+    let base = std::env::temp_dir().join(format!("fln-md-{}", std::process::id()));
+    let base_str = base.to_str().expect("temp path is UTF-8").to_string();
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::create_dir(&base).expect("scratch base");
+    let file = format!("{base_str}/file.bin");
+    let sym = format!("{base_str}/sym");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    std::fs::write(&file, [7u8; 137]).expect("planted file");
+    std::os::unix::fs::symlink(&file, &sym).expect("planted symlink");
+
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here.
+    // UNSAFE-LEDGER: FLN-UL-0378
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let take_md = |res: *mut crate::layout::LeanObject, what: &str| -> (u64, u64, u8, i64) {
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "{what}: ok arm");
+            let md = crate::object::ctor_get(res, 0);
+            let size = crate::object::ctor_get_scalar::<u64>(md, 2 * size_of::<usize>());
+            let nlink = crate::object::ctor_get_scalar::<u64>(
+                md,
+                2 * size_of::<usize>() + size_of::<u64>(),
+            );
+            let ftype = crate::object::ctor_get_scalar::<u8>(
+                md,
+                2 * size_of::<usize>() + 2 * size_of::<u64>(),
+            );
+            let mtime = crate::object::ctor_get(md, 1);
+            let sec_box = crate::object::ctor_get(mtime, 0);
+            let sec = crate::tagged::unbox(sec_box) as u32 as i32 as i64;
+            let out = (size, nlink, ftype, sec);
+            crate::rc::dec_ref(res);
+            out
+        };
+
+        let file_obj = mk(&file);
+        let (size, nlink, ftype, sec) = take_md(export_lean_io_metadata(file_obj), "file");
+        assert_eq!(size, 137, "byteSize is the planted length");
+        assert_eq!(nlink, 1, "one hard link");
+        assert_eq!(ftype, 1, "FileType.file");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        assert!(
+            (before..=after).contains(&sec),
+            "mtime sec {sec} within the test's own window [{before}, {after}]"
+        );
+
+        let dir_obj = mk(&base_str);
+        let (_, _, dtype, _) = take_md(export_lean_io_metadata(dir_obj), "dir");
+        assert_eq!(dtype, 0, "FileType.dir");
+        crate::rc::dec_ref(dir_obj);
+
+        let sym_obj = mk(&sym);
+        let (ssize, _, stype, _) = take_md(export_lean_io_metadata(sym_obj), "sym via stat");
+        assert_eq!(stype, 1, "metadata FOLLOWS the symlink");
+        assert_eq!(ssize, 137, "and reports the target's size");
+        let (_, _, ltype, _) = take_md(export_lean_io_symlink_metadata(sym_obj), "sym via lstat");
+        assert_eq!(ltype, 2, "symlink_metadata answers FileType.symlink");
+        crate::rc::dec_ref(sym_obj);
+
+        // The missing arm keeps the uv shape.
+        let missing = mk(&format!("{base_str}/nope"));
+        let err = export_lean_io_metadata(missing);
+        assert_eq!((&raw const (*err).m_tag).read(), 1, "missing: error arm");
+        let e = crate::object::ctor_get(err, 0);
+        assert_eq!(
+            (&raw const (*e).m_tag).read(),
+            crate::stdio::ERR_NO_FILE_OR_DIRECTORY,
+            "noFileOrDirectory through the uv decoder"
+        );
+        crate::rc::dec_ref(err);
+        crate::rc::dec_ref(missing);
+        crate::rc::dec_ref(file_obj);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the metadata cell");
+    std::fs::remove_dir_all(&base).ok();
+}

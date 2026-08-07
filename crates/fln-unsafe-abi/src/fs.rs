@@ -51,6 +51,8 @@ unsafe extern "C" {
     fn mkostemp(template: *mut c_char, flags: c_int) -> c_int;
     fn mkdtemp(template: *mut c_char) -> *mut c_char;
     fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
+    fn stat(path: *const c_char, buf: *mut c_void) -> c_int;
+    fn lstat(path: *const c_char, buf: *mut c_void) -> c_int;
     fn unlink(path: *const c_char) -> c_int;
     fn link(orig: *const c_char, new_path: *const c_char) -> c_int;
 }
@@ -594,5 +596,168 @@ pub(crate) unsafe fn prim_create_tempdir() -> *mut LeanObject {
             template.as_ptr().cast::<c_char>(),
             template.len() - 1,
         ))
+    }
+}
+
+// ------------------------------------------------- the metadata family
+
+// Measured stat(2) layout facts (errno_extract.c; glibc x86-64).
+const STAT_SIZE: usize = 144;
+const STAT_ST_MODE_OFFSET: usize = 24;
+const STAT_ST_NLINK_OFFSET: usize = 16;
+const STAT_ST_SIZE_OFFSET: usize = 48;
+const STAT_ST_ATIM_OFFSET: usize = 72;
+const STAT_ST_MTIM_OFFSET: usize = 88;
+const S_IFMT_MASK: u32 = 61440;
+const S_IFDIR_BITS: u32 = 16384;
+const S_IFREG_BITS: u32 = 32768;
+const S_IFLNK_BITS: u32 = 40960;
+
+/// `lean_int64_to_int`'s small arm (`lean.h:1618-1623`): a value inside
+/// [INT_MIN, INT_MAX] boxes as `lean_box((unsigned)(int)n)`. The big arm is
+/// `lean_big_int64_to_int`, which is the bignum shim's Unsupported census
+/// row — unreachable for any real filesystem timestamp before the year
+/// 2038 rolls st_atim past INT_MAX, and refused typed rather than
+/// fabricated when it is.
+fn int64_to_int(n: i64) -> *mut LeanObject {
+    if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&n) {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        tagged::boxi((n as i32) as u32 as usize)
+    } else {
+        crate::export::internal_panic_impl(
+            "metadata: timestamp outside the small-Int range needs the bignum shim \
+             (lean_big_int64_to_int, Unsupported census row)",
+        )
+    }
+}
+
+/// `timespec_to_obj` (`io.cpp:1107-1112`): the `SystemTime` ctor — sec as
+/// Int in field 0, nsec as the u32 scalar.
+///
+/// # Safety
+/// Caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0372
+#[allow(unsafe_code)]
+unsafe fn timespec_to_obj(sec: i64, nsec: u32) -> *mut LeanObject {
+    // SAFETY: fresh ctor, every slot initialized before escape.
+    unsafe {
+        let o = object::alloc_ctor(0, 1, 4);
+        object::ctor_set(o, 0, int64_to_int(sec));
+        object::ctor_set_scalar::<u32>(o, size_of::<usize>(), nsec);
+        o
+    }
+}
+
+/// `metadata_core` (`io.cpp:1114-1129`): the `Metadata` ctor over the raw
+/// stat buffer — accessed/modified SystemTimes, byteSize and nlink as u64
+/// scalars, and the FileType byte (dir 0, file 1, symlink 2, other 3).
+///
+/// # Safety
+/// `buf` holds a stat(2)-filled `struct stat`.
+// UNSAFE-LEDGER: FLN-UL-0373
+#[allow(unsafe_code)]
+unsafe fn metadata_core(buf: &[u8; STAT_SIZE]) -> *mut LeanObject {
+    // SAFETY: field reads at the measured offsets within the fixed-size
+    // buffer; fresh ctor slots initialized before escape.
+    unsafe {
+        let read_u64 = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let read_i64 = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let mode = u32::from_le_bytes(
+            buf[STAT_ST_MODE_OFFSET..STAT_ST_MODE_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let mdata = object::alloc_ctor(0, 2, 2 * size_of::<u64>() + 1);
+        object::ctor_set(
+            mdata,
+            0,
+            timespec_to_obj(
+                read_i64(STAT_ST_ATIM_OFFSET),
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                {
+                    read_i64(STAT_ST_ATIM_OFFSET + 8) as u32
+                },
+            ),
+        );
+        object::ctor_set(
+            mdata,
+            1,
+            timespec_to_obj(
+                read_i64(STAT_ST_MTIM_OFFSET),
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                {
+                    read_i64(STAT_ST_MTIM_OFFSET + 8) as u32
+                },
+            ),
+        );
+        object::ctor_set_scalar::<u64>(
+            mdata,
+            2 * size_of::<usize>(),
+            read_u64(STAT_ST_SIZE_OFFSET),
+        );
+        object::ctor_set_scalar::<u64>(
+            mdata,
+            2 * size_of::<usize>() + size_of::<u64>(),
+            read_u64(STAT_ST_NLINK_OFFSET),
+        );
+        let ftype: u8 = match mode & S_IFMT_MASK {
+            m if m == S_IFDIR_BITS => 0,
+            m if m == S_IFREG_BITS => 1,
+            m if m == S_IFLNK_BITS => 2,
+            _ => 3,
+        };
+        object::ctor_set_scalar::<u8>(mdata, 2 * size_of::<usize>() + 2 * size_of::<u64>(), ftype);
+        io_result_mk_ok(mdata)
+    }
+}
+
+/// `lean_io_metadata` (`io.cpp:1131-1146`): stat through the uv decoder.
+///
+/// # Safety
+/// `filename` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0374
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_metadata(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live string per contract; the stat buffer is stack-local.
+    unsafe {
+        let Some(bytes) = cstr_of(filename) else {
+            return mk_embedded_nul_error(filename);
+        };
+        let mut buf = [0u8; STAT_SIZE];
+        if stat(
+            bytes.as_ptr().cast::<c_char>(),
+            buf.as_mut_ptr().cast::<c_void>(),
+        ) != 0
+        {
+            io_result_mk_error(decode_uv_error(-errno(), filename))
+        } else {
+            metadata_core(&buf)
+        }
+    }
+}
+
+/// `lean_io_symlink_metadata` (`io.cpp:1148-1165`, the non-Windows arm):
+/// lstat through the uv decoder.
+///
+/// # Safety
+/// `filename` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0375
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_symlink_metadata(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live string per contract; the stat buffer is stack-local.
+    unsafe {
+        let Some(bytes) = cstr_of(filename) else {
+            return mk_embedded_nul_error(filename);
+        };
+        let mut buf = [0u8; STAT_SIZE];
+        if lstat(
+            bytes.as_ptr().cast::<c_char>(),
+            buf.as_mut_ptr().cast::<c_void>(),
+        ) != 0
+        {
+            io_result_mk_error(decode_uv_error(-errno(), filename))
+        } else {
+            metadata_core(&buf)
+        }
     }
 }

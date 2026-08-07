@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #define P(n) printf("pub(crate) const %s: c_int = %d;\n", #n, n)
 int main(void) {
     P(EINTR); P(ELOOP); P(ENAMETOOLONG); P(EDESTADDRREQ); P(EBADF); P(EDOM);
@@ -34,5 +35,21 @@ int main(void) {
     printf(
         "pub(crate) const DIRENT_D_NAME_OFFSET: usize = %zu;\n",
         offsetof(struct dirent, d_name));
+    /* fln-3gv slice 6d: the stat(2) layout facts metadata_core reads. */
+    printf("pub(crate) const STAT_SIZE: usize = %zu;\n", sizeof(struct stat));
+    printf("pub(crate) const STAT_ST_MODE_OFFSET: usize = %zu;\n",
+           offsetof(struct stat, st_mode));
+    printf("pub(crate) const STAT_ST_NLINK_OFFSET: usize = %zu;\n",
+           offsetof(struct stat, st_nlink));
+    printf("pub(crate) const STAT_ST_SIZE_OFFSET: usize = %zu;\n",
+           offsetof(struct stat, st_size));
+    printf("pub(crate) const STAT_ST_ATIM_OFFSET: usize = %zu;\n",
+           offsetof(struct stat, st_atim));
+    printf("pub(crate) const STAT_ST_MTIM_OFFSET: usize = %zu;\n",
+           offsetof(struct stat, st_mtim));
+    printf("pub(crate) const S_IFMT_MASK: u32 = %u;\n", (unsigned)S_IFMT);
+    printf("pub(crate) const S_IFDIR_BITS: u32 = %u;\n", (unsigned)S_IFDIR);
+    printf("pub(crate) const S_IFREG_BITS: u32 = %u;\n", (unsigned)S_IFREG);
+    printf("pub(crate) const S_IFLNK_BITS: u32 = %u;\n", (unsigned)S_IFLNK);
     return 0;
 }

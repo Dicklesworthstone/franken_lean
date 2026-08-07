@@ -3396,6 +3396,29 @@ pub(crate) extern "C" fn export_lean_io_create_tempdir(_w: *mut LeanObject) -> *
     unsafe { crate::fs::prim_create_tempdir() }
 }
 
+/// `lean_io_metadata` (`io.cpp:1131-1146`; extern census
+/// `IO.FS.metadata`): stat into the pin's Metadata ctor, failure through
+/// the measured uv decoder.
+// UNSAFE-LEDGER: FLN-UL-0376
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_metadata")]
+pub(crate) extern "C" fn export_lean_io_metadata(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_metadata(filename) }
+}
+
+/// `lean_io_symlink_metadata` (`io.cpp:1148-1165`; extern census
+/// `IO.FS.symlinkMetadata`): lstat, otherwise as metadata.
+// UNSAFE-LEDGER: FLN-UL-0377
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_symlink_metadata")]
+pub(crate) extern "C" fn export_lean_io_symlink_metadata(
+    filename: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_symlink_metadata(filename) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302
