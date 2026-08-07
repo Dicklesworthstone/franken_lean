@@ -1,0 +1,71 @@
+uvrow EINTR -4 10 4294967292 interrupted system call
+uvrow ELOOP -40 12 4294967256 too many symbolic links encountered
+uvrow ENAMETOOLONG -36 12 4294967260 name too long
+uvrow EDESTADDRREQ -89 12 4294967207 destination address required
+uvrow EBADF -9 12 4294967287 bad file descriptor
+uvrow EDOM -33 1 4294967263 Unknown system error -33
+uvrow EINVAL -22 12 4294967274 invalid argument
+uvrow EILSEQ -84 12 4294967212 illegal byte sequence
+uvrow ENOEXEC -8 1 4294967288 Unknown system error -8
+uvrow ENOSTR -60 1 4294967236 Unknown system error -60
+uvrow ENOTCONN -107 12 4294967189 socket is not connected
+uvrow ENOTSOCK -88 12 4294967208 socket operation on non-socket
+uvrow ENOENT -2 11 4294967294 no such file or directory
+uvrow EACCES -13 13 4294967283 permission denied
+uvrow EROFS -30 13 4294967266 read-only file system
+uvrow ECONNABORTED -103 13 4294967193 software caused connection abort
+uvrow EFBIG -27 13 4294967269 file too large
+uvrow EPERM -1 13 4294967295 operation not permitted
+uvrow EMFILE -24 14 4294967272 too many open files
+uvrow ENFILE -23 14 4294967273 file table overflow
+uvrow ENOSPC -28 14 4294967268 no space left on device
+uvrow E2BIG -7 14 4294967289 argument list too long
+uvrow EAGAIN -11 14 4294967285 resource temporarily unavailable
+uvrow EMLINK -31 14 4294967265 too many links
+uvrow EMSGSIZE -90 14 4294967206 message too long
+uvrow ENOBUFS -105 14 4294967191 no buffer space available
+uvrow ENOLCK -37 1 4294967259 Unknown system error -37
+uvrow ENOMEM -12 14 4294967284 not enough memory
+uvrow ENOSR -63 1 4294967233 Unknown system error -63
+uvrow EISDIR -21 15 4294967275 illegal operation on a directory
+uvrow EBADMSG -74 1 4294967222 Unknown system error -74
+uvrow ENOTDIR -20 15 4294967276 not a directory
+uvrow ENXIO -6 16 4294967290 no such device or address
+uvrow EHOSTUNREACH -113 16 4294967183 host is unreachable
+uvrow ENETUNREACH -101 16 4294967195 network is unreachable
+uvrow ECHILD -10 1 4294967286 Unknown system error -10
+uvrow ECONNREFUSED -111 16 4294967185 connection refused
+uvrow ENODATA -61 16 4294967235 no data available
+uvrow ENOMSG -42 1 4294967254 Unknown system error -42
+uvrow ESRCH -3 16 4294967293 no such process
+uvrow EEXIST -17 0 4294967279 file already exists
+uvrow EINPROGRESS -115 1 4294967181 Unknown system error -115
+uvrow EISCONN -106 0 4294967190 socket is already connected
+uvrow EIO -5 5 4294967291 i/o error
+uvrow ENOTEMPTY -39 6 4294967257 directory not empty
+uvrow ENOTTY -25 7 4294967271 inappropriate ioctl for device
+uvrow ECONNRESET -104 3 4294967192 connection reset by peer
+uvrow EIDRM -43 1 4294967253 Unknown system error -43
+uvrow ENETDOWN -100 3 4294967196 network is down
+uvrow ENETRESET -102 1 4294967194 Unknown system error -102
+uvrow ENOLINK -67 1 4294967229 Unknown system error -67
+uvrow EPIPE -32 3 4294967264 broken pipe
+uvrow EPROTO -71 8 4294967225 protocol error
+uvrow EPROTONOSUPPORT -93 8 4294967203 protocol not supported
+uvrow EPROTOTYPE -91 8 4294967205 protocol wrong type for socket
+uvrow ETIME -62 1 4294967234 Unknown system error -62
+uvrow ETIMEDOUT -110 9 4294967186 connection timed out
+uvrow EADDRINUSE -98 2 4294967198 address already in use
+uvrow EBUSY -16 2 4294967280 resource busy or locked
+uvrow EDEADLK -35 1 4294967261 Unknown system error -35
+uvrow ETXTBSY -26 2 4294967270 text file is busy
+uvrow EADDRNOTAVAIL -99 4 4294967197 address not available
+uvrow EAFNOSUPPORT -97 4 4294967199 address family not supported
+uvrow ENODEV -19 4 4294967277 no such device
+uvrow ENOPROTOOPT -92 4 4294967204 protocol not available
+uvrow ENOSYS -38 4 4294967258 function not implemented
+uvrow EOPNOTSUPP -95 4 4294967201 operation not supported on socket
+uvrow ERANGE -34 4 4294967262 result too large
+uvrow ESPIPE -29 4 4294967267 invalid seek
+uvrow EXDEV -18 4 4294967278 cross-device link not permitted
+uvrow EFAULT -14 1 4294967282 bad address in system call argument

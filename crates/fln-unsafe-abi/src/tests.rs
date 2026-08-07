@@ -4217,3 +4217,86 @@ fn export_stdio_reproduces_the_fs_dir_family_with_error_arms() {
     assert_eq!(live, 0, "RC balance across the fs-dir cell");
     std::fs::remove_dir_all(&base).ok();
 }
+
+#[test]
+fn export_stdio_reproduces_the_uv_decoded_pair_with_negative_codes() {
+    let _g = lock();
+    use crate::export::{export_lean_io_hard_link, export_lean_io_remove_file};
+
+    // The uv-decoded pair (fln-3gv slice 6b): the pin routes removeFile and
+    // hardLink through libuv, so a failure carries libuv's observables, not
+    // glibc's — the osCode is the NEGATED errno wrapped to u32, and the
+    // details are uv_strerror's lowercase strings, both measured from the
+    // Reference in tribunal/fixtures/c4/uv_error_contract.txt.
+    let base = std::env::temp_dir().join(format!("fln-uv-pair-{}", std::process::id()));
+    let base_str = base.to_str().expect("temp path is UTF-8").to_string();
+    let orig = format!("{base_str}-orig");
+    let linked = format!("{base_str}-link");
+    std::fs::remove_file(&orig).ok();
+    std::fs::remove_file(&linked).ok();
+    std::fs::write(&orig, b"payload").expect("orig seeded");
+
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here.
+    // UNSAFE-LEDGER: FLN-UL-0366
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let orig_obj = mk(&orig);
+        let link_obj = mk(&linked);
+
+        // hard_link then read through the second name.
+        let hl = export_lean_io_hard_link(orig_obj, link_obj);
+        assert_eq!((&raw const (*hl).m_tag).read(), 0, "hard_link: ok arm");
+        crate::rc::dec_ref(hl);
+        assert_eq!(
+            std::fs::read(&linked).expect("linked name readable"),
+            b"payload",
+            "both names reach the same inode"
+        );
+
+        // remove_file through the export, then the MISSING arm: the uv
+        // shape end to end.
+        let rm = export_lean_io_remove_file(link_obj);
+        assert_eq!((&raw const (*rm).m_tag).read(), 0, "remove_file: ok arm");
+        crate::rc::dec_ref(rm);
+        assert!(!std::path::Path::new(&linked).exists(), "link removed");
+        let rm2 = export_lean_io_remove_file(link_obj);
+        assert_eq!(
+            (&raw const (*rm2).m_tag).read(),
+            1,
+            "remove-missing: error arm"
+        );
+        let err = crate::object::ctor_get(rm2, 0);
+        assert_eq!(
+            (&raw const (*err).m_tag).read(),
+            crate::stdio::ERR_NO_FILE_OR_DIRECTORY,
+            "noFileOrDirectory variant"
+        );
+        let code = crate::object::ctor_get_scalar::<u32>(err, 2 * size_of::<usize>());
+        assert_eq!(
+            code,
+            (-(crate::stdio::ENOENT as i64)) as u32,
+            "osCode is the WRAPPED NEGATIVE of ENOENT — libuv's code, not glibc's"
+        );
+        let details = crate::object::ctor_get(err, 1);
+        let (dsz, _, _, dbytes) = crate::object::string_fields(details);
+        assert_eq!(
+            &dbytes[..dsz - 1],
+            b"no such file or directory",
+            "uv_strerror's lowercase string, not glibc's capitalized one"
+        );
+        crate::rc::dec_ref(rm2);
+
+        // Clean up the original through the prim too (second ok arm).
+        let rm3 = export_lean_io_remove_file(orig_obj);
+        assert_eq!((&raw const (*rm3).m_tag).read(), 0, "orig removed");
+        crate::rc::dec_ref(rm3);
+
+        crate::rc::dec_ref(link_obj);
+        crate::rc::dec_ref(orig_obj);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the uv-pair cell");
+}

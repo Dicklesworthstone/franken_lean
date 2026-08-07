@@ -27,8 +27,9 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::layout::LeanObject;
 use crate::stdio::{
-    ERR_NO_FILE_OR_DIRECTORY, decode_io_error, errno, io_result_mk_error, io_result_mk_ok,
-    mk_embedded_nul_error, mk_string,
+    ERR_NO_FILE_OR_DIRECTORY, decode_io_error, err_code_details, err_file_code_details,
+    err_optfile_code_details, errno, io_result_mk_error, io_result_mk_ok, mk_embedded_nul_error,
+    mk_string, opt_of_borrowed,
 };
 use crate::{object, rc, tagged};
 
@@ -46,6 +47,8 @@ unsafe extern "C" {
     fn opendir(name: *const c_char) -> *mut c_void;
     fn readdir(dirp: *mut c_void) -> *mut c_void;
     fn closedir(dirp: *mut c_void) -> c_int;
+    fn unlink(path: *const c_char) -> c_int;
+    fn link(orig: *const c_char, new_path: *const c_char) -> c_int;
 }
 
 // Measured constants (errno_extract.c on this platform's headers).
@@ -298,5 +301,195 @@ pub(crate) unsafe fn prim_read_dir(dirname: *mut LeanObject) -> *mut LeanObject 
             crate::export::internal_panic_impl("read_dir: closedir failed");
         }
         io_result_mk_ok(arr)
+    }
+}
+
+// ------------------------------------------------- the uv-decoded members
+
+use crate::stdio::{
+    E2BIG, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF, EBADMSG, EBUSY, ECHILD,
+    ECONNABORTED, ECONNREFUSED, ECONNRESET, EDEADLK, EDESTADDRREQ, EDOM, EEXIST, EFAULT, EFBIG,
+    EHOSTUNREACH, EIDRM, EILSEQ, EINPROGRESS, EINTR, EINVAL, EIO, EISCONN, EISDIR, ELOOP, EMFILE,
+    EMLINK, EMSGSIZE, ENAMETOOLONG, ENETDOWN, ENETRESET, ENETUNREACH, ENFILE, ENOBUFS, ENODATA,
+    ENODEV, ENOENT, ENOEXEC, ENOLCK, ENOLINK, ENOMEM, ENOMSG, ENOPROTOOPT, ENOSPC, ENOSR, ENOSTR,
+    ENOSYS, ENOTCONN, ENOTDIR, ENOTEMPTY, ENOTSOCK, ENOTTY, ENXIO, EOPNOTSUPP, EPERM, EPIPE,
+    EPROTO, EPROTONOSUPPORT, EPROTOTYPE, ERANGE, EROFS, ESPIPE, ESRCH, ETIME, ETIMEDOUT, ETXTBSY,
+    EXDEV,
+};
+
+// GENERATED from `tribunal/fixtures/c4/uv_error_contract.txt` — measured by
+// `uv_error_extract.c` from the Reference's own exported
+// `lean_decode_uv_error` at the pin (D5/D9: mined, never hand-transcribed).
+// Regenerate with the extractor; never hand-edit a row.
+// (errno, IO.Error variant tag, libuv uv_strerror details.)
+#[rustfmt::skip]
+const UV_ERROR_ROWS: &[(c_int, u8, &str)] = &[
+    (EINTR, 10, "interrupted system call"),
+    (ELOOP, 12, "too many symbolic links encountered"),
+    (ENAMETOOLONG, 12, "name too long"),
+    (EDESTADDRREQ, 12, "destination address required"),
+    (EBADF, 12, "bad file descriptor"),
+    (EDOM, 1, "Unknown system error -33"),
+    (EINVAL, 12, "invalid argument"),
+    (EILSEQ, 12, "illegal byte sequence"),
+    (ENOEXEC, 1, "Unknown system error -8"),
+    (ENOSTR, 1, "Unknown system error -60"),
+    (ENOTCONN, 12, "socket is not connected"),
+    (ENOTSOCK, 12, "socket operation on non-socket"),
+    (ENOENT, 11, "no such file or directory"),
+    (EACCES, 13, "permission denied"),
+    (EROFS, 13, "read-only file system"),
+    (ECONNABORTED, 13, "software caused connection abort"),
+    (EFBIG, 13, "file too large"),
+    (EPERM, 13, "operation not permitted"),
+    (EMFILE, 14, "too many open files"),
+    (ENFILE, 14, "file table overflow"),
+    (ENOSPC, 14, "no space left on device"),
+    (E2BIG, 14, "argument list too long"),
+    (EAGAIN, 14, "resource temporarily unavailable"),
+    (EMLINK, 14, "too many links"),
+    (EMSGSIZE, 14, "message too long"),
+    (ENOBUFS, 14, "no buffer space available"),
+    (ENOLCK, 1, "Unknown system error -37"),
+    (ENOMEM, 14, "not enough memory"),
+    (ENOSR, 1, "Unknown system error -63"),
+    (EISDIR, 15, "illegal operation on a directory"),
+    (EBADMSG, 1, "Unknown system error -74"),
+    (ENOTDIR, 15, "not a directory"),
+    (ENXIO, 16, "no such device or address"),
+    (EHOSTUNREACH, 16, "host is unreachable"),
+    (ENETUNREACH, 16, "network is unreachable"),
+    (ECHILD, 1, "Unknown system error -10"),
+    (ECONNREFUSED, 16, "connection refused"),
+    (ENODATA, 16, "no data available"),
+    (ENOMSG, 1, "Unknown system error -42"),
+    (ESRCH, 16, "no such process"),
+    (EEXIST, 0, "file already exists"),
+    (EINPROGRESS, 1, "Unknown system error -115"),
+    (EISCONN, 0, "socket is already connected"),
+    (EIO, 5, "i/o error"),
+    (ENOTEMPTY, 6, "directory not empty"),
+    (ENOTTY, 7, "inappropriate ioctl for device"),
+    (ECONNRESET, 3, "connection reset by peer"),
+    (EIDRM, 1, "Unknown system error -43"),
+    (ENETDOWN, 3, "network is down"),
+    (ENETRESET, 1, "Unknown system error -102"),
+    (ENOLINK, 1, "Unknown system error -67"),
+    (EPIPE, 3, "broken pipe"),
+    (EPROTO, 8, "protocol error"),
+    (EPROTONOSUPPORT, 8, "protocol not supported"),
+    (EPROTOTYPE, 8, "protocol wrong type for socket"),
+    (ETIME, 1, "Unknown system error -62"),
+    (ETIMEDOUT, 9, "connection timed out"),
+    (EADDRINUSE, 2, "address already in use"),
+    (EBUSY, 2, "resource busy or locked"),
+    (EDEADLK, 1, "Unknown system error -35"),
+    (ETXTBSY, 2, "text file is busy"),
+    (EADDRNOTAVAIL, 4, "address not available"),
+    (EAFNOSUPPORT, 4, "address family not supported"),
+    (ENODEV, 4, "no such device"),
+    (ENOPROTOOPT, 4, "protocol not available"),
+    (ENOSYS, 4, "function not implemented"),
+    (EOPNOTSUPP, 4, "operation not supported on socket"),
+    (ERANGE, 4, "result too large"),
+    (ESPIPE, 4, "invalid seek"),
+    (EXDEV, 4, "cross-device link not permitted"),
+    (EFAULT, 1, "bad address in system call argument"),
+];
+
+/// The `lean_decode_uv_error` twin (`io.cpp:258-363`) for the fs members
+/// the pin routes through libuv: the input is libuv's NEGATED errno (what
+/// `uv_fs_unlink`/`uv_fs_link` return on POSIX), the stored osCode is that
+/// negative value wrapped into u32 exactly as the pin's int-to-uint32
+/// conversion, and the details are libuv's `uv_strerror` strings — measured
+/// per errno in the generated table above, with libuv's own
+/// "Unknown system error N" shape for every code its map lacks.
+///
+/// # Safety
+/// `fname` is borrowed and live; caller owns the result.
+// UNSAFE-LEDGER: FLN-UL-0361
+#[allow(unsafe_code)]
+unsafe fn decode_uv_error(neg: c_int, fname: *mut LeanObject) -> *mut LeanObject {
+    let e = -neg;
+    let (tag, details_text) = UV_ERROR_ROWS
+        .iter()
+        .find(|&&(row_e, _, _)| row_e == e)
+        .map_or_else(
+            || (1u8, format!("Unknown system error {neg}")),
+            |&(_, t, d)| (t, d.to_string()),
+        );
+    let code = neg as u32;
+    // SAFETY: every builder consumes its freshly built arguments; the
+    // ctor families are exactly the errno decoder's (the pin keeps the two
+    // switches in sync and the measured tags confirm it).
+    unsafe {
+        let details = mk_string(&details_text);
+        match tag {
+            // (filename : String) families — interrupted, noFileOrDirectory.
+            10 | 11 => {
+                rc::inc_ref_n(fname, 1);
+                err_file_code_details(tag, fname, code, details)
+            }
+            // (filename : Option String) families.
+            0 | 12 | 13 | 14 | 15 | 16 => {
+                err_optfile_code_details(tag, opt_of_borrowed(fname), code, details)
+            }
+            // (osCode, details) families and the default arm.
+            _ => err_code_details(tag, code, details),
+        }
+    }
+}
+
+/// `lean_io_remove_file` (`io.cpp:1339-1350`, the non-Windows arm): the
+/// pin calls `uv_fs_unlink`, which on POSIX is unlink(2) answering the
+/// NEGATED errno; failure decodes through the uv decoder with the filename.
+///
+/// # Safety
+/// `filename` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0362
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_remove_file(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live string per contract; fresh result objects.
+    unsafe {
+        let Some(bytes) = cstr_of(filename) else {
+            return mk_embedded_nul_error(filename);
+        };
+        if unlink(bytes.as_ptr().cast::<c_char>()) == 0 {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_uv_error(-errno(), filename))
+        }
+    }
+}
+
+/// `lean_io_hard_link` (`io.cpp:1229-1245`): the pin calls `uv_fs_link`
+/// (link(2) on POSIX); failure decodes through the uv decoder with the
+/// ORIG path, exactly the pin's argument choice.
+///
+/// # Safety
+/// `orig` and `link_path` are borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0363
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_hard_link(
+    orig: *mut LeanObject,
+    link_path: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: live strings per contract; fresh result objects.
+    unsafe {
+        let Some(orig_bytes) = cstr_of(orig) else {
+            return mk_embedded_nul_error(orig);
+        };
+        let Some(link_bytes) = cstr_of(link_path) else {
+            return mk_embedded_nul_error(link_path);
+        };
+        if link(
+            orig_bytes.as_ptr().cast::<c_char>(),
+            link_bytes.as_ptr().cast::<c_char>(),
+        ) == 0
+        {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_uv_error(-errno(), orig))
+        }
     }
 }

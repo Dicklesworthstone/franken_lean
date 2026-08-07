@@ -84,6 +84,8 @@ extern lean_object *lean_io_rename(lean_object *from, lean_object *to);
 extern lean_object *lean_io_current_dir(void);
 extern lean_object *lean_io_realpath(lean_object *filename);
 extern lean_object *lean_io_read_dir(lean_object *dirname);
+extern lean_object *lean_io_remove_file(lean_object *filename);
+extern lean_object *lean_io_hard_link(lean_object *orig, lean_object *link);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -1039,6 +1041,54 @@ static void facts_mode(void) {
     lean_dec(ifs_sub2_obj);
     lean_dec(ifs_sub_obj);
     lean_dec(ifs_base_obj);
+
+    /* ---- fln-3gv slice 6b: the uv-decoded pair (io.cpp:1229-1245,
+     * 1339-1350) — hardLink + removeFile, and the missing arm's uv shape:
+     * osCode is the NEGATED errno wrapped to u32 and the details are
+     * uv_strerror's strings, both distinct from the glibc decoder's. */
+    char iuv_orig[160], iuv_link[160];
+    snprintf(iuv_orig, sizeof iuv_orig, "/tmp/fln-uv-pair-%lld-orig",
+             (long long)getpid());
+    snprintf(iuv_link, sizeof iuv_link, "/tmp/fln-uv-pair-%lld-link",
+             (long long)getpid());
+    remove(iuv_orig);
+    remove(iuv_link);
+    {
+        FILE *seed = fopen(iuv_orig, "w");
+        fputs("payload", seed);
+        fclose(seed);
+    }
+    lean_object *iuv_orig_obj = lean_mk_string(iuv_orig);
+    lean_object *iuv_link_obj = lean_mk_string(iuv_link);
+    lean_object *iuv_hl = lean_io_hard_link(iuv_orig_obj, iuv_link_obj);
+    fact("corpus.uv_pair.hardlink_ok", lean_ptr_tag(iuv_hl) == 0);
+    lean_dec(iuv_hl);
+    lean_object *iuv_rm = lean_io_remove_file(iuv_link_obj);
+    fact("corpus.uv_pair.remove_ok", lean_ptr_tag(iuv_rm) == 0);
+    lean_dec(iuv_rm);
+    lean_object *iuv_rm2 = lean_io_remove_file(iuv_link_obj);
+    fact("corpus.uv_pair.remove_missing_err", lean_ptr_tag(iuv_rm2) == 1);
+    {
+        lean_object *iuv_err = lean_ctor_get(iuv_rm2, 0);
+        fact("corpus.uv_pair.remove_missing_variant", lean_ptr_tag(iuv_err));
+        fact("corpus.uv_pair.remove_missing_code",
+             (long long)lean_ctor_get_uint32(iuv_err, 2 * sizeof(void *)));
+        lean_object *iuv_details = lean_ctor_get(iuv_err, 1);
+        const uint8_t *dp = (const uint8_t *)lean_string_cstr(iuv_details);
+        long long dn = (long long)lean_string_size(iuv_details) - 1;
+        long long dsum = 0;
+        for (long long i = 0; i < dn; i++) {
+            dsum += dp[i];
+        }
+        fact("corpus.uv_pair.remove_missing_details_bytes", dn);
+        fact("corpus.uv_pair.remove_missing_details_bytesum", dsum);
+    }
+    lean_dec(iuv_rm2);
+    lean_object *iuv_rm3 = lean_io_remove_file(iuv_orig_obj);
+    fact("corpus.uv_pair.remove_orig_ok", lean_ptr_tag(iuv_rm3) == 0);
+    lean_dec(iuv_rm3);
+    lean_dec(iuv_link_obj);
+    lean_dec(iuv_orig_obj);
 }
 
 int main(int argc, char **argv) {

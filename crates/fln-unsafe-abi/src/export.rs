@@ -3348,6 +3348,33 @@ pub(crate) extern "C" fn export_lean_io_read_dir(dirname: *mut LeanObject) -> *m
     unsafe { crate::fs::prim_read_dir(dirname) }
 }
 
+/// `lean_io_remove_file` (`io.cpp:1339-1350`; extern census
+/// `IO.FS.removeFile`): unlink through the uv-error decoder — the pin
+/// routes this member through libuv, so its failure carries libuv's
+/// NEGATED code and uv_strerror details, measured in
+/// `tribunal/fixtures/c4/uv_error_contract.txt`.
+// UNSAFE-LEDGER: FLN-UL-0364
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_remove_file")]
+pub(crate) extern "C" fn export_lean_io_remove_file(filename: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live string per the b_obj_arg contract.
+    unsafe { crate::fs::prim_remove_file(filename) }
+}
+
+/// `lean_io_hard_link` (`io.cpp:1229-1245`; extern census
+/// `IO.FS.Handle`-adjacent `hardLink`): link(2) through the uv-error
+/// decoder, failure attributed to the ORIG path as the pin's.
+// UNSAFE-LEDGER: FLN-UL-0365
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_hard_link")]
+pub(crate) extern "C" fn export_lean_io_hard_link(
+    orig: *mut LeanObject,
+    link_path: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: both borrowed and live per the b_obj_arg contract.
+    unsafe { crate::fs::prim_hard_link(orig, link_path) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302

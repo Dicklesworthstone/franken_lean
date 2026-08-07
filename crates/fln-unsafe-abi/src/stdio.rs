@@ -275,7 +275,11 @@ pub(crate) unsafe fn io_result_mk_error(e: *mut LeanObject) -> *mut LeanObject {
 /// `details` is consumed; caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0276
 #[allow(unsafe_code)]
-unsafe fn err_code_details(tag: u8, code: u32, details: *mut LeanObject) -> *mut LeanObject {
+pub(crate) unsafe fn err_code_details(
+    tag: u8,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
     // SAFETY: fresh ctor, every slot initialized before escape.
     unsafe {
         let r = object::alloc_ctor(tag, 1, 4);
@@ -293,7 +297,7 @@ unsafe fn err_code_details(tag: u8, code: u32, details: *mut LeanObject) -> *mut
 /// `fname_opt` and `details` are consumed; caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0277
 #[allow(unsafe_code)]
-unsafe fn err_optfile_code_details(
+pub(crate) unsafe fn err_optfile_code_details(
     tag: u8,
     fname_opt: *mut LeanObject,
     code: u32,
@@ -339,7 +343,7 @@ pub(crate) unsafe fn err_file_code_details(
 /// `fname` is borrowed (may be null); caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0279
 #[allow(unsafe_code)]
-unsafe fn opt_of_borrowed(fname: *mut LeanObject) -> *mut LeanObject {
+pub(crate) unsafe fn opt_of_borrowed(fname: *mut LeanObject) -> *mut LeanObject {
     if fname.is_null() {
         return tagged::boxi(0);
     }

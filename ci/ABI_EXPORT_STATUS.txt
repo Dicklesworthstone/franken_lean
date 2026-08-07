@@ -284,12 +284,12 @@ extern lean_io_create_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs 
 extern lean_io_create_tempdir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_create_tempfile | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_current_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | getcwd; failure is the pin's bare userError, never an errno decode (io.cpp:1409-1417; fln-3gv slice 6a)
-extern lean_io_hard_link | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_hard_link | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | link(2) through the uv-error decoder, failure attributed to the ORIG path (io.cpp:1229-1245; fln-3gv slice 6b)
 extern lean_io_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_read_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | opendir/readdir with dot entries skipped; DirEntry ctors over the validating string constructor (io.cpp:1064-1086; fln-3gv slice 6a)
 extern lean_io_realpath | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | realpath; filename arrives OWNED per the pin's own obj_arg signature; failure is noFileOrDirectory with EMPTY details (io.cpp:1002-1055 non-Windows arm; fln-3gv slice 6a)
 extern lean_io_remove_dir | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | rmdir (io.cpp:1185-1195; fln-3gv slice 6a)
-extern lean_io_remove_file | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
+extern lean_io_remove_file | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | uv-routed removal prim: negated code, uv_strerror details measured in tribunal/fixtures/c4/uv_error_contract.txt (io.cpp:1339-1350; fln-3gv slice 6b)
 extern lean_io_rename | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | rename(2); failure decodes errno against the pin's synthesized A-and/or-B filename (io.cpp:1197-1227 non-Windows arm; fln-3gv slice 6a)
 extern lean_io_symlink_metadata | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_app_path | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
