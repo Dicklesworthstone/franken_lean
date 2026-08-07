@@ -544,7 +544,10 @@ impl Manager {
         };
         let in_pool = matches!(cur_prio, Some(p) if p <= LEAN_MAX_PRIO);
         if cur_prio == Some(LEAN_SYNC_PRIO) {
-            crate::export::panic_impl(b"PANIC: `Task.get` called from a `(sync := true)` task");
+            crate::export::panic_impl(
+                b"PANIC: `Task.get` called from a `(sync := true)` task",
+                false,
+            );
         }
         if in_pool {
             g.max_std_workers += 1;

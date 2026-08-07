@@ -132,6 +132,10 @@ extern lean_object *lean_io_error_to_string(lean_object *err);
 extern lean_object *lean_io_exit(uint8_t code);
 extern lean_object *lean_io_force_exit(uint8_t code);
 
+/* fln-3gv slice 8d extern (extern-census class): the stderr get_set twin of
+ * the get_set_stdout already declared above (io.cpp:119-127). */
+extern lean_object *lean_get_set_stderr(lean_object *h);
+
 /* Slice 8a fixture builders: every IO.Error ctor shape synthesized directly
  * over the generated layout (IOError.c: 1-obj-field families u32 at
  * sizeof(void*)*1, 2-obj-field families at sizeof(void*)*2), so the arm
@@ -1533,6 +1537,46 @@ static void facts_mode(void) {
         dup2(sin_saved0, 0);
         close(sin_saved0);
         remove(sin_path);
+    }
+
+    /* ---- fln-3gv slice 8d: the panic-hook seam's native half — a
+     * NON-FATAL panic's message routes through the thread-current stderr
+     * STREAM (panic_eprintln's io_eprintln arm, object.cpp:130-137): one
+     * putStr of msg ++ "\n". LEAN_BACKTRACE=0 keeps the Reference's
+     * address-nondeterministic backtrace block out of the stream so the
+     * file bytes are deterministic on both runtimes; exit_on_panic is
+     * never set here, so the panic returns and the process continues. */
+    {
+        setenv("LEAN_BACKTRACE", "0", 1);
+        char pnc_path[128];
+        snprintf(pnc_path, sizeof pnc_path, "/tmp/fln-panic-stream-%lld",
+                 (long long)getpid());
+        remove(pnc_path);
+        lean_object *pnc_fname = lean_mk_string(pnc_path);
+        lean_object *pnc_hres = lean_io_prim_handle_mk(pnc_fname, 1);
+        fact("corpus.panic_stream.mk_ok", lean_ptr_tag(pnc_hres) == 0);
+        lean_object *pnc_h = lean_ctor_get(pnc_hres, 0);
+        lean_inc(pnc_h);
+        lean_dec(pnc_hres);
+        lean_dec(pnc_fname);
+        lean_object *pnc_old =
+            lean_get_set_stderr(lean_stream_of_handle(pnc_h));
+        lean_object *pnc_ret =
+            lean_panic_fn(lean_box(0), lean_mk_string("gauntlet-nonfatal-panic"));
+        fact("corpus.panic_stream.default_answered", pnc_ret == lean_box(0));
+        lean_dec(lean_get_set_stderr(pnc_old));
+        {
+            FILE *back = fopen(pnc_path, "r");
+            char pbuf[128];
+            size_t prd = back ? fread(pbuf, 1, sizeof pbuf, back) : 0;
+            if (back) {
+                fclose(back);
+            }
+            fact("corpus.panic_stream.bytes", (long long)prd);
+            fact("corpus.panic_stream.sum", bytesum(pbuf, prd));
+        }
+        remove(pnc_path);
+        unsetenv("LEAN_BACKTRACE");
     }
 }
 

@@ -4980,3 +4980,82 @@ fn export_stdio_reproduces_get_line_over_the_process_stdin() {
     std::fs::remove_file(&base).ok();
     crate::membrane::drain_small_bins_for_test();
 }
+
+#[test]
+fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
+    let _g = lock();
+    use crate::export::{export_lean_panic_fn, export_lean_set_panic_messages};
+
+    // The panic-hook seam's native half (fln-3gv slice 8d, seam measured in
+    // bead comment 2111): a NON-FATAL panic's message routes through the
+    // thread-current stderr stream — one putStr of msg ++ "\n" — when that
+    // stream's putStr is this crate's native closure; a foreign-closure
+    // stream falls back to the process stderr (the disclosed 7xe boundary);
+    // and panic_messages=false silences both arms.
+    crate::stdio::initialize_streams();
+    let base = std::env::temp_dir().join(format!("fln-panic-stream-{}", std::process::id()));
+
+    shadow::enable();
+    // SAFETY: stream and handle objects settled; fd/stream state restored
+    // before the cell ends; the panic under test is non-fatal by
+    // construction (exit_on_panic false, no abort env).
+    // UNSAFE-LEDGER: FLN-UL-0424
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+
+        // A writable handle-backed stream becomes the current stderr.
+        let fname = mk(base.to_str().expect("utf8 temp path"));
+        let mres = crate::stdio::prim_handle_mk(fname, 1);
+        assert_eq!((&raw const (*mres).m_tag).read(), 0, "scratch handle opens");
+        let h = crate::object::ctor_get(mres, 0);
+        crate::rc::inc_ref_n(h, 1);
+        crate::rc::dec_ref(mres);
+        crate::rc::dec_ref(fname);
+        let stream = crate::stdio::stream_of_handle(h);
+        let old = crate::stdio::get_set_stderr(stream);
+
+        // The non-fatal panic: message into the STREAM, default answered.
+        let r = export_lean_panic_fn(crate::tagged::boxi(0), mk("boom via stream"));
+        assert_eq!(r, crate::tagged::boxi(0), "panic_fn answers its default");
+
+        // panic_messages=false silences the stream arm too.
+        export_lean_set_panic_messages(false);
+        let r2 = export_lean_panic_fn(crate::tagged::boxi(0), mk("silenced"));
+        assert_eq!(r2, crate::tagged::boxi(0));
+        export_lean_set_panic_messages(true);
+
+        // Restore and settle: the finalizer fcloses, publishing the bytes.
+        let mine = crate::stdio::get_set_stderr(old);
+        crate::rc::dec_ref(mine);
+        let got = std::fs::read(&base).expect("stream file readable");
+        assert_eq!(
+            got, b"boom via stream\n",
+            "one putStr of msg ++ newline — IO.eprintln's exact bytes, and the silenced line absent"
+        );
+
+        // The FOREIGN-closure control: a stream whose fields are not this
+        // crate's native closures falls back to the process stderr (one
+        // disclosed control line on the test log) and must not crash.
+        let foreign = crate::object::alloc_ctor(0, 6, 0);
+        for i in 0..6 {
+            crate::object::ctor_set(foreign, i, crate::tagged::boxi(0));
+        }
+        let old2 = crate::stdio::get_set_stderr(foreign);
+        let r3 = export_lean_panic_fn(
+            crate::tagged::boxi(0),
+            mk("fln-panic-foreign-control (expected on the test log)"),
+        );
+        assert_eq!(
+            r3,
+            crate::tagged::boxi(0),
+            "foreign stream: fallback, no crash"
+        );
+        let mine2 = crate::stdio::get_set_stderr(old2);
+        crate::rc::dec_ref(mine2);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the panic-stream cell");
+    std::fs::remove_file(&base).ok();
+    crate::membrane::drain_small_bins_for_test();
+}

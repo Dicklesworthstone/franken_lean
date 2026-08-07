@@ -71,23 +71,32 @@ pub(crate) fn internal_panic_impl(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// `lean_panic_impl` (`object.cpp:139-146` shape): optional message, then
-/// the exit/abort policy. Slice-1 restriction (status ledger): upstream
-/// routes non-fatal messages through the Lean IO stderr buffer
-/// (`io_eprintln`) and can print a backtrace; both need the fln-3gv IO
-/// plane, so every message goes to the process stderr here.
-pub(crate) fn panic_impl(msg: &[u8]) {
+/// `lean_panic_impl` (`object.cpp:175-191`): the two-arm message router
+/// then the abort/exit policy, in the pin's order (abort BEFORE exit,
+/// object.cpp:187-190). The arm chooser is `panic_eprintln`'s exactly
+/// (object.cpp:131): fatal-bound — `force_stderr`, exit-on-panic, or the
+/// abort env — writes the process stderr, because the Lean buffer would
+/// die with the process; the NON-FATAL arm routes through the
+/// thread-current stderr STREAM (fln-3gv slice 8d over the seam measured
+/// in bead comment 2111), falling back to the process stderr only for a
+/// foreign-closure stream — the disclosed 7xe boundary. The backtrace
+/// block (object.cpp:178-184) remains open with fln-3gv.
+pub(crate) fn panic_impl(msg: &[u8], force_stderr: bool) {
     if PANIC_MESSAGES.load(Ordering::Relaxed) {
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(msg);
-        let _ = err.write_all(b"\n");
-        let _ = err.flush();
-    }
-    if EXIT_ON_PANIC.load(Ordering::Relaxed) {
-        std::process::exit(1);
+        let fatal_bound =
+            force_stderr || EXIT_ON_PANIC.load(Ordering::Relaxed) || should_abort_on_panic();
+        if fatal_bound || !crate::stdio::panic_message_via_stream(msg) {
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(msg);
+            let _ = err.write_all(b"\n");
+            let _ = err.flush();
+        }
     }
     if should_abort_on_panic() {
         std::process::abort();
+    }
+    if EXIT_ON_PANIC.load(Ordering::Relaxed) {
+        std::process::exit(1);
     }
 }
 
@@ -557,10 +566,9 @@ pub(crate) extern "C" fn export_lean_internal_panic_unreachable() -> ! {
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_panic")]
 pub(crate) extern "C" fn export_lean_panic(msg: *const c_char, force_stderr: bool) {
-    let _ = force_stderr; // both routes are the process stderr pre-fln-3gv
     // SAFETY: msg NUL-terminated per the contract.
     let bytes = unsafe { core::ffi::CStr::from_ptr(msg) }.to_bytes();
-    panic_impl(bytes);
+    panic_impl(bytes, force_stderr);
 }
 
 /// `lean_panic_fn` (`object.cpp`): print the Lean string `msg` (consumed),
@@ -577,7 +585,7 @@ pub(crate) extern "C" fn export_lean_panic_fn(
     unsafe {
         let (size, data) = string_size_and_data(msg);
         let bytes = core::slice::from_raw_parts(data, size.saturating_sub(1));
-        panic_impl(bytes);
+        panic_impl(bytes, false);
         if !is_scalar(msg) {
             rc::dec_ref(msg);
         }
@@ -2759,7 +2767,10 @@ pub(crate) extern "C" fn export_lean_option_get_or_block(o: *mut LeanObject) -> 
     if is_scalar(o) {
         // `none` (`box(0)`): the pin's panic; then, when panics are
         // non-fatal, its forever-sleep rather than a fabricated value.
-        panic_impl(b"PANIC: Promise.result!: promise has been dropped without ever being resolved");
+        panic_impl(
+            b"PANIC: Promise.result!: promise has been dropped without ever being resolved",
+            false,
+        );
         loop {
             std::thread::sleep(std::time::Duration::from_secs(86_400));
         }

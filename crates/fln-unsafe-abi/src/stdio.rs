@@ -687,6 +687,47 @@ pub(crate) unsafe fn io_result_show_error_core(r: *mut LeanObject, sink: &mut dy
     }
 }
 
+/// `panic_eprintln`'s NON-FATAL arm (`object.cpp:130-137`): the message
+/// routes through the THREAD-CURRENT stderr stream as ONE putStr of
+/// `msg ++ "\n"` — `IO.eprintln`'s exact shape (`eprintln = eprint
+/// (s.push '\n')`, Init/System/IO.lean:1291-1292, a single application).
+/// Implementable natively only when the current stream's putStr field is
+/// this module's own native closure over a handle; a FOREIGN closure needs
+/// `lean_apply_2` (7xe's Golem apply machinery), so that arm answers false
+/// and the caller falls back to the process stderr — a DISCLOSED divergence
+/// from the pin, which applies the closure (bead comment 2111). The pin
+/// asserts the putStr result ok and drops it (`lean_assert` is a release
+/// no-op); the result is settled unchecked here identically. Non-UTF8
+/// message bytes recover lossily exactly as the pin's
+/// `lean_mk_string_from_bytes`.
+// UNSAFE-LEDGER: FLN-UL-0423
+#[allow(unsafe_code)]
+pub(crate) fn panic_message_via_stream(msg: &[u8]) -> bool {
+    // SAFETY: the duplicated stream is settled; field reads stay within
+    // live objects; the handle is borrowed from the closure's fixed slot
+    // for the duration of one prim call.
+    unsafe {
+        let stream = get_stderr();
+        let f = object::ctor_get(stream, 4);
+        let mut carried = false;
+        if !tagged::is_scalar(f) && (&raw const (*f).m_tag).read() == crate::contract::TAG_CLOSURE {
+            let (fun, _, nfixed, args) = object::closure_fields(f);
+            if fun == stream_put_str_fn as *mut c_void && nfixed == 1 {
+                let h = *args;
+                let mut line = String::from_utf8_lossy(msg).into_owned();
+                line.push('\n');
+                let s = mk_string(&line);
+                let r = prim_handle_put_str(h, s);
+                rc::dec_ref(s);
+                rc::dec_ref(r);
+                carried = true;
+            }
+        }
+        rc::dec_ref(stream);
+        carried
+    }
+}
+
 /// `lean_io_exit` (`io.cpp:1594-1596`): `exit(code)` — atexit handlers run
 /// and C stdio flushes, which is the entire observable split from
 /// `force_exit` and is bound cross-runtime by the gauntlet's exit-parity
