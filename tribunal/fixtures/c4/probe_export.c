@@ -27,6 +27,7 @@
 
 #include <lean/lean.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1469,6 +1470,69 @@ static void facts_mode(void) {
                  bytesum(buf, (size_t)(rd > 0 ? rd : 0)));
             lean_dec(res);
         }
+    }
+
+    /* ---- fln-3gv slice 8c: the stdin corpus cell — the first cell whose
+     * subject is FD 0 ITSELF. The stream trio's closure fields cannot be
+     * invoked cross-runtime (lean_apply_* is 7xe's), so the cell drives
+     * the same ported prim the stdin stream's getLine field wraps, over a
+     * handle opened at /dev/stdin AFTER a fixture is dup2'd onto fd 0 —
+     * the process's own stdin, the real prim, all four getLine arms
+     * (terminated, lossy 0xFF, unterminated tail, read at EOF). */
+    {
+        char sin_path[128];
+        snprintf(sin_path, sizeof sin_path, "/tmp/fln-stdin-cell-%lld",
+                 (long long)getpid());
+        remove(sin_path);
+        {
+            FILE *seed = fopen(sin_path, "w");
+            static const unsigned char sin_bytes[] = {
+                's', 't', 'd', 'i', 'n', ' ', 'o', 'n', 'e', '\n',
+                'b', 0xFF, 'r', '\n',
+                'e', 'n', 'd'};
+            fwrite(sin_bytes, 1, sizeof sin_bytes, seed);
+            fclose(seed);
+        }
+        int sin_fd = open(sin_path, O_RDONLY);
+        int sin_saved0 = dup(0);
+        fact("corpus.stdin.redirect_ready", sin_fd >= 0 && sin_saved0 >= 0);
+        dup2(sin_fd, 0);
+        close(sin_fd);
+        lean_object *sin_fname = lean_mk_string("/dev/stdin");
+        lean_object *sin_mres = lean_io_prim_handle_mk(sin_fname, 0);
+        fact("corpus.stdin.mk_ok", lean_ptr_tag(sin_mres) == 0);
+        lean_object *sin_h = lean_ctor_get(sin_mres, 0);
+        lean_inc(sin_h);
+        lean_dec(sin_mres);
+        lean_dec(sin_fname);
+        for (int sin_i = 0; sin_i < 4; sin_i++) {
+            static const char *const sin_names[4][4] = {
+                {"corpus.stdin.l1_ok", "corpus.stdin.l1_bytes",
+                 "corpus.stdin.l1_bytesum", "corpus.stdin.l1_chars"},
+                {"corpus.stdin.l2_ok", "corpus.stdin.l2_bytes",
+                 "corpus.stdin.l2_bytesum", "corpus.stdin.l2_chars"},
+                {"corpus.stdin.l3_ok", "corpus.stdin.l3_bytes",
+                 "corpus.stdin.l3_bytesum", "corpus.stdin.l3_chars"},
+                {"corpus.stdin.l4_ok", "corpus.stdin.l4_bytes",
+                 "corpus.stdin.l4_bytesum", "corpus.stdin.l4_chars"}};
+            lean_object *sin_res = lean_io_prim_handle_get_line(sin_h);
+            fact(sin_names[sin_i][0], lean_ptr_tag(sin_res) == 0);
+            lean_object *sin_s = lean_ctor_get(sin_res, 0);
+            long long sin_n = (long long)lean_string_size(sin_s) - 1;
+            const uint8_t *sin_p = (const uint8_t *)lean_string_cstr(sin_s);
+            long long sin_sum = 0;
+            for (long long i = 0; i < sin_n; i++) {
+                sin_sum += sin_p[i];
+            }
+            fact(sin_names[sin_i][1], sin_n);
+            fact(sin_names[sin_i][2], sin_sum);
+            fact(sin_names[sin_i][3], (long long)lean_string_len(sin_s));
+            lean_dec(sin_res);
+        }
+        lean_dec(sin_h);
+        dup2(sin_saved0, 0);
+        close(sin_saved0);
+        remove(sin_path);
     }
 }
 
