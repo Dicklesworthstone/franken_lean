@@ -303,8 +303,8 @@ extern lean_io_process_get_pid | CompatWrapper | crates/fln-unsafe-abi/src/expor
 extern lean_io_process_get_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
 extern lean_io_process_set_current_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | process family (D2 seam)
 extern lean_io_getenv | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | the bare Option per the pin's BaseIO shape; embedded NUL answers none, never an error (io.cpp:964-1000 POSIX arm; fln-3gv slice 7a)
-extern lean_io_exit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
-extern lean_io_force_exit | Unsupported | fln-3gv | stage0 IO.c demand audit | env/misc family, later slice
+extern lean_io_exit | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet exit-parity lane (marrow_stage0_gauntlet.sh lane 7b); stage0 IO.c demand audit | exit(3) — atexit + stdio flush; process-fatal, so the evidence is rc + the flushed-buffer split vs the Reference, never an in-process cell (io.cpp:1594-1596; fln-3gv slice 8b)
+extern lean_io_force_exit | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet exit-parity lane (marrow_stage0_gauntlet.sh lane 7b); stage0 IO.c demand audit | std::_Exit — immediate, no handlers, no flush; split from exit by the same mode pair (io.cpp:1598-1600; fln-3gv slice 8b)
 extern lean_io_initializing | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | the process-global init flag read (io.cpp:81-83; fln-3gv slice 7a)
 extern lean_io_get_random_bytes | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | /dev/urandom with the pin's zero-byte, overflow-to-ENOMEM and EINTR arms (io.cpp:865-925 POSIX arm; fln-3gv slice 7a)
 extern lean_io_get_tid | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | gettid, the pin's Linux arm (process.cpp:340-352; fln-3gv slice 7a)

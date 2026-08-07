@@ -3731,6 +3731,26 @@ pub(crate) extern "C" fn export_lean_io_error_to_string(err: *mut LeanObject) ->
     unsafe { crate::stdio::error_to_string(err) }
 }
 
+/// `lean_io_exit` (`io.cpp:1594-1596`; extern census `IO.Process.exit`'s
+/// prim): `exit(code)`. Process-fatal, so its evidence is the gauntlet's
+/// exit-parity mode (rc + the flushed-buffer split vs the Reference), never
+/// an in-process cell.
+// UNSAFE-LEDGER: FLN-UL-0419
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_exit")]
+pub(crate) extern "C" fn export_lean_io_exit(code: u8) -> *mut LeanObject {
+    crate::stdio::io_exit(code)
+}
+
+/// `lean_io_force_exit` (`io.cpp:1598-1600`): `std::_Exit(code)` — the
+/// no-flush twin, split from `exit` by the same gauntlet mode pair.
+// UNSAFE-LEDGER: FLN-UL-0420
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_force_exit")]
+pub(crate) extern "C" fn export_lean_io_force_exit(code: u8) -> *mut LeanObject {
+    crate::stdio::io_force_exit(code)
+}
+
 /// `lean_io_result_show_error` (`io.cpp:61-67`): "uncaught exception: " plus
 /// the pretty-printed error and a newline on the process stderr, flushed —
 /// `std::cerr << ... << std::endl`'s exact bytes on fd 2.

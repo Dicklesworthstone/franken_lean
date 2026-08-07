@@ -126,6 +126,11 @@ extern lean_object *lean_io_set_heartbeats(lean_object *count);
  * (lean_io_result_show_error is already in lean.h:2950). */
 extern lean_object *lean_io_error_to_string(lean_object *err);
 
+/* fln-3gv slice 8b externs (extern-census class): the exit pair, declared
+ * exactly as stage0 Init/System/IO.c:1099/1101 declares them. */
+extern lean_object *lean_io_exit(uint8_t code);
+extern lean_object *lean_io_force_exit(uint8_t code);
+
 /* Slice 8a fixture builders: every IO.Error ctor shape synthesized directly
  * over the generated layout (IOError.c: 1-obj-field families u32 at
  * sizeof(void*)*1, 2-obj-field families at sizeof(void*)*2), so the arm
@@ -1491,6 +1496,20 @@ int main(int argc, char **argv) {
         lean_set_exit_on_panic(true);
         lean_option_get_or_block(lean_box(0));
         return 99; /* unreachable: exit-on-panic terminates with 1 */
+    }
+    /* fln-3gv slice 8b exit-parity modes: the marker has NO newline, so
+     * under the _IOLBF set above it sits in the stdio buffer when the prim
+     * fires — exit(3) flushes it, _Exit drops it, and that split IS the
+     * observable difference between the two prims. */
+    if (argc > 1 && strcmp(argv[1], "exit-flush") == 0) {
+        printf("EXIT-FLUSH-MARKER");
+        lean_io_exit(42);
+        return 99; /* unreachable: exit(3) terminates with 42 */
+    }
+    if (argc > 1 && strcmp(argv[1], "force-exit") == 0) {
+        printf("FORCE-EXIT-MARKER");
+        lean_io_force_exit(43);
+        return 99; /* unreachable: _Exit terminates with 43, marker dropped */
     }
     facts_mode();
     return 0;

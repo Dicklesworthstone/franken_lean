@@ -70,6 +70,10 @@ unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
     fn strerror(errnum: c_int) -> *const c_char;
     fn signal(signum: c_int, handler: usize) -> usize;
+    fn exit(code: c_int) -> !;
+    /// C11 `_Exit` — what `std::_Exit` is specified as (immediate
+    /// termination, no atexit handlers, no stdio flush).
+    fn _Exit(code: c_int) -> !;
     /// glibc's thread-local `errno` accessor (what the `errno` macro reads).
     fn __errno_location() -> *mut c_int;
 }
@@ -681,6 +685,26 @@ pub(crate) unsafe fn io_result_show_error_core(r: *mut LeanObject, sink: &mut dy
         let _ = sink.flush();
         rc::dec_ref(s);
     }
+}
+
+/// `lean_io_exit` (`io.cpp:1594-1596`): `exit(code)` — atexit handlers run
+/// and C stdio flushes, which is the entire observable split from
+/// `force_exit` and is bound cross-runtime by the gauntlet's exit-parity
+/// modes.
+// UNSAFE-LEDGER: FLN-UL-0417
+#[allow(unsafe_code)]
+pub(crate) fn io_exit(code: u8) -> ! {
+    // SAFETY: process termination; nothing to settle.
+    unsafe { exit(c_int::from(code)) }
+}
+
+/// `lean_io_force_exit` (`io.cpp:1598-1600`): `std::_Exit(code)` —
+/// immediate, no handlers, no flush.
+// UNSAFE-LEDGER: FLN-UL-0418
+#[allow(unsafe_code)]
+pub(crate) fn io_force_exit(code: u8) -> ! {
+    // SAFETY: process termination; nothing to settle.
+    unsafe { _Exit(c_int::from(code)) }
 }
 
 // ---------------------------------------------------------------- prims

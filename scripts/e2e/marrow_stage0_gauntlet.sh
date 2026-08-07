@@ -328,6 +328,29 @@ for mode in panic-internal panic-fn panic-promise-new panic-get-or-block-none; d
     emit panic_parity passed "\"mode\":\"$mode\",\"rc\":$rc_m,\"line\":\"$line_m\""
 done
 
+# ---- lane 7b: exit parity (fln-3gv slice 8b) -----------------------------------
+# lean_io_exit is exit(3) (atexit + stdio flush) and lean_io_force_exit is
+# _Exit (neither): the WHOLE observable split is whether a buffered,
+# unterminated stdout write survives termination. Each mode prints a marker
+# with no newline and fires its prim; rc and stdout bytes must match the
+# Reference AND the pinned expectation, so both-wrong-identically cannot
+# pass.
+note "lane 7b: exit parity (exit codes + the flushed-buffer split)"
+for spec in "exit-flush 42 EXIT-FLUSH-MARKER" "force-exit 43 "; do
+    read -r mode want_rc want_out <<<"$spec"
+    set +e
+    "$ART_DIR/probe_marrow" "$mode" >"$ART_DIR/${mode}_marrow.out" 2>/dev/null; rc_m=$?
+    "$ART_DIR/probe_reference" "$mode" >"$ART_DIR/${mode}_reference.out" 2>/dev/null; rc_r=$?
+    set -e
+    out_m=$(cat "$ART_DIR/${mode}_marrow.out")
+    out_r=$(cat "$ART_DIR/${mode}_reference.out")
+    if [ "$rc_m" != "$rc_r" ] || [ "$rc_m" != "$want_rc" ] \
+        || [ "$out_m" != "$out_r" ] || [ "$out_m" != "${want_out-}" ]; then
+        fail exit_parity "\"mode\":\"$mode\",\"rc_marrow\":$rc_m,\"rc_reference\":$rc_r,\"out_marrow\":\"$out_m\",\"out_reference\":\"$out_r\""
+    fi
+    emit exit_parity passed "\"mode\":\"$mode\",\"rc\":$rc_m,\"out\":\"$out_m\""
+done
+
 # ---- lane 8: named mutant 83r-M1 ----------------------------------------------
 # Ownership-convention perturbation per §18.2: the exported lean_dec_ref_cold
 # drops the release. Planted in a COPY of the crate; the differential must
