@@ -20,11 +20,10 @@
 //!   observable distinguishes the two. SIGPIPE is ignored at that seed —
 //!   the pin's disposition (`io.cpp:1654-1656`), installed before any stdio
 //!   write our streams can produce.
-//! - **The one unported stream field refuses typed.** `getLine` closes over
-//!   a prim a later slice ports; until then it refuses via the §6.5 panic
-//!   law rather than fabricate (the pin serves it — a disclosed
-//!   restriction, named in its extern row, never a silent divergence).
-//!   `read` and `write` went live in slice 5b over their ported prims.
+//! - **Every stream field is live.** `read` and `write` went live in slice
+//!   5b over their ported prims; `getLine` in slice 5c over
+//!   `prim_handle_get_line` (`io.cpp:635-659`), retiring the last typed
+//!   stream-field refusal.
 //! - **Thread-current semantics are the pin's exactly**: each thread's
 //!   current streams seed from the PROCESS-initial trio, never from the
 //!   spawning thread's current set (`MK_THREAD_LOCAL_GET`, io.cpp:115-117),
@@ -56,7 +55,11 @@ unsafe extern "C" {
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn fread(ptr: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn feof(f: *mut c_void) -> c_int;
+    fn ferror(f: *mut c_void) -> c_int;
     fn clearerr(f: *mut c_void);
+    fn flockfile(f: *mut c_void);
+    fn funlockfile(f: *mut c_void);
+    fn getc_unlocked(f: *mut c_void) -> c_int;
     fn fflush(f: *mut c_void) -> c_int;
     fn fclose(f: *mut c_void) -> c_int;
     fn fileno(f: *mut c_void) -> c_int;
@@ -614,6 +617,51 @@ pub(crate) unsafe fn prim_handle_write(
     }
 }
 
+/// `lean_io_prim_handle_get_line` (`io.cpp:635-659`), arm-for-arm: bytes
+/// accumulated under the file lock via `getc_unlocked` until EOF or a
+/// retained `'\n'`; ferror decodes errno (the buffer simply drops); EOF
+/// clears the flag and answers the partial line ok; otherwise ok — both ok
+/// arms through the pin's own `mk_string(std::string)`, which is
+/// `lean_mk_string_from_bytes` (`object.cpp:2049-2051`): UTF-8 validated,
+/// invalid bytes recovered lossily as U+FFFD.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0329
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_get_line(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live handle per contract; the byte loop holds the FILE lock
+    // exactly across the reads as the pin's flockfile pair does, and the
+    // string constructor copies out of the local buffer before it drops.
+    unsafe {
+        let fp = io_get_handle(h);
+        let mut result: Vec<u8> = Vec::new();
+        flockfile(fp);
+        loop {
+            let c = getc_unlocked(fp);
+            if c == -1 {
+                break;
+            }
+            result.push(c as u8);
+            if c == c_int::from(b'\n') {
+                break;
+            }
+        }
+        funlockfile(fp);
+        if ferror(fp) != 0 {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        } else {
+            if feof(fp) != 0 {
+                clearerr(fp);
+            }
+            io_result_mk_ok(crate::export::mk_string_from_bytes_impl(
+                result.as_ptr().cast::<c_char>(),
+                result.len(),
+            ))
+        }
+    }
+}
+
 /// `lean_io_prim_handle_flush` (`io.cpp:550-556`).
 ///
 /// # Safety
@@ -688,19 +736,6 @@ extern "C" fn stream_is_tty_fn(h: *mut LeanObject, _w: *mut LeanObject) -> *mut 
     }
 }
 
-/// The unported stream fields' typed refusal (§6.5 panic law): the pin
-/// serves `read`/`write`/`getLine`; Marrow's port of their prims is a later
-/// slice, and this restriction is disclosed in the module doc and the
-/// extern rows rather than fabricated around.
-fn stream_unported_refusal(what: &str) -> ! {
-    let text = format!(
-        "stdio plane: FS.Stream.{what} closes over a handle prim not yet \
-         ported (bead fln-3gv serves mk/putStr/flush/isTty/read/write; \
-         getLine is a later stdio slice)"
-    );
-    crate::export::internal_panic_impl(&text)
-}
-
 /// `read` field body: `Handle.read h` applied to (a boxed USize, world).
 /// At this pin `lean_box_usize` is ALWAYS a 0-field ctor carrying the
 /// usize scalar (`lean.h:2889-2897`) — never a tagged scalar.
@@ -739,8 +774,16 @@ extern "C" fn stream_write_fn(
     }
 }
 
-extern "C" fn stream_get_line_fn(_h: *mut LeanObject, _w: *mut LeanObject) -> *mut LeanObject {
-    stream_unported_refusal("getLine")
+/// `getLine` field body: `Handle.getLine h` applied to the world token.
+// UNSAFE-LEDGER: FLN-UL-0330
+#[allow(unsafe_code)]
+extern "C" fn stream_get_line_fn(h: *mut LeanObject, _w: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: h arrives owned (closure-arg transfer); the prim borrows it.
+    unsafe {
+        let r = prim_handle_get_line(h);
+        rc::dec_ref(h);
+        r
+    }
 }
 
 /// The native `Stream.ofHandle` (`Init/System/IO.lean:1683-1690`,

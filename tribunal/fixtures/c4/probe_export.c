@@ -71,6 +71,7 @@ extern lean_object *lean_get_set_stdout(lean_object *h);
 extern lean_object *lean_io_prim_handle_mk(lean_object *filename, uint8_t mode);
 extern lean_object *lean_io_prim_handle_put_str(lean_object *h, lean_object *s);
 extern lean_object *lean_io_prim_handle_read(lean_object *h, size_t nbytes);
+extern lean_object *lean_io_prim_handle_get_line(lean_object *h);
 extern lean_object *lean_stream_of_handle(lean_object *h);
 
 /* fln-3gv slice 3b externs (extern-census class): the io.cpp wrapper
@@ -780,6 +781,59 @@ static void facts_mode(void) {
     lean_dec(iof_chunk);
     lean_dec(iof_rh);
     remove(iof_path);
+
+    /* ---- fln-3gv slice 5c: Handle.getLine's four arms (io.cpp:635-659)
+     * through both runtimes over one scratch file — a terminated line
+     * (newline retained), a line carrying a raw 0xFF (the ok arms run
+     * lean_mk_string_from_bytes, so the byte recovers lossily as U+FFFD),
+     * an unterminated tail (the EOF partial-line arm), and a read at EOF
+     * (the empty string, still ok). */
+    char igl_path[128];
+    snprintf(igl_path, sizeof igl_path, "/tmp/fln-get-line-%lld",
+             (long long)getpid());
+    remove(igl_path);
+    {
+        FILE *seed = fopen(igl_path, "w");
+        static const unsigned char igl_bytes[] = {
+            'f', 'i', 'r', 's', 't', ' ', 'l', 'i', 'n', 'e', '\n',
+            'f', 'o', 0xFF, 'o', '\n',
+            't', 'a', 'i', 'l'};
+        fwrite(igl_bytes, 1, sizeof igl_bytes, seed);
+        fclose(seed);
+    }
+    lean_object *igl_fname = lean_mk_string(igl_path);
+    lean_object *igl_rres = lean_io_prim_handle_mk(igl_fname, 0);
+    fact("corpus.get_line.rmk_ok", lean_ptr_tag(igl_rres) == 0);
+    lean_object *igl_rh = lean_ctor_get(igl_rres, 0);
+    lean_inc(igl_rh);
+    lean_dec(igl_rres);
+    lean_dec(igl_fname);
+    for (int igl_i = 0; igl_i < 4; igl_i++) {
+        static const char *const igl_names[4][4] = {
+            {"corpus.get_line.l1_ok", "corpus.get_line.l1_bytes",
+             "corpus.get_line.l1_bytesum", "corpus.get_line.l1_chars"},
+            {"corpus.get_line.l2_ok", "corpus.get_line.l2_bytes",
+             "corpus.get_line.l2_bytesum", "corpus.get_line.l2_chars"},
+            {"corpus.get_line.l3_ok", "corpus.get_line.l3_bytes",
+             "corpus.get_line.l3_bytesum", "corpus.get_line.l3_chars"},
+            {"corpus.get_line.l4_ok", "corpus.get_line.l4_bytes",
+             "corpus.get_line.l4_bytesum", "corpus.get_line.l4_chars"}};
+        lean_object *igl_res = lean_io_prim_handle_get_line(igl_rh);
+        fact(igl_names[igl_i][0], lean_ptr_tag(igl_res) == 0);
+        lean_object *igl_s = lean_ctor_get(igl_res, 0);
+        long long igl_n = (long long)lean_string_size(igl_s) - 1;
+        const uint8_t *igl_p = (const uint8_t *)lean_string_cstr(igl_s);
+        long long igl_sum = 0;
+        for (long long i = 0; i < igl_n; i++) {
+            igl_sum += igl_p[i];
+        }
+        fact(igl_names[igl_i][1], igl_n);
+        fact(igl_names[igl_i][2], igl_sum);
+        fact(igl_names[igl_i][3], (long long)lean_string_len(igl_s));
+        lean_dec(igl_res);
+    }
+    lean_dec(igl_rh);
+    remove(igl_path);
 }
 
 int main(int argc, char **argv) {

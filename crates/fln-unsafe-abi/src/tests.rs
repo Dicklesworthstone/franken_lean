@@ -3877,3 +3877,76 @@ fn export_stdio_reproduces_the_io_file_corpus_slice_with_roundtrip() {
     assert_eq!(live, 0, "RC balance across the io_file cell");
     std::fs::remove_file(&scratch).ok();
 }
+
+#[test]
+fn export_stdio_reproduces_the_get_line_arms_with_lossy_recovery() {
+    let _g = lock();
+    use crate::export::{export_lean_io_prim_handle_get_line, export_lean_io_prim_handle_mk};
+
+    // The pin's four getLine arms (io.cpp:635-659) over one scratch file:
+    // a terminated line (newline RETAINED), a line carrying an invalid
+    // UTF-8 byte (the ok arms run mk_string_from_bytes, so 0xFF recovers
+    // lossily as U+FFFD), an unterminated tail (the EOF partial-line arm,
+    // feof cleared), and a read at EOF (the empty string, still ok).
+    let scratch = std::env::temp_dir().join(format!("fln-get-line-{}", std::process::id()));
+    let scratch_str = scratch.to_str().expect("temp path is UTF-8").to_string();
+    let mut content: Vec<u8> = b"first line\n".to_vec();
+    content.extend_from_slice(&[b'f', b'o', 0xFF, b'o', b'\n']);
+    content.extend_from_slice(b"tail without newline");
+    std::fs::write(&scratch, &content).expect("scratch file written");
+
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; the four arms run
+    // through the export exactly as the compiled Handle.getLine would drive
+    // them, with the shadow oracle watching.
+    // UNSAFE-LEDGER: FLN-UL-0332
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let fname = mk(&scratch_str);
+        let rr = export_lean_io_prim_handle_mk(fname, 0);
+        assert_eq!((&raw const (*rr).m_tag).read(), 0, "read-handle mk ok");
+        let rh = crate::object::ctor_get(rr, 0);
+        crate::rc::inc_ref_n(rh, 1);
+        crate::rc::dec_ref(rr);
+        crate::rc::dec_ref(fname);
+
+        let take = |rh: *mut crate::layout::LeanObject, what: &str| -> (Vec<u8>, usize) {
+            let res = export_lean_io_prim_handle_get_line(rh);
+            assert_eq!((&raw const (*res).m_tag).read(), 0, "{what}: ok arm");
+            let s = crate::object::ctor_get(res, 0);
+            let (m_size, _, chars, bytes) = crate::object::string_fields(s);
+            assert_eq!(bytes[m_size - 1], 0, "{what}: NUL-terminated");
+            let out = (bytes[..m_size - 1].to_vec(), chars);
+            crate::rc::dec_ref(res);
+            out
+        };
+
+        let (l1, c1) = take(rh, "terminated line");
+        assert_eq!(l1, b"first line\n", "newline retained (io.cpp:643-646)");
+        assert_eq!(c1, "first line\n".chars().count(), "char accounting");
+
+        let (l2, c2) = take(rh, "invalid-UTF-8 line");
+        assert_eq!(
+            l2,
+            "fo\u{FFFD}o\n".as_bytes(),
+            "0xFF recovers lossily as U+FFFD (object.cpp:2049-2051)"
+        );
+        assert_eq!(c2, "fo\u{FFFD}o\n".chars().count(), "char accounting");
+
+        let (l3, _) = take(rh, "unterminated tail");
+        assert_eq!(
+            l3, b"tail without newline",
+            "the EOF partial-line arm answers ok (io.cpp:651-654)"
+        );
+
+        let (l4, _) = take(rh, "read at EOF");
+        assert_eq!(l4, b"", "EOF yields the empty string, still ok");
+
+        crate::rc::dec_ref(rh);
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the get_line cell");
+    std::fs::remove_file(&scratch).ok();
+}

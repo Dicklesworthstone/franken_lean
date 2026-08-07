@@ -227,7 +227,7 @@ unsafe fn mk_string_lossy_recover(s: &[u8], mut pos: usize, mut i: usize) -> *mu
 /// `s`/`sz` must describe `sz` readable bytes (or `sz == 0`).
 // UNSAFE-LEDGER: FLN-UL-0069
 #[allow(unsafe_code)]
-unsafe fn mk_string_from_bytes_impl(s: *const c_char, sz: usize) -> *mut LeanObject {
+pub(crate) unsafe fn mk_string_from_bytes_impl(s: *const c_char, sz: usize) -> *mut LeanObject {
     // SAFETY: caller (C contract) vouches for sz readable bytes.
     let bytes = if sz == 0 {
         &[][..]
@@ -3199,6 +3199,20 @@ pub(crate) extern "C" fn export_lean_io_prim_handle_write(
 ) -> *mut LeanObject {
     // SAFETY: both borrowed and live per the b_obj_arg contract.
     unsafe { crate::stdio::prim_handle_write(h, buf) }
+}
+
+/// `lean_io_prim_handle_get_line` (`io.cpp:635-659`; extern census
+/// `IO.FS.Handle.getLine`): borrowed handle to an io_result String — the
+/// locked byte loop, the retained newline, the EOF partial-line arm, and
+/// the lossy-U+FFFD string constructor, exactly the pin's arms.
+// UNSAFE-LEDGER: FLN-UL-0331
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_get_line")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_get_line(
+    h: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_get_line(h) }
 }
 
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
