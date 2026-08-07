@@ -3215,6 +3215,64 @@ pub(crate) extern "C" fn export_lean_io_prim_handle_get_line(
     unsafe { crate::stdio::prim_handle_get_line(h) }
 }
 
+/// `lean_io_prim_handle_rewind` (`io.cpp:560-568`; extern census
+/// `IO.FS.Handle.rewind`).
+// UNSAFE-LEDGER: FLN-UL-0338
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_rewind")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_rewind(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_rewind(h) }
+}
+
+/// `lean_io_prim_handle_truncate` (`io.cpp:570-582`; extern census
+/// `IO.FS.Handle.truncate`): ftruncate at the current offset.
+// UNSAFE-LEDGER: FLN-UL-0339
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_truncate")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_truncate(
+    h: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_truncate(h) }
+}
+
+/// `lean_io_prim_handle_lock` (`io.cpp:480-488`; extern census
+/// `IO.FS.Handle.lock`): blocking flock, exclusive or shared.
+// UNSAFE-LEDGER: FLN-UL-0340
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_lock")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_lock(
+    h: *mut LeanObject,
+    exclusive: u8,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_lock(h, exclusive) }
+}
+
+/// `lean_io_prim_handle_try_lock` (`io.cpp:490-502`; extern census
+/// `IO.FS.Handle.tryLock`): held elsewhere is `ok false`, never an error.
+// UNSAFE-LEDGER: FLN-UL-0341
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_try_lock")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_try_lock(
+    h: *mut LeanObject,
+    exclusive: u8,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_try_lock(h, exclusive) }
+}
+
+/// `lean_io_prim_handle_unlock` (`io.cpp:504-512`; extern census
+/// `IO.FS.Handle.unlock`).
+// UNSAFE-LEDGER: FLN-UL-0342
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_prim_handle_unlock")]
+pub(crate) extern "C" fn export_lean_io_prim_handle_unlock(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live handle per the b_obj_arg contract.
+    unsafe { crate::stdio::prim_handle_unlock(h) }
+}
+
 /// `lean_io_prim_handle_is_tty` (`io.cpp:516-531`; extern census
 /// `IO.FS.Handle.isTty`): the raw bool, exactly the pin's C signature.
 // UNSAFE-LEDGER: FLN-UL-0302

@@ -64,6 +64,10 @@ unsafe extern "C" {
     fn fclose(f: *mut c_void) -> c_int;
     fn fileno(f: *mut c_void) -> c_int;
     fn isatty(fd: c_int) -> c_int;
+    fn fseek(f: *mut c_void, offset: i64, whence: c_int) -> c_int;
+    fn ftello(f: *mut c_void) -> i64;
+    fn ftruncate(fd: c_int, length: i64) -> c_int;
+    fn flock(fd: c_int, operation: c_int) -> c_int;
     fn strerror(errnum: c_int) -> *const c_char;
     fn signal(signum: c_int, handler: usize) -> usize;
     /// glibc's thread-local `errno` accessor (what the `errno` macro reads).
@@ -153,6 +157,13 @@ const O_APPEND: c_int = 1024;
 const O_CLOEXEC: c_int = 524288;
 const SIGPIPE: c_int = 13;
 const SIG_IGN: usize = 1;
+const SEEK_SET: c_int = 0;
+const LOCK_SH: c_int = 1;
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
+// EWOULDBLOCK == EAGAIN on Linux (asm-generic); the try_lock arm keys on it.
+const EWOULDBLOCK: c_int = EAGAIN;
 
 fn errno() -> c_int {
     // SAFETY: glibc guarantees a valid thread-local location.
@@ -672,6 +683,105 @@ pub(crate) unsafe fn prim_handle_flush(h: *mut LeanObject) -> *mut LeanObject {
     // SAFETY: live handle per contract.
     unsafe {
         if fflush(io_get_handle(h)) == 0 {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_rewind` (`io.cpp:560-568`): fseek to the start;
+/// failure decodes errno.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0333
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_rewind(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live handle per contract.
+    unsafe {
+        if fseek(io_get_handle(h), 0, SEEK_SET) == 0 {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_truncate` (`io.cpp:570-582`, the non-Windows arm):
+/// ftruncate at the handle's current offset; failure decodes errno.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0334
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_truncate(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live handle per contract.
+    unsafe {
+        let fp = io_get_handle(h);
+        if ftruncate(fileno(fp), ftello(fp)) == 0 {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_lock` (`io.cpp:480-488`, the non-Windows arm):
+/// blocking flock, exclusive or shared; failure decodes errno.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0335
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_lock(h: *mut LeanObject, exclusive: u8) -> *mut LeanObject {
+    // SAFETY: live handle per contract.
+    unsafe {
+        let fp = io_get_handle(h);
+        let op = if exclusive != 0 { LOCK_EX } else { LOCK_SH };
+        if flock(fileno(fp), op) == 0 {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_try_lock` (`io.cpp:490-502`, the non-Windows arm):
+/// non-blocking flock — held elsewhere (EWOULDBLOCK) is `ok false`, never
+/// an error; acquisition is `ok true`; anything else decodes errno.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0336
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_try_lock(h: *mut LeanObject, exclusive: u8) -> *mut LeanObject {
+    // SAFETY: live handle per contract.
+    unsafe {
+        let fp = io_get_handle(h);
+        let op = (if exclusive != 0 { LOCK_EX } else { LOCK_SH }) | LOCK_NB;
+        if flock(fileno(fp), op) == 0 {
+            io_result_mk_ok(tagged::boxi(1))
+        } else if errno() == EWOULDBLOCK {
+            io_result_mk_ok(tagged::boxi(0))
+        } else {
+            io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))
+        }
+    }
+}
+
+/// `lean_io_prim_handle_unlock` (`io.cpp:504-512`, the non-Windows arm):
+/// flock LOCK_UN; failure decodes errno.
+///
+/// # Safety
+/// `h` is borrowed and live; caller owns the io_result.
+// UNSAFE-LEDGER: FLN-UL-0337
+#[allow(unsafe_code)]
+pub(crate) unsafe fn prim_handle_unlock(h: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: live handle per contract.
+    unsafe {
+        let fp = io_get_handle(h);
+        if flock(fileno(fp), LOCK_UN) == 0 {
             io_result_mk_ok(tagged::boxi(0))
         } else {
             io_result_mk_error(decode_io_error(errno(), core::ptr::null_mut()))

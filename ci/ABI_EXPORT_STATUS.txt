@@ -274,11 +274,11 @@ extern lean_stream_of_handle | CompatWrapper | crates/fln-unsafe-abi/src/export.
 extern lean_io_prim_handle_read | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | the pin's EOF/zero-read arms exactly; the native stream's read field is live over it (io.cpp:584-607; fln-3gv slice 5b)
 extern lean_io_prim_handle_write | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | fwrite of the byte array's salient bytes; the native stream's write field is live over it (io.cpp:609-618; fln-3gv slice 5b)
 extern lean_io_prim_handle_get_line | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | the pin's locked byte loop, retained newline, EOF partial-line and lossy-U+FFFD arms; the native stream's getLine field is live over it (io.cpp:635-659; fln-3gv slice 5c)
-extern lean_io_prim_handle_rewind | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
-extern lean_io_prim_handle_truncate | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
-extern lean_io_prim_handle_lock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
-extern lean_io_prim_handle_try_lock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
-extern lean_io_prim_handle_unlock | Unsupported | fln-3gv | stage0 IO.c demand audit | handle-prim family, next stdio slice
+extern lean_io_prim_handle_rewind | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | fseek to the start; failure decodes errno (io.cpp:560-568; fln-3gv slice 5d)
+extern lean_io_prim_handle_truncate | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | ftruncate at the current offset (io.cpp:570-582 non-Windows arm; fln-3gv slice 5d)
+extern lean_io_prim_handle_lock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | blocking flock, exclusive or shared (io.cpp:480-488 non-Windows arm; fln-3gv slice 5d)
+extern lean_io_prim_handle_try_lock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | non-blocking flock; held elsewhere (EWOULDBLOCK) is ok-false, never an error (io.cpp:490-502 non-Windows arm; fln-3gv slice 5d)
+extern lean_io_prim_handle_unlock | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | flock LOCK_UN; failure decodes errno (io.cpp:504-512 non-Windows arm; fln-3gv slice 5d)
 extern lean_chmod | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice (ordinary syscalls, no D2 involvement)
 extern lean_io_create_dir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
 extern lean_io_create_tempdir | Unsupported | fln-3gv | stage0 IO.c demand audit | fs family, later slice
