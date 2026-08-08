@@ -1749,6 +1749,58 @@ static void facts_mode(void) {
         }
         remove(dbg_path);
     }
+
+    /* ---- franken_lean-83r batch 2: copies, compares, hashes — the nine
+     * exports driven cross-runtime (comment 2117's named next step). */
+    {
+        lean_object *ba1 = lean_alloc_sarray(1, 4, 4);
+        memcpy(lean_sarray_cptr(ba1), "abcd", 4);
+        lean_object *ba2 = lean_alloc_sarray(1, 4, 4);
+        memcpy(lean_sarray_cptr(ba2), "abcd", 4);
+        fact("corpus.b2.sarray_eq", lean_sarray_eq_cold(ba1, ba2));
+        lean_sarray_cptr(ba2)[3] = 'X';
+        fact("corpus.b2.sarray_ne", lean_sarray_eq_cold(ba1, ba2));
+        fact("corpus.b2.ba_hash", (long long)lean_byte_array_hash(ba1));
+        lean_object *bc = lean_copy_byte_array(ba1);
+        fact("corpus.b2.copy_ba_bytes",
+             bytesum((const char *)lean_sarray_cptr(bc), lean_sarray_size(bc)));
+        lean_dec(bc);
+        lean_dec(ba2);
+
+        lean_object *s1 = lean_mk_string("abc");
+        lean_object *s2 = lean_mk_string("abd");
+        fact("corpus.b2.cmp_lt", lean_string_compare(s1, s2));
+        fact("corpus.b2.cmp_eq", lean_string_compare(s1, s1));
+        fact("corpus.b2.cmp_gt", lean_string_compare(s2, s1));
+        lean_dec(s1);
+        lean_dec(s2);
+
+        lean_object *fa = lean_alloc_sarray(sizeof(double), 0, 1);
+        fa = lean_float_array_push(fa, 1.5);
+        fa = lean_float_array_push(fa, -2.25);
+        fact("corpus.b2.fpush_size", (long long)lean_sarray_size(fa));
+        double *fd = (double *)lean_sarray_cptr(fa);
+        fact("corpus.b2.fpush_vals", fd[0] == 1.5 && fd[1] == -2.25);
+        lean_object *fc = lean_copy_float_array(fa);
+        double *fcd = (double *)lean_sarray_cptr(fc);
+        fact("corpus.b2.fcopy_vals",
+             lean_sarray_size(fc) == 2 && fcd[0] == 1.5 && fcd[1] == -2.25);
+        lean_dec(fc);
+        lean_dec(fa);
+
+        lean_object *ma = lean_mk_array(lean_box(3), lean_box(7));
+        fact("corpus.b2.mk_array_size", (long long)lean_array_size(ma));
+        fact("corpus.b2.mk_array_elems",
+             lean_array_cptr(ma)[0] == lean_box(7) &&
+                 lean_array_cptr(ma)[2] == lean_box(7));
+        lean_object *me = lean_copy_expand_array(ma, true);
+        fact("corpus.b2.expand_cap", (long long)lean_array_capacity(me));
+        fact("corpus.b2.expand_elem0",
+             (long long)lean_unbox(lean_array_cptr(me)[0]));
+        lean_dec(me);
+        fact("corpus.b2.mk_array_zero",
+             lean_array_size(lean_mk_array(lean_box(0), lean_box(5))) == 0);
+    }
 }
 
 int main(int argc, char **argv) {
