@@ -3858,3 +3858,74 @@ pub(crate) extern "C" fn export_lean_mk_io_user_error(msg: *mut LeanObject) -> *
         r
     }
 }
+
+/// The dbg family's `io_eprintln` half (`object.cpp:2770-2775`): the message
+/// routes through the thread-current stderr stream exactly as the 8d panic
+/// arm does — one putStr of `msg ++ "\n"` when the stream's putStr is our
+/// native closure, the process stderr otherwise (the disclosed 7xe
+/// foreign-closure boundary). The pin asserts the result ok and drops it;
+/// both arms here settle everything they build.
+fn dbg_eprintln(msg: &[u8]) {
+    if !crate::stdio::panic_message_via_stream(msg) {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(msg);
+        let _ = err.write_all(b"\n");
+        let _ = err.flush();
+    }
+}
+
+/// `lean_dbg_trace` (`object.cpp:2777-2780`): eprintln the message, then
+/// apply the thunk to unit and answer its result.
+// UNSAFE-LEDGER: FLN-UL-0432
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_dbg_trace")]
+pub(crate) extern "C" fn export_lean_dbg_trace(
+    s: *mut LeanObject,
+    fn_obj: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: s is a consumed live string; fn is consumed by apply.
+    unsafe {
+        let (m_size, _, _, bytes) = object::string_fields(s);
+        dbg_eprintln(&bytes[..m_size - 1]);
+        rc::dec_ref(s);
+    }
+    export_lean_apply_1(fn_obj, crate::tagged::boxi(0))
+}
+
+/// `lean_dbg_sleep` (`object.cpp:2782-2786`): sleep, then apply.
+// UNSAFE-LEDGER: FLN-UL-0433
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_dbg_sleep")]
+pub(crate) extern "C" fn export_lean_dbg_sleep(
+    ms: u32,
+    fn_obj: *mut LeanObject,
+) -> *mut LeanObject {
+    std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+    export_lean_apply_1(fn_obj, crate::tagged::boxi(0))
+}
+
+/// `lean_dbg_trace_if_shared` (`object.cpp:2788-2793`): a non-exclusive
+/// heap `a` eprintlns "shared RC " + s; `a` passes through either way. The
+/// pin never settles `s` on either arm — a LEAK its obj_arg signature
+/// implies it should not have, mirrored here deliberately (the shadow cell
+/// accounts it, exactly as `lean_runtime_forget`'s is accounted).
+// UNSAFE-LEDGER: FLN-UL-0434
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_dbg_trace_if_shared")]
+pub(crate) extern "C" fn export_lean_dbg_trace_if_shared(
+    s: *mut LeanObject,
+    a: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: header reads on live objects; the composed message is a fresh
+    // Rust buffer; s is deliberately not settled (the pin's own shape).
+    unsafe {
+        if !is_scalar(a) && !is_exclusive(a) {
+            let (m_size, _, _, bytes) = object::string_fields(s);
+            let mut msg = b"shared RC ".to_vec();
+            msg.extend_from_slice(&bytes[..m_size - 1]);
+            dbg_eprintln(&msg);
+        }
+    }
+    a
+}
