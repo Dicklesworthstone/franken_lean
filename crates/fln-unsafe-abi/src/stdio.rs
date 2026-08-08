@@ -695,11 +695,11 @@ pub(crate) unsafe fn io_result_show_error_core(r: *mut LeanObject, sink: &mut dy
 /// routes through the THREAD-CURRENT stderr stream as ONE putStr of
 /// `msg ++ "\n"` — `IO.eprintln`'s exact shape (`eprintln = eprint
 /// (s.push '\n')`, Init/System/IO.lean:1291-1292, a single application).
-/// Implementable natively only when the current stream's putStr field is
-/// this module's own native closure over a handle; a FOREIGN closure needs
-/// `lean_apply_2` (7xe's Golem apply machinery), so that arm answers false
-/// and the caller falls back to the process stderr — a DISCLOSED divergence
-/// from the pin, which applies the closure (bead comment 2111). The pin
+/// Any closure putStr field is carried: this module's own native closure
+/// takes the direct-prim fast path, and a FOREIGN closure is APPLIED
+/// exactly as the pin's io_eprintln does — the apply tail's landing retired
+/// the 8d fallback (fln-3gv slice 8g). The residual false arm is only a
+/// MALFORMED stream whose putStr is not a closure at all (FL-INV-07). The pin
 /// asserts the putStr result ok and drops it (`lean_assert` is a release
 /// no-op); the result is settled unchecked here identically. Non-UTF8
 /// message bytes recover lossily exactly as the pin's
@@ -715,17 +715,31 @@ pub(crate) fn panic_message_via_stream(msg: &[u8]) -> bool {
         let f = object::ctor_get(stream, 4);
         let mut carried = false;
         if !tagged::is_scalar(f) && (&raw const (*f).m_tag).read() == crate::contract::TAG_CLOSURE {
+            let mut line = String::from_utf8_lossy(msg).into_owned();
+            line.push('\n');
             let (fun, _, nfixed, args) = object::closure_fields(f);
             if fun == stream_put_str_fn as *mut c_void && nfixed == 1 {
+                // The native fast path: this module's own closure over a
+                // handle, driven without the apply hop it would take anyway.
                 let h = *args;
-                let mut line = String::from_utf8_lossy(msg).into_owned();
-                line.push('\n');
                 let s = mk_string(&line);
                 let r = prim_handle_put_str(h, s);
                 rc::dec_ref(s);
                 rc::dec_ref(r);
-                carried = true;
+            } else {
+                // A FOREIGN closure: apply it exactly as the pin's
+                // io_eprintln does — putStr(msg ++ "\n") then the world.
+                // This retires the 8d fallback the moment the apply tail
+                // landed; the result is settled unchecked as the pin's
+                // lean_assert(ok) release no-op is.
+                rc::inc_ref_n(f, 1);
+                let s = mk_string(&line);
+                let r = crate::export::export_lean_apply_2(f, s, tagged::boxi(0));
+                if !tagged::is_scalar(r) {
+                    rc::dec_ref(r);
+                }
             }
+            carried = true;
         }
         rc::dec_ref(stream);
         carried

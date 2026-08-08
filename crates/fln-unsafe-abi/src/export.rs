@@ -77,9 +77,10 @@ pub(crate) fn internal_panic_impl(msg: &str) -> ! {
 /// (object.cpp:131): fatal-bound — `force_stderr`, exit-on-panic, or the
 /// abort env — writes the process stderr, because the Lean buffer would
 /// die with the process; the NON-FATAL arm routes through the
-/// thread-current stderr STREAM (fln-3gv slice 8d over the seam measured
-/// in bead comment 2111), falling back to the process stderr only for a
-/// foreign-closure stream — the disclosed 7xe boundary. The backtrace
+/// thread-current stderr STREAM (slices 8d + 8g over the seam measured in
+/// bead comment 2111; foreign closures are applied since the apply tail
+/// landed), falling back to the process stderr only for a malformed
+/// non-closure putStr field (FL-INV-07). The backtrace
 /// block (object.cpp:178-184) remains open with fln-3gv.
 pub(crate) fn panic_impl(msg: &[u8], force_stderr: bool) {
     if PANIC_MESSAGES.load(Ordering::Relaxed) {
@@ -3862,8 +3863,9 @@ pub(crate) extern "C" fn export_lean_mk_io_user_error(msg: *mut LeanObject) -> *
 /// The dbg family's `io_eprintln` half (`object.cpp:2770-2775`): the message
 /// routes through the thread-current stderr stream exactly as the 8d panic
 /// arm does — one putStr of `msg ++ "\n"` when the stream's putStr is our
-/// native closure, the process stderr otherwise (the disclosed 7xe
-/// foreign-closure boundary). The pin asserts the result ok and drops it;
+/// closure (native fast path or applied foreign closure alike, slice 8g);
+/// the process stderr remains only for a malformed non-closure field. The
+/// pin asserts the result ok and drops it;
 /// both arms here settle everything they build.
 fn dbg_eprintln(msg: &[u8]) {
     if !crate::stdio::panic_message_via_stream(msg) {

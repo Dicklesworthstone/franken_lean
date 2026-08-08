@@ -5016,6 +5016,29 @@ fn export_stdio_reproduces_get_line_over_the_process_stdin() {
     crate::membrane::drain_small_bins_for_test();
 }
 
+static FOREIGN_SUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The capturing putStr target for the foreign-closure control: sums the
+/// delivered bytes (plus 1000x the length) and answers ok(unit).
+extern "C" fn foreign_put_str_capture(
+    s: *mut crate::layout::LeanObject,
+    _w: *mut crate::layout::LeanObject,
+) -> *mut crate::layout::LeanObject {
+    // SAFETY: s is the live string the applied closure receives (consumed);
+    // the fresh ok-result is settled by the applying caller.
+    // UNSAFE-LEDGER: FLN-UL-0530
+    #[allow(unsafe_code)]
+    unsafe {
+        let (n, _, _, b) = crate::object::string_fields(s);
+        let sum: u64 = b[..n - 1].iter().map(|&x| u64::from(x)).sum::<u64>()
+            + 1000 * ((n - 1) as u64);
+        FOREIGN_SUM.store(sum, core::sync::atomic::Ordering::SeqCst);
+        crate::rc::dec_ref(s);
+        let ok = crate::object::alloc_ctor(0, 1, 0);
+        crate::object::ctor_set(ok, 0, crate::tagged::boxi(0));
+        ok
+    }
+}
+
 #[test]
 fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
     let _g = lock();
@@ -5069,22 +5092,48 @@ fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
             "one putStr of msg ++ newline — IO.eprintln's exact bytes, and the silenced line absent"
         );
 
-        // The FOREIGN-closure control: a stream whose fields are not this
-        // crate's native closures falls back to the process stderr (one
-        // disclosed control line on the test log) and must not crash.
+        // A FOREIGN-closure stream is APPLIED since slice 8g: the capturing
+        // closure receives msg ++ newline exactly as the pin's io_eprintln
+        // delivers it.
+        FOREIGN_SUM.store(0, core::sync::atomic::Ordering::SeqCst);
         let foreign = crate::object::alloc_ctor(0, 6, 0);
         for i in 0..6 {
-            crate::object::ctor_set(foreign, i, crate::tagged::boxi(0));
+            let c = crate::object::alloc_closure(
+                foreign_put_str_capture as *mut core::ffi::c_void,
+                2,
+                0,
+            );
+            crate::object::ctor_set(foreign, i, c);
         }
         let old2 = crate::stdio::get_set_stderr(foreign);
-        let r3 = export_lean_panic_fn(
+        let r3 = export_lean_panic_fn(crate::tagged::boxi(0), mk("via foreign"));
+        assert_eq!(r3, crate::tagged::boxi(0));
+        let mine_f = crate::stdio::get_set_stderr(old2);
+        crate::rc::dec_ref(mine_f);
+        let expect: u64 = "via foreign\n".bytes().map(u64::from).sum::<u64>()
+            + 1000 * ("via foreign\n".len() as u64);
+        assert_eq!(
+            FOREIGN_SUM.load(core::sync::atomic::Ordering::SeqCst),
+            expect,
+            "the foreign putStr closure received msg ++ newline via apply"
+        );
+        // The MALFORMED control: non-closure fields still fall back to the
+        // process stderr (one disclosed control line on the test log).
+        let old2 = {
+            let broken = crate::object::alloc_ctor(0, 6, 0);
+            for i in 0..6 {
+                crate::object::ctor_set(broken, i, crate::tagged::boxi(0));
+            }
+            crate::stdio::get_set_stderr(broken)
+        };
+        let r3b = export_lean_panic_fn(
             crate::tagged::boxi(0),
-            mk("fln-panic-foreign-control (expected on the test log)"),
+            mk("fln-panic-malformed-control (expected on the test log)"),
         );
         assert_eq!(
-            r3,
+            r3b,
             crate::tagged::boxi(0),
-            "foreign stream: fallback, no crash"
+            "malformed stream: fallback, no crash"
         );
         let mine2 = crate::stdio::get_set_stderr(old2);
         crate::rc::dec_ref(mine2);
