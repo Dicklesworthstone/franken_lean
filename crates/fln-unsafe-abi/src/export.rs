@@ -5511,3 +5511,95 @@ pub(crate) extern "C" fn export_lean_apply_n(
     // SAFETY: the caller passes n live argument slots per the contract.
     unsafe { apply_core(f, core::slice::from_raw_parts(args, n as usize)) }
 }
+
+// ------------------ fln-3gv slice 8f: allocprof + timeit (apply-unlocked)
+
+/// C++ default-ostream `setprecision(3)` formatting (%g semantics at three
+/// significant digits): fixed notation with trailing zeros stripped for
+/// exponents in [-4, 3), C++-style scientific ("1.23e-05") otherwise —
+/// io.cpp:930's exact stream state for the timeit line.
+fn format_g3(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_owned();
+    }
+    let exp = v.abs().log10().floor() as i32;
+    if (-4..3).contains(&exp) {
+        let decimals = (2 - exp).max(0) as usize;
+        let t = format!("{v:.decimals$}");
+        if t.contains('.') {
+            t.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            t
+        }
+    } else {
+        let t = format!("{v:.2e}");
+        let (mant, e) = t.split_once('e').expect("exponent");
+        let mant = if mant.contains('.') {
+            mant.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mant
+        };
+        let (sign, digits) = if let Some(d) = e.strip_prefix('-') {
+            ("-", d)
+        } else {
+            ("+", e)
+        };
+        format!("{mant}e{sign}{digits:0>2}")
+    }
+}
+
+/// `lean_io_timeit` (`io.cpp:923-938`): steady-clock the applied thunk,
+/// eprintln "msg X.XXms|s" through the thread-current stderr stream (the
+/// 8d arm — io_eprintln's own path), answer the thunk's io result. The
+/// DIGITS are time-dependent by construction; the corpus binds the frame
+/// (prefix, unit suffix, stream routing, result passthrough) and the
+/// formatter is format_g3 above, the pin's exact stream state.
+// UNSAFE-LEDGER: FLN-UL-0528
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_timeit")]
+pub(crate) extern "C" fn export_lean_io_timeit(
+    msg: *mut LeanObject,
+    fn_obj: *mut LeanObject,
+) -> *mut LeanObject {
+    let start = std::time::Instant::now();
+    let r = export_lean_apply_1(fn_obj, crate::tagged::boxi(0));
+    let secs = start.elapsed().as_secs_f64();
+    // SAFETY: msg borrowed live string.
+    let text = unsafe {
+        let (n, _, _, b) = object::string_fields(msg);
+        let m = String::from_utf8_lossy(&b[..n - 1]).into_owned();
+        if secs < 1.0 {
+            format!("{m} {}ms", format_g3(secs * 1000.0))
+        } else {
+            format!("{m} {}s", format_g3(secs))
+        }
+    };
+    dbg_eprintln(text.as_bytes());
+    r
+}
+
+/// `lean_io_allocprof` (`io.cpp:940-950` + allocprof.cpp): the RELEASE pin
+/// is built without LEAN_RUNTIME_STATS, so its report is the msg line plus
+/// one FIXED sentence — byte-deterministic and mirrored exactly, through
+/// the same eprintln arm (whose own newline lands after the report's,
+/// matching io_eprintln(out.str())'s trailing shape). A stats-build
+/// Reference is a different binary from the pin and out of scope by D8.
+// UNSAFE-LEDGER: FLN-UL-0529
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_allocprof")]
+pub(crate) extern "C" fn export_lean_io_allocprof(
+    msg: *mut LeanObject,
+    fn_obj: *mut LeanObject,
+) -> *mut LeanObject {
+    let r = export_lean_apply_1(fn_obj, crate::tagged::boxi(0));
+    // SAFETY: msg borrowed live string.
+    let text = unsafe {
+        let (n, _, _, b) = object::string_fields(msg);
+        let m = String::from_utf8_lossy(&b[..n - 1]).into_owned();
+        format!(
+            "{m}\nAllocation profiling data is not available, compile lean using `-D RUNTIME_STATS=ON`\n"
+        )
+    };
+    dbg_eprintln(text.as_bytes());
+    r
+}

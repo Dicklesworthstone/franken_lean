@@ -136,6 +136,11 @@ extern lean_object *lean_io_force_exit(uint8_t code);
  * the get_set_stdout already declared above (io.cpp:119-127). */
 extern lean_object *lean_get_set_stderr(lean_object *h);
 
+/* fln-3gv slice 8f externs (extern-census class): the profiling pair,
+ * declared exactly as stage0 Init/System/IO.c declares them. */
+extern lean_object *lean_io_timeit(lean_object *msg, lean_object *fn);
+extern lean_object *lean_io_allocprof(lean_object *msg, lean_object *fn);
+
 /* fln-3gv slice 8e fixtures: the float once cells (lean.h:3272 declares
  * lean_once_cell_t; the float pair is declared there too) driven twice each
  * with a counting initializer, so both runtimes must agree the initializer
@@ -183,6 +188,12 @@ static void errstr_facts(const char *arm, lean_object *err) {
     snprintf(name, sizeof name, "corpus.errstr.%s_sum", arm);
     fact(name, bytesum(lean_string_cstr(s), lean_string_size(s) - 1));
     lean_dec(s);
+}
+
+/* 8f fixture: an IO thunk answering ok(42). */
+static lean_object *probe_io_42(lean_object *w) {
+    (void)w;
+    return lean_io_result_mk_ok(lean_box(42));
 }
 
 /* Apply-tail fixtures: a width-6 summing target and the arity-17
@@ -2062,6 +2073,66 @@ static void facts_mode(void) {
         }
         fact("corpus.ap.m_seventeen",
              lean_apply_m(f17, 17, m17) == lean_box(153));
+    }
+
+    /* ---- fln-3gv slice 8f: allocprof/timeit through a captured stream —
+     * allocprof's release-pin report is byte-deterministic; timeit's frame
+     * is bound (prefix, unit suffix, passthrough) with the digits skipped
+     * as time-dependent. */
+    {
+        char pf_path[128];
+        snprintf(pf_path, sizeof pf_path, "/tmp/fln-prof-stream-%lld",
+                 (long long)getpid());
+        remove(pf_path);
+        lean_object *pf_fname = lean_mk_string(pf_path);
+        lean_object *pf_hres = lean_io_prim_handle_mk(pf_fname, 1);
+        lean_object *pf_h = lean_ctor_get(pf_hres, 0);
+        lean_inc(pf_h);
+        lean_dec(pf_hres);
+        lean_dec(pf_fname);
+        lean_object *pf_old = lean_get_set_stderr(lean_stream_of_handle(pf_h));
+        lean_object *am = lean_mk_string("prof-msg");
+        lean_object *ar = lean_io_allocprof(
+            am, lean_alloc_closure((void *)probe_io_42, 1, 0));
+        fact("corpus.prof.alloc_result",
+             lean_ptr_tag(ar) == 0 && lean_ctor_get(ar, 0) == lean_box(42));
+        lean_dec(ar);
+        lean_dec(am);
+        lean_object *tm = lean_mk_string("time-msg");
+        lean_object *tr = lean_io_timeit(
+            tm, lean_alloc_closure((void *)probe_io_42, 1, 0));
+        fact("corpus.prof.time_result",
+             lean_ptr_tag(tr) == 0 && lean_ctor_get(tr, 0) == lean_box(42));
+        lean_dec(tr);
+        lean_dec(tm);
+        lean_dec(lean_get_set_stderr(pf_old));
+        {
+            FILE *back = fopen(pf_path, "r");
+            char pbuf[512];
+            size_t prd = back ? fread(pbuf, 1, sizeof pbuf, back) : 0;
+            if (back) {
+                fclose(back);
+            }
+            pbuf[prd < sizeof pbuf ? prd : sizeof pbuf - 1] = 0;
+            /* The allocprof block is deterministic: msg line + the fixed
+             * no-stats sentence + eprintln's newline. */
+            static const char want[] =
+                "prof-msg\nAllocation profiling data is not available, "
+                "compile lean using `-D RUNTIME_STATS=ON`\n\n";
+            fact("corpus.prof.alloc_report_exact",
+                 prd >= sizeof want - 1 &&
+                     memcmp(pbuf, want, sizeof want - 1) == 0);
+            /* The timeit line follows: prefix and unit suffix bound, the
+             * digits between them time-dependent. */
+            const char *tline = pbuf + (sizeof want - 1);
+            size_t trem = prd - (sizeof want - 1);
+            fact("corpus.prof.time_prefix",
+                 trem > 9 && memcmp(tline, "time-msg ", 9) == 0);
+            fact("corpus.prof.time_suffix_ms",
+                 trem >= 3 && tline[trem - 1] == '\n' &&
+                     tline[trem - 2] == 's' && tline[trem - 3] == 'm');
+        }
+        remove(pf_path);
     }
 }
 
