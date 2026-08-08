@@ -4277,3 +4277,175 @@ pub(crate) extern "C" fn export_lean_mk_io_error_no_such_thing_file(
 pub(crate) extern "C" fn export_lean_mk_io_error_eof(_unit: *mut LeanObject) -> *mut LeanObject {
     crate::tagged::boxi(17)
 }
+
+// ------------------------------------ 83r batch: copies, compares, hashes
+// Nine mechanical exports over cores already in this crate (copy_sarray,
+// alloc_array, ensure_capacity/exclusive, murmur64a, nat_to_usize), each
+// the pin's body arm-for-arm.
+
+/// `lean_sarray_eq_cold` (`object.cpp:2111-2114`): salient-byte memcmp.
+// UNSAFE-LEDGER: FLN-UL-0464
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_sarray_eq_cold")]
+pub(crate) extern "C" fn export_lean_sarray_eq_cold(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> bool {
+    // SAFETY: borrowed live sarrays; the pin compares elem_size*size bytes
+    // of a1 against a2 (the caller guarantees equal sizes on this path).
+    unsafe {
+        let (es, sz, _, d1) = object::sarray_fields(a1);
+        let (_, _, _, d2) = object::sarray_fields(a2);
+        let len = usize::from(es) * sz;
+        len == 0 || core::slice::from_raw_parts(d1, len) == core::slice::from_raw_parts(d2, len)
+    }
+}
+
+/// `lean_string_compare` (`object.cpp:2130-2139`): Ordering as 0/1/2.
+// UNSAFE-LEDGER: FLN-UL-0465
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_compare")]
+pub(crate) extern "C" fn export_lean_string_compare(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+) -> u8 {
+    // SAFETY: borrowed live strings; content bytes exclude the NUL.
+    unsafe {
+        let (n1, _, _, b1) = object::string_fields(s1);
+        let (n2, _, _, b2) = object::string_fields(s2);
+        match b1[..n1 - 1].cmp(&b2[..n2 - 1]) {
+            core::cmp::Ordering::Less => 0,
+            core::cmp::Ordering::Equal => 1,
+            core::cmp::Ordering::Greater => 2,
+        }
+    }
+}
+
+/// `lean_byte_array_hash` (`object.cpp:2604-2606`): hash_str(bytes, 11).
+// UNSAFE-LEDGER: FLN-UL-0466
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_byte_array_hash")]
+pub(crate) extern "C" fn export_lean_byte_array_hash(a: *mut LeanObject) -> u64 {
+    // SAFETY: borrowed live sarray.
+    unsafe {
+        let (_, sz, _, d) = object::sarray_fields(a);
+        let bytes = if sz == 0 {
+            &[][..]
+        } else {
+            core::slice::from_raw_parts(d, sz)
+        };
+        murmur64a(bytes, 11)
+    }
+}
+
+/// `lean_copy_byte_array` (`object.cpp:2545-2547`): copy at capacity.
+// UNSAFE-LEDGER: FLN-UL-0467
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_copy_byte_array")]
+pub(crate) extern "C" fn export_lean_copy_byte_array(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned sarray; copy_sarray settles the source reference.
+    unsafe {
+        let (_, _, cap, _) = object::sarray_fields(a);
+        copy_sarray(a, cap)
+    }
+}
+
+/// `lean_copy_float_array` (`object.cpp:2608-2610`): the f64 twin of the
+/// byte copy — same core, elem_size carried by the source.
+// UNSAFE-LEDGER: FLN-UL-0468
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_copy_float_array")]
+pub(crate) extern "C" fn export_lean_copy_float_array(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned sarray; copy_sarray settles the source reference.
+    unsafe {
+        let (_, _, cap, _) = object::sarray_fields(a);
+        copy_sarray(a, cap)
+    }
+}
+
+/// `lean_float_array_push` (`object.cpp:2638-2645`): ensure capacity+
+/// exclusivity, append the raw double, grow m_size.
+// UNSAFE-LEDGER: FLN-UL-0469
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_array_push")]
+pub(crate) extern "C" fn export_lean_float_array_push(
+    a: *mut LeanObject,
+    d: f64,
+) -> *mut LeanObject {
+    // SAFETY: owned sarray through the shared grow/exclusive pair; the new
+    // slot is written before m_size includes it.
+    unsafe {
+        let (_, sz, _, _) = object::sarray_fields(a);
+        let r = sarray_ensure_exclusive(sarray_ensure_capacity(a, sz + 1, false));
+        let (_, rsz, _, rdata) = object::sarray_fields(r);
+        rdata.add(rsz * size_of::<f64>()).cast::<f64>().write_unaligned(d);
+        (&raw mut (*r.cast::<crate::layout::LeanSarrayObject>()).m_size).write(rsz + 1);
+        r
+    }
+}
+
+/// `lean_copy_expand_array` (`object.cpp:2674-2697`): copy at (cap+1)*2
+/// when expanding; children retained per the shared-source arm.
+// UNSAFE-LEDGER: FLN-UL-0470
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_copy_expand_array")]
+pub(crate) extern "C" fn export_lean_copy_expand_array(
+    a: *mut LeanObject,
+    expand: bool,
+) -> *mut LeanObject {
+    // SAFETY: owned array; every child gains a token for the copy, and the
+    // source's reference is settled after the walk exactly as the pin's.
+    unsafe {
+        let (sz, cap) = object::array_fields(a);
+        let new_cap = if expand { (cap + 1) * 2 } else { cap };
+        let r = object::alloc_array(sz, new_cap);
+        for i in 0..sz {
+            let child = object::array_get(a, i);
+            if !is_scalar(child) {
+                rc::inc_ref_n(child, 1);
+            }
+            object::array_set_core(r, i, child);
+        }
+        rc::dec_ref(a);
+        r
+    }
+}
+
+/// `lean_copy_expand_array_nonlinear` (`object.cpp:2699-2701`): the alias.
+// UNSAFE-LEDGER: FLN-UL-0471
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_copy_expand_array_nonlinear")]
+pub(crate) extern "C" fn export_lean_copy_expand_array_nonlinear(
+    a: *mut LeanObject,
+    expand: bool,
+) -> *mut LeanObject {
+    export_lean_copy_expand_array(a, expand)
+}
+
+/// `lean_mk_array` (`object.cpp:2650-2672`): n copies of v; a big Nat not
+/// fitting usize is the pin's internal OOM panic (nat_to_usize's law).
+// UNSAFE-LEDGER: FLN-UL-0472
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_array")]
+pub(crate) extern "C" fn export_lean_mk_array(
+    n: *mut LeanObject,
+    v: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: n consumed by nat_to_usize; v distributed across sz slots
+    // with sz-1 minted tokens, or settled when sz is zero — the pin's arms.
+    unsafe {
+        let sz = nat_to_usize(n);
+        let r = object::alloc_array(sz, sz);
+        for i in 0..sz {
+            object::array_set_core(r, i, v);
+        }
+        if sz == 0 {
+            if !is_scalar(v) {
+                rc::dec_ref(v);
+            }
+        } else if sz > 1 && !is_scalar(v) {
+            rc::inc_ref_n(v, sz - 1);
+        }
+        r
+    }
+}
