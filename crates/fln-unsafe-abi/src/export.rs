@@ -4704,3 +4704,72 @@ pub(crate) extern "C" fn export_lean_float_array_data(a: *mut LeanObject) -> *mu
         r
     }
 }
+
+// -------------------------------------- 83r batch 4: slices + cstr_to_int
+// The slice object is a 3-field ctor — the backing String, a boxed start
+// offset, a boxed end offset (object.cpp:2471-2483, the pin's own
+// accessors) — and both exports below read exactly those fields.
+
+/// `lean_slice_hash` (`object.cpp:2486-2490`): hash_str over the slice's
+/// window, seed 11.
+// UNSAFE-LEDGER: FLN-UL-0496
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_slice_hash")]
+pub(crate) extern "C" fn export_lean_slice_hash(s: *mut LeanObject) -> u64 {
+    // SAFETY: borrowed live slice ctor; the window stays inside the backing
+    // string's salient bytes by the slice invariant.
+    unsafe {
+        let string = object::ctor_get(s, 0);
+        let start = crate::tagged::unbox(object::ctor_get(s, 1));
+        let end = crate::tagged::unbox(object::ctor_get(s, 2));
+        let (_, _, _, bytes) = object::string_fields(string);
+        murmur64a(&bytes[start..end], 11)
+    }
+}
+
+/// `lean_slice_dec_lt` (`object.cpp:2492-2497`): memcmp over the shorter
+/// window, length as the tiebreak.
+// UNSAFE-LEDGER: FLN-UL-0497
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_slice_dec_lt")]
+pub(crate) extern "C" fn export_lean_slice_dec_lt(s1: *mut LeanObject, s2: *mut LeanObject) -> u8 {
+    // SAFETY: borrowed live slice ctors, windows inside their strings.
+    unsafe {
+        let win = |s: *mut LeanObject| {
+            let string = object::ctor_get(s, 0);
+            let start = crate::tagged::unbox(object::ctor_get(s, 1));
+            let end = crate::tagged::unbox(object::ctor_get(s, 2));
+            let (_, _, _, bytes) = object::string_fields(string);
+            bytes[start..end].to_vec()
+        };
+        let (w1, w2) = (win(s1), win(s2));
+        u8::from(w1 < w2)
+    }
+}
+
+/// `lean_cstr_to_int` (`object.cpp:1637-1639`): the decimal literal parsed
+/// into an Int. The pin routes every literal through mpz and demotes to a
+/// scalar for [INT_MIN, INT_MAX] (lean.h:1588); ours parses the small range
+/// directly and REFUSES TYPED beyond it — the bignum shim's boundary
+/// (kernel-grade bignum is the Crucible workstream), the same law as the
+/// metadata timestamp arm. A malformed literal is refused the same way:
+/// the pin's mpz(n) asserts on garbage, which release-mode would UB.
+// UNSAFE-LEDGER: FLN-UL-0498
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_cstr_to_int")]
+pub(crate) extern "C" fn export_lean_cstr_to_int(n: *const c_char) -> *mut LeanObject {
+    // SAFETY: NUL-terminated per the cstr contract.
+    let bytes = unsafe { core::ffi::CStr::from_ptr(n) }.to_bytes();
+    let parsed = core::str::from_utf8(bytes)
+        .ok()
+        .and_then(|t| t.parse::<i64>().ok());
+    match parsed {
+        Some(v) if v >= i64::from(i32::MIN) && v <= i64::from(i32::MAX) => {
+            crate::tagged::boxi(v as i32 as u32 as usize)
+        }
+        _ => internal_panic_impl(
+            "cstr_to_int: literal outside the small-Int range needs the bignum shim \
+             (kernel-grade bignum, Crucible workstream)",
+        ),
+    }
+}

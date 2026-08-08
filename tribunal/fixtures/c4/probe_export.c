@@ -1851,6 +1851,31 @@ static void facts_mode(void) {
                  lean_unbox_float(lean_array_cptr(fd2)[1]) == -2.25);
         lean_dec(fd2);
     }
+
+    /* ---- franken_lean-83r batch 4: the slice pair over directly-built
+     * slice ctors (string, boxed start, boxed end — the layout the pin's
+     * own accessors read), and cstr_to_int's small arms. */
+    {
+        lean_object *sb = lean_mk_string("hello slice world");
+        lean_object *sl1 = lean_alloc_ctor(0, 3, 0);
+        lean_inc(sb);
+        lean_ctor_set(sl1, 0, sb);
+        lean_ctor_set(sl1, 1, lean_box(6));
+        lean_ctor_set(sl1, 2, lean_box(11));
+        lean_object *sl2 = lean_alloc_ctor(0, 3, 0);
+        lean_ctor_set(sl2, 0, sb);
+        lean_ctor_set(sl2, 1, lean_box(0));
+        lean_ctor_set(sl2, 2, lean_box(5));
+        fact("corpus.slice.hash", (long long)lean_slice_hash(sl1));
+        fact("corpus.slice.lt_hello_vs_slice", lean_slice_dec_lt(sl2, sl1));
+        fact("corpus.slice.lt_reverse", lean_slice_dec_lt(sl1, sl2));
+        lean_dec(sl1);
+        lean_dec(sl2);
+        fact("corpus.slice.cstr_pos",
+             lean_cstr_to_int("12345") == lean_box(12345));
+        fact("corpus.slice.cstr_neg",
+             (long long)(unsigned)(int)(long long)lean_unbox(lean_cstr_to_int("-7")));
+    }
 }
 
 int main(int argc, char **argv) {
