@@ -4378,7 +4378,10 @@ pub(crate) extern "C" fn export_lean_float_array_push(
         let (_, sz, _, _) = object::sarray_fields(a);
         let r = sarray_ensure_exclusive(sarray_ensure_capacity(a, sz + 1, false));
         let (_, rsz, _, rdata) = object::sarray_fields(r);
-        rdata.add(rsz * size_of::<f64>()).cast::<f64>().write_unaligned(d);
+        rdata
+            .add(rsz * size_of::<f64>())
+            .cast::<f64>()
+            .write_unaligned(d);
         (&raw mut (*r.cast::<crate::layout::LeanSarrayObject>()).m_size).write(rsz + 1);
         r
     }
