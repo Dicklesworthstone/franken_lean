@@ -383,7 +383,9 @@ const LANE_CITED_ROWS: usize = 1;
 /// production individual-allocation fallback while its TLS bin is borrowed.
 /// 96 -> 97 in the FLN-UL-0328 semantic reentrant landing: its helper calls `alloc_small` while
 /// the TLS bin remains borrowed, so the named test pins the production fallback's one-tick law.
-const SYMBOL_RESOLVED_ROWS: usize = 97;
+/// 97 -> 117 with the campaign's twenty audited native-cell resolvers (see the
+/// RESOLVING_CITATION_TOKENS and PROSE_EVIDENCE_ROWS histories, this change).
+const SYMBOL_RESOLVED_ROWS: usize = 117;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -451,7 +453,12 @@ const SYMBOL_RESOLVED_ROWS: usize = 97;
 /// citation is a new symbol token and no existing row lost a resolving citation.
 /// 121 -> 122 in the all-class semantic reentrant matrix: FLN-UL-0328 gains the exact
 /// all-class test citation, while its row remains symbol-resolved and no row is added.
-const RESOLVING_CITATION_TOKENS: usize = 122;
+/// 122 -> 142 across the 83r/3gv export campaign (e34bc583..f738e96a, rows
+/// FLN-UL-0411..0512): twenty new tokens, each the named native cell in the
+/// row's suite column (the error-string, stdin, panic-stream, once/task,
+/// decoder, dbg/mk, and string-tail cells) — audited row by row, all
+/// resolving to #[test] fns that run under plain cargo test.
+const RESOLVING_CITATION_TOKENS: usize = 142;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -475,13 +482,20 @@ const RESOLVING_CITATION_TOKENS: usize = 122;
 /// mark-walk closure targets — land as suite-phrase prose exactly as the task manager's did.
 /// 220 -> 226 in the read/write-prims slice: six prose rows (the two prims, the two live
 /// stream fields, and the two export attributes).
-const PROSE_EVIDENCE_ROWS: usize = 226;
+/// 226 -> 388 and symbol-resolved 97 -> 117 across the fln-3gv slices 5c-8e and the
+/// franken_lean-83r batches 1-7 (2142a7d4..f738e96a) plus peer rows in the same span —
+/// caught by the first workspace sweep since the 226-era, because this suite runs only
+/// workspace-wide, never in the per-slice gauntlet lane. The twenty new resolvers are
+/// the campaign's named native cells (audited in RESOLVING_CITATION_TOKENS above); the
+/// prose growth is the getLine/handle-ctl/fs/uv/temp/metadata/env/exit/errstr/float/
+/// string-plane rows whose evidence is suite-phrase prose exactly as the stdio plane's.
+const PROSE_EVIDENCE_ROWS: usize = 388;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 324 rows: 1 cites an e2e lane, 97 carry \
-symbol-resolved evidence, and 226 remain prose; 122 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 506 rows: 1 cites an e2e lane, 117 carry \
+symbol-resolved evidence, and 388 remain prose; 142 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
