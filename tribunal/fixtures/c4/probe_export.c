@@ -190,6 +190,16 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* 8g fixture: a foreign putStr closure capturing its delivered bytes. */
+static long long probe_foreign_sum = 0;
+static lean_object *probe_foreign_putstr(lean_object *s, lean_object *w) {
+    (void)w;
+    probe_foreign_sum = bytesum(lean_string_cstr(s), lean_string_size(s) - 1) +
+                        1000 * ((long long)lean_string_size(s) - 1);
+    lean_dec(s);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 /* 8f fixture: an IO thunk answering ok(42). */
 static lean_object *probe_io_42(lean_object *w) {
     (void)w;
@@ -2133,6 +2143,56 @@ static void facts_mode(void) {
                      tline[trem - 2] == 's' && tline[trem - 3] == 'm');
         }
         remove(pf_path);
+    }
+
+    /* ---- fln-3gv slice 8g: (1) a FOREIGN-closure stderr stream receives
+     * a non-fatal panic via closure application on BOTH runtimes — the
+     * io_eprintln arm with no native shortcut available; (2) the stdin
+     * STREAM's getLine FIELD applied over the dup2'd fixture — the closure
+     * hop 8c deferred, closed by the apply tail. */
+    {
+        lean_object *fstream = lean_alloc_ctor(0, 6, 0);
+        for (int i = 0; i < 6; i++) {
+            lean_ctor_set(fstream, i,
+                          lean_alloc_closure((void *)probe_foreign_putstr, 2, 0));
+        }
+        lean_object *fold = lean_get_set_stderr(fstream);
+        probe_foreign_sum = 0;
+        lean_dec(lean_panic_fn(lean_box(0), lean_mk_string("foreign-line")));
+        lean_dec(lean_get_set_stderr(fold));
+        fact("corpus.sg.foreign_panic_sum", probe_foreign_sum);
+    }
+    {
+        char sg_path[128];
+        snprintf(sg_path, sizeof sg_path, "/tmp/fln-sg-stdin-%lld",
+                 (long long)getpid());
+        remove(sg_path);
+        FILE *seed = fopen(sg_path, "w");
+        fputs("field line\nrest", seed);
+        fclose(seed);
+        int sg_fd = open(sg_path, O_RDONLY);
+        int sg_saved0 = dup(0);
+        dup2(sg_fd, 0);
+        close(sg_fd);
+        lean_object *sg_fname = lean_mk_string("/dev/stdin");
+        lean_object *sg_hres = lean_io_prim_handle_mk(sg_fname, 0);
+        lean_object *sg_h = lean_ctor_get(sg_hres, 0);
+        lean_inc(sg_h);
+        lean_dec(sg_hres);
+        lean_dec(sg_fname);
+        lean_object *sg_stream = lean_stream_of_handle(sg_h);
+        lean_object *sg_field = lean_ctor_get(sg_stream, 3);
+        lean_inc(sg_field);
+        lean_object *sg_res = lean_apply_1(sg_field, lean_box(0));
+        fact("corpus.sg.stream_getline_ok", lean_ptr_tag(sg_res) == 0);
+        lean_object *sg_line = lean_ctor_get(sg_res, 0);
+        fact("corpus.sg.stream_getline_bytes",
+             bytesum(lean_string_cstr(sg_line), lean_string_size(sg_line) - 1));
+        lean_dec(sg_res);
+        lean_dec(sg_stream);
+        dup2(sg_saved0, 0);
+        close(sg_saved0);
+        remove(sg_path);
     }
 }
 
