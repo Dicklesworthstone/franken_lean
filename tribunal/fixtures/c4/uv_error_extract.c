@@ -1,8 +1,13 @@
-/* Derivation program for the fs plane's uv-error surface (fln-3gv slice 6b):
- * drives the Reference's own exported lean_decode_uv_error over every errno
- * the io.cpp decoder names, with a real filename, and prints one row per
- * input — the IO.Error variant tag, the stored osCode, and the details
- * string (libuv's uv_strerror text, which differs from glibc's strerror).
+/* Derivation program for the fs plane's uv-error surface (fln-3gv slice 6b;
+ * population widened by franken_lean-83r's decode-export sweep, which caught
+ * the original 71-named-errno scope UNDER-DERIVED — libuv maps errnos the
+ * io.cpp decoder never names, so the named list was a sampler): drives the
+ * Reference's own exported lean_decode_uv_error over EVERY errno 1..=200,
+ * with a real filename, and prints one row per input — the IO.Error variant
+ * tag, the stored osCode, and the details string (libuv's uv_strerror text,
+ * which differs from glibc's strerror). Codes outside the sweep keep the
+ * decoder's own "Unknown system error N" shape, which the EDOM-class rows
+ * inside the sweep pin.
  *
  * Link it ONLY against libleanshared (the same recipe as the gauntlet's
  * probe_reference): the output is a measured contract table, mined from the
@@ -36,22 +41,12 @@ static void row(const char *name, int e) {
     lean_dec(fname);
 }
 
-#define R(n) row(#n, n)
-
 int main(void) {
     lean_initialize_runtime_module();
-    R(EINTR); R(ELOOP); R(ENAMETOOLONG); R(EDESTADDRREQ); R(EBADF); R(EDOM);
-    R(EINVAL); R(EILSEQ); R(ENOEXEC); R(ENOSTR); R(ENOTCONN); R(ENOTSOCK);
-    R(ENOENT); R(EACCES); R(EROFS); R(ECONNABORTED); R(EFBIG); R(EPERM);
-    R(EMFILE); R(ENFILE); R(ENOSPC); R(E2BIG); R(EAGAIN); R(EMLINK);
-    R(EMSGSIZE); R(ENOBUFS); R(ENOLCK); R(ENOMEM); R(ENOSR); R(EISDIR);
-    R(EBADMSG); R(ENOTDIR); R(ENXIO); R(EHOSTUNREACH); R(ENETUNREACH);
-    R(ECHILD); R(ECONNREFUSED); R(ENODATA); R(ENOMSG); R(ESRCH); R(EEXIST);
-    R(EINPROGRESS); R(EISCONN); R(EIO); R(ENOTEMPTY); R(ENOTTY);
-    R(ECONNRESET); R(EIDRM); R(ENETDOWN); R(ENETRESET); R(ENOLINK); R(EPIPE);
-    R(EPROTO); R(EPROTONOSUPPORT); R(EPROTOTYPE); R(ETIME); R(ETIMEDOUT);
-    R(EADDRINUSE); R(EBUSY); R(EDEADLK); R(ETXTBSY); R(EADDRNOTAVAIL);
-    R(EAFNOSUPPORT); R(ENODEV); R(ENOPROTOOPT); R(ENOSYS); R(EOPNOTSUPP);
-    R(ERANGE); R(ESPIPE); R(EXDEV); R(EFAULT);
+    char name[16];
+    for (int e = 1; e <= 200; e++) {
+        snprintf(name, sizeof name, "E%d", e);
+        row(name, e);
+    }
     return 0;
 }

@@ -3831,7 +3831,7 @@ pub(crate) extern "C" fn export_lean_decode_io_error(
 }
 
 /// `lean_decode_uv_error` (`io.cpp:258` onward): the uv decoder over the
-/// MEASURED 71-row contract table (`tribunal/fixtures/c4/uv_error_contract.txt`,
+/// MEASURED contract table — a 200-errno sweep (`tribunal/fixtures/c4/uv_error_contract.txt`,
 /// fln-3gv slice 6b), exported under the pin's name — the NEGATIVE uv code
 /// plus a borrowed, possibly-null filename.
 // UNSAFE-LEDGER: FLN-UL-0429

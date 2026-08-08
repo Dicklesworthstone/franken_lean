@@ -1613,6 +1613,74 @@ static void facts_mode(void) {
                  lean_io_get_task_state_core(ts_t) == 2);
         lean_dec(ts_t);
     }
+
+    /* ---- franken_lean-83r export slice: the decode/mk-error trio under
+     * the pin's exported names, bound END TO END through the landed
+     * pretty-printer over aggregate errno sweeps — any single-arm
+     * divergence (variant, code, details, filename handling) moves the
+     * rolling totals. The uv sweep keeps a non-null fname throughout: the
+     * pin's bare-String arms lean_assert on null (release UB), which ours
+     * refuses typed — a disclosed deviation, deliberately outside this
+     * differential. The io null sweep skips EINTR/ENOENT (2, 4), whose
+     * arms require a filename in both runtimes. */
+    {
+        lean_object *dec_f = lean_mk_string("sweep.txt");
+        long long dc = 0, db = 0, ds = 0;
+        for (int e = 1; e <= 140; e++) {
+            lean_object *err = lean_decode_io_error(e, dec_f);
+            lean_object *s = lean_io_error_to_string(err);
+            dc++;
+            db += (long long)lean_string_size(s) - 1;
+            ds += bytesum(lean_string_cstr(s), lean_string_size(s) - 1);
+            lean_dec(s);
+        }
+        fact("corpus.decode.io_fname_count", dc);
+        fact("corpus.decode.io_fname_bytes", db);
+        fact("corpus.decode.io_fname_sum", ds);
+        dc = db = ds = 0;
+        for (int e = 1; e <= 140; e++) {
+            if (e == 2 || e == 4) {
+                continue; /* bare-fname arms: filename required both sides */
+            }
+            lean_object *err = lean_decode_io_error(e, NULL);
+            lean_object *s = lean_io_error_to_string(err);
+            dc++;
+            db += (long long)lean_string_size(s) - 1;
+            ds += bytesum(lean_string_cstr(s), lean_string_size(s) - 1);
+            lean_dec(s);
+        }
+        fact("corpus.decode.io_null_count", dc);
+        fact("corpus.decode.io_null_bytes", db);
+        fact("corpus.decode.io_null_sum", ds);
+        dc = db = ds = 0;
+        for (int e = 1; e <= 140; e++) {
+            lean_object *err = lean_decode_uv_error(-e, dec_f);
+            lean_object *s = lean_io_error_to_string(err);
+            dc++;
+            db += (long long)lean_string_size(s) - 1;
+            ds += bytesum(lean_string_cstr(s), lean_string_size(s) - 1);
+            lean_dec(s);
+        }
+        fact("corpus.decode.uv_count", dc);
+        fact("corpus.decode.uv_bytes", db);
+        fact("corpus.decode.uv_sum", ds);
+        lean_dec(dec_f);
+        /* Spot arms: the EFAULT-default join, an unmapped errno, and the
+         * userError identity through the exported ctor. */
+        {
+            lean_object *s = lean_io_error_to_string(lean_decode_io_error(14, NULL));
+            fact("corpus.decode.efault_bytes", (long long)lean_string_size(s) - 1);
+            fact("corpus.decode.efault_sum",
+                 bytesum(lean_string_cstr(s), lean_string_size(s) - 1));
+            lean_dec(s);
+            lean_object *u = lean_io_error_to_string(
+                lean_mk_io_user_error(lean_mk_string("User Boom")));
+            fact("corpus.decode.user_bytes", (long long)lean_string_size(u) - 1);
+            fact("corpus.decode.user_sum",
+                 bytesum(lean_string_cstr(u), lean_string_size(u) - 1));
+            lean_dec(u);
+        }
+    }
 }
 
 int main(int argc, char **argv) {

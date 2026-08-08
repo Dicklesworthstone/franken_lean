@@ -5094,3 +5094,69 @@ fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
     std::fs::remove_file(&base).ok();
     crate::membrane::drain_small_bins_for_test();
 }
+
+#[test]
+fn export_error_decoders_and_user_error_serve_the_pins_names() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_decode_io_error, export_lean_decode_uv_error, export_lean_io_error_to_string,
+        export_lean_mk_io_user_error,
+    };
+
+    // The decode/mk-error export trio (franken_lean-83r export slice over
+    // the 6a/6b/8a cores): the decoders answer under the pin's exported
+    // names, and each result prints through the landed pretty-printer, so
+    // the shapes are asserted at the byte level rather than by tag alone.
+    crate::stdio::initialize_streams();
+    shadow::enable();
+    // SAFETY: every object is allocated and settled here; borrowed fnames
+    // are settled by this cell after the borrowing calls return.
+    // UNSAFE-LEDGER: FLN-UL-0431
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let take = |e: *mut crate::layout::LeanObject| -> String {
+            let s = export_lean_io_error_to_string(e);
+            let (sz, _, _, b) = crate::object::string_fields(s);
+            let out = String::from_utf8(b[..sz - 1].to_vec()).expect("printer output is UTF-8");
+            crate::rc::dec_ref(s);
+            out
+        };
+
+        // errno decoder: the optfile arm with and without a filename
+        // (EINVAL 22), and the bare-fname EINTR arm (4).
+        let f = mk("cfg.txt");
+        assert_eq!(
+            take(export_lean_decode_io_error(22, f)),
+            "invalid argument (error code: 22, invalid argument)\n  file: cfg.txt"
+        );
+        assert_eq!(
+            take(export_lean_decode_io_error(22, core::ptr::null_mut())),
+            "invalid argument (error code: 22, invalid argument)"
+        );
+        assert_eq!(
+            take(export_lean_decode_io_error(4, f)),
+            "interrupted system call (error code: 4, interrupted system call)\n  file: cfg.txt"
+        );
+
+        // uv decoder: -ENOENT keeps libuv's lowercase details and the
+        // wrapped negative code (slice 6b's measured shape).
+        assert_eq!(
+            take(export_lean_decode_uv_error(-2, f)),
+            "no such file or directory (error code: 4294967294)\n  file: cfg.txt"
+        );
+        crate::rc::dec_ref(f);
+
+        // userError: the ctor answers its own msg through the printer.
+        let ue = export_lean_mk_io_user_error(mk("User Boom"));
+        assert_eq!((&raw const (*ue).m_tag).read(), 18, "tag-18 userError");
+        assert_eq!(
+            take(ue),
+            "User Boom",
+            "toString answers the msg bytes untouched"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "RC balance across the decoder-export cell");
+    crate::membrane::drain_small_bins_for_test();
+}
