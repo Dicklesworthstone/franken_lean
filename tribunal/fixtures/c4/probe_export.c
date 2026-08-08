@@ -136,6 +136,20 @@ extern lean_object *lean_io_force_exit(uint8_t code);
  * the get_set_stdout already declared above (io.cpp:119-127). */
 extern lean_object *lean_get_set_stderr(lean_object *h);
 
+/* fln-3gv slice 8e fixtures: the float once cells (lean.h:3272 declares
+ * lean_once_cell_t; the float pair is declared there too) driven twice each
+ * with a counting initializer, so both runtimes must agree the initializer
+ * ran exactly once per cell. */
+static int errstr_float_once_calls = 0;
+static float once_init_f32(void) {
+    errstr_float_once_calls++;
+    return 1.5f;
+}
+static double once_init_f64(void) {
+    errstr_float_once_calls++;
+    return 2.25;
+}
+
 /* Slice 8a fixture builders: every IO.Error ctor shape synthesized directly
  * over the generated layout (IOError.c: 1-obj-field families u32 at
  * sizeof(void*)*1, 2-obj-field families at sizeof(void*)*2), so the arm
@@ -1577,6 +1591,27 @@ static void facts_mode(void) {
         }
         remove(pnc_path);
         unsetenv("LEAN_BACKTRACE");
+    }
+
+    /* ---- fln-3gv slice 8e: the float once cells and the task-state core
+     * symbol (object.cpp:2903-2921, 1260-1265). */
+    {
+        static lean_once_cell_t f32_cell;
+        static float f32_loc;
+        static lean_once_cell_t f64_cell;
+        static double f64_loc;
+        float fa = lean_float32_once_cold(&f32_loc, &f32_cell, once_init_f32);
+        float fb = lean_float32_once_cold(&f32_loc, &f32_cell, once_init_f32);
+        double da = lean_float_once_cold(&f64_loc, &f64_cell, once_init_f64);
+        double db = lean_float_once_cold(&f64_loc, &f64_cell, once_init_f64);
+        fact("corpus.once_float.f32_value_x4", fa == 1.5f && fb == 1.5f && f32_loc == 1.5f);
+        fact("corpus.once_float.f64_value_x4", da == 2.25 && db == 2.25 && f64_loc == 2.25);
+        fact("corpus.once_float.inits_exactly_two", errstr_float_once_calls);
+        lean_object *ts_t = lean_task_pure(lean_box(9));
+        fact("corpus.once_float.task_state_core_agrees",
+             lean_io_get_task_state_core(ts_t) == lean_io_get_task_state(ts_t) &&
+                 lean_io_get_task_state_core(ts_t) == 2);
+        lean_dec(ts_t);
     }
 }
 

@@ -77,7 +77,7 @@ row lean_float32_isfinite | Unsupported | franken_lean-83r | census (fln-rt::abi
 row lean_float32_isinf | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float32_isnan | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float32_of_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_float32_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_float32_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); gauntlet corpus facts | scalar once cell at f32 over the shared once core (object.cpp:2903-2911; fln-3gv slice 8e)
 row lean_float32_scaleb | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float32_to_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float32_to_string | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -89,7 +89,7 @@ row lean_float_isfinite | Unsupported | franken_lean-83r | census (fln-rt::abi) 
 row lean_float_isinf | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float_isnan | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float_of_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_float_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_float_once_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export apply/once suites (tests.rs export_*); gauntlet corpus facts | scalar once cell at f64 (object.cpp:2913-2921; fln-3gv slice 8e)
 row lean_float_scaleb | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float_to_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float_to_string | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -122,7 +122,7 @@ row lean_internal_panic_rc_overflow | CompatWrapper | crates/fln-unsafe-abi/src/
 row lean_internal_panic_unreachable | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | always the process stderr then abort/exit — the pin writes std::cerr directly for internal panics (object.cpp:91-95), never the Lean buffer
 row lean_io_cancel_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task manager suite; stage0 gauntlet lane | finished no-op pre-manager; unfinished sets the flag under the lock (object.cpp:1254-1258); managerless unreachable arm refuses typed
 row lean_io_check_canceled_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task manager suite; stage0 gauntlet lane | current-task flag or shutdown; false off-worker and managerless (object.cpp:1246-1252)
-row lean_io_get_task_state_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_get_task_state_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | task suites (tests.rs export_*); gauntlet corpus facts | the runtime-layer state read; delegation inverted (core -> wrapper) with one copy of the logic, observably the pin's (object.cpp:1260-1265; fln-3gv slice 8e)
 row lean_io_mark_end_initialization | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | stdio prim suites; gauntlet corpus facts; stage0 IO.c demand audit | the init-flag flip generated main performs after module initializers (io.cpp:77-79; fln-3gv slice 7a)
 row lean_io_result_show_error | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); gauntlet corpus facts; stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | "uncaught exception: " + the pretty-printed error + newline on the process stderr, flushed (io.cpp:61-67; fln-3gv slice 8a)
 row lean_io_wait_any_core | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export io wrapper suite; stage0 gauntlet lane | first finished member in list order, block-and-rescan through the manager (object.cpp:1267-1269, 1014-1023); managerless finished-scan answers, empty-handed refuses typed

@@ -2608,6 +2608,36 @@ fn export_once_cells_initialize_exactly_once() {
             0,
             "once objects are persistent"
         );
+
+        // The float pair (fln-3gv slice 8e): same core, float slots.
+        use crate::export::{export_lean_float_once_cold, export_lean_float32_once_cold};
+        static FCALLS: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn init_f32() -> f32 {
+            FCALLS.fetch_add(1, O::SeqCst);
+            1.5f32
+        }
+        extern "C" fn init_f64() -> f64 {
+            FCALLS.fetch_add(1, O::SeqCst);
+            2.25f64
+        }
+        let mut f32cell = [0i32; 2];
+        let mut f32slot = 0.0f32;
+        FCALLS.store(0, O::SeqCst);
+        let fa =
+            export_lean_float32_once_cold(&raw mut f32slot, (&raw mut f32cell).cast(), init_f32);
+        let fb =
+            export_lean_float32_once_cold(&raw mut f32slot, (&raw mut f32cell).cast(), init_f32);
+        assert_eq!((fa, fb, f32slot), (1.5, 1.5, 1.5));
+        let mut f64cell = [0i32; 2];
+        let mut f64slot = 0.0f64;
+        let da = export_lean_float_once_cold(&raw mut f64slot, (&raw mut f64cell).cast(), init_f64);
+        let db = export_lean_float_once_cold(&raw mut f64slot, (&raw mut f64cell).cast(), init_f64);
+        assert_eq!((da, db, f64slot), (2.25, 2.25, 2.25));
+        assert_eq!(
+            FCALLS.load(O::SeqCst),
+            2,
+            "each float initializer ran exactly once"
+        );
     }
 }
 
@@ -3189,6 +3219,11 @@ fn export_task_promise_state_family_matches_upstream_arms() {
             export_lean_io_get_task_state(t),
             2,
             "Task.pure is born Finished (m_imp == NULL answers 2, object.cpp:1260-1263)"
+        );
+        assert_eq!(
+            crate::export::export_lean_io_get_task_state_core(t),
+            export_lean_io_get_task_state(t),
+            "the _core symbol and its wrapper agree (fln-3gv slice 8e; one copy of the logic)"
         );
         assert!(
             (&raw const (*t).m_rc).read() > 0,

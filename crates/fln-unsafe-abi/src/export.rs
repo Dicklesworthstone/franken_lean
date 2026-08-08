@@ -2135,6 +2135,34 @@ pub(crate) extern "C" fn export_lean_uint64_once_cold(
     unsafe { once_cell_run(tok, loc, init, false) }
 }
 
+/// `lean_float32_once_cold` (`object.cpp:2903-2911`): the scalar once cell
+/// at `f32` — the generated code's cached `Float32` constants
+/// (fln-3gv slice 8e).
+// UNSAFE-LEDGER: FLN-UL-0425
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_once_cold")]
+pub(crate) extern "C" fn export_lean_float32_once_cold(
+    loc: *mut f32,
+    tok: *mut c_void,
+    init: unsafe extern "C" fn() -> f32,
+) -> f32 {
+    // SAFETY: as lean_uint8_once_cold, float slot.
+    unsafe { once_cell_run(tok, loc, init, false) }
+}
+
+/// `lean_float_once_cold` (`object.cpp:2913-2921`): the `f64` twin.
+// UNSAFE-LEDGER: FLN-UL-0426
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_once_cold")]
+pub(crate) extern "C" fn export_lean_float_once_cold(
+    loc: *mut f64,
+    tok: *mut c_void,
+    init: unsafe extern "C" fn() -> f64,
+) -> f64 {
+    // SAFETY: as lean_uint8_once_cold, float slot.
+    unsafe { once_cell_run(tok, loc, init, false) }
+}
+
 /// `lean_usize_once_cold`.
 // UNSAFE-LEDGER: FLN-UL-0175
 #[allow(unsafe_code)]
@@ -2664,8 +2692,7 @@ pub(crate) extern "C" fn export_lean_task_map_core(
 /// (`m_imp == NULL`) answers 2 before the manager is ever consulted; the
 /// `m_imp != NULL` arm takes the manager's locked read (0 waiting/queued,
 /// 1 running/promised), and without a manager — where the pin null-derefs —
-/// refuses typed. The `_core` census symbol itself stays Unsupported —
-/// nothing in stage0 demands it; this wrapper inlines its body.
+/// refuses typed. The `_core` census symbol is served below since slice 8e.
 // UNSAFE-LEDGER: FLN-UL-0221
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_io_get_task_state")]
@@ -2682,6 +2709,18 @@ pub(crate) extern "C" fn export_lean_io_get_task_state(t: *mut LeanObject) -> u8
         return mgr.get_task_state(crate::task_manager::TaskPtr(t.cast()));
     }
     task_manager_refusal("`IO.getTaskState` on an unfinished task")
+}
+
+/// `lean_io_get_task_state_core` (`object.cpp:1260-1265`): the runtime-layer
+/// symbol the pin's `lean_io_get_task_state` wrapper calls. Ours inverts the
+/// delegation direction — the core delegates to the wrapper above, whose
+/// body IS the core's (null `m_imp` fast path, then the manager's locked
+/// read) — observably identical, one copy of the logic (fln-3gv slice 8e).
+// UNSAFE-LEDGER: FLN-UL-0427
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_io_get_task_state_core")]
+pub(crate) extern "C" fn export_lean_io_get_task_state_core(t: *mut LeanObject) -> u8 {
+    export_lean_io_get_task_state(t)
 }
 
 /// `lean_io_promise_new` (`object.cpp:1271-1292, 1298-1301`; extern census
