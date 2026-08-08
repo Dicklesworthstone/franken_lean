@@ -415,7 +415,7 @@ const UV_ERROR_ROWS: &[(c_int, u8, &str)] = &[
 /// `fname` is borrowed and live; caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0361
 #[allow(unsafe_code)]
-unsafe fn decode_uv_error(neg: c_int, fname: *mut LeanObject) -> *mut LeanObject {
+pub(crate) unsafe fn decode_uv_error(neg: c_int, fname: *mut LeanObject) -> *mut LeanObject {
     let e = -neg;
     let (tag, details_text) = UV_ERROR_ROWS
         .iter()

@@ -3813,3 +3813,48 @@ pub(crate) extern "C" fn export_lean_io_result_show_error(r: *mut LeanObject) {
         crate::stdio::io_result_show_error_core(r, &mut std::io::stderr().lock());
     }
 }
+
+/// `lean_decode_io_error` (`io.cpp:161-260`; census row `franken_lean-83r`):
+/// the errno decoder every fs/handle prim shares, exported under the pin's
+/// name — errnum plus a BORROWED, possibly-null filename to the exact
+/// `IO.Error` arm. The EINTR/ENOENT arms require a filename exactly as the
+/// pin's `lean_inc(fname)` does.
+// UNSAFE-LEDGER: FLN-UL-0428
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_decode_io_error")]
+pub(crate) extern "C" fn export_lean_decode_io_error(
+    errnum: core::ffi::c_int,
+    fname: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: fname borrowed (nullable) per the b_obj_arg contract.
+    unsafe { crate::stdio::decode_io_error(errnum, fname) }
+}
+
+/// `lean_decode_uv_error` (`io.cpp:258` onward): the uv decoder over the
+/// MEASURED 71-row contract table (`tribunal/fixtures/c4/uv_error_contract.txt`,
+/// fln-3gv slice 6b), exported under the pin's name — the NEGATIVE uv code
+/// plus a borrowed, possibly-null filename.
+// UNSAFE-LEDGER: FLN-UL-0429
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_decode_uv_error")]
+pub(crate) extern "C" fn export_lean_decode_uv_error(
+    errnum: core::ffi::c_int,
+    fname: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: fname borrowed (nullable) per the b_obj_arg contract.
+    unsafe { crate::fs::decode_uv_error(errnum, fname) }
+}
+
+/// `lean_mk_io_user_error` (IOError.c:71 + its generated body; `IO.userError`):
+/// the owned msg wrapped in the tag-18 `userError` ctor.
+// UNSAFE-LEDGER: FLN-UL-0430
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_user_error")]
+pub(crate) extern "C" fn export_lean_mk_io_user_error(msg: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: fresh 1-field ctor; the owned msg settles into its slot.
+    unsafe {
+        let r = object::alloc_ctor(18, 1, 0);
+        object::ctor_set(r, 0, msg);
+        r
+    }
+}

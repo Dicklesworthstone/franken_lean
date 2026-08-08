@@ -69,8 +69,8 @@ row lean_dbg_sleep | Unsupported | franken_lean-83r | census (fln-rt::abi) | lat
 row lean_dbg_trace | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_dbg_trace_if_shared | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_dec_ref_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | death test + iterative deletion worklist (object.cpp:443-457)
-row lean_decode_io_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_decode_uv_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_decode_io_error | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | error-string suites (tests.rs export_*); gauntlet corpus facts | the shared errno decoder exported under the pin's name; nullable borrowed fname, EINTR/ENOENT require one exactly as the pin (io.cpp:161-260; franken_lean-83r export slice)
+row lean_decode_uv_error | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | error-string suites (tests.rs export_*); gauntlet corpus facts | the uv decoder over the measured 71-row contract table, exported under the pin's name (io.cpp:258+; fln-3gv slice 6b core, franken_lean-83r export slice)
 row lean_finalize_task_manager | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export task manager suite; stage0 gauntlet lane | drain, join pooled workers, wait out dedicated (object.cpp:1092-1097, 937-953; fln-3gv slice 3)
 row lean_float32_frexp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_float32_isfinite | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -155,7 +155,7 @@ row lean_mk_io_error_resource_vanished | Unsupported | franken_lean-83r | census
 row lean_mk_io_error_time_expired | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_mk_io_error_unsatisfied_constraints | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_mk_io_error_unsupported_operation | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_mk_io_user_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_user_error | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | error-string suites (tests.rs export_*); gauntlet corpus facts | the owned msg in the tag-18 userError ctor, the generated body exactly (IOError.c:71; franken_lean-83r export slice)
 row lean_mk_string | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | validate + lossy U+FFFD recovery, exact utf8.cpp semantics
 row lean_mk_string_from_bytes | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | validate + lossy U+FFFD recovery, exact utf8.cpp semantics
 row lean_mk_string_from_bytes_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | utf8_n_strlen count, bug-compatible garbage stepping
