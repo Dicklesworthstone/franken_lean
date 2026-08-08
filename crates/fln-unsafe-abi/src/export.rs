@@ -3929,3 +3929,351 @@ pub(crate) extern "C" fn export_lean_dbg_trace_if_shared(
     }
     a
 }
+
+// --------------------------------------------- the mk_io_error ctor family
+// The 23 Lean-generated `lean_mk_io_error_*` exports (IOError.c:768-1120):
+// three shapes over the builders stdio.rs already owns, every tag from the
+// inductive's declaration order (Init/System/IOError.lean:24-140), the same
+// layouts the decode sweep proves byte-identical per commit. `_file` wraps
+// the owned filename in `some`; the plain opt-family variants carry `none`;
+// interrupted/noFileOrDirectory take the filename bare; eof is `box(17)`
+// with its unit argument scalar (nothing to settle).
+
+/// Shape helper: the `(osCode, details)` and none-arm families.
+/// # Safety
+/// `details` is a consumed live string.
+// UNSAFE-LEDGER: FLN-UL-0435
+#[allow(unsafe_code)]
+unsafe fn mk_err_plain(
+    tag: u8,
+    opt_family: bool,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: delegated to the shared builders; arguments consumed.
+    unsafe {
+        if opt_family {
+            crate::stdio::err_optfile_code_details(tag, crate::tagged::boxi(0), code, details)
+        } else {
+            crate::stdio::err_code_details(tag, code, details)
+        }
+    }
+}
+
+/// Shape helper: the `_file` (some-arm) and bare-filename families.
+/// # Safety
+/// `fname` and `details` are consumed live strings.
+// UNSAFE-LEDGER: FLN-UL-0436
+#[allow(unsafe_code)]
+unsafe fn mk_err_file(
+    tag: u8,
+    bare: bool,
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: delegated to the shared builders; arguments consumed; the
+    // some-cell takes the owned fname token directly.
+    unsafe {
+        if bare {
+            crate::stdio::err_file_code_details(tag, fname, code, details)
+        } else {
+            let some = object::alloc_ctor(1, 1, 0);
+            object::ctor_set(some, 0, fname);
+            crate::stdio::err_optfile_code_details(tag, some, code, details)
+        }
+    }
+}
+
+/// `lean_mk_io_error_already_exists` (IOError.c generated body; tag 0).
+// UNSAFE-LEDGER: FLN-UL-0441
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_already_exists")]
+pub(crate) extern "C" fn export_lean_mk_io_error_already_exists(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(0, true, code, details) }
+}
+
+/// `lean_mk_io_error_other_error` (IOError.c generated body; tag 1).
+// UNSAFE-LEDGER: FLN-UL-0442
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_other_error")]
+pub(crate) extern "C" fn export_lean_mk_io_error_other_error(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(1, false, code, details) }
+}
+
+/// `lean_mk_io_error_resource_busy` (IOError.c generated body; tag 2).
+// UNSAFE-LEDGER: FLN-UL-0443
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_resource_busy")]
+pub(crate) extern "C" fn export_lean_mk_io_error_resource_busy(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(2, false, code, details) }
+}
+
+/// `lean_mk_io_error_resource_vanished` (IOError.c generated body; tag 3).
+// UNSAFE-LEDGER: FLN-UL-0444
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_resource_vanished")]
+pub(crate) extern "C" fn export_lean_mk_io_error_resource_vanished(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(3, false, code, details) }
+}
+
+/// `lean_mk_io_error_unsupported_operation` (IOError.c generated body; tag 4).
+// UNSAFE-LEDGER: FLN-UL-0445
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_unsupported_operation")]
+pub(crate) extern "C" fn export_lean_mk_io_error_unsupported_operation(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(4, false, code, details) }
+}
+
+/// `lean_mk_io_error_hardware_fault` (IOError.c generated body; tag 5).
+// UNSAFE-LEDGER: FLN-UL-0446
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_hardware_fault")]
+pub(crate) extern "C" fn export_lean_mk_io_error_hardware_fault(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(5, false, code, details) }
+}
+
+/// `lean_mk_io_error_unsatisfied_constraints` (IOError.c generated body; tag 6).
+// UNSAFE-LEDGER: FLN-UL-0447
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_unsatisfied_constraints")]
+pub(crate) extern "C" fn export_lean_mk_io_error_unsatisfied_constraints(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(6, false, code, details) }
+}
+
+/// `lean_mk_io_error_illegal_operation` (IOError.c generated body; tag 7).
+// UNSAFE-LEDGER: FLN-UL-0448
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_illegal_operation")]
+pub(crate) extern "C" fn export_lean_mk_io_error_illegal_operation(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(7, false, code, details) }
+}
+
+/// `lean_mk_io_error_protocol_error` (IOError.c generated body; tag 8).
+// UNSAFE-LEDGER: FLN-UL-0449
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_protocol_error")]
+pub(crate) extern "C" fn export_lean_mk_io_error_protocol_error(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(8, false, code, details) }
+}
+
+/// `lean_mk_io_error_time_expired` (IOError.c generated body; tag 9).
+// UNSAFE-LEDGER: FLN-UL-0450
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_time_expired")]
+pub(crate) extern "C" fn export_lean_mk_io_error_time_expired(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(9, false, code, details) }
+}
+
+/// `lean_mk_io_error_invalid_argument` (IOError.c generated body; tag 12).
+// UNSAFE-LEDGER: FLN-UL-0451
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_invalid_argument")]
+pub(crate) extern "C" fn export_lean_mk_io_error_invalid_argument(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(12, true, code, details) }
+}
+
+/// `lean_mk_io_error_permission_denied` (IOError.c generated body; tag 13).
+// UNSAFE-LEDGER: FLN-UL-0452
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_permission_denied")]
+pub(crate) extern "C" fn export_lean_mk_io_error_permission_denied(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(13, true, code, details) }
+}
+
+/// `lean_mk_io_error_resource_exhausted` (IOError.c generated body; tag 14).
+// UNSAFE-LEDGER: FLN-UL-0453
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_resource_exhausted")]
+pub(crate) extern "C" fn export_lean_mk_io_error_resource_exhausted(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(14, true, code, details) }
+}
+
+/// `lean_mk_io_error_inappropriate_type` (IOError.c generated body; tag 15).
+// UNSAFE-LEDGER: FLN-UL-0454
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_inappropriate_type")]
+pub(crate) extern "C" fn export_lean_mk_io_error_inappropriate_type(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(15, true, code, details) }
+}
+
+/// `lean_mk_io_error_no_such_thing` (IOError.c generated body; tag 16).
+// UNSAFE-LEDGER: FLN-UL-0455
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_no_such_thing")]
+pub(crate) extern "C" fn export_lean_mk_io_error_no_such_thing(
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned details per the generated signature.
+    unsafe { mk_err_plain(16, true, code, details) }
+}
+
+/// `lean_mk_io_error_already_exists_file` (IOError.c generated body; tag 0).
+// UNSAFE-LEDGER: FLN-UL-0456
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_already_exists_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_already_exists_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(0, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_interrupted` (IOError.c generated body; tag 10).
+// UNSAFE-LEDGER: FLN-UL-0457
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_interrupted")]
+pub(crate) extern "C" fn export_lean_mk_io_error_interrupted(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(10, true, fname, code, details) }
+}
+
+/// `lean_mk_io_error_no_file_or_directory` (IOError.c generated body; tag 11).
+// UNSAFE-LEDGER: FLN-UL-0458
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_no_file_or_directory")]
+pub(crate) extern "C" fn export_lean_mk_io_error_no_file_or_directory(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(11, true, fname, code, details) }
+}
+
+/// `lean_mk_io_error_invalid_argument_file` (IOError.c generated body; tag 12).
+// UNSAFE-LEDGER: FLN-UL-0459
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_invalid_argument_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_invalid_argument_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(12, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_permission_denied_file` (IOError.c generated body; tag 13).
+// UNSAFE-LEDGER: FLN-UL-0460
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_permission_denied_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_permission_denied_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(13, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_resource_exhausted_file` (IOError.c generated body; tag 14).
+// UNSAFE-LEDGER: FLN-UL-0461
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_resource_exhausted_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_resource_exhausted_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(14, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_inappropriate_type_file` (IOError.c generated body; tag 15).
+// UNSAFE-LEDGER: FLN-UL-0462
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_inappropriate_type_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_inappropriate_type_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(15, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_no_such_thing_file` (IOError.c generated body; tag 16).
+// UNSAFE-LEDGER: FLN-UL-0463
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_no_such_thing_file")]
+pub(crate) extern "C" fn export_lean_mk_io_error_no_such_thing_file(
+    fname: *mut LeanObject,
+    code: u32,
+    details: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: owned fname/details per the generated signature.
+    unsafe { mk_err_file(16, false, fname, code, details) }
+}
+
+/// `lean_mk_io_error_eof` (IOError.c:791-798): `box(17)`; the unit argument
+/// is scalar and settles nothing.
+// UNSAFE-LEDGER: FLN-UL-0439
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_mk_io_error_eof")]
+pub(crate) extern "C" fn export_lean_mk_io_error_eof(_unit: *mut LeanObject) -> *mut LeanObject {
+    crate::tagged::boxi(17)
+}

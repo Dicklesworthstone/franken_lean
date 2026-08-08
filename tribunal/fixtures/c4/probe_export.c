@@ -1680,6 +1680,74 @@ static void facts_mode(void) {
                  bytesum(lean_string_cstr(u), lean_string_size(u) - 1));
             lean_dec(u);
         }
+        /* The mk_io_error ctor family, spot-checked one per shape class
+         * through the printer (the sweeps above already pin the layouts). */
+        {
+            lean_object *m1 = lean_io_error_to_string(
+                lean_mk_io_error_already_exists(17, lean_mk_string("File Exists")));
+            fact("corpus.decode.mk_plain_bytes", (long long)lean_string_size(m1) - 1);
+            fact("corpus.decode.mk_plain_sum",
+                 bytesum(lean_string_cstr(m1), lean_string_size(m1) - 1));
+            lean_dec(m1);
+            lean_object *m2 = lean_io_error_to_string(lean_mk_io_error_no_file_or_directory(
+                lean_mk_string("gone.txt"), 2, lean_mk_string("Ignored")));
+            fact("corpus.decode.mk_bare_bytes", (long long)lean_string_size(m2) - 1);
+            fact("corpus.decode.mk_bare_sum",
+                 bytesum(lean_string_cstr(m2), lean_string_size(m2) - 1));
+            lean_dec(m2);
+            fact("corpus.decode.mk_eof_is_box17",
+                 lean_mk_io_error_eof(lean_box(0)) == lean_box(17));
+        }
+    }
+
+    /* ---- franken_lean-83r: the dbg trio through the same captured-stream
+     * apparatus as the panic cell — trace writes msg ++ newline through the
+     * current stderr stream and answers the applied thunk; if_shared fires
+     * only on a non-exclusive heap arg; sleep(0) just applies. */
+    {
+        char dbg_path[128];
+        snprintf(dbg_path, sizeof dbg_path, "/tmp/fln-dbg-stream-%lld",
+                 (long long)getpid());
+        remove(dbg_path);
+        lean_object *dbg_fname = lean_mk_string(dbg_path);
+        lean_object *dbg_hres = lean_io_prim_handle_mk(dbg_fname, 1);
+        fact("corpus.dbg.mk_ok", lean_ptr_tag(dbg_hres) == 0);
+        lean_object *dbg_h = lean_ctor_get(dbg_hres, 0);
+        lean_inc(dbg_h);
+        lean_dec(dbg_hres);
+        lean_dec(dbg_fname);
+        lean_object *dbg_old = lean_get_set_stderr(lean_stream_of_handle(dbg_h));
+        lean_object *tfn = lean_alloc_closure((void *)probe_forty_two, 1, 0);
+        lean_object *tr = lean_dbg_trace(lean_mk_string("dbg line one"), tfn);
+        fact("corpus.dbg.trace_result", (long long)lean_unbox(tr));
+        lean_object *sfn = lean_alloc_closure((void *)probe_forty_two, 1, 0);
+        lean_object *sr = lean_dbg_sleep(0, sfn);
+        fact("corpus.dbg.sleep_result", (long long)lean_unbox(sr));
+        /* if_shared: an exclusive arg stays silent; a shared one fires.
+         * (s is never settled by the pin's own body — the probe mirrors
+         * the call shape and lets both leak identically on both sides.) */
+        lean_object *excl = lean_mk_string("exclusive-arg");
+        fact("corpus.dbg.if_shared_excl_passthrough",
+             lean_dbg_trace_if_shared(lean_mk_string("silent"), excl) == excl);
+        lean_dec(excl);
+        lean_object *shared = lean_mk_string("shared-arg");
+        lean_inc(shared);
+        fact("corpus.dbg.if_shared_shared_passthrough",
+             lean_dbg_trace_if_shared(lean_mk_string("loud"), shared) == shared);
+        lean_dec(shared);
+        lean_dec(shared);
+        lean_dec(lean_get_set_stderr(dbg_old));
+        {
+            FILE *back = fopen(dbg_path, "r");
+            char dbuf[256];
+            size_t drd = back ? fread(dbuf, 1, sizeof dbuf, back) : 0;
+            if (back) {
+                fclose(back);
+            }
+            fact("corpus.dbg.stream_bytes", (long long)drd);
+            fact("corpus.dbg.stream_sum", bytesum(dbuf, drd));
+        }
+        remove(dbg_path);
     }
 }
 

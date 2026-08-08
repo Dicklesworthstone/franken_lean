@@ -5160,3 +5160,110 @@ fn export_error_decoders_and_user_error_serve_the_pins_names() {
     assert_eq!(live, 0, "RC balance across the decoder-export cell");
     crate::membrane::drain_small_bins_for_test();
 }
+
+#[test]
+fn export_dbg_trio_and_mk_io_error_family_serve_the_pins_names() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_dbg_sleep, export_lean_dbg_trace, export_lean_dbg_trace_if_shared,
+        export_lean_io_error_to_string, export_lean_mk_io_error_already_exists,
+        export_lean_mk_io_error_eof, export_lean_mk_io_error_no_file_or_directory,
+    };
+
+    // franken_lean-83r batch: the dbg trio through a captured stderr stream
+    // (exact bytes) and the mk_io_error family spot-checked one per shape
+    // class — the sweeps + decode cells already pin the layouts.
+    crate::stdio::initialize_streams();
+    let base = std::env::temp_dir().join(format!("fln-dbg-stream-rs-{}", std::process::id()));
+
+    shadow::enable();
+    // SAFETY: objects settled except the two if_shared s-args, which the
+    // pin's own body leaks (object.cpp:2788-2793) — mirrored and accounted.
+    // UNSAFE-LEDGER: FLN-UL-0440
+    #[allow(unsafe_code)]
+    unsafe {
+        let mk = |s: &str| crate::object::mk_string_unchecked(s.as_bytes(), s.chars().count());
+        let fname = mk(base.to_str().expect("utf8 temp path"));
+        let mres = crate::stdio::prim_handle_mk(fname, 1);
+        assert_eq!((&raw const (*mres).m_tag).read(), 0);
+        let h = crate::object::ctor_get(mres, 0);
+        crate::rc::inc_ref_n(h, 1);
+        crate::rc::dec_ref(mres);
+        crate::rc::dec_ref(fname);
+        let old = crate::stdio::get_set_stderr(crate::stdio::stream_of_handle(h));
+
+        let forty = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        let tr = export_lean_dbg_trace(mk("dbg line one"), forty);
+        assert_eq!(
+            crate::tagged::unbox(tr),
+            42,
+            "trace answers the applied thunk"
+        );
+        let excl = mk("exclusive-arg");
+        assert_eq!(
+            export_lean_dbg_trace_if_shared(mk("silent"), excl),
+            excl,
+            "exclusive arg passes through silently"
+        );
+        crate::rc::dec_ref(excl);
+        let shared = mk("shared-arg");
+        crate::rc::inc_ref_n(shared, 1);
+        assert_eq!(export_lean_dbg_trace_if_shared(mk("loud"), shared), shared);
+        crate::rc::dec_ref(shared);
+        crate::rc::dec_ref(shared);
+        let forty2 = crate::object::alloc_closure(
+            task_state_targets::forty_two as *mut core::ffi::c_void,
+            1,
+            0,
+        );
+        assert_eq!(crate::tagged::unbox(export_lean_dbg_sleep(0, forty2)), 42);
+
+        let mine = crate::stdio::get_set_stderr(old);
+        crate::rc::dec_ref(mine);
+        assert_eq!(
+            std::fs::read(&base).expect("stream file"),
+            b"dbg line one\nshared RC loud\n",
+            "trace + the shared arm only, one putStr each, newlines appended"
+        );
+
+        // mk family: one per shape class, exact bytes through the printer.
+        let take = |e: *mut crate::layout::LeanObject| -> String {
+            let s = export_lean_io_error_to_string(e);
+            let (sz, _, _, b) = crate::object::string_fields(s);
+            let out = String::from_utf8(b[..sz - 1].to_vec()).expect("utf8");
+            crate::rc::dec_ref(s);
+            out
+        };
+        assert_eq!(
+            take(export_lean_mk_io_error_already_exists(
+                17,
+                mk("File Exists")
+            )),
+            "already exists (error code: 17, file Exists)"
+        );
+        assert_eq!(
+            take(export_lean_mk_io_error_no_file_or_directory(
+                mk("gone.txt"),
+                2,
+                mk("Ignored")
+            )),
+            "no such file or directory (error code: 2)\n  file: gone.txt"
+        );
+        assert_eq!(
+            export_lean_mk_io_error_eof(crate::tagged::boxi(0)),
+            crate::tagged::boxi(17),
+            "eof is box(17)"
+        );
+    }
+    let (_events, live) = shadow::disable_and_drain();
+    assert_eq!(
+        live, 2,
+        "exactly the two if_shared s-args survive — the pin's own leak, mirrored"
+    );
+    std::fs::remove_file(&base).ok();
+    crate::membrane::drain_small_bins_for_test();
+}
