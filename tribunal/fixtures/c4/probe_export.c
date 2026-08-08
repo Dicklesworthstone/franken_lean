@@ -185,6 +185,10 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* Batch-5 fixture: a no-op external class for the registration fact. */
+static void probe_ext_finalize(void *p) { (void)p; }
+static void probe_ext_foreach(void *p, lean_object *f) { (void)p; (void)f; }
+
 /* Apply targets for the task facts, closured exactly as generated C does. */
 static lean_object *probe_double(lean_object *x) {
     return lean_box(lean_unbox(x) * 2);
@@ -1875,6 +1879,51 @@ static void facts_mode(void) {
              lean_cstr_to_int("12345") == lean_box(12345));
         fact("corpus.slice.cstr_neg",
              (long long)(unsigned)(int)(long long)lean_unbox(lean_cstr_to_int("-7")));
+    }
+
+    /* ---- franken_lean-83r batch 5: to_string byte-parity over a value
+     * sweep chosen for rounding hazards (driven via of_bits so every input
+     * is bit-exact on both sides), and the external-class registration. */
+    {
+        static const unsigned long long f64_bits[] = {
+            0x0000000000000000ull, /* 0.0 */
+            0x8000000000000000ull, /* -0.0 */
+            0x3ff8000000000000ull, /* 1.5 */
+            0xc002000000000000ull, /* -2.25 */
+            0x3fd5555555555555ull, /* ~1/3 */
+            0x4415af1d78b58c40ull, /* 1e20 */
+            0x3e7ad7f29abcaf48ull, /* 1e-7 -> 0.000000 */
+            0x0000000000000001ull, /* min subnormal */
+            0x7fefffffffffffffull, /* DBL_MAX, ~309 fixed digits */
+            0x7ff0000000000000ull, /* +inf */
+            0xfff0000000000000ull, /* -inf */
+            0x7ff8000000000000ull, /* NaN -> "NaN" */
+            0x3ee4f8b588e368f1ull, /* 1e-5 */
+            0x408f400000000000ull, /* 1000.0 */
+        };
+        long long tb = 0, ts = 0;
+        for (size_t i = 0; i < sizeof(f64_bits) / sizeof(f64_bits[0]); i++) {
+            lean_object *t =
+                lean_float_to_string(lean_float_of_bits(f64_bits[i]));
+            tb += (long long)lean_string_size(t) - 1;
+            ts += bytesum(lean_string_cstr(t), lean_string_size(t) - 1);
+            lean_dec(t);
+            lean_object *t32 = lean_float32_to_string(
+                lean_float32_of_bits((uint32_t)(f64_bits[i] >> 32)));
+            tb += (long long)lean_string_size(t32) - 1;
+            ts += bytesum(lean_string_cstr(t32), lean_string_size(t32) - 1);
+            lean_dec(t32);
+        }
+        fact("corpus.ts.sweep_bytes", tb);
+        fact("corpus.ts.sweep_sum", ts);
+        lean_object *one = lean_float_to_string(lean_float_of_bits(0x3ff8000000000000ull));
+        fact("corpus.ts.spot_15_bytes", (long long)lean_string_size(one) - 1);
+        fact("corpus.ts.spot_15_sum",
+             bytesum(lean_string_cstr(one), lean_string_size(one) - 1));
+        lean_dec(one);
+        lean_external_class *pc =
+            lean_register_external_class(probe_ext_finalize, probe_ext_foreach);
+        fact("corpus.ts.register_class_nonnull", pc != NULL);
     }
 }
 
