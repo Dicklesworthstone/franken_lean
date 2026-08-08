@@ -185,6 +185,11 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* Batch-6 fixture: a main_fn observing argc and argv[0] for run_main. */
+static lean_object *probe_run_main_fn(int argc, char **argv) {
+    return lean_box((size_t)((size_t)argc * 100 + strlen(argv[0])));
+}
+
 /* Batch-5 fixture: a no-op external class for the registration fact. */
 static void probe_ext_finalize(void *p) { (void)p; }
 static void probe_ext_foreach(void *p, lean_object *f) { (void)p; (void)f; }
@@ -1924,6 +1929,23 @@ static void facts_mode(void) {
         lean_external_class *pc =
             lean_register_external_class(probe_ext_finalize, probe_ext_foreach);
         fact("corpus.ts.register_class_nonnull", pc != NULL);
+        /* run_main: the threaded default, the direct arm, the env-stack
+         * arm — same fixed argv on both runtimes so the value binds. */
+        {
+            char rm0[] = "fln-probe";
+            char rm1[] = "arg";
+            char *rm_argv[] = {rm0, rm1, NULL};
+            fact("corpus.rm.threaded",
+                 lean_run_main(probe_run_main_fn, 2, rm_argv) == lean_box(209));
+            setenv("LEAN_MAIN_USE_THREAD", "0", 1);
+            fact("corpus.rm.direct",
+                 lean_run_main(probe_run_main_fn, 2, rm_argv) == lean_box(209));
+            unsetenv("LEAN_MAIN_USE_THREAD");
+            setenv("LEAN_STACK_SIZE_KB", "9000", 1);
+            fact("corpus.rm.env_stack",
+                 lean_run_main(probe_run_main_fn, 2, rm_argv) == lean_box(209));
+            unsetenv("LEAN_STACK_SIZE_KB");
+        }
     }
 }
 

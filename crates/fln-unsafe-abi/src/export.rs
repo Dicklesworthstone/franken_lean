@@ -4825,3 +4825,63 @@ pub(crate) extern "C" fn export_lean_float32_to_string(a: f32) -> *mut LeanObjec
     // SAFETY: fresh ASCII string from a Rust buffer.
     unsafe { object::mk_string_unchecked(text.as_bytes(), text.len()) }
 }
+
+/// `lean_run_main` (`thread.cpp:173-195`): a STACK-SIZE TRAMPOLINE, not an
+/// entry runner — the generated main stub owns argv marshaling and exit
+/// decoding; this reads `LEAN_STACK_SIZE_KB` (kb/4*4*1024 bytes, plus the
+/// 128 KB buffer `set_thread_stack_size` adds, thread.h:14), honors
+/// `LEAN_MAIN_USE_THREAD=0` as a direct call, and otherwise runs `main_fn`
+/// on a fresh thread — default stack 1 GB on 64-bit
+/// (LEAN_DEFAULT_THREAD_STACK_SIZE, thread.cpp:27) — and joins. The raw
+/// argv/fn pointers cross the thread exactly as the pin's lambda capture
+/// does; the join bounds their use inside the caller's frame.
+// UNSAFE-LEDGER: FLN-UL-0502
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_run_main")]
+pub(crate) extern "C" fn export_lean_run_main(
+    main_fn: extern "C" fn(i32, *mut *mut c_char) -> *mut LeanObject,
+    argc: i32,
+    argv: *mut *mut c_char,
+) -> *mut LeanObject {
+    let use_thread = std::env::var_os("LEAN_MAIN_USE_THREAD").is_none_or(|v| v != "0");
+    if !use_thread {
+        return main_fn(argc, argv);
+    }
+    let stack = std::env::var_os("LEAN_STACK_SIZE_KB")
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| {
+            let kb: u64 = v
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()?;
+            let sz = kb / 4 * 4 * 1024;
+            (sz > 0).then_some(sz as usize + 128 * 1024)
+        })
+        .unwrap_or(1024 * 1024 * 1024);
+    struct Cross(usize, i32, usize);
+    // SAFETY: the pointers stay valid for the whole call because the
+    // spawning frame joins before returning, the pin's own lambda shape.
+    unsafe impl Send for Cross {}
+    let c = Cross(main_fn as usize, argc, argv as usize);
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || {
+            let f: extern "C" fn(i32, *mut *mut c_char) -> *mut LeanObject =
+                // SAFETY: round-trips the fn pointer the caller handed in.
+                unsafe { core::mem::transmute::<usize, _>(c.0) };
+            SendPtr(f(c.1, c.2 as *mut *mut c_char))
+        })
+        .expect("lean_run_main: thread spawn")
+        .join()
+        .expect("lean_run_main: main thread panicked")
+        .0
+}
+struct SendPtr(*mut LeanObject);
+// SAFETY: the result object is handed back across the join into the frame
+// that owns the runtime, exactly as the pin's captured `res` is.
+// UNSAFE-LEDGER: FLN-UL-0503
+#[allow(unsafe_code)]
+unsafe impl Send for SendPtr {}
