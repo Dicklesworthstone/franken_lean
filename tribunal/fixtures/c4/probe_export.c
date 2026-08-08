@@ -1801,6 +1801,56 @@ static void facts_mode(void) {
         fact("corpus.b2.mk_array_zero",
              lean_array_size(lean_mk_array(lean_box(0), lean_box(5))) == 0);
     }
+
+    /* ---- franken_lean-83r batch 3: the float plane — predicates, bit
+     * casts with the pin's model-exact quiet-NaN patterns, frexp/scaleb
+     * arms incl. the big-Int cases, and the float-array mk/data walks. */
+    {
+        fact("corpus.f.isnan", lean_float_isnan(0.0 / 0.0) == 1 &&
+                                   lean_float_isnan(1.5) == 0 &&
+                                   lean_float32_isnan(0.0f / 0.0f) == 1);
+        fact("corpus.f.isinf", lean_float_isinf(1.0 / 0.0) == 1 &&
+                                   lean_float32_isinf(-1.0f / 0.0f) == 1);
+        fact("corpus.f.isfinite", lean_float_isfinite(2.5) == 1 &&
+                                      lean_float_isfinite(1.0 / 0.0) == 0 &&
+                                      lean_float32_isfinite(2.5f) == 1);
+        fact("corpus.f.nan_bits",
+             lean_float_to_bits(0.0 / 0.0) == 0x7ff8000000000000ull &&
+                 lean_float32_to_bits(0.0f / 0.0f) == 0x7fc00000u);
+        fact("corpus.f.bits_roundtrip",
+             lean_float_of_bits(lean_float_to_bits(-3.25)) == -3.25 &&
+                 lean_float32_of_bits(lean_float32_to_bits(9.5f)) == 9.5f);
+        fact("corpus.f.of_bits_nan_canon",
+             lean_float_to_bits(lean_float_of_bits(0x7ff0000000000001ull)) ==
+                 0x7ff8000000000000ull);
+        lean_object *fx = lean_float_frexp(12.0);
+        fact("corpus.f.frexp_mantissa_bits",
+             (long long)lean_float_to_bits(lean_unbox_float(lean_ctor_get(fx, 0))));
+        fact("corpus.f.frexp_exp",
+             (long long)lean_unbox(lean_ctor_get(fx, 1)));
+        lean_dec(fx);
+        lean_object *fi = lean_float_frexp(1.0 / 0.0);
+        fact("corpus.f.frexp_inf_exp_is_box0", lean_ctor_get(fi, 1) == lean_box(0));
+        lean_dec(fi);
+        fact("corpus.f.scaleb_small",
+             lean_float_scaleb(1.5, lean_box(3)) == 12.0 &&
+                 lean_float32_scaleb(1.5f, lean_box(2)) == 6.0f);
+        fact("corpus.f.scaleb_neg_small",
+             lean_float_scaleb(12.0, lean_box((size_t)(unsigned)-2)) == 3.0);
+        lean_object *fa2 = lean_alloc_array(2, 2);
+        lean_array_cptr(fa2)[0] = lean_box_float(1.5);
+        lean_array_cptr(fa2)[1] = lean_box_float(-2.25);
+        lean_object *fs2 = lean_float_array_mk(fa2);
+        double *fsd = (double *)lean_sarray_cptr(fs2);
+        fact("corpus.f.array_mk", lean_sarray_size(fs2) == 2 &&
+                                      fsd[0] == 1.5 && fsd[1] == -2.25);
+        lean_object *fd2 = lean_float_array_data(fs2);
+        fact("corpus.f.array_data",
+             lean_array_size(fd2) == 2 &&
+                 lean_unbox_float(lean_array_cptr(fd2)[0]) == 1.5 &&
+                 lean_unbox_float(lean_array_cptr(fd2)[1]) == -2.25);
+        lean_dec(fd2);
+    }
 }
 
 int main(int argc, char **argv) {

@@ -4452,3 +4452,255 @@ pub(crate) extern "C" fn export_lean_mk_array(
         r
     }
 }
+
+// -------------------------------------- 83r batch 3: the float plane
+// Float boxing (lean.h:2899-2911), the scalar predicate/bit family
+// (object.cpp:1879-1960), frexp/scaleb over the same glibc calls the pin
+// makes, and the float-array mk/data walks the boxing unlocks. The quiet-NaN
+// canonicalizations use the pin's OWN bit patterns (0x7ff8... / 0x7fc00000),
+// stated there to be model-exact rather than implementation-defined.
+
+/// `lean_box_float` (`lean.h:2899-2903`): a 0-field ctor with one f64 scalar.
+// UNSAFE-LEDGER: FLN-UL-0477
+#[allow(unsafe_code)]
+fn box_float(v: f64) -> *mut LeanObject {
+    // SAFETY: fresh ctor; the scalar slot is initialized before escape.
+    unsafe {
+        let r = object::alloc_ctor(0, 0, 8);
+        object::ctor_set_scalar::<f64>(r, 0, v);
+        r
+    }
+}
+/// `lean_box_float32` (`lean.h:2913-2917`).
+// UNSAFE-LEDGER: FLN-UL-0478
+#[allow(unsafe_code)]
+fn box_float32(v: f32) -> *mut LeanObject {
+    // SAFETY: fresh ctor; the scalar slot is initialized before escape.
+    unsafe {
+        let r = object::alloc_ctor(0, 0, 4);
+        object::ctor_set_scalar::<f32>(r, 0, v);
+        r
+    }
+}
+/// `lean_int_to_int`'s small arm (`lean.h:1600-1605` shape): an `i32` is
+/// always small, boxed two's-complement exactly as fs.rs's timespec arm.
+fn int_to_int_small(n: i32) -> *mut LeanObject {
+    crate::tagged::boxi(n as u32 as usize)
+}
+/// `lean_scalar_to_int` + the big arm's sign read: a scalar Int unboxes
+/// two's-complement; a big Int answers only its SIGN here (scaleb's arms
+/// need nothing more), read from the mpz mirror's GMP size convention.
+// UNSAFE-LEDGER: FLN-UL-0479
+#[allow(unsafe_code)]
+unsafe fn int_scalar_or_sign(b: *mut LeanObject) -> Result<i32, bool> {
+    if is_scalar(b) {
+        Ok(crate::tagged::unbox(b) as u32 as i32)
+    } else {
+        // SAFETY: live mpz per the non-scalar Int contract.
+        let (_, m_size, _, _) = unsafe { object::mpz_fields(b) };
+        Err(m_size < 0)
+    }
+}
+
+/// `lean_float_isnan`/`isfinite`/`isinf` and the f32 twins
+/// (object.cpp:1879-1881, 1931-1933).
+// UNSAFE-LEDGER: FLN-UL-0480
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_isnan")]
+pub(crate) extern "C" fn export_lean_float_isnan(a: f64) -> u8 {
+    u8::from(a.is_nan())
+}
+// UNSAFE-LEDGER: FLN-UL-0481
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_isfinite")]
+pub(crate) extern "C" fn export_lean_float_isfinite(a: f64) -> u8 {
+    u8::from(a.is_finite())
+}
+// UNSAFE-LEDGER: FLN-UL-0482
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_isinf")]
+pub(crate) extern "C" fn export_lean_float_isinf(a: f64) -> u8 {
+    u8::from(a.is_infinite())
+}
+// UNSAFE-LEDGER: FLN-UL-0483
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_isnan")]
+pub(crate) extern "C" fn export_lean_float32_isnan(a: f32) -> u8 {
+    u8::from(a.is_nan())
+}
+// UNSAFE-LEDGER: FLN-UL-0484
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_isfinite")]
+pub(crate) extern "C" fn export_lean_float32_isfinite(a: f32) -> u8 {
+    u8::from(a.is_finite())
+}
+// UNSAFE-LEDGER: FLN-UL-0485
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_isinf")]
+pub(crate) extern "C" fn export_lean_float32_isinf(a: f32) -> u8 {
+    u8::from(a.is_infinite())
+}
+
+/// `lean_float_of_bits`/`to_bits` (object.cpp:1890-1907): NaN inputs
+/// canonicalize to the pin's exact quiet patterns.
+// UNSAFE-LEDGER: FLN-UL-0486
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_of_bits")]
+pub(crate) extern "C" fn export_lean_float_of_bits(u: u64) -> f64 {
+    let ret = f64::from_bits(u);
+    if ret.is_nan() {
+        f64::from_bits(0x7ff8_0000_0000_0000)
+    } else {
+        ret
+    }
+}
+// UNSAFE-LEDGER: FLN-UL-0487
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_to_bits")]
+pub(crate) extern "C" fn export_lean_float_to_bits(d: f64) -> u64 {
+    if d.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        d.to_bits()
+    }
+}
+// UNSAFE-LEDGER: FLN-UL-0488
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_of_bits")]
+pub(crate) extern "C" fn export_lean_float32_of_bits(u: u32) -> f32 {
+    let ret = f32::from_bits(u);
+    if ret.is_nan() {
+        f32::from_bits(0x7fc0_0000)
+    } else {
+        ret
+    }
+}
+// UNSAFE-LEDGER: FLN-UL-0489
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_to_bits")]
+pub(crate) extern "C" fn export_lean_float32_to_bits(d: f32) -> u32 {
+    if d.is_nan() { 0x7fc0_0000 } else { d.to_bits() }
+}
+
+/// `lean_float_frexp` (object.cpp:1882-1889): (mantissa, exp) pair; a
+/// non-finite input carries `box(0)` in the exp slot.
+// UNSAFE-LEDGER: FLN-UL-0490
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_frexp")]
+pub(crate) extern "C" fn export_lean_float_frexp(a: f64) -> *mut LeanObject {
+    let (m, e) = crate::stdio::libm_frexp(a);
+    // SAFETY: fresh 2-field ctor, both slots initialized before escape.
+    unsafe {
+        let r = object::alloc_ctor(0, 2, 0);
+        object::ctor_set(r, 0, box_float(m));
+        object::ctor_set(
+            r,
+            1,
+            if a.is_finite() {
+                int_to_int_small(e)
+            } else {
+                crate::tagged::boxi(0)
+            },
+        );
+        r
+    }
+}
+/// `lean_float32_frexp` (object.cpp:1934-1941).
+// UNSAFE-LEDGER: FLN-UL-0491
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_frexp")]
+pub(crate) extern "C" fn export_lean_float32_frexp(a: f32) -> *mut LeanObject {
+    let (m, e) = crate::stdio::libm_frexpf(a);
+    // SAFETY: fresh 2-field ctor, both slots initialized before escape.
+    unsafe {
+        let r = object::alloc_ctor(0, 2, 0);
+        object::ctor_set(r, 0, box_float32(m));
+        object::ctor_set(
+            r,
+            1,
+            if a.is_finite() {
+                int_to_int_small(e)
+            } else {
+                crate::tagged::boxi(0)
+            },
+        );
+        r
+    }
+}
+
+/// `lean_float_scaleb` (the f64 twin of object.cpp:1922-1929): a scalar Int
+/// scales; a big Int answers 0 for zero-or-negative-sign, signed infinity
+/// otherwise — the pin's exact arms.
+// UNSAFE-LEDGER: FLN-UL-0492
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_scaleb")]
+pub(crate) extern "C" fn export_lean_float_scaleb(a: f64, b: *mut LeanObject) -> f64 {
+    // SAFETY: b borrowed per the b_obj_arg contract.
+    match unsafe { int_scalar_or_sign(b) } {
+        Ok(n) => crate::stdio::libm_scalbn(a, n),
+        Err(neg) => {
+            if a == 0.0 || neg {
+                0.0
+            } else {
+                a * f64::INFINITY
+            }
+        }
+    }
+}
+/// `lean_float32_scaleb` (object.cpp:1922-1929).
+// UNSAFE-LEDGER: FLN-UL-0493
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_scaleb")]
+pub(crate) extern "C" fn export_lean_float32_scaleb(a: f32, b: *mut LeanObject) -> f32 {
+    // SAFETY: b borrowed per the b_obj_arg contract.
+    match unsafe { int_scalar_or_sign(b) } {
+        Ok(n) => crate::stdio::libm_scalbnf(a, n),
+        Err(neg) => {
+            if a == 0.0 || neg {
+                0.0
+            } else {
+                a * f32::INFINITY
+            }
+        }
+    }
+}
+
+/// `lean_float_array_mk` (object.cpp:2612-2623): unbox every element into
+/// a fresh f64 sarray; the source array is settled.
+// UNSAFE-LEDGER: FLN-UL-0494
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_array_mk")]
+pub(crate) extern "C" fn export_lean_float_array_mk(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned array of boxed floats; each element read borrowed, the
+    // scalar copied out, the source settled once at the end.
+    unsafe {
+        let (sz, _) = object::array_fields(a);
+        let r = object::alloc_sarray(8, sz, sz.max(1));
+        let (_, _, _, rdata) = object::sarray_fields(r);
+        for i in 0..sz {
+            let e = object::array_get(a, i);
+            let v = object::ctor_get_scalar::<f64>(e, 0);
+            rdata.add(i * 8).cast::<f64>().write_unaligned(v);
+        }
+        rc::dec_ref(a);
+        r
+    }
+}
+/// `lean_float_array_data` (object.cpp:2625-2636): box every element into
+/// a fresh array; the source sarray is settled.
+// UNSAFE-LEDGER: FLN-UL-0495
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_array_data")]
+pub(crate) extern "C" fn export_lean_float_array_data(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned f64 sarray; each scalar boxed fresh, the source settled.
+    unsafe {
+        let (_, sz, _, data) = object::sarray_fields(a);
+        let r = object::alloc_array(sz, sz);
+        for i in 0..sz {
+            let v = data.add(i * 8).cast::<f64>().read_unaligned();
+            object::array_set_core(r, i, box_float(v));
+        }
+        rc::dec_ref(a);
+        r
+    }
+}

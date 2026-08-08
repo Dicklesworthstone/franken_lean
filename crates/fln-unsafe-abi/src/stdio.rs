@@ -71,6 +71,10 @@ unsafe extern "C" {
     fn strerror(errnum: c_int) -> *const c_char;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn exit(code: c_int) -> !;
+    fn frexp(x: f64, exp: *mut c_int) -> f64;
+    fn frexpf(x: f32, exp: *mut c_int) -> f32;
+    fn scalbn(x: f64, n: c_int) -> f64;
+    fn scalbnf(x: f32, n: c_int) -> f32;
     /// C11 `_Exit` — what `std::_Exit` is specified as (immediate
     /// termination, no atexit handlers, no stdio flush).
     fn _Exit(code: c_int) -> !;
@@ -726,6 +730,41 @@ pub(crate) fn panic_message_via_stream(msg: &[u8]) -> bool {
         rc::dec_ref(stream);
         carried
     }
+}
+
+/// glibc `frexp`/`scalbn` family, wrapped for the float-op exports —
+/// exact (no rounding), the same platform functions the pin's own arms
+/// call (object.cpp:1882-1943).
+// UNSAFE-LEDGER: FLN-UL-0473
+#[allow(unsafe_code)]
+pub(crate) fn libm_frexp(x: f64) -> (f64, i32) {
+    let mut e: c_int = 0;
+    // SAFETY: exp is a valid out-slot for the call's duration.
+    let m = unsafe { frexp(x, &raw mut e) };
+    (m, e)
+}
+/// See [`libm_frexp`].
+// UNSAFE-LEDGER: FLN-UL-0474
+#[allow(unsafe_code)]
+pub(crate) fn libm_frexpf(x: f32) -> (f32, i32) {
+    let mut e: c_int = 0;
+    // SAFETY: exp is a valid out-slot for the call's duration.
+    let m = unsafe { frexpf(x, &raw mut e) };
+    (m, e)
+}
+/// See [`libm_frexp`].
+// UNSAFE-LEDGER: FLN-UL-0475
+#[allow(unsafe_code)]
+pub(crate) fn libm_scalbn(x: f64, n: i32) -> f64 {
+    // SAFETY: pure scalar call.
+    unsafe { scalbn(x, n) }
+}
+/// See [`libm_frexp`].
+// UNSAFE-LEDGER: FLN-UL-0476
+#[allow(unsafe_code)]
+pub(crate) fn libm_scalbnf(x: f32, n: i32) -> f32 {
+    // SAFETY: pure scalar call.
+    unsafe { scalbnf(x, n) }
 }
 
 /// `lean_io_exit` (`io.cpp:1594-1596`): `exit(code)` — atexit handlers run
