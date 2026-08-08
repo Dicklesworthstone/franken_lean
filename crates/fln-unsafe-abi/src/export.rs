@@ -4885,3 +4885,313 @@ struct SendPtr(*mut LeanObject);
 // UNSAFE-LEDGER: FLN-UL-0503
 #[allow(unsafe_code)]
 unsafe impl Send for SendPtr {}
+
+// ---------------------- 83r batch 7: the string/utf8/thunk tail (final 9)
+
+/// `lean_string_lt` (`object.cpp:2122-2127`).
+// UNSAFE-LEDGER: FLN-UL-0504
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_lt")]
+pub(crate) extern "C" fn export_lean_string_lt(s1: *mut LeanObject, s2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live strings; content excludes the NUL.
+    unsafe {
+        let (n1, _, _, b1) = object::string_fields(s1);
+        let (n2, _, _, b2) = object::string_fields(s2);
+        b1[..n1 - 1] < b2[..n2 - 1]
+    }
+}
+
+/// `lean_string_memcmp` (`object.cpp:2459-2469`): the three index args are
+/// scalars by the callers' proof obligations, exactly the pin's asserts.
+// UNSAFE-LEDGER: FLN-UL-0505
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_memcmp")]
+pub(crate) extern "C" fn export_lean_string_memcmp(
+    s1: *mut LeanObject,
+    s2: *mut LeanObject,
+    lstart: *mut LeanObject,
+    rstart: *mut LeanObject,
+    len: *mut LeanObject,
+) -> u8 {
+    // SAFETY: borrowed live strings; the proof-carried indices stay inside
+    // the salient prefixes.
+    unsafe {
+        let (_, _, _, b1) = object::string_fields(s1);
+        let (_, _, _, b2) = object::string_fields(s2);
+        let (l, r, n) = (
+            crate::tagged::unbox(lstart),
+            crate::tagged::unbox(rstart),
+            crate::tagged::unbox(len),
+        );
+        u8::from(b1[l..l + n] == b2[r..r + n])
+    }
+}
+
+/// `lean_string_push` (`object.cpp:2066-2082`): the shared arm allocates at
+/// `mk_capacity(sz+5) == 2*(sz+5)`; the exclusive arm reuses in place or
+/// grows at `cap + sz + 5` with a raw dealloc (`string_ensure_capacity`,
+/// object.cpp:1966-1978); then the scalar is UTF-8-encoded over the NUL,
+/// size/length updated, NUL restored.
+// UNSAFE-LEDGER: FLN-UL-0506
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_push")]
+pub(crate) extern "C" fn export_lean_string_push(s: *mut LeanObject, c: u32) -> *mut LeanObject {
+    // SAFETY: owned live string; every arm settles s exactly once and every
+    // write stays inside the (re)allocated capacity.
+    unsafe {
+        let (sz, cap, len, _) = object::string_fields(s);
+        let r = if !is_exclusive(s) {
+            let newcap = (sz + 5).checked_mul(2).expect("capacity overflow");
+            let r = object::alloc_string_cap(sz, newcap, len);
+            let dst = (&raw mut (*r.cast::<crate::layout::LeanStringObject>()).m_data).cast::<u8>();
+            let src =
+                (&raw const (*s.cast::<crate::layout::LeanStringObject>()).m_data).cast::<u8>();
+            core::ptr::copy_nonoverlapping(src, dst, sz - 1);
+            rc::dec_ref(s);
+            r
+        } else if sz + 5 > cap {
+            let grown = cap
+                .checked_add(sz)
+                .and_then(|x| x.checked_add(5))
+                .expect("capacity overflow");
+            let r = object::alloc_string_cap(sz, grown, len);
+            let dst = (&raw mut (*r.cast::<crate::layout::LeanStringObject>()).m_data).cast::<u8>();
+            let src =
+                (&raw const (*s.cast::<crate::layout::LeanStringObject>()).m_data).cast::<u8>();
+            core::ptr::copy_nonoverlapping(src, dst, sz);
+            let old_bytes = size_of::<crate::layout::LeanStringObject>() + cap;
+            crate::membrane::release_with_size(s, old_bytes, "object.string_push.grow");
+            r
+        } else {
+            s
+        };
+        let mut buf = Vec::with_capacity(4);
+        push_unicode_scalar(&mut buf, c);
+        let rs = r.cast::<crate::layout::LeanStringObject>();
+        let data = (&raw mut (*rs).m_data).cast::<u8>();
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), data.add(sz - 1), buf.len());
+        (&raw mut (*rs).m_size).write(sz + buf.len());
+        (&raw mut (*rs).m_length).write(len + 1);
+        data.add(sz + buf.len() - 1).write(0);
+        r
+    }
+}
+
+/// The pin's `is_utf8_first_byte` (`object.cpp:2356-2358`).
+fn is_utf8_first_byte(c: u8) -> bool {
+    (c & 0x80) == 0 || (c & 0xe0) == 0xc0 || (c & 0xf0) == 0xe0 || (c & 0xf8) == 0xf0
+}
+
+/// `lean_string_utf8_extract` (`object.cpp:2373-2395`): the pin RETURNS THE
+/// BORROWED `s` VERBATIM for a non-scalar index — mirrored exactly; a bad
+/// start yields empty; a bad end clamps to the size.
+// UNSAFE-LEDGER: FLN-UL-0507
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_extract")]
+pub(crate) extern "C" fn export_lean_string_utf8_extract(
+    s: *mut LeanObject,
+    b0: *mut LeanObject,
+    e0: *mut LeanObject,
+) -> *mut LeanObject {
+    if !crate::tagged::is_scalar(b0) || !crate::tagged::is_scalar(e0) {
+        return s;
+    }
+    // SAFETY: borrowed live string; the window stays inside the salient
+    // prefix after the pin's own clamps.
+    unsafe {
+        let b = crate::tagged::unbox(b0);
+        let mut e = crate::tagged::unbox(e0);
+        let (n, _, _, bytes) = object::string_fields(s);
+        let sz = n - 1;
+        if b >= e || b >= sz || !is_utf8_first_byte(bytes[b]) {
+            return object::mk_string_unchecked(b"", 0);
+        }
+        if e > sz {
+            e = sz;
+        }
+        if e < sz && !is_utf8_first_byte(bytes[e]) {
+            e = sz;
+        }
+        let window = &bytes[b..e];
+        let mut chars = 0usize;
+        let mut i = 0usize;
+        while i < window.len() {
+            i += get_utf8_size(window[i]);
+            chars += 1;
+        }
+        object::mk_string_unchecked(window, chars)
+    }
+}
+
+/// `lean_string_utf8_get_fast_cold` (`object.cpp:2247-2276`): the multi-byte
+/// arms of utf8_get with the caller-supplied lead byte; every fallthrough is
+/// the default `'A'`.
+// UNSAFE-LEDGER: FLN-UL-0508
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_get_fast_cold")]
+pub(crate) extern "C" fn export_lean_string_utf8_get_fast_cold(
+    str_: *const c_char,
+    i: usize,
+    size: usize,
+    c: u8,
+) -> u32 {
+    const DEFAULT: u32 = 'A' as u32;
+    // SAFETY: the caller passes the string's live data pointer and size.
+    unsafe {
+        let bytes = core::slice::from_raw_parts(str_.cast::<u8>(), size);
+        let c = u32::from(c);
+        if (c & 0xe0) == 0xc0 && i + 1 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let r = ((c & 0x1f) << 6) | (c1 & 0x3f);
+            if r >= 0x80 {
+                return r;
+            }
+        }
+        if (c & 0xf0) == 0xe0 && i + 2 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let r = ((c & 0x0f) << 12) | ((c1 & 0x3f) << 6) | (c2 & 0x3f);
+            if (0x800..0xd800).contains(&r) || (0xe000..0x1_0000).contains(&r) {
+                return r;
+            }
+        }
+        if (c & 0xf8) == 0xf0 && i + 3 < size {
+            let c1 = u32::from(bytes[i + 1]);
+            let c2 = u32::from(bytes[i + 2]);
+            let c3 = u32::from(bytes[i + 3]);
+            let r = ((c & 0x07) << 18) | ((c1 & 0x3f) << 12) | ((c2 & 0x3f) << 6) | (c3 & 0x3f);
+            if (0x1_0000..0x11_0000).contains(&r) {
+                return r;
+            }
+        }
+        DEFAULT
+    }
+}
+
+/// `lean_string_utf8_next` (`object.cpp:2329-2346`): a big-Nat index needs
+/// bignum `Nat.add` — the shim boundary, refused typed where the pin
+/// computes (disclosed in the census row); the scalar arms are the pin's.
+// UNSAFE-LEDGER: FLN-UL-0509
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_next")]
+pub(crate) extern "C" fn export_lean_string_utf8_next(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+) -> *mut LeanObject {
+    if !crate::tagged::is_scalar(i0) {
+        internal_panic_impl(
+            "string_utf8_next: big-Nat index needs the bignum shim (Crucible workstream)",
+        );
+    }
+    let i = crate::tagged::unbox(i0);
+    // SAFETY: borrowed live string.
+    unsafe {
+        let (n, _, _, bytes) = object::string_fields(s);
+        let size = n - 1;
+        if i >= size {
+            return crate::tagged::boxi(i + 1);
+        }
+        let c = bytes[i];
+        let step = if (c & 0x80) == 0 {
+            1
+        } else if (c & 0xe0) == 0xc0 {
+            2
+        } else if (c & 0xf0) == 0xe0 {
+            3
+        } else if (c & 0xf8) == 0xf0 {
+            4
+        } else {
+            1
+        };
+        crate::tagged::boxi(i + step)
+    }
+}
+
+/// `lean_string_utf8_next_fast_cold` (`object.cpp:2348-2354`).
+// UNSAFE-LEDGER: FLN-UL-0510
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_next_fast_cold")]
+pub(crate) extern "C" fn export_lean_string_utf8_next_fast_cold(
+    i: usize,
+    c: u8,
+) -> *mut LeanObject {
+    let step = if (c & 0xe0) == 0xc0 {
+        2
+    } else if (c & 0xf0) == 0xe0 {
+        3
+    } else if (c & 0xf8) == 0xf0 {
+        4
+    } else {
+        1
+    };
+    crate::tagged::boxi(i + step)
+}
+
+/// `lean_string_utf8_prev` (`object.cpp:2397-2413`): the big-Nat arm is the
+/// same disclosed shim refusal; scalar arms walk back to the first byte.
+// UNSAFE-LEDGER: FLN-UL-0511
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_utf8_prev")]
+pub(crate) extern "C" fn export_lean_string_utf8_prev(
+    s: *mut LeanObject,
+    i0: *mut LeanObject,
+) -> *mut LeanObject {
+    if !crate::tagged::is_scalar(i0) {
+        internal_panic_impl(
+            "string_utf8_prev: big-Nat index needs the bignum shim (Crucible workstream)",
+        );
+    }
+    let mut i = crate::tagged::unbox(i0);
+    // SAFETY: borrowed live string.
+    unsafe {
+        let (n, _, _, bytes) = object::string_fields(s);
+        let sz = n - 1;
+        if i == 0 {
+            return crate::tagged::boxi(0);
+        }
+        if i > sz {
+            return crate::tagged::boxi(i - 1);
+        }
+        i -= 1;
+        while !is_utf8_first_byte(bytes[i]) {
+            i -= 1;
+        }
+        crate::tagged::boxi(i)
+    }
+}
+
+/// `lean_thunk_get_core` (`object.cpp:510-534`): atomically claim the
+/// closure; the claimant applies it, marks the result MT, publishes it in
+/// `m_value` and returns the BORROWED reference; a loser spins with yield
+/// until the value appears — the pin's exact protocol.
+// UNSAFE-LEDGER: FLN-UL-0512
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_thunk_get_core")]
+pub(crate) extern "C" fn export_lean_thunk_get_core(t: *mut LeanObject) -> *mut LeanObject {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    // SAFETY: live thunk; m_closure/m_value are the pin's atomics, accessed
+    // through the same-layout AtomicPtr views; the published value's token
+    // stays with the thunk (borrowed return), the pin's convention.
+    unsafe {
+        let th = t.cast::<crate::layout::LeanThunkObject>();
+        let closure_slot = &*(&raw mut (*th).m_closure).cast::<AtomicPtr<LeanObject>>();
+        let value_slot = &*(&raw mut (*th).m_value).cast::<AtomicPtr<LeanObject>>();
+        let c = closure_slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+        if !c.is_null() {
+            let r = export_lean_apply_1(c, crate::tagged::boxi(0));
+            if !crate::tagged::is_scalar(r) {
+                rc::mark_mt(r);
+            }
+            value_slot.store(r, Ordering::SeqCst);
+            r
+        } else {
+            loop {
+                let v = value_slot.load(Ordering::SeqCst);
+                if !v.is_null() {
+                    return v;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}

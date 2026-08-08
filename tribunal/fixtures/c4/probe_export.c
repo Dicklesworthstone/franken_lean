@@ -185,6 +185,14 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* Batch-7 fixture: a counting thunk closure — init-once is the fact. */
+static int probe_thunk_inits = 0;
+static lean_object *probe_thunk_fn(lean_object *w) {
+    (void)w;
+    probe_thunk_inits++;
+    return lean_box(77);
+}
+
 /* Batch-6 fixture: a main_fn observing argc and argv[0] for run_main. */
 static lean_object *probe_run_main_fn(int argc, char **argv) {
     return lean_box((size_t)((size_t)argc * 100 + strlen(argv[0])));
@@ -1946,6 +1954,71 @@ static void facts_mode(void) {
                  lean_run_main(probe_run_main_fn, 2, rm_argv) == lean_box(209));
             unsetenv("LEAN_STACK_SIZE_KB");
         }
+    }
+
+    /* ---- franken_lean-83r batch 7: the string/utf8/thunk tail. */
+    {
+        lean_object *sa = lean_mk_string("abc");
+        lean_object *sb = lean_mk_string("abd");
+        fact("corpus.s7.lt", lean_string_lt(sa, sb) == 1 &&
+                                 lean_string_lt(sb, sa) == 0 &&
+                                 lean_string_lt(sa, sa) == 0);
+        fact("corpus.s7.memcmp",
+             lean_string_memcmp(sa, sb, lean_box(0), lean_box(0), lean_box(2)) == 1 &&
+                 lean_string_memcmp(sa, sb, lean_box(0), lean_box(0), lean_box(3)) == 0);
+        lean_dec(sb);
+        /* push: the SHARED arm (sa still referenced here) then the
+         * EXCLUSIVE arm on the fresh result; capacities are law-bound. */
+        lean_inc(sa);
+        lean_object *p1 = lean_string_push(sa, 0x2200); /* forall, 3 bytes */
+        fact("corpus.s7.push_shared",
+             (long long)(lean_string_size(p1) * 1000 + lean_string_capacity(p1)));
+        lean_object *p2 = lean_string_push(p1, 'x');
+        fact("corpus.s7.push_excl",
+             (long long)(lean_string_size(p2) * 1000 + lean_string_capacity(p2)));
+        fact("corpus.s7.push_bytes",
+             bytesum(lean_string_cstr(p2), lean_string_size(p2) - 1));
+        fact("corpus.s7.push_len", (long long)lean_string_len(p2));
+        lean_dec(p2);
+        /* extract: window, bad-start empty, end clamp. */
+        lean_object *ex = lean_mk_string("h\xe2\x88\x80llo");
+        lean_object *e1 = lean_string_utf8_extract(ex, lean_box(1), lean_box(4));
+        fact("corpus.s7.extract_win",
+             bytesum(lean_string_cstr(e1), lean_string_size(e1) - 1));
+        lean_object *e2 = lean_string_utf8_extract(ex, lean_box(2), lean_box(4));
+        fact("corpus.s7.extract_badstart", (long long)lean_string_size(e2) - 1);
+        lean_object *e3 = lean_string_utf8_extract(ex, lean_box(4), lean_box(99));
+        fact("corpus.s7.extract_clamp",
+             bytesum(lean_string_cstr(e3), lean_string_size(e3) - 1));
+        lean_dec(e1);
+        lean_dec(e2);
+        lean_dec(e3);
+        /* nav: next over ASCII + the 3-byte char + past-end; prev walks
+         * back over the multi-byte char; the fast_cold pair. */
+        fact("corpus.s7.next",
+             lean_string_utf8_next(ex, lean_box(0)) == lean_box(1) &&
+                 lean_string_utf8_next(ex, lean_box(1)) == lean_box(4) &&
+                 lean_string_utf8_next(ex, lean_box(9)) == lean_box(10));
+        fact("corpus.s7.prev",
+             lean_string_utf8_prev(ex, lean_box(4)) == lean_box(1) &&
+                 lean_string_utf8_prev(ex, lean_box(0)) == lean_box(0) &&
+                 lean_string_utf8_prev(ex, lean_box(9)) == lean_box(8));
+        fact("corpus.s7.fast_cold",
+             lean_string_utf8_next_fast_cold(1, 0xe2) == lean_box(4) &&
+                 lean_string_utf8_get_fast_cold(lean_string_cstr(ex), 1,
+                                                lean_string_size(ex) - 1,
+                                                0xe2) == 0x2200);
+        lean_dec(ex);
+        lean_dec(sa);
+        /* thunk: the claimant applies once; the second read is the cached
+         * value; the counting closure is the init-once witness. */
+        lean_object *tk = lean_mk_thunk(
+            lean_alloc_closure((void *)probe_thunk_fn, 1, 0));
+        fact("corpus.s7.thunk_first",
+             lean_thunk_get_core(tk) == lean_box(77));
+        fact("corpus.s7.thunk_cached",
+             lean_thunk_get_core(tk) == lean_box(77) && probe_thunk_inits == 1);
+        lean_dec(tk);
     }
 }
 
