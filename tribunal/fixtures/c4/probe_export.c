@@ -185,6 +185,21 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* Apply-tail fixtures: a width-6 summing target and the arity-17
+ * args-array (FNN) target apply_m's n>16 contract exercises. */
+static lean_object *probe_sum6(lean_object *a1, lean_object *a2, lean_object *a3,
+                               lean_object *a4, lean_object *a5, lean_object *a6) {
+    return lean_box(lean_unbox(a1) + lean_unbox(a2) + lean_unbox(a3) +
+                    lean_unbox(a4) + lean_unbox(a5) + lean_unbox(a6));
+}
+static lean_object *probe_sum17(lean_object **args) {
+    size_t acc = 0;
+    for (int i = 0; i < 17; i++) {
+        acc += lean_unbox(args[i]);
+    }
+    return lean_box(acc);
+}
+
 /* Batch-7 fixture: a counting thunk closure — init-once is the fact. */
 static int probe_thunk_inits = 0;
 static lean_object *probe_thunk_fn(lean_object *w) {
@@ -2019,6 +2034,34 @@ static void facts_mode(void) {
         fact("corpus.s7.thunk_cached",
              lean_thunk_get_core(tk) == lean_box(77) && probe_thunk_inits == 1);
         lean_dec(tk);
+    }
+
+    /* ---- the apply tail (rows orphaned by 7xe's close): a width-6 exact
+     * application, the same through apply_n's dispatch, an under-
+     * application curried then finished, and apply_m at the n>16
+     * args-array convention. */
+    {
+        lean_object *f6 = lean_alloc_closure((void *)probe_sum6, 6, 0);
+        lean_inc(f6);
+        fact("corpus.ap.six",
+             lean_apply_6(f6, lean_box(1), lean_box(2), lean_box(3), lean_box(4),
+                          lean_box(5), lean_box(6)) == lean_box(21));
+        lean_object *ndis[6] = {lean_box(10), lean_box(20), lean_box(30),
+                                lean_box(40), lean_box(50), lean_box(60)};
+        fact("corpus.ap.n_dispatch",
+             lean_apply_n(f6, 6, ndis) == lean_box(210));
+        lean_object *f6b = lean_alloc_closure((void *)probe_sum6, 6, 0);
+        lean_object *cur = lean_apply_5(f6b, lean_box(1), lean_box(1), lean_box(1),
+                                        lean_box(1), lean_box(1));
+        fact("corpus.ap.under_then_finish",
+             lean_apply_1(cur, lean_box(7)) == lean_box(12));
+        lean_object *f17 = lean_alloc_closure((void *)probe_sum17, 17, 0);
+        lean_object *m17[17];
+        for (int i = 0; i < 17; i++) {
+            m17[i] = lean_box((size_t)(i + 1));
+        }
+        fact("corpus.ap.m_seventeen",
+             lean_apply_m(f17, 17, m17) == lean_box(153));
     }
 }
 

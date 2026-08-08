@@ -5195,3 +5195,319 @@ pub(crate) extern "C" fn export_lean_thunk_get_core(t: *mut LeanObject) -> *mut 
         }
     }
 }
+
+// ------------------- the apply tail (rows orphaned by 7xe's close)
+// apply_1..4 have run over the generic `apply_core` since G0-3 landed;
+// the census rows for 5..16 + m + n kept citing the CLOSED franken_lean-7xe
+// as the excusing owner — the disclosed-unknowns-rot shape this repository
+// documents: the capability landed and nothing failed. Served here, each a
+// slice-length instantiation of the same core (apply.cpp:220-878 arms);
+// `lean_apply_n`'s by-count switch (apply.cpp:903-925) funnels into the
+// identical semantics, so the dispatch collapses into the core, and
+// `lean_apply_m`'s n>16 contract is a debug assertion exactly as the pin's
+// release build treats its lean_assert.
+
+/// `lean_apply_5` (apply.cpp; as lean_apply_4 at width 5).
+// UNSAFE-LEDGER: FLN-UL-0513
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_5")]
+pub(crate) extern "C" fn export_lean_apply_5(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5]) }
+}
+
+/// `lean_apply_6` (apply.cpp; as lean_apply_4 at width 6).
+// UNSAFE-LEDGER: FLN-UL-0514
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_6")]
+pub(crate) extern "C" fn export_lean_apply_6(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6]) }
+}
+
+/// `lean_apply_7` (apply.cpp; as lean_apply_4 at width 7).
+// UNSAFE-LEDGER: FLN-UL-0515
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_7")]
+pub(crate) extern "C" fn export_lean_apply_7(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7]) }
+}
+
+/// `lean_apply_8` (apply.cpp; as lean_apply_4 at width 8).
+// UNSAFE-LEDGER: FLN-UL-0516
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_8")]
+pub(crate) extern "C" fn export_lean_apply_8(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8]) }
+}
+
+/// `lean_apply_9` (apply.cpp; as lean_apply_4 at width 9).
+// UNSAFE-LEDGER: FLN-UL-0517
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_9")]
+pub(crate) extern "C" fn export_lean_apply_9(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8, a9]) }
+}
+
+/// `lean_apply_10` (apply.cpp; as lean_apply_4 at width 10).
+// UNSAFE-LEDGER: FLN-UL-0518
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_10")]
+pub(crate) extern "C" fn export_lean_apply_10(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10]) }
+}
+
+/// `lean_apply_11` (apply.cpp; as lean_apply_4 at width 11).
+// UNSAFE-LEDGER: FLN-UL-0519
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_11")]
+pub(crate) extern "C" fn export_lean_apply_11(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11]) }
+}
+
+/// `lean_apply_12` (apply.cpp; as lean_apply_4 at width 12).
+// UNSAFE-LEDGER: FLN-UL-0520
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_12")]
+pub(crate) extern "C" fn export_lean_apply_12(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+    a12: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12]) }
+}
+
+/// `lean_apply_13` (apply.cpp; as lean_apply_4 at width 13).
+// UNSAFE-LEDGER: FLN-UL-0521
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_13")]
+pub(crate) extern "C" fn export_lean_apply_13(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+    a12: *mut LeanObject,
+    a13: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe { apply_core(f, &[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13]) }
+}
+
+/// `lean_apply_14` (apply.cpp; as lean_apply_4 at width 14).
+// UNSAFE-LEDGER: FLN-UL-0522
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_14")]
+pub(crate) extern "C" fn export_lean_apply_14(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+    a12: *mut LeanObject,
+    a13: *mut LeanObject,
+    a14: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe {
+        apply_core(
+            f,
+            &[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14],
+        )
+    }
+}
+
+/// `lean_apply_15` (apply.cpp; as lean_apply_4 at width 15).
+// UNSAFE-LEDGER: FLN-UL-0523
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_15")]
+pub(crate) extern "C" fn export_lean_apply_15(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+    a12: *mut LeanObject,
+    a13: *mut LeanObject,
+    a14: *mut LeanObject,
+    a15: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe {
+        apply_core(
+            f,
+            &[
+                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            ],
+        )
+    }
+}
+
+/// `lean_apply_16` (apply.cpp; as lean_apply_4 at width 16).
+// UNSAFE-LEDGER: FLN-UL-0524
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_16")]
+pub(crate) extern "C" fn export_lean_apply_16(
+    f: *mut LeanObject,
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+    a3: *mut LeanObject,
+    a4: *mut LeanObject,
+    a5: *mut LeanObject,
+    a6: *mut LeanObject,
+    a7: *mut LeanObject,
+    a8: *mut LeanObject,
+    a9: *mut LeanObject,
+    a10: *mut LeanObject,
+    a11: *mut LeanObject,
+    a12: *mut LeanObject,
+    a13: *mut LeanObject,
+    a14: *mut LeanObject,
+    a15: *mut LeanObject,
+    a16: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: as lean_apply_1.
+    unsafe {
+        apply_core(
+            f,
+            &[
+                a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16,
+            ],
+        )
+    }
+}
+
+/// `lean_apply_m` (apply.cpp:880-902): the args-array entry for n > 16.
+// UNSAFE-LEDGER: FLN-UL-0525
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_m")]
+pub(crate) extern "C" fn export_lean_apply_m(
+    f: *mut LeanObject,
+    n: u32,
+    args: *mut *mut LeanObject,
+) -> *mut LeanObject {
+    debug_assert!(n > 16, "lean_apply_m contract (apply.cpp:881)");
+    // SAFETY: the caller passes n live argument slots per the contract.
+    unsafe { apply_core(f, core::slice::from_raw_parts(args, n as usize)) }
+}
+
+/// `lean_apply_n` (apply.cpp:903-925): by-count dispatch; every arm funnels
+/// into the same generic core here.
+// UNSAFE-LEDGER: FLN-UL-0526
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_apply_n")]
+pub(crate) extern "C" fn export_lean_apply_n(
+    f: *mut LeanObject,
+    n: u32,
+    args: *mut *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: the caller passes n live argument slots per the contract.
+    unsafe { apply_core(f, core::slice::from_raw_parts(args, n as usize)) }
+}
