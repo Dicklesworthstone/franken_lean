@@ -4773,3 +4773,55 @@ pub(crate) extern "C" fn export_lean_cstr_to_int(n: *const c_char) -> *mut LeanO
         ),
     }
 }
+
+// ------------------------------- 83r batch 5: to_string + class registry
+
+/// `lean_register_external_class` (`object.cpp:2806-2811`): the pin
+/// heap-allocates a class and pushes it on a registry read ONLY at
+/// `finalize_object` teardown (object.cpp:2822) — never during operation —
+/// so the immortal leaked allocation the internal core already makes is
+/// observably identical, and this export is its skin.
+// UNSAFE-LEDGER: FLN-UL-0499
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_register_external_class")]
+pub(crate) extern "C" fn export_lean_register_external_class(
+    finalize: unsafe extern "C" fn(*mut c_void),
+    foreach: unsafe extern "C" fn(*mut c_void, *mut LeanObject),
+) -> *mut crate::layout::LeanExternalClass {
+    object::register_external_class(finalize, foreach)
+}
+
+/// `lean_float_to_string` (`object.cpp:1860-1867`): `std::to_string(double)`
+/// is fixed-notation six-fractional-digit formatting; NaN overrides to
+/// "NaN" so architecture-dependent payload bits never become observable.
+/// Rust's `{:.6}` is the same correctly-rounded fixed-6 conversion, and the
+/// gauntlet's value sweep holds the two byte-identical rather than assuming
+/// it (subnormals, huge magnitudes, and rounding boundaries included).
+// UNSAFE-LEDGER: FLN-UL-0500
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float_to_string")]
+pub(crate) extern "C" fn export_lean_float_to_string(a: f64) -> *mut LeanObject {
+    let text = if a.is_nan() {
+        "NaN".to_owned()
+    } else {
+        format!("{a:.6}")
+    };
+    // SAFETY: fresh ASCII string from a Rust buffer.
+    unsafe { object::mk_string_unchecked(text.as_bytes(), text.len()) }
+}
+
+/// `lean_float32_to_string` (`object.cpp:1912-1919`): the f32 twin —
+/// `std::to_string(float)` promotes to double before formatting, so the
+/// twin formats the f64 promotion identically.
+// UNSAFE-LEDGER: FLN-UL-0501
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_float32_to_string")]
+pub(crate) extern "C" fn export_lean_float32_to_string(a: f32) -> *mut LeanObject {
+    let text = if a.is_nan() {
+        "NaN".to_owned()
+    } else {
+        format!("{:.6}", f64::from(a))
+    };
+    // SAFETY: fresh ASCII string from a Rust buffer.
+    unsafe { object::mk_string_unchecked(text.as_bytes(), text.len()) }
+}
