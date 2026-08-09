@@ -197,7 +197,12 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
             expected: NatDefinitionExpectation::NaturalValue,
         });
     }
-    if tokens.len() > 4 && !matches!(tokens.get(3).map(|token| &token.kind), Some(TokenKind::Ident(_))) {
+    if tokens.len() > 4
+        && !matches!(
+            tokens.get(3).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        )
+    {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, 4),
             expected: NatDefinitionExpectation::EndOfCommand,

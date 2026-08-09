@@ -489,10 +489,7 @@ mod tests {
             Err(NatDefinitionElabError::UnexpectedSyntax { .. })
         ));
         assert!(matches!(
-            elaborate_nat_term(&Syntax::node(
-                parser_kind(&["Term", "app"]),
-                Vec::new()
-            )),
+            elaborate_nat_term(&Syntax::node(parser_kind(&["Term", "app"]), Vec::new())),
             Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "Lean.Parser.Term.app"
             })
