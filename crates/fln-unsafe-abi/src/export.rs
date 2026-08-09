@@ -86,11 +86,26 @@ pub(crate) fn panic_impl(msg: &[u8], force_stderr: bool) {
     if PANIC_MESSAGES.load(Ordering::Relaxed) {
         let fatal_bound =
             force_stderr || EXIT_ON_PANIC.load(Ordering::Relaxed) || should_abort_on_panic();
-        if fatal_bound || !crate::stdio::panic_message_via_stream(msg) {
-            let mut err = std::io::stderr().lock();
-            let _ = err.write_all(msg);
-            let _ = err.write_all(b"\n");
-            let _ = err.flush();
+        let line = |bytes: &[u8]| {
+            if fatal_bound || !crate::stdio::panic_message_via_stream(bytes) {
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(bytes);
+                let _ = err.write_all(b"\n");
+                let _ = err.flush();
+            }
+        };
+        line(msg);
+        // The backtrace block (object.cpp:178-184): LEAN_BACKTRACE=0
+        // suppresses; otherwise the header and every captured line ride the
+        // SAME arm chooser — the shape slice 8g measured through an applied
+        // foreign closure. Line CONTENT is ours, disclosed (address-
+        // dependent even between the pin's own runs).
+        let bt_env = std::env::var_os("LEAN_BACKTRACE");
+        if bt_env.as_deref().is_none_or(|v| v != "0") {
+            line(b"backtrace:");
+            for l in crate::stdio::backtrace_lines() {
+                line(&l);
+            }
         }
     }
     if should_abort_on_panic() {
