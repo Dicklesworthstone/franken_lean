@@ -312,7 +312,14 @@ fn ulp_error_table_two_argument() {
 #[test]
 fn diag_atanh_reduction() {
     use fln_libm as m;
-    let x: f64 = -0.999 + 1.998 * 5.0 / 200_000.0;
+    // Reconstruct the grid point EXACTLY as sweep1's Linear point() does, so
+    // the input matches the table's worst case bit-for-bit.
+    let (lo, hi, n) = (-0.999_f64, 0.999_f64, 200_000u64);
+    let t = 5.0_f64 / (n as f64);
+    let x: f64 = lo + (hi - lo) * t;
+    println!("x.bits   = {:#018x}", x.to_bits());
+    println!("our.bits = {:#018x}", m::atanh(x).to_bits());
+    println!("std.bits = {:#018x}", x.atanh().to_bits());
     let xa = x.abs();
     let num = 2.0 * xa;
     let den = 1.0 - xa;
