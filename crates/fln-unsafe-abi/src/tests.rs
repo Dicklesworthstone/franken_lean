@@ -5029,8 +5029,8 @@ extern "C" fn foreign_put_str_capture(
     #[allow(unsafe_code)]
     unsafe {
         let (n, _, _, b) = crate::object::string_fields(s);
-        let sum: u64 = b[..n - 1].iter().map(|&x| u64::from(x)).sum::<u64>()
-            + 1000 * ((n - 1) as u64);
+        let sum: u64 =
+            b[..n - 1].iter().map(|&x| u64::from(x)).sum::<u64>() + 1000 * ((n - 1) as u64);
         FOREIGN_SUM.store(sum, core::sync::atomic::Ordering::SeqCst);
         crate::rc::dec_ref(s);
         let ok = crate::object::alloc_ctor(0, 1, 0);

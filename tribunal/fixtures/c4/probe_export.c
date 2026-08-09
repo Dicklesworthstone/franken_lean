@@ -2156,10 +2156,12 @@ static void facts_mode(void) {
             lean_ctor_set(fstream, i,
                           lean_alloc_closure((void *)probe_foreign_putstr, 2, 0));
         }
+        setenv("LEAN_BACKTRACE", "0", 1);
         lean_object *fold = lean_get_set_stderr(fstream);
         probe_foreign_sum = 0;
         lean_dec(lean_panic_fn(lean_box(0), lean_mk_string("foreign-line")));
         lean_dec(lean_get_set_stderr(fold));
+        unsetenv("LEAN_BACKTRACE");
         fact("corpus.sg.foreign_panic_sum", probe_foreign_sum);
     }
     {
