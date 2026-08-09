@@ -1,16 +1,40 @@
 //! **fln** — the embeddable library facade (plan §17.2).
 //!
-//! The first live surface is the typed diagnostic return adapter (bead
-//! `franken_lean-wlan`). It deliberately returns the shared structured value rather
-//! than serializing it: an embedder receives the same cause, authority, positions,
-//! related spans, evidence, and truncation facts as every other frontend.
+//! The first live surfaces are the typed diagnostic return adapter (bead
+//! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
+//! from either `def <identifier> := <natural-literal>` source or an already-
+//! elaborated definition through Crucible, the compiler's validated FIR and
+//! canonical FLBC, and Golem. The source path is deliberately the implemented
+//! grammar subset, not a claim of general Lean elaboration or Prelude support.
 
 #![forbid(unsafe_code)]
 
+pub use fln_comp::fir::LoweringError;
+pub use fln_comp::flbc::{CodecError, CodecLimits};
+pub use fln_comp::ingress::{IngressError, IngressLimits};
 use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, ExitClass,
     ProjectionRefusal, ProjectionRequest, ProjectionSnapshot,
 };
+pub use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
+pub use fln_core::level::Level;
+pub use fln_core::name::Name;
+pub use fln_core::options::KVMap;
+pub use fln_core::outcome::Outcome;
+pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
+pub use fln_env::constants::{
+    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+};
+use fln_env::environment::DeclarationCommitted;
+pub use fln_env::environment::{DeclarationBudget, Environment};
+pub use fln_env::pmap::CollisionBudget;
+pub use fln_hash::root::LogicalRoot;
+pub use fln_kernel::Declaration;
+use fln_kernel::capability::{Published, admit};
+use fln_kernel::council::{Council, CouncilOutcome, convene};
+pub use fln_kernel::verdict::{Budget, RejectClass};
+pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryProjection {
@@ -55,4 +79,666 @@ pub fn project_diagnostics(
         disposition: snapshot.exit_class(),
         semantic: snapshot.clone(),
     })
+}
+
+/// One immutable embeddable engine snapshot.
+///
+/// The currently live constructor seeds only the axiomatic `Nat : Sort 1` name
+/// needed by the bounded natural-definition frontend. It is not the real
+/// Prelude. Successful execution returns a new `Engine` snapshot containing
+/// the published declaration; the receiver is never mutated.
+#[derive(Debug, Clone)]
+pub struct Engine {
+    environment: Environment,
+}
+
+impl Engine {
+    /// Attach the embeddable facade to an existing immutable environment
+    /// produced by an importer, module transaction, or earlier engine session.
+    /// This performs no admission and grants no new authority.
+    pub fn from_environment(environment: Environment) -> Self {
+        Self { environment }
+    }
+
+    /// Construct the bounded natural-definition engine through the same kernel
+    /// admission and publication capability used for ordinary declarations.
+    pub fn with_nat_seed(budget: Budget) -> Result<Self, SeedEnvironmentError> {
+        fln_elab::seed::bootstrap_nat_environment(budget).map(|environment| Self { environment })
+    }
+
+    /// The immutable environment snapshot against which the next declaration
+    /// will be checked.
+    pub fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    /// The deterministic identity of this snapshot under the caller's exact
+    /// elaboration-relevant options.
+    pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
+        self.environment.logical_root(options)
+    }
+
+    /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
+    /// and execute one `def <identifier> := <natural-literal>` command.
+    ///
+    /// The publication council is explicitly empty because no independent
+    /// checker is configured on this bounded facade yet. This is a real K1
+    /// admission and publication, but it is not consensus-receipt evidence.
+    /// Kernel and VM non-answers remain [`Outcome::Inconclusive`] or
+    /// [`Outcome::InternalFault`]; they are never collapsed into rejection.
+    pub fn execute_nat_definition(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let parsed = fln_parse::parse_nat_definition(source)
+            .map_err(NatDefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        let declaration = fln_elab::elaborate_nat_definition(parsed.syntax())
+            .map_err(NatDefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        self.execute_definition(declaration, options, limits)
+    }
+
+    /// Execute a nonempty sequence of bounded source definitions atomically.
+    ///
+    /// Each command observes the immutable successor of the command before it.
+    /// A refusal or non-answer at any index returns no batch successor, so the
+    /// caller can only retain the original `self`. Completed per-command roots
+    /// remain in the successful result and form a checkable continuity chain.
+    pub fn execute_nat_definitions(
+        &self,
+        sources: &[&[u8]],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+        if sources.is_empty() {
+            return Err(EngineExecutionError::EmptyBatch);
+        }
+        let mut executions = Vec::new();
+        executions.try_reserve_exact(sources.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "definition batch results",
+                requested: sources.len(),
+            }
+        })?;
+        let base_logical_root = self.logical_root(options);
+        let mut engine = self.clone();
+        for (index, source) in sources.iter().enumerate() {
+            let execution = match engine.execute_nat_definition(source, options, limits) {
+                Ok(Outcome::Complete(execution)) => execution,
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+                Err(error) => {
+                    return Err(EngineExecutionError::BatchCommand {
+                        index,
+                        error: Box::new(error),
+                    });
+                }
+            };
+            engine = execution.engine.clone();
+            executions.push(execution);
+        }
+        let result_logical_root = engine.logical_root(options);
+        Ok(Outcome::Complete(DefinitionBatchExecution {
+            engine,
+            base_logical_root,
+            result_logical_root,
+            executions,
+        }))
+    }
+
+    /// Admit, publish, compile, canonically encode/decode, and execute one
+    /// already-elaborated definition.
+    ///
+    /// This is the reusable engine seam behind [`Self::execute_nat_definition`].
+    /// It accepts the compiler's substantially broader implemented closed-
+    /// expression subset rather than the seed parser's natural-literal subset.
+    /// Non-definition declarations are explicit refusals because they have no
+    /// executable body.
+    ///
+    /// The publication council is still explicitly empty: this is real K1
+    /// admission, not independent-checker consensus. Publication creates only a
+    /// local immutable successor until compilation and execution complete, so a
+    /// later refusal or non-answer exposes no partially advanced engine.
+    pub fn execute_definition(
+        &self,
+        declaration: Declaration,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let expression = match &declaration {
+            Declaration::Defn(definition) => definition.value.clone(),
+            Declaration::Axiom(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration { kind: "axiom" });
+            }
+            Declaration::Thm(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration { kind: "theorem" });
+            }
+            Declaration::Opaque(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration { kind: "opaque" });
+            }
+            Declaration::Mutual(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration {
+                    kind: "mutual block",
+                });
+            }
+            Declaration::Inductive(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration {
+                    kind: "inductive block",
+                });
+            }
+            Declaration::Quotient(_) => {
+                return Err(EngineExecutionError::UnsupportedDeclaration {
+                    kind: "quotient initialization",
+                });
+            }
+        };
+        let base_logical_root = self.logical_root(options);
+
+        let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let checked = match convene(&Council::nobody_was_asked(), admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            CouncilOutcome::KernelRejected { class, message, .. } => {
+                return Err(EngineExecutionError::KernelRejected { class, message });
+            }
+            CouncilOutcome::Halted(halt) => {
+                return Err(EngineExecutionError::CouncilHalted {
+                    summary: halt.summary(),
+                });
+            }
+        };
+        let environment = match checked.publish(limits.declaration, limits.collisions, None) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) => publication.environment,
+            Outcome::Complete(Published::Committed(DeclarationCommitted::DuplicateName {
+                name,
+            }))
+            | Outcome::Complete(Published::DuplicateName { name }) => {
+                return Err(EngineExecutionError::DuplicateName { name });
+            }
+            Outcome::Complete(Published::BlockCommitted(_)) => {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "a single definition published as a block",
+                });
+            }
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+
+        let ingress = fln_comp::ingress::lower_closed_expr(&expression, limits.ingress)
+            .map_err(EngineExecutionError::Ingress)?;
+        let lowered =
+            fln_comp::fir::lower_to_flbc(ingress.fir()).map_err(EngineExecutionError::Lowering)?;
+        let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
+            .map_err(EngineExecutionError::Codec)?;
+        let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
+            .map_err(EngineExecutionError::Codec)?;
+        let exit = match fln_vm::interpreter::execute(&executable, limits.vm, None) {
+            Outcome::Complete(exit) => exit,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let result_logical_root = environment.logical_root(options);
+
+        Ok(Outcome::Complete(DefinitionExecution {
+            engine: Engine { environment },
+            declaration,
+            base_logical_root,
+            result_logical_root,
+            flbc_artifact,
+            exit,
+        }))
+    }
+}
+
+/// Independent caller-supplied bounds for every bounded stage of one execution.
+///
+/// There is deliberately no `Default`: a kernel budget is calibrated to the
+/// native stack on which the caller will run it, and an embeddable API cannot
+/// infer that stack size honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineExecutionLimits {
+    pub kernel: Budget,
+    pub declaration: DeclarationBudget,
+    pub collisions: CollisionBudget,
+    pub ingress: IngressLimits,
+    pub flbc_codec: CodecLimits,
+    pub vm: VmExecutionLimits,
+}
+
+impl EngineExecutionLimits {
+    /// Use subsystem defaults around an explicitly calibrated kernel budget.
+    pub fn new(kernel: Budget) -> Self {
+        Self {
+            kernel,
+            declaration: DeclarationBudget::default(),
+            collisions: CollisionBudget::default(),
+            ingress: IngressLimits::default(),
+            flbc_codec: CodecLimits::default(),
+            vm: VmExecutionLimits::default(),
+        }
+    }
+}
+
+/// The authoritative outputs of one completed bounded engine run.
+#[derive(Debug)]
+pub struct DefinitionExecution {
+    /// The immutable snapshot containing the newly published declaration.
+    pub engine: Engine,
+    /// The exact declaration admitted by K1 and then published.
+    pub declaration: Declaration,
+    /// The exact base-environment identity under the caller's options.
+    pub base_logical_root: LogicalRoot,
+    /// The exact successor-environment identity under the same options.
+    pub result_logical_root: LogicalRoot,
+    /// The canonical FLBC bytes decoded and executed by Golem.
+    pub flbc_artifact: Vec<u8>,
+    /// Golem's completed domain result.
+    pub exit: VmExit,
+}
+
+/// The authoritative result of one atomic nonempty source batch.
+#[derive(Debug)]
+pub struct DefinitionBatchExecution {
+    /// The immutable snapshot containing every published definition.
+    pub engine: Engine,
+    /// The batch's original environment identity under the caller's options.
+    pub base_logical_root: LogicalRoot,
+    /// The final environment identity under the same options.
+    pub result_logical_root: LogicalRoot,
+    /// Every completed command in source order, including its root transition.
+    pub executions: Vec<DefinitionExecution>,
+}
+
+/// A completed refusal before Golem execution. Non-answers live in `Outcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineExecutionError {
+    EmptyBatch,
+    AllocationFailure {
+        resource: &'static str,
+        requested: usize,
+    },
+    BatchCommand {
+        index: usize,
+        error: Box<EngineExecutionError>,
+    },
+    Frontend(NatDefinitionFrontendError),
+    KernelRejected {
+        class: RejectClass,
+        message: String,
+    },
+    CouncilHalted {
+        summary: String,
+    },
+    DuplicateName {
+        name: Name,
+    },
+    UnsupportedDeclaration {
+        kind: &'static str,
+    },
+    UnexpectedPublication {
+        detail: &'static str,
+    },
+    Ingress(IngressError),
+    Lowering(LoweringError),
+    Codec(CodecError),
+}
+
+impl fmt::Display for EngineExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
+            Self::AllocationFailure {
+                resource,
+                requested,
+            } => write!(
+                formatter,
+                "could not reserve {requested} entries for {resource}"
+            ),
+            Self::BatchCommand { index, error } => {
+                write!(
+                    formatter,
+                    "definition batch command {index} failed: {error}"
+                )
+            }
+            Self::Frontend(error) => write!(formatter, "frontend refused source: {error:?}"),
+            Self::KernelRejected { class, message } => {
+                write!(
+                    formatter,
+                    "kernel rejected declaration ({class:?}): {message}"
+                )
+            }
+            Self::CouncilHalted { summary } => write!(formatter, "council halted: {summary}"),
+            Self::DuplicateName { name } => {
+                write!(
+                    formatter,
+                    "environment already contains {}",
+                    name.to_display_string()
+                )
+            }
+            Self::UnsupportedDeclaration { kind } => {
+                write!(formatter, "cannot execute {kind}: no definition body")
+            }
+            Self::UnexpectedPublication { detail } => {
+                write!(formatter, "unexpected publication result: {detail}")
+            }
+            Self::Ingress(error) => write!(formatter, "compiler ingress refused term: {error:?}"),
+            Self::Lowering(error) => write!(formatter, "FIR lowering refused term: {error}"),
+            Self::Codec(error) => write!(formatter, "FLBC codec refused artifact: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BatchCommand { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AxiomVal, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine,
+        EngineExecutionError, EngineExecutionLimits, Expr, KVMap, Level, Literal, Name, NatLit,
+        Outcome, ReducibilityHints, RejectClass,
+    };
+    use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
+
+    fn test_budget() -> Budget {
+        Budget::for_stack_bytes(2 * 1024 * 1024)
+    }
+
+    fn test_limits() -> EngineExecutionLimits {
+        EngineExecutionLimits::new(test_budget())
+    }
+
+    fn nat_type() -> Expr {
+        Expr::const_(Name::str(Name::anonymous(), "Nat"), Vec::new())
+    }
+
+    fn definition(name: &str, value: Expr) -> Declaration {
+        let name = Name::from_components([name]);
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: nat_type(),
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name],
+        })
+    }
+
+    fn nested_let_definition() -> Declaration {
+        definition(
+            "chosen",
+            Expr::let_e(
+                Name::from_components(["x"]),
+                nat_type(),
+                Expr::lit(Literal::Nat(NatLit::from_u64(41))),
+                Expr::bvar(0).expect("one local binder fits the term covenant"),
+                false,
+            ),
+        )
+    }
+
+    #[test]
+    fn bounded_engine_executes_checked_source_and_returns_the_published_snapshot() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let completed = engine
+            .execute_nat_definition(b"def answer := 42", &options, test_limits())
+            .expect("the supported source reaches Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the small bounded run must answer completely");
+        };
+
+        assert_eq!(
+            engine.environment().len(),
+            1,
+            "the receiver stays immutable"
+        );
+        assert_eq!(completed.engine.environment().len(), 2);
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+        assert_eq!(completed.base_logical_root, base_root);
+        assert_eq!(
+            completed.result_logical_root,
+            completed.engine.logical_root(&options)
+        );
+        assert_ne!(completed.base_logical_root, completed.result_logical_root);
+        assert!(!completed.flbc_artifact.is_empty());
+        let VmExit::Returned(returned) = completed.exit else {
+            panic!("the literal definition must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
+        assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn bounded_engine_refuses_unsupported_source_without_mutating_its_snapshot() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let before = engine.environment().clone();
+        let error = engine
+            .execute_nat_definition(b"theorem answer : True := trivial", &options, test_limits())
+            .expect_err("unsupported syntax is an explicit frontend refusal");
+
+        assert!(matches!(error, EngineExecutionError::Frontend(_)));
+        assert_eq!(engine.environment(), &before);
+        assert_eq!(engine.environment().len(), 1);
+    }
+
+    #[test]
+    fn bounded_engine_reports_duplicate_kernel_refusal_without_running_golem() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let first = engine
+            .execute_nat_definition(b"def answer := 42", &options, test_limits())
+            .expect("first definition is accepted");
+        let Outcome::Complete(first) = first else {
+            panic!("the small bounded run must answer completely");
+        };
+        let error = first
+            .engine
+            .execute_nat_definition(b"def answer := 7", &options, test_limits())
+            .expect_err("duplicate name must not publish or execute");
+
+        assert!(matches!(
+            error,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::AlreadyDeclared,
+                ref message,
+            } if message.contains("answer")
+        ));
+        assert_eq!(first.engine.environment().len(), 2);
+    }
+
+    #[test]
+    fn bounded_engine_preserves_vm_resource_exhaustion_as_a_non_answer() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let mut limits = test_limits();
+        limits.vm.max_steps = 0;
+        let outcome = engine
+            .execute_nat_definition(b"def answer := 42", &options, limits)
+            .expect("resource exhaustion is not a pipeline refusal");
+
+        assert!(matches!(outcome, Outcome::Inconclusive(_)));
+        assert_eq!(
+            engine.environment().len(),
+            1,
+            "an inconclusive run cannot expose a published successor"
+        );
+    }
+
+    #[test]
+    fn checked_definition_ingress_executes_the_compilers_richer_closed_subset() {
+        let seeded = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = Engine::from_environment(seeded.environment().clone());
+        let options = KVMap::new();
+        assert_eq!(engine.logical_root(&options), seeded.logical_root(&options));
+        let completed = engine
+            .execute_definition(nested_let_definition(), &options, test_limits())
+            .expect("a checked nested let reaches the reusable engine seam");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the small checked definition must answer completely");
+        };
+
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["chosen"]))
+        );
+        assert_eq!(
+            completed.result_logical_root,
+            completed.engine.logical_root(&options)
+        );
+        let VmExit::Returned(returned) = completed.exit else {
+            panic!("the checked nested let must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
+        assert_eq!(returned.value.unbox(), 41);
+    }
+
+    #[test]
+    fn checked_definition_ingress_refuses_non_executable_declarations_atomically() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let declaration = Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::from_components(["postulate"]),
+                level_params: Vec::new(),
+                type_: nat_type(),
+            },
+            is_unsafe: false,
+        });
+        let error = engine
+            .execute_definition(declaration, &options, test_limits())
+            .expect_err("an axiom has no executable body");
+
+        assert_eq!(
+            error,
+            EngineExecutionError::UnsupportedDeclaration { kind: "axiom" }
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["postulate"]))
+        );
+    }
+
+    #[test]
+    fn checked_definition_ingress_hides_a_successor_when_compilation_refuses() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let name = Name::from_components(["universe"]);
+        let declaration = Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::one()),
+            },
+            value: Expr::sort(Level::zero()),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name.clone()],
+        });
+        let error = engine
+            .execute_definition(declaration, &options, test_limits())
+            .expect_err("K1 accepts the sort definition but compiler ingress refuses it");
+
+        assert!(matches!(error, EngineExecutionError::Ingress(_)));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&name));
+    }
+
+    #[test]
+    fn bounded_source_batch_chains_real_root_transitions_in_order() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let sources: [&[u8]; 2] = [b"def first := 1", b"def second := 2"];
+        let completed = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect("both supported commands execute");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the small bounded batch must answer completely");
+        };
+
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(completed.engine.environment().len(), 3);
+        assert_eq!(completed.base_logical_root, engine.logical_root(&options));
+        assert_eq!(
+            completed.executions[0].result_logical_root,
+            completed.executions[1].base_logical_root
+        );
+        assert_eq!(
+            completed.result_logical_root,
+            completed.engine.logical_root(&options)
+        );
+        let VmExit::Returned(returned) = &completed.executions[1].exit else {
+            panic!("the second literal definition must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 2);
+    }
+
+    #[test]
+    fn bounded_source_batch_exposes_no_successor_after_a_later_refusal() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let empty: [&[u8]; 0] = [];
+        assert_eq!(
+            engine
+                .execute_nat_definitions(&empty, &options, test_limits())
+                .expect_err("a zero-command batch is not a successful project"),
+            EngineExecutionError::EmptyBatch
+        );
+
+        let sources: [&[u8]; 2] = [b"def answer := 1", b"def answer := 2"];
+        let error = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect_err("the duplicate second command must abort the batch");
+        assert!(matches!(
+            error,
+            EngineExecutionError::BatchCommand {
+                index: 1,
+                error,
+            } if matches!(
+                error.as_ref(),
+                EngineExecutionError::KernelRejected {
+                    class: RejectClass::AlreadyDeclared,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(engine.environment().len(), 1);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+    }
 }

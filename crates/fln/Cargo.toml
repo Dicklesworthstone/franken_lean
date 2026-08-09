@@ -6,4 +6,11 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+fln-comp = { path = "../fln-comp" }
 fln-core = { path = "../fln-core" }
+fln-elab = { path = "../fln-elab" }
+fln-env = { path = "../fln-env" }
+fln-hash = { path = "../fln-hash" }
+fln-kernel = { path = "../fln-kernel" }
+fln-parse = { path = "../fln-parse" }
+fln-vm = { path = "../fln-vm" }

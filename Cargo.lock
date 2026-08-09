@@ -6,7 +6,14 @@ version = 4
 name = "fln"
 version = "0.0.0"
 dependencies = [
+ "fln-comp",
  "fln-core",
+ "fln-elab",
+ "fln-env",
+ "fln-hash",
+ "fln-kernel",
+ "fln-parse",
+ "fln-vm",
 ]
 
 [[package]]
