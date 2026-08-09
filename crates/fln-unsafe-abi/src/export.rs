@@ -4692,7 +4692,11 @@ pub(crate) extern "C" fn export_lean_float_array_mk(a: *mut LeanObject) -> *mut 
     // scalar copied out, the source settled once at the end.
     unsafe {
         let (sz, _) = object::array_fields(a);
-        let r = object::alloc_sarray(8, sz, sz.max(1));
+        // Capacity is exactly `sz`, the pin's `lean_alloc_sarray(8, sz, sz)`
+        // (object.cpp:2614) — an empty input yields a capacity-0 array (a
+        // header-only alloc), NOT capacity 1. The loop below is skipped when
+        // `sz == 0`, so `rdata` is never dereferenced.
+        let r = object::alloc_sarray(8, sz, sz);
         let (_, _, _, rdata) = object::sarray_fields(r);
         for i in 0..sz {
             let e = object::array_get(a, i);
