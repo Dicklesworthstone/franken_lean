@@ -14,7 +14,7 @@ pub use fln_comp::fir::LoweringError;
 use fln_comp::fir::ValueType;
 use fln_comp::flbc::CallableResultOwnership;
 pub use fln_comp::flbc::{CodecError, CodecLimits};
-use fln_comp::ingress::{FunctionBinding, IngressResource};
+use fln_comp::ingress::{FunctionBinding, IngressResource, LambdaBinding, LambdaRecursion};
 pub use fln_comp::ingress::{IngressError, IngressLimits};
 use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, ExitClass,
@@ -202,11 +202,12 @@ impl Engine {
     /// It accepts the compiler's substantially broader implemented closed-
     /// expression subset rather than the seed parser's literal-or-identifier
     /// Nat-term subset.
-    /// References to closed, universe-free `Nat` definitions are compiled from
-    /// the exact bodies already published in the base environment. This is the
-    /// first environment-to-compiler catalog bridge; other runtime signatures
-    /// remain explicit compiler refusals. Non-definition declarations are
-    /// explicit refusals because they have no executable body.
+    /// References to closed, universe-free first-order `Nat -> ... -> Nat`
+    /// definitions are compiled from the exact types and bodies already
+    /// published in the base environment. This is the first
+    /// environment-to-compiler catalog bridge; other runtime signatures remain
+    /// explicit compiler refusals. Non-definition declarations are explicit
+    /// refusals because they have no executable body.
     ///
     /// The publication council is still explicitly empty: this is real K1
     /// admission, not independent-checker consensus. Publication creates only a
@@ -284,11 +285,15 @@ impl Engine {
 
         let functions = executable_nat_dependencies(&self.environment, &expression, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
-        let ingress = fln_comp::ingress::lower_closed_expr_with_catalogs(
+        let local_lambda = executable_nat_lambda(&declaration, limits.ingress)
+            .map_err(EngineExecutionError::Ingress)?;
+        let lambdas = local_lambda.as_slice();
+        let ingress = fln_comp::ingress::lower_closed_expr_with_lambdas(
             &expression,
             &[],
             &[],
             &functions,
+            lambdas,
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
@@ -318,9 +323,10 @@ impl Engine {
 
 /// Derive the compiler catalog from declarations that already passed K1.
 ///
-/// This deliberately supports one exact erased signature. A raw caller-supplied
-/// [`FunctionBinding`] would be able to replace a checked constant's body or lie
-/// about its runtime type; neither is an acceptable embeddable-engine boundary.
+/// This deliberately supports one exact family of erased signatures. A raw
+/// caller-supplied [`FunctionBinding`] would be able to replace a checked
+/// constant's body or lie about its runtime type; neither is an acceptable
+/// embeddable-engine boundary.
 fn executable_nat_dependencies(
     environment: &Environment,
     source: &Expr,
@@ -341,9 +347,11 @@ fn executable_nat_dependencies(
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
         };
-        if !definition.base.level_params.is_empty() || definition.base.type_ != nat_type {
+        let Some((arity, body)) =
+            executable_nat_signature(definition, &nat_type, &mut visited_nodes, limits)?
+        else {
             continue;
-        }
+        };
         let observed = functions.len().saturating_add(1);
         if observed > maximum_functions {
             return Err(IngressError::ResourceLimit {
@@ -358,18 +366,148 @@ fn executable_nat_dependencies(
                 resource: IngressResource::ProgramTables,
                 requested: observed,
             })?;
-        collect_executable_constants(&definition.value, &mut pending, &mut visited_nodes, limits)?;
+        let (parameters, parameter_ownership) = nat_runtime_parameters(arity)?;
+        collect_executable_constants(body, &mut pending, &mut visited_nodes, limits)?;
         functions.push(FunctionBinding {
             name,
             universe_arity: 0,
-            parameters: Vec::new(),
-            parameter_ownership: Vec::new(),
+            parameters,
+            parameter_ownership,
             result: ValueType::Nat,
             result_ownership: CallableResultOwnership::Scalar,
-            body: definition.value.clone(),
+            body: body.clone(),
         });
     }
     Ok(functions)
+}
+
+/// Describe the definition currently being published when its full value is a
+/// supported first-order Nat lambda. This lets the same compiler path execute
+/// the function value itself and expose the checked successor snapshot.
+fn executable_nat_lambda(
+    declaration: &Declaration,
+    limits: IngressLimits,
+) -> Result<Option<LambdaBinding>, IngressError> {
+    let Declaration::Defn(definition) = declaration else {
+        return Ok(None);
+    };
+    let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    let mut visited_nodes = 0usize;
+    let Some((arity, _)) =
+        executable_nat_signature(definition, &nat_type, &mut visited_nodes, limits)?
+    else {
+        return Ok(None);
+    };
+    if arity == 0 {
+        return Ok(None);
+    }
+    let (parameters, parameter_ownership) = nat_runtime_parameters(arity)?;
+    Ok(Some(LambdaBinding {
+        lambda: definition.value.clone(),
+        parameters,
+        parameter_ownership,
+        result: ValueType::Nat,
+        result_ownership: CallableResultOwnership::Scalar,
+        recursion: LambdaRecursion::NonRecursive,
+    }))
+}
+
+fn nat_runtime_parameters(
+    arity: usize,
+) -> Result<(Vec<ValueType>, Vec<fln_comp::flbc::ArgumentOwnership>), IngressError> {
+    let mut parameters = Vec::new();
+    parameters
+        .try_reserve_exact(arity)
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::ProgramTables,
+            requested: arity,
+        })?;
+    parameters.resize(arity, ValueType::Nat);
+    let mut parameter_ownership = Vec::new();
+    parameter_ownership
+        .try_reserve_exact(arity)
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::ProgramTables,
+            requested: arity,
+        })?;
+    parameter_ownership.resize(arity, fln_comp::flbc::ArgumentOwnership::Borrowed);
+    Ok((parameters, parameter_ownership))
+}
+
+/// Bind one checked definition to the compiler's exact first-order Nat ABI.
+///
+/// Pi binders and lambda binders must match structurally and in count. K1 has
+/// already proved the declaration well typed, but the runtime bridge accepts a
+/// deliberately narrower representation than definitional equality so it
+/// never invents an erasure rule. The returned body has its top-level lambdas
+/// removed, as required by [`FunctionBinding`].
+fn executable_nat_signature<'a>(
+    definition: &'a DefinitionVal,
+    nat_type: &Expr,
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+) -> Result<Option<(usize, &'a Expr)>, IngressError> {
+    use fln_core::expr::ExprNode;
+
+    if !definition.base.level_params.is_empty() {
+        return Ok(None);
+    }
+
+    let mut declared_type = &definition.base.type_;
+    let mut body = &definition.value;
+    let mut arity = 0usize;
+    loop {
+        charge_catalog_node(visited_nodes, limits)?;
+        match declared_type.node() {
+            ExprNode::ForallE {
+                binder_type,
+                body: result_type,
+                ..
+            } if binder_type == nat_type => {
+                charge_catalog_node(visited_nodes, limits)?;
+                let ExprNode::Lam {
+                    binder_type: value_binder_type,
+                    body: value_body,
+                    ..
+                } = body.node()
+                else {
+                    return Ok(None);
+                };
+                if value_binder_type != nat_type {
+                    return Ok(None);
+                }
+                arity = arity.saturating_add(1);
+                if arity > limits.max_context_depth {
+                    return Err(IngressError::ResourceLimit {
+                        resource: IngressResource::ContextDepth,
+                        limit: limits.max_context_depth,
+                        observed: arity,
+                    });
+                }
+                declared_type = result_type;
+                body = value_body;
+            }
+            _ => break,
+        }
+    }
+
+    Ok((declared_type == nat_type).then_some((arity, body)))
+}
+
+fn charge_catalog_node(
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    let observed = visited_nodes.saturating_add(1);
+    if observed > limits.max_nodes {
+        return Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: limits.max_nodes,
+            observed,
+        });
+    }
+    *visited_nodes = observed;
+    Ok(())
 }
 
 /// Find only constants in expression positions that compiler ingress evaluates.
@@ -391,15 +529,7 @@ fn collect_executable_constants(
         })?;
     pending.push(source);
     while let Some(expression) = pending.pop() {
-        let observed = visited_nodes.saturating_add(1);
-        if observed > limits.max_nodes {
-            return Err(IngressError::ResourceLimit {
-                resource: IngressResource::Nodes,
-                limit: limits.max_nodes,
-                observed,
-            });
-        }
-        *visited_nodes = observed;
+        charge_catalog_node(visited_nodes, limits)?;
         match expression.node() {
             ExprNode::Const { name, .. } => {
                 names.insert(name.clone());
@@ -602,9 +732,9 @@ impl std::error::Error for EngineExecutionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AxiomVal, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine,
-        EngineExecutionError, EngineExecutionLimits, Expr, IngressError, IngressResource, KVMap,
-        Level, Literal, Name, NatLit, Outcome, ReducibilityHints, RejectClass,
+        AxiomVal, BinderInfo, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal,
+        Engine, EngineExecutionError, EngineExecutionLimits, Expr, IngressError, IngressResource,
+        KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints, RejectClass,
     };
     use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
 
@@ -646,6 +776,67 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    fn nat_identity_definition(name: &str) -> Declaration {
+        let name = Name::from_components([name]);
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::forall_e(
+                    Name::from_components(["value"]),
+                    nat_type(),
+                    nat_type(),
+                    BinderInfo::Default,
+                ),
+            },
+            value: Expr::lam(
+                Name::from_components(["value"]),
+                nat_type(),
+                Expr::bvar(0).expect("one Nat parameter fits the term covenant"),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name],
+        })
+    }
+
+    fn first_nat_definition(name: &str) -> Declaration {
+        let name = Name::from_components([name]);
+        let second_type = Expr::forall_e(
+            Name::from_components(["second"]),
+            nat_type(),
+            nat_type(),
+            BinderInfo::Default,
+        );
+        Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::forall_e(
+                    Name::from_components(["first"]),
+                    nat_type(),
+                    second_type,
+                    BinderInfo::Default,
+                ),
+            },
+            value: Expr::lam(
+                Name::from_components(["first"]),
+                nat_type(),
+                Expr::lam(
+                    Name::from_components(["second"]),
+                    nat_type(),
+                    Expr::bvar(1).expect("two Nat parameters fit the term covenant"),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name],
+        })
     }
 
     #[test]
@@ -833,6 +1024,95 @@ mod tests {
         };
         assert_eq!(returned.value.unbox(), 41);
         assert_eq!(chained.engine.environment().len(), 4);
+    }
+
+    #[test]
+    fn checked_nat_functions_publish_execute_and_recover_after_a_bounded_refusal() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let identity = nat_identity_definition("identity");
+        let identity_name = Name::from_components(["identity"]);
+        let base_root = engine.logical_root(&options);
+
+        let mut constrained = test_limits();
+        constrained.ingress.max_context_depth = 0;
+        let error = engine
+            .execute_definition(identity.clone(), &options, constrained)
+            .expect_err("the explicit zero-depth bound refuses one Nat parameter");
+        assert_eq!(
+            error,
+            EngineExecutionError::Ingress(IngressError::ResourceLimit {
+                resource: IngressResource::ContextDepth,
+                limit: 0,
+                observed: 1,
+            })
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&identity_name));
+
+        let published = engine
+            .execute_definition(identity, &options, test_limits())
+            .expect("the checked Nat function is compiled as a local closure");
+        let Outcome::Complete(published) = published else {
+            panic!("the small checked function must answer completely");
+        };
+        assert!(published.engine.environment().contains(&identity_name));
+
+        let applied = published
+            .engine
+            .execute_definition(
+                definition(
+                    "answer",
+                    Expr::app(
+                        Expr::const_(identity_name, Vec::new()),
+                        Expr::lit(Literal::Nat(NatLit::from_u64(42))),
+                    ),
+                ),
+                &options,
+                test_limits(),
+            )
+            .expect("the compiler derives the function ABI from the checked environment");
+        let Outcome::Complete(applied) = applied else {
+            panic!("the checked function application must answer completely");
+        };
+        let VmExit::Returned(returned) = applied.exit else {
+            panic!("the checked function application must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
+        assert_eq!(returned.value.unbox(), 42);
+        assert_eq!(applied.engine.environment().len(), 3);
+    }
+
+    #[test]
+    fn checked_multi_parameter_nat_function_preserves_argument_order() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let first_name = Name::from_components(["first"]);
+        let published = engine
+            .execute_definition(first_nat_definition("first"), &options, test_limits())
+            .expect("the two-parameter checked function is executable");
+        let Outcome::Complete(published) = published else {
+            panic!("the small checked function must answer completely");
+        };
+
+        let call = Expr::app(
+            Expr::app(
+                Expr::const_(first_name, Vec::new()),
+                Expr::lit(Literal::Nat(NatLit::from_u64(17))),
+            ),
+            Expr::lit(Literal::Nat(NatLit::from_u64(29))),
+        );
+        let selected = published
+            .engine
+            .execute_definition(definition("selected", call), &options, test_limits())
+            .expect("the environment-derived two-parameter catalog entry compiles");
+        let Outcome::Complete(selected) = selected else {
+            panic!("the checked function application must answer completely");
+        };
+        let VmExit::Returned(returned) = selected.exit else {
+            panic!("the checked function application must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 17);
     }
 
     #[test]
