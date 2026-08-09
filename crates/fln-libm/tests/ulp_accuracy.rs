@@ -358,6 +358,14 @@ fn golden_correctly_rounded() {
     // 80-digit decimal; regenerate with the harness's companion script.
     type Golden = (&'static str, fn(f64) -> f64, u64, u64);
     let golden: &[Golden] = &[
+        // Large-argument sin: the Payne-Hanek reduction's whole reason to
+        // exist. The distance sweep only reaches 1e6, so these huge-argument
+        // goldens are the only check that reduction near/beyond 1e15 (where a
+        // double's ulp exceeds pi and naive `x % 2pi` loses ALL accuracy) is
+        // correct. Truth from 400-digit decimal.
+        ("sin", m::sin, 0x43ab_c16d_674e_c800, 0xbfef_c667_98d0_5d2e),
+        ("sin", m::sin, 0x430c_6bf5_2634_0000, 0x3feb_76f8_8136_ceba),
+        ("sin", m::sin, 0x437b_69b3_6eca_4580, 0xbfe2_e753_48bc_f28a),
         (
             "atanh",
             m::atanh,
