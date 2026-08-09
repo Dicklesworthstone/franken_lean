@@ -68,22 +68,49 @@ struct Report {
     hard_diverge: u64,
 }
 
-/// Sweep a single-argument function over an inclusive linear grid and tally
-/// the ulp distance against the reference.
+/// How to distribute the sample points across `[lo, hi]`.
+#[derive(Clone, Copy)]
+enum Grid {
+    /// Uniform in the value — right for bounded domains (sin, asin, tanh).
+    Linear,
+    /// Uniform in the EXPONENT — the only honest sweep for a function whose
+    /// domain spans many orders of magnitude (log, exp, sqrt). A linear grid
+    /// over `[1e-300, 1e300]` has a step near `1e295`, so every sample but
+    /// the first lands in the extreme high tail and the moderate range where
+    /// real callers live is never tested. `lo`/`hi` must be finite and
+    /// same-signed (the sign is reapplied after the geometric interpolation).
+    Geometric,
+}
+
+/// Sweep a single-argument function and tally the ulp distance against the
+/// reference over `n + 1` points distributed by `grid`.
 fn sweep1(
     name: &'static str,
     ours: fn(f64) -> f64,
     reference: fn(f64) -> f64,
     lo: f64,
     hi: f64,
+    grid: Grid,
     n: u64,
 ) -> Report {
     let mut max_ulp = 0u64;
     let mut worst_input = lo;
     let mut within_1 = 0u64;
     let mut hard = 0u64;
+    let point = |i: u64| -> f64 {
+        let t = (i as f64) / (n as f64);
+        match grid {
+            Grid::Linear => lo + (hi - lo) * t,
+            Grid::Geometric => {
+                // Interpolate in log-magnitude, reapplying the common sign.
+                let sign = if lo < 0.0 { -1.0 } else { 1.0 };
+                let (a, b) = (lo.abs().ln(), hi.abs().ln());
+                sign * (a + (b - a) * t).exp()
+            }
+        }
+    };
     for i in 0..=n {
-        let x = lo + (hi - lo) * (i as f64) / (n as f64);
+        let x = point(i);
         let r = reference(x);
         if !r.is_finite() {
             continue; // reference outside the function's finite domain
@@ -136,29 +163,37 @@ fn print_table(reports: &[Report]) {
 fn ulp_error_table_single_argument() {
     use fln_libm as m;
     use std::f64::consts::TAU;
+    use Grid::{Geometric, Linear};
+    // Bounded domains sweep Linear; domains spanning many orders of magnitude
+    // sweep Geometric (log-spaced) so the moderate range real callers use is
+    // actually tested, not just the extreme tail. `log`/`exp`/`sqrt` are also
+    // swept with a Linear moderate partition [1, 4096] to catch the mid-range
+    // exercised indirectly by atanh's reduction.
     let reports = vec![
-        sweep1("sin", m::sin, |x| x.sin(), -TAU, TAU, 200_000),
-        sweep1("sin_big", m::sin, |x| x.sin(), -1.0e6, 1.0e6, 200_000),
-        sweep1("cos", m::cos, |x| x.cos(), -TAU, TAU, 200_000),
-        sweep1("tan", m::tan, |x| x.tan(), -1.5, 1.5, 200_000),
-        sweep1("asin", m::asin, |x| x.asin(), -1.0, 1.0, 200_000),
-        sweep1("acos", m::acos, |x| x.acos(), -1.0, 1.0, 200_000),
-        sweep1("atan", m::atan, |x| x.atan(), -50.0, 50.0, 200_000),
-        sweep1("exp", m::exp, |x| x.exp(), -700.0, 700.0, 200_000),
-        sweep1("exp2", m::exp2, |x| x.exp2(), -1000.0, 1000.0, 200_000),
-        sweep1("expm1", m::expm1, |x| x.exp_m1(), -1.0, 1.0, 200_000),
-        sweep1("log", m::log, |x| x.ln(), 1.0e-300, 1.0e300, 200_000),
-        sweep1("log2", m::log2, |x| x.log2(), 1.0e-300, 1.0e300, 200_000),
-        sweep1("log10", m::log10, |x| x.log10(), 1.0e-300, 1.0e300, 200_000),
-        sweep1("log1p", m::log1p, |x| x.ln_1p(), -0.9, 10.0, 200_000),
-        sweep1("sinh", m::sinh, |x| x.sinh(), -50.0, 50.0, 200_000),
-        sweep1("cosh", m::cosh, |x| x.cosh(), -50.0, 50.0, 200_000),
-        sweep1("tanh", m::tanh, |x| x.tanh(), -20.0, 20.0, 200_000),
-        sweep1("asinh", m::asinh, |x| x.asinh(), -1.0e6, 1.0e6, 200_000),
-        sweep1("acosh", m::acosh, |x| x.acosh(), 1.0, 1.0e6, 200_000),
-        sweep1("atanh", m::atanh, |x| x.atanh(), -0.999, 0.999, 200_000),
-        sweep1("cbrt", m::cbrt, |x| x.cbrt(), -1.0e9, 1.0e9, 200_000),
-        sweep1("sqrt", m::sqrt, |x| x.sqrt(), 0.0, 1.0e12, 200_000),
+        sweep1("sin", m::sin, |x| x.sin(), -TAU, TAU, Linear, 200_000),
+        sweep1("sin_big", m::sin, |x| x.sin(), -1.0e6, 1.0e6, Linear, 200_000),
+        sweep1("cos", m::cos, |x| x.cos(), -TAU, TAU, Linear, 200_000),
+        sweep1("tan", m::tan, |x| x.tan(), -1.5, 1.5, Linear, 200_000),
+        sweep1("asin", m::asin, |x| x.asin(), -1.0, 1.0, Linear, 200_000),
+        sweep1("acos", m::acos, |x| x.acos(), -1.0, 1.0, Linear, 200_000),
+        sweep1("atan", m::atan, |x| x.atan(), -50.0, 50.0, Linear, 200_000),
+        sweep1("exp", m::exp, |x| x.exp(), -700.0, 700.0, Linear, 200_000),
+        sweep1("exp2", m::exp2, |x| x.exp2(), -1000.0, 1000.0, Linear, 200_000),
+        sweep1("expm1", m::expm1, |x| x.exp_m1(), -1.0, 1.0, Linear, 200_000),
+        sweep1("log_hi", m::log, |x| x.ln(), 1.0e-300, 1.0e300, Geometric, 200_000),
+        sweep1("log_mid", m::log, |x| x.ln(), 1.0, 4096.0, Linear, 200_000),
+        sweep1("log2", m::log2, |x| x.log2(), 1.0e-300, 1.0e300, Geometric, 200_000),
+        sweep1("log10", m::log10, |x| x.log10(), 1.0e-300, 1.0e300, Geometric, 200_000),
+        sweep1("log1p_sm", m::log1p, |x| x.ln_1p(), -0.9, 10.0, Linear, 200_000),
+        sweep1("log1p_big", m::log1p, |x| x.ln_1p(), 1.0, 1.0e6, Geometric, 200_000),
+        sweep1("sinh", m::sinh, |x| x.sinh(), -50.0, 50.0, Linear, 200_000),
+        sweep1("cosh", m::cosh, |x| x.cosh(), -50.0, 50.0, Linear, 200_000),
+        sweep1("tanh", m::tanh, |x| x.tanh(), -20.0, 20.0, Linear, 200_000),
+        sweep1("asinh", m::asinh, |x| x.asinh(), -1.0e6, 1.0e6, Linear, 200_000),
+        sweep1("acosh", m::acosh, |x| x.acosh(), 1.0, 1.0e6, Geometric, 200_000),
+        sweep1("atanh", m::atanh, |x| x.atanh(), -0.999, 0.999, Linear, 200_000),
+        sweep1("cbrt", m::cbrt, |x| x.cbrt(), -1.0e9, 1.0e9, Geometric, 200_000),
+        sweep1("sqrt", m::sqrt, |x| x.sqrt(), 1.0e-12, 1.0e12, Geometric, 200_000),
     ];
     print_table(&reports);
 
@@ -272,4 +307,24 @@ fn ulp_error_table_two_argument() {
         pow_ulp <= 33,
         "pow remainder regressed past 33 ulp: {pow_ulp}"
     );
+}
+
+#[test]
+fn diag_atanh_reduction() {
+    use fln_libm as m;
+    let x: f64 = -0.999 + 1.998 * 5.0 / 200_000.0;
+    let xa = x.abs();
+    let num = 2.0 * xa;
+    let den = 1.0 - xa;
+    let arg = num / den;
+    println!("x        = {x:.17e}");
+    println!("2x       = {num:.17e}");
+    println!("1-x      = {den:.17e}  (exact? {})", (1.0 - xa) + xa == 1.0);
+    println!("arg      = {arg:.17e}");
+    println!("our log1p(arg) = {:.17e}", m::log1p(arg));
+    println!("std log1p(arg) = {:.17e}", arg.ln_1p());
+    println!("our log(1+arg) = {:.17e}", m::log(1.0 + arg));
+    println!("our atanh(x)   = {:.17e}", m::atanh(x));
+    println!("std atanh(x)   = {:.17e}", x.atanh());
+    println!("0.5*our_log1p  = {:.17e}", 0.5 * m::log1p(arg));
 }
