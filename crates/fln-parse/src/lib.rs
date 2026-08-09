@@ -5,10 +5,11 @@
 //! The general Pratt/category machinery lives in the modules below. The
 //! [`parse_nat_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` (bead `fln-5720`) and accepts
-//! exactly `def <ident> := <natural-literal-or-ident>`. It uses the same source
-//! view, lexer, attachment, and canonical `Syntax` shape as the general engine.
-//! Being outside this seed grammar is a typed refusal, not a claim that the
-//! source is invalid Lean.
+//! `def <ident> := <natural-literal-or-ident>` plus saturated applications whose
+//! head is an identifier and whose arguments are natural literals or
+//! identifiers. It uses the same source view, lexer, attachment, and canonical
+//! `Syntax` shape as the general engine. Being outside this seed grammar is a
+//! typed refusal, not a claim that the source is invalid Lean.
 
 #![forbid(unsafe_code)]
 
@@ -131,6 +132,7 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
 ///
 /// ```text
 /// def <identifier> := <natural-literal-or-identifier>
+/// def <identifier> := <identifier> <natural-literal-or-identifier>+
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -195,11 +197,22 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
             expected: NatDefinitionExpectation::NaturalValue,
         });
     }
-    if tokens.len() != 4 {
+    if tokens.len() > 4 && !matches!(tokens.get(3).map(|token| &token.kind), Some(TokenKind::Ident(_))) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, 4),
             expected: NatDefinitionExpectation::EndOfCommand,
         });
+    }
+    for index in 4..tokens.len() {
+        if !matches!(
+            tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, index),
+                expected: NatDefinitionExpectation::NaturalValue,
+            });
+        }
     }
 
     let leaves = Leaves::build(view.normalized(), &tokens)?;
@@ -207,7 +220,6 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     let definition_keyword = leaves.leaf(0)?;
     let declaration_name = leaves.leaf(1)?;
     let assignment = leaves.leaf(2)?;
-    let value = leaves.leaf(3)?;
 
     let modifiers = Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
@@ -229,17 +241,32 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let value = match tokens.get(3).map(|token| &token.kind) {
-        Some(TokenKind::Literal(LiteralKind::Nat)) => {
-            Syntax::node(Name::str(Name::anonymous(), "num"), vec![value])
-        }
-        Some(TokenKind::Ident(_)) => value,
-        _ => {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, 3),
+    let term_leaf = |index: usize| -> Result<Syntax, NatDefinitionParseError> {
+        let leaf = leaves.leaf(index)?;
+        match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Literal(LiteralKind::Nat)) => Ok(Syntax::node(
+                Name::str(Name::anonymous(), "num"),
+                vec![leaf],
+            )),
+            Some(TokenKind::Ident(_)) => Ok(leaf),
+            _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, index),
                 expected: NatDefinitionExpectation::NaturalValue,
-            });
+            }),
         }
+    };
+    let head = term_leaf(3)?;
+    let value = if tokens.len() == 4 {
+        head
+    } else {
+        let mut arguments = Vec::new();
+        for index in 4..tokens.len() {
+            arguments.push(term_leaf(index)?);
+        }
+        Syntax::node(
+            parser_kind(&["Term", "app"]),
+            vec![head, null_node(arguments)],
+        )
     };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
@@ -324,6 +351,57 @@ mod nat_definition_tests {
     }
 
     #[test]
+    fn command_slice_builds_the_reference_application_shape_without_losing_source() {
+        let source = b"def selected := first 17 29";
+        let parsed = parse_nat_definition(source).expect("the bounded Nat application parses");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        let Syntax::Node {
+            kind,
+            args: application,
+            ..
+        } = &value[1]
+        else {
+            panic!("the source application must be a term node");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "app"]));
+        assert!(matches!(
+            &application[0],
+            Syntax::Ident { val, .. } if val.to_display_string() == "first"
+        ));
+        let Syntax::Node {
+            kind,
+            args: arguments,
+            ..
+        } = &application[1]
+        else {
+            panic!("the application arguments must use the Reference null array shape");
+        };
+        assert_eq!(kind, &state::null_kind());
+        assert_eq!(arguments.len(), 2);
+        assert!(arguments.iter().all(|argument| matches!(
+            argument,
+            Syntax::Node { kind, args, .. }
+                if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1
+        )));
+    }
+
+    #[test]
     fn source_and_seed_grammar_refusals_remain_typed() {
         assert!(matches!(
             parse_nat_definition(&[0xff]),
@@ -342,6 +420,13 @@ mod nat_definition_tests {
             parse_nat_definition(b"def answer := 42 extra"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
                 expected: NatDefinitionExpectation::EndOfCommand,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def answer := identity \"not a Nat\""),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalValue,
                 ..
             })
         ));
