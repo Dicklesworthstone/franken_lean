@@ -2,9 +2,9 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from either `def <identifier> := <natural-literal-or-ident>` source or an
-//! already-elaborated definition through Crucible, the compiler's validated FIR
-//! and canonical FLBC, and Golem. The source path is deliberately the
+//! from a bounded Nat definition or first-order application source, or from an
+//! already-elaborated definition, through Crucible, the compiler's validated
+//! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
 //! Prelude support.
 
@@ -125,7 +125,9 @@ impl Engine {
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
-    /// and execute one bounded Nat-valued definition command.
+    /// and execute one bounded Nat-valued definition command. The source value
+    /// may be a natural literal, a constant identifier, or a saturated
+    /// identifier-headed application of those atom forms.
     ///
     /// The publication council is explicitly empty because no independent
     /// checker is configured on this bounded facade yet. This is a real K1
@@ -1145,6 +1147,50 @@ mod tests {
             panic!("the checked function application must return normally");
         };
         assert_eq!(returned.value.unbox(), 17);
+    }
+
+    #[test]
+    fn bounded_source_calls_checked_nat_functions_and_recovers_after_an_argument_bound() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let published = engine
+            .execute_definition(first_nat_definition("first"), &options, test_limits())
+            .expect("the checked two-parameter function publishes");
+        let Outcome::Complete(published) = published else {
+            panic!("the small checked function must answer completely");
+        };
+        let base_root = published.engine.logical_root(&options);
+        let selected_name = Name::from_components(["selected"]);
+
+        let mut constrained = test_limits();
+        constrained.ingress.max_application_args = 1;
+        let error = published
+            .engine
+            .execute_nat_definition(b"def selected := first 17 29", &options, constrained)
+            .expect_err("two source arguments exceed the explicit one-argument bound");
+        assert_eq!(
+            error,
+            EngineExecutionError::Ingress(IngressError::ResourceLimit {
+                resource: IngressResource::ApplicationArguments,
+                limit: 1,
+                observed: 2,
+            })
+        );
+        assert_eq!(published.engine.logical_root(&options), base_root);
+        assert!(!published.engine.environment().contains(&selected_name));
+
+        let selected = published
+            .engine
+            .execute_nat_definition(b"def selected := first 17 29", &options, test_limits())
+            .expect("the same source application recovers under sufficient bounds");
+        let Outcome::Complete(selected) = selected else {
+            panic!("the bounded source call must answer completely");
+        };
+        let VmExit::Returned(returned) = selected.exit else {
+            panic!("the bounded source call must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 17);
+        assert!(selected.engine.environment().contains(&selected_name));
     }
 
     #[test]
