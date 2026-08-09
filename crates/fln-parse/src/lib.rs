@@ -229,12 +229,17 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let value = match &tokens[3].kind {
-        TokenKind::Literal(LiteralKind::Nat) => {
+    let value = match tokens.get(3).map(|token| &token.kind) {
+        Some(TokenKind::Literal(LiteralKind::Nat)) => {
             Syntax::node(Name::str(Name::anonymous(), "num"), vec![value])
         }
-        TokenKind::Ident(_) => value,
-        _ => unreachable!("the seed grammar checked the value token"),
+        Some(TokenKind::Ident(_)) => value,
+        _ => {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, 3),
+                expected: NatDefinitionExpectation::NaturalValue,
+            });
+        }
     };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
