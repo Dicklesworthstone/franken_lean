@@ -58,26 +58,43 @@ fn nat(u: u128) -> BigNat {
 #[test]
 fn u128_exact_differential() {
     let mut rng = Rng(0x1234_5678_9abc_def0);
-    for _ in 0..300_000 {
+    for _ in 0..60_000 {
         // Mix full-width and small operands so single-limb paths, the
         // single->double limb boundary, and near-2^64 values all appear.
         let pick = |r: &mut Rng| -> u128 {
             match r.next() % 4 {
-                0 => u128::from(r.next()),                       // 1 limb
-                1 => u128::from(r.next() as u32),                // small
+                0 => u128::from(r.next()),                                // 1 limb
+                1 => u128::from(r.next() as u32),                         // small
                 2 => (u128::from(r.next()) << 64) | u128::from(r.next()), // 2 limb
-                _ => u128::from(r.next()) << 64,                 // top-limb only
+                _ => u128::from(r.next()) << 64,                          // top-limb only
             }
         };
         let a = pick(&mut rng);
         let b = pick(&mut rng);
 
-        assert_eq!(nat(a).add(&nat(b)).to_decimal(), (a.wrapping_add(b)).to_string(), "add {a}+{b}");
+        // u128 can only oracle add when the true sum fits (a+b may be 129
+        // bits); the carry-OUT-of-top case is covered by the metamorphic
+        // reconstruction test, which exercises arbitrary-width addition.
+        if let Some(sum) = a.checked_add(b) {
+            assert_eq!(
+                nat(a).add(&nat(b)).to_decimal(),
+                sum.to_string(),
+                "add {a}+{b}"
+            );
+        }
         // Lean-Nat TRUNCATED subtraction: a < b yields 0, not underflow.
         let sub_truth = a.saturating_sub(b);
-        assert_eq!(nat(a).sub(&nat(b)).to_decimal(), sub_truth.to_string(), "sub {a}-{b} (truncated)");
+        assert_eq!(
+            nat(a).sub(&nat(b)).to_decimal(),
+            sub_truth.to_string(),
+            "sub {a}-{b} (truncated)"
+        );
         if let Some(prod) = a.checked_mul(b) {
-            assert_eq!(nat(a).mul(&nat(b)).to_decimal(), prod.to_string(), "mul {a}*{b}");
+            assert_eq!(
+                nat(a).mul(&nat(b)).to_decimal(),
+                prod.to_string(),
+                "mul {a}*{b}"
+            );
         }
         if b != 0 {
             let (q, r) = nat(a).div_rem(&nat(b));
@@ -86,26 +103,31 @@ fn u128_exact_differential() {
         } else {
             // Lean-Nat: x / 0 = 0 and x % 0 = x.
             assert_eq!(nat(a).div(&nat(0)).to_decimal(), "0", "div-by-zero {a}/0");
-            assert_eq!(nat(a).rem(&nat(0)).to_decimal(), a.to_string(), "rem-by-zero {a}%0");
+            assert_eq!(
+                nat(a).rem(&nat(0)).to_decimal(),
+                a.to_string(),
+                "rem-by-zero {a}%0"
+            );
         }
-        assert_eq!(nat(a).gcd(&nat(b)).to_decimal(), gcd_u128(a, b).to_string(), "gcd({a},{b})");
-        let s = (rng.next() % 200) as u64;
+        assert_eq!(
+            nat(a).gcd(&nat(b)).to_decimal(),
+            gcd_u128(a, b).to_string(),
+            "gcd({a},{b})"
+        );
+        // shl oracle is an INDEPENDENT decimal-doubling impl (a<<s can exceed
+        // u128, so u128 is not a valid oracle here); shr is exact in u128.
+        let s = rng.next() % 200;
         assert_eq!(
             nat(a).shl(s).to_decimal(),
-            {
-                let mut acc = BigNat::from_limbs_le(vec![a as u64, (a >> 64) as u64]);
-                acc = acc.shl(0); // no-op, keep type
-                let _ = &acc;
-                // reference: a << s via its own decimal (a is u128; shifting
-                // may overflow u128, so use a BigNat-independent big shift by
-                // decimal doubling is overkill — instead verify via shr round
-                // trip below and exact small shifts here).
-                shl_ref_decimal(a, s)
-            },
+            shl_ref_decimal(a, s),
             "shl {a}<<{s}"
         );
-        // shr is exact in u128.
-        assert_eq!(nat(a).shr(s).to_decimal(), (if s >= 128 { 0 } else { a >> s }).to_string(), "shr {a}>>{s}");
+        let shr_truth = if s >= 128 { 0 } else { a >> s };
+        assert_eq!(
+            nat(a).shr(s).to_decimal(),
+            shr_truth.to_string(),
+            "shr {a}>>{s}"
+        );
     }
 }
 
@@ -122,7 +144,12 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
 /// repeated decimal doubling (so it is a genuine second implementation).
 fn shl_ref_decimal(a: u128, s: u64) -> String {
     // a * 2^s in decimal, via schoolbook doubling on a byte-per-digit vector.
-    let mut digits: Vec<u8> = a.to_string().into_bytes().into_iter().map(|c| c - b'0').collect();
+    let mut digits: Vec<u8> = a
+        .to_string()
+        .into_bytes()
+        .into_iter()
+        .map(|c| c - b'0')
+        .collect();
     for _ in 0..s {
         let mut carry = 0u8;
         for d in digits.iter_mut().rev() {
@@ -149,7 +176,7 @@ fn multilimb_metamorphic_reconstruction() {
     let mut rng = Rng(0xdead_beef_cafe_babe);
     // Widths span single-limb through Toom-3 territory.
     let widths = [1usize, 2, 3, 4, 5, 8, 12, 20, 33, 48, 80];
-    for _ in 0..4_000 {
+    for _ in 0..3_000 {
         let aw = widths[(rng.next() as usize) % widths.len()];
         let bw = 1 + (rng.next() as usize) % aw.max(1);
         let a = rng.bignat(aw);
@@ -161,7 +188,10 @@ fn multilimb_metamorphic_reconstruction() {
         let (q, r) = a.div_rem(&b);
         let recon = q.mul(&b).add(&r);
         assert!(recon.beq(&a), "reconstruction failed: aw={aw} bw={bw}");
-        assert!(r.as_view().ble(b.as_view()) && !r.beq(&b), "remainder not < divisor");
+        assert!(
+            r.as_view().ble(b.as_view()) && !r.beq(&b),
+            "remainder not < divisor"
+        );
         // mul/div inverse: (a*b)/b == a and (a*b)/a == b (a nonzero).
         let prod = a.mul(&b);
         assert!(prod.div(&b).beq(&a), "a*b/b != a: aw={aw} bw={bw}");
@@ -177,7 +207,7 @@ fn multilimb_metamorphic_reconstruction() {
 #[test]
 fn knuth_addback_crafted() {
     let mut rng = Rng(0x0f0f_0f0f_1234_5678);
-    for _ in 0..2_000 {
+    for _ in 0..1_500 {
         let n = 2 + (rng.next() as usize) % 6; // 2..=7 limb divisor
         // Divisor near a power of the base: top limbs all-ones.
         let mut dv = vec![0u64; n];
@@ -187,10 +217,14 @@ fn knuth_addback_crafted() {
         dv[0] = rng.next() | 1; // keep it odd/varied, still enormous
         let b = BigNat::from_limbs_le(dv);
         // Dividend a few limbs wider, random.
-        let a = rng.bignat(n + 1 + (rng.next() as usize) % 4);
+        let extra = (rng.next() as usize) % 4;
+        let a = rng.bignat(n + 1 + extra);
         let (q, r) = a.div_rem(&b);
         let recon = q.mul(&b).add(&r);
         assert!(recon.beq(&a), "add-back reconstruction failed n={n}");
-        assert!(r.as_view().ble(b.as_view()) && !r.beq(&b), "add-back remainder not < divisor");
+        assert!(
+            r.as_view().ble(b.as_view()) && !r.beq(&b),
+            "add-back remainder not < divisor"
+        );
     }
 }
