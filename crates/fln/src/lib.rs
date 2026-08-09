@@ -159,20 +159,52 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        if sources.is_empty() {
+        self.execute_batch(sources.len(), options, |engine, index| {
+            engine.execute_nat_definition(sources[index], options, limits)
+        })
+    }
+
+    /// Execute a nonempty sequence of already-elaborated definitions atomically.
+    ///
+    /// This is the reusable project-sized door over [`Self::execute_definition`]:
+    /// each declaration is admitted, published, compiled, and executed against
+    /// the preceding immutable successor. A refusal or non-answer exposes no
+    /// batch successor, while a completed result carries every root transition
+    /// and the final queryable environment.
+    pub fn execute_definitions(
+        &self,
+        declarations: &[Declaration],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+        self.execute_batch(declarations.len(), options, |engine, index| {
+            engine.execute_definition(declarations[index].clone(), options, limits)
+        })
+    }
+
+    fn execute_batch<F>(
+        &self,
+        command_count: usize,
+        options: &KVMap,
+        mut execute: F,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError>
+    where
+        F: FnMut(&Engine, usize) -> Result<Outcome<DefinitionExecution>, EngineExecutionError>,
+    {
+        if command_count == 0 {
             return Err(EngineExecutionError::EmptyBatch);
         }
         let mut executions = Vec::new();
-        executions.try_reserve_exact(sources.len()).map_err(|_| {
+        executions.try_reserve_exact(command_count).map_err(|_| {
             EngineExecutionError::AllocationFailure {
                 resource: "definition batch results",
-                requested: sources.len(),
+                requested: command_count,
             }
         })?;
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
-        for (index, source) in sources.iter().enumerate() {
-            let execution = match engine.execute_nat_definition(source, options, limits) {
+        for index in 0..command_count {
+            let execution = match execute(&engine, index) {
                 Ok(Outcome::Complete(execution)) => execution,
                 Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
                 Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
@@ -628,7 +660,7 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
 }
 
-/// The authoritative result of one atomic nonempty source batch.
+/// The authoritative result of one atomic nonempty definition batch.
 #[derive(Debug)]
 pub struct DefinitionBatchExecution {
     /// The immutable snapshot containing every published definition.
@@ -637,7 +669,7 @@ pub struct DefinitionBatchExecution {
     pub base_logical_root: LogicalRoot,
     /// The final environment identity under the same options.
     pub result_logical_root: LogicalRoot,
-    /// Every completed command in source order, including its root transition.
+    /// Every completed definition in input order, including its root transition.
     pub executions: Vec<DefinitionExecution>,
 }
 
@@ -1113,6 +1145,109 @@ mod tests {
             panic!("the checked function application must return normally");
         };
         assert_eq!(returned.value.unbox(), 17);
+    }
+
+    #[test]
+    fn checked_definition_batch_publishes_a_function_and_dependent_call_atomically() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let identity_name = Name::from_components(["identity"]);
+        let declarations = [
+            nat_identity_definition("identity"),
+            definition(
+                "answer",
+                Expr::app(
+                    Expr::const_(identity_name.clone(), Vec::new()),
+                    Expr::lit(Literal::Nat(NatLit::from_u64(42))),
+                ),
+            ),
+        ];
+        let completed = engine
+            .execute_definitions(&declarations, &options, test_limits())
+            .expect("the elaborated project uses the checked batch door");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the small checked project must answer completely");
+        };
+
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(completed.engine.environment().len(), 3);
+        assert_eq!(completed.base_logical_root, engine.logical_root(&options));
+        assert_eq!(
+            completed.executions[0].result_logical_root,
+            completed.executions[1].base_logical_root
+        );
+        assert!(completed.engine.environment().contains(&identity_name));
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+        let VmExit::Returned(returned) = &completed.executions[1].exit else {
+            panic!("the dependent checked definition must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
+        assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn checked_definition_batch_hides_partial_progress_and_recovers_after_refusal() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let empty: [Declaration; 0] = [];
+        assert_eq!(
+            engine
+                .execute_definitions(&empty, &options, test_limits())
+                .expect_err("an empty elaborated project is not a successful batch"),
+            EngineExecutionError::EmptyBatch
+        );
+
+        let postulate_name = Name::from_components(["postulate"]);
+        let declarations = [
+            definition("answer", Expr::lit(Literal::Nat(NatLit::from_u64(42)))),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: postulate_name.clone(),
+                    level_params: Vec::new(),
+                    type_: nat_type(),
+                },
+                is_unsafe: false,
+            }),
+        ];
+        let error = engine
+            .execute_definitions(&declarations, &options, test_limits())
+            .expect_err("a declaration without executable content aborts the project");
+        assert!(matches!(
+            error,
+            EngineExecutionError::BatchCommand {
+                index: 1,
+                error,
+            } if matches!(
+                error.as_ref(),
+                EngineExecutionError::UnsupportedDeclaration { kind: "axiom" }
+            )
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(engine.environment().len(), 1);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+        assert!(!engine.environment().contains(&postulate_name));
+
+        let recovered = engine
+            .execute_definitions(&declarations[..1], &options, test_limits())
+            .expect("the original snapshot accepts a corrected retry");
+        let Outcome::Complete(recovered) = recovered else {
+            panic!("the corrected project must answer completely");
+        };
+        assert_eq!(recovered.engine.environment().len(), 2);
+        let VmExit::Returned(returned) = &recovered.executions[0].exit else {
+            panic!("the recovered checked definition must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 42);
     }
 
     #[test]
