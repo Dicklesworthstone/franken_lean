@@ -5051,6 +5051,14 @@ fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
     // stream falls back to the process stderr (the disclosed 7xe boundary);
     // and panic_messages=false silences both arms.
     crate::stdio::initialize_streams();
+    // The 8h backtrace block would append its lines to every capture below;
+    // suppressed via the pin's own env gate, exactly as the probe does.
+    // SAFETY: single-threaded under the suite lock.
+    // UNSAFE-LEDGER: FLN-UL-0532
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("LEAN_BACKTRACE", "0")
+    };
     let base = std::env::temp_dir().join(format!("fln-panic-stream-{}", std::process::id()));
 
     shadow::enable();
@@ -5140,6 +5148,12 @@ fn export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream() {
     }
     let (_events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "RC balance across the panic-stream cell");
+    // SAFETY: single-threaded under the suite lock.
+    // UNSAFE-LEDGER: FLN-UL-0533
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var("LEAN_BACKTRACE")
+    };
     std::fs::remove_file(&base).ok();
     crate::membrane::drain_small_bins_for_test();
 }

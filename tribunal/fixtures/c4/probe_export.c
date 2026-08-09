@@ -190,6 +190,21 @@ static void errstr_facts(const char *arm, lean_object *err) {
     lean_dec(s);
 }
 
+/* 8h fixture: counts deliveries and captures the SECOND one's sum. */
+static long long probe_bt_count = 0;
+static long long probe_bt_second_sum = 0;
+static lean_object *probe_bt_putstr(lean_object *s, lean_object *w) {
+    (void)w;
+    probe_bt_count++;
+    if (probe_bt_count == 2) {
+        probe_bt_second_sum =
+            bytesum(lean_string_cstr(s), lean_string_size(s) - 1) +
+            1000 * ((long long)lean_string_size(s) - 1);
+    }
+    lean_dec(s);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 /* 8g fixture: a foreign putStr closure capturing its delivered bytes. */
 static long long probe_foreign_sum = 0;
 static lean_object *probe_foreign_putstr(lean_object *s, lean_object *w) {
@@ -2163,6 +2178,22 @@ static void facts_mode(void) {
         lean_dec(lean_get_set_stderr(fold));
         unsetenv("LEAN_BACKTRACE");
         fact("corpus.sg.foreign_panic_sum", probe_foreign_sum);
+        /* The backtrace POSITIVE arm (8h): with the gate open, the second
+         * delivery through the applied closure is the "backtrace:" header
+         * on BOTH runtimes, followed by >0 address-dependent lines whose
+         * content is disclosed non-comparable. */
+        lean_object *bstream = lean_alloc_ctor(0, 6, 0);
+        for (int i = 0; i < 6; i++) {
+            lean_ctor_set(bstream, i,
+                          lean_alloc_closure((void *)probe_bt_putstr, 2, 0));
+        }
+        lean_object *bold = lean_get_set_stderr(bstream);
+        probe_bt_count = 0;
+        probe_bt_second_sum = 0;
+        lean_dec(lean_panic_fn(lean_box(0), lean_mk_string("bt-msg")));
+        lean_dec(lean_get_set_stderr(bold));
+        fact("corpus.sg.bt_second_is_header", probe_bt_second_sum);
+        fact("corpus.sg.bt_lines_follow", probe_bt_count > 2);
     }
     {
         char sg_path[128];
