@@ -4,11 +4,12 @@
 //! dataflow scheduler (plan §10, §4.3).
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
-//! end-to-end production seam: one parsed `def <ident> := <natural-literal>`
-//! becomes a real [`Declaration::Defn`] and is handed to Crucible's sole check
-//! authority. This is a subset of the final abstraction, not a substitute for
-//! unification, expected-type propagation, transactions, macros, instances, or
-//! tactics. Unsupported source is refused by an explicit variant.
+//! end-to-end production seam: one parsed
+//! `def <ident> := <natural-literal-or-ident>` becomes a real
+//! [`Declaration::Defn`] and is handed to Crucible's sole check authority. This
+//! is a subset of the final abstraction, not a substitute for unification,
+//! expected-type propagation, transactions, macros, instances, or tactics.
+//! Unsupported source is refused by an explicit variant.
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +32,7 @@ use fln_syntax::tree::Syntax;
 pub enum NatDefinitionElabError {
     UnexpectedSyntax { expected: &'static str },
     AnonymousDeclarationName,
+    AnonymousReferenceName,
     InvalidNaturalLiteral,
 }
 
@@ -164,10 +166,10 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
 /// Elaborate the exact canonical tree produced by
 /// [`fln_parse::parse_nat_definition`].
 ///
-/// This first slice has no expected-type input, so a natural literal synthesizes
-/// `Nat` directly. The caller's environment must already contain that constant;
-/// the kernel, not this function, determines whether the resulting declaration
-/// is admissible.
+/// This first slice has no expected-type input, so both a natural literal and a
+/// single constant reference synthesize `Nat` directly. The caller's
+/// environment must already contain those constants; the kernel, not this
+/// function, determines whether the resulting declaration is admissible.
 pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
@@ -230,18 +232,29 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         "Lean.Parser.Command.declValSimple",
     )?;
     expect_atom(&value[0], ":=", "definition assignment")?;
-    let numeral = expect_node(
-        &value[1],
-        &Name::str(Name::anonymous(), "num"),
-        1,
-        "natural numeral",
-    )?;
-    let Syntax::Atom { val: spelling, .. } = &numeral[0] else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "natural numeral atom",
-        });
+    let expression = match &value[1] {
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1 =>
+        {
+            let Syntax::Atom { val: spelling, .. } = &args[0] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "natural numeral atom",
+                });
+            };
+            Expr::lit(decode_natural(spelling)?)
+        }
+        Syntax::Ident { val: name, .. } => {
+            if name.is_anonymous() {
+                return Err(NatDefinitionElabError::AnonymousReferenceName);
+            }
+            Expr::const_(name.clone(), Vec::new())
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "natural literal or constant identifier",
+            });
+        }
     };
-    let literal = decode_natural(spelling)?;
 
     let termination = expect_node(
         &value[2],
@@ -263,14 +276,14 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
             level_params: Vec::new(),
             type_: Expr::const_(nat, Vec::new()),
         },
-        value: Expr::lit(literal),
+        value: expression,
         hints: ReducibilityHints::Regular(1),
         safety: DefinitionSafety::Safe,
         all: vec![name],
     }))
 }
 
-/// Parse, elaborate, and kernel-check one natural-literal definition.
+/// Parse, elaborate, and kernel-check one bounded Nat-valued definition.
 ///
 /// The kernel outcome crosses this boundary unchanged, including
 /// `Inconclusive` and `InternalFault` (FL-INV-07). No environment mutation is
@@ -331,6 +344,27 @@ mod tests {
             } if value == &NatLit::from_limbs_le(vec![0, 1])
         ));
         assert_eq!(result.parsed.reconstruct_original(), source);
+    }
+
+    #[test]
+    fn identifier_value_becomes_a_nat_typed_constant_reference() {
+        let parsed = parse_nat_definition(b"def copy := answer")
+            .expect("the bounded Nat reference grammar parses");
+        let declaration = elaborate_nat_definition(parsed.syntax())
+            .expect("the canonical identifier leaf elaborates");
+        let Declaration::Defn(definition) = declaration else {
+            panic!("the seed command must elaborate to a definition");
+        };
+        assert_eq!(definition.base.name.to_display_string(), "copy");
+        assert_eq!(
+            definition.base.type_,
+            Expr::const_(Name::from_components(["Nat"]), Vec::new())
+        );
+        assert!(matches!(
+            definition.value.node(),
+            ExprNode::Const { name, levels }
+                if name.to_display_string() == "answer" && levels.is_empty()
+        ));
     }
 
     #[test]

@@ -2,15 +2,19 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from either `def <identifier> := <natural-literal>` source or an already-
-//! elaborated definition through Crucible, the compiler's validated FIR and
-//! canonical FLBC, and Golem. The source path is deliberately the implemented
-//! grammar subset, not a claim of general Lean elaboration or Prelude support.
+//! from either `def <identifier> := <natural-literal-or-ident>` source or an
+//! already-elaborated definition through Crucible, the compiler's validated FIR
+//! and canonical FLBC, and Golem. The source path is deliberately the
+//! implemented grammar subset, not a claim of general Lean elaboration or
+//! Prelude support.
 
 #![forbid(unsafe_code)]
 
 pub use fln_comp::fir::LoweringError;
+use fln_comp::fir::ValueType;
+use fln_comp::flbc::CallableResultOwnership;
 pub use fln_comp::flbc::{CodecError, CodecLimits};
+use fln_comp::ingress::{FunctionBinding, IngressResource};
 pub use fln_comp::ingress::{IngressError, IngressLimits};
 use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, ExitClass,
@@ -22,6 +26,7 @@ pub use fln_core::name::Name;
 pub use fln_core::options::KVMap;
 pub use fln_core::outcome::Outcome;
 pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
+use fln_env::constants::ConstantInfo;
 pub use fln_env::constants::{
     AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
 };
@@ -34,6 +39,7 @@ use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 pub use fln_kernel::verdict::{Budget, RejectClass};
 pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
+use std::collections::BTreeSet;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +125,7 @@ impl Engine {
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
-    /// and execute one `def <identifier> := <natural-literal>` command.
+    /// and execute one bounded Nat-valued definition command.
     ///
     /// The publication council is explicitly empty because no independent
     /// checker is configured on this bounded facade yet. This is a real K1
@@ -194,9 +200,13 @@ impl Engine {
     ///
     /// This is the reusable engine seam behind [`Self::execute_nat_definition`].
     /// It accepts the compiler's substantially broader implemented closed-
-    /// expression subset rather than the seed parser's natural-literal subset.
-    /// Non-definition declarations are explicit refusals because they have no
-    /// executable body.
+    /// expression subset rather than the seed parser's literal-or-identifier
+    /// Nat-term subset.
+    /// References to closed, universe-free `Nat` definitions are compiled from
+    /// the exact bodies already published in the base environment. This is the
+    /// first environment-to-compiler catalog bridge; other runtime signatures
+    /// remain explicit compiler refusals. Non-definition declarations are
+    /// explicit refusals because they have no executable body.
     ///
     /// The publication council is still explicitly empty: this is real K1
     /// admission, not independent-checker consensus. Publication creates only a
@@ -272,8 +282,16 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let ingress = fln_comp::ingress::lower_closed_expr(&expression, limits.ingress)
+        let functions = executable_nat_dependencies(&self.environment, &expression, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
+        let ingress = fln_comp::ingress::lower_closed_expr_with_catalogs(
+            &expression,
+            &[],
+            &[],
+            &functions,
+            limits.ingress,
+        )
+        .map_err(EngineExecutionError::Ingress)?;
         let lowered =
             fln_comp::fir::lower_to_flbc(ingress.fir()).map_err(EngineExecutionError::Lowering)?;
         let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
@@ -296,6 +314,142 @@ impl Engine {
             exit,
         }))
     }
+}
+
+/// Derive the compiler catalog from declarations that already passed K1.
+///
+/// This deliberately supports one exact erased signature. A raw caller-supplied
+/// [`FunctionBinding`] would be able to replace a checked constant's body or lie
+/// about its runtime type; neither is an acceptable embeddable-engine boundary.
+fn executable_nat_dependencies(
+    environment: &Environment,
+    source: &Expr,
+    limits: IngressLimits,
+) -> Result<Vec<FunctionBinding>, IngressError> {
+    let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    let mut pending = BTreeSet::new();
+    let mut resolved = BTreeSet::new();
+    let mut visited_nodes = 0usize;
+    collect_executable_constants(source, &mut pending, &mut visited_nodes, limits)?;
+
+    let maximum_functions = limits.fir.max_functions.saturating_sub(1);
+    let mut functions = Vec::new();
+    while let Some(name) = pending.pop_first() {
+        if !resolved.insert(name.clone()) {
+            continue;
+        }
+        let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
+            continue;
+        };
+        if !definition.base.level_params.is_empty() || definition.base.type_ != nat_type {
+            continue;
+        }
+        let observed = functions.len().saturating_add(1);
+        if observed > maximum_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: maximum_functions,
+                observed,
+            });
+        }
+        functions
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: observed,
+            })?;
+        collect_executable_constants(&definition.value, &mut pending, &mut visited_nodes, limits)?;
+        functions.push(FunctionBinding {
+            name,
+            universe_arity: 0,
+            parameters: Vec::new(),
+            parameter_ownership: Vec::new(),
+            result: ValueType::Nat,
+            result_ownership: CallableResultOwnership::Scalar,
+            body: definition.value.clone(),
+        });
+    }
+    Ok(functions)
+}
+
+/// Find only constants in expression positions that compiler ingress evaluates.
+/// Type annotations remain source metadata on the currently implemented path.
+fn collect_executable_constants(
+    source: &Expr,
+    names: &mut BTreeSet<Name>,
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    use fln_core::expr::ExprNode;
+
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::PendingTasks,
+            requested: 1,
+        })?;
+    pending.push(source);
+    while let Some(expression) = pending.pop() {
+        let observed = visited_nodes.saturating_add(1);
+        if observed > limits.max_nodes {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: limits.max_nodes,
+                observed,
+            });
+        }
+        *visited_nodes = observed;
+        match expression.node() {
+            ExprNode::Const { name, .. } => {
+                names.insert(name.clone());
+            }
+            ExprNode::App { f, a } => {
+                pending
+                    .try_reserve(2)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::PendingTasks,
+                        requested: pending.len().saturating_add(2),
+                    })?;
+                pending.push(a);
+                pending.push(f);
+            }
+            ExprNode::Lam { body, .. } | ExprNode::ForallE { body, .. } => {
+                pending
+                    .try_reserve(1)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::PendingTasks,
+                        requested: pending.len().saturating_add(1),
+                    })?;
+                pending.push(body);
+            }
+            ExprNode::LetE { value, body, .. } => {
+                pending
+                    .try_reserve(2)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::PendingTasks,
+                        requested: pending.len().saturating_add(2),
+                    })?;
+                pending.push(body);
+                pending.push(value);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                pending
+                    .try_reserve(1)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::PendingTasks,
+                        requested: pending.len().saturating_add(1),
+                    })?;
+                pending.push(expr);
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 /// Independent caller-supplied bounds for every bounded stage of one execution.
@@ -449,8 +603,8 @@ impl std::error::Error for EngineExecutionError {
 mod tests {
     use super::{
         AxiomVal, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine,
-        EngineExecutionError, EngineExecutionLimits, Expr, KVMap, Level, Literal, Name, NatLit,
-        Outcome, ReducibilityHints, RejectClass,
+        EngineExecutionError, EngineExecutionLimits, Expr, IngressError, IngressResource, KVMap,
+        Level, Literal, Name, NatLit, Outcome, ReducibilityHints, RejectClass,
     };
     use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
 
@@ -620,6 +774,68 @@ mod tests {
     }
 
     #[test]
+    fn checked_nat_dependencies_compile_from_the_published_environment_and_recover_after_refusal() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let answer = engine
+            .execute_nat_definition(b"def answer := 41", &options, test_limits())
+            .expect("the dependency is checked and published first");
+        let Outcome::Complete(answer) = answer else {
+            panic!("the small bounded run must answer completely");
+        };
+
+        let answer_name = Name::from_components(["answer"]);
+        let copy_name = Name::from_components(["copy"]);
+        let copy = definition("copy", Expr::const_(answer_name, Vec::new()));
+        let before_refusal = answer.engine.logical_root(&options);
+        let mut constrained = test_limits();
+        constrained.ingress.fir.max_functions = 1;
+        let error = answer
+            .engine
+            .execute_definition(copy.clone(), &options, constrained)
+            .expect_err("the entry-only FIR bound cannot admit one dependency");
+        assert_eq!(
+            error,
+            EngineExecutionError::Ingress(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: 0,
+                observed: 1,
+            })
+        );
+        assert_eq!(answer.engine.logical_root(&options), before_refusal);
+        assert!(!answer.engine.environment().contains(&copy_name));
+
+        let copied = answer
+            .engine
+            .execute_definition(copy, &options, test_limits())
+            .expect("retrying with a sufficient bound compiles the checked dependency");
+        let Outcome::Complete(copied) = copied else {
+            panic!("the checked dependency run must answer completely");
+        };
+        let VmExit::Returned(returned) = &copied.exit else {
+            panic!("the checked dependency must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 41);
+
+        let chained = copied
+            .engine
+            .execute_definition(
+                definition("again", Expr::const_(copy_name, Vec::new())),
+                &options,
+                test_limits(),
+            )
+            .expect("transitive checked dependencies form a complete compiler catalog");
+        let Outcome::Complete(chained) = chained else {
+            panic!("the transitive dependency run must answer completely");
+        };
+        let VmExit::Returned(returned) = chained.exit else {
+            panic!("the transitive checked dependency must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 41);
+        assert_eq!(chained.engine.environment().len(), 4);
+    }
+
+    #[test]
     fn checked_definition_ingress_refuses_non_executable_declarations_atomically() {
         let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
         let options = KVMap::new();
@@ -678,7 +894,7 @@ mod tests {
     fn bounded_source_batch_chains_real_root_transitions_in_order() {
         let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
         let options = KVMap::new();
-        let sources: [&[u8]; 2] = [b"def first := 1", b"def second := 2"];
+        let sources: [&[u8]; 2] = [b"def first := 1", b"def second := first"];
         let completed = engine
             .execute_nat_definitions(&sources, &options, test_limits())
             .expect("both supported commands execute");
@@ -698,9 +914,9 @@ mod tests {
             completed.engine.logical_root(&options)
         );
         let VmExit::Returned(returned) = &completed.executions[1].exit else {
-            panic!("the second literal definition must return normally");
+            panic!("the dependent second definition must return normally");
         };
-        assert_eq!(returned.value.unbox(), 2);
+        assert_eq!(returned.value.unbox(), 1);
     }
 
     #[test]

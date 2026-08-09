@@ -5,8 +5,8 @@
 //! The general Pratt/category machinery lives in the modules below. The
 //! [`parse_nat_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` (bead `fln-5720`) and accepts
-//! exactly `def <ident> := <natural-literal>`. It uses the same source view,
-//! lexer, attachment, and canonical `Syntax` shape as the general engine.
+//! exactly `def <ident> := <natural-literal-or-ident>`. It uses the same source
+//! view, lexer, attachment, and canonical `Syntax` shape as the general engine.
 //! Being outside this seed grammar is a typed refusal, not a claim that the
 //! source is invalid Lean.
 
@@ -44,7 +44,7 @@ pub enum NatDefinitionExpectation {
     DefinitionKeyword,
     DeclarationIdentifier,
     Assignment,
-    NaturalLiteral,
+    NaturalValue,
     EndOfCommand,
 }
 
@@ -130,7 +130,7 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
 /// Parse the first production command subset:
 ///
 /// ```text
-/// def <identifier> := <natural-literal>
+/// def <identifier> := <natural-literal-or-identifier>
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -188,11 +188,11 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     }
     if !matches!(
         tokens.get(3).map(|token| &token.kind),
-        Some(TokenKind::Literal(LiteralKind::Nat))
+        Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
     ) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(&view, &tokens, 3),
-            expected: NatDefinitionExpectation::NaturalLiteral,
+            expected: NatDefinitionExpectation::NaturalValue,
         });
     }
     if tokens.len() != 4 {
@@ -207,7 +207,7 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     let definition_keyword = leaves.leaf(0)?;
     let declaration_name = leaves.leaf(1)?;
     let assignment = leaves.leaf(2)?;
-    let literal = leaves.leaf(3)?;
+    let value = leaves.leaf(3)?;
 
     let modifiers = Syntax::node(
         parser_kind(&["Command", "declModifiers"]),
@@ -229,14 +229,20 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
-    let numeral = Syntax::node(Name::str(Name::anonymous(), "num"), vec![literal]);
+    let value = match &tokens[3].kind {
+        TokenKind::Literal(LiteralKind::Nat) => {
+            Syntax::node(Name::str(Name::anonymous(), "num"), vec![value])
+        }
+        TokenKind::Ident(_) => value,
+        _ => unreachable!("the seed grammar checked the value token"),
+    };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
     );
     let declaration_value = Syntax::node(
         parser_kind(&["Command", "declValSimple"]),
-        vec![assignment, numeral, termination, null_node(Vec::new())],
+        vec![assignment, value, termination, null_node(Vec::new())],
     );
     let definition = Syntax::node(
         parser_kind(&["Command", "definition"]),
@@ -283,6 +289,33 @@ mod nat_definition_tests {
         );
         assert_eq!(parsed.reconstruct_original(), source);
         assert_eq!(parsed.source_view().removed_count(), 1);
+    }
+
+    #[test]
+    fn command_slice_retains_an_identifier_value_as_the_canonical_leaf() {
+        let source = b"def copy := answer";
+        let parsed = parse_nat_definition(source).expect("the seed Nat reference parses");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        assert!(matches!(
+            &value[1],
+            Syntax::Ident { val, .. } if val.to_display_string() == "answer"
+        ));
     }
 
     #[test]
