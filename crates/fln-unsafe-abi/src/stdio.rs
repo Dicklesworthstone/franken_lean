@@ -71,6 +71,9 @@ unsafe extern "C" {
     fn strerror(errnum: c_int) -> *const c_char;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn exit(code: c_int) -> !;
+    fn backtrace(buf: *mut *mut c_void, size: c_int) -> c_int;
+    fn backtrace_symbols(buf: *const *mut c_void, size: c_int) -> *mut *mut c_char;
+    fn free(p: *mut c_void);
     fn frexp(x: f64, exp: *mut c_int) -> f64;
     fn frexpf(x: f32, exp: *mut c_int) -> f32;
     fn scalbn(x: f64, n: c_int) -> f64;
@@ -779,6 +782,45 @@ pub(crate) fn libm_scalbn(x: f64, n: i32) -> f64 {
 pub(crate) fn libm_scalbnf(x: f32, n: i32) -> f32 {
     // SAFETY: pure scalar call.
     unsafe { scalbnf(x, n) }
+}
+
+/// `print_backtrace`'s capture half (`object.cpp:143-165`): glibc
+/// backtrace(3) over a 100-frame buffer, symbolized, each line answered to
+/// the caller for routing through the panic arm chooser; the 100-frame
+/// truncation sentinel "..." is the pin's own. The pin additionally filters
+/// lines through the Lean-compiled `lean_demangle_bt_line_cstr` unless
+/// LEAN_BACKTRACE_RAW — ours emits the raw symbolized lines always, a
+/// DISCLOSED format divergence subsumed by the larger one: backtrace line
+/// CONTENT is address-dependent and differs even between the pin's own
+/// runs, so only the block's STRUCTURE (header, env gates, per-line stream
+/// routing) is cross-runtime bindable, and the corpus binds exactly that.
+// UNSAFE-LEDGER: FLN-UL-0531
+#[allow(unsafe_code)]
+pub(crate) fn backtrace_lines() -> Vec<Vec<u8>> {
+    // SAFETY: fixed-size frame buffer; symbols is a malloc'd array of
+    // NUL-terminated lines freed once after copying, per man backtrace.
+    unsafe {
+        let mut buf = [core::ptr::null_mut::<c_void>(); 100];
+        let n = backtrace(buf.as_mut_ptr(), 100);
+        let symbols = backtrace_symbols(buf.as_ptr(), n);
+        let mut out = Vec::new();
+        if symbols.is_null() {
+            return out;
+        }
+        for i in 0..n as usize {
+            let p = *symbols.add(i);
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            out.push(core::slice::from_raw_parts(p.cast::<u8>(), len).to_vec());
+        }
+        free(symbols.cast::<c_void>());
+        if n as usize == 100 {
+            out.push(b"...".to_vec());
+        }
+        out
+    }
 }
 
 /// `lean_io_exit` (`io.cpp:1594-1596`): `exit(code)` — atexit handlers run
