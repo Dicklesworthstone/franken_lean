@@ -366,6 +366,25 @@ fn golden_correctly_rounded() {
         ("sin", m::sin, 0x43ab_c16d_674e_c800, 0xbfef_c667_98d0_5d2e),
         ("sin", m::sin, 0x430c_6bf5_2634_0000, 0x3feb_76f8_8136_ceba),
         ("sin", m::sin, 0x437b_69b3_6eca_4580, 0xbfe2_e753_48bc_f28a),
+        // Overflow/underflow boundaries the -50..50 / -700..700 sweeps skip:
+        // exp just below DBL_MAX, exp underflowing to the smallest subnormal
+        // (0x1), and sinh/cosh near their own overflow. Truth via Decimal.exp.
+        ("exp", m::exp, 0x4086_2800_0000_0000, 0x7fdd_422d_2be5_dc9b),
+        ("exp", m::exp, 0x4086_2d99_9999_999a, 0x7fed_75ae_7a50_ee14),
+        ("exp", m::exp, 0xc087_4800_0000_0000, 0x0000_0000_0000_0001),
+        ("exp", m::exp, 0xc085_e000_0000_0000, 0x00d1_4f2b_0fb9_307f),
+        (
+            "sinh",
+            m::sinh,
+            0x4086_3000_0000_0000,
+            0x7fe3_e21a_4645_07f9,
+        ),
+        (
+            "cosh",
+            m::cosh,
+            0x4086_3000_0000_0000,
+            0x7fe3_e21a_4645_07f9,
+        ),
         (
             "atanh",
             m::atanh,
