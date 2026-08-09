@@ -5,9 +5,9 @@
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed
-//! `def <ident> := <natural-literal-or-ident>` becomes a real
-//! [`Declaration::Defn`] and is handed to Crucible's sole check authority. This
-//! is a subset of the final abstraction, not a substitute for unification,
+//! bounded Nat definition or first-order application becomes a real
+//! [`Declaration::Defn`] and is handed to Crucible's sole check authority.
+//! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
 
@@ -166,10 +166,11 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
 /// Elaborate the exact canonical tree produced by
 /// [`fln_parse::parse_nat_definition`].
 ///
-/// This first slice has no expected-type input, so both a natural literal and a
-/// single constant reference synthesize `Nat` directly. The caller's
-/// environment must already contain those constants; the kernel, not this
-/// function, determines whether the resulting declaration is admissible.
+/// This first slice has no expected-type input. It constructs only natural
+/// literals, constant references, and the parser's flat first-order application
+/// spine, then declares the result as `Nat`. The caller's environment must
+/// already contain those constants; the kernel, not this function, determines
+/// whether the function and arguments make the declaration admissible.
 pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
@@ -232,29 +233,7 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         "Lean.Parser.Command.declValSimple",
     )?;
     expect_atom(&value[0], ":=", "definition assignment")?;
-    let expression = match &value[1] {
-        Syntax::Node { kind, args, .. }
-            if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1 =>
-        {
-            let Syntax::Atom { val: spelling, .. } = &args[0] else {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "natural numeral atom",
-                });
-            };
-            Expr::lit(decode_natural(spelling)?)
-        }
-        Syntax::Ident { val: name, .. } => {
-            if name.is_anonymous() {
-                return Err(NatDefinitionElabError::AnonymousReferenceName);
-            }
-            Expr::const_(name.clone(), Vec::new())
-        }
-        _ => {
-            return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "natural literal or constant identifier",
-            });
-        }
-    };
+    let expression = elaborate_nat_term(&value[1])?;
 
     let termination = expect_node(
         &value[2],
@@ -281,6 +260,75 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         safety: DefinitionSafety::Safe,
         all: vec![name],
     }))
+}
+
+fn elaborate_nat_atom(syntax: &Syntax) -> Result<Expr, NatDefinitionElabError> {
+    Ok(match syntax {
+        Syntax::Node { kind, args, .. }
+            if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1 =>
+        {
+            let Syntax::Atom { val: spelling, .. } = &args[0] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "natural numeral atom",
+                });
+            };
+            Expr::lit(decode_natural(spelling)?)
+        }
+        Syntax::Ident { val: name, .. } => {
+            if name.is_anonymous() {
+                return Err(NatDefinitionElabError::AnonymousReferenceName);
+            }
+            Expr::const_(name.clone(), Vec::new())
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "natural literal or constant identifier",
+            });
+        }
+    })
+}
+
+fn elaborate_nat_term(syntax: &Syntax) -> Result<Expr, NatDefinitionElabError> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return elaborate_nat_atom(syntax);
+    };
+    if kind != &parser_kind(&["Term", "app"]) {
+        return elaborate_nat_atom(syntax);
+    }
+    if args.len() != 2 {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "Lean.Parser.Term.app",
+        });
+    }
+    let Syntax::Ident { val: function, .. } = &args[0] else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "application function identifier",
+        });
+    };
+    if function.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousReferenceName);
+    }
+    let Syntax::Node {
+        kind: argument_kind,
+        args: arguments,
+        ..
+    } = &args[1]
+    else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "nonempty application argument array",
+        });
+    };
+    if argument_kind != &Name::str(Name::anonymous(), "null") || arguments.is_empty() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "nonempty application argument array",
+        });
+    }
+
+    let mut expression = Expr::const_(function.clone(), Vec::new());
+    for argument in arguments {
+        expression = Expr::app(expression, elaborate_nat_atom(argument)?);
+    }
+    Ok(expression)
 }
 
 /// Parse, elaborate, and kernel-check one bounded Nat-valued definition.
@@ -368,6 +416,25 @@ mod tests {
     }
 
     #[test]
+    fn first_order_application_preserves_function_and_argument_order() {
+        let parsed = parse_nat_definition(b"def selected := first 17 29")
+            .expect("the bounded Nat application grammar parses");
+        let declaration = elaborate_nat_definition(parsed.syntax())
+            .expect("the canonical application node elaborates");
+        let Declaration::Defn(definition) = declaration else {
+            panic!("the seed command must elaborate to a definition");
+        };
+        let expected = Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["first"]), Vec::new()),
+                Expr::lit(Literal::Nat(NatLit::from_u64(17))),
+            ),
+            Expr::lit(Literal::Nat(NatLit::from_u64(29))),
+        );
+        assert_eq!(definition.value, expected);
+    }
+
+    #[test]
     fn the_frontend_does_not_manufacture_the_nat_environment_or_a_verdict() {
         let result =
             check_nat_definition_source(b"def answer := 42", &Environment::new(), Budget::DEFAULT)
@@ -420,6 +487,15 @@ mod tests {
         assert!(matches!(
             elaborate_nat_definition(&Syntax::Missing),
             Err(NatDefinitionElabError::UnexpectedSyntax { .. })
+        ));
+        assert!(matches!(
+            elaborate_nat_term(&Syntax::node(
+                parser_kind(&["Term", "app"]),
+                Vec::new()
+            )),
+            Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "Lean.Parser.Term.app"
+            })
         ));
         for malformed in ["", "_1", "1_", "0x", "0x1_", "0b2"] {
             assert_eq!(
