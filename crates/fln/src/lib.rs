@@ -522,26 +522,69 @@ impl Engine {
         let parsed = fln_parse::parse_nat_definition(source)
             .map_err(NatDefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        self.execute_parsed_nat_definition(parsed, options, limits)
+    }
+
+    fn execute_parsed_nat_definition(
+        &self,
+        parsed: fln_parse::ParsedNatDefinition,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
         let declaration = fln_elab::elaborate_nat_definition(parsed.syntax())
             .map_err(NatDefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         self.execute_definition(declaration, options, limits)
     }
 
-    /// Execute a nonempty sequence of bounded source definitions atomically.
+    /// Execute the bounded Nat definitions in a nonempty sequence of source
+    /// files atomically.
     ///
-    /// Each command observes the immutable successor of the command before it.
-    /// A refusal or non-answer at any index returns no batch successor, so the
-    /// caller can only retain the original `self`. Completed per-command roots
-    /// remain in the successful result and form a checkable continuity chain.
+    /// Each file may contain one or more commands. The seed parser partitions
+    /// only on real `def` tokens, then parses every slice through its existing
+    /// single-command authority. Commands observe the immutable successor of the
+    /// command before them across file boundaries. A refusal or non-answer at any
+    /// flattened command index returns no batch successor, so the caller can only
+    /// retain the original `self`. Completed per-command roots remain in the
+    /// successful result and form a checkable continuity chain.
     pub fn execute_nat_definitions(
         &self,
         sources: &[&[u8]],
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_batch(sources.len(), options, |engine, index| {
-            engine.execute_nat_definition(sources[index], options, limits)
+        let mut commands = Vec::new();
+        for source in sources {
+            let partitioned =
+                fln_parse::partition_nat_definition_commands(source).map_err(|error| {
+                    EngineExecutionError::BatchCommand {
+                        index: commands.len(),
+                        error: Box::new(EngineExecutionError::Frontend(
+                            NatDefinitionFrontendError::Parse(error),
+                        )),
+                    }
+                })?;
+            let requested = commands.len().checked_add(partitioned.len()).ok_or(
+                EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested: usize::MAX,
+                },
+            )?;
+            commands.try_reserve(partitioned.len()).map_err(|_| {
+                EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested,
+                }
+            })?;
+            commands.extend(partitioned);
+        }
+        self.execute_batch(commands.len(), options, |engine, index| {
+            let (original_offset, source) = commands[index];
+            let parsed = fln_parse::parse_nat_definition(source)
+                .map_err(|error| error.with_original_offset(original_offset))
+                .map_err(NatDefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend)?;
+            engine.execute_parsed_nat_definition(parsed, options, limits)
         })
     }
 
@@ -1757,11 +1800,12 @@ mod tests {
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
-        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit,
-        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanRebuildError,
-        OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome, ReducibilityHints, RejectClass,
-        TheoremVal, VmExecutionLimits, decode_olean_artifact, execute_flbc_artifact,
-        execute_golem_with_options, rebuild_olean_artifact,
+        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name,
+        NatDefinitionFrontendError, NatLit, OleanDeclarationError, OleanDecodeError,
+        OleanDecodeLimits, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal,
+        Outcome, ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits,
+        decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
+        rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -3194,6 +3238,63 @@ mod tests {
             panic!("the dependent second definition must return normally");
         };
         assert_eq!(returned.value.unbox(), 1);
+    }
+
+    #[test]
+    fn bounded_source_batch_flattens_multiple_commands_in_one_file() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let sources: [&[u8]; 1] = [
+            b"-- def hidden\r\ndef first (x y : Nat) : Nat := x\r\ndef selected : Nat := first 17 29",
+        ];
+        let completed = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect("both commands in the file execute");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the bounded source file must answer completely");
+        };
+
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(completed.engine.environment().len(), 3);
+        assert_eq!(
+            completed.executions[0].result_logical_root,
+            completed.executions[1].base_logical_root
+        );
+        let VmExit::Returned(returned) = &completed.executions[1].exit else {
+            panic!("the dependent command must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 17);
+    }
+
+    #[test]
+    fn bounded_source_batch_rebases_later_parse_refusals_to_the_file() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let sources: [&[u8]; 1] = [b"def first := 1\r\ndef second : String := first"];
+        let error = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect_err("the unsupported second result type must abort the file");
+
+        assert!(matches!(
+            error,
+            EngineExecutionError::BatchCommand {
+                index: 1,
+                error,
+            } if matches!(
+                error.as_ref(),
+                EngineExecutionError::Frontend(NatDefinitionFrontendError::Parse(
+                    fln_parse::NatDefinitionParseError::OutsideSeedGrammar { at, .. }
+                )) if at.0 == 29
+            )
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(engine.environment().len(), 1);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["first"]))
+        );
     }
 
     #[test]

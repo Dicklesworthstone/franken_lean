@@ -103,6 +103,38 @@ impl std::fmt::Display for NatDefinitionParseError {
 
 impl std::error::Error for NatDefinitionParseError {}
 
+impl NatDefinitionParseError {
+    /// Rebase a command-local refusal into its containing source file.
+    ///
+    /// Partitioned commands are parsed as independent slices so their syntax
+    /// retains the existing single-command shape. This projection keeps every
+    /// source refusal in the original file's coordinate system. Internal syntax
+    /// construction faults carry no user-facing parser position and are retained
+    /// unchanged.
+    pub fn with_original_offset(self, offset: BytePos) -> Self {
+        let shifted = |at: BytePos| BytePos(at.0.saturating_add(offset.0));
+        match self {
+            Self::Source(SourceError::NotUtf8 { at }) => {
+                Self::Source(SourceError::NotUtf8 { at: shifted(at) })
+            }
+            Self::Lexical { diagnostics } => Self::Lexical {
+                diagnostics: diagnostics
+                    .into_iter()
+                    .map(|diagnostic| ParseDiagnostic {
+                        message: diagnostic.message,
+                        at: shifted(diagnostic.at),
+                    })
+                    .collect(),
+            },
+            Self::OutsideSeedGrammar { at, expected } => Self::OutsideSeedGrammar {
+                at: shifted(at),
+                expected,
+            },
+            Self::Build(error) => Self::Build(error),
+        }
+    }
+}
+
 impl From<BuildError> for NatDefinitionParseError {
     fn from(error: BuildError) -> Self {
         NatDefinitionParseError::Build(error)
@@ -172,6 +204,10 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
     Syntax::node(state::null_kind(), args)
 }
 
+fn nat_definition_token_table() -> TokenTable {
+    TokenTable::from_tokens(["def", "let", "(", ")", ":", ":=", ";"])
+}
+
 fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> BytePos {
     let in_view = tokens
         .get(index)
@@ -232,7 +268,7 @@ fn validate_flat_nat_term(
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = TokenTable::from_tokens(["def", "let", "(", ")", ":", ":=", ";"]);
+    let table = nat_definition_token_table();
     let run = lex_run(view.normalized(), &table);
     let diagnostics = run
         .diagnostics()
@@ -560,6 +596,63 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     })
 }
 
+/// Partition one source file into bounded Nat-definition command slices.
+///
+/// This is deliberately a lexical partition, not a second parser. In the seed
+/// grammar `def` cannot occur inside a definition body, while occurrences in
+/// comments remain trivia, so every `def` token after the first begins the next
+/// command. Each returned slice is still parsed independently by
+/// [`parse_nat_definition`], which remains the only acceptance authority.
+/// Boundaries are mapped back through [`SourceView`] before slicing, preserving
+/// original CRLF bytes exactly.
+///
+/// A file containing zero or one `def` token is returned as one slice, including
+/// an empty file. That keeps malformed or unsupported input on the parser's typed
+/// refusal path instead of misclassifying it as an empty batch.
+pub fn partition_nat_definition_commands(
+    source: &[u8],
+) -> Result<Vec<(BytePos, &[u8])>, NatDefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let table = nat_definition_token_table();
+    let run = lex_run(view.normalized(), &table);
+    let diagnostics = run
+        .diagnostics()
+        .into_iter()
+        .map(|(message, at)| ParseDiagnostic {
+            message,
+            at: view.to_original(at),
+        })
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+
+    let command_starts = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Token(LexedToken {
+                kind: TokenKind::Symbol(symbol),
+                extent,
+            }) if symbol == "def" => Some(view.to_original(extent.start()).0),
+            Event::Trivia(_) | Event::Refused { .. } | Event::Token(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if command_starts.len() <= 1 {
+        return Ok(vec![(BytePos(0), source)]);
+    }
+
+    let mut commands = Vec::with_capacity(command_starts.len());
+    let mut start = 0;
+    for next in command_starts.iter().copied().skip(1) {
+        commands.push((BytePos(start), &source[start..next]));
+        start = next;
+    }
+    commands.push((BytePos(start), &source[start..]));
+    Ok(commands)
+}
+
 #[cfg(test)]
 mod nat_definition_tests {
     use super::*;
@@ -583,6 +676,77 @@ mod nat_definition_tests {
         );
         assert_eq!(parsed.reconstruct_original(), source);
         assert_eq!(parsed.source_view().removed_count(), 1);
+    }
+
+    #[test]
+    fn file_partition_uses_real_def_tokens_and_preserves_original_bytes() {
+        let source =
+            b"-- def hidden\r\ndef first := 1\r\n/- def alsoHidden -/\r\ndef second := first";
+        let commands = partition_nat_definition_commands(source)
+            .expect("comments and CRLFs are valid in the bounded source file");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0, BytePos(0));
+        assert!(commands[0].1.ends_with(b"/- def alsoHidden -/\r\n"));
+        assert_eq!(commands[1].0, BytePos(53));
+        assert_eq!(commands[1].1, b"def second := first");
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|(_, command)| command.iter().copied())
+                .collect::<Vec<_>>(),
+            source
+        );
+        for (_, command) in commands {
+            parse_nat_definition(command).expect("each partition is one accepted command");
+        }
+    }
+
+    #[test]
+    fn file_partition_keeps_unsupported_single_commands_on_the_parser_path() {
+        let source = b"theorem answer : Nat := 42";
+        let commands = partition_nat_definition_commands(source)
+            .expect("lexically valid unsupported input still partitions");
+        assert_eq!(commands, vec![(BytePos(0), source.as_slice())]);
+        assert!(matches!(
+            parse_nat_definition(commands[0].1),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::DefinitionKeyword,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn file_partition_reports_lexical_positions_in_original_crlf_bytes() {
+        let source = b"def first := 1\r\ndef second := first\rbroken";
+        let error = partition_nat_definition_commands(source)
+            .expect_err("an isolated carriage return must remain a lexical refusal");
+        let NatDefinitionParseError::Lexical { diagnostics } = error else {
+            panic!("the isolated carriage return must be classified lexically");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].at, BytePos(35));
+        assert_eq!(source[diagnostics[0].at.0], b'\r');
+    }
+
+    #[test]
+    fn partitioned_refusals_rebase_to_the_original_file() {
+        let source = b"def first := 1\r\ndef second : String := first";
+        let commands = partition_nat_definition_commands(source)
+            .expect("the unsupported type remains lexically valid");
+        let (start, second) = commands[1];
+        let error = parse_nat_definition(second)
+            .expect_err("String is outside the bounded Nat grammar")
+            .with_original_offset(start);
+        assert!(matches!(
+            error,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(29),
+                expected: NatDefinitionExpectation::NaturalType,
+            }
+        ));
+        assert!(source[29..].starts_with(b"String"));
     }
 
     #[test]

@@ -55,7 +55,7 @@ const USAGE: &str = concat!(
     "semantics and requires byte identity with no codec findings. It is not\n",
     "fresh emission and does not kernel-check declarations.\n",
     "\n",
-    "`run` executes one supported Nat definition per path, in dependency order,\n",
+    "`run` executes supported Nat definitions from each path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
     "and Golem. The final path must produce the closed Nat result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. It is\n",
@@ -2007,6 +2007,20 @@ mod tests {
                 b"def first (x y : Nat) : Nat := x".to_vec(),
                 b"def selected : Nat := first 17 29".to_vec(),
             ],
+            true,
+        );
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"definitions\":2"));
+        assert!(output.stdout.contains("\"finalValue\":17"));
+        assert!(output.stdout.contains("\"authority\":true"));
+    }
+
+    #[test]
+    fn source_run_executes_dependent_commands_from_one_file() {
+        let output = execute_source_bytes(
+            vec![b"-- def hidden\r\ndef first (x y : Nat) : Nat := x\r\ndef selected : Nat := first 17 29".to_vec()],
             true,
         );
 
