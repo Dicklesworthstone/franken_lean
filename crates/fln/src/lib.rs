@@ -117,20 +117,29 @@ pub fn project_diagnostics(
 #[derive(Debug, Clone)]
 pub struct Engine {
     environment: Environment,
+    checker_environment: Option<CheckerConstantEnvironment>,
 }
 
 impl Engine {
     /// Attach the embeddable facade to an existing immutable environment
     /// produced by an importer, module transaction, or earlier engine session.
-    /// This performs no admission and grants no new authority.
+    /// This performs no admission and grants no new authority. The independent
+    /// checker projection is constructed lazily on the first execution because
+    /// this constructor intentionally accepts no resource budget.
     pub fn from_environment(environment: Environment) -> Self {
-        Self { environment }
+        Self {
+            environment,
+            checker_environment: None,
+        }
     }
 
     /// Construct the bounded natural-definition engine through the same kernel
     /// admission and publication capability used for ordinary declarations.
     pub fn with_nat_seed(budget: Budget) -> Result<Self, SeedEnvironmentError> {
-        fln_elab::seed::bootstrap_nat_environment(budget).map(|environment| Self { environment })
+        fln_elab::seed::bootstrap_nat_environment(budget).map(|environment| Self {
+            environment,
+            checker_environment: None,
+        })
     }
 
     /// The immutable environment snapshot against which the next declaration
@@ -307,8 +316,12 @@ impl Engine {
             }
         };
         let base_logical_root = self.logical_root(options);
-        let checker_review =
-            review_with_independent_checker(&self.environment, &declaration, limits.checker);
+        let checker_review = review_with_independent_checker(
+            &self.environment,
+            self.checker_environment.as_ref(),
+            &declaration,
+            limits.checker,
+        );
 
         let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
             Outcome::Complete(admitted) => admitted,
@@ -332,6 +345,12 @@ impl Engine {
                 .ok_or_else(|| EngineExecutionError::CheckerBridge {
                     detail: "the checker council agreed without an admission record".to_owned(),
                 })?;
+        let checker_environment = checker_review.successor_environment.ok_or_else(|| {
+            EngineExecutionError::CheckerBridge {
+                detail: "the checker council agreed without a retained successor environment"
+                    .to_owned(),
+            }
+        })?;
         let environment = match checked.publish(limits.declaration, limits.collisions, None) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
                 publication,
@@ -379,7 +398,10 @@ impl Engine {
         let result_logical_root = environment.logical_root(options);
 
         Ok(Outcome::Complete(DefinitionExecution {
-            engine: Engine { environment },
+            engine: Engine {
+                environment,
+                checker_environment: Some(checker_environment),
+            },
             declaration,
             base_logical_root,
             result_logical_root,
@@ -407,10 +429,15 @@ fn execute_golem_with_options(
 struct CheckerReview {
     council: Council,
     agreement: Option<CheckerAgreement>,
+    successor_environment: Option<CheckerConstantEnvironment>,
 }
 
 impl CheckerReview {
-    fn from_seat(verdict: SeatVerdict, agreement: Option<CheckerAgreement>) -> Self {
+    fn from_seat(
+        verdict: SeatVerdict,
+        agreement: Option<CheckerAgreement>,
+        successor_environment: Option<CheckerConstantEnvironment>,
+    ) -> Self {
         Self {
             council: Council::of(vec![Seat::new(
                 "fln-checker",
@@ -421,11 +448,12 @@ impl CheckerReview {
                 verdict,
             )]),
             agreement,
+            successor_environment,
         }
     }
 
     fn no_answer(reason: String) -> Self {
-        Self::from_seat(SeatVerdict::NoAnswer { reason }, None)
+        Self::from_seat(SeatVerdict::NoAnswer { reason }, None, None)
     }
 }
 
@@ -584,6 +612,7 @@ fn checker_environment(
 
 fn review_with_independent_checker(
     environment: &Environment,
+    retained_environment: Option<&CheckerConstantEnvironment>,
     declaration: &Declaration,
     limits: CheckerExecutionLimits,
 ) -> CheckerReview {
@@ -605,27 +634,49 @@ fn review_with_independent_checker(
             ));
         }
     };
-    let environment = match checker_environment(environment, limits) {
-        Ok(environment) => environment,
-        Err(detail) => {
-            return CheckerReview::no_answer(format!(
-                "base projection into fln-checker failed: {detail}"
-            ));
-        }
+    let environment = match retained_environment {
+        Some(environment) => environment.clone(),
+        None => match checker_environment(environment, limits) {
+            Ok(environment) => environment,
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "base projection into fln-checker failed: {detail}"
+                ));
+            }
+        },
     };
 
     match fln_checker::admit::admit(&environment, &candidate, limits.admission) {
-        CheckerVerdict::Admitted(admission) => CheckerReview::from_seat(
-            SeatVerdict::Agrees,
-            Some(CheckerAgreement {
+        CheckerVerdict::Admitted(admission) => {
+            let agreement = CheckerAgreement {
                 schema: admission.schema(),
                 ground: admission.ground(),
-            }),
-        ),
+            };
+            match environment.extend(candidate, limits.environment) {
+                CheckerEnvironmentOutcome::Complete {
+                    environment: successor,
+                    ..
+                } => {
+                    CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+                }
+                CheckerEnvironmentOutcome::Refused { refusal, .. } => CheckerReview::no_answer(
+                    format!("fln-checker refused candidate retention: {refusal:?}"),
+                ),
+                CheckerEnvironmentOutcome::Inconclusive(stop) => CheckerReview::no_answer(format!(
+                    "fln-checker could not retain the candidate: {stop:?}"
+                )),
+                CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
+                    CheckerReview::no_answer(format!(
+                        "fln-checker hit an internal fault while retaining the candidate: {fault:?}"
+                    ))
+                }
+            }
+        }
         CheckerVerdict::Rejected(rejection) => CheckerReview::from_seat(
             SeatVerdict::Disagrees {
                 detail: format!("fln-checker rejected the declaration: {rejection:?}"),
             },
+            None,
             None,
         ),
         CheckerVerdict::Deferred(requirement) => CheckerReview::no_answer(format!(
@@ -1363,6 +1414,67 @@ mod tests {
                 .engine
                 .environment()
                 .contains(&Name::from_components(["answer"]))
+        );
+    }
+
+    #[test]
+    fn retained_checker_projection_advances_under_a_single_candidate_budget() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let answer = engine
+            .execute_nat_definition(b"def answer := 41", &options, test_limits())
+            .expect("the first definition establishes the retained checker projection");
+        let Outcome::Complete(answer) = answer else {
+            panic!("the small bounded run must answer completely");
+        };
+
+        let mut candidate_only = test_limits();
+        candidate_only.checker.environment = fln_checker::environment::EnvironmentBudget::new(
+            u64::MAX,
+            1,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
+        let answer_name = Name::from_components(["answer"]);
+        let copy_name = Name::from_components(["copy"]);
+        let copied = answer
+            .engine
+            .execute_definition(
+                definition("copy", Expr::const_(answer_name.clone(), Vec::new())),
+                &options,
+                candidate_only,
+            )
+            .expect("a retained base leaves the one-constant budget for the candidate");
+        let Outcome::Complete(copied) = copied else {
+            panic!("the retained checker projection must answer completely");
+        };
+        assert!(copied.engine.environment().contains(&copy_name));
+        let VmExit::Returned(returned) = copied.exit else {
+            panic!("the checked dependency must execute after retained admission");
+        };
+        assert_eq!(returned.value.unbox(), 41);
+
+        let uncached = Engine::from_environment(answer.engine.environment().clone());
+        let before = uncached.logical_root(&options);
+        let error = uncached
+            .execute_definition(
+                definition("uncached", Expr::const_(answer_name, Vec::new())),
+                &options,
+                candidate_only,
+            )
+            .expect_err("the same budget cannot reconstruct a two-constant base");
+        assert!(matches!(
+            error,
+            EngineExecutionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert_eq!(uncached.logical_root(&options), before);
+        assert!(
+            !uncached
+                .environment()
+                .contains(&Name::from_components(["uncached"]))
         );
     }
 

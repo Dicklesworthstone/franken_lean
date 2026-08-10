@@ -354,10 +354,8 @@ fn persistent_extension_charges_only_the_candidate_and_preserves_both_snapshots(
         vec![candidate.clone()],
         EnvironmentBudget::unlimited(),
     ));
-    let (extended, extension_progress) = complete(base.extend(
-        candidate.clone(),
-        exact_budget(candidate_progress),
-    ));
+    let (extended, extension_progress) =
+        complete(base.extend(candidate.clone(), exact_budget(candidate_progress)));
 
     assert_eq!(extension_progress, candidate_progress);
     assert_eq!(base.len(), 2, "extension cannot mutate the base snapshot");
@@ -372,10 +370,13 @@ fn persistent_extension_charges_only_the_candidate_and_preserves_both_snapshots(
     );
 
     assert!(matches!(
-        base.extend(candidate.clone(), EnvironmentBudget {
-            max_constants: 0,
-            ..exact_budget(candidate_progress)
-        }),
+        base.extend(
+            candidate.clone(),
+            EnvironmentBudget {
+                max_constants: 0,
+                ..exact_budget(candidate_progress)
+            }
+        ),
         EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
             limit: EnvironmentLimit::Constants,
             allowed: 0,

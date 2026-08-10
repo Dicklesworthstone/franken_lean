@@ -1195,6 +1195,69 @@ mod tests {
         )
     }
 
+    fn named_entry(name: &str) -> ConstantEntry {
+        let name = WireName::from_parts(vec![NamePart::Text(name.to_owned())]);
+        ConstantEntry::new(
+            name,
+            ConstantDeclaration::header(
+                Vec::new(),
+                leaf(),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        )
+    }
+
+    fn declaration_arc(
+        environment: &ConstantEnvironment,
+        name: &WireName,
+    ) -> Arc<ConstantDeclaration> {
+        let mut current = environment.constants.as_deref();
+        while let Some(node) = current {
+            match name.cmp(&node.name) {
+                std::cmp::Ordering::Less => current = node.left.as_deref(),
+                std::cmp::Ordering::Greater => current = node.right.as_deref(),
+                std::cmp::Ordering::Equal => return Arc::clone(&node.declaration),
+            }
+        }
+        panic!("test fixture constant was not retained")
+    }
+
+    #[test]
+    fn extension_structurally_shares_every_retained_declaration() {
+        let EnvironmentOutcome::Complete {
+            environment: base, ..
+        } = ConstantEnvironment::build(
+            vec![
+                named_entry("alpha"),
+                named_entry("middle"),
+                named_entry("zeta"),
+            ],
+            EnvironmentBudget::unlimited(),
+        )
+        else {
+            panic!("the valid base fixture must build");
+        };
+        let retained = ["alpha", "middle", "zeta"].map(|name| {
+            let name = WireName::from_parts(vec![NamePart::Text(name.to_owned())]);
+            (name.clone(), declaration_arc(&base, &name))
+        });
+        let EnvironmentOutcome::Complete {
+            environment: extended,
+            ..
+        } = base.extend(named_entry("omega"), EnvironmentBudget::unlimited())
+        else {
+            panic!("the valid extension fixture must build");
+        };
+
+        for (name, before) in retained {
+            let after = declaration_arc(&extended, &name);
+            assert!(Arc::ptr_eq(&before, &after));
+        }
+        assert_eq!(base.len(), 3);
+        assert_eq!(extended.len(), 4);
+    }
+
     #[test]
     fn private_type_and_value_corruption_are_distinct_faults_and_recovery_is_exact() {
         let root = ExprId::from_index(0).expect("zero is a valid expression index");
