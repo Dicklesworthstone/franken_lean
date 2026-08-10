@@ -238,7 +238,6 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         "bounded Nat declaration signature",
     )?;
     let binders = expect_null_args(&signature[0], "explicit Nat binder array")?;
-    expect_empty_null(&signature[1], "absent explicit result type")?;
     let mut parameters = Vec::new();
     for binder in binders {
         let parts = expect_node(
@@ -248,14 +247,11 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
             "Lean.Parser.Term.explicitBinder",
         )?;
         expect_atom(&parts[0], "(", "explicit binder opener")?;
-        let names = expect_null_args(&parts[1], "single explicit binder identifier")?;
-        let [Syntax::Ident { val: parameter, .. }] = names else {
+        let names = expect_null_args(&parts[1], "nonempty explicit binder identifiers")?;
+        if names.is_empty() {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "single explicit binder identifier",
+                expected: "nonempty explicit binder identifiers",
             });
-        };
-        if parameter.is_anonymous() {
-            return Err(NatDefinitionElabError::AnonymousReferenceName);
         }
         let type_spec = expect_null_args(&parts[2], "explicit Nat binder type")?;
         let [
@@ -278,7 +274,48 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         }
         expect_empty_null(&parts[3], "absent explicit binder default")?;
         expect_atom(&parts[4], ")", "explicit binder closer")?;
-        parameters.push(parameter.clone());
+        for name in names {
+            let Syntax::Ident { val: parameter, .. } = name else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "explicit binder identifier",
+                });
+            };
+            if parameter.is_anonymous() {
+                return Err(NatDefinitionElabError::AnonymousReferenceName);
+            }
+            parameters.push(parameter.clone());
+        }
+    }
+    let result_type = expect_null_args(&signature[1], "optional explicit result type")?;
+    match result_type {
+        [] => {}
+        [result_type] => {
+            let parts = expect_node(
+                result_type,
+                &parser_kind(&["Term", "typeSpec"]),
+                2,
+                "Lean.Parser.Term.typeSpec",
+            )?;
+            expect_atom(&parts[0], ":", "explicit result type ascription")?;
+            let Syntax::Ident {
+                val: result_type, ..
+            } = &parts[1]
+            else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "Nat result type",
+                });
+            };
+            if result_type != &Name::from_components(["Nat"]) {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "Nat result type",
+                });
+            }
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "optional explicit result type",
+            });
+        }
     }
 
     let value = expect_node(
@@ -527,7 +564,7 @@ mod tests {
     #[test]
     fn explicit_nat_parameters_become_dependent_type_and_lambda_binders() {
         let result = check_nat_definition_source(
-            b"def first (x : Nat) (y : Nat) := x",
+            b"def first (x y : Nat) : Nat := x",
             &nat_environment(),
             Budget::DEFAULT,
         )

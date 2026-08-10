@@ -88,6 +88,15 @@ pub struct ParsedNatDefinition {
     epilogue: ByteSpan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplicitNatBinderTokens {
+    open: usize,
+    names: std::ops::Range<usize>,
+    colon: usize,
+    type_name: usize,
+    close: usize,
+}
+
 impl ParsedNatDefinition {
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
@@ -135,8 +144,8 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
 /// Parse the first production command subset:
 ///
 /// ```text
-/// def <identifier> (<identifier> : Nat)* := <natural-literal-or-identifier>
-/// def <identifier> (<identifier> : Nat)* := <identifier> <natural-literal-or-identifier>+
+/// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <natural-literal-or-identifier>
+/// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <identifier> <natural-literal-or-identifier>+
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -183,51 +192,89 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
             expected: NatDefinitionExpectation::DeclarationIdentifier,
         });
     }
-    let mut parameter_starts = Vec::new();
+    let mut parameter_groups = Vec::new();
     let mut cursor = 2;
     while matches!(
         tokens.get(cursor).map(|token| &token.kind),
         Some(TokenKind::Symbol(symbol)) if symbol == "("
     ) {
-        parameter_starts.push(cursor);
-        if !matches!(
-            tokens.get(cursor + 1).map(|token| &token.kind),
+        let open = cursor;
+        cursor += 1;
+        let names_start = cursor;
+        while matches!(
+            tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Ident(_))
         ) {
+            cursor += 1;
+        }
+        if cursor == names_start {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor + 1),
+                at: original_position(&view, &tokens, cursor),
                 expected: NatDefinitionExpectation::ParameterIdentifier,
             });
         }
         if !matches!(
-            tokens.get(cursor + 2).map(|token| &token.kind),
+            tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":"
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor + 2),
+                at: original_position(&view, &tokens, cursor),
                 expected: NatDefinitionExpectation::ParameterTypeAscription,
             });
         }
+        let colon = cursor;
+        cursor += 1;
         if !matches!(
-            tokens.get(cursor + 3).map(|token| &token.kind),
+            tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Ident(name)) if name == &Name::from_components(["Nat"])
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor + 3),
+                at: original_position(&view, &tokens, cursor),
                 expected: NatDefinitionExpectation::NaturalType,
             });
         }
+        let type_name = cursor;
+        cursor += 1;
         if !matches!(
-            tokens.get(cursor + 4).map(|token| &token.kind),
+            tokens.get(cursor).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ")"
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, cursor + 4),
+                at: original_position(&view, &tokens, cursor),
                 expected: NatDefinitionExpectation::ClosingParenthesis,
             });
         }
-        cursor += 5;
+        let close = cursor;
+        cursor += 1;
+        parameter_groups.push(ExplicitNatBinderTokens {
+            open,
+            names: names_start..colon,
+            colon,
+            type_name,
+            close,
+        });
     }
+    let explicit_result_type = if matches!(
+        tokens.get(cursor).map(|token| &token.kind),
+        Some(TokenKind::Symbol(symbol)) if symbol == ":"
+    ) {
+        let colon = cursor;
+        cursor += 1;
+        if !matches!(
+            tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Ident(name)) if name == &Name::from_components(["Nat"])
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, cursor),
+                expected: NatDefinitionExpectation::NaturalType,
+            });
+        }
+        let type_name = cursor;
+        cursor += 1;
+        Some((colon, type_name))
+    } else {
+        None
+    };
     let assignment_index = cursor;
     if !matches!(
         tokens.get(assignment_index).map(|token| &token.kind),
@@ -270,7 +317,6 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
             });
         }
     }
-
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -294,21 +340,36 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         vec![declaration_name, null_node(Vec::new())],
     );
     let mut parameters = Vec::new();
-    for start in parameter_starts {
+    for group in parameter_groups {
+        let names = group
+            .names
+            .map(|index| leaves.leaf(index))
+            .collect::<Result<Vec<_>, _>>()?;
         parameters.push(Syntax::node(
             parser_kind(&["Term", "explicitBinder"]),
             vec![
-                leaves.leaf(start)?,
-                null_node(vec![leaves.leaf(start + 1)?]),
-                null_node(vec![leaves.leaf(start + 2)?, leaves.leaf(start + 3)?]),
+                leaves.leaf(group.open)?,
+                null_node(names),
+                null_node(vec![
+                    leaves.leaf(group.colon)?,
+                    leaves.leaf(group.type_name)?,
+                ]),
                 null_node(Vec::new()),
-                leaves.leaf(start + 4)?,
+                leaves.leaf(group.close)?,
             ],
         ));
     }
+    let result_type = if let Some((colon, type_name)) = explicit_result_type {
+        null_node(vec![Syntax::node(
+            parser_kind(&["Term", "typeSpec"]),
+            vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
+        )])
+    } else {
+        null_node(Vec::new())
+    };
     let optional_signature = Syntax::node(
         parser_kind(&["Command", "optDeclSig"]),
-        vec![null_node(parameters), null_node(Vec::new())],
+        vec![null_node(parameters), result_type],
     );
     let term_leaf = |index: usize| -> Result<Syntax, NatDefinitionParseError> {
         let leaf = leaves.leaf(index)?;
@@ -472,8 +533,9 @@ mod nat_definition_tests {
 
     #[test]
     fn command_slice_builds_the_reference_explicit_nat_binder_shape() {
-        let source = b"def first (x : Nat) (y : Nat) := x";
-        let parsed = parse_nat_definition(source).expect("explicit Nat parameters parse");
+        let source = b"def first (x y : Nat) : Nat := x";
+        let parsed =
+            parse_nat_definition(source).expect("grouped Nat parameters and explicit result parse");
         assert_eq!(
             parsed.reconstruct_normalized().as_deref(),
             Some(source.as_slice())
@@ -506,36 +568,46 @@ mod nat_definition_tests {
             panic!("the signature binders must use the Reference null array shape");
         };
         assert_eq!(kind, &state::null_kind());
-        assert_eq!(binders.len(), 2);
-        for (binder, expected_name) in binders.iter().zip(["x", "y"]) {
-            let Syntax::Node { kind, args, .. } = binder else {
-                panic!("each parameter must be an explicit binder node");
-            };
-            assert_eq!(kind, &parser_kind(&["Term", "explicitBinder"]));
-            assert_eq!(args.len(), 5);
-            assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "("));
-            assert!(matches!(
-                &args[1],
-                Syntax::Node { kind, args, .. }
-                    if kind == &state::null_kind()
-                        && matches!(&args[..], [Syntax::Ident { val, .. }]
-                            if val.to_display_string() == expected_name)
-            ));
-            assert!(matches!(
-                &args[2],
-                Syntax::Node { kind, args, .. }
-                    if kind == &state::null_kind()
-                        && matches!(&args[..],
-                            [Syntax::Atom { val: colon, .. }, Syntax::Ident { val: ty, .. }]
-                            if colon == ":" && ty.to_display_string() == "Nat")
-            ));
-            assert!(matches!(
-                &args[3],
-                Syntax::Node { kind, args, .. }
-                    if kind == &state::null_kind() && args.is_empty()
-            ));
-            assert!(matches!(&args[4], Syntax::Atom { val, .. } if val == ")"));
-        }
+        let [Syntax::Node { kind, args, .. }] = &binders[..] else {
+            panic!("the grouped parameters must share one explicit binder node");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "explicitBinder"]));
+        assert_eq!(args.len(), 5);
+        assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "("));
+        assert!(matches!(
+            &args[1],
+            Syntax::Node { kind, args, .. }
+                if kind == &state::null_kind()
+                    && matches!(&args[..],
+                        [Syntax::Ident { val: x, .. }, Syntax::Ident { val: y, .. }]
+                        if x.to_display_string() == "x" && y.to_display_string() == "y")
+        ));
+        assert!(matches!(
+            &args[2],
+            Syntax::Node { kind, args, .. }
+                if kind == &state::null_kind()
+                    && matches!(&args[..],
+                        [Syntax::Atom { val: colon, .. }, Syntax::Ident { val: ty, .. }]
+                        if colon == ":" && ty.to_display_string() == "Nat")
+        ));
+        assert!(matches!(
+            &args[3],
+            Syntax::Node { kind, args, .. }
+                if kind == &state::null_kind() && args.is_empty()
+        ));
+        assert!(matches!(&args[4], Syntax::Atom { val, .. } if val == ")"));
+
+        assert!(matches!(
+            &signature[1],
+            Syntax::Node { kind, args, .. }
+                if kind == &state::null_kind()
+                    && matches!(&args[..],
+                        [Syntax::Node { kind, args, .. }]
+                        if kind == &parser_kind(&["Term", "typeSpec"])
+                            && matches!(&args[..],
+                                [Syntax::Atom { val: colon, .. }, Syntax::Ident { val: ty, .. }]
+                                if colon == ":" && ty.to_display_string() == "Nat"))
+        ));
     }
 
     #[test]
@@ -569,6 +641,13 @@ mod nat_definition_tests {
         ));
         assert!(matches!(
             parse_nat_definition(b"def answer (x : String) := x"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalType,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def answer : String := 42"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
                 expected: NatDefinitionExpectation::NaturalType,
                 ..

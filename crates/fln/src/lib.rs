@@ -1386,9 +1386,9 @@ mod tests {
         let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
         let options = KVMap::new();
         let sources: [&[u8]; 3] = [
-            b"def first (x : Nat) (y : Nat) := x",
-            b"def choose (x : Nat) := first x 29",
-            b"def selected := choose 17",
+            b"def first (x y : Nat) : Nat := x",
+            b"def choose (x : Nat) : Nat := first x 29",
+            b"def selected : Nat := choose 17",
         ];
         let completed = engine
             .execute_nat_definitions(&sources, &options, test_limits())
