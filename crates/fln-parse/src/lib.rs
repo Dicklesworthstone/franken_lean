@@ -6,10 +6,10 @@
 //! [`parse_nat_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` (bead `fln-5720`) and accepts
 //! optional explicit `Nat` parameters followed by a natural literal, identifier,
-//! or saturated identifier-headed application of those atom forms. It uses the
-//! same source view, lexer, attachment, and canonical `Syntax` shape as the
-//! general engine. Being outside this seed grammar is a typed refusal, not a
-//! claim that the source is invalid Lean.
+//! saturated identifier-headed application, or one non-recursive local `Nat`
+//! let over those forms. It uses the same source view, lexer, attachment, and
+//! canonical `Syntax` shape as the general engine. Being outside this seed
+//! grammar is a typed refusal, not a claim that the source is invalid Lean.
 
 #![forbid(unsafe_code)]
 
@@ -49,6 +49,9 @@ pub enum NatDefinitionExpectation {
     NaturalType,
     ClosingParenthesis,
     Assignment,
+    LocalIdentifier,
+    LocalAssignment,
+    LetSeparator,
     NaturalValue,
     EndOfCommand,
 }
@@ -97,6 +100,16 @@ struct ExplicitNatBinderTokens {
     close: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LetNatTermTokens {
+    keyword: usize,
+    name: usize,
+    assignment: usize,
+    value: std::ops::Range<usize>,
+    separator: usize,
+    body: std::ops::Range<usize>,
+}
+
 impl ParsedNatDefinition {
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
@@ -141,17 +154,57 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
     view.to_original(in_view)
 }
 
+fn validate_flat_nat_term(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+) -> Result<(), NatDefinitionParseError> {
+    if !matches!(
+        tokens.get(range.start).map(|token| &token.kind),
+        Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+    ) {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, range.start),
+            expected: NatDefinitionExpectation::NaturalValue,
+        });
+    }
+    if range.len() > 1
+        && !matches!(
+            tokens.get(range.start).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        )
+    {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, range.start + 1),
+            expected: NatDefinitionExpectation::EndOfCommand,
+        });
+    }
+    for index in range.start + 1..range.end {
+        if !matches!(
+            tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, index),
+                expected: NatDefinitionExpectation::NaturalValue,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Parse the first production command subset:
 ///
 /// ```text
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <natural-literal-or-identifier>
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <identifier> <natural-literal-or-identifier>+
+/// def <identifier> (<identifier>+ : Nat)* (: Nat)? := let <identifier> := <flat-term>; <flat-term>
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = TokenTable::from_tokens(["def", "(", ")", ":", ":="]);
+    let table = TokenTable::from_tokens(["def", "let", "(", ")", ":", ":=", ";"]);
     let run = lex_run(view.normalized(), &table);
     let diagnostics = run
         .diagnostics()
@@ -286,37 +339,57 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         });
     }
     let value_index = assignment_index + 1;
-    if !matches!(
+    let let_term = if matches!(
         tokens.get(value_index).map(|token| &token.kind),
-        Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+        Some(TokenKind::Symbol(symbol)) if symbol == "let"
     ) {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(&view, &tokens, value_index),
-            expected: NatDefinitionExpectation::NaturalValue,
-        });
-    }
-    if tokens.len() > value_index + 1
-        && !matches!(
-            tokens.get(value_index).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        )
-    {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(&view, &tokens, value_index + 1),
-            expected: NatDefinitionExpectation::EndOfCommand,
-        });
-    }
-    for index in value_index + 1..tokens.len() {
+        let name = value_index + 1;
         if !matches!(
-            tokens.get(index).map(|token| &token.kind),
-            Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+            tokens.get(name).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, index),
-                expected: NatDefinitionExpectation::NaturalValue,
+                at: original_position(&view, &tokens, name),
+                expected: NatDefinitionExpectation::LocalIdentifier,
             });
         }
-    }
+        let assignment = name + 1;
+        if !matches!(
+            tokens.get(assignment).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":="
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, assignment),
+                expected: NatDefinitionExpectation::LocalAssignment,
+            });
+        }
+        let value_start = assignment + 1;
+        let Some(separator) = (value_start..tokens.len()).find(|index| {
+            matches!(
+                tokens.get(*index).map(|token| &token.kind),
+                Some(TokenKind::Symbol(symbol)) if symbol == ";"
+            )
+        }) else {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(&view, &tokens, tokens.len()),
+                expected: NatDefinitionExpectation::LetSeparator,
+            });
+        };
+        let body_start = separator + 1;
+        validate_flat_nat_term(&view, &tokens, value_start..separator)?;
+        validate_flat_nat_term(&view, &tokens, body_start..tokens.len())?;
+        Some(LetNatTermTokens {
+            keyword: value_index,
+            name,
+            assignment,
+            value: value_start..separator,
+            separator,
+            body: body_start..tokens.len(),
+        })
+    } else {
+        validate_flat_nat_term(&view, &tokens, value_index..tokens.len())?;
+        None
+    };
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -385,18 +458,52 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
             }),
         }
     };
-    let head = term_leaf(value_index)?;
-    let value = if tokens.len() == value_index + 1 {
-        head
-    } else {
+    let flat_term = |range: std::ops::Range<usize>| -> Result<Syntax, NatDefinitionParseError> {
+        let head = term_leaf(range.start)?;
+        if range.len() == 1 {
+            return Ok(head);
+        }
         let mut arguments = Vec::new();
-        for index in value_index + 1..tokens.len() {
+        for index in range.start + 1..range.end {
             arguments.push(term_leaf(index)?);
         }
-        Syntax::node(
+        Ok(Syntax::node(
             parser_kind(&["Term", "app"]),
             vec![head, null_node(arguments)],
+        ))
+    };
+    let value = if let Some(let_term) = let_term {
+        let local_value = flat_term(let_term.value)?;
+        let body = flat_term(let_term.body)?;
+        let local_id = Syntax::node(
+            parser_kind(&["Term", "letId"]),
+            vec![leaves.leaf(let_term.name)?],
+        );
+        let local_declaration = Syntax::node(
+            parser_kind(&["Term", "letIdDecl"]),
+            vec![
+                local_id,
+                null_node(Vec::new()),
+                null_node(Vec::new()),
+                leaves.leaf(let_term.assignment)?,
+                local_value,
+            ],
+        );
+        Syntax::node(
+            parser_kind(&["Term", "let"]),
+            vec![
+                leaves.leaf(let_term.keyword)?,
+                Syntax::node(
+                    parser_kind(&["Term", "letConfig"]),
+                    vec![null_node(Vec::new())],
+                ),
+                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![local_declaration]),
+                leaves.leaf(let_term.separator)?,
+                body,
+            ],
         )
+    } else {
+        flat_term(value_index..tokens.len())?
     };
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
@@ -611,6 +718,86 @@ mod nat_definition_tests {
     }
 
     #[test]
+    fn command_slice_builds_the_pinned_let_shape_without_losing_source() {
+        let source = b"def answer : Nat := let x := 41; x";
+        let parsed = parse_nat_definition(source).expect("the bounded Nat let grammar parses");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        let Syntax::Node {
+            kind,
+            args: let_parts,
+            ..
+        } = &value[1]
+        else {
+            panic!("the source let must be a term node");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "let"]));
+        assert_eq!(let_parts.len(), 5);
+        assert!(matches!(&let_parts[0], Syntax::Atom { val, .. } if val == "let"));
+        assert!(matches!(
+            &let_parts[1],
+            Syntax::Node { kind, args, .. }
+                if kind == &parser_kind(&["Term", "letConfig"])
+                    && matches!(&args[..], [Syntax::Node { kind, args, .. }]
+                        if kind == &state::null_kind() && args.is_empty())
+        ));
+        let Syntax::Node {
+            kind,
+            args: let_declarations,
+            ..
+        } = &let_parts[2]
+        else {
+            panic!("the let declaration must use its Reference wrapper");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "letDecl"]));
+        let [
+            Syntax::Node {
+                kind,
+                args: local_declaration,
+                ..
+            },
+        ] = &let_declarations[..]
+        else {
+            panic!("the let must contain one identifier declaration");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "letIdDecl"]));
+        assert_eq!(local_declaration.len(), 5);
+        assert!(matches!(
+            &local_declaration[0],
+            Syntax::Node { kind, args, .. }
+                if kind == &parser_kind(&["Term", "letId"])
+                    && matches!(&args[..], [Syntax::Ident { val, .. }]
+                        if val.to_display_string() == "x")
+        ));
+        assert!(matches!(&local_declaration[3], Syntax::Atom { val, .. } if val == ":="));
+        assert!(matches!(
+            &local_declaration[4],
+            Syntax::Node { kind, args, .. }
+                if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1
+        ));
+        assert!(matches!(&let_parts[3], Syntax::Atom { val, .. } if val == ";"));
+        assert!(matches!(
+            &let_parts[4],
+            Syntax::Ident { val, .. } if val.to_display_string() == "x"
+        ));
+    }
+
+    #[test]
     fn source_and_seed_grammar_refusals_remain_typed() {
         assert!(matches!(
             parse_nat_definition(&[0xff]),
@@ -657,6 +844,13 @@ mod nat_definition_tests {
             parse_nat_definition(b"def answer (x : Nat := x"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
                 expected: NatDefinitionExpectation::ClosingParenthesis,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def answer := let x := 41 x"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::LetSeparator,
                 ..
             })
         ));

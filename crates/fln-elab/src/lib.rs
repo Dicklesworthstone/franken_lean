@@ -5,9 +5,9 @@
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed
-//! bounded Nat definition, explicit first-order `Nat` function, or application
-//! becomes a real [`Declaration::Defn`] and is handed to Crucible's sole check
-//! authority.
+//! bounded Nat definition, explicit first-order `Nat` function, application, or
+//! local let becomes a real [`Declaration::Defn`] and is handed to Crucible's
+//! sole check authority.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
@@ -182,10 +182,11 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
 /// [`fln_parse::parse_nat_definition`].
 ///
 /// This first slice has no expected-type input. It constructs only explicit
-/// `Nat` binders, natural literals, references, and the parser's flat first-order
-/// application spine, then declares a `Nat` result. The caller's environment must
-/// already contain referenced constants; the kernel, not this function,
-/// determines whether the function and arguments make the declaration admissible.
+/// `Nat` binders, natural literals, references, local lets, and the parser's flat
+/// first-order application spine, then declares a `Nat` result. The caller's
+/// environment must already contain referenced constants; the kernel, not this
+/// function, determines whether the function and arguments make the declaration
+/// admissible.
 pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
@@ -419,6 +420,9 @@ fn elaborate_nat_term(
     let Syntax::Node { kind, args, .. } = syntax else {
         return elaborate_nat_atom(syntax, parameters);
     };
+    if kind == &parser_kind(&["Term", "let"]) {
+        return elaborate_nat_let(args, parameters);
+    }
     if kind != &parser_kind(&["Term", "app"]) {
         return elaborate_nat_atom(syntax, parameters);
     }
@@ -456,6 +460,70 @@ fn elaborate_nat_term(
         expression = Expr::app(expression, elaborate_nat_atom(argument, parameters)?);
     }
     Ok(expression)
+}
+
+fn elaborate_nat_let(
+    parts: &[Syntax],
+    parameters: &[Name],
+) -> Result<Expr, NatDefinitionElabError> {
+    let [keyword, config, declaration, separator, body] = parts else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "Lean.Parser.Term.let",
+        });
+    };
+    expect_atom(keyword, "let", "let keyword")?;
+    let config = expect_node(
+        config,
+        &parser_kind(&["Term", "letConfig"]),
+        1,
+        "empty Lean.Parser.Term.letConfig",
+    )?;
+    expect_empty_null(&config[0], "empty let configuration")?;
+    let declaration = expect_node(
+        declaration,
+        &parser_kind(&["Term", "letDecl"]),
+        1,
+        "Lean.Parser.Term.letDecl",
+    )?;
+    let declaration = expect_node(
+        &declaration[0],
+        &parser_kind(&["Term", "letIdDecl"]),
+        5,
+        "Lean.Parser.Term.letIdDecl",
+    )?;
+    let local_id = expect_node(
+        &declaration[0],
+        &parser_kind(&["Term", "letId"]),
+        1,
+        "Lean.Parser.Term.letId",
+    )?;
+    let Syntax::Ident {
+        val: local_name, ..
+    } = &local_id[0]
+    else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "let identifier",
+        });
+    };
+    if local_name.is_anonymous() {
+        return Err(NatDefinitionElabError::AnonymousReferenceName);
+    }
+    expect_empty_null(&declaration[1], "empty let binder array")?;
+    expect_empty_null(&declaration[2], "absent explicit let type")?;
+    expect_atom(&declaration[3], ":=", "let assignment")?;
+    let value = elaborate_nat_term(&declaration[4], parameters)?;
+    expect_atom(separator, ";", "let body separator")?;
+
+    let mut body_parameters = parameters.to_vec();
+    body_parameters.push(local_name.clone());
+    let body = elaborate_nat_term(body, &body_parameters)?;
+    Ok(Expr::let_e(
+        local_name.clone(),
+        Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+        value,
+        body,
+        false,
+    ))
 }
 
 /// Parse, elaborate, and kernel-check one bounded Nat-valued definition.
@@ -601,6 +669,34 @@ mod tests {
         );
         assert_eq!(definition.base.type_, expected_type);
         assert_eq!(definition.value, expected_value);
+    }
+
+    #[test]
+    fn source_let_becomes_a_nat_typed_core_let_expression() {
+        let result = check_nat_definition_source(
+            b"def answer : Nat := let x := 41; x",
+            &nat_environment(),
+            Budget::DEFAULT,
+        )
+        .expect("the bounded Nat let grammar elaborates");
+        assert!(matches!(
+            result.outcome,
+            Outcome::Complete(Verdict::Accepted { .. })
+        ));
+        let Declaration::Defn(definition) = result.declaration else {
+            panic!("the seed command must elaborate to a definition");
+        };
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        assert_eq!(
+            definition.value,
+            Expr::let_e(
+                Name::from_components(["x"]),
+                nat,
+                Expr::lit(Literal::Nat(NatLit::from_u64(41))),
+                Expr::bvar(0).expect("one local binder fits the expression covenant"),
+                false,
+            )
+        );
     }
 
     #[test]
