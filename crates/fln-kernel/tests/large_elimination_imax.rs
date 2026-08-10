@@ -23,8 +23,9 @@
 //! the public authority at all (the admission engine is otherwise exercised only by
 //! the Reference differential / corpus lane), so this file additionally guards the
 //! recursor-regeneration paths those cases reach: single-type non-recursive (`T`),
-//! single-type recursive/reflexive (`W`, Acc-shaped), and a two-type MUTUAL block
-//! (`P`/`Q`) whose recursors each carry every block motive.
+//! single-type recursive/reflexive (`W`, Acc-shaped), a two-type MUTUAL block
+//! (`P`/`Q`) whose recursors each carry every block motive, and an INDEXED inductive
+//! (`Ix : A → Type`) whose recursor motive, minor, and major all carry the index.
 
 #![forbid(unsafe_code)]
 
