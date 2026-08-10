@@ -86,57 +86,6 @@ fn size_of_lemmas_theorems_and_defs_decode() {
 }
 
 #[test]
-fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let module = PathBuf::from(home)
-        .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
-        .join("Init/Data/List/ToArrayImpl.olean");
-    if !module.is_file() {
-        return;
-    }
-
-    let public = std::fs::read(&module).expect("read public module part");
-    let server =
-        std::fs::read(module.with_extension("olean.server")).expect("read server module part");
-    let private =
-        std::fs::read(module.with_extension("olean.private")).expect("read private module part");
-
-    let public_view = OleanView::parse(&public).expect("parse public module part");
-    let public_infos = DeclDecoder::new(&public_view, WalkBudget::default())
-        .decode_module_constants()
-        .expect("decode public module part");
-    assert_eq!(public_infos.len(), 5, "pin's public declaration census");
-
-    let private_view = OleanView::parse_with_dependencies(&private, &[&public, &server])
-        .expect("parse private module part with its compacted dependencies");
-    let private_infos = DeclDecoder::new(&private_view, WalkBudget::default())
-        .decode_module_constants()
-        .expect("decode private module part through dependency address space");
-    assert!(
-        private_infos.len() > public_infos.len(),
-        "private level must restore declarations absent from the exported part"
-    );
-    assert!(
-        private_infos.iter().any(|info| {
-            info.name().to_display_string()
-                == "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"
-        }),
-        "equation compiler auxiliary omitted by public-only decode"
-    );
-    assert!(
-        matches!(
-            private_infos
-                .iter()
-                .find(|info| info.name().to_display_string() == "List.toArrayAux"),
-            Some(ConstantInfo::Defn(_))
-        ),
-        "private level must retain the definition body rather than a weakened axiom"
-    );
-}
-
-#[test]
 fn crosscheck_catches_a_corrupted_hash_word() {
     // Flip a bit somewhere in the data region and demand that decoding either
     // fails typed (a cross-check or shape error) or returns Ok — but NEVER

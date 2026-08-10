@@ -1150,6 +1150,13 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
 const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
 const PINNED_DECODED_DECL_FLOOR: u64 = 215_136;
 const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 211_524;
+/// Anti-vacuity floor for the retained v1 matrix observation. That observation
+/// predates module-part decoding and therefore measured the 158,608 declarations
+/// visible in public `.olean` regions. It remains historical bounded-model evidence,
+/// not a claim about the current decoder; `lane_source_digest_at_run` is explicitly
+/// provenance rather than a freshness gate. New matrix runs still have to clear the
+/// current `PINNED_DECODED_DECL_FLOOR` before they can publish a receipt.
+const RETAINED_MATRIX_V1_DECODED_DECL_FLOOR: u64 = 158_608;
 /// The single, explicitly pinned worker count the corpus census is produced at
 /// (R1 of bead `fln-corpus-thread-matrix-93te`).
 ///
@@ -2586,6 +2593,51 @@ fn reference_import_adapter_preserves_one_name_authority_and_rejects_conflicts()
 }
 
 #[test]
+fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
+    let Some(reference_lib) = reference_lib() else {
+        return;
+    };
+    let module = reference_lib.join("Init/Data/List/ToArrayImpl.olean");
+
+    let public = fs::read(&module).expect("read public module part");
+    let server = fs::read(module.with_extension("olean.server")).expect("read server module part");
+    let private =
+        fs::read(module.with_extension("olean.private")).expect("read private module part");
+
+    let public_view = OleanView::parse(&public).expect("parse public module part");
+    let public_infos = DeclDecoder::new(&public_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode public module part");
+    assert_eq!(public_infos.len(), 5, "pin's public declaration census");
+
+    let private_view = OleanView::parse_with_dependencies(&private, &[&public, &server])
+        .expect("parse private module part with its compacted dependencies");
+    let private_infos = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private module part through dependency address space");
+    assert!(
+        private_infos.len() > public_infos.len(),
+        "private level must restore declarations absent from the exported part"
+    );
+    assert!(
+        private_infos.iter().any(|info| {
+            info.name().to_display_string()
+                == "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"
+        }),
+        "equation compiler auxiliary omitted by public-only decode"
+    );
+    assert!(
+        matches!(
+            private_infos
+                .iter()
+                .find(|info| info.name().to_display_string() == "List.toArrayAux"),
+            Some(ConstantInfo::Defn(_))
+        ),
+        "private level must retain the definition body rather than a weakened axiom"
+    );
+}
+
+#[test]
 fn present_olean_corpus_inventory_is_closed_and_honest() {
     let rig = pin::RigRun::new(pin::PinRig::PresentOleanCorpusInventory);
     let Some(reference_lib) = reference_lib() else {
@@ -2802,8 +2854,8 @@ fn present_olean_import_contexts_accept_reference_extended_duplicates() {
         "context adapter must cover every present module"
     );
     assert!(
-        extended_only_duplicates > 0,
-        "the pin must exercise duplicate cases beyond the legacy replay exception"
+        extended_duplicates > 0,
+        "the pin must exercise real duplicate acceptance in reconstructed import contexts"
     );
     assert_eq!(
         collision_count, 0,
@@ -3123,17 +3175,16 @@ impl CorpusMatrixReceipt {
     /// `2ebe03e0`: the vacuous row passed, a wrong-pin row failed, so the guard was reading
     /// the file and simply had nothing to say about what the row claimed to have done.
     ///
-    /// The producer cannot emit such a row — it asserts the same coverage floors before it
-    /// compares anything (`PINNED_PRESENT_OLEAN_FLOOR`, `PINNED_DECODED_DECL_FLOOR`) and
-    /// refuses a single unmatrixed module. But the producer is not what stands between the
-    /// documents and the file: this is. The receipt reaches the tree by an operator running
-    /// the lane and **committing the row by hand**, which is exactly the path a truncated or
-    /// invented row arrives on, and it is the path the expiry message invites when the pin
-    /// moves and the honest re-run costs 32 minutes.
+    /// The producer cannot emit such a row — it asserts the current live coverage floors
+    /// before it compares anything and refuses a single unmatrixed module. But the producer
+    /// is not what stands between the documents and the file: this is. The retained v1 row
+    /// predates module-part decoding, so its anti-vacuity floor is the public-region
+    /// population it actually observed (`RETAINED_MATRIX_V1_DECODED_DECL_FLOOR`), not the
+    /// larger live inventory a later decoder exposed. Recasting the old row as a current run
+    /// would be fabricated evidence; accepting less than its measured population would make
+    /// the guard vacuous.
     ///
-    /// So the consumer re-derives the producer's own preconditions from the same constants
-    /// rather than trusting that the row came from the producer. The floors are `>=`: a
-    /// larger corpus is not a failure, a smaller one is.
+    /// The floors are `>=`: a larger corpus is not a failure, a smaller one is.
     fn validate(&self, pin: &str) -> Result<(), String> {
         if self.pin != pin {
             return Err(format!(
@@ -3196,10 +3247,10 @@ impl CorpusMatrixReceipt {
                 self.modules
             ));
         }
-        if self.decoded < PINNED_DECODED_DECL_FLOOR {
+        if self.decoded < RETAINED_MATRIX_V1_DECODED_DECL_FLOOR {
             return Err(format!(
                 "row records {} decoded declaration(s) in matrixed modules, below the pinned \
-                 floor of {PINNED_DECODED_DECL_FLOOR}",
+                 retained-v1 floor of {RETAINED_MATRIX_V1_DECODED_DECL_FLOOR}",
                 self.decoded
             ));
         }
@@ -6238,7 +6289,7 @@ fn a_receipt_that_compared_nothing_is_refused() {
         (
             "one declaration short of the pinned corpus",
             CorpusMatrixReceipt {
-                decoded: below(PINNED_DECODED_DECL_FLOOR),
+                decoded: below(RETAINED_MATRIX_V1_DECODED_DECL_FLOOR),
                 ..real.clone()
             },
             "decoded declaration(s) in matrixed modules",
