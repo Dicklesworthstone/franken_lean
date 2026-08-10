@@ -325,7 +325,7 @@
 //! cite crates/fln-hash/src/canon.rs:1133 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:631 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:539 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite crates/fln-conformance/src/witness.rs:540 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
