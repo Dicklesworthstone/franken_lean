@@ -694,6 +694,95 @@ fn checked_pow_limbs(limbs: &[u64], exp: u32) -> Option<BigNat> {
     Some(result)
 }
 
+fn land_limbs(left: &[u64], right: &[u64]) -> BigNat {
+    BigNat::from_limbs_le(
+        left.iter()
+            .zip(right.iter())
+            .map(|(&a, &b)| a & b)
+            .collect(),
+    )
+}
+
+fn lor_limbs(left: &[u64], right: &[u64]) -> BigNat {
+    let (longer, shorter) = if left.len() >= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut short_iter = shorter.iter();
+    BigNat {
+        limbs: longer
+            .iter()
+            .map(|&a| a | short_iter.next().copied().unwrap_or(0))
+            .collect(),
+    }
+}
+
+fn lxor_limbs(left: &[u64], right: &[u64]) -> BigNat {
+    let (longer, shorter) = if left.len() >= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut short_iter = shorter.iter();
+    BigNat::from_limbs_le(
+        longer
+            .iter()
+            .map(|&a| a ^ short_iter.next().copied().unwrap_or(0))
+            .collect(),
+    )
+}
+
+fn checked_shl_limbs(limbs: &[u64], bits: u64) -> Option<BigNat> {
+    if limbs.is_empty() {
+        return Some(BigNat::zero());
+    }
+    let limb_shift = u128::from(bits / 64);
+    let bit_shift = (bits % 64) as u32;
+    let possible_carry = u128::from(bit_shift != 0);
+    let needed = limb_shift + limbs.len() as u128 + possible_carry;
+    if needed > MAX_LIMBS as u128 {
+        return None;
+    }
+    let limb_shift = limb_shift as usize;
+    let mut out = vec![0u64; limb_shift];
+    out.reserve(limbs.len() + 1);
+    if bit_shift == 0 {
+        out.extend_from_slice(limbs);
+    } else {
+        let mut carry = 0u64;
+        for &limb in limbs {
+            out.push((limb << bit_shift) | carry);
+            carry = limb >> (64 - bit_shift);
+        }
+        if carry != 0 {
+            out.push(carry);
+        }
+    }
+    Some(BigNat::from_limbs_le(out))
+}
+
+fn shr_limbs(limbs: &[u64], bits: u64) -> BigNat {
+    if bits >= bit_length_limbs(limbs) {
+        return BigNat::zero();
+    }
+    let limb_shift = (bits / 64) as usize;
+    let bit_shift = (bits % 64) as u32;
+    let rest = limbs.get(limb_shift..).unwrap_or(&[]);
+    let out = if bit_shift == 0 {
+        rest.to_vec()
+    } else {
+        rest.iter()
+            .enumerate()
+            .map(|(i, &limb)| {
+                let hi = rest.get(i + 1).map_or(0, |&next| next << (64 - bit_shift));
+                (limb >> bit_shift) | hi
+            })
+            .collect()
+    };
+    BigNat::from_limbs_le(out)
+}
+
 impl<'a> BigNatView<'a> {
     /// Borrow little-endian limbs, normalizing by shortening the view only.
     pub fn from_limbs_le(mut limbs: &'a [u64]) -> Self {
@@ -780,6 +869,44 @@ impl<'a> BigNatView<'a> {
                 self.bit_length()
             )
         })
+    }
+
+    pub fn gcd(self, other: BigNatView<'_>) -> BigNat {
+        binary_gcd_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn land(self, other: BigNatView<'_>) -> BigNat {
+        land_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn lor(self, other: BigNatView<'_>) -> BigNat {
+        lor_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn lxor(self, other: BigNatView<'_>) -> BigNat {
+        lxor_limbs(self.limbs, other.limbs)
+    }
+
+    pub fn checked_shl(self, bits: u64) -> Option<BigNat> {
+        checked_shl_limbs(self.limbs, bits)
+    }
+
+    /// # Panics
+    /// If the result would exceed [`MAX_LIMBS`] limbs.
+    #[allow(clippy::should_implement_trait)]
+    pub fn shl(self, bits: u64) -> BigNat {
+        self.checked_shl(bits).unwrap_or_else(|| {
+            panic!(
+                "BigNatView::shl: {bits}-bit shift of a {}-limb value exceeds MAX_LIMBS \
+                 ({MAX_LIMBS}); the caller must charge the result size before shifting",
+                self.limbs.len()
+            )
+        })
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn shr(self, bits: u64) -> BigNat {
+        shr_limbs(self.limbs, bits)
     }
 }
 
@@ -962,48 +1089,22 @@ impl BigNat {
     /// Greatest common divisor by Stein's binary algorithm; `gcd(0, x) = x`
     /// (KR-313).
     pub fn gcd(&self, other: &BigNat) -> BigNat {
-        binary_gcd_limbs(&self.limbs, &other.limbs)
+        self.as_view().gcd(other.as_view())
     }
 
     /// Bitwise AND (KR-313 `Nat.land`).
     pub fn land(&self, other: &BigNat) -> BigNat {
-        let out: Vec<u64> = self
-            .limbs
-            .iter()
-            .zip(other.limbs.iter())
-            .map(|(&a, &b)| a & b)
-            .collect();
-        BigNat::from_limbs_le(out)
+        self.as_view().land(other.as_view())
     }
 
     /// Bitwise OR (KR-313 `Nat.lor`).
     pub fn lor(&self, other: &BigNat) -> BigNat {
-        let (longer, shorter) = if self.limbs.len() >= other.limbs.len() {
-            (&self.limbs, &other.limbs)
-        } else {
-            (&other.limbs, &self.limbs)
-        };
-        let mut short_iter = shorter.iter();
-        let out: Vec<u64> = longer
-            .iter()
-            .map(|&a| a | short_iter.next().copied().unwrap_or(0))
-            .collect();
-        BigNat { limbs: out }
+        self.as_view().lor(other.as_view())
     }
 
     /// Bitwise XOR (KR-313 `Nat.xor`).
     pub fn lxor(&self, other: &BigNat) -> BigNat {
-        let (longer, shorter) = if self.limbs.len() >= other.limbs.len() {
-            (&self.limbs, &other.limbs)
-        } else {
-            (&other.limbs, &self.limbs)
-        };
-        let mut short_iter = shorter.iter();
-        let out: Vec<u64> = longer
-            .iter()
-            .map(|&a| a ^ short_iter.next().copied().unwrap_or(0))
-            .collect();
-        BigNat::from_limbs_le(out)
+        self.as_view().lxor(other.as_view())
     }
 
     /// `self << bits` (KR-313 `Nat.shiftLeft`).
@@ -1032,58 +1133,12 @@ impl BigNat {
     /// limb is allocated, so an unrepresentable request costs nothing and never
     /// reaches the allocator.
     pub fn checked_shl(&self, bits: u64) -> Option<BigNat> {
-        if self.is_zero() {
-            return Some(BigNat::zero());
-        }
-        // Sized in u128: on a 32-bit target `(bits / 64) as usize` truncates,
-        // which would allocate a small buffer and return a wrong value rather
-        // than refusing.
-        let limb_shift = u128::from(bits / 64);
-        let bit_shift = (bits % 64) as u32;
-        let possible_carry = u128::from(bit_shift != 0);
-        let needed = limb_shift + self.limbs.len() as u128 + possible_carry;
-        if needed > MAX_LIMBS as u128 {
-            return None;
-        }
-        // In range by the check above, so this conversion cannot truncate.
-        let limb_shift = limb_shift as usize;
-        let mut out = vec![0u64; limb_shift];
-        out.reserve(self.limbs.len() + 1);
-        if bit_shift == 0 {
-            out.extend_from_slice(&self.limbs);
-        } else {
-            let mut carry = 0u64;
-            for &limb in &self.limbs {
-                out.push((limb << bit_shift) | carry);
-                carry = limb >> (64 - bit_shift);
-            }
-            if carry != 0 {
-                out.push(carry);
-            }
-        }
-        Some(BigNat::from_limbs_le(out))
+        self.as_view().checked_shl(bits)
     }
 
     /// `self >> bits` (KR-313 `Nat.shiftRight`); shifts past the top yield 0.
     pub fn shr(&self, bits: u64) -> BigNat {
-        if bits >= self.bit_length() {
-            return BigNat::zero();
-        }
-        let limb_shift = (bits / 64) as usize;
-        let bit_shift = (bits % 64) as u32;
-        let rest = self.limbs.get(limb_shift..).unwrap_or(&[]);
-        let out: Vec<u64> = if bit_shift == 0 {
-            rest.to_vec()
-        } else {
-            rest.iter()
-                .enumerate()
-                .map(|(i, &limb)| {
-                    let hi = rest.get(i + 1).map_or(0, |&next| next << (64 - bit_shift));
-                    (limb >> bit_shift) | hi
-                })
-                .collect()
-        };
-        BigNat::from_limbs_le(out)
+        self.as_view().shr(bits)
     }
 
     /// `self * m` for a machine-word multiplier.

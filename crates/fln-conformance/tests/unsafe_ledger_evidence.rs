@@ -508,13 +508,15 @@ const RESOLVING_CITATION_TOKENS: usize = 146;
 /// implementation-site rows whose evidence is deliberately the export-suite/C4 corpus
 /// phrase. FLN-UL-0559 is the one symbol-side test-apparatus row, and the FLN-UL-0498
 /// evidence rewrite remains prose, so no pre-existing row changed class.
-const PROSE_EVIDENCE_ROWS: usize = 430;
+/// 430 -> 439 in the remaining Nat ABI wiring: FLN-UL-0560 through FLN-UL-0568
+/// add nine implementation-site rows backed by the existing export suite and C4 lane.
+const PROSE_EVIDENCE_ROWS: usize = 439;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 552 rows: 1 cites an e2e lane, 121 carry \
-symbol-resolved evidence, and 430 remain prose; 146 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 561 rows: 1 cites an e2e lane, 121 carry \
+symbol-resolved evidence, and 439 remain prose; 146 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\

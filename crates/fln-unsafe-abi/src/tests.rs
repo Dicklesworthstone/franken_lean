@@ -2319,9 +2319,12 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
     use crate::export::{
         export_lean_big_uint64_to_nat, export_lean_big_usize_to_nat, export_lean_cstr_to_nat,
         export_lean_dec_ref_cold, export_lean_nat_big_add, export_lean_nat_big_div,
-        export_lean_nat_big_eq, export_lean_nat_big_le, export_lean_nat_big_lt,
-        export_lean_nat_big_mod, export_lean_nat_big_mul, export_lean_nat_big_sub,
-        export_lean_nat_overflow_mul, export_lean_string_of_usize, export_lean_uint8_of_big_nat,
+        export_lean_nat_big_div_exact, export_lean_nat_big_eq, export_lean_nat_big_land,
+        export_lean_nat_big_le, export_lean_nat_big_lor, export_lean_nat_big_lt,
+        export_lean_nat_big_mod, export_lean_nat_big_mul, export_lean_nat_big_shiftr,
+        export_lean_nat_big_sub, export_lean_nat_big_succ, export_lean_nat_big_xor,
+        export_lean_nat_gcd, export_lean_nat_log2, export_lean_nat_overflow_mul,
+        export_lean_nat_shiftl, export_lean_string_of_usize, export_lean_uint8_of_big_nat,
         export_lean_uint64_of_big_nat, export_lean_usize_of_big_nat,
     };
     // SAFETY: every value here is either a boxed scalar, which carries no
@@ -2385,6 +2388,26 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
         );
         assert_eq!(tagged::unbox(export_lean_nat_big_div(big2, big)), 1);
 
+        // The remaining pinned Nat bignum surface is wired to the same
+        // zero-copy views: exact division, bitwise, shifts, gcd, log2, succ.
+        let succ = export_lean_nat_big_succ(big);
+        assert!(export_lean_nat_big_eq(succ, big2));
+        let exact = export_lean_nat_big_div_exact(big2, tagged::boxi(2));
+        assert_eq!(export_lean_uint64_of_big_nat(exact), 1u64 << 63);
+        assert_eq!(tagged::unbox(export_lean_nat_big_land(big2, big)), 0);
+        let lor = export_lean_nat_big_lor(big2, big);
+        let xor = export_lean_nat_big_xor(big2, big);
+        assert!(export_lean_nat_big_eq(lor, xor));
+        assert_eq!(export_lean_uint64_of_big_nat(lor), u64::MAX);
+        let shifted = export_lean_nat_shiftl(tagged::boxi(3), tagged::boxi(65));
+        assert_eq!(export_lean_uint64_of_big_nat(shifted), 0);
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_shiftr(big2, tagged::boxi(64))),
+            1
+        );
+        assert_eq!(tagged::unbox(export_lean_nat_gcd(big2, big)), 1);
+        assert_eq!(tagged::unbox(export_lean_nat_log2(big2)), 64);
+
         // mod: scalar%big = the scalar; x%0 returns the RETAINED input.
         assert_eq!(
             tagged::unbox(export_lean_nat_big_mod(tagged::boxi(9), big)),
@@ -2414,6 +2437,16 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
         let c128 = export_lean_cstr_to_nat(c"340282366920938463463374607431768211457".as_ptr());
         let (csz, climbs) = mpz_copy(c128);
         assert_eq!((csz, climbs.as_slice()), (3, &[1, 0, 1][..]));
+        assert_eq!(
+            tagged::unbox(export_lean_nat_shiftl(tagged::boxi(0), c128)),
+            0,
+            "zero short-circuits before the heap-exponent refusal"
+        );
+        assert_eq!(
+            tagged::unbox(export_lean_nat_big_shiftr(big2, c128)),
+            0,
+            "the pin treats a heap right-shift exponent as clearing the value"
+        );
 
         // truncations: lowest limb / low bits.
         assert_eq!(export_lean_uint64_of_big_nat(big), u64::MAX);
@@ -2426,7 +2459,7 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
         assert_eq!((ssz, slen), (17, 16));
         assert_eq!(&sbytes[..16], b"9007199254740993");
 
-        for o in [big, big2, sq, of, c128, s] {
+        for o in [big, big2, succ, exact, lor, xor, shifted, sq, of, c128, s] {
             export_lean_dec_ref_cold(o);
         }
     }

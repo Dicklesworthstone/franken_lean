@@ -867,7 +867,7 @@ BIGNUM_SEMANTIC_SCHEMA = "fln.e2e.bignum-semantic/1"
 BIGNUM_TELEMETRY_SCHEMA = "fln.e2e.bignum-telemetry/1"
 BIGNUM_VALIDATION_SCHEMA = "fln.e2e.bignum-validation/1"
 BIGNUM_VECTOR_COUNT = 5_725
-BIGNUM_C4_NAT_FACTS = 28
+BIGNUM_C4_NAT_FACTS = 41
 BIGNUM_C4_INT_FACTS = 44
 BIGNUM_MUTATIONS = (
     ("carry_drop", "nat::tests::u128_model_agreement"),

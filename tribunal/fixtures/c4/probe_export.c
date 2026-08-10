@@ -510,6 +510,24 @@ static void facts_mode(void) {
     fact("nat.div.small", (long long)lean_unbox(lean_nat_big_div(lean_box(7), big)));
     fact("nat.div.by_zero", (long long)lean_unbox(lean_nat_big_div(big, lean_box(0))));
     fact("nat.div.value", (long long)lean_unbox(lean_nat_big_div(big2, big)));
+    lean_object *nsucc = lean_nat_big_succ(big);
+    fact("nat.succ.eq", lean_nat_big_eq(nsucc, big2));
+    lean_object *nexact = lean_nat_big_div_exact(big2, lean_box(2));
+    fact("nat.div_exact.is_scalar", lean_is_scalar(nexact));
+    fact("nat.div_exact.trunc64", (long long)lean_uint64_of_big_nat(nexact));
+    fact("nat.land.value",
+         (long long)lean_unbox(lean_nat_big_land(big2, big)));
+    lean_object *nlor = lean_nat_big_lor(big2, big);
+    lean_object *nxor = lean_nat_big_xor(big2, big);
+    fact("nat.lor.trunc64", (long long)lean_uint64_of_big_nat(nlor));
+    fact("nat.xor.eq_lor", lean_nat_big_eq(nxor, nlor));
+    lean_object *nshiftl = lean_nat_shiftl(lean_box(3), lean_box(65));
+    fact("nat.shiftl.is_scalar", lean_is_scalar(nshiftl));
+    fact("nat.shiftl.trunc64", (long long)lean_uint64_of_big_nat(nshiftl));
+    fact("nat.shiftr.value",
+         (long long)lean_unbox(lean_nat_big_shiftr(big2, lean_box(64))));
+    fact("nat.gcd.value", (long long)lean_unbox(lean_nat_gcd(big2, big)));
+    fact("nat.log2.value", (long long)lean_unbox(lean_nat_log2(big2)));
     fact("nat.mod.small", (long long)lean_unbox(lean_nat_big_mod(lean_box(9), big)));
     lean_object *modz = lean_nat_big_mod(big, lean_box(0)); /* retained input */
     fact("nat.mod.by_zero.same", modz == big);
@@ -531,12 +549,17 @@ static void facts_mode(void) {
     lean_object *c128 = lean_cstr_to_nat("340282366920938463463374607431768211457");
     fact("nat.cstr.usize_trunc", (long long)lean_usize_of_big_nat(c128));
     fact("nat.cstr.u8_trunc", lean_uint8_of_big_nat(c128));
+    fact("nat.shiftl.zero_heap_exp",
+         (long long)lean_unbox(lean_nat_shiftl(lean_box(0), c128)));
+    fact("nat.shiftr.heap_exp",
+         (long long)lean_unbox(lean_nat_big_shiftr(big2, c128)));
     uint64_t bt = lean_uint64_of_big_nat(big);
     fact("nat.trunc64.hi", (long long)(bt >> 32));
     fact("nat.trunc64.lo", (long long)(bt & 0xFFFFFFFFu));
     lean_object *sou = lean_string_of_usize(9007199254740993);
     fact("nat.string_of_usize.bytesum", bytesum(lean_string_cstr(sou), lean_string_size(sou)));
     lean_dec(sou);
+    lean_dec(nsucc); lean_dec(nexact); lean_dec(nlor); lean_dec(nxor); lean_dec(nshiftl);
     lean_dec(one); lean_dec(sq); lean_dec(pw); lean_dec(of); lean_dec(c128);
     lean_dec(big2); lean_dec(big);
     /* ---- end slice 3: bignum-backed Nat families ---- */

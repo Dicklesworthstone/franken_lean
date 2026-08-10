@@ -658,7 +658,7 @@ marrow_nat_facts="$(grep -c '"probe":"nat\.' "$c4_dir/facts_marrow.ndjson")"
 reference_nat_facts="$(grep -c '"probe":"nat\.' "$c4_dir/facts_reference.ndjson")"
 marrow_int_facts="$(grep -c '"probe":"int\.' "$c4_dir/facts_marrow.ndjson")"
 reference_int_facts="$(grep -c '"probe":"int\.' "$c4_dir/facts_reference.ndjson")"
-if [ "$marrow_nat_facts" -ne 28 ] || [ "$reference_nat_facts" -ne 28 ] \
+if [ "$marrow_nat_facts" -ne 41 ] || [ "$reference_nat_facts" -ne 41 ] \
     || [ "$marrow_int_facts" -ne 44 ] || [ "$reference_int_facts" -ne 44 ] \
     || ! cmp -s "$c4_dir/facts_marrow.ndjson" "$c4_dir/facts_reference.ndjson"; then
   emit c4_gauntlet failed "\"detail\":\"Nat/Int fact population or full differential drifted\",\"artifact\":\"c4.log\""
@@ -668,7 +668,7 @@ fi
 cp "$c4_dir/run.ndjson" "$ART_DIR/c4-run.ndjson"
 cp "$c4_dir/facts_marrow.ndjson" "$ART_DIR/c4-facts-marrow.ndjson"
 cp "$c4_dir/facts_reference.ndjson" "$ART_DIR/c4-facts-reference.ndjson"
-emit c4_gauntlet passed "\"nat_facts\":28,\"int_facts\":44,\"artifact\":\"c4.log\""
+emit c4_gauntlet passed "\"nat_facts\":41,\"int_facts\":44,\"artifact\":\"c4.log\""
 
 # ---- step 5: every named production mutant must be killed -------------------------------
 OVERLAY="$ART_DIR/overlay"
@@ -752,10 +752,10 @@ cells = {
         "            if byte == b'_' {\n",
     ),
     "shift_limb_boundary": (
-        "    pub fn checked_shl(&self, bits: u64)",
-        "    /// `self >> bits`",
-        "        let limb_shift = u128::from(bits / 64);\n",
-        "        let limb_shift = u128::from(bits.saturating_sub(1) / 64);\n",
+        "fn checked_shl_limbs(limbs: &[u64], bits: u64)",
+        "fn shr_limbs(",
+        "    let limb_shift = u128::from(bits / 64);\n",
+        "    let limb_shift = u128::from(bits.saturating_sub(1) / 64);\n",
     ),
 }
 try:

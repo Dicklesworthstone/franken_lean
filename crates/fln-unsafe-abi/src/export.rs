@@ -1445,6 +1445,20 @@ unsafe fn big_nat_limb0(a: *mut LeanObject) -> u64 {
     unsafe { with_nat_view(a, |value| value.limbs_le().first().copied().unwrap_or(0)) }
 }
 
+/// `lean_nat_big_succ` (`object.cpp:1379-1381`): the heap-only successor
+/// stays on the `_core` path because a positive increment cannot become small.
+// UNSAFE-LEDGER: FLN-UL-0560
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_succ")]
+pub(crate) extern "C" fn export_lean_nat_big_succ(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live heap Nat; result is fresh.
+    unsafe {
+        let one = [1u64];
+        let r = with_nat_view(a, |n| n.add(BigNatView::from_limbs_le(&one)));
+        nat_obj_from_bignat_core(&r)
+    }
+}
+
 /// `lean_nat_big_add` (`object.cpp:1383-1391`): every arm is `_core` — a
 /// big plus anything non-negative stays big.
 // UNSAFE-LEDGER: FLN-UL-0138
@@ -1545,6 +1559,35 @@ pub(crate) extern "C" fn export_lean_nat_big_div(
     }
 }
 
+/// `lean_nat_big_div_exact` (`object.cpp:1438-1453`): the caller establishes
+/// a nonzero divisor and a zero remainder.
+// UNSAFE-LEDGER: FLN-UL-0561
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_div_exact")]
+pub(crate) extern "C" fn export_lean_nat_big_div_exact(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; the runtime entry's exactness
+    // precondition is checked before publishing the quotient.
+    unsafe {
+        let (quotient, remainder) = with_nat_view(a1, |n1| {
+            with_nat_view(a2, |n2| {
+                assert!(
+                    !n2.is_zero(),
+                    "lean_nat_big_div_exact requires a nonzero divisor"
+                );
+                n1.div_rem(n2)
+            })
+        });
+        assert!(
+            remainder.is_zero(),
+            "lean_nat_big_div_exact precondition violated"
+        );
+        nat_obj_from_bignat(&quotient)
+    }
+}
+
 /// `lean_nat_big_mod` (`object.cpp:1455-1472` shape): scalar%big is the
 /// scalar itself (borrowed scalar returns as-is — no rc); n%0 returns `a1`
 /// RETAINED exactly as upstream's `lean_inc(a1)`; big arms normalize.
@@ -1620,6 +1663,102 @@ pub(crate) extern "C" fn export_lean_nat_big_lt(a1: *mut LeanObject, a2: *mut Le
     }
 }
 
+/// `lean_nat_big_land` (`object.cpp:1509-1517`).
+// UNSAFE-LEDGER: FLN-UL-0562
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_land")]
+pub(crate) extern "C" fn export_lean_nat_big_land(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; result is fresh and normalized.
+    unsafe {
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.land(n2)));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_big_lor` (`object.cpp:1519-1527`).
+// UNSAFE-LEDGER: FLN-UL-0563
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_lor")]
+pub(crate) extern "C" fn export_lean_nat_big_lor(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; result is fresh and normalized.
+    unsafe {
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.lor(n2)));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_big_xor` (`object.cpp:1529-1537`).
+// UNSAFE-LEDGER: FLN-UL-0564
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_xor")]
+pub(crate) extern "C" fn export_lean_nat_big_xor(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; result is fresh and normalized.
+    unsafe {
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.lxor(n2)));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_shiftl` (`object.cpp:1539-1553`): zero short-circuits before
+/// validating the exponent, exactly as the pin does.
+// UNSAFE-LEDGER: FLN-UL-0565
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_shiftl")]
+pub(crate) extern "C" fn export_lean_nat_shiftl(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if is_scalar(a1) && crate::tagged::unbox(a1) == 0 {
+            return crate::tagged::boxi(0);
+        }
+        if !is_scalar(a2) || crate::tagged::unbox(a2) > u32::MAX as usize {
+            internal_panic_impl("Nat.shiftl exponent is too big");
+        }
+        let r = with_nat_view(a1, |n| n.shl(crate::tagged::unbox(a2) as u64));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_big_shiftr` (`object.cpp:1555-1575`): the pin returns zero for a
+/// heap exponent without inspecting the base; an oversized scalar must
+/// actually clear the value or it reports its internal panic.
+// UNSAFE-LEDGER: FLN-UL-0566
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_big_shiftr")]
+pub(crate) extern "C" fn export_lean_nat_big_shiftr(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands.
+    unsafe {
+        if !is_scalar(a2) {
+            return crate::tagged::boxi(0);
+        }
+        let shift = crate::tagged::unbox(a2) as u64;
+        let r = with_nat_view(a1, |n| {
+            if shift > u64::from(u32::MAX)
+                && !n.is_zero()
+                && n.bit_length().saturating_sub(1) >= shift
+            {
+                internal_panic_impl("Nat.shiftr exponent is too big");
+            }
+            n.shr(shift)
+        });
+        nat_obj_from_bignat(&r)
+    }
+}
+
 /// `lean_nat_pow` (`object.cpp:1577-1586`): the exponent must be a scalar
 /// `<= UINT_MAX` or the pin's INTERNAL PANIC fires; result normalized.
 // UNSAFE-LEDGER: FLN-UL-0147
@@ -1637,6 +1776,32 @@ pub(crate) extern "C" fn export_lean_nat_pow(
         let r = with_nat_view(a1, |n| n.pow(crate::tagged::unbox(a2) as u32));
         nat_obj_from_bignat(&r)
     }
+}
+
+/// `lean_nat_gcd` (`object.cpp:1587-1599`).
+// UNSAFE-LEDGER: FLN-UL-0567
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_gcd")]
+pub(crate) extern "C" fn export_lean_nat_gcd(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operands; result is fresh and normalized.
+    unsafe {
+        let r = with_nat_view(a1, |n1| with_nat_view(a2, |n2| n1.gcd(n2)));
+        nat_obj_from_bignat(&r)
+    }
+}
+
+/// `lean_nat_log2` (`object.cpp:1601-1612`): floor(log2 n), with 0 and 1
+/// both yielding zero.
+// UNSAFE-LEDGER: FLN-UL-0568
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_nat_log2")]
+pub(crate) extern "C" fn export_lean_nat_log2(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live Nat operand; bit length is an exact scalar fact.
+    let log2 = unsafe { with_nat_view(a, |n| n.bit_length().saturating_sub(1)) };
+    crate::tagged::boxi(log2 as usize)
 }
 
 /// `lean_cstr_to_nat` (`object.cpp:1359-1361`): decimal literal (generated

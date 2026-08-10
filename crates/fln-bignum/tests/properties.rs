@@ -831,6 +831,13 @@ fn borrowed_limb_views_alias_storage_and_match_owned_arithmetic() {
             assert_eq!(a_view.sub(b_view), a.sub(&b), "{origin}: subtraction");
             assert_eq!(a_view.mul(b_view), a.mul(&b), "{origin}: multiplication");
             assert_eq!(a_view.div_rem(b_view), a.div_rem(&b), "{origin}: division");
+            assert_eq!(a_view.gcd(b_view), a.gcd(&b), "{origin}: gcd");
+            assert_eq!(a_view.land(b_view), a.land(&b), "{origin}: and");
+            assert_eq!(a_view.lor(b_view), a.lor(&b), "{origin}: or");
+            assert_eq!(a_view.lxor(b_view), a.lxor(&b), "{origin}: xor");
+            let shift = rng.below(130);
+            assert_eq!(a_view.shl(shift), a.shl(shift), "{origin}: shift left");
+            assert_eq!(a_view.shr(shift), a.shr(shift), "{origin}: shift right");
             let exponent = rng.below(5) as u32;
             assert_eq!(
                 a_view.checked_pow(exponent),
