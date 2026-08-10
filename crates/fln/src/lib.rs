@@ -10,8 +10,8 @@
 //! and non-safe mutual definition blocks can also advance an immutable engine
 //! snapshot through admission and publication without compiling or executing a
 //! body. Embedders can also validate and execute an existing canonical FLBC
-//! artifact without reaching into the compiler or VM crates, and inspect a
-//! real pinned-format `.olean` through the codec's audited by-value reader.
+//! artifact without reaching into the compiler or VM crates, and inspect or
+//! re-derive a real pinned-format `.olean` through the codec's audited reader.
 
 #![forbid(unsafe_code)]
 

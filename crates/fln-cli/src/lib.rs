@@ -1740,6 +1740,7 @@ mod tests {
 
     const PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
+    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x07\0\x0b\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
         let invoked_from = std::env::current_dir().expect("the test has an invocation directory");
@@ -1761,10 +1762,14 @@ mod tests {
                 fln::EngineExecutionLimits::new(kernel),
             )
             .expect("the fixture source reaches the engine");
-        let fln::Outcome::Complete(execution) = outcome else {
-            panic!("the fixture source must execute authoritatively");
-        };
-        execution.flbc_artifact
+        assert!(
+            matches!(&outcome, fln::Outcome::Complete(_)),
+            "the fixture source must execute authoritatively: {outcome:?}"
+        );
+        match outcome {
+            fln::Outcome::Complete(execution) => execution.flbc_artifact,
+            fln::Outcome::Inconclusive(_) | fln::Outcome::InternalFault(_) => Vec::new(),
+        }
     }
 
     #[test]
@@ -1786,6 +1791,11 @@ mod tests {
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("canonical FLBC execution: complete"));
         assert!(human.stdout.contains("scalar value: 73"));
+
+        let non_scalar = execute_flbc_bytes(STRING_FLBC, STRING_FLBC.len(), true);
+        assert_eq!(non_scalar.exit_code, 0, "{}", non_scalar.stderr);
+        assert!(non_scalar.stdout.contains("\"returnKind\":\"string\""));
+        assert!(non_scalar.stdout.contains("\"scalarValue\":null"));
 
         let mut malformed = artifact.clone();
         malformed[0] ^= u8::MAX;
