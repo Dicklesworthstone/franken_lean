@@ -92,6 +92,7 @@ row FLN-BX-0077 | crates/fln-unsafe-abi/src/handle.rs | fn complete_claimed_thun
 row FLN-BX-0078 | crates/fln-unsafe-abi/src/handle.rs | fn ref_take | (&self) -> Obj | ref_take_transfers_the_exact_cell_token_and_refill_restores_ownership; FLBC take/refill suite | transfers one owned ABI value from a tag-checked cell without exposing a raw pointer, address, kernel type, or admission capability
 row FLN-BX-0079 | crates/fln-unsafe-abi/src/lib.rs | fn allocation_heartbeats | () -> u64 | export heartbeat-state suite; Golem heartbeat IO intrinsic suite | copies one thread-local runtime counter; no object, pointer, kernel type, or admission authority escapes
 row FLN-BX-0080 | crates/fln-unsafe-abi/src/lib.rs | fn set_allocation_heartbeats | (u64) | export heartbeat-state suite; Golem heartbeat IO intrinsic suite | mutates only one thread-local runtime counter from a plain integer; no object or admission authority enters
+row FLN-BX-0081 | crates/fln-unsafe-abi/src/handle.rs | fn mk_int | (i64) -> Obj | signed_int_constructor_normalizes_small_and_heap_values; expression writer roundtrip | tagged scalar or structural mpz container; no kernel type or admission capability enters or escapes
 
 # ---- bead fln-wgp slice 1: fln-unsafe-region mapping surface + compactor identity ----
 row FLN-BX-0053 | crates/fln-unsafe-abi/src/handle.rs | fn identity_token | (&self) -> usize | region compact sharing tests | opaque dedup key; address-derived, never enters artifacts/digests (CGSE)

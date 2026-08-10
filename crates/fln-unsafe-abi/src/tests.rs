@@ -263,6 +263,30 @@ fn tagged_pointer_law() {
     }
 }
 
+#[test]
+fn signed_int_constructor_normalizes_small_and_heap_values() {
+    let _g = lock();
+    for value in [i32::MIN, -7, 0, 9, i32::MAX] {
+        let object = Obj::mk_int(i64::from(value));
+        assert!(object.is_scalar());
+        assert_eq!(object.unbox() as u32 as i32, value);
+    }
+
+    for value in [
+        i64::MIN,
+        i64::from(i32::MIN) - 1,
+        i64::from(i32::MAX) + 1,
+        i64::MAX,
+    ] {
+        let object = Obj::mk_int(value);
+        assert!(!object.is_scalar());
+        let (allocation, size, limbs) = object.mpz_view();
+        assert_eq!(allocation, 1);
+        assert_eq!(size, if value.is_negative() { -1 } else { 1 });
+        assert_eq!(limbs, &[value.unsigned_abs()]);
+    }
+}
+
 // ================================================================ objects
 
 #[test]

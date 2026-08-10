@@ -182,6 +182,55 @@ impl<'a> DeclDecoder<'a> {
         byte != 0
     }
 
+    fn decode_int(&mut self, ptr: u64) -> DResult<i64> {
+        if Self::is_scalar(ptr) {
+            #[cfg(target_pointer_width = "64")]
+            {
+                return Ok(i64::from((ptr >> 1) as u32 as i32));
+            }
+            #[cfg(target_pointer_width = "32")]
+            {
+                return Ok(i64::from((ptr as u32 as i32) >> 1));
+            }
+        }
+
+        let off = self.view.deref(ptr)?;
+        let (tag, _, _) = self.view.obj_header(off)?;
+        if tag != fln_rt::abi::TAG_MPZ {
+            return Err(DeclError::Shape {
+                offset: off,
+                what: "Int: neither scalar nor mpz",
+            });
+        }
+        let (negative, limbs) = self.view.mpz_limbs(off)?;
+        let magnitude = match limbs.as_slice() {
+            [] => 0,
+            [limb] => *limb,
+            _ => {
+                return Err(DeclError::Overflow {
+                    offset: off,
+                    what: "DataValue.ofInt",
+                });
+            }
+        };
+        if negative {
+            if magnitude == 1u64 << 63 {
+                Ok(i64::MIN)
+            } else {
+                let magnitude = i64::try_from(magnitude).map_err(|_| DeclError::Overflow {
+                    offset: off,
+                    what: "DataValue.ofInt",
+                })?;
+                Ok(-magnitude)
+            }
+        } else {
+            i64::try_from(magnitude).map_err(|_| DeclError::Overflow {
+                offset: off,
+                what: "DataValue.ofInt",
+            })
+        }
+    }
+
     // ---- Name --------------------------------------------------------------------------
 
     /// Iterative over the `pre` chain; memoized; cross-checks the stored hash.
@@ -476,18 +525,9 @@ impl<'a> DeclDecoder<'a> {
                     }),
                 }
             }
-            4 => {
-                let p = self.view.read_u64(off + 8)?;
-                if Self::is_scalar(p) {
-                    // Int scalar boxing: signed value in the tagged word.
-                    Ok(DataValue::OfInt((p as i64) >> 1))
-                } else {
-                    Err(DeclError::Unsupported {
-                        offset: off,
-                        what: "DataValue.ofInt mpz",
-                    })
-                }
-            }
+            4 => Ok(DataValue::OfInt(
+                self.decode_int(self.view.read_u64(off + 8)?)?,
+            )),
             5 => {
                 // Syntax payloads are out of scope for this slice: preserved
                 // in the region, surfaced as an opaque handle of the offset.

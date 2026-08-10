@@ -94,6 +94,28 @@ impl Obj {
         Obj(tagged::boxi(n))
     }
 
+    /// Construct a Lean `Int`, using the pin's sign-extended small scalar
+    /// representation when possible and a normalized mpz otherwise.
+    pub fn mk_int(value: i64) -> Obj {
+        let small_min = if cfg!(target_pointer_width = "64") {
+            i64::from(i32::MIN)
+        } else {
+            i64::from(i32::MIN / 2)
+        };
+        let small_max = if cfg!(target_pointer_width = "64") {
+            i64::from(i32::MAX)
+        } else {
+            i64::from(i32::MAX / 2)
+        };
+        if (small_min..=small_max).contains(&value) {
+            let payload = value as i32 as u32 as usize;
+            return Obj(core::ptr::without_provenance_mut(
+                payload.wrapping_shl(1) | 1,
+            ));
+        }
+        Obj::mk_mpz(&[value.unsigned_abs()], value.is_negative())
+    }
+
     /// Constructor object; consumes the children, copies the scalar bytes.
     pub fn mk_ctor(tag: u8, children: Vec<Obj>, scalar_bytes: &[u8]) -> Obj {
         assert!(tag <= TAG_MAX_CTOR_TAG);

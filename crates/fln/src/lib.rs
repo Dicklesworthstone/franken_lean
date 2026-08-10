@@ -65,11 +65,26 @@ use fln_kernel::council::{
 pub use fln_kernel::verdict::{Budget, RejectClass};
 use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;
+pub use fln_olean::format::{
+    ILEAN_VERSION, OLEAN_ACCEPTED_VERSIONS, PIN_COMMIT as OLEAN_PIN_COMMIT,
+    PIN_TAG as OLEAN_PIN_TAG, REGION_ALIGN as OLEAN_REGION_ALIGN,
+};
+pub use fln_olean::ilean::{
+    Ilean, IleanBudget, IleanDeclInfo, IleanError, IleanImport, IleanLocation, IleanRefIdent,
+    IleanRefInfo, decode_ilean, encode_ilean,
+};
 pub use fln_olean::rebuild::RebuildReport as OleanRebuildReport;
 use fln_olean::region::OleanView;
 pub use fln_olean::region::{
-    ModuleDataView as OleanModuleData, OleanHeader, RegionError as OleanRegionError,
-    WalkBudget as OleanWalkBudget, WalkReport as OleanWalkReport,
+    ModuleDataView as OleanModuleData, ModuleImport as OleanModuleImport, OleanHeader,
+    RegionError as OleanRegionError, WalkBudget as OleanWalkBudget, WalkReport as OleanWalkReport,
+};
+pub use fln_olean::write::{
+    EncodedExprRegion as EncodedOleanExprRegion, EncodedModule as EncodedOleanModule,
+    ExprWriteReport as OleanExprWriteReport, ModuleWriteInput as OleanModuleWriteInput,
+    ModuleWriteReport as OleanModuleWriteReport, OleanWriteHeader, WriteBudget as OleanWriteBudget,
+    WriteError as OleanWriteError, WriteResource as OleanWriteResource,
+    encode_expr_region as encode_olean_expr_region, encode_module as encode_olean_module,
 };
 use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{
@@ -1952,6 +1967,50 @@ mod tests {
             constant.name().to_display_string() == "binderNameHint"
                 && matches!(constant, ConstantInfo::Defn(_))
         }));
+    }
+
+    #[test]
+    fn public_olean_write_and_ilean_doors_are_live() {
+        let lean_version = super::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the extracted pin tag carries its v prefix");
+        let encoded = super::encode_olean_module(
+            super::OleanModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            super::OleanWriteHeader {
+                version: super::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version,
+                githash: super::OLEAN_PIN_COMMIT,
+                base_addr: (super::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            super::OleanWriteBudget::default(),
+        )
+        .expect("the public facade writes an empty basic module image");
+        let decoded =
+            decode_olean_artifact(&encoded.bytes, OleanDecodeLimits::new(encoded.bytes.len()))
+                .expect("the public reader accepts the public writer's image");
+        assert_eq!(decoded.module.constants, 0);
+        assert!(decoded.constants.is_empty());
+
+        let semantic = super::Ilean {
+            version: super::ILEAN_VERSION,
+            module: "Facade.Probe".to_owned(),
+            direct_imports: Vec::new(),
+            references: Default::default(),
+            decls: Default::default(),
+        };
+        let bytes = super::encode_ilean(&semantic, super::IleanBudget::default())
+            .expect("the public facade writes compact ilean JSON");
+        assert_eq!(
+            super::decode_ilean(&bytes, super::IleanBudget::default())
+                .expect("the public facade reads its ilean JSON"),
+            semantic
+        );
     }
 
     #[test]
