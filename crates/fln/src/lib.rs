@@ -9,7 +9,8 @@
 //! Prelude support. Already-elaborated axioms, definitions, theorems, opaques,
 //! and non-safe mutual definition blocks can also advance an immutable engine
 //! snapshot through admission and publication without compiling or executing a
-//! body.
+//! body. Embedders can also validate and execute an existing canonical FLBC
+//! artifact without reaching into the compiler or VM crates.
 
 #![forbid(unsafe_code)]
 
@@ -110,6 +111,28 @@ pub fn project_diagnostics(
         disposition: snapshot.exit_class(),
         semantic: snapshot.clone(),
     })
+}
+
+/// Independent resource ceilings for canonical FLBC decoding and execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlbcExecutionLimits {
+    pub codec: CodecLimits,
+    pub vm: VmExecutionLimits,
+}
+
+/// Validates and executes one canonical FLBC artifact through Golem.
+///
+/// Malformed or over-budget bytes are refused before execution. A valid
+/// artifact that exhausts a VM resource returns a typed non-answer. This door
+/// executes code only: it does not admit declarations, prove compiler
+/// provenance, or advance an [`Engine`] snapshot.
+pub fn execute_flbc_artifact(
+    artifact: &[u8],
+    options: &KVMap,
+    limits: FlbcExecutionLimits,
+) -> Result<Outcome<VmExit>, CodecError> {
+    let executable = fln_comp::flbc::decode_canonical(artifact, limits.codec)?;
+    Ok(execute_golem_with_options(&executable, options, limits.vm))
 }
 
 /// One immutable embeddable engine snapshot.
@@ -1572,12 +1595,14 @@ mod tests {
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
-        IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit, OpaqueVal, Outcome,
-        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, execute_golem_with_options,
+        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit,
+        OpaqueVal, Outcome, ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits,
+        execute_flbc_artifact, execute_golem_with_options,
     };
     use fln_comp::flbc::{
-        ArgumentOwnership, CallableResultOwnership, Function, FunctionId, Instruction, Program,
-        Register, ResultOwnership, ValidatedProgram, validate,
+        ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
+        Instruction, Program, Register, ResultOwnership, ValidatedProgram, encode_canonical,
+        validate,
     };
     use fln_core::diag::ResourceReason;
     use fln_core::options::DataValue;
@@ -1642,6 +1667,55 @@ mod tests {
                 None,
             ),
             Outcome::Complete(VmExit::Returned(_))
+        ));
+    }
+
+    #[test]
+    fn public_flbc_artifact_door_validates_executes_and_preserves_nonanswers() {
+        let program = validate(Program::new(
+            FunctionId::new(0),
+            vec![Function {
+                id: FunctionId::new(0),
+                arity: 0,
+                parameter_ownership: Vec::new(),
+                result_ownership: CallableResultOwnership::Scalar,
+                register_count: 1,
+                code: vec![
+                    Instruction::Nat {
+                        dst: Register::new(0),
+                        value: 41,
+                    },
+                    Instruction::Return {
+                        src: Register::new(0),
+                    },
+                ],
+            }],
+        ))
+        .expect("the public-door fixture is valid FLBC");
+        let artifact = encode_canonical(&program, CodecLimits::default())
+            .expect("the validated fixture has a canonical encoding");
+
+        let Outcome::Complete(VmExit::Returned(returned)) =
+            execute_flbc_artifact(&artifact, &KVMap::new(), FlbcExecutionLimits::default())
+                .expect("canonical bytes pass decoder validation")
+        else {
+            panic!("the small valid artifact must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 41);
+        drop(returned);
+
+        let mut malformed = artifact.clone();
+        malformed[0] ^= u8::MAX;
+        assert!(matches!(
+            execute_flbc_artifact(&malformed, &KVMap::new(), FlbcExecutionLimits::default()),
+            Err(CodecError::BadMagic)
+        ));
+
+        let mut limits = FlbcExecutionLimits::default();
+        limits.vm.max_steps = 0;
+        assert!(matches!(
+            execute_flbc_artifact(&artifact, &KVMap::new(), limits),
+            Ok(Outcome::Inconclusive(_))
         ));
     }
 
