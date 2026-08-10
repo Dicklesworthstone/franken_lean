@@ -7,8 +7,9 @@
 //! and file laws, `fln_rt::abi` for the object model) — never hand-written
 //! constants (Rule D5/D9).
 //!
-//! This is a pure by-value reader: stored pointers are interpreted as
-//! `base_addr`-relative file offsets and every dereference is bounds- and
+//! This is a pure by-value reader: stored pointers are interpreted against the
+//! file's compacted address range and, for module-system sidecars, the ordered
+//! ranges of their earlier `.olean` parts. Every dereference is bounds- and
 //! alignment-checked, so the reader needs no `unsafe` and no mmap-at-address.
 //! Malformed input yields a typed [`RegionError`], never a panic and never a
 //! silently-partial success (FL-INV-07 discipline), and traversal is
@@ -259,7 +260,14 @@ pub(crate) struct ModuleArrays {
 #[derive(Debug)]
 pub struct OleanView<'a> {
     bytes: &'a [u8],
+    dependencies: Vec<DependencyRegion<'a>>,
     pub header: OleanHeader,
+}
+
+#[derive(Debug)]
+struct DependencyRegion<'a> {
+    bytes: &'a [u8],
+    base_addr: u64,
 }
 
 fn field_offset(name: &str) -> u64 {
@@ -378,6 +386,7 @@ impl<'a> OleanView<'a> {
         };
         Ok(Self {
             bytes,
+            dependencies: Vec::new(),
             header: OleanHeader {
                 version: envelope.version,
                 flags,
@@ -386,6 +395,61 @@ impl<'a> OleanView<'a> {
                 base_addr: envelope.base_addr,
             },
         })
+    }
+
+    /// Parse one module-system sidecar with the compacted regions it may
+    /// reference, in load order.
+    ///
+    /// Lean writes `.olean.server` against the public `.olean` region and
+    /// `.olean.private` against both earlier regions. Stored pointers retain
+    /// those earlier regions' compacted addresses. A sidecar decoded as a
+    /// standalone file therefore has to refuse valid external pointers; this
+    /// constructor supplies the same dependency address space that Lean's
+    /// `CompactedRegion.read` receives without relocating or mutating bytes.
+    pub fn parse_with_dependencies(bytes: &'a [u8], dependencies: &[&'a [u8]]) -> RResult<Self> {
+        let mut view = Self::parse(bytes)?;
+        let mut regions = Vec::with_capacity(dependencies.len());
+        for bytes in dependencies {
+            let dependency = Self::parse(bytes)?;
+            regions.push(DependencyRegion {
+                bytes,
+                base_addr: dependency.header.base_addr,
+            });
+        }
+
+        let mut ranges = regions
+            .iter()
+            .map(|region| Self::address_range(region.base_addr, region.bytes.len()))
+            .collect::<RResult<Vec<_>>>()?;
+        ranges.push(Self::address_range(
+            view.header.base_addr,
+            view.bytes.len(),
+        )?);
+        ranges.sort_unstable_by_key(|range| range.0);
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(RegionError::DecodeShape {
+                offset: 0,
+                reason: "compacted dependency address ranges overlap",
+            });
+        }
+        view.dependencies = regions;
+        Ok(view)
+    }
+
+    fn address_range(base_addr: u64, len: usize) -> RResult<(u64, u64)> {
+        let start = base_addr
+            .checked_add(format::OLEAN_HEADER_SIZE as u64)
+            .ok_or(RegionError::DecodeShape {
+                offset: 0,
+                reason: "compacted region address range overflows",
+            })?;
+        let end = base_addr
+            .checked_add(len as u64)
+            .ok_or(RegionError::DecodeShape {
+                offset: 0,
+                reason: "compacted region address range overflows",
+            })?;
+        Ok((start, end))
     }
 
     /// Full-surface integrity audit through the SHARED region engine
@@ -415,6 +479,12 @@ impl<'a> OleanView<'a> {
     }
 
     pub(crate) fn read_u64(&self, off: u64) -> RResult<u64> {
+        if !self.dependencies.is_empty() && off >= self.bytes.len() as u64 {
+            let bytes = self.read_dependency_bytes(off, 8)?;
+            let mut word = [0_u8; 8];
+            word.copy_from_slice(bytes);
+            return Ok(u64::from_le_bytes(word));
+        }
         let end = off.checked_add(8).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
             len: self.bytes.len() as u64,
@@ -431,6 +501,9 @@ impl<'a> OleanView<'a> {
     }
 
     pub(crate) fn read_bytes(&self, off: u64, len: u64) -> RResult<&'a [u8]> {
+        if !self.dependencies.is_empty() && off >= self.bytes.len() as u64 {
+            return self.read_dependency_bytes(off, len);
+        }
         let end = off.checked_add(len).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
             len: self.bytes.len() as u64,
@@ -444,18 +517,81 @@ impl<'a> OleanView<'a> {
         Ok(&self.bytes[off as usize..end as usize])
     }
 
+    fn read_dependency_bytes(&self, address: u64, len: u64) -> RResult<&'a [u8]> {
+        let end = address.checked_add(len).ok_or(RegionError::Truncated {
+            wanted_end: u64::MAX,
+            len: 0,
+        })?;
+        for region in &self.dependencies {
+            let data_start = region
+                .base_addr
+                .saturating_add(format::OLEAN_HEADER_SIZE as u64);
+            let region_end = region.base_addr.saturating_add(region.bytes.len() as u64);
+            if address >= data_start && end <= region_end {
+                let start = (address - region.base_addr) as usize;
+                let end = (end - region.base_addr) as usize;
+                return Ok(&region.bytes[start..end]);
+            }
+        }
+        Err(RegionError::PtrOutOfBounds {
+            ptr: address,
+            resolved: address as i128 - self.header.base_addr as i128,
+        })
+    }
+
+    /// Whether `child` was serialized before `parent` in the compacted
+    /// module-part chain. Within one region this is the writer's strict
+    /// post-order offset law; every dependency region precedes the regions
+    /// loaded after it.
+    pub(crate) fn object_precedes(&self, child: u64, parent: u64) -> bool {
+        let position = |address: u64| {
+            if address < self.bytes.len() as u64 {
+                return Some((self.dependencies.len(), address));
+            }
+            self.dependencies
+                .iter()
+                .enumerate()
+                .find_map(|(index, region)| {
+                    let start = region
+                        .base_addr
+                        .saturating_add(format::OLEAN_HEADER_SIZE as u64);
+                    let end = region.base_addr.saturating_add(region.bytes.len() as u64);
+                    (address >= start && address < end)
+                        .then_some((index, address - region.base_addr))
+                })
+        };
+        matches!(
+            (position(child), position(parent)),
+            (Some((child_region, child_offset)), Some((parent_region, parent_offset)))
+                if child_region < parent_region
+                    || (child_region == parent_region && child_offset < parent_offset)
+        )
+    }
+
     /// Resolve a stored pointer to a file offset: the compactor rewrote every
     /// interior pointer to `base_addr + file_offset` (OLEAN_CONTRACT §1).
     pub(crate) fn deref(&self, ptr: u64) -> RResult<u64> {
         let resolved = ptr as i128 - self.header.base_addr as i128;
         let header_size = format::OLEAN_HEADER_SIZE as i128;
-        if resolved < header_size || resolved >= self.bytes.len() as i128 {
-            return Err(RegionError::PtrOutOfBounds { ptr, resolved });
+        if resolved >= header_size && resolved < self.bytes.len() as i128 {
+            if resolved % 8 != 0 {
+                return Err(RegionError::MisalignedPtr { ptr });
+            }
+            return Ok(resolved as u64);
         }
-        if resolved % 8 != 0 {
-            return Err(RegionError::MisalignedPtr { ptr });
+        for region in &self.dependencies {
+            let dependency_offset = ptr as i128 - region.base_addr as i128;
+            if dependency_offset >= header_size && dependency_offset < region.bytes.len() as i128 {
+                if dependency_offset % 8 != 0 {
+                    return Err(RegionError::MisalignedPtr { ptr });
+                }
+                // Dependency addresses remain absolute tokens. This preserves
+                // ordinary arithmetic (`off + field_offset`) while keeping
+                // the primary file's long-standing file-offset diagnostics.
+                return Ok(ptr);
+            }
         }
-        Ok(resolved as u64)
+        Err(RegionError::PtrOutOfBounds { ptr, resolved })
     }
 
     /// Read a compacted `lean_object` header at a file offset: `m_rc` (i32),
@@ -1094,6 +1230,7 @@ impl MappedOlean {
     pub fn view(&self) -> OleanView<'_> {
         OleanView {
             bytes: self.mapping.as_slice(),
+            dependencies: Vec::new(),
             header: self.header.clone(),
         }
     }

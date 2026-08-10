@@ -293,7 +293,7 @@ impl<'a> DeclDecoder<'a> {
                 let child = self.view.read_u64(off + 8 + 8 * i)?;
                 if !Self::is_scalar(child) {
                     let coff = self.view.deref(child)?;
-                    if coff >= off {
+                    if !self.view.object_precedes(coff, off) {
                         // The writer's post-order law: every heap child resolves
                         // strictly below its parent. A violation means a cycle,
                         // and a cycle never builds a node, so no budget would
@@ -589,7 +589,7 @@ impl<'a> DeclDecoder<'a> {
                     });
                 }
                 let coff = self.view.deref(child)?;
-                if coff >= off {
+                if !self.view.object_precedes(coff, off) {
                     // The writer's post-order law: every heap child resolves
                     // strictly below its parent. A violation means a cycle, and
                     // a cycle never builds a node, so the decode budget would
