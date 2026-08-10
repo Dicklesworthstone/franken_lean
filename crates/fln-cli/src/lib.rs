@@ -37,11 +37,13 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
+const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/1";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/2";
 
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln run [--json] [--max-bytes BYTES] PATH...\n",
+    "  fln flbc run [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
@@ -59,6 +61,9 @@ const USAGE: &str = concat!(
     "batch is atomic, and --max-bytes bounds all source inputs together. It is\n",
     "not general Lean, Prelude/import processing, a project build, or evidence\n",
     "that `check-olean` is complete.\n",
+    "\n",
+    "`flbc run` validates and executes one canonical FLBC artifact through Golem.\n",
+    "It does not admit declarations or prove how the artifact was compiled.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -93,6 +98,11 @@ enum MultiplexerCommand {
     Version,
     SourceRun {
         paths: Vec<PathBuf>,
+        max_bytes: usize,
+        json: bool,
+    },
+    FlbcRun {
+        path: PathBuf,
         max_bytes: usize,
         json: bool,
     },
@@ -279,6 +289,27 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     })
 }
 
+fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) = parse_path_options(
+        arguments,
+        "flbc run",
+        fln::CodecLimits::default().max_artifact_bytes,
+    )?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "flbc run accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::FlbcRun {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let Some((paths, max_bytes, json)) =
         parse_path_options(arguments, "olean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
@@ -333,6 +364,21 @@ fn parse_command(
     }
     if command == "run" {
         return parse_source_run(arguments.collect());
+    }
+    if command == "flbc" {
+        let Some(subcommand) = arguments.next() else {
+            return Err(UsageError("flbc requires the `run` subcommand".to_owned()));
+        };
+        if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if subcommand == "run" {
+            return parse_flbc_run(arguments.collect());
+        }
+        return Err(UsageError(format!(
+            "unknown flbc subcommand {:?}",
+            subcommand.to_string_lossy()
+        )));
     }
     if command != "olean" {
         return Err(UsageError(format!(
@@ -409,6 +455,198 @@ fn read_bounded(
         detail: format!("cannot open {}: {error}", path.display()),
     })?;
     read_bounded_from(&mut file, max_bytes, subject)
+}
+
+fn vm_value_kind_name(kind: fln::VmValueKind) -> String {
+    match kind {
+        fln::VmValueKind::Scalar => "scalar".to_owned(),
+        fln::VmValueKind::Ctor(tag) => format!("constructor:{tag}"),
+        fln::VmValueKind::Promise => "promise".to_owned(),
+        fln::VmValueKind::Closure => "closure".to_owned(),
+        fln::VmValueKind::Array => "array".to_owned(),
+        fln::VmValueKind::StructArray => "struct-array".to_owned(),
+        fln::VmValueKind::ScalarArray => "scalar-array".to_owned(),
+        fln::VmValueKind::String => "string".to_owned(),
+        fln::VmValueKind::Mpz => "mpz".to_owned(),
+        fln::VmValueKind::Thunk => "thunk".to_owned(),
+        fln::VmValueKind::Task => "task".to_owned(),
+        fln::VmValueKind::Ref => "reference".to_owned(),
+        fln::VmValueKind::External => "external".to_owned(),
+        fln::VmValueKind::Reserved => "reserved".to_owned(),
+    }
+}
+
+fn render_flbc_success(bytes: usize, returned: &fln::VmExit, json: bool) -> MultiplexerOutput {
+    let fln::VmExit::Returned(returned) = returned else {
+        return flbc_failure(
+            "internal-fault",
+            "non-returning VM exit reached the FLBC success renderer",
+            false,
+            None,
+            json,
+            4,
+        );
+    };
+    let kind = vm_value_kind_name(fln::vm_value_kind(&returned.value));
+    let scalar = returned.value.is_scalar().then(|| returned.value.unbox());
+    let usage = (
+        returned.usage.steps,
+        returned.usage.system_polls,
+        returned.usage.peak_stack_depth,
+    );
+    let stdout = if json {
+        let value = scalar
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned());
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "\"artifactBytes\":{},\"returnKind\":{},\"scalarValue\":{},",
+                "\"execution\":{{\"steps\":{},\"systemPolls\":{},",
+                "\"peakStackDepth\":{}}}}}\n"
+            ),
+            json_string(FLBC_RUN_SCHEMA),
+            bytes,
+            json_string(&kind),
+            value,
+            usage.0,
+            usage.1,
+            usage.2,
+        )
+    } else {
+        let value = scalar
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not a scalar".to_owned());
+        format!(
+            concat!(
+                "canonical FLBC execution: complete\n",
+                "artifact bytes: {}\n",
+                "return kind: {}\n",
+                "scalar value: {}\n",
+                "execution: {} steps, {} system polls, peak stack {}\n"
+            ),
+            bytes, kind, value, usage.0, usage.1, usage.2,
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn flbc_failure(
+    class: &'static str,
+    detail: &str,
+    authority: bool,
+    usage: Option<(u64, u64, u64)>,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
+    let detail = BoundedText::new(detail.to_owned());
+    let stderr = if json {
+        let usage = usage
+            .map(|(steps, polls, peak)| {
+                format!("{{\"steps\":{steps},\"systemPolls\":{polls},\"peakStackDepth\":{peak}}}")
+            })
+            .unwrap_or_else(|| "null".to_owned());
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{},",
+                "\"execution\":{}}}\n"
+            ),
+            json_string(FLBC_RUN_SCHEMA),
+            authority,
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+            usage,
+        )
+    } else {
+        let usage = usage
+            .map(|(steps, polls, peak)| {
+                format!("\nexecution: {steps} steps, {polls} system polls, peak stack {peak}")
+            })
+            .unwrap_or_default();
+        let truncation = if detail.truncated() {
+            format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
+        } else {
+            String::new()
+        };
+        format!(
+            "fln flbc run: {class}: {}{usage}{truncation}\n",
+            detail.text()
+        )
+    };
+    MultiplexerOutput::failure(stderr, exit_code)
+}
+
+fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let mut limits = fln::FlbcExecutionLimits::default();
+    limits.codec.max_artifact_bytes = max_bytes;
+    let outcome = match fln::execute_flbc_artifact(bytes, &fln::KVMap::new(), limits) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (class, authority, exit_code) = match error {
+                fln::CodecError::ResourceLimit { .. }
+                | fln::CodecError::AllocationFailure { .. } => ("resource", false, 3),
+                _ => ("codec", true, 1),
+            };
+            return flbc_failure(class, &error.to_string(), authority, None, json, exit_code);
+        }
+    };
+    match outcome {
+        fln::Outcome::Complete(exit @ fln::VmExit::Returned(_)) => {
+            render_flbc_success(bytes.len(), &exit, json)
+        }
+        fln::Outcome::Complete(fln::VmExit::Panicked { message, usage }) => flbc_failure(
+            "program-panic",
+            &message,
+            true,
+            Some((usage.steps, usage.system_polls, usage.peak_stack_depth)),
+            json,
+            1,
+        ),
+        fln::Outcome::Complete(fln::VmExit::Refused { refusal, usage }) => flbc_failure(
+            "vm-refusal",
+            &refusal.to_string(),
+            true,
+            Some((usage.steps, usage.system_polls, usage.peak_stack_depth)),
+            json,
+            1,
+        ),
+        fln::Outcome::Inconclusive(inconclusive) => flbc_failure(
+            "inconclusive",
+            &format!("{inconclusive:?}"),
+            false,
+            None,
+            json,
+            3,
+        ),
+        fln::Outcome::InternalFault(fault) => flbc_failure(
+            "internal-fault",
+            &format!("{fault:?}"),
+            false,
+            None,
+            json,
+            4,
+        ),
+    }
+}
+
+fn run_flbc(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let bytes = match read_bounded(path, max_bytes, "FLBC artifact") {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let class = error.class();
+            return flbc_failure(
+                class,
+                &error.to_string(),
+                false,
+                None,
+                json,
+                if class == "resource" { 3 } else { 1 },
+            );
+        }
+    };
+    execute_flbc_bytes(&bytes, max_bytes, json)
 }
 
 fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
@@ -1041,6 +1279,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => run_sources(&paths, max_bytes, json),
+        Ok(MultiplexerCommand::FlbcRun {
+            path,
+            max_bytes,
+            json,
+        }) => run_flbc(&path, max_bytes, json),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
@@ -1487,9 +1730,9 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_SCHEMA, execute_source_bytes,
-        execution_error_disposition, inspect_olean_bytes, read_bounded_from, run, source_failure,
-        verify_olean_rebuild_bytes,
+        FLBC_RUN_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES,
+        SOURCE_RUN_SCHEMA, execute_flbc_bytes, execute_source_bytes, execution_error_disposition,
+        inspect_olean_bytes, read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -1505,6 +1748,79 @@ mod tests {
             .find(|candidate| candidate.join("crates/fln-cli/Cargo.toml").is_file())
             .expect("the test is invoked from inside the FrankenLean workspace");
         root.join(relative)
+    }
+
+    fn scalar_flbc_fixture(value: u64) -> Vec<u8> {
+        let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+        let engine = fln::Engine::with_nat_seed(kernel).expect("the Nat seed is valid");
+        let source = format!("def flbcFixture : Nat := {value}");
+        let outcome = engine
+            .execute_nat_definition(
+                source.as_bytes(),
+                &fln::KVMap::new(),
+                fln::EngineExecutionLimits::new(kernel),
+            )
+            .expect("the fixture source reaches the engine");
+        let fln::Outcome::Complete(execution) = outcome else {
+            panic!("the fixture source must execute authoritatively");
+        };
+        execution.flbc_artifact
+    }
+
+    #[test]
+    fn flbc_run_executes_canonical_bytes_and_preserves_typed_stops() {
+        let artifact = scalar_flbc_fixture(73);
+        let robot = execute_flbc_bytes(&artifact, artifact.len(), true);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{FLBC_RUN_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"authority\":true"));
+        assert!(robot.stdout.contains("\"returnKind\":\"scalar\""));
+        assert!(robot.stdout.contains("\"scalarValue\":73"));
+
+        let human = execute_flbc_bytes(&artifact, artifact.len(), false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stdout.contains("canonical FLBC execution: complete"));
+        assert!(human.stdout.contains("scalar value: 73"));
+
+        let mut malformed = artifact.clone();
+        malformed[0] ^= u8::MAX;
+        let invalid = execute_flbc_bytes(&malformed, malformed.len(), true);
+        assert_eq!(invalid.exit_code, 1);
+        assert!(invalid.stdout.is_empty());
+        assert!(invalid.stderr.contains("\"authority\":true"));
+        assert!(invalid.stderr.contains("\"class\":\"codec\""));
+        assert!(invalid.stderr.contains("FLBC artifact magic mismatch"));
+
+        let exhausted = execute_flbc_bytes(&artifact, artifact.len() - 1, true);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"authority\":false"));
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+    }
+
+    #[test]
+    fn flbc_run_requires_exactly_one_path() {
+        let missing = run([OsString::from("flbc"), OsString::from("run")]);
+        assert_eq!(missing.exit_code, 2);
+        assert!(missing.stderr.contains("flbc run requires PATH"));
+
+        let extra = run([
+            OsString::from("flbc"),
+            OsString::from("run"),
+            OsString::from("first.flbc"),
+            OsString::from("second.flbc"),
+        ]);
+        assert_eq!(extra.exit_code, 2);
+        assert!(
+            extra
+                .stderr
+                .contains("flbc run accepts exactly one input path")
+        );
     }
 
     #[test]

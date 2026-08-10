@@ -72,7 +72,10 @@ pub use fln_olean::region::{
     WalkBudget as OleanWalkBudget, WalkReport as OleanWalkReport,
 };
 use fln_vm::interpreter::CommandExecutionContext;
-pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
+pub use fln_vm::interpreter::{
+    ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit,
+    value_kind as vm_value_kind,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 
