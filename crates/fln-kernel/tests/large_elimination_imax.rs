@@ -26,6 +26,8 @@
 //! single-type recursive/reflexive (`W`, Acc-shaped), a two-type MUTUAL block
 //! (`P`/`Q`) whose recursors each carry every block motive, and an INDEXED inductive
 //! (`Ix : A → Type`) whose recursor motive, minor, and major all carry the index.
+//! It also guards the REJECTION direction (soundness): a non-strictly-positive
+//! `Bad : Type` (`Bad.mk : (Bad → Bad) → Bad`) must be refused by KR-606.
 
 #![forbid(unsafe_code)]
 
@@ -703,5 +705,67 @@ fn indexed_inductive_block_admits() {
         ),
         "an indexed inductive `Ix : A → Type` must admit, exercising the recursor's \
          index-carrying motive/minor/major regeneration; got {verdict:?}"
+    );
+}
+
+/// SOUNDNESS boundary: `Bad : Type` with `Bad.mk : (Bad → Bad) → Bad` is
+/// non-strictly-positive — `Bad` occurs in the DOMAIN of the field's arrow (a
+/// negative position). The KR-606 strict-positivity check (admit.rs:948) must
+/// REJECT it; accepting it would admit a type enabling non-termination/paradox.
+fn bad_block() -> InductiveBlock {
+    let bad = || Expr::const_(n("Bad"), vec![]);
+    InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: n("Bad"),
+                level_params: vec![],
+                type_: sort(Level::one()),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![n("Bad")],
+            ctors: vec![nn("Bad", "mk")],
+            num_nested: 0,
+            is_rec: true,
+            is_unsafe: false,
+            is_reflexive: true,
+        }],
+        ctors: vec![ConstructorVal {
+            base: ConstantVal {
+                name: nn("Bad", "mk"),
+                level_params: vec![],
+                // (Bad → Bad) → Bad : `Bad` in the domain of the field arrow (negative)
+                type_: forall("f", forall("_x", bad(), bad()), bad()),
+            },
+            induct: n("Bad"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }],
+        recursors: vec![],
+    }
+}
+
+#[test]
+fn non_strictly_positive_inductive_is_rejected() {
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(bad_block()),
+        Budget::DEFAULT,
+    );
+    // Assert the SPECIFIC positivity reason, not merely "rejected": both the KR-606
+    // check and the empty-recursor arity check reject with BlockMismatch, so a bare
+    // is_rejected() would pass even if positivity silently regressed. The `matches!`
+    // guard keeps the check panic-free.
+    let rejected_for_positivity = matches!(
+        &verdict,
+        fln_core::outcome::Outcome::Complete(Verdict::Rejected { message, .. })
+            if message.contains("non positive occurrence")
+    );
+    assert!(
+        rejected_for_positivity,
+        "Bad.mk : (Bad → Bad) → Bad must be rejected by KR-606 strict positivity \
+         specifically; got {verdict:?}"
     );
 }
