@@ -27,7 +27,9 @@
 //! (`P`/`Q`) whose recursors each carry every block motive, and an INDEXED inductive
 //! (`Ix : A → Type`) whose recursor motive, minor, and major all carry the index.
 //! It also guards the REJECTION direction (soundness): a non-strictly-positive
-//! `Bad : Type` (`Bad.mk : (Bad → Bad) → Bad`) must be refused by KR-606.
+//! `Bad : Type` (`Bad.mk : (Bad → Bad) → Bad`) must be refused by KR-606, and a
+//! universe-too-large field (`Big : Type` with `Big.mk : Type → Big`, Girard's
+//! paradox) must be refused by the field-universe check.
 
 #![forbid(unsafe_code)]
 
@@ -767,5 +769,63 @@ fn non_strictly_positive_inductive_is_rejected() {
         rejected_for_positivity,
         "Bad.mk : (Bad → Bad) → Bad must be rejected by KR-606 strict positivity \
          specifically; got {verdict:?}"
+    );
+}
+
+/// SOUNDNESS boundary (Girard): `Big : Type` with `Big.mk : Type → Big` has a
+/// field `α : Type` living in `Sort 2`, too big for `Big`'s `Sort 1`. A `Type`
+/// containing all `Type`s is `Type : Type` and admits Girard's paradox, so the
+/// field-universe check (admit.rs:1085) must refuse it. (Not a Prop, so the
+/// `result_level.is_zero()` impredicativity escape does not apply.)
+fn big_block() -> InductiveBlock {
+    InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: n("Big"),
+                level_params: vec![],
+                type_: sort(Level::one()), // Big : Type = Sort 1
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![n("Big")],
+            ctors: vec![nn("Big", "mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }],
+        ctors: vec![ConstructorVal {
+            base: ConstantVal {
+                name: nn("Big", "mk"),
+                level_params: vec![],
+                // Big.mk : Type → Big ; field `α : Type` (Sort 1) lives in Sort 2 > Big's Sort 1
+                type_: forall("α", sort(Level::one()), Expr::const_(n("Big"), vec![])),
+            },
+            induct: n("Big"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }],
+        recursors: vec![],
+    }
+}
+
+#[test]
+fn constructor_field_universe_too_large_is_rejected() {
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(big_block()),
+        Budget::DEFAULT,
+    );
+    let rejected_for_universe = matches!(
+        &verdict,
+        fln_core::outcome::Outcome::Complete(Verdict::Rejected { message, .. })
+            if message.contains("too big")
+    );
+    assert!(
+        rejected_for_universe,
+        "Big : Type with Big.mk : Type → Big has a field living in Sort 2, too big for \
+         Big's Sort 1, and must be rejected by the field-universe check; got {verdict:?}"
     );
 }
