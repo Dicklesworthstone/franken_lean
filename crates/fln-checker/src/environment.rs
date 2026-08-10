@@ -256,10 +256,9 @@ fn constant_node(
 }
 
 fn rotate_constant_left(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
-    let right = root
-        .right
-        .as_ref()
-        .expect("an AVL left rotation requires a right child");
+    let Some(right) = root.right.as_ref() else {
+        return root;
+    };
     let new_left = constant_node(
         root.name.clone(),
         Arc::clone(&root.declaration),
@@ -275,10 +274,9 @@ fn rotate_constant_left(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
 }
 
 fn rotate_constant_right(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
-    let left = root
-        .left
-        .as_ref()
-        .expect("an AVL right rotation requires a left child");
+    let Some(left) = root.left.as_ref() else {
+        return root;
+    };
     let new_right = constant_node(
         root.name.clone(),
         Arc::clone(&root.declaration),
@@ -296,10 +294,9 @@ fn rotate_constant_right(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
 fn balance_constant_node(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
     let balance = i64::from(node_height(&root.left)) - i64::from(node_height(&root.right));
     if balance > 1 {
-        let left = root
-            .left
-            .as_ref()
-            .expect("a left-heavy AVL node has a left child");
+        let Some(left) = root.left.as_ref() else {
+            return root;
+        };
         let root = if node_height(&left.right) > node_height(&left.left) {
             constant_node(
                 root.name.clone(),
@@ -312,10 +309,9 @@ fn balance_constant_node(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
         };
         rotate_constant_right(root)
     } else if balance < -1 {
-        let right = root
-            .right
-            .as_ref()
-            .expect("a right-heavy AVL node has a right child");
+        let Some(right) = root.right.as_ref() else {
+            return root;
+        };
         let root = if node_height(&right.left) > node_height(&right.right) {
             constant_node(
                 root.name.clone(),
@@ -1215,16 +1211,16 @@ mod tests {
     fn declaration_arc(
         environment: &ConstantEnvironment,
         name: &WireName,
-    ) -> Arc<ConstantDeclaration> {
+    ) -> Option<Arc<ConstantDeclaration>> {
         let mut current = environment.constants.as_deref();
         while let Some(node) = current {
             match name.cmp(&node.name) {
                 std::cmp::Ordering::Less => current = node.left.as_deref(),
                 std::cmp::Ordering::Greater => current = node.right.as_deref(),
-                std::cmp::Ordering::Equal => return Arc::clone(&node.declaration),
+                std::cmp::Ordering::Equal => return Some(Arc::clone(&node.declaration)),
             }
         }
-        panic!("test fixture constant was not retained")
+        None
     }
 
     fn assert_balanced(node: &Option<Arc<ConstantNode>>) -> (u32, usize) {
@@ -1245,15 +1241,20 @@ mod tests {
     fn reverse_order_extensions_remain_balanced_and_canonically_iterable() {
         let mut environment = ConstantEnvironment::empty();
         for index in (0..127).rev() {
+            let outcome = environment.extend(
+                named_entry(&format!("constant_{index:03}")),
+                EnvironmentBudget::unlimited(),
+            );
+            assert!(
+                matches!(&outcome, EnvironmentOutcome::Complete { .. }),
+                "each unique valid extension must complete"
+            );
             let EnvironmentOutcome::Complete {
                 environment: successor,
                 ..
-            } = environment.extend(
-                named_entry(&format!("constant_{index:03}")),
-                EnvironmentBudget::unlimited(),
-            )
+            } = outcome
             else {
-                panic!("each unique valid extension must complete");
+                return;
             };
             environment = successor;
         }
@@ -1271,33 +1272,51 @@ mod tests {
 
     #[test]
     fn extension_structurally_shares_every_retained_declaration() {
-        let EnvironmentOutcome::Complete {
-            environment: base, ..
-        } = ConstantEnvironment::build(
+        let outcome = ConstantEnvironment::build(
             vec![
                 named_entry("alpha"),
                 named_entry("middle"),
                 named_entry("zeta"),
             ],
             EnvironmentBudget::unlimited(),
-        )
+        );
+        assert!(
+            matches!(&outcome, EnvironmentOutcome::Complete { .. }),
+            "the valid base fixture must build"
+        );
+        let EnvironmentOutcome::Complete {
+            environment: base, ..
+        } = outcome
         else {
-            panic!("the valid base fixture must build");
+            return;
         };
         let retained = ["alpha", "middle", "zeta"].map(|name| {
             let name = WireName::from_parts(vec![NamePart::Text(name.to_owned())]);
             (name.clone(), declaration_arc(&base, &name))
         });
+        let outcome = base.extend(named_entry("omega"), EnvironmentBudget::unlimited());
+        assert!(
+            matches!(&outcome, EnvironmentOutcome::Complete { .. }),
+            "the valid extension fixture must build"
+        );
         let EnvironmentOutcome::Complete {
             environment: extended,
             ..
-        } = base.extend(named_entry("omega"), EnvironmentBudget::unlimited())
+        } = outcome
         else {
-            panic!("the valid extension fixture must build");
+            return;
         };
 
         for (name, before) in retained {
+            assert!(before.is_some(), "the base must retain every fixture row");
+            let Some(before) = before else {
+                return;
+            };
             let after = declaration_arc(&extended, &name);
+            assert!(after.is_some(), "the extension must retain every base row");
+            let Some(after) = after else {
+                return;
+            };
             assert!(Arc::ptr_eq(&before, &after));
         }
         assert_eq!(base.len(), 3);

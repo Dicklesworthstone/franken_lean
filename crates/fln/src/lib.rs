@@ -1424,8 +1424,12 @@ mod tests {
         let answer = engine
             .execute_nat_definition(b"def answer := 41", &options, test_limits())
             .expect("the first definition establishes the retained checker projection");
+        assert!(
+            matches!(&answer, Outcome::Complete(_)),
+            "the small bounded run must answer completely"
+        );
         let Outcome::Complete(answer) = answer else {
-            panic!("the small bounded run must answer completely");
+            return;
         };
 
         let mut candidate_only = test_limits();
@@ -1447,12 +1451,20 @@ mod tests {
                 candidate_only,
             )
             .expect("a retained base leaves the one-constant budget for the candidate");
+        assert!(
+            matches!(&copied, Outcome::Complete(_)),
+            "the retained checker projection must answer completely"
+        );
         let Outcome::Complete(copied) = copied else {
-            panic!("the retained checker projection must answer completely");
+            return;
         };
         assert!(copied.engine.environment().contains(&copy_name));
+        assert!(
+            matches!(&copied.exit, VmExit::Returned(_)),
+            "the checked dependency must execute after retained admission"
+        );
         let VmExit::Returned(returned) = copied.exit else {
-            panic!("the checked dependency must execute after retained admission");
+            return;
         };
         assert_eq!(returned.value.unbox(), 41);
 
