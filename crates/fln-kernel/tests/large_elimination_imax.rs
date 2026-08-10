@@ -18,6 +18,13 @@
 //! accepted ONLY when the field is recognised as a Prop and the motive universe
 //! is regenerated. Under the pre-`bbb464f1` code the regenerated recursor is one
 //! level-parameter short and the block is a `BlockMismatch`.
+//!
+//! These are also the only fast unit tests that admit an `InductiveBlock` through
+//! the public authority at all (the admission engine is otherwise exercised only by
+//! the Reference differential / corpus lane), so this file additionally guards the
+//! recursor-regeneration paths those cases reach: single-type non-recursive (`T`),
+//! single-type recursive/reflexive (`W`, Acc-shaped), and a two-type MUTUAL block
+//! (`P`/`Q`) whose recursors each carry every block motive.
 
 #![forbid(unsafe_code)]
 
@@ -407,6 +414,147 @@ fn recursive_imax_field_permits_large_elimination() {
         ),
         "W (Acc-shaped recursive Prop) with an `imax u 0` recursive field must permit \
          large elimination via the recursive recursor path (bead franken_lean-d17i); \
+         got {verdict:?}"
+    );
+}
+
+/// A minimal MUTUAL inductive block `{P, Q}` — both `Type`, nullary constructors,
+/// no cross-reference — admitted through the public authority. This is a genuinely
+/// distinct admission path from the single-type cases above: `generate_recursors`
+/// emits EACH recursor carrying ALL block motives (`motive_1`, `motive_2`) and ALL
+/// minors (`p`, `q`), the mutual recursor regeneration that otherwise only the
+/// Reference differential / corpus lane exercises. A fast per-commit guard for it.
+fn pq_block(u: &Name) -> InductiveBlock {
+    let p = || Expr::const_(n("P"), vec![]);
+    let q = || Expr::const_(n("Q"), vec![]);
+    let pp = || Expr::const_(nn("P", "p"), vec![]);
+    let qq = || Expr::const_(nn("Q", "q"), vec![]);
+    let sort_u = || sort(Level::param(u.clone()));
+    let type1 = || sort(Level::one());
+
+    // motive_1 : P → Sort u ; motive_2 : Q → Sort u  (closed, no bvars)
+    let motive1_ty = || forall("t", p(), sort_u());
+    let motive2_ty = || forall("t", q(), sort_u());
+    // minor types: `p : motive_1 P.p` (scope m1=1,m2=0), `q : motive_2 Q.q` (scope m1=2,m2=1,p=0)
+    let minor_p_ty = || Expr::app(bvar(1), pp());
+    let minor_q_ty = || Expr::app(bvar(1), qq());
+
+    // {motive_1}{motive_2}(p)(q)(t : major), motive_{result} t
+    //   scope at result: m1=4,m2=3,p=2,q=1,t=0
+    let rec_type = |major: Expr, result_motive: u32| {
+        forall_impl(
+            "motive_1",
+            motive1_ty(),
+            forall_impl(
+                "motive_2",
+                motive2_ty(),
+                forall(
+                    "p",
+                    minor_p_ty(),
+                    forall(
+                        "q",
+                        minor_q_ty(),
+                        forall("t", major, Expr::app(bvar(result_motive), bvar(0))),
+                    ),
+                ),
+            ),
+        )
+    };
+    // rhs: fun motive_1 motive_2 p q => <minor>  (no fields/ihs); scope m1=3,m2=2,p=1,q=0
+    let rec_rhs = |minor: u32| {
+        lam(
+            "motive_1",
+            motive1_ty(),
+            lam(
+                "motive_2",
+                motive2_ty(),
+                lam("p", minor_p_ty(), lam("q", minor_q_ty(), bvar(minor))),
+            ),
+        )
+    };
+
+    let recursor = |name: Name, ctor: Name, ty: Expr, rhs: Expr| RecursorVal {
+        base: ConstantVal {
+            name,
+            level_params: vec![u.clone()],
+            type_: ty,
+        },
+        all: vec![n("P"), n("Q")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 2,
+        num_minors: 2,
+        rules: vec![RecursorRule {
+            ctor,
+            nfields: 0,
+            rhs,
+        }],
+        k: false,
+        is_unsafe: false,
+    };
+
+    let inductive = |name: Name, ctor: Name| InductiveVal {
+        base: ConstantVal {
+            name,
+            level_params: vec![],
+            type_: type1(),
+        },
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("P"), n("Q")],
+        ctors: vec![ctor],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let ctor = |name: Name, induct: Name, ty: Expr| ConstructorVal {
+        base: ConstantVal {
+            name,
+            level_params: vec![],
+            type_: ty,
+        },
+        induct,
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+
+    InductiveBlock {
+        types: vec![
+            inductive(n("P"), nn("P", "p")),
+            inductive(n("Q"), nn("Q", "q")),
+        ],
+        ctors: vec![
+            ctor(nn("P", "p"), n("P"), p()),
+            ctor(nn("Q", "q"), n("Q"), q()),
+        ],
+        // P.rec result is motive_1 (bvar 4); Q.rec result is motive_2 (bvar 3).
+        // P.rec.(P.p) ↦ p (minor bvar 1); Q.rec.(Q.q) ↦ q (minor bvar 0).
+        recursors: vec![
+            recursor(nn("P", "rec"), nn("P", "p"), rec_type(p(), 4), rec_rhs(1)),
+            recursor(nn("Q", "rec"), nn("Q", "q"), rec_type(q(), 3), rec_rhs(0)),
+        ],
+    }
+}
+
+#[test]
+fn mutual_inductive_block_admits() {
+    let u = n("u");
+    let block = pq_block(&u);
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(block),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "a two-type mutual inductive block must admit, exercising cross-motive \
+         recursor regeneration (both `motive_1` and `motive_2` in each recursor); \
          got {verdict:?}"
     );
 }
