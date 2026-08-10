@@ -1169,11 +1169,12 @@ mod tests {
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
 
     fn repository_path(relative: &str) -> PathBuf {
-        std::env::var_os("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .expect("cargo identifies the invoking crate directory")
-            .join("../..")
-            .join(relative)
+        let invoked_from = std::env::current_dir().expect("the test has an invocation directory");
+        let root = invoked_from
+            .ancestors()
+            .find(|candidate| candidate.join("crates/fln-cli/Cargo.toml").is_file())
+            .expect("the test is invoked from inside the FrankenLean workspace");
+        root.join(relative)
     }
 
     #[test]
