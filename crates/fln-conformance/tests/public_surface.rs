@@ -218,9 +218,13 @@ fn generated_consumer_compile() {
 
 #[test]
 fn public_surface_drift_model() {
+    let contract_root = CONTRACT_TEXT
+        .lines()
+        .find(|line| line.starts_with("contract-root "))
+        .expect("canonical contract root row");
     let corrupted_root = replace_once(
         CONTRACT_TEXT,
-        "contract-root fnv1a64:b609240f0801118b",
+        contract_root,
         "contract-root fnv1a64:0000000000000000",
     );
     PublicSurfaceContract::parse(&corrupted_root).expect_err("root drift must be refused");
