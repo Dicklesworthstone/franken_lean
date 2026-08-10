@@ -125,9 +125,10 @@ impl Engine {
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
-    /// and execute one bounded Nat-valued definition command. The source value
-    /// may be a natural literal, a constant identifier, or a saturated
-    /// identifier-headed application of those atom forms.
+    /// and execute one bounded Nat-valued definition command. The declaration
+    /// may have explicit `Nat` parameters; its body may be a natural literal, a
+    /// reference, or a saturated identifier-headed application of those atom
+    /// forms.
     ///
     /// The publication council is explicitly empty because no independent
     /// checker is configured on this bounded facade yet. This is a real K1
@@ -1378,6 +1379,47 @@ mod tests {
             panic!("the dependent second definition must return normally");
         };
         assert_eq!(returned.value.unbox(), 1);
+    }
+
+    #[test]
+    fn bounded_source_batch_composes_first_order_nat_functions() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let sources: [&[u8]; 3] = [
+            b"def first (x : Nat) (y : Nat) := x",
+            b"def choose (x : Nat) := first x 29",
+            b"def selected := choose 17",
+        ];
+        let completed = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect("composed source-defined functions execute atomically");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the bounded source project must answer completely");
+        };
+
+        assert_eq!(completed.executions.len(), 3);
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["first"]))
+        );
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["choose"]))
+        );
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["selected"]))
+        );
+        let VmExit::Returned(returned) = &completed.executions[2].exit else {
+            panic!("the source call must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 17);
     }
 
     #[test]
