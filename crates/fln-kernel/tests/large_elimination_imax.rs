@@ -29,7 +29,8 @@
 //! It also guards the REJECTION direction (soundness): a non-strictly-positive
 //! `Bad : Type` (`Bad.mk : (Bad → Bad) → Bad`) must be refused by KR-606, and a
 //! universe-too-large field (`Big : Type` with `Big.mk : Type → Big`, Girard's
-//! paradox) must be refused by the field-universe check.
+//! paradox) must be refused by the field-universe check, and a constructor whose
+//! result is a foreign type (`Wrong.mk : A`) must be refused by the return-type check.
 
 #![forbid(unsafe_code)]
 
@@ -827,5 +828,61 @@ fn constructor_field_universe_too_large_is_rejected() {
         rejected_for_universe,
         "Big : Type with Big.mk : Type → Big has a field living in Sort 2, too big for \
          Big's Sort 1, and must be rejected by the field-universe check; got {verdict:?}"
+    );
+}
+
+/// WELL-FORMEDNESS boundary: a constructor of `Wrong` must PRODUCE `Wrong`.
+/// `Wrong.mk : A` (result `A`, a foreign axiom type) does not, so the return-type
+/// check (admit.rs:1109) must refuse it — a ctor producing a foreign type would
+/// let the recursor case-analyse values that are not of the datatype at all.
+fn wrong_result_block() -> InductiveBlock {
+    InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: n("Wrong"),
+                level_params: vec![],
+                type_: sort(Level::one()),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![n("Wrong")],
+            ctors: vec![nn("Wrong", "mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }],
+        ctors: vec![ConstructorVal {
+            base: ConstantVal {
+                name: nn("Wrong", "mk"),
+                level_params: vec![],
+                type_: Expr::const_(n("A"), vec![]), // Wrong.mk : A — result A, not Wrong
+            },
+            induct: n("Wrong"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        }],
+        recursors: vec![],
+    }
+}
+
+#[test]
+fn constructor_with_foreign_result_type_is_rejected() {
+    let verdict = check(
+        &env_with_a(),
+        &Declaration::Inductive(wrong_result_block()),
+        Budget::DEFAULT,
+    );
+    let rejected = matches!(
+        &verdict,
+        fln_core::outcome::Outcome::Complete(Verdict::Rejected { message, .. })
+            if message.contains("invalid return type")
+    );
+    assert!(
+        rejected,
+        "Wrong.mk : A (result A, not Wrong) must be rejected as an invalid constructor \
+         return type; got {verdict:?}"
     );
 }
