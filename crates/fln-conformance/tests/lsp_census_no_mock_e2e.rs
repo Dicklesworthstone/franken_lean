@@ -453,6 +453,25 @@ fn normalize_session_ids(message: &str) -> String {
     output
 }
 
+const NORMALIZED_SERVER_REQUEST_ID: &str = "SERVER_REQUEST";
+
+fn normalize_server_request_id(message: &str) -> Result<String, String> {
+    let compact = compact_json(message);
+    let id = jsonrpc_id_token(&compact)
+        .ok_or_else(|| "server-to-client request has no JSON-RPC id".to_string())?;
+    let field = format!("\"id\":{id}");
+    let offset = compact
+        .find(&field)
+        .ok_or_else(|| "server-to-client request id is not a top-level field".to_string())?;
+    let mut normalized = String::with_capacity(compact.len());
+    normalized.push_str(&compact[..offset]);
+    normalized.push_str("\"id\":\"");
+    normalized.push_str(NORMALIZED_SERVER_REQUEST_ID);
+    normalized.push('"');
+    normalized.push_str(&compact[offset + field.len()..]);
+    Ok(normalized)
+}
+
 fn response_error_code(response: &str) -> String {
     let Some(error) = response.find("\"error\":") else {
         return "none".to_string();
@@ -492,10 +511,24 @@ fn insert_observation(
     message: &str,
     roots: (&Path, &Path),
 ) -> Result<(), String> {
+    let mut normalized_id_message = None;
+    let mut request_id = request_id.into();
+    if method.family == MessageFamily::Request
+        && method.direction == MessageDirection::ServerToClient
+    {
+        // The pinned server maps per-worker request IDs into a process-wide
+        // counter in worker-arrival order. The live harness still answers with
+        // the actual ID, proving correlation; the semantic digest binds only
+        // the fact that the server supplied an ID, not its schedule-dependent
+        // spelling.
+        normalized_id_message = Some(normalize_server_request_id(message)?);
+        request_id = NORMALIZED_SERVER_REQUEST_ID.to_string();
+    }
+    let message = normalized_id_message.as_deref().unwrap_or(message);
     let normalized = normalized_probe_message(message, roots.0, roots.1)?;
     let observation = MethodObservation {
         method_key: method.key.clone(),
-        request_id: request_id.into(),
+        request_id,
         disposition,
         error_code: error_code.into(),
         message_root: fixture_content_hash(normalized.as_bytes()),
@@ -506,6 +539,22 @@ fn insert_observation(
     {
         return Err(format!("method {} was observed more than once", method.key));
     }
+    Ok(())
+}
+
+#[test]
+fn server_request_id_normalization_erases_only_the_correlator() -> Result<(), String> {
+    let first = r#"{"jsonrpc":"2.0","id":12,"method":"workspace/semanticTokens/refresh","params":{"id":99}}"#;
+    let second = r#"{"jsonrpc":"2.0","id":13,"method":"workspace/semanticTokens/refresh","params":{"id":99}}"#;
+    let changed_payload = r#"{"jsonrpc":"2.0","id":13,"method":"workspace/semanticTokens/refresh","params":{"id":100}}"#;
+
+    let normalized = normalize_server_request_id(first)?;
+    assert_eq!(normalized, normalize_server_request_id(second)?);
+    assert_ne!(normalized, normalize_server_request_id(changed_payload)?);
+    assert!(normalized.contains("\"id\":\"SERVER_REQUEST\""));
+    assert!(normalized.contains("\"params\":{\"id\":99}"));
+    assert_eq!(jsonrpc_id_token(first).as_deref(), Some("12"));
+    assert!(normalize_server_request_id(r#"{"jsonrpc":"2.0","method":"exit"}"#).is_err());
     Ok(())
 }
 
