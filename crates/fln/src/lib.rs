@@ -154,6 +154,145 @@ impl Engine {
         self.environment.logical_root(options)
     }
 
+    /// Admit and publish one non-block declaration without compiling or
+    /// executing it.
+    ///
+    /// This is the environment-building counterpart to
+    /// [`Self::execute_definition`]. It currently accepts the declaration kinds
+    /// on which both K1 and the independent checker can issue a completed
+    /// verdict: axioms and definitions. Theorems, opaques, mutual blocks,
+    /// inductives, and quotient initialization remain explicit refusals until
+    /// the independent checker can represent and decide their complete input.
+    ///
+    /// Success returns a new immutable engine snapshot. A rejection,
+    /// independent-checker non-answer, duplicate, resource stop, or internal
+    /// fault exposes no successor and leaves `self` unchanged.
+    pub fn admit_declaration(
+        &self,
+        declaration: Declaration,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
+        if !matches!(declaration, Declaration::Axiom(_) | Declaration::Defn(_)) {
+            return Err(EngineAdmissionError::UnsupportedDeclaration {
+                kind: declaration_kind(&declaration),
+            });
+        }
+
+        let base_logical_root = self.logical_root(options);
+        let checker_review = review_with_independent_checker(
+            &self.environment,
+            self.checker_environment.as_ref(),
+            &declaration,
+            limits.checker,
+        );
+        let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let checked = match convene(&checker_review.council, admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            CouncilOutcome::KernelRejected { class, message, .. } => {
+                return Err(EngineAdmissionError::KernelRejected { class, message });
+            }
+            CouncilOutcome::Halted(halt) => {
+                return Err(EngineAdmissionError::CouncilHalted {
+                    summary: halt.summary(),
+                });
+            }
+        };
+        let checker = checker_review.agreement.ok_or_else(|| {
+            EngineAdmissionError::CheckerBridge {
+                detail: "the checker council agreed without an admission record".to_owned(),
+            }
+        })?;
+        let checker_environment = checker_review.successor_environment.ok_or_else(|| {
+            EngineAdmissionError::CheckerBridge {
+                detail: "the checker council agreed without a retained successor environment"
+                    .to_owned(),
+            }
+        })?;
+        let environment = match checked.publish(limits.declaration, limits.collisions, None) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) => publication.environment,
+            Outcome::Complete(Published::Committed(DeclarationCommitted::DuplicateName {
+                name,
+            }))
+            | Outcome::Complete(Published::DuplicateName { name }) => {
+                return Err(EngineAdmissionError::DuplicateName { name });
+            }
+            Outcome::Complete(Published::BlockCommitted(_)) => {
+                return Err(EngineAdmissionError::UnexpectedPublication {
+                    detail: "a non-block declaration published as a block",
+                });
+            }
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let result_logical_root = environment.logical_root(options);
+
+        Ok(Outcome::Complete(DeclarationAdmission {
+            engine: Engine {
+                environment,
+                checker_environment: Some(checker_environment),
+            },
+            declaration,
+            base_logical_root,
+            result_logical_root,
+            checker,
+        }))
+    }
+
+    /// Admit and publish a nonempty declaration sequence atomically.
+    ///
+    /// Each declaration observes the immutable successor of its predecessor.
+    /// Any error or non-answer returns no batch successor, so callers can retain
+    /// only the original engine. Completed results carry every root transition
+    /// for direct continuity checks.
+    pub fn admit_declarations(
+        &self,
+        declarations: &[Declaration],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineAdmissionError> {
+        if declarations.is_empty() {
+            return Err(EngineAdmissionError::EmptyBatch);
+        }
+        let mut admissions = Vec::new();
+        admissions
+            .try_reserve_exact(declarations.len())
+            .map_err(|_| EngineAdmissionError::AllocationFailure {
+                resource: "declaration batch results",
+                requested: declarations.len(),
+            })?;
+        let base_logical_root = self.logical_root(options);
+        let mut engine = self.clone();
+        for (index, declaration) in declarations.iter().cloned().enumerate() {
+            let admission = match engine.admit_declaration(declaration, options, limits) {
+                Ok(Outcome::Complete(admission)) => admission,
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => return Ok(Outcome::InternalFault(fault)),
+                Err(error) => {
+                    return Err(EngineAdmissionError::BatchDeclaration {
+                        index,
+                        error: Box::new(error),
+                    });
+                }
+            };
+            engine = admission.engine.clone();
+            admissions.push(admission);
+        }
+        let result_logical_root = engine.logical_root(options);
+        Ok(Outcome::Complete(DeclarationBatchAdmission {
+            engine,
+            base_logical_root,
+            result_logical_root,
+            admissions,
+        }))
+    }
+
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
     /// and execute one bounded Nat-valued definition command. The declaration
     /// may have explicit `Nat` parameters; its body may be a natural literal, a
@@ -315,64 +454,18 @@ impl Engine {
                 });
             }
         };
-        let base_logical_root = self.logical_root(options);
-        let checker_review = review_with_independent_checker(
-            &self.environment,
-            self.checker_environment.as_ref(),
-            &declaration,
-            limits.checker,
-        );
-
-        let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
-            Outcome::Complete(admitted) => admitted,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
-        let checked = match convene(&checker_review.council, admitted) {
-            CouncilOutcome::Agreed(checked) => checked,
-            CouncilOutcome::KernelRejected { class, message, .. } => {
-                return Err(EngineExecutionError::KernelRejected { class, message });
-            }
-            CouncilOutcome::Halted(halt) => {
-                return Err(EngineExecutionError::CouncilHalted {
-                    summary: halt.summary(),
-                });
-            }
-        };
-        let checker =
-            checker_review
-                .agreement
-                .ok_or_else(|| EngineExecutionError::CheckerBridge {
-                    detail: "the checker council agreed without an admission record".to_owned(),
-                })?;
-        let checker_environment = checker_review.successor_environment.ok_or_else(|| {
-            EngineExecutionError::CheckerBridge {
-                detail: "the checker council agreed without a retained successor environment"
-                    .to_owned(),
-            }
-        })?;
-        let environment = match checked.publish(limits.declaration, limits.collisions, None) {
-            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
-                publication,
-            ))) => publication.environment,
-            Outcome::Complete(Published::Committed(DeclarationCommitted::DuplicateName {
-                name,
-            }))
-            | Outcome::Complete(Published::DuplicateName { name }) => {
-                return Err(EngineExecutionError::DuplicateName { name });
-            }
-            Outcome::Complete(Published::BlockCommitted(_)) => {
-                return Err(EngineExecutionError::UnexpectedPublication {
-                    detail: "a single definition published as a block",
-                });
-            }
+        let admission = match self
+            .admit_declaration(declaration, options, limits.admission())
+            .map_err(EngineExecutionError::from)?
+        {
+            Outcome::Complete(admission) => admission,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
         let functions = executable_nat_dependencies(&self.environment, &expression, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
-        let local_lambda = executable_nat_lambda(&declaration, limits.ingress)
+        let local_lambda = executable_nat_lambda(&admission.declaration, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
         let lambdas = local_lambda.as_slice();
         let ingress = fln_comp::ingress::lower_closed_expr_with_lambdas(
@@ -395,19 +488,14 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let result_logical_root = environment.logical_root(options);
-
         Ok(Outcome::Complete(DefinitionExecution {
-            engine: Engine {
-                environment,
-                checker_environment: Some(checker_environment),
-            },
-            declaration,
-            base_logical_root,
-            result_logical_root,
+            engine: admission.engine,
+            declaration: admission.declaration,
+            base_logical_root: admission.base_logical_root,
+            result_logical_root: admission.result_logical_root,
             flbc_artifact,
             exit,
-            checker,
+            checker: admission.checker,
         }))
     }
 }
@@ -423,6 +511,18 @@ fn execute_golem_with_options(
         CommandExecutionContext::from_options(options),
         None,
     )
+}
+
+fn declaration_kind(declaration: &Declaration) -> &'static str {
+    match declaration {
+        Declaration::Axiom(_) => "axiom",
+        Declaration::Defn(_) => "definition",
+        Declaration::Thm(_) => "theorem",
+        Declaration::Opaque(_) => "opaque",
+        Declaration::Mutual(_) => "mutual block",
+        Declaration::Inductive(_) => "inductive block",
+        Declaration::Quotient(_) => "quotient initialization",
+    }
 }
 
 #[derive(Debug)]
@@ -617,12 +717,16 @@ fn review_with_independent_checker(
     limits: CheckerExecutionLimits,
 ) -> CheckerReview {
     let candidate = match declaration {
+        Declaration::Axiom(axiom) => {
+            checker_entry(&ConstantInfo::Axiom(axiom.clone()), limits.decode)
+        }
         Declaration::Defn(definition) => {
             checker_entry(&ConstantInfo::Defn(definition.clone()), limits.decode)
         }
         _ => {
             return CheckerReview::no_answer(
-                "the facade asked the definition checker to review a non-definition".to_owned(),
+                "the facade asked the independent checker to review an unsupported declaration"
+                    .to_owned(),
             );
         }
     };
@@ -986,6 +1090,30 @@ impl Default for CheckerExecutionLimits {
     }
 }
 
+/// Caller-supplied bounds for admission and immutable environment publication.
+///
+/// There is deliberately no `Default`: as with [`EngineExecutionLimits`], the
+/// kernel budget must be calibrated to the native stack on which it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineAdmissionLimits {
+    pub kernel: Budget,
+    pub checker: CheckerExecutionLimits,
+    pub declaration: DeclarationBudget,
+    pub collisions: CollisionBudget,
+}
+
+impl EngineAdmissionLimits {
+    /// Use subsystem defaults around an explicitly calibrated kernel budget.
+    pub fn new(kernel: Budget) -> Self {
+        Self {
+            kernel,
+            checker: CheckerExecutionLimits::default(),
+            declaration: DeclarationBudget::default(),
+            collisions: CollisionBudget::default(),
+        }
+    }
+}
+
 /// Independent caller-supplied bounds for every bounded stage of one execution.
 ///
 /// There is deliberately no `Default`: a kernel budget is calibrated to the
@@ -1015,6 +1143,16 @@ impl EngineExecutionLimits {
             vm: VmExecutionLimits::default(),
         }
     }
+
+    /// The exact admission subset used before compiler ingress and Golem.
+    pub fn admission(self) -> EngineAdmissionLimits {
+        EngineAdmissionLimits {
+            kernel: self.kernel,
+            checker: self.checker,
+            declaration: self.declaration,
+            collisions: self.collisions,
+        }
+    }
 }
 
 /// The independent checker's exact completed admission observation.
@@ -1022,6 +1160,34 @@ impl EngineExecutionLimits {
 pub struct CheckerAgreement {
     pub schema: &'static str,
     pub ground: CheckerAdmissionGround,
+}
+
+/// The authoritative outputs of one completed admission-only transition.
+#[derive(Debug)]
+pub struct DeclarationAdmission {
+    /// The immutable snapshot containing the newly published declaration.
+    pub engine: Engine,
+    /// The exact declaration admitted by K1 and independently reviewed.
+    pub declaration: Declaration,
+    /// The exact base-environment identity under the caller's options.
+    pub base_logical_root: LogicalRoot,
+    /// The exact successor-environment identity under the same options.
+    pub result_logical_root: LogicalRoot,
+    /// The independent checker observation that allowed the council to agree.
+    pub checker: CheckerAgreement,
+}
+
+/// The authoritative result of one atomic nonempty admission batch.
+#[derive(Debug)]
+pub struct DeclarationBatchAdmission {
+    /// The immutable snapshot containing every published declaration.
+    pub engine: Engine,
+    /// The batch's original environment identity under the caller's options.
+    pub base_logical_root: LogicalRoot,
+    /// The final environment identity under the same options.
+    pub result_logical_root: LogicalRoot,
+    /// Every completed admission in input order, including root transitions.
+    pub admissions: Vec<DeclarationAdmission>,
 }
 
 /// The authoritative outputs of one completed bounded engine run.
@@ -1054,6 +1220,89 @@ pub struct DefinitionBatchExecution {
     pub result_logical_root: LogicalRoot,
     /// Every completed definition in input order, including its root transition.
     pub executions: Vec<DefinitionExecution>,
+}
+
+/// A completed refusal before an admission-only successor is exposed.
+/// Non-answers live in [`Outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineAdmissionError {
+    EmptyBatch,
+    AllocationFailure {
+        resource: &'static str,
+        requested: usize,
+    },
+    BatchDeclaration {
+        index: usize,
+        error: Box<EngineAdmissionError>,
+    },
+    UnsupportedDeclaration {
+        kind: &'static str,
+    },
+    KernelRejected {
+        class: RejectClass,
+        message: String,
+    },
+    CouncilHalted {
+        summary: String,
+    },
+    CheckerBridge {
+        detail: String,
+    },
+    DuplicateName {
+        name: Name,
+    },
+    UnexpectedPublication {
+        detail: &'static str,
+    },
+}
+
+impl fmt::Display for EngineAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyBatch => write!(formatter, "declaration batch must not be empty"),
+            Self::AllocationFailure {
+                resource,
+                requested,
+            } => write!(
+                formatter,
+                "could not reserve {requested} entries for {resource}"
+            ),
+            Self::BatchDeclaration { index, error } => {
+                write!(formatter, "declaration batch item {index} failed: {error}")
+            }
+            Self::UnsupportedDeclaration { kind } => write!(
+                formatter,
+                "cannot admit {kind}: the independent checker has no completed representation"
+            ),
+            Self::KernelRejected { class, message } => {
+                write!(
+                    formatter,
+                    "kernel rejected declaration ({class:?}): {message}"
+                )
+            }
+            Self::CouncilHalted { summary } => write!(formatter, "council halted: {summary}"),
+            Self::CheckerBridge { detail } => {
+                write!(formatter, "independent checker bridge failed: {detail}")
+            }
+            Self::DuplicateName { name } => write!(
+                formatter,
+                "environment already contains {}",
+                name.to_display_string()
+            ),
+            Self::UnexpectedPublication { detail } => {
+                write!(formatter, "unexpected publication result: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BatchDeclaration { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 /// A completed refusal before Golem execution. Non-answers live in `Outcome`.
@@ -1150,13 +1399,45 @@ impl std::error::Error for EngineExecutionError {
     }
 }
 
+impl From<EngineAdmissionError> for EngineExecutionError {
+    fn from(error: EngineAdmissionError) -> Self {
+        match error {
+            EngineAdmissionError::EmptyBatch => Self::EmptyBatch,
+            EngineAdmissionError::AllocationFailure {
+                resource,
+                requested,
+            } => Self::AllocationFailure {
+                resource,
+                requested,
+            },
+            EngineAdmissionError::BatchDeclaration { index, error } => Self::BatchCommand {
+                index,
+                error: Box::new(Self::from(*error)),
+            },
+            EngineAdmissionError::UnsupportedDeclaration { kind } => {
+                Self::UnsupportedDeclaration { kind }
+            }
+            EngineAdmissionError::KernelRejected { class, message } => {
+                Self::KernelRejected { class, message }
+            }
+            EngineAdmissionError::CouncilHalted { summary } => Self::CouncilHalted { summary },
+            EngineAdmissionError::CheckerBridge { detail } => Self::CheckerBridge { detail },
+            EngineAdmissionError::DuplicateName { name } => Self::DuplicateName { name },
+            EngineAdmissionError::UnexpectedPublication { detail } => {
+                Self::UnexpectedPublication { detail }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantVal,
-        Declaration, DefinitionSafety, DefinitionVal, Engine, EngineExecutionError,
-        EngineExecutionLimits, Expr, IngressError, IngressResource, KVMap, Level, Literal, Name,
-        NatLit, Outcome, ReducibilityHints, RejectClass, VmExecutionLimits,
+        Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
+        EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Expr, IngressError,
+        IngressResource, KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints,
+        RejectClass, VmExecutionLimits,
         execute_golem_with_options,
     };
     use fln_comp::flbc::{
@@ -1245,6 +1526,17 @@ mod tests {
             hints: ReducibilityHints::Regular(1),
             safety: DefinitionSafety::Safe,
             all: vec![name],
+        })
+    }
+
+    fn axiom(name: &str) -> Declaration {
+        Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::from_components([name]),
+                level_params: Vec::new(),
+                type_: nat_type(),
+            },
+            is_unsafe: false,
         })
     }
 
@@ -1487,6 +1779,150 @@ mod tests {
             !uncached
                 .environment()
                 .contains(&Name::from_components(["uncached"]))
+        );
+    }
+
+    #[test]
+    fn admission_only_axioms_publish_and_retain_the_checker_projection() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let first = engine
+            .admit_declaration(
+                axiom("first_postulate"),
+                &options,
+                EngineAdmissionLimits::new(test_budget()),
+            )
+            .expect("K1 and the independent checker both admit the axiom");
+        assert!(
+            matches!(&first, Outcome::Complete(_)),
+            "the bounded axiom admission must answer completely"
+        );
+        let Outcome::Complete(first) = first else {
+            return;
+        };
+
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(engine.environment().len(), 1, "the receiver is immutable");
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["first_postulate"]))
+        );
+        assert!(
+            first
+                .engine
+                .environment()
+                .contains(&Name::from_components(["first_postulate"]))
+        );
+        assert_eq!(first.base_logical_root, base_root);
+        assert_eq!(
+            first.result_logical_root,
+            first.engine.logical_root(&options)
+        );
+        assert_eq!(
+            first.checker.ground,
+            CheckerAdmissionGround::AxiomPreamble
+        );
+
+        let mut candidate_only = EngineAdmissionLimits::new(test_budget());
+        candidate_only.checker.environment =
+            fln_checker::environment::EnvironmentBudget::new(
+                u64::MAX,
+                1,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+            );
+        let second = first
+            .engine
+            .admit_declaration(axiom("second_postulate"), &options, candidate_only)
+            .expect("the retained projection leaves the one-row budget for the candidate");
+        assert!(
+            matches!(&second, Outcome::Complete(_)),
+            "the retained checker projection must answer completely"
+        );
+        let Outcome::Complete(second) = second else {
+            return;
+        };
+        assert!(
+            second
+                .engine
+                .environment()
+                .contains(&Name::from_components(["second_postulate"]))
+        );
+
+        let uncached = Engine::from_environment(first.engine.environment().clone());
+        let uncached_root = uncached.logical_root(&options);
+        let error = uncached
+            .admit_declaration(axiom("uncached_postulate"), &options, candidate_only)
+            .expect_err("the same budget cannot reconstruct the multi-row base");
+        assert!(matches!(
+            error,
+            EngineAdmissionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert_eq!(uncached.logical_root(&options), uncached_root);
+        assert!(
+            !uncached
+                .environment()
+                .contains(&Name::from_components(["uncached_postulate"]))
+        );
+    }
+
+    #[test]
+    fn admission_batch_hides_a_valid_prefix_and_recovers_after_rejection() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let declarations = [axiom("postulate"), axiom("postulate")];
+        let error = engine
+            .admit_declarations(&declarations, &options, limits)
+            .expect_err("the duplicate second declaration aborts the whole batch");
+        assert!(matches!(
+            error,
+            EngineAdmissionError::BatchDeclaration {
+                index: 1,
+                error,
+            } if matches!(
+                error.as_ref(),
+                EngineAdmissionError::KernelRejected {
+                    class: RejectClass::AlreadyDeclared,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(engine.environment().len(), 1);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["postulate"]))
+        );
+
+        let corrected = [axiom("first_postulate"), axiom("second_postulate")];
+        let completed = engine
+            .admit_declarations(&corrected, &options, limits)
+            .expect("the original snapshot accepts a corrected batch");
+        assert!(
+            matches!(&completed, Outcome::Complete(_)),
+            "the corrected batch must answer completely"
+        );
+        let Outcome::Complete(completed) = completed else {
+            return;
+        };
+        assert_eq!(completed.admissions.len(), 2);
+        assert_eq!(completed.engine.environment().len(), 3);
+        assert_eq!(completed.base_logical_root, base_root);
+        assert_eq!(
+            completed.admissions[0].result_logical_root,
+            completed.admissions[1].base_logical_root
+        );
+        assert_eq!(
+            completed.result_logical_root,
+            completed.engine.logical_root(&options)
         );
     }
 
