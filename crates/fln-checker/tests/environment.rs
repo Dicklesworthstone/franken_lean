@@ -344,6 +344,58 @@ fn permutation_independent_builds_compare_equal_and_iterate_canonically() {
 }
 
 #[test]
+fn persistent_extension_charges_only_the_candidate_and_preserves_both_snapshots() {
+    let (base, _) = complete(ConstantEnvironment::build(
+        vec![simple_entry("alpha", 1), simple_entry("middle", 2)],
+        EnvironmentBudget::unlimited(),
+    ));
+    let candidate = simple_entry("zeta", 3);
+    let (_, candidate_progress) = complete(ConstantEnvironment::build(
+        vec![candidate.clone()],
+        EnvironmentBudget::unlimited(),
+    ));
+    let (extended, extension_progress) = complete(base.extend(
+        candidate.clone(),
+        exact_budget(candidate_progress),
+    ));
+
+    assert_eq!(extension_progress, candidate_progress);
+    assert_eq!(base.len(), 2, "extension cannot mutate the base snapshot");
+    assert!(base.find(&checker_name("zeta")).is_none());
+    assert_eq!(extended.len(), 3);
+    assert_eq!(
+        extended
+            .constants()
+            .map(|(name, _)| display_name(name))
+            .collect::<Vec<_>>(),
+        ["alpha", "middle", "zeta"]
+    );
+
+    assert!(matches!(
+        base.extend(candidate.clone(), EnvironmentBudget {
+            max_constants: 0,
+            ..exact_budget(candidate_progress)
+        }),
+        EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
+            limit: EnvironmentLimit::Constants,
+            allowed: 0,
+            observed: 1,
+            ..
+        })
+    ));
+    assert_eq!(base.len(), 2);
+
+    assert!(matches!(
+        extended.extend(candidate, exact_budget(candidate_progress)),
+        EnvironmentOutcome::Refused {
+            refusal: EnvironmentRefusal::DuplicateConstant { name },
+            ..
+        } if name == checker_name("zeta")
+    ));
+    assert_eq!(extended.len(), 3);
+}
+
+#[test]
 fn duplicate_names_and_level_parameters_refuse_deterministically_then_recover() {
     let duplicate_a = entry(
         "duplicate",
