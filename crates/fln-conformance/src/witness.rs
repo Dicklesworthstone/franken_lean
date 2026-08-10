@@ -524,15 +524,16 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    `convene` CONSUMES the Admitted capability and on a halt simply never hands \
                    the non-Clone CheckedDecl back, so halting is not a flag anyone can ignore; \
                    and there is no quorum, no tally and no seat count anywhere in the module, \
-                   so agreement is required rather than counted. What the sentence still \
-                   promises beyond the tree: `convene` now has one bounded production caller, \
-                   fln-elab's seed environment builder, where it admits the opaque Nat fixture \
-                   before the first literal-definition test. That proves the capability route \
-                   executes, but it is not an elaboration transaction, carries no independent \
-                   witness seat, and never publishes the user declaration. The mechanism and \
-                   one bring-up caller exist; the running consensus behaviour the wording \
-                   describes does not. Also still absent: the canonical Judgment type plan \
-                   §8.3c specifies as the substrate of consensus.",
+                   so agreement is required rather than counted. Corrected again 2026-08-09: \
+                   `fln::Engine::execute_definition` now projects the complete base environment \
+                   and candidate through canonical wire into checker-owned values, runs \
+                   `fln-checker`, and presents its result as an IndependentImplementation seat. \
+                   The positive facade test requires the body-checked admission ground; the \
+                   constrained control proves a checker non-answer halts and publishes nothing. \
+                   This row remains TARGETED because that running policy covers only the bounded \
+                   embeddable definition path. The Nat seed and reflected-theorem publisher \
+                   still name empty councils, no sampled/release/paranoid policy dispatcher \
+                   exists, and the canonical Judgment substrate from plan §8.3c is absent.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -545,9 +546,14 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    — the independence-boundary work (franken_lean-r0xu) filled it in while the \
                    matrix went on asserting the stub, green. Its INDEPENDENCE has been enforced \
                    throughout: structure-guard walks fln-checker ->* fln-kernel, ->* fln-olean, \
-                   ->* fln-rt, ->* fln-unsafe-*. What the claim still promises beyond the tree \
-                   is a second CHECKING ENGINE: what exists is the independence boundary and \
-                   the data schema, not an implementation that decides verdicts. The \
+                   ->* fln-rt, ->* fln-unsafe-*. Corrected again 2026-08-09: the crate now owns \
+                   its decoder, environment, universe/reduction/equality/inference machinery \
+                   and declaration admission, and it decides definition verdicts. The bounded \
+                   `fln` facade now makes that verdict a mandatory veto seat for user \
+                   definitions and returns its exact admission ground on success. What remains \
+                   beyond the tree is full product coverage: other publication paths still use \
+                   empty councils, general declaration/module/corpus execution is not wired, \
+                   and the planned WASM and policy-driven release-closure lanes are absent. The \
                    Reference-kernel-oracle lane genuinely runs \
                    (scripts/tribunal/leanchecker_witness.sh, called from scripts/check.sh), \
                    but it re-executes the Reference implementation and therefore does NOT \
@@ -814,20 +820,21 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 19] = [
             count: 85,
         },
     ),
-    // Corrected 2026-07-25 after this row asserted a stub that had grown to 149 lines.
+    // Corrected 2026-08-09 after the checker became a real facade veto seat.
     (
         "B3-INDEPENDENT-CHECKER",
-        Citation::FileAtLeastLines {
-            path: "crates/fln-checker/src/lib.rs",
-            min_lines: 100,
+        Citation::OccursExactly {
+            path: "crates/fln/src/lib.rs",
+            needle: "SeatOrigin::IndependentImplementation",
+            count: 1,
         },
     ),
-    // The seat this row's corrected evidence describes must still exist.
+    // The facade join this row's corrected evidence describes must still exist.
     (
         "B3-CONSENSUS-HALTS",
         Citation::OccursExactly {
-            path: "crates/fln-kernel/src/council.rs",
-            needle: "pub fn convene",
+            path: "crates/fln/src/lib.rs",
+            needle: "convene(&checker_review.council, admitted)",
             count: 1,
         },
     ),

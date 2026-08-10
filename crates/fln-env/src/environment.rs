@@ -912,6 +912,18 @@ impl Environment {
         self.constants.contains_key(name)
     }
 
+    /// Borrow every constant in deterministic persistent-map order.
+    ///
+    /// This is an observation surface only: callers receive neither owned
+    /// declarations nor a way to mutate the snapshot. Importers and independent
+    /// checkers use it to derive a complete view instead of maintaining a second,
+    /// caller-supplied declaration inventory that can drift from the environment.
+    pub fn constants(&self) -> impl Iterator<Item = (&Name, &ConstantInfo)> {
+        self.constants
+            .iter()
+            .map(|(name, info)| (name, info.as_ref()))
+    }
+
     /// Verify that `self` differs from `base` by exactly `additions` and by nothing
     /// else. This is a comparison boundary, never declaration admission: it allocates
     /// no environment state, does not derive an authority token, and cannot make an
@@ -1416,6 +1428,40 @@ mod tests {
             },
             is_unsafe: false,
         })
+    }
+
+    #[test]
+    fn constant_observation_is_complete_deterministic_and_key_bound() {
+        let forward = Environment::new()
+            .add_decl(axiom("alpha"))
+            .expect("first fixture declaration is unique")
+            .add_decl(axiom("beta"))
+            .expect("second fixture declaration is unique");
+        let reverse = Environment::new()
+            .add_decl(axiom("beta"))
+            .expect("first reverse fixture declaration is unique")
+            .add_decl(axiom("alpha"))
+            .expect("second reverse fixture declaration is unique");
+
+        let forward_names: Vec<_> = forward
+            .constants()
+            .map(|(name, info)| {
+                assert_eq!(name, info.name(), "map key drifted from declaration name");
+                name.clone()
+            })
+            .collect();
+        let reverse_names: Vec<_> = reverse
+            .constants()
+            .map(|(name, info)| {
+                assert_eq!(name, info.name(), "map key drifted from declaration name");
+                name.clone()
+            })
+            .collect();
+
+        assert_eq!(forward_names.len(), forward.len());
+        assert_eq!(forward_names, reverse_names);
+        assert!(forward_names.contains(&n("alpha")));
+        assert!(forward_names.contains(&n("beta")));
     }
 
     /// Successor chains over every enum whose variants reach `Domain::DeclContent`.

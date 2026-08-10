@@ -70,6 +70,7 @@ edge fln-conformance -> fln-cli    # diagnostic CLI/JSON projection conformance 
 edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Pratt and grammar-epoch surfaces (franken_lean-hly)
 edge fln-conformance -> fln-server # diagnostic LSP projection conformance (franken_lean-wlan)
 edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
+edge fln -> fln-checker            # independent checker veto on embeddable definition publication
 edge fln -> fln-core               # embeddable typed diagnostic projection (franken_lean-wlan)
 edge fln -> fln-comp               # bounded checked-source to canonical FLBC facade (franken_lean-7kc)
 edge fln -> fln-elab               # bounded checked-source elaboration facade (franken_lean-7kc)

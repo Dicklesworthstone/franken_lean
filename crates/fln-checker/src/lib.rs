@@ -20,9 +20,9 @@
 //! and the inferred body type receives KR-107's exact cheap head-beta step before
 //! dependent Pi rebuilding. KR-108 checks every Forall domain and its terminal
 //! codomain in both modes, then constructs the raw right-associated `imax`
-//! universe independently. Lets, literals, projections, the remaining equality
-//! rules, and declaration checking remain open. The crate map and layering are
-//! governed by
+//! universe independently. Lets, literals, projections, and KR-970 … KR-978
+//! declaration admission are live; the remaining equality and inductive-family
+//! work stays open. The crate map and layering are governed by
 //! `WORKSPACE_GRAPH.txt` (bead fln-8mj).
 //!
 //! # THE INDEPENDENCE BOUNDARY (bead `franken_lean-r0xu`) — read this first
@@ -214,7 +214,7 @@
 //!   no declaration-admission authority and cannot acquire one through this crate.
 //! * **AND THAT SENTENCE NOW HAS A MODULE STANDING NEXT TO IT CALLED `admit`, so it
 //!   is restated rather than left to look contradicted.** `admit` implements KR-970
-//!   … KR-973 and produces a `Verdict` — an *observation a council may consult*, not
+//!   … KR-978 and produces a `Verdict` — an *observation a council may consult*, not
 //!   a capability. Three properties hold it there: `Admission` has no public
 //!   constructor and no public field, so it can only come from this crate saying
 //!   yes; neither it nor `Verdict` is `Clone` or `Copy`, so a verdict cannot be

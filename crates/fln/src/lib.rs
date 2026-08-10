@@ -10,6 +10,23 @@
 
 #![forbid(unsafe_code)]
 
+use fln_checker::admit::Verdict as CheckerVerdict;
+pub use fln_checker::admit::{
+    AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
+};
+pub use fln_checker::environment::EnvironmentBudget as CheckerEnvironmentBudget;
+use fln_checker::environment::{
+    ConstantDeclaration as CheckerConstantDeclaration, ConstantEntry as CheckerConstantEntry,
+    ConstantEnvironment as CheckerConstantEnvironment, ConstantKind as CheckerConstantKind,
+    ConstantSafety as CheckerConstantSafety, DefinitionBody as CheckerDefinitionBody,
+    DefinitionSafety as CheckerDefinitionSafety, EnvironmentOutcome as CheckerEnvironmentOutcome,
+    ReducibilityHint as CheckerReducibilityHint,
+};
+pub use fln_checker::wire::DecodeBudget as CheckerDecodeBudget;
+use fln_checker::wire::{
+    DecodeOutcome as CheckerDecodeOutcome, WireExpr as CheckerExpr, WireName as CheckerName,
+    decode_expr as checker_decode_expr, decode_name as checker_decode_name,
+};
 pub use fln_comp::fir::LoweringError;
 use fln_comp::fir::ValueType;
 use fln_comp::flbc::CallableResultOwnership;
@@ -33,10 +50,13 @@ pub use fln_env::constants::{
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
 pub use fln_env::pmap::CollisionBudget;
+use fln_hash::canon::Canonical;
 pub use fln_hash::root::LogicalRoot;
 pub use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
-use fln_kernel::council::{Council, CouncilOutcome, convene};
+use fln_kernel::council::{
+    Council, CouncilOutcome, Seat, SeatBounds, SeatOrigin, SeatVerdict, convene,
+};
 pub use fln_kernel::verdict::{Budget, RejectClass};
 use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
@@ -131,11 +151,11 @@ impl Engine {
     /// reference, or a saturated identifier-headed application of those atom
     /// forms, optionally under a chain of non-recursive local `Nat` lets.
     ///
-    /// The publication council is explicitly empty because no independent
-    /// checker is configured on this bounded facade yet. This is a real K1
-    /// admission and publication, but it is not consensus-receipt evidence.
-    /// Kernel and VM non-answers remain [`Outcome::Inconclusive`] or
-    /// [`Outcome::InternalFault`]; they are never collapsed into rejection.
+    /// The independent `fln-checker` must agree with K1 before the publication
+    /// capability survives the council. A disagreement or checker non-answer
+    /// halts publication. Kernel and VM non-answers remain
+    /// [`Outcome::Inconclusive`] or [`Outcome::InternalFault`]; they are never
+    /// collapsed into rejection.
     pub fn execute_nat_definition(
         &self,
         source: &[u8],
@@ -245,10 +265,11 @@ impl Engine {
     /// explicit compiler refusals. Non-definition declarations are explicit
     /// refusals because they have no executable body.
     ///
-    /// The publication council is still explicitly empty: this is real K1
-    /// admission, not independent-checker consensus. Publication creates only a
-    /// local immutable successor until compilation and execution complete, so a
-    /// later refusal or non-answer exposes no partially advanced engine.
+    /// The independent checker receives a complete checker-owned projection of
+    /// the base environment and candidate. Its agreement is a mandatory council
+    /// veto seat, never an alternative publication authority. Publication creates
+    /// only a local immutable successor until compilation and execution complete,
+    /// so a later refusal or non-answer exposes no partially advanced engine.
     /// Golem captures the pin-defined `maxHeartbeats` value from `options` at
     /// command entry; its own instruction and stack ceilings remain the separate
     /// explicit [`EngineExecutionLimits`] policy.
@@ -286,13 +307,15 @@ impl Engine {
             }
         };
         let base_logical_root = self.logical_root(options);
+        let checker_review =
+            review_with_independent_checker(&self.environment, &declaration, limits.checker);
 
         let admitted = match admit(&self.environment, declaration.clone(), limits.kernel) {
             Outcome::Complete(admitted) => admitted,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let checked = match convene(&Council::nobody_was_asked(), admitted) {
+        let checked = match convene(&checker_review.council, admitted) {
             CouncilOutcome::Agreed(checked) => checked,
             CouncilOutcome::KernelRejected { class, message, .. } => {
                 return Err(EngineExecutionError::KernelRejected { class, message });
@@ -303,6 +326,12 @@ impl Engine {
                 });
             }
         };
+        let checker =
+            checker_review
+                .agreement
+                .ok_or_else(|| EngineExecutionError::CheckerBridge {
+                    detail: "the checker council agreed without an admission record".to_owned(),
+                })?;
         let environment = match checked.publish(limits.declaration, limits.collisions, None) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
                 publication,
@@ -356,6 +385,7 @@ impl Engine {
             result_logical_root,
             flbc_artifact,
             exit,
+            checker,
         }))
     }
 }
@@ -371,6 +401,243 @@ fn execute_golem_with_options(
         CommandExecutionContext::from_options(options),
         None,
     )
+}
+
+#[derive(Debug)]
+struct CheckerReview {
+    council: Council,
+    agreement: Option<CheckerAgreement>,
+}
+
+impl CheckerReview {
+    fn from_seat(verdict: SeatVerdict, agreement: Option<CheckerAgreement>) -> Self {
+        Self {
+            council: Council::of(vec![Seat::new(
+                "fln-checker",
+                SeatOrigin::IndependentImplementation,
+                SeatBounds::not_established(
+                    "fln-checker uses an independent structural budget taxonomy",
+                ),
+                verdict,
+            )]),
+            agreement,
+        }
+    }
+
+    fn no_answer(reason: String) -> Self {
+        Self::from_seat(SeatVerdict::NoAnswer { reason }, None)
+    }
+}
+
+fn decode_checker_name(name: &Name, budget: CheckerDecodeBudget) -> Result<CheckerName, String> {
+    match checker_decode_name(&name.to_canonical_bytes(), budget) {
+        CheckerDecodeOutcome::Complete(Ok(name)) => Ok(name),
+        CheckerDecodeOutcome::Complete(Err(malformed)) => {
+            Err(format!("canonical name decode failed: {malformed:?}"))
+        }
+        CheckerDecodeOutcome::Inconclusive(stop) => {
+            Err(format!("canonical name decode did not finish: {stop:?}"))
+        }
+    }
+}
+
+fn decode_checker_expr(
+    expression: &Expr,
+    budget: CheckerDecodeBudget,
+) -> Result<CheckerExpr, String> {
+    match checker_decode_expr(&expression.to_canonical_bytes(), budget) {
+        CheckerDecodeOutcome::Complete(Ok(expression)) => Ok(expression),
+        CheckerDecodeOutcome::Complete(Err(malformed)) => {
+            Err(format!("canonical expression decode failed: {malformed:?}"))
+        }
+        CheckerDecodeOutcome::Inconclusive(stop) => Err(format!(
+            "canonical expression decode did not finish: {stop:?}"
+        )),
+    }
+}
+
+fn decode_checker_names(
+    names: &[Name],
+    budget: CheckerDecodeBudget,
+) -> Result<Vec<CheckerName>, String> {
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(names.len())
+        .map_err(|_| format!("could not reserve {} checker names", names.len()))?;
+    for name in names {
+        decoded.push(decode_checker_name(name, budget)?);
+    }
+    Ok(decoded)
+}
+
+fn checker_constant_safety(is_unsafe: bool) -> CheckerConstantSafety {
+    if is_unsafe {
+        CheckerConstantSafety::Unsafe
+    } else {
+        CheckerConstantSafety::Safe
+    }
+}
+
+fn checker_entry(
+    info: &ConstantInfo,
+    budget: CheckerDecodeBudget,
+) -> Result<CheckerConstantEntry, String> {
+    let base = info.constant_val();
+    let name = decode_checker_name(&base.name, budget)?;
+    let level_parameters = decode_checker_names(&base.level_params, budget)?;
+    let type_ = decode_checker_expr(&base.type_, budget)?;
+    let declaration = match info {
+        ConstantInfo::Axiom(value) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Axiom,
+            checker_constant_safety(value.is_unsafe),
+        ),
+        ConstantInfo::Defn(value) => {
+            let hint = match value.hints {
+                ReducibilityHints::Opaque => CheckerReducibilityHint::Opaque,
+                ReducibilityHints::Abbrev => CheckerReducibilityHint::Abbrev,
+                ReducibilityHints::Regular(height) => CheckerReducibilityHint::Regular(height),
+            };
+            let safety = match value.safety {
+                DefinitionSafety::Unsafe => CheckerDefinitionSafety::Unsafe,
+                DefinitionSafety::Safe => CheckerDefinitionSafety::Safe,
+                DefinitionSafety::Partial => CheckerDefinitionSafety::Partial,
+            };
+            let body = CheckerDefinitionBody::new(
+                decode_checker_expr(&value.value, budget)?,
+                hint,
+                safety,
+                decode_checker_names(&value.all, budget)?,
+            );
+            CheckerConstantDeclaration::definition(
+                level_parameters,
+                type_,
+                checker_constant_safety(matches!(value.safety, DefinitionSafety::Unsafe)),
+                body,
+            )
+        }
+        ConstantInfo::Thm(_) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Theorem,
+            CheckerConstantSafety::Safe,
+        ),
+        ConstantInfo::Opaque(value) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Opaque,
+            checker_constant_safety(value.is_unsafe),
+        ),
+        ConstantInfo::Quot(_) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Quotient,
+            CheckerConstantSafety::Safe,
+        ),
+        ConstantInfo::Induct(value) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Inductive,
+            checker_constant_safety(value.is_unsafe),
+        ),
+        ConstantInfo::Ctor(value) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Constructor,
+            checker_constant_safety(value.is_unsafe),
+        ),
+        ConstantInfo::Rec(value) => CheckerConstantDeclaration::header(
+            level_parameters,
+            type_,
+            CheckerConstantKind::Recursor,
+            checker_constant_safety(value.is_unsafe),
+        ),
+    };
+    Ok(CheckerConstantEntry::new(name, declaration))
+}
+
+fn checker_environment(
+    environment: &Environment,
+    limits: CheckerExecutionLimits,
+) -> Result<CheckerConstantEnvironment, String> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(environment.len())
+        .map_err(|_| format!("could not reserve {} checker constants", environment.len()))?;
+    for (_, info) in environment.constants() {
+        entries.push(checker_entry(info, limits.decode)?);
+    }
+    match CheckerConstantEnvironment::build(entries, limits.environment) {
+        CheckerEnvironmentOutcome::Complete { environment, .. } => Ok(environment),
+        CheckerEnvironmentOutcome::Refused { refusal, .. } => Err(format!(
+            "checker environment refused its projection: {refusal:?}"
+        )),
+        CheckerEnvironmentOutcome::Inconclusive(stop) => Err(format!(
+            "checker environment projection did not finish: {stop:?}"
+        )),
+        CheckerEnvironmentOutcome::InternalFault { fault, .. } => Err(format!(
+            "checker environment projection hit an internal fault: {fault:?}"
+        )),
+    }
+}
+
+fn review_with_independent_checker(
+    environment: &Environment,
+    declaration: &Declaration,
+    limits: CheckerExecutionLimits,
+) -> CheckerReview {
+    let candidate = match declaration {
+        Declaration::Defn(definition) => {
+            checker_entry(&ConstantInfo::Defn(definition.clone()), limits.decode)
+        }
+        _ => {
+            return CheckerReview::no_answer(
+                "the facade asked the definition checker to review a non-definition".to_owned(),
+            );
+        }
+    };
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(detail) => {
+            return CheckerReview::no_answer(format!(
+                "candidate projection into fln-checker failed: {detail}"
+            ));
+        }
+    };
+    let environment = match checker_environment(environment, limits) {
+        Ok(environment) => environment,
+        Err(detail) => {
+            return CheckerReview::no_answer(format!(
+                "base projection into fln-checker failed: {detail}"
+            ));
+        }
+    };
+
+    match fln_checker::admit::admit(&environment, &candidate, limits.admission) {
+        CheckerVerdict::Admitted(admission) => CheckerReview::from_seat(
+            SeatVerdict::Agrees,
+            Some(CheckerAgreement {
+                schema: admission.schema(),
+                ground: admission.ground(),
+            }),
+        ),
+        CheckerVerdict::Rejected(rejection) => CheckerReview::from_seat(
+            SeatVerdict::Disagrees {
+                detail: format!("fln-checker rejected the declaration: {rejection:?}"),
+            },
+            None,
+        ),
+        CheckerVerdict::Deferred(requirement) => CheckerReview::no_answer(format!(
+            "fln-checker deferred the declaration: {requirement:?}"
+        )),
+        CheckerVerdict::Inconclusive(stop) => {
+            CheckerReview::no_answer(format!("fln-checker exhausted or was cancelled: {stop:?}"))
+        }
+        CheckerVerdict::InternalFault(fault) => {
+            CheckerReview::no_answer(format!("fln-checker hit an internal fault: {fault:?}"))
+        }
+    }
 }
 
 /// Derive the compiler catalog from declarations that already passed K1.
@@ -634,6 +901,40 @@ fn collect_executable_constants(
     Ok(())
 }
 
+/// Independent checker bounds for one facade execution.
+///
+/// These defaults are finite and deliberately separate from K1's calibrated
+/// stack budget. Callers may tighten or expand them explicitly without making a
+/// checker non-answer count as agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckerExecutionLimits {
+    pub decode: CheckerDecodeBudget,
+    pub environment: CheckerEnvironmentBudget,
+    pub admission: CheckerAdmissionBudget,
+}
+
+impl Default for CheckerExecutionLimits {
+    fn default() -> Self {
+        let term = fln_checker::term::TermBudget::new(1_000_000, 10_000_000)
+            .with_max_arena_nodes(1_000_000);
+        let whnf = fln_checker::whnf::WhnfBudget::new(1_000_000, 1_000_000, term);
+        let inference = fln_checker::infer::InferenceBudget::new(1_000_000, 1_000_000, term, term)
+            .with_whnf(whnf);
+        Self {
+            decode: CheckerDecodeBudget::new(16 * 1024 * 1024, 1_000_000),
+            environment: CheckerEnvironmentBudget::new(
+                10_000_000,
+                100_000,
+                100_000,
+                100_000,
+                10_000_000,
+                100_000_000,
+            ),
+            admission: CheckerAdmissionBudget::new(inference, whnf, inference.defeq),
+        }
+    }
+}
+
 /// Independent caller-supplied bounds for every bounded stage of one execution.
 ///
 /// There is deliberately no `Default`: a kernel budget is calibrated to the
@@ -642,6 +943,7 @@ fn collect_executable_constants(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineExecutionLimits {
     pub kernel: Budget,
+    pub checker: CheckerExecutionLimits,
     pub declaration: DeclarationBudget,
     pub collisions: CollisionBudget,
     pub ingress: IngressLimits,
@@ -654,6 +956,7 @@ impl EngineExecutionLimits {
     pub fn new(kernel: Budget) -> Self {
         Self {
             kernel,
+            checker: CheckerExecutionLimits::default(),
             declaration: DeclarationBudget::default(),
             collisions: CollisionBudget::default(),
             ingress: IngressLimits::default(),
@@ -661,6 +964,13 @@ impl EngineExecutionLimits {
             vm: VmExecutionLimits::default(),
         }
     }
+}
+
+/// The independent checker's exact completed admission observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckerAgreement {
+    pub schema: &'static str,
+    pub ground: CheckerAdmissionGround,
 }
 
 /// The authoritative outputs of one completed bounded engine run.
@@ -678,6 +988,8 @@ pub struct DefinitionExecution {
     pub flbc_artifact: Vec<u8>,
     /// Golem's completed domain result.
     pub exit: VmExit,
+    /// The independent checker observation that allowed the council to agree.
+    pub checker: CheckerAgreement,
 }
 
 /// The authoritative result of one atomic nonempty definition batch.
@@ -712,6 +1024,9 @@ pub enum EngineExecutionError {
     },
     CouncilHalted {
         summary: String,
+    },
+    CheckerBridge {
+        detail: String,
     },
     DuplicateName {
         name: Name,
@@ -752,6 +1067,9 @@ impl fmt::Display for EngineExecutionError {
                 )
             }
             Self::CouncilHalted { summary } => write!(formatter, "council halted: {summary}"),
+            Self::CheckerBridge { detail } => {
+                write!(formatter, "independent checker bridge failed: {detail}")
+            }
             Self::DuplicateName { name } => {
                 write!(
                     formatter,
@@ -784,10 +1102,11 @@ impl std::error::Error for EngineExecutionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AxiomVal, BinderInfo, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal,
-        Engine, EngineExecutionError, EngineExecutionLimits, Expr, IngressError, IngressResource,
-        KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints, RejectClass,
-        VmExecutionLimits, execute_golem_with_options,
+        AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantVal,
+        Declaration, DefinitionSafety, DefinitionVal, Engine, EngineExecutionError,
+        EngineExecutionLimits, Expr, IngressError, IngressResource, KVMap, Level, Literal, Name,
+        NatLit, Outcome, ReducibilityHints, RejectClass, VmExecutionLimits,
+        execute_golem_with_options,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, Function, FunctionId, Instruction, Program,
@@ -983,11 +1302,68 @@ mod tests {
         );
         assert_ne!(completed.base_logical_root, completed.result_logical_root);
         assert!(!completed.flbc_artifact.is_empty());
+        assert_eq!(
+            completed.checker.schema,
+            fln_checker::admit::ADMISSION_SCHEMA
+        );
+        assert_eq!(
+            completed.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
         let VmExit::Returned(returned) = completed.exit else {
             panic!("the literal definition must return normally");
         };
         assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
         assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn independent_checker_non_answer_vetoes_publication() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+        let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+        let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+        let mut constrained = test_limits();
+        constrained.checker.admission =
+            CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+
+        let error = engine
+            .execute_nat_definition(b"def answer := 42", &options, constrained)
+            .expect_err("a checker non-answer must consume the publication capability");
+        assert!(matches!(
+            error,
+            EngineExecutionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let control = engine
+            .execute_nat_definition(b"def answer := 42", &options, test_limits())
+            .expect("the same declaration completes when the checker can answer");
+        assert!(
+            matches!(&control, Outcome::Complete(_)),
+            "the checker control must answer completely"
+        );
+        let Outcome::Complete(control) = control else {
+            return;
+        };
+        assert_eq!(
+            control.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert!(
+            control
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
     }
 
     #[test]
