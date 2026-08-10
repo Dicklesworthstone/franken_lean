@@ -2541,16 +2541,21 @@ fn export_int_big_arithmetic_division_and_truncation_match_pin_laws() {
         export_lean_dec_ref_cold(mixed_product);
         export_lean_dec_ref_cold(mixed_remainder);
 
-        let normalized_small = export_lean_big_int64_to_int(i64::from(i32::MAX));
+        let small_boundary = if cfg!(target_pointer_width = "64") {
+            i64::from(i32::MAX)
+        } else {
+            i64::from(i32::MAX / 2)
+        };
+        let normalized_small = export_lean_big_int64_to_int(small_boundary);
         assert!(tagged::is_scalar(normalized_small));
-        assert_eq!(scalar_int(normalized_small), i64::from(i32::MAX));
+        assert_eq!(scalar_int(normalized_small), small_boundary);
         let min64 = export_lean_big_int64_to_int(i64::MIN);
         assert_eq!(export_lean_int64_of_big_int(min64), i64::MIN);
 
         let core_small = export_lean_big_int_to_int(-1);
         assert_eq!(mpz_copy(core_small), (-1, vec![1]));
         let size_int = export_lean_big_size_t_to_int(usize::MAX);
-        assert_eq!(mpz_copy(size_int), (1, vec![u64::MAX]));
+        assert_eq!(mpz_copy(size_int), (1, vec![usize::MAX as u64]));
 
         let to_nat_source =
             export_lean_cstr_to_int(c"340282366920938463463374607431768211457".as_ptr());
