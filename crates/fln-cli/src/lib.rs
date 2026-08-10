@@ -29,16 +29,29 @@ use std::path::{Path, PathBuf};
 /// the codec's own structural budgets take over.
 pub const OLEAN_INSPECT_DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
 
+/// Default whole-file ceiling for the current bounded source runner.
+pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Native stack provided to the kernel worker used by `fln run`.
+const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
+
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/1";
 
 const USAGE: &str = concat!(
     "Usage:\n",
+    "  fln run [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
+    "\n",
+    "`run` executes one currently supported closed Nat definition through the\n",
+    "native parser, elaborator, K1, independent checker, compiler, and Golem.\n",
+    "It is not general Lean, Prelude/import processing, a project build, or\n",
+    "evidence that `check-olean` is complete.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -71,11 +84,62 @@ impl MultiplexerOutput {
 enum MultiplexerCommand {
     Help,
     Version,
+    SourceRun {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
     OleanInspect {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
     },
+}
+
+#[derive(Debug)]
+enum BoundedReadFailure {
+    Input {
+        subject: &'static str,
+        detail: String,
+    },
+    TooLarge {
+        subject: &'static str,
+        observed: usize,
+        limit: usize,
+    },
+    Allocation {
+        subject: &'static str,
+        requested: usize,
+    },
+}
+
+impl BoundedReadFailure {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::Input { .. } => "input",
+            Self::TooLarge { .. } | Self::Allocation { .. } => "resource",
+        }
+    }
+}
+
+impl fmt::Display for BoundedReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input { subject, detail } => write!(f, "could not read {subject}: {detail}"),
+            Self::TooLarge {
+                subject,
+                observed,
+                limit,
+            } => write!(
+                f,
+                "{subject} exceeded the {limit}-byte input limit after reading {observed} bytes"
+            ),
+            Self::Allocation { subject, requested } => write!(
+                f,
+                "could not reserve memory for {requested} bytes of bounded {subject} input"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,17 +153,14 @@ impl fmt::Display for UsageError {
 
 #[derive(Debug)]
 enum OleanInspectFailure {
-    Input(String),
-    ArtifactTooLarge { observed: usize, limit: usize },
-    Allocation { requested: usize },
+    Read(BoundedReadFailure),
     Decode(fln::OleanDecodeError),
 }
 
 impl OleanInspectFailure {
     const fn class(&self) -> &'static str {
         match self {
-            Self::Input(_) => "input",
-            Self::ArtifactTooLarge { .. } | Self::Allocation { .. } => "resource",
+            Self::Read(error) => error.class(),
             Self::Decode(_) => "decode",
         }
     }
@@ -108,15 +169,7 @@ impl OleanInspectFailure {
 impl fmt::Display for OleanInspectFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Input(detail) => f.write_str(detail),
-            Self::ArtifactTooLarge { observed, limit } => write!(
-                f,
-                ".olean artifact exceeded the {limit}-byte input limit after reading {observed} bytes"
-            ),
-            Self::Allocation { requested } => write!(
-                f,
-                "could not reserve memory for {requested} bytes of bounded .olean input"
-            ),
+            Self::Read(error) => write!(f, "{error}"),
             Self::Decode(error) => write!(f, "{error}"),
         }
     }
@@ -140,9 +193,13 @@ fn parse_byte_limit(value: &OsString) -> Result<usize, UsageError> {
     })
 }
 
-fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+fn parse_path_options(
+    arguments: Vec<OsString>,
+    command: &'static str,
+    default_max_bytes: usize,
+) -> Result<(PathBuf, usize, bool), UsageError> {
     let mut path = None;
-    let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
+    let mut max_bytes = default_max_bytes;
     let mut json = false;
     let mut options = true;
     let mut arguments = arguments.into_iter();
@@ -176,18 +233,37 @@ fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
         }
         if options && argument.to_string_lossy().starts_with('-') {
             return Err(UsageError(format!(
-                "unknown olean inspect option {:?}",
+                "unknown {command} option {:?}",
                 argument.to_string_lossy()
             )));
         }
         if path.replace(PathBuf::from(&argument)).is_some() {
-            return Err(UsageError(
-                "olean inspect accepts exactly one artifact path".to_owned(),
-            ));
+            return Err(UsageError(format!(
+                "{command} accepts exactly one input path"
+            )));
         }
     }
 
-    let path = path.ok_or_else(|| UsageError("olean inspect requires PATH".to_owned()))?;
+    let path = path.ok_or_else(|| UsageError(format!("{command} requires PATH")))?;
+    Ok((path, max_bytes, json))
+}
+
+fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let (path, max_bytes, json) =
+        parse_path_options(arguments, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?;
+    Ok(MultiplexerCommand::SourceRun {
+        path,
+        max_bytes,
+        json,
+    })
+}
+
+fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let (path, max_bytes, json) = parse_path_options(
+        arguments,
+        "olean inspect",
+        OLEAN_INSPECT_DEFAULT_MAX_BYTES,
+    )?;
     Ok(MultiplexerCommand::OleanInspect {
         path,
         max_bytes,
@@ -207,6 +283,9 @@ fn parse_command(
     }
     if command == "--version" || command == "-V" || command == "version" {
         return Ok(MultiplexerCommand::Version);
+    }
+    if command == "run" {
+        return parse_source_run(arguments.collect());
     }
     if command != "olean" {
         return Err(UsageError(format!(
@@ -234,7 +313,8 @@ fn parse_command(
 fn read_bounded_from(
     reader: &mut impl Read,
     max_bytes: usize,
-) -> Result<Vec<u8>, OleanInspectFailure> {
+    subject: &'static str,
+) -> Result<Vec<u8>, BoundedReadFailure> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
@@ -242,9 +322,10 @@ fn read_bounded_from(
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                return Err(OleanInspectFailure::Input(format!(
-                    "could not read .olean input: {error}"
-                )));
+                return Err(BoundedReadFailure::Input {
+                    subject,
+                    detail: error.to_string(),
+                });
             }
         };
         if read == 0 {
@@ -252,28 +333,32 @@ fn read_bounded_from(
         }
         let observed = bytes.len().saturating_add(read);
         if observed > max_bytes {
-            return Err(OleanInspectFailure::ArtifactTooLarge {
+            return Err(BoundedReadFailure::TooLarge {
+                subject,
                 observed,
                 limit: max_bytes,
             });
         }
         bytes
             .try_reserve_exact(read)
-            .map_err(|_| OleanInspectFailure::Allocation {
+            .map_err(|_| BoundedReadFailure::Allocation {
+                subject,
                 requested: observed,
             })?;
         bytes.extend_from_slice(&chunk[..read]);
     }
 }
 
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, OleanInspectFailure> {
-    let mut file = std::fs::File::open(path).map_err(|error| {
-        OleanInspectFailure::Input(format!(
-            "cannot open .olean artifact {}: {error}",
-            path.display()
-        ))
+fn read_bounded(
+    path: &Path,
+    max_bytes: usize,
+    subject: &'static str,
+) -> Result<Vec<u8>, BoundedReadFailure> {
+    let mut file = std::fs::File::open(path).map_err(|error| BoundedReadFailure::Input {
+        subject,
+        detail: format!("cannot open {}: {error}", path.display()),
     })?;
-    read_bounded_from(&mut file, max_bytes)
+    read_bounded_from(&mut file, max_bytes, subject)
 }
 
 fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
@@ -373,9 +458,262 @@ fn inspect_failure(error: OleanInspectFailure, json: bool) -> MultiplexerOutput 
 }
 
 fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
-    match read_bounded(path, max_bytes) {
+    match read_bounded(path, max_bytes, ".olean artifact") {
         Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
-        Err(error) => inspect_failure(error, json),
+        Err(error) => inspect_failure(OleanInspectFailure::Read(error), json),
+    }
+}
+
+fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
+    match ground {
+        fln::CheckerAdmissionGround::AxiomPreamble => "axiom-preamble",
+        fln::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType => {
+            "body-checked-against-declared-type"
+        }
+        fln::CheckerAdmissionGround::UnsafeQuarantine => "unsafe-quarantine",
+        fln::CheckerAdmissionGround::PartialQuarantine => "partial-quarantine",
+    }
+}
+
+struct SourceSuccess<'a> {
+    source_bytes: usize,
+    value: usize,
+    flbc_bytes: usize,
+    base_root: &'a str,
+    result_root: &'a str,
+    checker_schema: &'a str,
+    checker_ground: &'a str,
+    steps: u64,
+    system_polls: u64,
+    peak_stack_depth: u64,
+}
+
+fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOutput {
+    let stdout = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "\"sourceBytes\":{},\"value\":{},\"flbcBytes\":{},",
+                "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
+                "\"checker\":{{\"schema\":{},\"ground\":{}}},",
+                "\"execution\":{{\"steps\":{},\"systemPolls\":{},",
+                "\"peakStackDepth\":{}}}}}\n"
+            ),
+            json_string(SOURCE_RUN_SCHEMA),
+            result.source_bytes,
+            result.value,
+            result.flbc_bytes,
+            json_string(result.base_root),
+            json_string(result.result_root),
+            json_string(result.checker_schema),
+            json_string(result.checker_ground),
+            result.steps,
+            result.system_polls,
+            result.peak_stack_depth,
+        )
+    } else {
+        format!(
+            concat!(
+                "native source run: complete\n",
+                "value: {}\n",
+                "source bytes: {}\n",
+                "canonical FLBC bytes: {}\n",
+                "base logical root: {}\n",
+                "result logical root: {}\n",
+                "independent checker: {} ({})\n",
+                "execution: {} steps, {} system polls, peak stack {}\n"
+            ),
+            result.value,
+            result.source_bytes,
+            result.flbc_bytes,
+            result.base_root,
+            result.result_root,
+            result.checker_schema,
+            result.checker_ground,
+            result.steps,
+            result.system_polls,
+            result.peak_stack_depth,
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn source_failure(
+    class: &'static str,
+    detail: &str,
+    authority: bool,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
+                "\"class\":{},\"detail\":{}}}\n"
+            ),
+            json_string(SOURCE_RUN_SCHEMA),
+            authority,
+            json_string(class),
+            json_string(detail),
+        )
+    } else {
+        format!("fln run: {class}: {detail}\n")
+    };
+    MultiplexerOutput::failure(stderr, exit_code)
+}
+
+fn source_terminal(
+    class: &'static str,
+    detail: &str,
+    usage: fln_vm_usage::Usage,
+    json: bool,
+) -> MultiplexerOutput {
+    let detail = format!(
+        "{detail}; execution used {} steps, {} system polls, peak stack {}",
+        usage.steps, usage.system_polls, usage.peak_stack_depth
+    );
+    source_failure(class, &detail, true, json, 1)
+}
+
+mod fln_vm_usage {
+    #[derive(Clone, Copy)]
+    pub(super) struct Usage {
+        pub(super) steps: u64,
+        pub(super) system_polls: u64,
+        pub(super) peak_stack_depth: u64,
+    }
+}
+
+fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
+    let source_bytes = source.len();
+    let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+    let engine = match fln::Engine::with_nat_seed(kernel_budget) {
+        Ok(engine) => engine,
+        Err(error) => {
+            let (class, exit_code) = match &error {
+                fln::SeedEnvironmentError::Inconclusive(_) => ("inconclusive", 3),
+                fln::SeedEnvironmentError::InternalFault(_) => ("internal-fault", 4),
+                _ => ("seed", 1),
+            };
+            return source_failure(class, &error.to_string(), false, json, exit_code);
+        }
+    };
+    let options = fln::KVMap::new();
+    let execution = match engine.execute_nat_definition(
+        &source,
+        &options,
+        fln::EngineExecutionLimits::new(kernel_budget),
+    ) {
+        Ok(execution) => execution,
+        Err(error) => {
+            let (class, authority, exit_code) = match &error {
+                fln::EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+                fln::EngineExecutionError::CheckerBridge { .. }
+                | fln::EngineExecutionError::UnexpectedPublication { .. } => {
+                    ("internal-fault", false, 4)
+                }
+                _ => ("execution", true, 1),
+            };
+            return source_failure(class, &error.to_string(), authority, json, exit_code);
+        }
+    };
+    let completed = match execution {
+        fln::Outcome::Complete(completed) => completed,
+        fln::Outcome::Inconclusive(inconclusive) => {
+            return source_failure(
+                "inconclusive",
+                &format!("{inconclusive:?}"),
+                false,
+                json,
+                3,
+            );
+        }
+        fln::Outcome::InternalFault(fault) => {
+            return source_failure(
+                "internal-fault",
+                &format!("{fault:?}"),
+                false,
+                json,
+                4,
+            );
+        }
+    };
+    let base_root = completed.base_logical_root.to_string();
+    let result_root = completed.result_logical_root.to_string();
+    let checker_ground = checker_ground_name(completed.checker.ground);
+    let flbc_bytes = completed.flbc_artifact.len();
+    match completed.exit {
+        fln::VmExit::Returned(returned) => render_source_success(
+            SourceSuccess {
+                source_bytes,
+                value: returned.value.unbox(),
+                flbc_bytes,
+                base_root: &base_root,
+                result_root: &result_root,
+                checker_schema: completed.checker.schema,
+                checker_ground,
+                steps: returned.usage.steps,
+                system_polls: returned.usage.system_polls,
+                peak_stack_depth: returned.usage.peak_stack_depth,
+            },
+            json,
+        ),
+        fln::VmExit::Panicked { message, usage } => source_terminal(
+            "program-panic",
+            &message,
+            fln_vm_usage::Usage {
+                steps: usage.steps,
+                system_polls: usage.system_polls,
+                peak_stack_depth: usage.peak_stack_depth,
+            },
+            json,
+        ),
+        fln::VmExit::Refused { refusal, usage } => source_terminal(
+            "vm-refusal",
+            &refusal.to_string(),
+            fln_vm_usage::Usage {
+                steps: usage.steps,
+                system_polls: usage.system_polls,
+                peak_stack_depth: usage.peak_stack_depth,
+            },
+            json,
+        ),
+    }
+}
+
+fn run_source(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let source = match read_bounded(path, max_bytes, "source file") {
+        Ok(source) => source,
+        Err(error) => {
+            let exit_code = if error.class() == "resource" { 3 } else { 1 };
+            return source_failure(error.class(), &error.to_string(), false, json, exit_code);
+        }
+    };
+    let worker = match std::thread::Builder::new()
+        .name("fln-source-run".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || execute_source_bytes(source, json))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            return source_failure(
+                "internal-fault",
+                &format!("could not start bounded kernel worker: {error}"),
+                false,
+                json,
+                4,
+            );
+        }
+    };
+    match worker.join() {
+        Ok(output) => output,
+        Err(_) => source_failure(
+            "internal-fault",
+            "bounded kernel worker panicked",
+            false,
+            json,
+            4,
+        ),
     }
 }
 
@@ -387,6 +725,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
         Ok(MultiplexerCommand::Version) => {
             MultiplexerOutput::success(format!("fln {}\n", env!("CARGO_PKG_VERSION")))
         }
+        Ok(MultiplexerCommand::SourceRun {
+            path,
+            max_bytes,
+            json,
+        }) => run_source(&path, max_bytes, json),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
