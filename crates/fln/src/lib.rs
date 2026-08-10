@@ -65,6 +65,7 @@ use fln_kernel::council::{
 pub use fln_kernel::verdict::{Budget, RejectClass};
 use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;
+pub use fln_olean::rebuild::RebuildReport as OleanRebuildReport;
 use fln_olean::region::OleanView;
 pub use fln_olean::region::{
     ModuleDataView as OleanModuleData, OleanHeader, RegionError as OleanRegionError,
@@ -210,6 +211,52 @@ impl From<OleanDeclarationError> for OleanDecodeError {
     fn from(error: OleanDeclarationError) -> Self {
         Self::Declaration(error)
     }
+}
+
+/// Typed refusal from the public pinned `.olean` rebuild path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OleanRebuildError {
+    ArtifactTooLarge { bytes: usize, limit: usize },
+    Region(OleanRegionError),
+}
+
+impl fmt::Display for OleanRebuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArtifactTooLarge { bytes, limit } => {
+                write!(f, ".olean artifact has {bytes} bytes; limit is {limit}")
+            }
+            Self::Region(error) => write!(f, ".olean rebuild: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OleanRebuildError {}
+
+impl From<OleanRegionError> for OleanRebuildError {
+    fn from(error: OleanRegionError) -> Self {
+        Self::Region(error)
+    }
+}
+
+/// Re-derive a pinned `.olean` artifact from its parsed object graph.
+///
+/// This is the bounded embeddable door over Grimoire's read-to-rebuild lane.
+/// It reconstructs every understood structural byte from semantic fields and
+/// copies only declared content classes. Callers compare the returned bytes to
+/// the input and inspect the accounting report. It is not fresh `.olean`
+/// emission and does not resolve imports or kernel-check declarations.
+pub fn rebuild_olean_artifact(
+    artifact: &[u8],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, OleanRebuildReport), OleanRebuildError> {
+    if artifact.len() > max_bytes {
+        return Err(OleanRebuildError::ArtifactTooLarge {
+            bytes: artifact.len(),
+            limit: max_bytes,
+        });
+    }
+    fln_olean::rebuild::rebuild(artifact).map_err(OleanRebuildError::from)
 }
 
 /// Audit and decode one `.olean` produced by the pinned Reference epoch.
@@ -1708,10 +1755,10 @@ mod tests {
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
         FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit,
-        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanRegionError,
-        OleanWalkBudget, OpaqueVal, Outcome, ReducibilityHints, RejectClass, TheoremVal,
-        VmExecutionLimits, decode_olean_artifact, execute_flbc_artifact,
-        execute_golem_with_options,
+        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanRebuildError,
+        OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome, ReducibilityHints, RejectClass,
+        TheoremVal, VmExecutionLimits, decode_olean_artifact, execute_flbc_artifact,
+        execute_golem_with_options, rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -1890,6 +1937,34 @@ mod tests {
             Err(OleanDecodeError::Declaration(
                 OleanDeclarationError::Budget { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn public_olean_rebuild_door_rederives_real_reference_bytes_with_a_bound() {
+        let bytes = olean_fixture("Init.BinderNameHint.olean");
+        let (rebuilt, report) = rebuild_olean_artifact(&bytes, bytes.len())
+            .expect("the real pinned artifact rebuilds from parsed semantics");
+
+        assert_eq!(rebuilt, bytes);
+        assert!(report.objects > 0);
+        assert!(report.rederived_bytes > 0);
+        assert_eq!(report.nonzero_padding_bytes, 0);
+        assert!(report.findings.is_empty());
+
+        assert!(matches!(
+            rebuild_olean_artifact(&bytes, bytes.len() - 1),
+            Err(OleanRebuildError::ArtifactTooLarge {
+                bytes: observed,
+                limit,
+            }) if observed == bytes.len() && limit == bytes.len() - 1
+        ));
+
+        let mut malformed = bytes;
+        malformed[0] ^= u8::MAX;
+        assert!(matches!(
+            rebuild_olean_artifact(&malformed, malformed.len()),
+            Err(OleanRebuildError::Region(OleanRegionError::BadMagic))
         ));
     }
 

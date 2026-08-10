@@ -36,17 +36,22 @@ pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
+const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/2";
 
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln run [--json] [--max-bytes BYTES] PATH...\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
+    "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
+    "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
+    "semantics and requires byte identity with no codec findings. It is not\n",
+    "fresh emission and does not kernel-check declarations.\n",
     "\n",
     "`run` executes one supported Nat definition per path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
@@ -92,6 +97,11 @@ enum MultiplexerCommand {
         json: bool,
     },
     OleanInspect {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
+    OleanVerifyRebuild {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
@@ -163,6 +173,14 @@ impl OleanInspectFailure {
     const fn class(&self) -> &'static str {
         match self {
             Self::Read(error) => error.class(),
+            Self::Decode(
+                fln::OleanDecodeError::ArtifactTooLarge { .. }
+                | fln::OleanDecodeError::Region(fln::OleanRegionError::BudgetExhausted { .. })
+                | fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Budget { .. })
+                | fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Region(
+                    fln::OleanRegionError::BudgetExhausted { .. },
+                )),
+            ) => "resource",
             Self::Decode(_) => "decode",
         }
     }
@@ -279,6 +297,27 @@ fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
     })
 }
 
+fn parse_olean_verify_rebuild(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) = parse_path_options(
+        arguments,
+        "olean verify-rebuild",
+        OLEAN_INSPECT_DEFAULT_MAX_BYTES,
+    )?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "olean verify-rebuild accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::OleanVerifyRebuild {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<MultiplexerCommand, UsageError> {
@@ -309,13 +348,16 @@ fn parse_command(
     if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
         return Ok(MultiplexerCommand::Help);
     }
-    if subcommand != "inspect" {
-        return Err(UsageError(format!(
-            "unknown olean subcommand {:?}",
-            subcommand.to_string_lossy()
-        )));
+    if subcommand == "inspect" {
+        return parse_olean_inspect(arguments.collect());
     }
-    parse_olean_inspect(arguments.collect())
+    if subcommand == "verify-rebuild" {
+        return parse_olean_verify_rebuild(arguments.collect());
+    }
+    Err(UsageError(format!(
+        "unknown olean subcommand {:?}",
+        subcommand.to_string_lossy()
+    )))
 }
 
 fn read_bounded_from(
@@ -452,17 +494,18 @@ fn inspect_olean_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> Multiplexe
 
 fn inspect_failure(error: OleanInspectFailure, json: bool) -> MultiplexerOutput {
     let detail = error.to_string();
+    let class = error.class();
     let stderr = if json {
         format!(
             "{{\"schema\":{},\"outcome\":\"error\",\"class\":{},\"detail\":{}}}\n",
             json_string(OLEAN_INSPECT_SCHEMA),
-            json_string(error.class()),
+            json_string(class),
             json_string(&detail),
         )
     } else {
         format!("fln olean inspect: {detail}\n")
     };
-    MultiplexerOutput::failure(stderr, 1)
+    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
 }
 
 fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
@@ -470,6 +513,167 @@ fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput
         Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
         Err(error) => inspect_failure(OleanInspectFailure::Read(error), json),
     }
+}
+
+fn render_olean_rebuild_success(
+    bytes: usize,
+    report: &fln::OleanRebuildReport,
+    json: bool,
+) -> MultiplexerOutput {
+    let Some(copied_content_bytes) = report
+        .copied_string_bytes
+        .checked_add(report.copied_sarray_bytes)
+        .and_then(|total| total.checked_add(report.copied_ctor_tail_bytes))
+        .and_then(|total| total.checked_add(report.copied_mpz_limb_bytes))
+    else {
+        return olean_rebuild_failure(
+            "internal-fault",
+            "rebuild report content-byte accounting overflowed",
+            json,
+            4,
+        );
+    };
+    let stdout = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"bytes\":{},",
+                "\"byteIdentity\":true,\"objects\":{},",
+                "\"accounting\":{{\"rederivedBytes\":{},",
+                "\"copiedContentBytes\":{},\"paddingBytes\":{},",
+                "\"nonzeroPaddingBytes\":{},\"slackBytes\":{}}},",
+                "\"findings\":0}}\n"
+            ),
+            json_string(OLEAN_REBUILD_SCHEMA),
+            bytes,
+            report.objects,
+            report.rederived_bytes,
+            copied_content_bytes,
+            report.padding_bytes,
+            report.nonzero_padding_bytes,
+            report.slack_bytes,
+        )
+    } else {
+        format!(
+            concat!(
+                "pinned .olean rebuild audit: complete\n",
+                "bytes: {}\n",
+                "byte identity: exact\n",
+                "objects: {}\n",
+                "re-derived bytes: {}\n",
+                "declared content bytes: {}\n",
+                "padding bytes: {} ({} nonzero)\n",
+                "capacity slack bytes: {}\n",
+                "findings: 0\n"
+            ),
+            bytes,
+            report.objects,
+            report.rederived_bytes,
+            copied_content_bytes,
+            report.padding_bytes,
+            report.nonzero_padding_bytes,
+            report.slack_bytes,
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn olean_rebuild_failure(
+    class: &'static str,
+    detail: &str,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
+    let detail = BoundedText::new(detail.to_owned());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"class\":{},",
+                "\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(OLEAN_REBUILD_SCHEMA),
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        let truncation = if detail.truncated() {
+            format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
+        } else {
+            String::new()
+        };
+        format!(
+            "fln olean verify-rebuild: {class}: {}{truncation}\n",
+            detail.text()
+        )
+    };
+    MultiplexerOutput::failure(stderr, exit_code)
+}
+
+fn olean_rebuild_error_class(error: &fln::OleanRebuildError) -> (&'static str, u8) {
+    match error {
+        fln::OleanRebuildError::ArtifactTooLarge { .. }
+        | fln::OleanRebuildError::Region(fln::OleanRegionError::BudgetExhausted { .. }) => {
+            ("resource", 3)
+        }
+        fln::OleanRebuildError::Region(_) => ("rebuild", 1),
+    }
+}
+
+fn first_byte_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then(|| left.len().min(right.len())))
+}
+
+fn verify_olean_rebuild_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let (rebuilt, report) = match fln::rebuild_olean_artifact(bytes, max_bytes) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            let (class, exit_code) = olean_rebuild_error_class(&error);
+            return olean_rebuild_failure(class, &error.to_string(), json, exit_code);
+        }
+    };
+    if let Some(offset) = first_byte_difference(bytes, &rebuilt) {
+        return olean_rebuild_failure(
+            "divergence",
+            &format!(
+                "re-derived artifact first differs at byte {offset}; input has {} bytes and rebuild has {} bytes",
+                bytes.len(),
+                rebuilt.len()
+            ),
+            json,
+            1,
+        );
+    }
+    if let Some(first) = report.findings.first() {
+        return olean_rebuild_failure(
+            "finding",
+            &format!(
+                "rebuild reported {} codec finding(s); first: {first}",
+                report.findings.len()
+            ),
+            json,
+            1,
+        );
+    }
+    render_olean_rebuild_success(bytes.len(), &report, json)
+}
+
+fn verify_olean_rebuild(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let bytes = match read_bounded(path, max_bytes, ".olean artifact") {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let class = error.class();
+            return olean_rebuild_failure(
+                class,
+                &error.to_string(),
+                json,
+                if class == "resource" { 3 } else { 1 },
+            );
+        }
+    };
+    verify_olean_rebuild_bytes(&bytes, max_bytes, json)
 }
 
 fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
@@ -842,6 +1046,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => inspect_olean(&path, max_bytes, json),
+        Ok(MultiplexerCommand::OleanVerifyRebuild {
+            path,
+            max_bytes,
+            json,
+        }) => verify_olean_rebuild(&path, max_bytes, json),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }
@@ -1278,8 +1487,9 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        OLEAN_INSPECT_SCHEMA, SOURCE_RUN_SCHEMA, execute_source_bytes, execution_error_disposition,
-        inspect_olean_bytes, read_bounded_from, run, source_failure,
+        OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_SCHEMA, execute_source_bytes,
+        execution_error_disposition, inspect_olean_bytes, read_bounded_from, run, source_failure,
+        verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -1331,6 +1541,59 @@ mod tests {
     }
 
     #[test]
+    fn olean_verify_rebuild_rederives_real_bytes_in_human_and_robot_forms() {
+        let artifact = repository_path("tribunal/fixtures/c3/Init.BinderNameHint.olean");
+        let human = run([
+            OsString::from("olean"),
+            OsString::from("verify-rebuild"),
+            artifact.clone().into_os_string(),
+        ]);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(
+            human
+                .stdout
+                .contains("pinned .olean rebuild audit: complete")
+        );
+        assert!(human.stdout.contains("byte identity: exact"));
+        assert!(human.stdout.contains("findings: 0"));
+
+        let robot = run([
+            OsString::from("olean"),
+            OsString::from("verify-rebuild"),
+            OsString::from("--json"),
+            artifact.into_os_string(),
+        ]);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{OLEAN_REBUILD_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"outcome\":\"complete\""));
+        assert!(robot.stdout.contains("\"byteIdentity\":true"));
+        assert!(robot.stdout.contains("\"findings\":0"));
+    }
+
+    #[test]
+    fn olean_verify_rebuild_preserves_corruption_and_resource_stops() {
+        let mut corrupted = PINNED_OLEAN.to_vec();
+        corrupted[0] ^= u8::MAX;
+        let invalid = verify_olean_rebuild_bytes(&corrupted, corrupted.len(), true);
+        assert_eq!(invalid.exit_code, 1);
+        assert!(invalid.stdout.is_empty());
+        assert!(invalid.stderr.contains("\"class\":\"rebuild\""));
+        assert!(invalid.stderr.contains("bad magic (not an olean file)"));
+
+        let exhausted = verify_olean_rebuild_bytes(PINNED_OLEAN, PINNED_OLEAN.len() - 1, true);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+        assert!(exhausted.stderr.contains("\"detailTruncated\":false"));
+    }
+
+    #[test]
     fn olean_input_is_bounded_before_the_decoder_runs() {
         let mut input = Cursor::new(vec![0_u8; 17]);
         let error = read_bounded_from(&mut input, 16, ".olean artifact")
@@ -1338,6 +1601,11 @@ mod tests {
         assert_eq!(error.class(), "resource");
         assert!(error.to_string().contains("16-byte input limit"));
         assert!(error.to_string().contains("17 bytes"));
+
+        let output = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len() - 1, true);
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"class\":\"resource\""));
     }
 
     #[test]
