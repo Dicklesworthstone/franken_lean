@@ -1148,8 +1148,8 @@ fn decode_prelude() -> Option<(Vec<u8>, Vec<ConstantInfo>)> {
 /// module at the same Reference epoch may increase coverage, while silently
 /// enumerating or decoding less than the measured pin must fail.
 const PINNED_PRESENT_OLEAN_FLOOR: u64 = 2_433;
-const PINNED_DECODED_DECL_FLOOR: u64 = 158_608;
-const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 157_183;
+const PINNED_DECODED_DECL_FLOOR: u64 = 215_136;
+const PINNED_ORACLE_APPLICABLE_FLOOR: u64 = 211_524;
 /// The single, explicitly pinned worker count the corpus census is produced at
 /// (R1 of bead `fln-corpus-thread-matrix-93te`).
 ///
@@ -1284,7 +1284,13 @@ fn tagged_fixture_hash(tag: &[u8], fields: &[&[u8]]) -> String {
     hash(Domain::Fixture, &preimage).to_hex()
 }
 
-fn decode_corpus_module(path: &Path) -> Result<(Vec<u8>, Vec<ConstantInfo>), String> {
+struct DecodedCorpusModule {
+    infos: Vec<ConstantInfo>,
+    imports: BTreeSet<String>,
+    olean_hash: String,
+}
+
+fn read_corpus_module_part(path: &Path) -> Result<Vec<u8>, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if metadata.len() > MAX_PINNED_OLEAN_BYTES {
@@ -1295,13 +1301,89 @@ fn decode_corpus_module(path: &Path) -> Result<(Vec<u8>, Vec<ConstantInfo>), Str
             MAX_PINNED_OLEAN_BYTES
         ));
     }
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let view =
-        OleanView::parse(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))?;
-    let infos = DeclDecoder::new(&view, WalkBudget::default())
+    fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+fn corpus_module_parts_hash(name: &str, parts: &[(&str, &[u8])]) -> String {
+    let mut fields = Vec::with_capacity(1 + parts.len() * 2);
+    fields.push(name.as_bytes());
+    for (level, bytes) in parts {
+        fields.push(level.as_bytes());
+        fields.push(*bytes);
+    }
+    tagged_fixture_hash(b"fln.kernel-reference-corpus.olean-parts/2", &fields)
+}
+
+/// Decode the exact module-data level Lean imports under `import all`.
+///
+/// A module-system `.olean` is only the exported part. The server and private
+/// sidecars are compacted against the earlier regions, and the private part is
+/// the one whose constant array retains private auxiliaries and definition
+/// bodies. Reading only the public file silently postulated exported
+/// definitions as axioms and omitted the equation compiler's private family.
+fn decode_corpus_module(path: &Path, name: &str) -> Result<DecodedCorpusModule, String> {
+    let public = read_corpus_module_part(path)?;
+    let public_view =
+        OleanView::parse(&public).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let module_data = public_view
+        .module_data(WalkBudget::default())
+        .map_err(|error| format!("module data {}: {error}", path.display()))?;
+    let imports = module_data
+        .imports
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect::<BTreeSet<_>>();
+
+    if !module_data.is_module {
+        let infos = DeclDecoder::new(&public_view, WalkBudget::default())
+            .decode_module_constants()
+            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let olean_hash = corpus_module_parts_hash(name, &[("exported", &public)]);
+        return Ok(DecodedCorpusModule {
+            infos,
+            imports,
+            olean_hash,
+        });
+    }
+
+    let server_path = path.with_extension("olean.server");
+    let private_path = path.with_extension("olean.private");
+    let server = read_corpus_module_part(&server_path)?;
+    let private = read_corpus_module_part(&private_path)?;
+    let total_bytes = public
+        .len()
+        .checked_add(server.len())
+        .and_then(|total| total.checked_add(private.len()))
+        .ok_or_else(|| format!("module-part byte count overflow for {name}"))?;
+    if total_bytes as u64 > MAX_PINNED_OLEAN_BYTES {
+        return Err(format!(
+            "module parts for {name} total {total_bytes} bytes, over the {}-byte corpus cap",
+            MAX_PINNED_OLEAN_BYTES
+        ));
+    }
+    let private_view =
+        OleanView::parse_with_dependencies(&private, &[&public, &server]).map_err(|error| {
+            format!(
+                "parse {} with module dependencies: {error}",
+                private_path.display()
+            )
+        })?;
+    let infos = DeclDecoder::new(&private_view, WalkBudget::default())
         .decode_module_constants()
-        .map_err(|error| format!("decode {}: {error}", path.display()))?;
-    Ok((bytes, infos))
+        .map_err(|error| format!("decode {}: {error}", private_path.display()))?;
+    let olean_hash = corpus_module_parts_hash(
+        name,
+        &[
+            ("exported", &public),
+            ("server", &server),
+            ("private", &private),
+        ],
+    );
+    Ok(DecodedCorpusModule {
+        infos,
+        imports,
+        olean_hash,
+    })
 }
 
 fn qualify_module_name(module_prefix: Option<&str>, relative_name: String) -> String {
@@ -1326,40 +1408,16 @@ fn inventory_oleans(root: &Path, module_prefix: Option<&str>) -> Result<CorpusIn
     for path in paths {
         let relative_name = module_name_from_path(root, &path)?;
         let name = qualify_module_name(module_prefix, relative_name);
-        let metadata =
-            fs::metadata(&path).map_err(|error| format!("stat {}: {error}", path.display()))?;
-        if metadata.len() > MAX_PINNED_OLEAN_BYTES {
-            return Err(format!(
-                "{} is {} bytes, over the {}-byte corpus cap",
-                path.display(),
-                metadata.len(),
-                MAX_PINNED_OLEAN_BYTES
-            ));
-        }
-        let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let view = OleanView::parse(&bytes)
-            .map_err(|error| format!("parse {}: {error}", path.display()))?;
-        let module_data = view
-            .module_data(WalkBudget::default())
-            .map_err(|error| format!("module data {}: {error}", path.display()))?;
-        let infos = DeclDecoder::new(&view, WalkBudget::default())
-            .decode_module_constants()
-            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let decoded_module = decode_corpus_module(&path, &name)?;
+        let infos = decoded_module.infos;
         let decoded_here = u64::try_from(infos.len())
             .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
         let skipped_here = infos
             .iter()
             .filter(|info| reference_replay_skips(info))
             .count() as u64;
-        let olean_hash = tagged_fixture_hash(
-            b"fln.kernel-reference-corpus.olean/1",
-            &[name.as_bytes(), &bytes],
-        );
-        let imports = module_data
-            .imports
-            .iter()
-            .map(|import| import.module.to_display_string())
-            .collect::<BTreeSet<_>>();
+        let olean_hash = decoded_module.olean_hash;
+        let imports = decoded_module.imports;
         let module = CorpusModule {
             name: name.clone(),
             path,
@@ -2573,7 +2631,7 @@ fn present_olean_corpus_inventory_is_closed_and_honest() {
          {PINNED_ORACLE_APPLICABLE_FLOOR}"
     );
     assert_eq!(
-        inventory.oracle_skipped, 1_425,
+        inventory.oracle_skipped, 3_612,
         "Lean.Replay applicability census moved; never count skipped rows as accepted"
     );
     assert_eq!(
@@ -2636,7 +2694,9 @@ fn present_olean_import_contexts_accept_reference_extended_duplicates() {
     let mut first_collisions = Vec::new();
     for module_name in &order {
         let module = &inventory.modules[module_name];
-        let (_, infos) = decode_corpus_module(&module.path).expect("decode governed corpus module");
+        let infos = decode_corpus_module(&module.path, &module.name)
+            .expect("decode governed corpus module")
+            .infos;
         let (active_infos, _, _) = reference_active_rows(&infos);
         let direct_imports = module
             .imports
@@ -3420,7 +3480,7 @@ fn whole_mathlib_corpus_resurrection_sweep() {
 }
 
 /// The executable corpus obligation. It remains ignored while fln-7odd is
-/// open because the selected oracle itself supplies no verdict for 1,425
+/// open because the selected oracle itself supplies no verdict for 3,612
 /// decoded rows; enabling a gate that is known to fail before that contract is
 /// decided would make every ordinary `cargo test` unusable. Run explicitly:
 ///
@@ -3518,12 +3578,10 @@ fn pinned_present_olean_kernel_differential() {
     let mut total = CorpusCounts::default();
     for (index, module_name) in order.iter().enumerate() {
         let module = &inventory.modules[module_name];
-        let (bytes, infos) =
-            decode_corpus_module(&module.path).expect("decode governed corpus module");
-        let current_hash = tagged_fixture_hash(
-            b"fln.kernel-reference-corpus.olean/1",
-            &[module.name.as_bytes(), &bytes],
-        );
+        let decoded_module = decode_corpus_module(&module.path, &module.name)
+            .expect("decode governed corpus module");
+        let current_hash = decoded_module.olean_hash;
+        let infos = decoded_module.infos;
         assert_eq!(
             current_hash, module.olean_hash,
             "{} changed between inventory and replay",
@@ -3818,14 +3876,12 @@ fn present_olean_corpus_thread_matrix_compares_stream_digests() {
 
     for (index, module_name) in order.iter().enumerate() {
         let module = &inventory.modules[module_name];
-        let (bytes, infos) =
-            decode_corpus_module(&module.path).expect("decode governed corpus module");
+        let decoded_module = decode_corpus_module(&module.path, &module.name)
+            .expect("decode governed corpus module");
+        let current_hash = decoded_module.olean_hash;
+        let infos = decoded_module.infos;
         // The census's own two identity checks. A corpus that moved under the run would
         // make every digest below evidence about an input nobody named.
-        let current_hash = tagged_fixture_hash(
-            b"fln.kernel-reference-corpus.olean/1",
-            &[module.name.as_bytes(), &bytes],
-        );
         assert_eq!(
             current_hash, module.olean_hash,
             "{} changed between inventory and replay",
@@ -6426,30 +6482,16 @@ fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<Corpus
         }
         let path = chosen_module_file(roots, &name)
             .ok_or_else(|| format!("no provisioned olean for import {name}"))?;
-        let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let view = OleanView::parse(&bytes)
-            .map_err(|error| format!("parse {}: {error}", path.display()))?;
-        let module_data = view
-            .module_data(WalkBudget::default())
-            .map_err(|error| format!("module data {}: {error}", path.display()))?;
-        let infos = DeclDecoder::new(&view, WalkBudget::default())
-            .decode_module_constants()
-            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let decoded_module = decode_corpus_module(&path, &name)?;
+        let infos = decoded_module.infos;
         let decoded_here = u64::try_from(infos.len())
             .map_err(|_| format!("declaration count overflow in {}", path.display()))?;
         let skipped_here = infos
             .iter()
             .filter(|info| reference_replay_skips(info))
             .count() as u64;
-        let olean_hash = tagged_fixture_hash(
-            b"fln.kernel-reference-corpus.olean/1",
-            &[name.as_bytes(), &bytes],
-        );
-        let imports = module_data
-            .imports
-            .iter()
-            .map(|import| import.module.to_display_string())
-            .collect::<BTreeSet<_>>();
+        let olean_hash = decoded_module.olean_hash;
+        let imports = decoded_module.imports;
         for import in &imports {
             if !modules.contains_key(import) {
                 queue.push(import.clone());
@@ -6531,11 +6573,9 @@ fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLeg
     let mut states = BTreeMap::<String, CorpusFixtureState>::new();
     for module_name in &order {
         let module = &inventory.modules[module_name];
-        let (bytes, infos) = decode_corpus_module(&module.path)?;
-        let current_hash = tagged_fixture_hash(
-            b"fln.kernel-reference-corpus.olean/1",
-            &[module.name.as_bytes(), &bytes],
-        );
+        let decoded_module = decode_corpus_module(&module.path, &module.name)?;
+        let current_hash = decoded_module.olean_hash;
+        let infos = decoded_module.infos;
         if current_hash != module.olean_hash {
             return Err(format!(
                 "{} changed between inventory and replay",
