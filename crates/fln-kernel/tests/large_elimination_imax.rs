@@ -281,7 +281,11 @@ fn w_block(u: &Name, mu: &Name) -> InductiveBlock {
     // minor sup, scope α=bvar1 motive=bvar0
     let sup_f_ty = forall("_a", bvar(1), Expr::app(w(), bvar(2)));
     // ih : ∀ (a : α), motive (f a); scope α=2 motive=1 f=0, under a: motive=2 f=1 a=0
-    let sup_ih_ty = forall("a", bvar(2), Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))));
+    let sup_ih_ty = forall(
+        "_a",
+        bvar(2),
+        Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))),
+    );
     // result motive (W.sup α f); scope α=3 motive=2 f=1 ih=0
     let sup_result = Expr::app(bvar(2), Expr::app(Expr::app(wsup(), bvar(3)), bvar(1)));
     let sup_minor_ty = forall("f", sup_f_ty, forall("f_ih", sup_ih_ty, sup_result));
@@ -300,14 +304,22 @@ fn w_block(u: &Name, mu: &Name) -> InductiveBlock {
     // iota rhs: fun α motive sup f => sup f (fun a => W.rec α motive sup (f a))
     let rhs_motive_ty = forall("t", Expr::app(w(), bvar(0)), sort(Level::param(mu.clone())));
     let rhs_sup_f_ty = forall("_a", bvar(1), Expr::app(w(), bvar(2)));
-    let rhs_sup_ih_ty = forall("a", bvar(2), Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))));
+    let rhs_sup_ih_ty = forall(
+        "_a",
+        bvar(2),
+        Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))),
+    );
     let rhs_sup_result = Expr::app(bvar(2), Expr::app(Expr::app(wsup(), bvar(3)), bvar(1)));
-    let rhs_sup_ty = forall("f", rhs_sup_f_ty, forall("f_ih", rhs_sup_ih_ty, rhs_sup_result));
+    let rhs_sup_ty = forall(
+        "f",
+        rhs_sup_f_ty,
+        forall("f_ih", rhs_sup_ih_ty, rhs_sup_result),
+    );
     // f's type at scope α=2 motive=1 sup=0: ∀(_:α[bvar2]), W α[bvar3]
     let rhs_f_ty = forall("_a", bvar(2), Expr::app(w(), bvar(3)));
     // ih_value = fun (a : α) => W.rec α motive sup (f a); a:α=bvar3, under a shift +1
     let ih_value = lam(
-        "a",
+        "_a",
         bvar(3),
         Expr::app(
             Expr::app(Expr::app(Expr::app(wrec(), bvar(4)), bvar(3)), bvar(2)),
