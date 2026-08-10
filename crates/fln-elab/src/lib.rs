@@ -38,12 +38,46 @@ pub enum NatDefinitionElabError {
     TooManyParameters,
 }
 
+impl std::fmt::Display for NatDefinitionElabError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedSyntax { expected } => {
+                write!(formatter, "unexpected syntax; expected {expected}")
+            }
+            Self::AnonymousDeclarationName => write!(formatter, "declaration name is anonymous"),
+            Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
+            Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
+            Self::TooManyParameters => write!(formatter, "definition has too many parameters"),
+        }
+    }
+}
+
+impl std::error::Error for NatDefinitionElabError {}
+
 /// A source-to-elaboration failure. Kernel rejections and non-answers are not
 /// collapsed into this type; they remain in [`NatDefinitionCheck::outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatDefinitionFrontendError {
     Parse(NatDefinitionParseError),
     Elaborate(NatDefinitionElabError),
+}
+
+impl std::fmt::Display for NatDefinitionFrontendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(error) => write!(formatter, "parse refused source: {error}"),
+            Self::Elaborate(error) => write!(formatter, "elaboration refused source: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for NatDefinitionFrontendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::Elaborate(error) => Some(error),
+        }
+    }
 }
 
 impl From<NatDefinitionParseError> for NatDefinitionFrontendError {

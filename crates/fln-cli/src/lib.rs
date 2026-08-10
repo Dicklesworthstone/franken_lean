@@ -197,7 +197,7 @@ fn parse_path_options(
     arguments: Vec<OsString>,
     command: &'static str,
     default_max_bytes: usize,
-) -> Result<(PathBuf, usize, bool), UsageError> {
+) -> Result<Option<(PathBuf, usize, bool)>, UsageError> {
     let mut path = None;
     let mut max_bytes = default_max_bytes;
     let mut json = false;
@@ -210,7 +210,7 @@ fn parse_path_options(
             continue;
         }
         if options && (argument == "--help" || argument == "-h") {
-            return Ok(MultiplexerCommand::Help);
+            return Ok(None);
         }
         if options && argument == "--json" {
             json = true;
@@ -245,12 +245,15 @@ fn parse_path_options(
     }
 
     let path = path.ok_or_else(|| UsageError(format!("{command} requires PATH")))?;
-    Ok((path, max_bytes, json))
+    Ok(Some((path, max_bytes, json)))
 }
 
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let (path, max_bytes, json) =
-        parse_path_options(arguments, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?;
+    let Some((path, max_bytes, json)) =
+        parse_path_options(arguments, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
     Ok(MultiplexerCommand::SourceRun {
         path,
         max_bytes,
@@ -259,11 +262,11 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
 }
 
 fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let (path, max_bytes, json) = parse_path_options(
-        arguments,
-        "olean inspect",
-        OLEAN_INSPECT_DEFAULT_MAX_BYTES,
-    )?;
+    let Some((path, max_bytes, json)) =
+        parse_path_options(arguments, "olean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
     Ok(MultiplexerCommand::OleanInspect {
         path,
         max_bytes,
@@ -545,19 +548,26 @@ fn source_failure(
     json: bool,
     exit_code: u8,
 ) -> MultiplexerOutput {
+    let detail = BoundedText::new(detail.to_owned());
     let stderr = if json {
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
-                "\"class\":{},\"detail\":{}}}\n"
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
             ),
             json_string(SOURCE_RUN_SCHEMA),
             authority,
             json_string(class),
-            json_string(detail),
+            json_string(detail.text()),
+            detail.truncated(),
         )
     } else {
-        format!("fln run: {class}: {detail}\n")
+        let truncation = if detail.truncated() {
+            format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
+        } else {
+            String::new()
+        };
+        format!("fln run: {class}: {}{truncation}\n", detail.text())
     };
     MultiplexerOutput::failure(stderr, exit_code)
 }
@@ -565,23 +575,16 @@ fn source_failure(
 fn source_terminal(
     class: &'static str,
     detail: &str,
-    usage: fln_vm_usage::Usage,
+    steps: u64,
+    system_polls: u64,
+    peak_stack_depth: u64,
     json: bool,
 ) -> MultiplexerOutput {
     let detail = format!(
         "{detail}; execution used {} steps, {} system polls, peak stack {}",
-        usage.steps, usage.system_polls, usage.peak_stack_depth
+        steps, system_polls, peak_stack_depth
     );
     source_failure(class, &detail, true, json, 1)
-}
-
-mod fln_vm_usage {
-    #[derive(Clone, Copy)]
-    pub(super) struct Usage {
-        pub(super) steps: u64,
-        pub(super) system_polls: u64,
-        pub(super) peak_stack_depth: u64,
-    }
 }
 
 fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
@@ -620,22 +623,10 @@ fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
     let completed = match execution {
         fln::Outcome::Complete(completed) => completed,
         fln::Outcome::Inconclusive(inconclusive) => {
-            return source_failure(
-                "inconclusive",
-                &format!("{inconclusive:?}"),
-                false,
-                json,
-                3,
-            );
+            return source_failure("inconclusive", &format!("{inconclusive:?}"), false, json, 3);
         }
         fln::Outcome::InternalFault(fault) => {
-            return source_failure(
-                "internal-fault",
-                &format!("{fault:?}"),
-                false,
-                json,
-                4,
-            );
+            return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
         }
     };
     let base_root = completed.base_logical_root.to_string();
@@ -661,21 +652,17 @@ fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
         fln::VmExit::Panicked { message, usage } => source_terminal(
             "program-panic",
             &message,
-            fln_vm_usage::Usage {
-                steps: usage.steps,
-                system_polls: usage.system_polls,
-                peak_stack_depth: usage.peak_stack_depth,
-            },
+            usage.steps,
+            usage.system_polls,
+            usage.peak_stack_depth,
             json,
         ),
         fln::VmExit::Refused { refusal, usage } => source_terminal(
             "vm-refusal",
             &refusal.to_string(),
-            fln_vm_usage::Usage {
-                steps: usage.steps,
-                system_polls: usage.system_polls,
-                peak_stack_depth: usage.peak_stack_depth,
-            },
+            usage.steps,
+            usage.system_polls,
+            usage.peak_stack_depth,
             json,
         ),
     }
@@ -1170,12 +1157,24 @@ pub fn project(
 
 #[cfg(test)]
 mod tests {
-    use super::{OLEAN_INSPECT_SCHEMA, inspect_olean_bytes, read_bounded_from, run};
+    use super::{
+        OLEAN_INSPECT_SCHEMA, SOURCE_RUN_SCHEMA, inspect_olean_bytes, read_bounded_from, run,
+        source_failure,
+    };
     use std::ffi::OsString;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     const PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
+
+    fn repository_path(relative: &str) -> PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .expect("cargo identifies the invoking crate directory")
+            .join("../..")
+            .join(relative)
+    }
 
     #[test]
     fn olean_inspect_reports_a_real_pinned_artifact_in_human_and_robot_forms() {
@@ -1213,18 +1212,93 @@ mod tests {
     #[test]
     fn olean_input_is_bounded_before_the_decoder_runs() {
         let mut input = Cursor::new(vec![0_u8; 17]);
-        let error =
-            read_bounded_from(&mut input, 16).expect_err("the seventeenth byte must refuse");
+        let error = read_bounded_from(&mut input, 16, ".olean artifact")
+            .expect_err("the seventeenth byte must refuse");
         assert_eq!(error.class(), "resource");
         assert!(error.to_string().contains("16-byte input limit"));
         assert!(error.to_string().contains("17 bytes"));
     }
 
     #[test]
+    fn source_run_reaches_the_native_pipeline_in_human_and_robot_forms() {
+        let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
+        let human = run([OsString::from("run"), source.clone().into_os_string()]);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(human.stdout.contains("native source run: complete"));
+        assert!(human.stdout.contains("value: 0\n"));
+        assert!(human.stdout.contains("independent checker:"));
+
+        let robot = run([
+            OsString::from("run"),
+            OsString::from("--json"),
+            source.into_os_string(),
+        ]);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{SOURCE_RUN_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"outcome\":\"complete\""));
+        assert!(robot.stdout.contains("\"authority\":true"));
+        assert!(robot.stdout.contains("\"value\":0"));
+        assert!(
+            robot
+                .stdout
+                .contains("\"ground\":\"body-checked-against-declared-type\"")
+        );
+    }
+
+    #[test]
+    fn source_run_preserves_frontend_refusal_as_an_authoritative_error() {
+        let source = repository_path("crates/fln-conformance/fixtures/g04_reference_fixture.lean");
+        let output = run([
+            OsString::from("run"),
+            OsString::from("--json"),
+            source.into_os_string(),
+        ]);
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"outcome\":\"error\""));
+        assert!(output.stderr.contains("\"authority\":true"));
+        assert!(output.stderr.contains("\"class\":\"execution\""));
+        assert!(output.stderr.contains("frontend refused source"));
+        assert!(output.stderr.contains("lexical analysis reported"));
+        assert!(output.stderr.contains("\"detailTruncated\":false"));
+    }
+
+    #[test]
+    fn source_run_failure_details_are_bounded_and_marked() {
+        let output = source_failure("execution", &"x".repeat(5000), true, true, 1);
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"detailTruncated\":true"));
+        assert!(output.stderr.len() < 5000);
+    }
+
+    #[test]
+    fn source_run_input_exhaustion_is_a_nonanswer_not_a_rejection() {
+        let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
+        let output = run([
+            OsString::from("run"),
+            OsString::from("--json"),
+            OsString::from("--max-bytes=0"),
+            source.into_os_string(),
+        ]);
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"authority\":false"));
+        assert!(output.stderr.contains("\"class\":\"resource\""));
+        assert!(output.stderr.contains("0-byte input limit"));
+    }
+
+    #[test]
     fn multiplexer_help_and_usage_errors_have_distinct_exit_codes() {
         let help = run(std::iter::empty());
         assert_eq!(help.exit_code, 0);
-        assert!(help.stdout.starts_with("Usage:\n  fln olean inspect"));
+        assert!(help.stdout.starts_with("Usage:\n  fln run"));
 
         let error = run([OsString::from("olean"), OsString::from("decode")]);
         assert_eq!(error.exit_code, 2);

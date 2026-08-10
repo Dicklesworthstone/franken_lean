@@ -1630,7 +1630,7 @@ impl fmt::Display for EngineExecutionError {
                     "definition batch command {index} failed: {error}"
                 )
             }
-            Self::Frontend(error) => write!(formatter, "frontend refused source: {error:?}"),
+            Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
                 write!(
                     formatter,

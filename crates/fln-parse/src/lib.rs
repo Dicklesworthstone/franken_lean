@@ -75,6 +75,34 @@ pub enum NatDefinitionParseError {
     Build(BuildError),
 }
 
+impl std::fmt::Display for NatDefinitionParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source(error) => write!(formatter, "{error}"),
+            Self::Lexical { diagnostics } => match diagnostics.first() {
+                Some(first) => write!(
+                    formatter,
+                    "lexical analysis reported {} diagnostic(s); first {}: {}",
+                    diagnostics.len(),
+                    first.at,
+                    first.message
+                ),
+                None => write!(
+                    formatter,
+                    "lexical analysis returned an empty diagnostic set"
+                ),
+            },
+            Self::OutsideSeedGrammar { at, expected } => write!(
+                formatter,
+                "source is outside the bounded Nat-definition grammar at {at}; expected {expected:?}"
+            ),
+            Self::Build(error) => write!(formatter, "syntax construction failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for NatDefinitionParseError {}
+
 impl From<BuildError> for NatDefinitionParseError {
     fn from(error: BuildError) -> Self {
         NatDefinitionParseError::Build(error)
