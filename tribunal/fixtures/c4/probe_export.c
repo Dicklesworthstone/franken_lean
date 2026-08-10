@@ -539,6 +539,96 @@ static void facts_mode(void) {
     lean_dec(sou);
     lean_dec(one); lean_dec(sq); lean_dec(pw); lean_dec(of); lean_dec(c128);
     lean_dec(big2); lean_dec(big);
+    /* ---- end slice 3: bignum-backed Nat families ---- */
+
+    /* ---- signed bignum Int surface */
+    lean_object *ipos =
+        lean_cstr_to_int("340282366920938463463374607431768211457");
+    lean_object *ineg =
+        lean_cstr_to_int("-340282366920938463463374607431768211457");
+    fact("int.pos.is_scalar", lean_is_scalar(ipos));
+    fact("int.neg.is_scalar", lean_is_scalar(ineg));
+    fact("int.pos.nonneg", lean_int_big_nonneg(ipos));
+    fact("int.neg.nonneg", lean_int_big_nonneg(ineg));
+    lean_object *inegated = lean_int_big_neg(ipos);
+    fact("int.negate.eq", lean_int_big_eq(inegated, ineg));
+    lean_object *izero = lean_int_big_add(ipos, ineg);
+    fact("int.add.normalized", lean_is_scalar(izero));
+    fact("int.add.value", (long long)lean_scalar_to_int64(izero));
+    lean_object *itwice = lean_int_big_sub(ipos, ineg);
+    fact("int.sub.nonneg", lean_int_big_nonneg(itwice));
+    lean_object *iproduct = lean_int_big_mul(ipos, lean_box(3));
+    fact("int.mul.nonneg", lean_int_big_nonneg(iproduct));
+    fact("int.div.value",
+         (long long)lean_scalar_to_int64(lean_int_big_div(iproduct, ipos)));
+    fact("int.div_exact.value",
+         (long long)lean_scalar_to_int64(lean_int_big_div_exact(iproduct, ipos)));
+    fact("int.mod.value",
+         (long long)lean_scalar_to_int64(lean_int_big_mod(ineg, lean_box(10))));
+    lean_object *ieq = lean_int_big_ediv(ineg, lean_box(10));
+    lean_object *ier = lean_int_big_emod(ineg, lean_box(10));
+    fact("int.emod.value", (long long)lean_scalar_to_int64(ier));
+    lean_object *iq10 = lean_int_big_mul(ieq, lean_box(10));
+    lean_object *ireconstructed = lean_int_big_add(iq10, ier);
+    fact("int.ediv.reconstruct", lean_int_big_eq(ireconstructed, ineg));
+    lean_object *imodz = lean_int_big_mod(ineg, lean_box(0));
+    fact("int.mod.by_zero.same", imodz == ineg);
+    fact("int.mod.by_zero.rc", ineg->m_rc);
+    lean_dec(imodz);
+    fact("int.eq.sign", lean_int_big_eq(ipos, ineg));
+    fact("int.le.neg_zero", lean_int_big_le(ineg, lean_box(0)));
+    fact("int.lt.neg_pos", lean_int_big_lt(ineg, ipos));
+    fact("int.trunc.i8", lean_int8_of_big_int(ineg));
+    fact("int.trunc.i16", lean_int16_of_big_int(ineg));
+    fact("int.trunc.i32", lean_int32_of_big_int(ineg));
+    fact("int.trunc.i64", (long long)lean_int64_of_big_int(ineg));
+    fact("int.trunc.isize", (long long)lean_isize_of_big_int(ineg));
+    fact("int.div.by_zero.same",
+         lean_int_big_div(ineg, lean_box(0)) == lean_box(0));
+    fact("int.ediv.by_zero.same",
+         lean_int_big_ediv(ineg, lean_box(0)) == lean_box(0));
+    lean_object *iemodz = lean_int_big_emod(ineg, lean_box(0));
+    fact("int.emod.by_zero.same", iemodz == ineg);
+    fact("int.emod.by_zero.rc", ineg->m_rc);
+    lean_dec(iemodz);
+    lean_object *iminus3 = lean_big_int64_to_int(-3);
+    fact("int.mixed.div",
+         (long long)lean_scalar_to_int64(lean_int_big_div(iminus3, ineg)));
+    fact("int.mixed.mod",
+         (long long)lean_scalar_to_int64(lean_int_big_mod(iminus3, ineg)));
+    fact("int.mixed.ediv",
+         (long long)lean_scalar_to_int64(lean_int_big_ediv(iminus3, ineg)));
+    lean_object *imixedr = lean_int_big_emod(iminus3, ineg);
+    fact("int.mixed.emod.nonneg", lean_int_big_nonneg(imixedr));
+    lean_object *imixedp = lean_int_big_mul(lean_box(1), ineg);
+    lean_object *imixedrec = lean_int_big_add(imixedp, imixedr);
+    fact("int.mixed.reconstruct",
+         (long long)lean_scalar_to_int64(imixedrec));
+    lean_dec(imixedr); lean_dec(imixedp);
+    lean_object *icsmall = lean_cstr_to_int("-7");
+    fact("int.cstr.small_is_scalar", lean_is_scalar(icsmall));
+    fact("int.cstr.small_value", (long long)lean_scalar_to_int64(icsmall));
+    lean_object *ismall = lean_big_int64_to_int(2147483647ll);
+    fact("int.big_int64.small_is_scalar", lean_is_scalar(ismall));
+    lean_object *imin64 = lean_big_int64_to_int(INT64_MIN);
+    fact("int.big_int64.min_is_scalar", lean_is_scalar(imin64));
+    fact("int.big_int64.min_trunc", (long long)lean_int64_of_big_int(imin64));
+    lean_object *icoresmall = lean_big_int_to_int(-1);
+    fact("int.core_small.is_scalar", lean_is_scalar(icoresmall));
+    fact("int.core_small.trunc", lean_int8_of_big_int(icoresmall));
+    lean_object *isize = lean_big_size_t_to_int(SIZE_MAX);
+    fact("int.size_t.is_scalar", lean_is_scalar(isize));
+    fact("int.size_t.trunc", (long long)lean_int64_of_big_int(isize));
+    lean_object *inat_source =
+        lean_cstr_to_int("340282366920938463463374607431768211457");
+    lean_object *inat = lean_big_int_to_nat(inat_source);
+    fact("int.to_nat.low64", (long long)lean_uint64_of_big_nat(inat));
+    lean_object *inat_small_source = lean_big_int_to_int(7);
+    lean_object *inat_small = lean_big_int_to_nat(inat_small_source);
+    fact("int.to_nat.small_value", (long long)lean_unbox(inat_small));
+    lean_dec(ipos); lean_dec(ineg); lean_dec(inegated); lean_dec(itwice);
+    lean_dec(iproduct); lean_dec(ieq); lean_dec(iq10); lean_dec(ireconstructed);
+    lean_dec(imin64); lean_dec(icoresmall); lean_dec(isize); lean_dec(inat);
 
     /* The active LEAN_MIMALLOC generated-C inline takes its supported 8-byte
      * classes through lean_inc_heartbeat + mi_malloc_small. At this pin the

@@ -868,6 +868,7 @@ BIGNUM_TELEMETRY_SCHEMA = "fln.e2e.bignum-telemetry/1"
 BIGNUM_VALIDATION_SCHEMA = "fln.e2e.bignum-validation/1"
 BIGNUM_VECTOR_COUNT = 5_725
 BIGNUM_C4_NAT_FACTS = 28
+BIGNUM_C4_INT_FACTS = 44
 BIGNUM_MUTATIONS = (
     ("carry_drop", "nat::tests::u128_model_agreement"),
     (
@@ -903,9 +904,9 @@ BIGNUM_PROFILE_SOURCES = (
     ),
     (
         "tribunal/fixtures/c4/probe_export.c",
-        "c4-nat-slice-v1",
+        "c4-nat-slice-v2",
         b"/* ---- slice 3: bignum-backed Nat families */",
-        b"/* ---- slice 3: Name equality",
+        b"    /* ---- end slice 3: bignum-backed Nat families ---- */",
     ),
 )
 BIGNUM_MAX_SEMANTIC_BYTES = 65_536
@@ -11035,9 +11036,9 @@ def validate_bignum_no_mock_evidence(
     )
     if (
         suite_data.count(b"test result: ok.") < 10
-        or b"15 passed; 0 failed" not in suite_data
-        or b"13 passed; 0 failed" not in suite_data
-        or b"52 passed; 0 failed" not in suite_data
+        or b"18 passed; 0 failed" not in suite_data
+        or b"14 passed; 0 failed" not in suite_data
+        or b"88 passed; 0 failed" not in suite_data
         or b"test result: FAILED." in suite_data
     ):
         raise EvidenceError("bignum consumer suites did not meet their floors")
@@ -11087,18 +11088,27 @@ def validate_bignum_no_mock_evidence(
     reference_nat_facts = sum(
         b'"probe":"nat.' in line for line in reference_data.splitlines()
     )
+    marrow_int_facts = sum(
+        b'"probe":"int.' in line for line in marrow_data.splitlines()
+    )
+    reference_int_facts = sum(
+        b'"probe":"int.' in line for line in reference_data.splitlines()
+    )
     if (
         marrow_data != reference_data
         or marrow_digest != reference_digest
         or marrow_nat_facts != BIGNUM_C4_NAT_FACTS
         or reference_nat_facts != BIGNUM_C4_NAT_FACTS
+        or marrow_int_facts != BIGNUM_C4_INT_FACTS
+        or reference_int_facts != BIGNUM_C4_INT_FACTS
     ):
-        raise EvidenceError("bignum C4 Nat fact differential changed")
+        raise EvidenceError("bignum C4 Nat/Int fact differential changed")
     c4_row = semantic[3]
     if (
         c4_row
         != {
             "fact_sha256": marrow_digest,
+            "int_facts": BIGNUM_C4_INT_FACTS,
             "nat_facts": BIGNUM_C4_NAT_FACTS,
             "scenario": "c4_differential",
             "schema": BIGNUM_SEMANTIC_SCHEMA,
@@ -11196,8 +11206,8 @@ def validate_bignum_no_mock_evidence(
     )
     if (
         recovery_data.count(b"test result: ok.") < 2
-        or b"15 passed; 0 failed" not in recovery_data
-        or b"13 passed; 0 failed" not in recovery_data
+        or b"18 passed; 0 failed" not in recovery_data
+        or b"14 passed; 0 failed" not in recovery_data
         or b"test result: FAILED." in recovery_data
         or recovered_source_data != pristine_data
         or recovered_source_digest != pristine_digest
@@ -11242,6 +11252,7 @@ def validate_bignum_no_mock_evidence(
         )
 
     return {
+        "c4_int_facts": BIGNUM_C4_INT_FACTS,
         "c4_nat_facts": BIGNUM_C4_NAT_FACTS,
         "inner_run_sha256": inner_digest,
         "mutation_cells": len(BIGNUM_MUTATIONS),

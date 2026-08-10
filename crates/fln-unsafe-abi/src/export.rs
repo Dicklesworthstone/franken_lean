@@ -32,7 +32,8 @@
 //! family (as_task/map_task/bind_task/wait/wait_any + the cancel wrappers)
 //! and `wait_any_core` still fln-3gv's next slice; general IO
 //! (`lean_io_*` beyond those) — fln-3gv; bignum arithmetic
-//! (`lean_nat_big_*`, `lean_int_big_*`) — the fln-bignum shim; panic-path
+//! (`lean_nat_big_*`) and signed arithmetic (`lean_int_big_*`) are LIVE through
+//! the owned fln-bignum shim; panic-path
 //! Lean-buffered stderr and backtrace printing — fln-3gv (messages go to the
 //! process stderr until the IO plane exists).
 
@@ -42,7 +43,7 @@ use crate::membrane;
 use crate::object;
 use crate::rc;
 use crate::tagged::is_scalar;
-use core::ffi::{c_char, c_uint, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::Write;
 
@@ -1256,6 +1257,7 @@ pub(crate) extern "C" fn export_lean_string_hash(s: *mut LeanObject) -> u64 {
 // truncations read low bits exactly as the pin's `mpz_fdiv_r_2exp` /
 // lowest-limb accessors do for non-negative values.
 
+use fln_bignum::int::{BigInt, BigIntView};
 use fln_bignum::nat::{BigNat, BigNatView};
 
 /// Run `f` with a zero-copy view of a borrowed Nat operand.
@@ -1292,6 +1294,110 @@ unsafe fn with_nat_view<R>(o: *mut LeanObject, f: impl FnOnce(BigNatView<'_>) ->
         };
         f(BigNatView::from_limbs_le(limbs))
     }
+}
+
+/// Decode the pin's boxed small-`Int` representation.
+///
+/// On 64-bit targets Lean stores a sign-extended 32-bit value in the unboxed
+/// payload. On 32-bit targets the signed pointer itself is shifted.
+fn scalar_to_int(o: *mut LeanObject) -> i64 {
+    debug_assert!(is_scalar(o));
+    #[cfg(target_pointer_width = "64")]
+    {
+        i64::from(crate::tagged::unbox(o) as u32 as i32)
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        i64::from((o as usize as u32 as i32) >> 1)
+    }
+}
+
+/// Box one value already proven to fit Lean's small-`Int` range.
+fn box_small_int(value: i64) -> *mut LeanObject {
+    debug_assert!((small_int_min()..=small_int_max()).contains(&value));
+    let payload = value as i32 as u32 as usize;
+    core::ptr::without_provenance_mut(payload.wrapping_shl(1) | 1)
+}
+
+const fn small_int_min() -> i64 {
+    if cfg!(target_pointer_width = "64") {
+        i32::MIN as i64
+    } else {
+        (i32::MIN / 2) as i64
+    }
+}
+
+const fn small_int_max() -> i64 {
+    if cfg!(target_pointer_width = "64") {
+        i32::MAX as i64
+    } else {
+        (i32::MAX / 2) as i64
+    }
+}
+
+/// Run `f` with a zero-copy view of a borrowed `Int` operand.
+///
+/// # Safety
+/// `o` is a live boxed scalar or mpz `Int` object.
+// UNSAFE-LEDGER: FLN-UL-0534
+#[allow(unsafe_code)]
+unsafe fn with_int_view<R>(o: *mut LeanObject, f: impl FnOnce(BigIntView<'_>) -> R) -> R {
+    if is_scalar(o) {
+        let value = scalar_to_int(o);
+        let word = [value.unsigned_abs()];
+        let limbs = if word[0] == 0 { &[] } else { &word[..] };
+        f(BigIntView::from_sign_limbs_le(value.is_negative(), limbs))
+    } else {
+        // SAFETY: live mpz object; |m_size| limbs are salient.
+        let (alloc, size, pointer, live) = unsafe { object::mpz_fields(o) };
+        assert!(alloc >= 0, "mpz allocation count is negative");
+        assert!(
+            live <= alloc as usize,
+            "mpz live limb count exceeds its allocation"
+        );
+        let limbs = if live == 0 {
+            &[]
+        } else {
+            assert!(!pointer.is_null(), "nonempty mpz has a null limb buffer");
+            // SAFETY: live <= allocation was checked and the view cannot
+            // escape this callback.
+            unsafe { core::slice::from_raw_parts(pointer, live) }
+        };
+        f(BigIntView::from_sign_limbs_le(size < 0, limbs))
+    }
+}
+
+/// Normalize an owned signed result into a boxed small `Int` or fresh mpz.
+///
+/// # Safety
+/// None beyond allocation; the mpz constructor copies the magnitude.
+// UNSAFE-LEDGER: FLN-UL-0535
+#[allow(unsafe_code)]
+unsafe fn int_obj_from_bigint(value: &BigInt) -> *mut LeanObject {
+    if let Some(small) = value
+        .to_i64()
+        .filter(|small| (small_int_min()..=small_int_max()).contains(small))
+    {
+        box_small_int(small)
+    } else {
+        // SAFETY: fresh mpz over a normalized magnitude copy.
+        unsafe { object::alloc_mpz(value.magnitude().limbs_le(), value.is_negative()) }
+    }
+}
+
+/// Always allocate the runtime-private mpz representation.
+///
+/// The pin's `lean_big_int_to_int` / `lean_big_size_t_to_int` constructors are
+/// `_core` entry points: their inline callers establish that boxing is not
+/// available.
+///
+/// # Safety
+/// As [`int_obj_from_bigint`].
+// UNSAFE-LEDGER: FLN-UL-0536
+#[allow(unsafe_code)]
+unsafe fn int_obj_from_bigint_core(value: &BigInt) -> *mut LeanObject {
+    // SAFETY: fresh mpz over a normalized magnitude copy.
+    unsafe { object::alloc_mpz(value.magnitude().limbs_le(), value.is_negative()) }
 }
 
 /// `mpz_to_nat` (`object.cpp:1352-1357`): box when the value fits
@@ -4768,30 +4874,337 @@ pub(crate) extern "C" fn export_lean_slice_dec_lt(s1: *mut LeanObject, s2: *mut 
     }
 }
 
-/// `lean_cstr_to_int` (`object.cpp:1637-1639`): the decimal literal parsed
-/// into an Int. The pin routes every literal through mpz and demotes to a
-/// scalar for [INT_MIN, INT_MAX] (lean.h:1588); ours parses the small range
-/// directly and REFUSES TYPED beyond it — the bignum shim's boundary
-/// (kernel-grade bignum is the Crucible workstream), the same law as the
-/// metadata timestamp arm. A malformed literal is refused the same way:
-/// the pin's mpz(n) asserts on garbage, which release-mode would UB.
+/// `lean_cstr_to_int` (`object.cpp:1637-1639`): signed decimal to normalized
+/// `Int`. Malformed input terminates rather than fabricating a value.
 // UNSAFE-LEDGER: FLN-UL-0498
 #[allow(unsafe_code)]
 #[unsafe(export_name = "lean_cstr_to_int")]
 pub(crate) extern "C" fn export_lean_cstr_to_int(n: *const c_char) -> *mut LeanObject {
-    // SAFETY: NUL-terminated per the cstr contract.
-    let bytes = unsafe { core::ffi::CStr::from_ptr(n) }.to_bytes();
-    let parsed = core::str::from_utf8(bytes)
-        .ok()
-        .and_then(|t| t.parse::<i64>().ok());
-    match parsed {
-        Some(v) if v >= i64::from(i32::MIN) && v <= i64::from(i32::MAX) => {
-            crate::tagged::boxi(v as i32 as u32 as usize)
+    // SAFETY: NUL-terminated generated numeral per the C ABI.
+    unsafe {
+        let Some(value) = core::ffi::CStr::from_ptr(n)
+            .to_str()
+            .ok()
+            .and_then(BigInt::from_decimal)
+        else {
+            internal_panic_impl("lean_cstr_to_int: malformed integer");
+        };
+        int_obj_from_bigint(&value)
+    }
+}
+
+// ---- complete signed bignum surface -----------------------------------------
+// Exact ports of object.cpp:1620-1818 / 1832-1854 over `BigInt`. Operands are
+// borrowed except `lean_big_int_to_nat`, whose `lean_obj_arg` ownership is
+// consumed exactly once. `div`/`mod` truncate toward zero; `ediv`/`emod`
+// produce a non-negative remainder.
+
+/// `lean_big_int_to_int` (`object.cpp:1641-1643`): the non-boxable `int`
+/// constructor always allocates mpz.
+// UNSAFE-LEDGER: FLN-UL-0537
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_int_to_int")]
+pub(crate) extern "C" fn export_lean_big_int_to_int(value: c_int) -> *mut LeanObject {
+    // SAFETY: fresh result only.
+    unsafe { int_obj_from_bigint_core(&BigInt::from_i64(i64::from(value))) }
+}
+
+/// `lean_big_size_t_to_int` (`object.cpp:1645-1647`): non-boxable positive
+/// `size_t` to mpz.
+// UNSAFE-LEDGER: FLN-UL-0538
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_size_t_to_int")]
+pub(crate) extern "C" fn export_lean_big_size_t_to_int(value: usize) -> *mut LeanObject {
+    // SAFETY: fresh result only.
+    unsafe { int_obj_from_bigint_core(&BigInt::from_u64(value as u64)) }
+}
+
+/// `lean_big_int64_to_int` (`object.cpp:1649-1655`): normalize when the value
+/// fits Lean's target-specific small-`Int` range.
+// UNSAFE-LEDGER: FLN-UL-0539
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_int64_to_int")]
+pub(crate) extern "C" fn export_lean_big_int64_to_int(value: i64) -> *mut LeanObject {
+    // SAFETY: fresh result only.
+    unsafe { int_obj_from_bigint(&BigInt::from_i64(value)) }
+}
+
+/// `lean_big_int_to_nat` (`object.cpp:1630-1635`): consume a non-negative heap
+/// `Int`, normalize the Nat result, and yield the source reference once.
+// UNSAFE-LEDGER: FLN-UL-0540
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_big_int_to_nat")]
+pub(crate) extern "C" fn export_lean_big_int_to_nat(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: owned live heap Int; the magnitude is copied before yielding it.
+    unsafe {
+        assert!(!is_scalar(a), "lean_big_int_to_nat requires a heap Int");
+        let magnitude = with_int_view(a, |value| {
+            assert!(
+                !value.is_negative(),
+                "lean_big_int_to_nat requires a non-negative Int"
+            );
+            value.magnitude().to_owned()
+        });
+        dec(a);
+        nat_obj_from_bignat(&magnitude)
+    }
+}
+
+/// `lean_int_big_neg` (`object.cpp:1657-1659`).
+// UNSAFE-LEDGER: FLN-UL-0541
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_neg")]
+pub(crate) extern "C" fn export_lean_int_big_neg(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: borrowed live heap Int.
+    unsafe {
+        let result = with_int_view(a, |value| value.neg());
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_add` (`object.cpp:1661-1669`).
+// UNSAFE-LEDGER: FLN-UL-0542
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_add")]
+pub(crate) extern "C" fn export_lean_int_big_add(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.add(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_sub` (`object.cpp:1671-1679`).
+// UNSAFE-LEDGER: FLN-UL-0543
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_sub")]
+pub(crate) extern "C" fn export_lean_int_big_sub(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.sub(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_mul` (`object.cpp:1681-1689`).
+// UNSAFE-LEDGER: FLN-UL-0544
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_mul")]
+pub(crate) extern "C" fn export_lean_int_big_mul(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.mul(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_div` (`object.cpp:1691-1703`): truncating quotient; divisor
+/// zero returns the boxed zero operand.
+// UNSAFE-LEDGER: FLN-UL-0545
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_div")]
+pub(crate) extern "C" fn export_lean_int_big_div(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        if is_scalar(a2) && scalar_to_int(a2) == 0 {
+            return a2;
         }
-        _ => internal_panic_impl(
-            "cstr_to_int: literal outside the small-Int range needs the bignum shim \
-             (kernel-grade bignum, Crucible workstream)",
-        ),
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.div(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_div_exact` (`object.cpp:1705-1724`): the caller establishes a
+/// nonzero divisor and exact remainder.
+// UNSAFE-LEDGER: FLN-UL-0546
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_div_exact")]
+pub(crate) extern "C" fn export_lean_int_big_div_exact(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands; exactness is checked before return.
+    unsafe {
+        let result = with_int_view(a1, |left| {
+            with_int_view(a2, |right| {
+                left.checked_div_exact(right)
+                    .expect("lean_int_big_div_exact precondition violated")
+            })
+        });
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_mod` (`object.cpp:1726-1740`): truncating remainder; modulo
+/// zero returns the retained dividend.
+// UNSAFE-LEDGER: FLN-UL-0547
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_mod")]
+pub(crate) extern "C" fn export_lean_int_big_mod(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands; the zero arm retains a heap dividend.
+    unsafe {
+        if is_scalar(a2) && scalar_to_int(a2) == 0 {
+            inc(a1);
+            return a1;
+        }
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.rem(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_ediv` (`object.cpp:1742-1754`): Euclidean quotient; divisor
+/// zero returns boxed zero.
+// UNSAFE-LEDGER: FLN-UL-0548
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_ediv")]
+pub(crate) extern "C" fn export_lean_int_big_ediv(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        if is_scalar(a2) && scalar_to_int(a2) == 0 {
+            return a2;
+        }
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.ediv(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_emod` (`object.cpp:1756-1770`): non-negative Euclidean
+/// remainder; modulo zero returns the retained dividend.
+// UNSAFE-LEDGER: FLN-UL-0549
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_emod")]
+pub(crate) extern "C" fn export_lean_int_big_emod(
+    a1: *mut LeanObject,
+    a2: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: borrowed live Int operands; the zero arm retains a heap dividend.
+    unsafe {
+        if is_scalar(a2) && scalar_to_int(a2) == 0 {
+            inc(a1);
+            return a1;
+        }
+        let result = with_int_view(a1, |left| with_int_view(a2, |right| left.emod(right)));
+        int_obj_from_bigint(&result)
+    }
+}
+
+/// `lean_int_big_eq` (`object.cpp:1772-1783`): mixed scalar/mpz arms are
+/// unequal by the normalized representation invariant.
+// UNSAFE-LEDGER: FLN-UL-0550
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_eq")]
+pub(crate) extern "C" fn export_lean_int_big_eq(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        if is_scalar(a1) || is_scalar(a2) {
+            return false;
+        }
+        with_int_view(a1, |left| with_int_view(a2, |right| left.beq(right)))
+    }
+}
+
+/// `lean_int_big_le` (`object.cpp:1785-1795`).
+// UNSAFE-LEDGER: FLN-UL-0551
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_le")]
+pub(crate) extern "C" fn export_lean_int_big_le(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Int operands.
+    unsafe { with_int_view(a1, |left| with_int_view(a2, |right| left.ble(right))) }
+}
+
+/// `lean_int_big_lt` (`object.cpp:1797-1807`).
+// UNSAFE-LEDGER: FLN-UL-0552
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_lt")]
+pub(crate) extern "C" fn export_lean_int_big_lt(a1: *mut LeanObject, a2: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live Int operands.
+    unsafe {
+        with_int_view(a1, |left| {
+            with_int_view(a2, |right| left.ble(right) && !left.beq(right))
+        })
+    }
+}
+
+/// `lean_int_big_nonneg` (`object.cpp:1809-1811`).
+// UNSAFE-LEDGER: FLN-UL-0553
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int_big_nonneg")]
+pub(crate) extern "C" fn export_lean_int_big_nonneg(a: *mut LeanObject) -> bool {
+    // SAFETY: borrowed live heap Int.
+    unsafe { with_int_view(a, |value| !value.is_negative()) }
+}
+
+/// `lean_int8_of_big_int` (`object.cpp:1832-1834`): signed low eight bits.
+// UNSAFE-LEDGER: FLN-UL-0554
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int8_of_big_int")]
+pub(crate) extern "C" fn export_lean_int8_of_big_int(a: *mut LeanObject) -> i8 {
+    // SAFETY: borrowed live heap Int.
+    unsafe { with_int_view(a, |value| value.low_u64() as u8 as i8) }
+}
+
+/// `lean_int16_of_big_int` (`object.cpp:1836-1838`).
+// UNSAFE-LEDGER: FLN-UL-0555
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int16_of_big_int")]
+pub(crate) extern "C" fn export_lean_int16_of_big_int(a: *mut LeanObject) -> i16 {
+    // SAFETY: borrowed live heap Int.
+    unsafe { with_int_view(a, |value| value.low_u64() as u16 as i16) }
+}
+
+/// `lean_int32_of_big_int` (`object.cpp:1840-1842`).
+// UNSAFE-LEDGER: FLN-UL-0556
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int32_of_big_int")]
+pub(crate) extern "C" fn export_lean_int32_of_big_int(a: *mut LeanObject) -> i32 {
+    // SAFETY: borrowed live heap Int.
+    unsafe { with_int_view(a, |value| value.low_u64() as u32 as i32) }
+}
+
+/// `lean_int64_of_big_int` (`object.cpp:1844-1846`).
+// UNSAFE-LEDGER: FLN-UL-0557
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_int64_of_big_int")]
+pub(crate) extern "C" fn export_lean_int64_of_big_int(a: *mut LeanObject) -> i64 {
+    // SAFETY: borrowed live heap Int.
+    unsafe { with_int_view(a, |value| value.low_u64() as i64) }
+}
+
+/// `lean_isize_of_big_int` (`object.cpp:1848-1854`).
+// UNSAFE-LEDGER: FLN-UL-0558
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_isize_of_big_int")]
+pub(crate) extern "C" fn export_lean_isize_of_big_int(a: *mut LeanObject) -> isize {
+    // SAFETY: borrowed live heap Int.
+    unsafe {
+        with_int_view(a, |value| {
+            #[cfg(target_pointer_width = "64")]
+            {
+                value.low_u64() as i64 as isize
+            }
+            #[cfg(target_pointer_width = "32")]
+            {
+                value.low_u64() as u32 as i32 as isize
+            }
+        })
     }
 }
 

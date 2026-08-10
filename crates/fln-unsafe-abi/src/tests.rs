@@ -2433,6 +2433,150 @@ fn export_nat_big_arithmetic_normalization_and_truncation() {
 }
 
 #[test]
+fn export_int_big_arithmetic_division_and_truncation_match_pin_laws() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_big_int_to_int, export_lean_big_int_to_nat, export_lean_big_int64_to_int,
+        export_lean_big_size_t_to_int, export_lean_cstr_to_int, export_lean_dec_ref_cold,
+        export_lean_int_big_add, export_lean_int_big_div, export_lean_int_big_div_exact,
+        export_lean_int_big_ediv, export_lean_int_big_emod, export_lean_int_big_eq,
+        export_lean_int_big_le, export_lean_int_big_lt, export_lean_int_big_mod,
+        export_lean_int_big_mul, export_lean_int_big_neg, export_lean_int_big_nonneg,
+        export_lean_int_big_sub, export_lean_int8_of_big_int, export_lean_int16_of_big_int,
+        export_lean_int32_of_big_int, export_lean_int64_of_big_int, export_lean_isize_of_big_int,
+        export_lean_uint64_of_big_nat,
+    };
+    // SAFETY: every heap value is minted by this crate, borrowed exactly for
+    // arithmetic, and released once. The sole owned-input conversion is not
+    // released again after it consumes its source. `lock()` serialises the
+    // heap-observing assertions.
+    // UNSAFE-LEDGER: FLN-UL-0559
+    #[allow(unsafe_code)]
+    unsafe {
+        let scalar_int = |object| i64::from(tagged::unbox(object) as u32 as i32);
+        let mpz_copy = |object| {
+            let (alloc, size, pointer, live) = crate::object::mpz_fields(object);
+            assert!(alloc >= 0 && live <= alloc as usize);
+            let limbs = if live == 0 {
+                Vec::new()
+            } else {
+                assert!(!pointer.is_null());
+                core::slice::from_raw_parts(pointer, live).to_vec()
+            };
+            (size, limbs)
+        };
+
+        let pos = export_lean_cstr_to_int(c"340282366920938463463374607431768211457".as_ptr());
+        let neg = export_lean_cstr_to_int(c"-340282366920938463463374607431768211457".as_ptr());
+        assert_eq!(mpz_copy(pos), (3, vec![1, 0, 1]));
+        assert_eq!(mpz_copy(neg), (-3, vec![1, 0, 1]));
+        assert!(export_lean_int_big_nonneg(pos));
+        assert!(!export_lean_int_big_nonneg(neg));
+
+        let negated = export_lean_int_big_neg(pos);
+        assert!(export_lean_int_big_eq(negated, neg));
+        assert_eq!(
+            scalar_int(export_lean_int_big_add(pos, neg)),
+            0,
+            "opposite magnitudes cancel and normalize"
+        );
+        let twice = export_lean_int_big_sub(pos, neg);
+        assert_eq!(mpz_copy(twice), (3, vec![2, 0, 2]));
+
+        let product = export_lean_int_big_mul(pos, tagged::boxi(3));
+        assert_eq!(scalar_int(export_lean_int_big_div(product, pos)), 3);
+        assert_eq!(scalar_int(export_lean_int_big_div_exact(product, pos)), 3);
+        assert_eq!(
+            scalar_int(export_lean_int_big_mod(neg, tagged::boxi(10))),
+            -7,
+            "truncating remainder keeps the dividend sign"
+        );
+        let euclidean_q = export_lean_int_big_ediv(neg, tagged::boxi(10));
+        let euclidean_r = export_lean_int_big_emod(neg, tagged::boxi(10));
+        assert_eq!(scalar_int(euclidean_r), 3);
+        let q_times_ten = export_lean_int_big_mul(euclidean_q, tagged::boxi(10));
+        let reconstructed = export_lean_int_big_add(q_times_ten, euclidean_r);
+        assert!(export_lean_int_big_eq(reconstructed, neg));
+
+        let before = crate::rc::read_header(neg).rc;
+        let retained = export_lean_int_big_mod(neg, tagged::boxi(0));
+        assert_eq!(retained, neg);
+        assert_eq!(crate::rc::read_header(neg).rc, before + 1);
+        export_lean_dec_ref_cold(retained);
+
+        assert!(export_lean_int_big_eq(pos, pos));
+        assert!(!export_lean_int_big_eq(pos, neg));
+        assert!(!export_lean_int_big_eq(tagged::boxi(1), pos));
+        assert!(export_lean_int_big_le(neg, tagged::boxi(0)));
+        assert!(export_lean_int_big_lt(neg, pos));
+        assert_eq!(export_lean_int8_of_big_int(neg), -1);
+        assert_eq!(export_lean_int16_of_big_int(neg), -1);
+        assert_eq!(export_lean_int32_of_big_int(neg), -1);
+        assert_eq!(export_lean_int64_of_big_int(neg), -1);
+        assert_eq!(export_lean_isize_of_big_int(neg), -1);
+
+        assert_eq!(
+            export_lean_int_big_div(neg, tagged::boxi(0)),
+            tagged::boxi(0)
+        );
+        assert_eq!(
+            export_lean_int_big_ediv(neg, tagged::boxi(0)),
+            tagged::boxi(0)
+        );
+        let before = crate::rc::read_header(neg).rc;
+        let retained = export_lean_int_big_emod(neg, tagged::boxi(0));
+        assert_eq!(retained, neg);
+        assert_eq!(crate::rc::read_header(neg).rc, before + 1);
+        export_lean_dec_ref_cold(retained);
+
+        let minus_three = export_lean_big_int64_to_int(-3);
+        assert_eq!(scalar_int(export_lean_int_big_div(minus_three, neg)), 0);
+        assert_eq!(scalar_int(export_lean_int_big_mod(minus_three, neg)), -3);
+        assert_eq!(scalar_int(export_lean_int_big_ediv(minus_three, neg)), 1);
+        let mixed_remainder = export_lean_int_big_emod(minus_three, neg);
+        assert!(export_lean_int_big_nonneg(mixed_remainder));
+        let mixed_product = export_lean_int_big_mul(tagged::boxi(1), neg);
+        let mixed_reconstructed = export_lean_int_big_add(mixed_product, mixed_remainder);
+        assert_eq!(scalar_int(mixed_reconstructed), -3);
+        export_lean_dec_ref_cold(mixed_product);
+        export_lean_dec_ref_cold(mixed_remainder);
+
+        let normalized_small = export_lean_big_int64_to_int(i64::from(i32::MAX));
+        assert!(tagged::is_scalar(normalized_small));
+        assert_eq!(scalar_int(normalized_small), i64::from(i32::MAX));
+        let min64 = export_lean_big_int64_to_int(i64::MIN);
+        assert_eq!(export_lean_int64_of_big_int(min64), i64::MIN);
+
+        let core_small = export_lean_big_int_to_int(-1);
+        assert_eq!(mpz_copy(core_small), (-1, vec![1]));
+        let size_int = export_lean_big_size_t_to_int(usize::MAX);
+        assert_eq!(mpz_copy(size_int), (1, vec![u64::MAX]));
+
+        let to_nat_source =
+            export_lean_cstr_to_int(c"340282366920938463463374607431768211457".as_ptr());
+        let nat = export_lean_big_int_to_nat(to_nat_source);
+        assert_eq!(export_lean_uint64_of_big_nat(nat), 1);
+
+        for object in [
+            pos,
+            neg,
+            negated,
+            twice,
+            product,
+            euclidean_q,
+            q_times_ten,
+            reconstructed,
+            min64,
+            core_small,
+            size_int,
+            nat,
+        ] {
+            export_lean_dec_ref_cold(object);
+        }
+    }
+}
+
+#[test]
 fn export_name_eq_walks_prefixes_exactly() {
     let _g = lock();
     use crate::export::{

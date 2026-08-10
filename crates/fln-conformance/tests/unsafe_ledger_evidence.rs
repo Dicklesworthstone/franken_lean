@@ -388,7 +388,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// 117 -> 120 after the apply tail: FLN-UL-0530, FLN-UL-0532, and FLN-UL-0533
 /// each cite `export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream`,
 /// the exact boundary test their foreign-stream and environment-guard paths support.
-const SYMBOL_RESOLVED_ROWS: usize = 120;
+/// 120 -> 121 in the signed-Int ABI recovery: FLN-UL-0559 cites
+/// `export_int_big_arithmetic_division_and_truncation_match_pin_laws`, the exact boundary
+/// test covering the new constructors, arithmetic, ownership, zero, and truncation arms.
+const SYMBOL_RESOLVED_ROWS: usize = 121;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -464,7 +467,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 120;
 /// 142 -> 145 at `e4625801` and `73826919`: the three symbol-resolved rows
 /// named above each add the same exact panic-stream test citation; no existing
 /// resolving token was removed or renamed.
-const RESOLVING_CITATION_TOKENS: usize = 145;
+/// 145 -> 146 in the signed-Int ABI recovery: FLN-UL-0559 adds the exact boundary-test
+/// citation named in the row history above; no existing resolving token moved.
+const RESOLVING_CITATION_TOKENS: usize = 146;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -499,13 +504,17 @@ const RESOLVING_CITATION_TOKENS: usize = 145;
 /// export rows, the timeit and allocprof rows, and the backtrace implementation row
 /// carry suite-phrase or corpus-fact evidence. The separately landed foreign-stream
 /// cell and its two environment guards are the three symbol-side rows above.
-const PROSE_EVIDENCE_ROWS: usize = 405;
+/// 405 -> 430 in the signed-Int ABI recovery: FLN-UL-0534 through FLN-UL-0558 add 25
+/// implementation-site rows whose evidence is deliberately the export-suite/C4 corpus
+/// phrase. FLN-UL-0559 is the one symbol-side test-apparatus row, and the FLN-UL-0498
+/// evidence rewrite remains prose, so no pre-existing row changed class.
+const PROSE_EVIDENCE_ROWS: usize = 430;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 526 rows: 1 cites an e2e lane, 120 carry \
-symbol-resolved evidence, and 405 remain prose; 145 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 552 rows: 1 cites an e2e lane, 121 carry \
+symbol-resolved evidence, and 430 remain prose; 146 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
