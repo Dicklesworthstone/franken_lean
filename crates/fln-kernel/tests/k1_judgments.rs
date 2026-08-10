@@ -571,8 +571,11 @@ fn fl_inv_07_exhaustion_is_inconclusive_never_rejected() {
     );
     assert!(verdict.as_complete().is_none());
 
-    // Depth exhaustion likewise.
-    let shallow = Budget::DEFAULT.narrowed(1_000_000, 1);
+    // Depth exhaustion likewise. The checker now peels this consecutive
+    // lambda/Pi telescope iteratively, so depth 1 is sufficient; a zero-depth
+    // allowance forces the first genuine nested judgment to stop without
+    // reinstating stack growth merely to preserve the old fixture.
+    let shallow = Budget::DEFAULT.narrowed(1_000_000, 0);
     let verdict = check(&Environment::new(), &defn("id", ty, value), shallow);
     let usage = exhausted_usage(&verdict);
     assert_eq!(
@@ -1953,6 +1956,56 @@ fn fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected() {
     assert!(
         verdict.is_inconclusive(),
         "budget exhaustion in an iota chain is Inconclusive, got {verdict:?}"
+    );
+}
+
+#[test]
+fn nested_recursor_majors_use_steps_instead_of_logical_depth() {
+    // Each outer recursor must normalize another recursor before it can choose
+    // its own rule. The Reference uses native recursion for this chain; K1
+    // carries an explicit continuation stack so hostile nesting remains inside
+    // the governed step budget. Keeping the logical depth allowance at 64
+    // makes a recursive mutant fail as typed exhaustion long before host-stack
+    // safety could be involved.
+    const NESTING: usize = 256;
+    let env = add_nat_with_rec(&Environment::new());
+    let nat = Expr::const_(n("Nat"), vec![]);
+    let zero = Expr::const_(nn("Nat", "zero"), vec![]);
+    let succ = Expr::const_(nn("Nat", "succ"), vec![]);
+    let motive = Expr::lam(n("t"), nat.clone(), nat.clone(), BinderInfo::Default);
+    let succ_minor = Expr::lam(
+        n("n"),
+        nat.clone(),
+        Expr::lam(
+            n("ih"),
+            nat,
+            Expr::app(succ, Expr::bvar(0).expect("packs")),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec_on = |major: Expr| {
+        let mut app = Expr::const_(nn("Nat", "rec"), vec![Level::one()]);
+        for arg in [motive.clone(), zero.clone(), succ_minor.clone(), major] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let mut nested = zero.clone();
+    for _ in 0..NESTING {
+        nested = rec_on(nested);
+    }
+
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &nested,
+        &zero,
+        Budget::DEFAULT.narrowed(250_000, 64),
+    );
+    assert!(
+        verdict.is_accepted(),
+        "an explicit recursor-major worklist must normalize {NESTING} nested majors; got {verdict:?}"
     );
 }
 

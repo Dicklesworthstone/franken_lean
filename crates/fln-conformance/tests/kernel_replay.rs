@@ -76,7 +76,7 @@ use fln_env::decl_closure::{
 use fln_env::environment::Environment;
 use fln_hash::domain::{Domain, hash};
 use fln_kernel::Declaration;
-use fln_kernel::verdict::{Budget, Verdict};
+use fln_kernel::verdict::{Budget, ExecConfig, StackMeasurement, Verdict};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -796,6 +796,43 @@ fn first_divergence_across_widths(runs: &[MatrixRun]) -> Option<String> {
 // but below the measured worst case for depth 4096.
 const KERNEL_REPLAY_WORKER_STACK_BYTES: usize = Budget::MIN_STACK_BYTES;
 
+fn unit_outcome(item: &WorkItem, verdict: &Outcome<Verdict>) -> UnitOutcome {
+    let (outcome, class, message, steps_used, max_depth) = verdict_facts(verdict);
+    let outcome = match class {
+        Some(class) => format!("{outcome}:{class}"),
+        None => outcome,
+    };
+    UnitOutcome {
+        lead: item.lead.to_display_string(),
+        kind: item.kind,
+        members: item.members,
+        outcome,
+        message,
+        steps_used,
+        max_depth,
+    }
+}
+
+/// Run one selected real-corpus admission unit on an explicit stack contract.
+/// The resource probe below must not accidentally inherit Rust's smaller
+/// default spawned-thread stack and turn a typed depth result into a process
+/// abort.
+fn check_work_item_with_stack(
+    item: &WorkItem,
+    budget: Budget,
+    stack_bytes: usize,
+) -> Outcome<Verdict> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("fln-kernel-resource-probe".to_string())
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, || fln_kernel::check(&item.env, &item.decl, budget))
+            .expect("spawn selected kernel replay worker with the explicit stack contract")
+            .join()
+            .expect("selected kernel replay worker must not panic")
+    })
+}
+
 /// Check every prepared unit across `threads` workers pulling from a shared
 /// cursor (a genuinely nondeterministic schedule), then merge in canonical
 /// unit order. The kernel is pure and each unit's inputs are fixed by
@@ -854,22 +891,9 @@ fn check_matrix_run(prep: &PreparedReplay, threads: usize, budget: Budget) -> Ma
             // stream, and the totality assertion below makes the run fail.
             Outcome::InternalFault(_) => {}
         }
-        let (outcome, class, message, steps_used, max_depth) = verdict_facts(verdict);
-        let outcome = match class {
-            Some(class) => format!("{outcome}:{class}"),
-            None => outcome,
-        };
-        steps_total = steps_total.saturating_add(steps_used);
-        depth_max = depth_max.max(max_depth);
-        let outcome = UnitOutcome {
-            lead: item.lead.to_display_string(),
-            kind: item.kind,
-            members: item.members,
-            outcome,
-            message,
-            steps_used,
-            max_depth,
-        };
+        let outcome = unit_outcome(item, verdict);
+        steps_total = steps_total.saturating_add(outcome.steps_used);
+        depth_max = depth_max.max(outcome.max_depth);
         stream.push_str(&outcome.canonical_line(i));
         stream.push('\n');
         outcomes.push(outcome);
@@ -6613,8 +6637,15 @@ struct ChosenLegReport {
     wall_ms: u64,
 }
 
-fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLegReport, String> {
-    let started = Instant::now();
+struct PreparedChosenModule {
+    prep: PreparedReplay,
+    collision_count: u64,
+}
+
+fn prepare_chosen_module(
+    inventory: &CorpusInventory,
+    chosen: &str,
+) -> Result<PreparedChosenModule, String> {
     let order = corpus_module_order(inventory)?;
     let order_index = order
         .iter()
@@ -6653,26 +6684,9 @@ fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLeg
                 &active_infos,
                 false,
             );
-            let run = check_matrix_run(&prep, 1, Budget::DEFAULT);
-            return Ok(ChosenLegReport {
-                module: chosen.to_string(),
-                closure_modules: inventory.modules.len() as u64,
-                closure_decoded: inventory.decoded,
-                context_faithful: true,
+            return Ok(PreparedChosenModule {
+                prep,
                 collision_count: collisions.len() as u64,
-                units: prep.items.len() as u64,
-                decls_total: prep.decls_total as u64,
-                unchecked: prep
-                    .unchecked
-                    .iter()
-                    .map(|(kind, count)| (kind.to_string(), *count))
-                    .collect(),
-                artifact_incomplete: prep.artifact_incomplete.len() as u64,
-                accepted: run.accepted,
-                rejected: run.rejected,
-                inconclusive: run.inconclusive,
-                stream_digest: run.stream_digest,
-                wall_ms: started.elapsed().as_millis() as u64,
             });
         }
         let (context, _) =
@@ -6690,6 +6704,166 @@ fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLeg
     Err(format!(
         "chosen module {chosen} absent from its own closure"
     ))
+}
+
+fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLegReport, String> {
+    let started = Instant::now();
+    let PreparedChosenModule {
+        prep,
+        collision_count,
+    } = prepare_chosen_module(inventory, chosen)?;
+    let run = check_matrix_run(&prep, 1, Budget::DEFAULT);
+    Ok(ChosenLegReport {
+        module: chosen.to_string(),
+        closure_modules: inventory.modules.len() as u64,
+        closure_decoded: inventory.decoded,
+        context_faithful: true,
+        collision_count,
+        units: prep.items.len() as u64,
+        decls_total: prep.decls_total as u64,
+        unchecked: prep
+            .unchecked
+            .iter()
+            .map(|(kind, count)| (kind.to_string(), *count))
+            .collect(),
+        artifact_incomplete: prep.artifact_incomplete.len() as u64,
+        accepted: run.accepted,
+        rejected: run.rejected,
+        inconclusive: run.inconclusive,
+        stream_digest: run.stream_digest,
+        wall_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Select exactly one declaration from a provisioned Reference module and
+/// report its governed kernel consumption.
+///
+/// This is intentionally an ignored, operator-selected diagnostic rather than
+/// a per-commit claim. It reuses the chosen-set closure reconstruction, checks
+/// the selected admission unit on an explicit stack, and refuses missing or
+/// non-unique selectors. Run with:
+///
+///   FLN_CORPUS_PROBE_MODULE=Init.Data.Nat.Bitwise.Basic \
+///   FLN_CORPUS_PROBE_DECL=Nat.shiftRight_eq_div_pow._f \
+///   cargo test -p fln-conformance --test kernel_replay \
+///     selected_real_module_resource_probe -- --ignored --nocapture
+///
+/// Omitting `FLN_CORPUS_PROBE_STACK_BYTES` and `FLN_CORPUS_PROBE_STEPS` uses
+/// `Budget::DEFAULT` on its required stack. Supplying either value is a
+/// diagnostic-only way to derive an explicitly calibrated budget for that
+/// stack; the output always records both values, so it cannot be mistaken for
+/// the default-budget observation.
+#[ignore = "cost: decodes one selected module's real import closure; on-demand resource probe"]
+#[test]
+fn selected_real_module_resource_probe() {
+    let chosen = std::env::var("FLN_CORPUS_PROBE_MODULE")
+        .expect("FLN_CORPUS_PROBE_MODULE must name one provisioned Reference module");
+    let selector = std::env::var("FLN_CORPUS_PROBE_DECL")
+        .expect("FLN_CORPUS_PROBE_DECL must name exactly one declaration");
+    assert!(
+        !chosen.trim().is_empty() && !selector.trim().is_empty(),
+        "resource-probe module and declaration selectors must be non-empty"
+    );
+    let stack_override = match std::env::var("FLN_CORPUS_PROBE_STACK_BYTES") {
+        Ok(raw) => {
+            let stack_bytes = raw
+                .parse::<usize>()
+                .expect("FLN_CORPUS_PROBE_STACK_BYTES must be a base-10 byte count");
+            assert!(
+                stack_bytes >= 64 * 1024,
+                "resource-probe stack must be at least 64 KiB"
+            );
+            Some(stack_bytes)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("read FLN_CORPUS_PROBE_STACK_BYTES: {error}"),
+    };
+    let steps_override = match std::env::var("FLN_CORPUS_PROBE_STEPS") {
+        Ok(raw) => Some(
+            raw.parse::<u64>()
+                .expect("FLN_CORPUS_PROBE_STEPS must be a base-10 step count"),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("read FLN_CORPUS_PROBE_STEPS: {error}"),
+    };
+    let stack_bytes = stack_override.unwrap_or(KERNEL_REPLAY_WORKER_STACK_BYTES);
+    let steps = steps_override.unwrap_or(Budget::DEFAULT_STEPS);
+    assert!(steps > 0, "resource-probe step budget must be nonzero");
+    let budget = if stack_override.is_none() && steps_override.is_none() {
+        Budget::DEFAULT
+    } else {
+        Budget::derive(
+            StackMeasurement::k1_here(),
+            ExecConfig::current(),
+            stack_bytes,
+            steps,
+        )
+    };
+
+    let reference_lib = reference_lib().expect("pinned toolchain required for the resource probe");
+    let roots = chosen_set_roots(&reference_lib);
+    let inventory = closure_inventory(&roots, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: closure inventory failed: {error}"));
+    assert!(
+        inventory.missing_imports.is_empty(),
+        "{chosen}: closure has unresolved imports: {:?}",
+        inventory.missing_imports
+    );
+    let PreparedChosenModule {
+        prep,
+        collision_count,
+    } = prepare_chosen_module(&inventory, &chosen)
+        .unwrap_or_else(|error| panic!("{chosen}: replay preparation failed: {error}"));
+
+    let matches = prep
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.member_names
+                .iter()
+                .any(|name| name.to_display_string() == selector)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches.len() == 1,
+        "{chosen}: declaration selector `{selector}` matched {} admission units; expected exactly one",
+        matches.len()
+    );
+    let (unit_index, item) = matches[0];
+    let verdict = check_work_item_with_stack(item, budget, stack_bytes);
+    let outcome = unit_outcome(item, &verdict);
+    let message_digest = if outcome.message.is_empty() {
+        "none".to_string()
+    } else {
+        hash(Domain::Fixture, outcome.message.as_bytes()).to_hex()
+    };
+    eprintln!(
+        "kernel_resource_probe module={} declaration={} unit_index={} unit_lead={} \
+         kind={} members={} outcome={} steps_used={} max_depth={} \
+         budget_steps={} budget_depth={} stack_bytes={} closure_modules={} \
+         closure_decoded={} collision_count={} diagnostic_digest={}",
+        chosen,
+        selector,
+        unit_index,
+        outcome.lead,
+        outcome.kind,
+        outcome.members,
+        outcome.outcome,
+        outcome.steps_used,
+        outcome.max_depth,
+        budget.steps,
+        budget.depth,
+        stack_bytes,
+        inventory.modules.len(),
+        inventory.decoded,
+        collision_count,
+        message_digest,
+    );
+    assert!(
+        !matches!(verdict, Outcome::InternalFault(_)),
+        "{chosen}:{selector}: an internal fault is never a resource observation"
+    );
 }
 
 fn validate_leanchecker_authority_contract(script: &str, findings: &str) -> Result<(), String> {

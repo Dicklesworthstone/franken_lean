@@ -1022,7 +1022,7 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
 /// The same holds one level down: prohibiting `fln-core` would be absurd, since
 /// both implementations need `ExprNode` and `Name` to denote the same term —
 /// yet `Level::is_equiv` inside `fln-core` is a judgment `fln-kernel` returns
-/// directly as its verdict (`tc.rs:949`). Crate granularity is the wrong unit.
+/// directly as its verdict (`tc.rs:1757`). Crate granularity is the wrong unit.
 ///
 /// A cross-check is worth exactly the questions its two sides answer
 /// *separately*, so each entry below is an answer that would otherwise be
@@ -1048,12 +1048,12 @@ pub const CHECKER_SEMANTIC: [(&str, &str); 12] = [
     ),
     (
         "loose_bvar_range",
-        "a precomputed answer `instantiate` prunes traversal on (tc.rs:176); \
+        "a precomputed answer `instantiate` prunes traversal on (tc.rs:713); \
              a shared wrong range makes both engines skip the same subterm",
     ),
     (
         "has_fvar",
-        "a precomputed answer the `abstract_*` walks prune on (tc.rs:1645/1707/1779)",
+        "a precomputed answer the iterative abstraction walks prune on (tc.rs:2764/2839)",
     ),
     (
         "has_expr_mvar",

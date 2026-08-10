@@ -42,21 +42,16 @@ use fln_kernel::{Declaration, check, check_def_eq};
 // Probe shapes
 // ---------------------------------------------------------------------------
 
-/// The distinct mutually-recursive descents that thread `depth`. Each shape is
-/// built so that reaching depth `d` costs `O(d)` work, not `O(d^2)`: every
-/// binder is non-dependent, so `open_binder`/`instantiate` prune on the loose
-/// bvar flag and contribute no work per level. That keeps a bisection over
-/// depth cheap enough to run to 32k.
+/// The residual recursive descents that thread `depth`. Consecutive
+/// application, lambda, Pi, let, and recursor-major spines have explicit
+/// worklists now, so they are covered by shallow-depth regressions rather than
+/// pretending to remain native-stack calibration shapes. Each shape here is
+/// built so that reaching depth `d` costs `O(d)` work, not `O(d^2)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
-    /// `infer`/`infer_core` down a `forall` telescope (KR-108).
-    ForallInfer,
-    /// `infer`/`infer_core` down a `lam` telescope (KR-107) — `ensure_sort_of`,
-    /// `open_binder` and `abstract_fvar` all live on this frame.
-    LamInfer,
-    /// `infer_core` down a right-nested application spine (KR-106): the
-    /// widest `infer_core` arm, carrying `whnf`, `is_def_eq` and `instantiate`
-    /// calls in the same frame.
+    /// `infer_core` down a right-nested argument tree (KR-106): flattening the
+    /// left-associated application spine does not flatten an application
+    /// nested inside its argument.
     AppInfer,
     /// `is_def_eq` → `quick_def_eq_rules` → `is_def_eq` binder congruence
     /// (KR-302). Two kernel frames per unit of depth.
@@ -64,17 +59,10 @@ enum Shape {
 }
 
 impl Shape {
-    const ALL: [Shape; 4] = [
-        Shape::ForallInfer,
-        Shape::LamInfer,
-        Shape::AppInfer,
-        Shape::DefEqBinder,
-    ];
+    const ALL: [Shape; 2] = [Shape::AppInfer, Shape::DefEqBinder];
 
     fn as_str(self) -> &'static str {
         match self {
-            Shape::ForallInfer => "forall_infer",
-            Shape::LamInfer => "lam_infer",
             Shape::AppInfer => "app_infer",
             Shape::DefEqBinder => "defeq_binder",
         }
@@ -131,16 +119,6 @@ fn add(env: &Environment, decl: &Declaration) -> Environment {
     env.add_decl(info).expect("probe environment extends")
 }
 
-/// `(x : Sort 1) -> ... -> leaf`, `levels` binders deep, none of them used in
-/// the body (so the binder machinery prunes and the cost stays linear).
-fn forall_nest(levels: u32, leaf: Expr) -> Expr {
-    let mut e = leaf;
-    for _ in 0..levels {
-        e = Expr::forall_e(n("x"), sort1(), e, BinderInfo::Default);
-    }
-    e
-}
-
 /// `fun (x : Sort 1) => ... => leaf`, `levels` binders deep.
 fn lam_nest(levels: u32, leaf: Expr) -> Expr {
     let mut e = leaf;
@@ -168,26 +146,6 @@ impl Probe {
 /// Builds a term guaranteed to force the descent past `levels` units of depth.
 fn build_probe(shape: Shape, levels: u32) -> Probe {
     match shape {
-        Shape::ForallInfer => {
-            // `A : (x : Sort 1) -> ... -> Sort 1`. `check_inner` infers the
-            // type, which walks the whole telescope.
-            Probe::Decl(
-                Environment::new(),
-                axiom_decl("Probe", forall_nest(levels, sort1())),
-            )
-        }
-        Shape::LamInfer => {
-            // `d : (x : Sort 1) -> ... -> Sort 1 := fun x => ... => Prop`.
-            // Both halves walk the telescope; the value's walk is the KR-107 arm.
-            Probe::Decl(
-                Environment::new(),
-                defn_decl(
-                    "Probe",
-                    forall_nest(levels, sort1()),
-                    lam_nest(levels, prop()),
-                ),
-            )
-        }
         Shape::AppInfer => {
             // `T : Sort 1`, `f : T -> T`, `a : T`; term `f (f (... (f a)))`.
             // The spine is right-nested, so `infer_core` descends the argument.
@@ -482,8 +440,8 @@ fn the_stack_derivation_is_sound_at_and_around_the_shipped_point() {
 /// documented minimum stack, a term deeper than `Budget::DEFAULT.depth`
 /// returns a typed FL-INV-07 `Inconclusive` and the worker returns cleanly.
 ///
-/// Every shape, because the guarantee is over the whole mutually recursive
-/// descent, not over whichever one happened to be measured deepest.
+/// Every residual recursive shape, because the guarantee is over every path
+/// still represented by `Budget::depth`, not only the measured worst one.
 #[test]
 fn default_budget_is_survivable_on_the_documented_minimum_stack() {
     for shape in Shape::ALL {
@@ -573,16 +531,12 @@ impl Shape {
     /// `calibrate_stack_bytes_per_depth`'s table, i.e. the one that overflows
     /// first.
     ///
-    /// Corrected under bead `fln-kx3y`. This named `DefEqBinder` and described
-    /// it as the deepest-per-level descent, which the measurement contradicts:
-    /// defeq binder congruence uses two kernel frames per level and is
-    /// nonetheless the CHEAPEST of the four at 4,507 bytes/depth against 5,935
-    /// for the three inference descents, so it overflows LAST. The witness
-    /// still fired, because `Budget::DEFAULT` on 2 MiB overflows on any shape —
-    /// which is exactly why nobody noticed. A witness that passes for a reason
-    /// other than the one stated beside it is the same defect class this bead
-    /// is about, one level down.
-    const WITNESS: Shape = Shape::ForallInfer;
+    /// Re-measured after the explicit telescope/worklist conversion:
+    /// `DefEqBinder` is the residual worst case at 4,688.1 bytes/depth versus
+    /// 4,430.6 for `AppInfer`. The former forall/lambda shapes no longer belong
+    /// in a native-stack witness at all; retaining either would make "survived
+    /// without reaching the ceiling" look like a calibration failure.
+    const WITNESS: Shape = Shape::DefEqBinder;
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +558,7 @@ impl Shape {
 // on `franken_lean-kxbj`'s judgement row: the same instrument read 5,935.3
 // bytes/depth on the development host and 6,553.6 on an RCH remote worker at
 // the identical (profile, arch, os); and widening `Budget` for
-// `franken_lean-4o3n` cost two of the four shapes one level of ceiling. Neither
+// `franken_lean-4o3n` cost two of the then-four shapes one level of ceiling. Neither
 // was caught by anything. Both were caught because a human re-ran an
 // `#[ignore]`d test on a hunch.
 //
@@ -647,9 +601,12 @@ const TRIPWIRE_TOLERANCE_HIGH: f64 = 0.25;
 /// room that the unsafe direction is not.
 const TRIPWIRE_TOLERANCE_LOW: f64 = 0.33;
 
-/// Depth used by the entry-reserve probe. Small, so the fixed cost dominates
-/// and the probe is a statement about the reserve rather than about the slope.
-const TRIPWIRE_RESERVE_PROBE_DEPTH: u32 = 8;
+/// Depth used by the entry-reserve probe. The per-level allowance is placed at
+/// the tripwire's accepted low edge, preventing an intentionally conservative
+/// slope claim from silently donating its accumulated slack to a false entry
+/// reserve. Sixteen levels also keep the requested stack above the platform
+/// thread minimum, so a planted low reserve remains observable.
+const TRIPWIRE_RESERVE_PROBE_DEPTH: u32 = 16;
 
 /// What the two bracket probes and the reserve probe said about one shape.
 #[derive(Debug)]
@@ -696,8 +653,9 @@ fn observe_shape(
     };
     let high_probe_depth = depth_at(claimed * (1.0 + TRIPWIRE_TOLERANCE_HIGH));
     let low_probe_depth = depth_at(claimed * (1.0 - TRIPWIRE_TOLERANCE_LOW)).saturating_add(1);
+    let reserve_level_bytes = (claimed * (1.0 - TRIPWIRE_TOLERANCE_LOW)).ceil().max(1.0) as usize;
     let reserve_probe_stack =
-        claimed_entry_reserve + (TRIPWIRE_RESERVE_PROBE_DEPTH as usize) * claimed_bytes_per_depth;
+        claimed_entry_reserve + (TRIPWIRE_RESERVE_PROBE_DEPTH as usize) * reserve_level_bytes;
 
     ShapeObservation {
         shape,
@@ -715,7 +673,7 @@ fn observe_shape(
 ///
 /// THE TWO DIRECTIONS ARE NOT QUANTIFIED THE SAME WAY, and getting that wrong
 /// is how this check would have become a flake generator. The constant is the
-/// MAXIMUM over the four descents, so:
+/// MAXIMUM over the registered residual descents, so:
 ///
 /// * ABOVE the claim is a property of ANY shape. One descent costing more than
 ///   the constant says is enough to make `MIN_STACK_BYTES` promise too little,
@@ -754,10 +712,11 @@ fn calibration_refusals(
         if !o.reserve_covers_entry {
             refusals.push(format!(
                 "{:?}: a stack of {} bytes — the claimed entry reserve of \
-                 {claimed_entry_reserve} plus {TRIPWIRE_RESERVE_PROBE_DEPTH} levels — could \
-                 not hold {TRIPWIRE_RESERVE_PROBE_DEPTH} levels, so the fixed entry cost has \
-                 outgrown Budget::STACK_ENTRY_RESERVE_BYTES and depth_for_stack_bytes \
-                 over-promises depth to every caller",
+                 {claimed_entry_reserve} plus {TRIPWIRE_RESERVE_PROBE_DEPTH} levels at the \
+                 accepted low-edge slope — could not hold {TRIPWIRE_RESERVE_PROBE_DEPTH} \
+                 levels, so the fixed entry cost has outgrown \
+                 Budget::STACK_ENTRY_RESERVE_BYTES and depth_for_stack_bytes over-promises \
+                 depth to every caller",
                 o.shape, o.reserve_probe_stack
             ));
         }
@@ -786,9 +745,9 @@ fn calibration_refusals(
 /// shape, both directions, plus the entry reserve.
 ///
 /// Every shape rather than the measured-worst one, because
-/// `MEASURED_STACK_BYTES_PER_DEPTH` is the MAXIMUM over the four descents: a
+/// `MEASURED_STACK_BYTES_PER_DEPTH` is the MAXIMUM over the registered descents: a
 /// drift that moved a different shape above the shipped figure would be exactly
-/// as unsafe and would be invisible to a single-shape check. Twelve subprocess
+/// as unsafe and would be invisible to a single-shape check. Six subprocess
 /// probes, no bisection.
 #[test]
 fn the_shipped_calibration_still_describes_the_descent() {

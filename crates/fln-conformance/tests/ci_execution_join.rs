@@ -297,6 +297,14 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
+        "selected_real_module_resource_probe",
+        "not evidence for any claim — an operator-selected diagnostic whose output describes \
+         only that invocation. NOTHING compensates per commit by design, and no coverage row \
+         may cite it; its purpose is to localize one real declaration's resource use without \
+         upgrading the observation into corpus-wide evidence",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
         "whole_mathlib_corpus_resurrection_preflight",
         "not evidence for any claim — a host-provisioning PRECONDITION for the sweep below, \
          which is why nothing compensates and nothing needs to: a missing or truncated corpus \
@@ -372,7 +380,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// `cargo test` next rather than at the author. Recorded here rather than filed, because
 /// the repair is `sso4`'s — a pre-commit affordance — and the count is the evidence for
 /// it.
-const IGNORED_PRODUCER_CEILING: usize = 9;
+///
+/// 9 -> 10 for `selected_real_module_resource_probe`: a deliberately on-demand,
+/// operator-selected diagnostic recovered with the checker resource repair. It
+/// carries no per-commit or corpus-wide claim, so the declaration records that
+/// absence rather than inventing a compensating ceremony.
+const IGNORED_PRODUCER_CEILING: usize = 10;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];

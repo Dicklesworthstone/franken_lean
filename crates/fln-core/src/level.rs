@@ -827,46 +827,73 @@ impl Level {
         }
     }
 
-    /// `mkLevelMax'` (Level.lean:516-533): the simplifying max builder.
-    pub fn smart_max(u: Level, v: Level) -> Level {
+    /// Fallible `mkLevelMax'` (Level.lean:516-533): the simplifying max builder.
+    ///
+    /// The Reference constructor panics if the raw fallback would exceed the packed depth.
+    /// Authoritative FrankenLean callers use this form to preserve typed exhaustion instead.
+    pub fn try_smart_max(u: Level, v: Level) -> Result<Level, LevelTooDeep> {
         if u == v {
-            return u;
+            return Ok(u);
         }
         if u.is_zero() {
-            return v;
+            return Ok(v);
         }
         if v.is_zero() {
-            return u;
+            return Ok(u);
         }
         if Level::subsumes(&u, &v) {
-            return u;
+            return Ok(u);
         }
         if Level::subsumes(&v, &u) {
-            return v;
+            return Ok(v);
         }
         if u.get_level_offset() == v.get_level_offset() {
             if u.get_offset() >= v.get_offset() {
-                u
+                Ok(u)
             } else {
-                v
+                Ok(v)
             }
         } else {
-            Level::max(u, v).expect("children already packed")
+            Level::max(u, v)
         }
     }
 
-    /// `mkLevelIMax'` (Level.lean:541-551): the simplifying imax builder.
-    pub fn smart_imax(u: Level, v: Level) -> Level {
+    /// `mkLevelMax'` for callers whose inputs are already known to have depth headroom.
+    pub fn smart_max(u: Level, v: Level) -> Level {
+        Level::try_smart_max(u, v).expect("smart max inputs have packed depth headroom")
+    }
+
+    /// Fallible `mkLevelIMax'` (Level.lean:541-551): the simplifying imax builder.
+    pub fn try_smart_imax(u: Level, v: Level) -> Result<Level, LevelTooDeep> {
         if v.is_never_zero() {
-            Level::smart_max(u, v)
+            Level::try_smart_max(u, v)
         } else if v.is_zero() || u.is_zero() {
             // Distinct upstream arms (`v.isZero` then `u.isZero`) that both yield `v`.
-            v
+            Ok(v)
         } else if u == v {
-            u
+            Ok(u)
         } else {
-            Level::imax(u, v).expect("children already packed")
+            Level::imax(u, v)
         }
+    }
+
+    /// Fallible kernel `mk_imax` (`kernel/level.cpp`), including its additional
+    /// `imax 1 u = u` simplification beyond Lean's library-level `mkLevelIMax'`.
+    pub fn try_kernel_imax(u: Level, v: Level) -> Result<Level, LevelTooDeep> {
+        if v.is_never_zero() {
+            Level::try_smart_max(u, v)
+        } else if v.is_zero() || u.is_zero() || u == Level::one() {
+            Ok(v)
+        } else if u == v {
+            Ok(u)
+        } else {
+            Level::imax(u, v)
+        }
+    }
+
+    /// `mkLevelIMax'` for callers whose inputs are already known to have depth headroom.
+    pub fn smart_imax(u: Level, v: Level) -> Level {
+        Level::try_smart_imax(u, v).expect("smart imax inputs have packed depth headroom")
     }
 }
 
@@ -1045,6 +1072,10 @@ mod tests {
         let v = p("v");
         // mkLevelMax' identities
         assert_eq!(Level::smart_max(u.clone(), u.clone()), u);
+        assert_eq!(
+            Level::try_smart_max(u.clone(), u.clone()).expect("no depth growth"),
+            u
+        );
         assert_eq!(Level::smart_max(Level::zero(), u.clone()), u);
         assert_eq!(Level::smart_max(u.clone(), Level::zero()), u);
         // explicit subsumption: max (u+2) 1 = u+2? No — subsumes needs v explicit and
@@ -1059,13 +1090,50 @@ mod tests {
         assert_eq!(m, Level::max(u.clone(), v.clone()).expect("packs"));
         // mkLevelIMax' laws
         assert_eq!(Level::smart_imax(u.clone(), Level::zero()), Level::zero());
+        assert_eq!(
+            Level::try_smart_imax(u.clone(), Level::zero()).expect("no depth growth"),
+            Level::zero()
+        );
         assert_eq!(Level::smart_imax(Level::zero(), v.clone()), v);
         assert_eq!(Level::smart_imax(u.clone(), u.clone()), u);
+        assert_eq!(
+            Level::try_kernel_imax(Level::one(), v.clone()).expect("no depth growth"),
+            v
+        );
         let sv = v.clone().succ().expect("packs");
         assert_eq!(
             Level::smart_imax(u.clone(), sv.clone()),
             Level::smart_max(u.clone(), sv)
         );
+    }
+
+    #[test]
+    fn fallible_smart_constructors_report_raw_depth_overflow() {
+        let deep_name = Name::str(Name::anonymous(), "deep");
+        let boundary = Level {
+            node: Some(std::sync::Arc::new(Node::Param(deep_name.clone()))),
+            data: LevelData::pack(
+                mix_hash(SEED_PARAM, deep_name.hash()),
+                MAX_LEVEL_DEPTH,
+                false,
+                true,
+            )
+            .expect("the boundary depth itself packs"),
+        };
+        let other = p("other");
+        let expected = LevelTooDeep {
+            depth: MAX_LEVEL_DEPTH + 1,
+        };
+
+        assert_eq!(
+            Level::try_smart_max(boundary.clone(), other.clone()),
+            Err(expected)
+        );
+        assert_eq!(
+            Level::try_smart_imax(boundary.clone(), other.clone()),
+            Err(expected)
+        );
+        assert_eq!(Level::try_kernel_imax(boundary, other), Err(expected));
     }
 
     #[test]

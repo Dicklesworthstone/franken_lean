@@ -363,6 +363,12 @@ fn stop_to_outcome(
             "kernel scratch admission",
             what,
         )),
+        Stop::DeferredRecursor { .. } => {
+            Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+                "kernel recursor continuation",
+                "a private whnf recursor continuation escaped the type checker",
+            ))
+        }
     }
 }
 
@@ -542,6 +548,12 @@ pub fn check_def_eq(
             "kernel scratch admission",
             what,
         )),
+        Err(Stop::DeferredRecursor { .. }) => {
+            Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+                "kernel recursor continuation",
+                "a private whnf recursor continuation escaped the type checker",
+            ))
+        }
         Err(Stop::Exhausted(reason)) => exhaustion_outcome(reason, consumption, budget),
     }
 }
