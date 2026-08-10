@@ -135,6 +135,9 @@ pub const EXTERN_E2E_PREFIX: &str = "fln-extern-e2e-";
 /// `crates/fln-kernel/tests/admission_laundering.rs` — the compile-fail probe roots
 /// (bead `franken_lean-79k`).
 pub const ADMISSION_PROBE_PREFIX: &str = "fln-admission-probe-";
+/// `crates/fln-olean/tests/artifact_publication.rs` — crash-consistent multi-file
+/// publication, cancellation, storage-fault, and process-death fixtures.
+pub const ARTIFACT_PUBLICATION_PREFIX: &str = "fln-artifact-publication-";
 
 /// One scratch-root namespace: its prefix, the constant producers name it by, the source
 /// that produces it, and whether that source routes through [`ScratchRoot`].
@@ -235,6 +238,12 @@ pub const SCRATCH_FAMILIES: &[ScratchFamily] = &[
         prefix: ADMISSION_PROBE_PREFIX,
         constant: "ADMISSION_PROBE_PREFIX",
         producer: "crates/fln-kernel/tests/admission_laundering.rs",
+        routed: true,
+    },
+    ScratchFamily {
+        prefix: ARTIFACT_PUBLICATION_PREFIX,
+        constant: "ARTIFACT_PUBLICATION_PREFIX",
+        producer: "crates/fln-olean/tests/artifact_publication.rs",
         routed: true,
     },
     // --- declared remainders; each one's reason is in the module header. A row here
@@ -596,8 +605,8 @@ mod tests {
              producer"
         );
         assert!(
-            routed >= 13,
-            "at least thirteen producers route through ScratchRoot; found {routed}"
+            routed >= 14,
+            "at least fourteen producers route through ScratchRoot; found {routed}"
         );
 
         // Prefixes are distinct, and no prefix is a prefix of another — otherwise one

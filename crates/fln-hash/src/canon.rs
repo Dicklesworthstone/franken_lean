@@ -91,14 +91,16 @@ pub const SCHEMA_CARTRIDGE_ARCHIVE: SchemaId = SchemaId {
 ///
 /// Formats live in the crate that encodes them — the registry does not centralize the
 /// *codecs*, only the *identities*. That is forced by the crate map (§21): dependency
-/// edges point strictly downward and fln-hash sits below fln-env and fln-verdict, so
-/// this crate cannot import their constants even to compare them.
+/// edges point strictly downward and fln-hash sits below fln-env, fln-olean, and
+/// fln-verdict, so this crate cannot import their constants even to compare them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SchemaOwner {
     /// `fln-hash` — the term plane and the diagnostic taxonomy (this module).
     Hash,
     /// `fln-env` — Grimoire's module and provenance identities.
     Env,
+    /// `fln-olean` — Grimoire's durable artifact transaction formats.
+    Olean,
     /// `fln-verdict` — the CNF / model / proof wire formats.
     Verdict,
 }
@@ -108,6 +110,7 @@ impl SchemaOwner {
         match self {
             SchemaOwner::Hash => "fln-hash",
             SchemaOwner::Env => "fln-env",
+            SchemaOwner::Olean => "fln-olean",
             SchemaOwner::Verdict => "fln-verdict",
         }
     }
@@ -120,11 +123,17 @@ impl SchemaOwner {
         match self {
             SchemaOwner::Hash => "crates/fln-hash/src/canon.rs",
             SchemaOwner::Env => "crates/fln-env/src/provenance.rs",
+            SchemaOwner::Olean => "crates/fln-olean/src/artifact.rs",
             SchemaOwner::Verdict => "crates/fln-verdict/src/lib.rs",
         }
     }
 
-    pub const ALL: [SchemaOwner; 3] = [SchemaOwner::Hash, SchemaOwner::Env, SchemaOwner::Verdict];
+    pub const ALL: [SchemaOwner; 4] = [
+        SchemaOwner::Hash,
+        SchemaOwner::Env,
+        SchemaOwner::Olean,
+        SchemaOwner::Verdict,
+    ];
 }
 
 /// One durable format of the program.
@@ -156,7 +165,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 18] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 19] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -237,6 +246,14 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 18] = [
         },
         owner: SchemaOwner::Env,
         covers: "content identity of one extension journal entry",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.olean.artifact-set-manifest",
+            version: 1,
+        },
+        owner: SchemaOwner::Olean,
+        covers: "one verified cross-file olean/ilean/native artifact generation",
     },
     SchemaRow {
         id: SchemaId {

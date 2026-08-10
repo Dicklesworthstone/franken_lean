@@ -11,8 +11,8 @@
 #![forbid(unsafe_code)]
 
 use fln_rt::region::{
-    canonical_digest, compact, materialize, parse_olean_envelope, relocate, staging_tmp_path,
-    write_region_file,
+    atomic_staging_path, canonical_digest, compact, materialize, parse_olean_envelope, relocate,
+    write_file_atomic,
 };
 use fln_unsafe_region::mapping::RegionMapping;
 
@@ -108,14 +108,14 @@ fn main() {
         file_bytes.extend_from_slice(&payload);
         if crash_after_temp {
             // The staging drill: die between temp write and rename.
-            let tmp = staging_tmp_path(out);
+            let tmp = atomic_staging_path(out);
             if let Err(e) = std::fs::write(&tmp, &file_bytes) {
                 fail("stage-temp", e);
             }
             fact("crashing", &format!("{{\"tmp\":\"{}\"}}", tmp.display()));
             std::process::exit(9);
         }
-        if let Err(e) = write_region_file(&file_bytes, out) {
+        if let Err(e) = write_file_atomic(&file_bytes, out) {
             fail("publish", e);
         }
         fact(

@@ -5,8 +5,8 @@
 //! Its in-crate laws — unique, well-shaped names, and fln-hash's own rows joined
 //! against the real constants — live beside it in `canon.rs`. What it cannot do from
 //! there is check the *other* owners: the crate map (§21) points dependency edges
-//! strictly downward, and fln-hash sits below fln-env and fln-verdict, so it can never
-//! import their constants to compare them.
+//! strictly downward, and fln-hash sits below fln-env, fln-olean, and fln-verdict,
+//! so it can never import their constants to compare them.
 //!
 //! So this test reads their sources instead, and joins **in both directions**:
 //!

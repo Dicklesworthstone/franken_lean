@@ -63,6 +63,15 @@ class CancelledGeneration(Exception):
         self.signum = signum
         super().__init__(f"cancelled at {stage} by signal {signum}")
 
+
+def report_cancellation(cancelled: CancelledGeneration) -> int:
+    print(
+        f"attribute-census: CANCELLED at {cancelled.stage} by signal {cancelled.signum}; "
+        "nothing partial published (the write is atomic)",
+        file=sys.stderr,
+    )
+    return 130 if cancelled.signum == signal.SIGINT else 143
+
 ATTR_IMPL_MODULE = "src/Lean/Attributes.lean"
 
 # The application-time lattice, with the default the pin declares in
@@ -969,12 +978,7 @@ def main() -> int:
     try:
         rows, problems, machinery = extract(vendor)
     except CancelledGeneration as cancelled:
-        print(
-            f"attribute-census: CANCELLED at {cancelled.stage} by signal {cancelled.signum}; "
-            "nothing partial published (the write is atomic)",
-            file=sys.stderr,
-        )
-        return 130 if cancelled.signum == signal.SIGINT else 143
+        return report_cancellation(cancelled)
     except BudgetExceeded as exceeded:
         print(f"attribute-census: budget refusal — {exceeded}", file=sys.stderr)
         return 2
@@ -1089,4 +1093,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except CancelledGeneration as cancelled:
+        exit_code = report_cancellation(cancelled)
+    raise SystemExit(exit_code)

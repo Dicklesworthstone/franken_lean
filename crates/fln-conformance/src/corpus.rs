@@ -68,9 +68,9 @@ use fln_env::provenance::{
 };
 use fln_hash::canon::{
     CanonWriter, Canonical, SCHEMA_CARTRIDGE_ARCHIVE, SCHEMA_CARTRIDGE_MANIFEST,
-    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL,
-    SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SCHEMA_WARM_DEFEQ_CACHE,
-    SchemaId, SchemaRow, kvmap_canonical_set_bytes,
+    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_NAME, SCHEMA_REGISTRY,
+    SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON,
+    SCHEMA_WARM_DEFEQ_CACHE, SchemaId, SchemaRow, kvmap_canonical_set_bytes,
 };
 use fln_hash::cartridge::{
     AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
@@ -90,6 +90,7 @@ use fln_hash::shadow::{
     ShadowCellSpecV1, ShadowCellV1, ShadowPublicationV1, ShadowScopeV1, ShadowTelemetryV1,
     recover_journal,
 };
+use fln_olean::artifact::{ArtifactLimits, ArtifactSetManifest, SCHEMA_ARTIFACT_SET_MANIFEST};
 use fln_verdict::{
     Assignment, CNF_SCHEMA, Clause, ClauseId, Cnf, InputClause, Literal as SatLiteral, ProofRule,
     ProofStep, SAT_MODEL_SCHEMA, SatModel, SchemaLimits, UNSAT_PROOF_SCHEMA, UnsatProof,
@@ -324,7 +325,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 18] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 19] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -448,6 +449,14 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 18] = [
                    one id, and a changed payload, descriptor name or epoch each give \
                    another; a one-way content identity, so no round trip",
         run: exercise_entry_id,
+    },
+    CorpusCoverage {
+        schema: "fln.olean.artifact-set-manifest",
+        version: 1,
+        exercise: "decode and canonical re-encode byte-identically a sorted two-member \
+                   olean/ilean generation, preserve its content root, and refuse every \
+                   truncation, reversed member order, and a one-member structural budget",
+        run: exercise_artifact_set_manifest,
     },
     CorpusCoverage {
         schema: "fln.verdict.cnf",
@@ -1430,6 +1439,83 @@ fn exercise_entry_id(row: &SchemaRow) -> Result<(), String> {
     let other_epoch = ModuleEpoch::new("v4.33.0", "0123456789abcdef0123456789abcdef01234567");
     if ExtensionEntryId::derive(&other_epoch, &descriptor, payload) == identity {
         return Err("a changed epoch did not change the entry id".to_string());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Grimoire's cross-file artifact generation (fln-olean)
+// ---------------------------------------------------------------------------
+
+fn artifact_manifest_fixture(names: &[(&str, u64, u8)]) -> Vec<u8> {
+    let mut writer = CanonWriter::new();
+    writer.schema(SCHEMA_ARTIFACT_SET_MANIFEST);
+    writer.u64(names.len() as u64);
+    for (name, byte_len, seed) in names {
+        writer.str(name);
+        writer.u64(*byte_len);
+        writer.str(SCHEMA_NAME.name);
+        writer.u16(SCHEMA_NAME.version);
+        writer.bytes(&[*seed; 32]);
+        writer.bytes(&[seed.wrapping_add(1); 32]);
+    }
+    writer.into_bytes()
+}
+
+fn exercise_artifact_set_manifest(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_ARTIFACT_SET_MANIFEST)?;
+    let bytes = artifact_manifest_fixture(&[("Demo.ilean", 11, 1), ("Demo.olean", 13, 3)]);
+    if !bytes.starts_with(&schema_prefix(SCHEMA_ARTIFACT_SET_MANIFEST)) {
+        return Err("the artifact manifest does not begin with its schema header".to_string());
+    }
+
+    let limits = ArtifactLimits::default();
+    let manifest = ok(
+        ArtifactSetManifest::from_canonical_bytes(&bytes, limits),
+        "decode artifact-set manifest",
+    )?;
+    if manifest.canonical_bytes() != bytes {
+        return Err("re-encoding the artifact-set manifest is not byte-identical".to_string());
+    }
+    let names: Vec<&str> = manifest
+        .members()
+        .iter()
+        .map(|member| member.name())
+        .collect();
+    if names != ["Demo.ilean", "Demo.olean"] {
+        return Err(format!(
+            "decoded artifact members are not canonical: {names:?}"
+        ));
+    }
+    let repeated = ok(
+        ArtifactSetManifest::from_canonical_bytes(manifest.canonical_bytes(), limits),
+        "decode the re-encoded artifact-set manifest",
+    )?;
+    if repeated != manifest || repeated.root() != manifest.root() {
+        return Err(
+            "the artifact manifest value or root changed across its round trip".to_string(),
+        );
+    }
+
+    for end in 0..bytes.len() {
+        if ArtifactSetManifest::from_canonical_bytes(&bytes[..end], limits).is_ok() {
+            return Err(format!(
+                "the artifact manifest accepted a truncation at byte {end}"
+            ));
+        }
+    }
+    let reversed = artifact_manifest_fixture(&[("Demo.olean", 13, 3), ("Demo.ilean", 11, 1)]);
+    if ArtifactSetManifest::from_canonical_bytes(&reversed, limits).is_ok() {
+        return Err("the artifact manifest accepted non-canonical member order".to_string());
+    }
+    let one_member_limit = ArtifactLimits::new(
+        1,
+        limits.max_manifest_bytes(),
+        limits.max_member_bytes(),
+        limits.max_total_bytes(),
+    );
+    if ArtifactSetManifest::from_canonical_bytes(&bytes, one_member_limit).is_ok() {
+        return Err("the artifact manifest exceeded its member budget without refusal".to_string());
     }
     Ok(())
 }

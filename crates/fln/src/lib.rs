@@ -63,6 +63,14 @@ use fln_kernel::council::{
     Council, CouncilOutcome, Seat, SeatBounds, SeatOrigin, SeatVerdict, convene,
 };
 pub use fln_kernel::verdict::{Budget, RejectClass};
+pub use fln_olean::artifact::{
+    ArtifactByteHash, ArtifactError, ArtifactIdentityPlane, ArtifactLimits, ArtifactMemberInput,
+    ArtifactMemberRecord, ArtifactPointer, ArtifactPublication, ArtifactResource,
+    ArtifactSemanticHash, ArtifactSetManifest, ArtifactSetRoot, ArtifactStore,
+    ArtifactStoreDirectory, BoundArtifactSet, InjectedIoError, PublicationControl,
+    PublicationIoPoint, PublicationPoint, ResolvedArtifactSet, SCHEMA_ARTIFACT_SET_MANIFEST,
+    StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash,
+};
 use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;
 pub use fln_olean::format::{

@@ -885,7 +885,7 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
 /// in parallel — which is the point of a deterministic-parallel build fabric.
 ///
 /// Keeping it a pure function of (pid, thread, target) is what lets
-/// [`staging_tmp_path`] still predict it for the crash drill; a counter or a
+/// [`atomic_staging_path`] still predict it for the crash drill; a counter or a
 /// random token would be unique but unpredictable.
 fn staging_name(path: &std::path::Path) -> String {
     let thread: String = format!("{:?}", std::thread::current().id())
@@ -896,15 +896,15 @@ fn staging_name(path: &std::path::Path) -> String {
         ".{}.tmp.{}.{}",
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "region".to_string()),
+            .unwrap_or_else(|| "artifact".to_string()),
         std::process::id(),
         thread
     )
 }
 
-/// Atomically publish a region file: write to a sibling temp file, fsync it,
+/// Atomically publish a file: write to a sibling temp file, fsync it,
 /// rename over the target, fsync the directory. A crash at ANY point leaves
-/// either the old target or no target — never a half-published region (the
+/// either the old target or no target — never a half-published file (the
 /// fln-wgp staging drill kills the process between temp write and rename and
 /// asserts exactly that).
 ///
@@ -913,23 +913,213 @@ fn staging_name(path: &std::path::Path) -> String {
 /// the target ends up as exactly one caller's bytes, never a mixture. Which
 /// caller wins is the last rename, which is the caller's problem to care about,
 /// not this function's.
-pub fn write_region_file(bytes: &[u8], path: &std::path::Path) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = dir.join(staging_name(path));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut f, bytes)?;
-        f.sync_all()?;
+pub fn write_file_atomic(bytes: &[u8], path: &std::path::Path) -> std::io::Result<()> {
+    let mut control = |_step| Ok::<(), std::convert::Infallible>(());
+    match write_file_atomic_controlled(bytes, path, &mut control) {
+        Ok(()) => Ok(()),
+        Err(AtomicWriteError::Io { source, .. }) => Err(source),
+        Err(AtomicWriteError::Control { source, .. }) => match source {},
     }
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
 }
 
-/// The staging temp path `write_region_file` uses for `path` in THIS process
+const ATOMIC_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The next externally fallible step in an atomic file replacement.
+///
+/// A controller observes each value immediately before the named operation.
+/// `WriteChunk::offset` is the number of bytes already written, so a refusal
+/// there can model a full device after an exact prefix without publishing a
+/// partial target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AtomicWriteStep {
+    CreateStaging,
+    WriteChunk {
+        offset: u64,
+        chunk_len: u64,
+        total_len: u64,
+    },
+    SyncStaging,
+    RenameTarget,
+    SyncDirectory,
+}
+
+impl std::fmt::Display for AtomicWriteStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateStaging => f.write_str("create staging file"),
+            Self::WriteChunk {
+                offset,
+                chunk_len,
+                total_len,
+            } => write!(
+                f,
+                "write {chunk_len} bytes at offset {offset} of {total_len}"
+            ),
+            Self::SyncStaging => f.write_str("sync staging file"),
+            Self::RenameTarget => f.write_str("replace target"),
+            Self::SyncDirectory => f.write_str("sync target directory"),
+        }
+    }
+}
+
+/// Typed failure from [`write_file_atomic_controlled`].
+///
+/// `target_replaced` is the transaction boundary. If it is false, the target
+/// still names the prior complete file. If it is true, the rename succeeded
+/// and the new complete file is visible, but the directory sync failed or was
+/// refused, so crash durability is not established.
+#[derive(Debug)]
+pub enum AtomicWriteError<E> {
+    Control {
+        step: AtomicWriteStep,
+        target_replaced: bool,
+        source: E,
+    },
+    Io {
+        step: AtomicWriteStep,
+        target_replaced: bool,
+        source: std::io::Error,
+    },
+}
+
+impl<E> AtomicWriteError<E> {
+    pub const fn step(&self) -> AtomicWriteStep {
+        match self {
+            Self::Control { step, .. } | Self::Io { step, .. } => *step,
+        }
+    }
+
+    pub const fn target_replaced(&self) -> bool {
+        match self {
+            Self::Control {
+                target_replaced, ..
+            }
+            | Self::Io {
+                target_replaced, ..
+            } => *target_replaced,
+        }
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AtomicWriteError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control {
+                step,
+                target_replaced,
+                source,
+            } => write!(
+                f,
+                "atomic write control refused `{step}` after target replacement={target_replaced}: \
+                 {source}"
+            ),
+            Self::Io {
+                step,
+                target_replaced,
+                source,
+            } => write!(
+                f,
+                "atomic write failed during `{step}` after target replacement={target_replaced}: \
+                 {source}"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for AtomicWriteError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+fn atomic_write_checkpoint<E, C>(
+    control: &mut C,
+    step: AtomicWriteStep,
+    target_replaced: bool,
+) -> Result<(), AtomicWriteError<E>>
+where
+    C: FnMut(AtomicWriteStep) -> Result<(), E> + ?Sized,
+{
+    control(step).map_err(|source| AtomicWriteError::Control {
+        step,
+        target_replaced,
+        source,
+    })
+}
+
+/// Atomically replace `path`, consulting `control` immediately before every
+/// fallible filesystem step.
+///
+/// This is the fault-drill and cancellation-capable form of
+/// [`write_file_atomic`]. A control refusal is structurally distinct from an
+/// operating-system error, and both report whether the rename already
+/// linearized. The controller is never called after a successful directory
+/// sync.
+pub fn write_file_atomic_controlled<E, C>(
+    bytes: &[u8],
+    path: &std::path::Path,
+    control: &mut C,
+) -> Result<(), AtomicWriteError<E>>
+where
+    C: FnMut(AtomicWriteStep) -> Result<(), E> + ?Sized,
+{
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(staging_name(path));
+    let mut target_replaced = false;
+    atomic_write_checkpoint(control, AtomicWriteStep::CreateStaging, target_replaced)?;
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(|source| AtomicWriteError::Io {
+            step: AtomicWriteStep::CreateStaging,
+            target_replaced,
+            source,
+        })?;
+        let mut offset = 0u64;
+        for chunk in bytes.chunks(ATOMIC_WRITE_CHUNK_BYTES) {
+            let step = AtomicWriteStep::WriteChunk {
+                offset,
+                chunk_len: chunk.len() as u64,
+                total_len: bytes.len() as u64,
+            };
+            atomic_write_checkpoint(control, step, target_replaced)?;
+            std::io::Write::write_all(&mut file, chunk).map_err(|source| AtomicWriteError::Io {
+                step,
+                target_replaced,
+                source,
+            })?;
+            offset = offset.saturating_add(chunk.len() as u64);
+        }
+        atomic_write_checkpoint(control, AtomicWriteStep::SyncStaging, target_replaced)?;
+        file.sync_all().map_err(|source| AtomicWriteError::Io {
+            step: AtomicWriteStep::SyncStaging,
+            target_replaced,
+            source,
+        })?;
+    }
+    atomic_write_checkpoint(control, AtomicWriteStep::RenameTarget, target_replaced)?;
+    std::fs::rename(&tmp, path).map_err(|source| AtomicWriteError::Io {
+        step: AtomicWriteStep::RenameTarget,
+        target_replaced,
+        source,
+    })?;
+    target_replaced = true;
+    atomic_write_checkpoint(control, AtomicWriteStep::SyncDirectory, target_replaced)?;
+    std::fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| AtomicWriteError::Io {
+            step: AtomicWriteStep::SyncDirectory,
+            target_replaced,
+            source,
+        })
+}
+
+/// The staging temp path [`write_file_atomic`] uses for `path` in THIS process
 /// and THIS thread — exposed so the crash drill can assert "temp present,
 /// target absent". Call it from the thread that publishes, or it will name a
 /// different file.
-pub fn staging_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+pub fn atomic_staging_path(path: &std::path::Path) -> std::path::PathBuf {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     dir.join(staging_name(path))
 }

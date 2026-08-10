@@ -7,7 +7,8 @@
 
 use fln_rt::obj::Obj;
 use fln_rt::region::{
-    RegionFault, canonical_digest, compact, materialize, parse_olean_envelope, relocate,
+    AtomicWriteError, AtomicWriteStep, RegionFault, atomic_staging_path, canonical_digest, compact,
+    materialize, parse_olean_envelope, relocate, write_file_atomic_controlled,
 };
 use fln_unsafe_region::mapping::RegionMapping;
 use std::sync::{Mutex, MutexGuard};
@@ -338,7 +339,7 @@ fn concurrent_publication_of_one_target_never_yields_a_mixture() {
             for payload in [&a, &b] {
                 let target = target.clone();
                 s.spawn(move || {
-                    let _ = fln_rt::region::write_region_file(payload, &target);
+                    let _ = fln_rt::region::write_file_atomic(payload, &target);
                 });
             }
         });
@@ -360,9 +361,9 @@ fn concurrent_publication_of_one_target_never_yields_a_mixture() {
 
     // The staging names must actually differ per thread, which is the property
     // the fix rests on.
-    let mine = fln_rt::region::staging_tmp_path(&target);
+    let mine = fln_rt::region::atomic_staging_path(&target);
     let theirs = std::thread::scope(|s| {
-        s.spawn(|| fln_rt::region::staging_tmp_path(&target))
+        s.spawn(|| fln_rt::region::atomic_staging_path(&target))
             .join()
             .expect("thread")
     });
@@ -370,5 +371,75 @@ fn concurrent_publication_of_one_target_never_yields_a_mixture() {
         mine, theirs,
         "two threads must not share a staging file for the same target"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn controlled_atomic_publication_distinguishes_pre_and_post_rename_faults() {
+    const CHUNK: u64 = 64 * 1024;
+    let dir = std::env::temp_dir().join(format!("fln-rt-pubfault-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let old = b"old-complete".to_vec();
+    let payload = vec![0xA5; (2 * CHUNK + 17) as usize];
+    let cases = [
+        ("create", AtomicWriteStep::CreateStaging, false, false),
+        (
+            "second-chunk",
+            AtomicWriteStep::WriteChunk {
+                offset: CHUNK,
+                chunk_len: CHUNK,
+                total_len: payload.len() as u64,
+            },
+            false,
+            true,
+        ),
+        ("file-sync", AtomicWriteStep::SyncStaging, false, true),
+        ("rename", AtomicWriteStep::RenameTarget, false, true),
+        (
+            "directory-sync",
+            AtomicWriteStep::SyncDirectory,
+            true,
+            false,
+        ),
+    ];
+
+    for (label, fault_step, target_replaced, staging_remains) in cases {
+        let target = dir.join(format!("{label}.bin"));
+        std::fs::write(&target, &old).expect("seed prior complete target");
+        let staging = atomic_staging_path(&target);
+        let mut injected = false;
+        let error = write_file_atomic_controlled(&payload, &target, &mut |step| {
+            if step == fault_step {
+                injected = true;
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("the selected atomic-write step is refused");
+
+        assert!(injected, "{label}: selected step was not reached");
+        assert_eq!(error.step(), fault_step, "{label}");
+        assert_eq!(error.target_replaced(), target_replaced, "{label}");
+        assert!(
+            matches!(&error, AtomicWriteError::Control { .. }),
+            "{label}: injected failure was misclassified"
+        );
+        if let AtomicWriteError::Control { source, .. } = error {
+            assert_eq!(source.kind(), std::io::ErrorKind::StorageFull, "{label}");
+        }
+
+        let visible = std::fs::read(&target).expect("visible target remains complete");
+        if target_replaced {
+            assert_eq!(
+                visible, payload,
+                "{label}: renamed target is the new whole file"
+            );
+        } else {
+            assert_eq!(visible, old, "{label}: prior target remains byte-identical");
+        }
+        assert_eq!(staging.exists(), staging_remains, "{label}");
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
