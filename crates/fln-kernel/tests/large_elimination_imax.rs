@@ -31,7 +31,9 @@
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
-use fln_env::constants::{ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal};
+use fln_env::constants::{
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal,
+};
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, InductiveBlock, check};
@@ -556,5 +558,149 @@ fn mutual_inductive_block_admits() {
         "a two-type mutual inductive block must admit, exercising cross-motive \
          recursor regeneration (both `motive_1` and `motive_2` in each recursor); \
          got {verdict:?}"
+    );
+}
+
+/// An environment holding just `axiom A : Type`, the index type for `ix_block`.
+fn env_with_a() -> Environment {
+    Environment::new()
+        .add_decl(ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("A"),
+                level_params: vec![],
+                type_: sort(Level::one()),
+            },
+            is_unsafe: false,
+        }))
+        .expect("axiom A : Type admits")
+}
+
+/// An INDEXED inductive `Ix : A → Type` with `Ix.mk (a : A) : Ix a`. Distinct from
+/// every case above: the recursor's motive ranges over the index (`∀ (i : A), Ix i →
+/// Sort u`), the minor targets the field-determined index (`motive a (Ix.mk a)`), and
+/// the major carries an IMPLICIT index binder inferred from it (`{i : A} (t : Ix i)`).
+/// Index handling in `mk_rec_infos`/`generate_recursors` is a path the param-only and
+/// mutual cases never reach.
+fn ix_block(u: &Name) -> InductiveBlock {
+    let a_ty = || Expr::const_(n("A"), vec![]);
+    let ix = || Expr::const_(n("Ix"), vec![]);
+    let ixmk = || Expr::const_(nn("Ix", "mk"), vec![]);
+    let sort_u = || sort(Level::param(u.clone()));
+
+    // Ix : ∀ (i : A), Type   (0 params, 1 index)
+    let ix_type = forall("i", a_ty(), sort(Level::one()));
+    // Ix.mk : ∀ (a : A), Ix a   (0 params, 1 field; `Ix a` = app(Ix, a), a = bvar 0)
+    let mk_type = forall("a", a_ty(), Expr::app(ix(), bvar(0)));
+
+    // motive : ∀ (i : A) (t : Ix i), Sort u  (closed)
+    let motive_ty = || forall("i", a_ty(), forall("t", Expr::app(ix(), bvar(0)), sort_u()));
+    // minor `mk` : ∀ (a : A), motive a (Ix.mk a)
+    //   at `a` binder: motive = bvar 1, a = bvar 0 → app(app(motive, a), Ix.mk a)
+    let mk_minor_ty = || {
+        forall(
+            "a",
+            a_ty(),
+            Expr::app(Expr::app(bvar(1), bvar(0)), Expr::app(ixmk(), bvar(0))),
+        )
+    };
+
+    // Ix.rec.{u} : {motive} (mk) {i : A} (t : Ix i), motive i t
+    //   i is Implicit (occurs in t's type Ix i); t/mk explicit; motive implicit.
+    //   result motive i t: scope motive=3, mk=2, i=1, t=0
+    let rec_type = forall_impl(
+        "motive",
+        motive_ty(),
+        forall(
+            "mk",
+            mk_minor_ty(),
+            forall_impl(
+                "i",
+                a_ty(),
+                forall(
+                    "t",
+                    Expr::app(ix(), bvar(0)), // Ix i, i = bvar 0
+                    Expr::app(Expr::app(bvar(3), bvar(1)), bvar(0)),
+                ),
+            ),
+        ),
+    );
+    // rhs: fun (motive) (mk) (a) => mk a   (params none, motives, minors, then fields=[a])
+    //   scope inside: motive=2, mk=1, a=0
+    let rec_rhs = lam(
+        "motive",
+        motive_ty(),
+        lam(
+            "mk",
+            mk_minor_ty(),
+            lam("a", a_ty(), Expr::app(bvar(1), bvar(0))),
+        ),
+    );
+
+    InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: n("Ix"),
+                level_params: vec![],
+                type_: ix_type,
+            },
+            num_params: 0,
+            num_indices: 1,
+            all: vec![n("Ix")],
+            ctors: vec![nn("Ix", "mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }],
+        ctors: vec![ConstructorVal {
+            base: ConstantVal {
+                name: nn("Ix", "mk"),
+                level_params: vec![],
+                type_: mk_type,
+            },
+            induct: n("Ix"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }],
+        recursors: vec![RecursorVal {
+            base: ConstantVal {
+                name: nn("Ix", "rec"),
+                level_params: vec![u.clone()],
+                type_: rec_type,
+            },
+            all: vec![n("Ix")],
+            num_params: 0,
+            num_indices: 1,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("Ix", "mk"),
+                nfields: 1,
+                rhs: rec_rhs,
+            }],
+            k: false,
+            is_unsafe: false,
+        }],
+    }
+}
+
+#[test]
+fn indexed_inductive_block_admits() {
+    let u = n("u");
+    let block = ix_block(&u);
+    let verdict = check(
+        &env_with_a(),
+        &Declaration::Inductive(block),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "an indexed inductive `Ix : A → Type` must admit, exercising the recursor's \
+         index-carrying motive/minor/major regeneration; got {verdict:?}"
     );
 }
