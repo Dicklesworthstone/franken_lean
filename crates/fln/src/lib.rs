@@ -6,7 +6,9 @@
 //! already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
-//! Prelude support.
+//! Prelude support. Already-elaborated axioms and definitions can also advance
+//! an immutable engine snapshot through admission and publication without
+//! compiling or executing a body.
 
 #![forbid(unsafe_code)]
 
@@ -112,8 +114,8 @@ pub fn project_diagnostics(
 ///
 /// The currently live constructor seeds only the axiomatic `Nat : Sort 1` name
 /// needed by the bounded natural-definition frontend. It is not the real
-/// Prelude. Successful execution returns a new `Engine` snapshot containing
-/// the published declaration; the receiver is never mutated.
+/// Prelude. Successful admission or execution returns a new `Engine` snapshot
+/// containing the published declaration; the receiver is never mutated.
 #[derive(Debug, Clone)]
 pub struct Engine {
     environment: Environment,
@@ -124,8 +126,9 @@ impl Engine {
     /// Attach the embeddable facade to an existing immutable environment
     /// produced by an importer, module transaction, or earlier engine session.
     /// This performs no admission and grants no new authority. The independent
-    /// checker projection is constructed lazily on the first execution because
-    /// this constructor intentionally accepts no resource budget.
+    /// checker projection is constructed lazily on the first admission or
+    /// execution because this constructor intentionally accepts no resource
+    /// budget.
     pub fn from_environment(environment: Environment) -> Self {
         Self {
             environment,
@@ -202,11 +205,12 @@ impl Engine {
                 });
             }
         };
-        let checker = checker_review.agreement.ok_or_else(|| {
-            EngineAdmissionError::CheckerBridge {
-                detail: "the checker council agreed without an admission record".to_owned(),
-            }
-        })?;
+        let checker =
+            checker_review
+                .agreement
+                .ok_or_else(|| EngineAdmissionError::CheckerBridge {
+                    detail: "the checker council agreed without an admission record".to_owned(),
+                })?;
         let checker_environment = checker_review.successor_environment.ok_or_else(|| {
             EngineAdmissionError::CheckerBridge {
                 detail: "the checker council agreed without a retained successor environment"
@@ -1437,8 +1441,7 @@ mod tests {
         Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Expr, IngressError,
         IngressResource, KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints,
-        RejectClass, VmExecutionLimits,
-        execute_golem_with_options,
+        RejectClass, VmExecutionLimits, execute_golem_with_options,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, Function, FunctionId, Instruction, Program,
@@ -1820,21 +1823,17 @@ mod tests {
             first.result_logical_root,
             first.engine.logical_root(&options)
         );
-        assert_eq!(
-            first.checker.ground,
-            CheckerAdmissionGround::AxiomPreamble
-        );
+        assert_eq!(first.checker.ground, CheckerAdmissionGround::AxiomPreamble);
 
         let mut candidate_only = EngineAdmissionLimits::new(test_budget());
-        candidate_only.checker.environment =
-            fln_checker::environment::EnvironmentBudget::new(
-                u64::MAX,
-                1,
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-                u64::MAX,
-            );
+        candidate_only.checker.environment = fln_checker::environment::EnvironmentBudget::new(
+            u64::MAX,
+            1,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
         let second = first
             .engine
             .admit_declaration(axiom("second_postulate"), &options, candidate_only)
