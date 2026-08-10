@@ -4,6 +4,8 @@ version = "0.0.0"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
+default-run = "fln"
 
 [dependencies]
+fln = { path = "../fln" }
 fln-core = { path = "../fln-core" }

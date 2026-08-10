@@ -80,6 +80,7 @@ edge fln -> fln-kernel             # kernel admission and publication capability
 edge fln -> fln-olean              # bounded public reader for pinned .olean artifacts
 edge fln -> fln-parse              # bounded source parser facade (franken_lean-7kc)
 edge fln -> fln-vm                 # canonical FLBC execution result facade (franken_lean-7kc)
+edge fln-cli -> fln                # executable multiplexer delegates to the embeddable engine
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)
 edge fln-server -> fln-core        # LSP diagnostic adapter (franken_lean-wlan)
 edge fln-hash -> fln-core          # canonical serialization of term-plane values (franken_lean-rps)

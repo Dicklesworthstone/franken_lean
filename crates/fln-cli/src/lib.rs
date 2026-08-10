@@ -17,6 +17,384 @@ use fln_core::diag::{
 };
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
+use std::ffi::OsString;
+use std::fmt;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Default whole-file ceiling for `fln olean inspect`.
+///
+/// The largest pinned module is far smaller than this. Keeping the ceiling
+/// explicit prevents an accidental path to an unbounded `read_to_end` before
+/// the codec's own structural budgets take over.
+pub const OLEAN_INSPECT_DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
+
+const USAGE: &str = concat!(
+    "Usage:\n",
+    "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
+    "  fln --help\n",
+    "  fln --version\n",
+    "\n",
+    "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
+    "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
+);
+
+/// Complete process result produced by the `fln` multiplexer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiplexerOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: u8,
+}
+
+impl MultiplexerOutput {
+    fn success(stdout: String) -> Self {
+        Self {
+            stdout,
+            stderr: String::new(),
+            exit_code: 0,
+        }
+    }
+
+    fn failure(stderr: String, exit_code: u8) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr,
+            exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultiplexerCommand {
+    Help,
+    Version,
+    OleanInspect {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageError(String);
+
+impl fmt::Display for UsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug)]
+enum OleanInspectFailure {
+    Input(String),
+    ArtifactTooLarge { observed: usize, limit: usize },
+    Allocation { requested: usize },
+    Decode(fln::OleanDecodeError),
+}
+
+impl OleanInspectFailure {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::Input(_) => "input",
+            Self::ArtifactTooLarge { .. } | Self::Allocation { .. } => "resource",
+            Self::Decode(_) => "decode",
+        }
+    }
+}
+
+impl fmt::Display for OleanInspectFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(detail) => f.write_str(detail),
+            Self::ArtifactTooLarge { observed, limit } => write!(
+                f,
+                ".olean artifact exceeded the {limit}-byte input limit after reading {observed} bytes"
+            ),
+            Self::Allocation { requested } => write!(
+                f,
+                "could not reserve memory for {requested} bytes of bounded .olean input"
+            ),
+            Self::Decode(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+fn parse_byte_limit(value: &OsString) -> Result<usize, UsageError> {
+    let Some(value) = value.to_str() else {
+        return Err(UsageError(
+            "--max-bytes requires an ASCII integer".to_owned(),
+        ));
+    };
+    let parsed = value.parse::<u64>().map_err(|_| {
+        UsageError(format!(
+            "invalid --max-bytes value {value:?}; expected a non-negative integer"
+        ))
+    })?;
+    usize::try_from(parsed).map_err(|_| {
+        UsageError(format!(
+            "--max-bytes value {parsed} does not fit this platform"
+        ))
+    })
+}
+
+fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut path = None;
+    let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
+    let mut json = false;
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if options && (argument == "--help" || argument == "-h") {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if options && argument == "--json" {
+            json = true;
+            continue;
+        }
+        if options && argument == "--max-bytes" {
+            let value = arguments
+                .next()
+                .ok_or_else(|| UsageError("--max-bytes requires a following integer".to_owned()))?;
+            max_bytes = parse_byte_limit(&value)?;
+            continue;
+        }
+        if options
+            && let Some(value) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--max-bytes="))
+        {
+            max_bytes = parse_byte_limit(&OsString::from(value))?;
+            continue;
+        }
+        if options && argument.to_string_lossy().starts_with('-') {
+            return Err(UsageError(format!(
+                "unknown olean inspect option {:?}",
+                argument.to_string_lossy()
+            )));
+        }
+        if path.replace(PathBuf::from(&argument)).is_some() {
+            return Err(UsageError(
+                "olean inspect accepts exactly one artifact path".to_owned(),
+            ));
+        }
+    }
+
+    let path = path.ok_or_else(|| UsageError("olean inspect requires PATH".to_owned()))?;
+    Ok(MultiplexerCommand::OleanInspect {
+        path,
+        max_bytes,
+        json,
+    })
+}
+
+fn parse_command(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<MultiplexerCommand, UsageError> {
+    let mut arguments = arguments.into_iter();
+    let Some(command) = arguments.next() else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    if command == "--help" || command == "-h" || command == "help" {
+        return Ok(MultiplexerCommand::Help);
+    }
+    if command == "--version" || command == "-V" || command == "version" {
+        return Ok(MultiplexerCommand::Version);
+    }
+    if command != "olean" {
+        return Err(UsageError(format!(
+            "unknown fln command {:?}",
+            command.to_string_lossy()
+        )));
+    }
+    let Some(subcommand) = arguments.next() else {
+        return Err(UsageError(
+            "olean requires the `inspect` subcommand".to_owned(),
+        ));
+    };
+    if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+        return Ok(MultiplexerCommand::Help);
+    }
+    if subcommand != "inspect" {
+        return Err(UsageError(format!(
+            "unknown olean subcommand {:?}",
+            subcommand.to_string_lossy()
+        )));
+    }
+    parse_olean_inspect(arguments.collect())
+}
+
+fn read_bounded_from(
+    reader: &mut impl Read,
+    max_bytes: usize,
+) -> Result<Vec<u8>, OleanInspectFailure> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(OleanInspectFailure::Input(format!(
+                    "could not read .olean input: {error}"
+                )));
+            }
+        };
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let observed = bytes.len().saturating_add(read);
+        if observed > max_bytes {
+            return Err(OleanInspectFailure::ArtifactTooLarge {
+                observed,
+                limit: max_bytes,
+            });
+        }
+        bytes
+            .try_reserve_exact(read)
+            .map_err(|_| OleanInspectFailure::Allocation {
+                requested: observed,
+            })?;
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, OleanInspectFailure> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        OleanInspectFailure::Input(format!(
+            "cannot open .olean artifact {}: {error}",
+            path.display()
+        ))
+    })?;
+    read_bounded_from(&mut file, max_bytes)
+}
+
+fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
+    format!(
+        concat!(
+            "pinned .olean audit: complete\n",
+            "bytes: {}\n",
+            "format version: {}\n",
+            "lean version: {}\n",
+            "reference commit: {}\n",
+            "flags: 0x{:02x}\n",
+            "base address: {}\n",
+            "module: {}\n",
+            "imports: {}\n",
+            "constants: {}\n",
+            "extension blocks: {}\n",
+            "reachable objects: {}\n"
+        ),
+        bytes,
+        decoded.header.version,
+        decoded.header.lean_version,
+        decoded.header.githash,
+        decoded.header.flags,
+        decoded.header.base_addr,
+        decoded.module.is_module,
+        decoded.module.imports.len(),
+        decoded.constants.len(),
+        decoded.module.extensions.len(),
+        decoded.walk.objects,
+    )
+}
+
+fn render_olean_json(bytes: usize, decoded: &fln::DecodedOlean) -> String {
+    format!(
+        concat!(
+            "{{\"schema\":{},\"outcome\":\"complete\",\"bytes\":{},",
+            "\"header\":{{\"version\":{},\"leanVersion\":{},\"githash\":{},",
+            "\"flags\":{},\"baseAddress\":{}}},",
+            "\"module\":{{\"isModule\":{},\"imports\":{},\"constantNames\":{},",
+            "\"constants\":{},\"decodedConstants\":{},\"extraConstantNames\":{},",
+            "\"extensionBlocks\":{}}},",
+            "\"walk\":{{\"objects\":{},\"constructors\":{},\"arrays\":{},",
+            "\"scalarArrays\":{},\"strings\":{},\"bigIntegers\":{},",
+            "\"thunks\":{},\"tasks\":{},\"references\":{},\"scalarReferences\":{}}}}}\n"
+        ),
+        json_string(OLEAN_INSPECT_SCHEMA),
+        bytes,
+        decoded.header.version,
+        json_string(&decoded.header.lean_version),
+        json_string(&decoded.header.githash),
+        decoded.header.flags,
+        decoded.header.base_addr,
+        decoded.module.is_module,
+        decoded.module.imports.len(),
+        decoded.module.const_names.len(),
+        decoded.module.constants,
+        decoded.constants.len(),
+        decoded.module.extra_const_names,
+        decoded.module.extensions.len(),
+        decoded.walk.objects,
+        decoded.walk.ctors,
+        decoded.walk.arrays,
+        decoded.walk.scalar_arrays,
+        decoded.walk.strings,
+        decoded.walk.mpz,
+        decoded.walk.thunks,
+        decoded.walk.tasks,
+        decoded.walk.refs,
+        decoded.walk.scalar_refs,
+    )
+}
+
+fn inspect_olean_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    match fln::decode_olean_artifact(bytes, fln::OleanDecodeLimits::new(max_bytes)) {
+        Ok(decoded) => MultiplexerOutput::success(if json {
+            render_olean_json(bytes.len(), &decoded)
+        } else {
+            render_olean_human(bytes.len(), &decoded)
+        }),
+        Err(error) => inspect_failure(OleanInspectFailure::Decode(error), json),
+    }
+}
+
+fn inspect_failure(error: OleanInspectFailure, json: bool) -> MultiplexerOutput {
+    let detail = error.to_string();
+    let stderr = if json {
+        format!(
+            "{{\"schema\":{},\"outcome\":\"error\",\"class\":{},\"detail\":{}}}\n",
+            json_string(OLEAN_INSPECT_SCHEMA),
+            json_string(error.class()),
+            json_string(&detail),
+        )
+    } else {
+        format!("fln olean inspect: {detail}\n")
+    };
+    MultiplexerOutput::failure(stderr, 1)
+}
+
+fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    match read_bounded(path, max_bytes) {
+        Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
+        Err(error) => inspect_failure(error, json),
+    }
+}
+
+/// Run the native `fln` multiplexer without touching process-global arguments
+/// or streams. The binary is a thin adapter over this testable entry point.
+pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+    match parse_command(arguments) {
+        Ok(MultiplexerCommand::Help) => MultiplexerOutput::success(USAGE.to_owned()),
+        Ok(MultiplexerCommand::Version) => {
+            MultiplexerOutput::success(format!("fln {}\n", env!("CARGO_PKG_VERSION")))
+        }
+        Ok(MultiplexerCommand::OleanInspect {
+            path,
+            max_bytes,
+            json,
+        }) => inspect_olean(&path, max_bytes, json),
+        Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
+    }
+}
 
 /// Rendered C-family streams plus the exact structured value that authorized them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,4 +823,69 @@ pub fn project(
         exit: snapshot.exit_class(),
         semantic: snapshot.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OLEAN_INSPECT_SCHEMA, inspect_olean_bytes, read_bounded_from, run};
+    use std::ffi::OsString;
+    use std::io::Cursor;
+
+    const PINNED_OLEAN: &[u8] =
+        include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
+
+    #[test]
+    fn olean_inspect_reports_a_real_pinned_artifact_in_human_and_robot_forms() {
+        let human = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(human.stdout.contains("pinned .olean audit: complete"));
+        assert!(human.stdout.contains("constants: 2\n"));
+
+        let robot = inspect_olean_bytes(PINNED_OLEAN, PINNED_OLEAN.len(), true);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{OLEAN_INSPECT_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"outcome\":\"complete\""));
+        assert!(robot.stdout.contains("\"decodedConstants\":2"));
+    }
+
+    #[test]
+    fn olean_inspect_preserves_corruption_as_a_typed_robot_error() {
+        let mut bytes = PINNED_OLEAN.to_vec();
+        bytes[0] ^= u8::MAX;
+
+        let output = inspect_olean_bytes(&bytes, bytes.len(), true);
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"outcome\":\"error\""));
+        assert!(output.stderr.contains("\"class\":\"decode\""));
+        assert!(output.stderr.contains("bad magic (not an olean file)"));
+    }
+
+    #[test]
+    fn olean_input_is_bounded_before_the_decoder_runs() {
+        let mut input = Cursor::new(vec![0_u8; 17]);
+        let error =
+            read_bounded_from(&mut input, 16).expect_err("the seventeenth byte must refuse");
+        assert_eq!(error.class(), "resource");
+        assert!(error.to_string().contains("16-byte input limit"));
+        assert!(error.to_string().contains("17 bytes"));
+    }
+
+    #[test]
+    fn multiplexer_help_and_usage_errors_have_distinct_exit_codes() {
+        let help = run(std::iter::empty());
+        assert_eq!(help.exit_code, 0);
+        assert!(help.stdout.starts_with("Usage:\n  fln olean inspect"));
+
+        let error = run([OsString::from("olean"), OsString::from("decode")]);
+        assert_eq!(error.exit_code, 2);
+        assert!(error.stdout.is_empty());
+        assert!(error.stderr.contains("unknown olean subcommand"));
+    }
 }

@@ -48,6 +48,7 @@ dependencies = [
 name = "fln-cli"
 version = "0.0.0"
 dependencies = [
+ "fln",
  "fln-core",
 ]
 
