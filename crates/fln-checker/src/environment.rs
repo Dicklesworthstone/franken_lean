@@ -1223,6 +1223,48 @@ mod tests {
         panic!("test fixture constant was not retained")
     }
 
+    fn assert_balanced(node: &Option<Arc<ConstantNode>>) -> (u32, usize) {
+        let Some(node) = node else {
+            return (0, 0);
+        };
+        let (left_height, left_len) = assert_balanced(&node.left);
+        let (right_height, right_len) = assert_balanced(&node.right);
+        assert!(left_height.abs_diff(right_height) <= 1);
+        let height = left_height.max(right_height).saturating_add(1);
+        let len = left_len.saturating_add(right_len).saturating_add(1);
+        assert_eq!(node.height, height);
+        assert_eq!(node.len, len);
+        (height, len)
+    }
+
+    #[test]
+    fn reverse_order_extensions_remain_balanced_and_canonically_iterable() {
+        let mut environment = ConstantEnvironment::empty();
+        for index in (0..127).rev() {
+            let EnvironmentOutcome::Complete {
+                environment: successor,
+                ..
+            } = environment.extend(
+                named_entry(&format!("constant_{index:03}")),
+                EnvironmentBudget::unlimited(),
+            )
+            else {
+                panic!("each unique valid extension must complete");
+            };
+            environment = successor;
+        }
+
+        assert_eq!(assert_balanced(&environment.constants), (7, 127));
+        let names = environment
+            .constants()
+            .map(|(name, _)| name.parts().last().cloned())
+            .collect::<Vec<_>>();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert_eq!(environment.constants().rev().count(), 127);
+    }
+
     #[test]
     fn extension_structurally_shares_every_retained_declaration() {
         let EnvironmentOutcome::Complete {
