@@ -38,6 +38,7 @@ pub use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 pub use fln_kernel::verdict::{Budget, RejectClass};
+use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -248,6 +249,9 @@ impl Engine {
     /// admission, not independent-checker consensus. Publication creates only a
     /// local immutable successor until compilation and execution complete, so a
     /// later refusal or non-answer exposes no partially advanced engine.
+    /// Golem captures the pin-defined `maxHeartbeats` value from `options` at
+    /// command entry; its own instruction and stack ceilings remain the separate
+    /// explicit [`EngineExecutionLimits`] policy.
     pub fn execute_definition(
         &self,
         declaration: Declaration,
@@ -338,7 +342,7 @@ impl Engine {
             .map_err(EngineExecutionError::Codec)?;
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
-        let exit = match fln_vm::interpreter::execute(&executable, limits.vm, None) {
+        let exit = match execute_golem_with_options(&executable, options, limits.vm) {
             Outcome::Complete(exit) => exit,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -354,6 +358,19 @@ impl Engine {
             exit,
         }))
     }
+}
+
+fn execute_golem_with_options(
+    executable: &fln_comp::flbc::ValidatedProgram,
+    options: &KVMap,
+    limits: VmExecutionLimits,
+) -> Outcome<VmExit> {
+    fln_vm::interpreter::execute_with_context(
+        executable,
+        limits,
+        CommandExecutionContext::from_options(options),
+        None,
+    )
 }
 
 /// Derive the compiler catalog from declarations that already passed K1.
@@ -770,7 +787,15 @@ mod tests {
         AxiomVal, BinderInfo, Budget, ConstantVal, Declaration, DefinitionSafety, DefinitionVal,
         Engine, EngineExecutionError, EngineExecutionLimits, Expr, IngressError, IngressResource,
         KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints, RejectClass,
+        VmExecutionLimits, execute_golem_with_options,
     };
+    use fln_comp::flbc::{
+        ArgumentOwnership, CallableResultOwnership, Function, FunctionId, Instruction, Program,
+        Register, ResultOwnership, ValidatedProgram, validate,
+    };
+    use fln_core::diag::ResourceReason;
+    use fln_core::options::DataValue;
+    use fln_core::outcome::InconclusiveCause;
     use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
 
     fn test_budget() -> Budget {
@@ -779,6 +804,59 @@ mod tests {
 
     fn test_limits() -> EngineExecutionLimits {
         EngineExecutionLimits::new(test_budget())
+    }
+
+    fn heartbeat_program(new_count: u64, check_system: bool) -> ValidatedProgram {
+        let mut code = vec![
+            Instruction::Nat {
+                dst: Register::new(0),
+                value: new_count,
+            },
+            Instruction::Intrinsic {
+                dst: Register::new(1),
+                row: "extern:IO.setNumHeartbeats".to_string(),
+                args: vec![Register::new(0)],
+                argument_ownership: vec![ArgumentOwnership::Borrowed],
+                result_ownership: ResultOwnership::Owned,
+            },
+        ];
+        if check_system {
+            code.push(Instruction::CheckSystem {
+                module_name: "Facade.Options".to_string(),
+            });
+        }
+        code.extend([
+            Instruction::Nat {
+                dst: Register::new(2),
+                value: 7,
+            },
+            Instruction::Return {
+                src: Register::new(2),
+            },
+        ]);
+        validate(Program::new(
+            FunctionId::new(0),
+            vec![Function {
+                id: FunctionId::new(0),
+                arity: 0,
+                parameter_ownership: Vec::new(),
+                result_ownership: CallableResultOwnership::Scalar,
+                register_count: 3,
+                code,
+            }],
+        ))
+        .expect("the command-options fixture is valid FLBC")
+    }
+
+    fn reset_runtime_heartbeats() {
+        assert!(matches!(
+            fln_vm::interpreter::execute(
+                &heartbeat_program(0, false),
+                VmExecutionLimits::default(),
+                None,
+            ),
+            Outcome::Complete(VmExit::Returned(_))
+        ));
     }
 
     fn nat_type() -> Expr {
@@ -967,6 +1045,51 @@ mod tests {
             1,
             "an inconclusive run cannot expose a published successor"
         );
+    }
+
+    #[test]
+    fn engine_execution_binds_max_heartbeats_from_the_same_command_options() {
+        reset_runtime_heartbeats();
+        let program = heartbeat_program(1_001, true);
+        let mut options = KVMap::new();
+        options.insert(
+            Name::from_components(["maxHeartbeats"]),
+            DataValue::OfNat(1),
+        );
+        let outcome = execute_golem_with_options(&program, &options, VmExecutionLimits::default());
+        let Outcome::Inconclusive(inconclusive) = outcome else {
+            panic!("one command option unit must stop at 1,001 allocation heartbeats");
+        };
+        assert!(matches!(
+            inconclusive.cause,
+            InconclusiveCause::ResourceExhausted { usage }
+                if usage.allowed == 1_000
+                    && usage.observed == 1_001
+                    && usage.reason
+                        == ResourceReason::Heartbeats {
+                            consumed: 1_001,
+                            limit: 1_000,
+                        }
+        ));
+        assert!(
+            inconclusive
+                .progress
+                .as_deref()
+                .is_some_and(|progress| progress.text().contains("Facade.Options"))
+        );
+
+        options.insert(
+            Name::from_components(["maxHeartbeats"]),
+            DataValue::OfNat(0),
+        );
+        let Outcome::Complete(VmExit::Returned(returned)) =
+            execute_golem_with_options(&program, &options, VmExecutionLimits::default())
+        else {
+            panic!("zero maxHeartbeats must leave the same command unlimited");
+        };
+        assert_eq!(returned.value.unbox(), 7);
+        drop(returned);
+        reset_runtime_heartbeats();
     }
 
     #[test]
