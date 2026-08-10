@@ -6,8 +6,8 @@
 //! map, separate validation, and separate resource taxonomy. Construction is
 //! failure-atomic: only a completely validated environment is published.
 
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::wire::{
@@ -216,11 +216,241 @@ impl ConstantEntry {
     }
 }
 
-/// Persistent, deterministic name resolution for checker-owned constants.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConstantEnvironment {
-    constants: Arc<BTreeMap<WireName, ConstantDeclaration>>,
+#[derive(Clone)]
+struct ConstantNode {
+    name: WireName,
+    declaration: Arc<ConstantDeclaration>,
+    left: Option<Arc<ConstantNode>>,
+    right: Option<Arc<ConstantNode>>,
+    height: u32,
+    len: usize,
 }
+
+fn node_height(node: &Option<Arc<ConstantNode>>) -> u32 {
+    node.as_ref().map_or(0, |node| node.height)
+}
+
+fn node_len(node: &Option<Arc<ConstantNode>>) -> usize {
+    node.as_ref().map_or(0, |node| node.len)
+}
+
+fn constant_node(
+    name: WireName,
+    declaration: Arc<ConstantDeclaration>,
+    left: Option<Arc<ConstantNode>>,
+    right: Option<Arc<ConstantNode>>,
+) -> Arc<ConstantNode> {
+    Arc::new(ConstantNode {
+        name,
+        declaration,
+        height: node_height(&left).max(node_height(&right)).saturating_add(1),
+        len: node_len(&left)
+            .saturating_add(node_len(&right))
+            .saturating_add(1),
+        left,
+        right,
+    })
+}
+
+fn rotate_constant_left(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
+    let right = root
+        .right
+        .as_ref()
+        .expect("an AVL left rotation requires a right child");
+    let new_left = constant_node(
+        root.name.clone(),
+        Arc::clone(&root.declaration),
+        root.left.clone(),
+        right.left.clone(),
+    );
+    constant_node(
+        right.name.clone(),
+        Arc::clone(&right.declaration),
+        Some(new_left),
+        right.right.clone(),
+    )
+}
+
+fn rotate_constant_right(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
+    let left = root
+        .left
+        .as_ref()
+        .expect("an AVL right rotation requires a left child");
+    let new_right = constant_node(
+        root.name.clone(),
+        Arc::clone(&root.declaration),
+        left.right.clone(),
+        root.right.clone(),
+    );
+    constant_node(
+        left.name.clone(),
+        Arc::clone(&left.declaration),
+        left.left.clone(),
+        Some(new_right),
+    )
+}
+
+fn balance_constant_node(root: Arc<ConstantNode>) -> Arc<ConstantNode> {
+    let balance = i64::from(node_height(&root.left)) - i64::from(node_height(&root.right));
+    if balance > 1 {
+        let left = root
+            .left
+            .as_ref()
+            .expect("a left-heavy AVL node has a left child");
+        let root = if node_height(&left.right) > node_height(&left.left) {
+            constant_node(
+                root.name.clone(),
+                Arc::clone(&root.declaration),
+                Some(rotate_constant_left(Arc::clone(left))),
+                root.right.clone(),
+            )
+        } else {
+            root
+        };
+        rotate_constant_right(root)
+    } else if balance < -1 {
+        let right = root
+            .right
+            .as_ref()
+            .expect("a right-heavy AVL node has a right child");
+        let root = if node_height(&right.left) > node_height(&right.right) {
+            constant_node(
+                root.name.clone(),
+                Arc::clone(&root.declaration),
+                root.left.clone(),
+                Some(rotate_constant_right(Arc::clone(right))),
+            )
+        } else {
+            root
+        };
+        rotate_constant_left(root)
+    } else {
+        root
+    }
+}
+
+fn insert_constant(
+    root: &Option<Arc<ConstantNode>>,
+    name: WireName,
+    declaration: Arc<ConstantDeclaration>,
+) -> Result<Option<Arc<ConstantNode>>, WireName> {
+    let Some(current) = root else {
+        return Ok(Some(constant_node(name, declaration, None, None)));
+    };
+    match name.cmp(&current.name) {
+        std::cmp::Ordering::Less => {
+            let left = insert_constant(&current.left, name, declaration)?;
+            Ok(Some(balance_constant_node(constant_node(
+                current.name.clone(),
+                Arc::clone(&current.declaration),
+                left,
+                current.right.clone(),
+            ))))
+        }
+        std::cmp::Ordering::Greater => {
+            let right = insert_constant(&current.right, name, declaration)?;
+            Ok(Some(balance_constant_node(constant_node(
+                current.name.clone(),
+                Arc::clone(&current.declaration),
+                current.left.clone(),
+                right,
+            ))))
+        }
+        std::cmp::Ordering::Equal => Err(name),
+    }
+}
+
+/// Canonically ordered traversal over an immutable checker environment.
+pub struct ConstantIter<'a> {
+    front: Vec<&'a ConstantNode>,
+    back: Vec<&'a ConstantNode>,
+    remaining: usize,
+}
+
+impl<'a> ConstantIter<'a> {
+    fn new(root: &'a Option<Arc<ConstantNode>>) -> ConstantIter<'a> {
+        let mut iter = ConstantIter {
+            front: Vec::new(),
+            back: Vec::new(),
+            remaining: node_len(root),
+        };
+        iter.push_left(root.as_deref());
+        iter.push_right(root.as_deref());
+        iter
+    }
+
+    fn push_left(&mut self, mut node: Option<&'a ConstantNode>) {
+        while let Some(current) = node {
+            self.front.push(current);
+            node = current.left.as_deref();
+        }
+    }
+
+    fn push_right(&mut self, mut node: Option<&'a ConstantNode>) {
+        while let Some(current) = node {
+            self.back.push(current);
+            node = current.right.as_deref();
+        }
+    }
+}
+
+impl<'a> Iterator for ConstantIter<'a> {
+    type Item = (&'a WireName, &'a ConstantDeclaration);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let node = self.front.pop()?;
+        self.push_left(node.right.as_deref());
+        self.remaining -= 1;
+        Some((&node.name, node.declaration.as_ref()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl DoubleEndedIterator for ConstantIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let node = self.back.pop()?;
+        self.push_right(node.left.as_deref());
+        self.remaining -= 1;
+        Some((&node.name, node.declaration.as_ref()))
+    }
+}
+
+impl ExactSizeIterator for ConstantIter<'_> {}
+
+/// Persistent, deterministic name resolution for checker-owned constants.
+///
+/// Each successful extension path-copies only one balanced-tree search path;
+/// prior snapshots and every untouched declaration remain shared by `Arc`.
+#[derive(Clone, Default)]
+pub struct ConstantEnvironment {
+    constants: Option<Arc<ConstantNode>>,
+}
+
+impl fmt::Debug for ConstantEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.constants())
+            .finish()
+    }
+}
+
+impl PartialEq for ConstantEnvironment {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.constants().eq(other.constants())
+    }
+}
+
+impl Eq for ConstantEnvironment {}
 
 impl ConstantEnvironment {
     pub fn empty() -> ConstantEnvironment {
@@ -228,22 +458,27 @@ impl ConstantEnvironment {
     }
 
     pub fn len(&self) -> usize {
-        self.constants.len()
+        node_len(&self.constants)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.constants.is_empty()
+        self.constants.is_none()
     }
 
     pub fn find(&self, name: &WireName) -> Option<&ConstantDeclaration> {
-        self.constants.get(name)
+        let mut current = self.constants.as_deref();
+        while let Some(node) = current {
+            match name.cmp(&node.name) {
+                std::cmp::Ordering::Less => current = node.left.as_deref(),
+                std::cmp::Ordering::Greater => current = node.right.as_deref(),
+                std::cmp::Ordering::Equal => return Some(node.declaration.as_ref()),
+            }
+        }
+        None
     }
 
-    pub fn constants(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (&WireName, &ConstantDeclaration)> + DoubleEndedIterator
-    {
-        self.constants.iter()
+    pub fn constants(&self) -> ConstantIter<'_> {
+        ConstantIter::new(&self.constants)
     }
 
     pub fn build(entries: Vec<ConstantEntry>, budget: EnvironmentBudget) -> EnvironmentOutcome {
@@ -256,6 +491,24 @@ impl ConstantEnvironment {
         mut cancelled: impl FnMut() -> bool,
     ) -> EnvironmentOutcome {
         build_environment(entries, budget, &mut cancelled)
+    }
+
+    /// Validate and retain one new constant without rebuilding the base map.
+    ///
+    /// Progress and limits cover the candidate only. The immutable base has
+    /// already passed this constructor's validation and is structurally shared
+    /// on success; refusal, cancellation, exhaustion, and faults leave it intact.
+    pub fn extend(&self, entry: ConstantEntry, budget: EnvironmentBudget) -> EnvironmentOutcome {
+        self.extend_with(entry, budget, || false)
+    }
+
+    pub fn extend_with(
+        &self,
+        entry: ConstantEntry,
+        budget: EnvironmentBudget,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> EnvironmentOutcome {
+        extend_environment(self, entry, budget, &mut cancelled)
     }
 }
 
@@ -714,6 +967,145 @@ fn validate_term(
     Ok(())
 }
 
+enum ValidationFailure {
+    Refusal(EnvironmentRefusal),
+    Halt(Halt),
+}
+
+fn validate_constant(
+    control: &mut Control<'_>,
+    constant_index: usize,
+    declaration: &ConstantDeclaration,
+) -> Result<(), ValidationFailure> {
+    let mut parameters = BTreeMap::new();
+    for (parameter_index, parameter) in declaration.level_parameters.iter().enumerate() {
+        let at = EnvironmentPosition {
+            constant: constant_index,
+            field: EnvironmentField::LevelParameter,
+            index: parameter_index,
+        };
+        control
+            .step(at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        control
+            .level_parameter(at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        control
+            .owned_units(name_owned_units(parameter), at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        if let Some(first) = parameters.insert(parameter, parameter_index) {
+            return Err(ValidationFailure::Refusal(
+                EnvironmentRefusal::DuplicateLevelParameter {
+                    constant: constant_index,
+                    first,
+                    second: parameter_index,
+                },
+            ));
+        }
+    }
+
+    validate_term(
+        control,
+        constant_index,
+        EnvironmentTerm::Type,
+        &declaration.type_,
+    )
+    .map_err(ValidationFailure::Halt)?;
+
+    if let Some(definition) = declaration.definition.as_ref() {
+        for (member_index, member) in definition.mutual.iter().enumerate() {
+            let at = EnvironmentPosition {
+                constant: constant_index,
+                field: EnvironmentField::MutualMember,
+                index: member_index,
+            };
+            control
+                .step(at)
+                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+            control
+                .mutual_member(at)
+                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+            control
+                .owned_units(name_owned_units(member), at)
+                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        }
+
+        validate_term(
+            control,
+            constant_index,
+            EnvironmentTerm::Value,
+            &definition.value,
+        )
+        .map_err(ValidationFailure::Halt)?;
+    }
+    Ok(())
+}
+
+fn validation_outcome(
+    failure: ValidationFailure,
+    progress: EnvironmentProgress,
+) -> EnvironmentOutcome {
+    match failure {
+        ValidationFailure::Refusal(refusal) => {
+            EnvironmentOutcome::Refused { refusal, progress }
+        }
+        ValidationFailure::Halt(Halt::Stop(stop)) => EnvironmentOutcome::Inconclusive(stop),
+        ValidationFailure::Halt(Halt::Fault(fault)) => {
+            EnvironmentOutcome::InternalFault { fault, progress }
+        }
+    }
+}
+
+fn extend_environment(
+    environment: &ConstantEnvironment,
+    entry: ConstantEntry,
+    budget: EnvironmentBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> EnvironmentOutcome {
+    let mut control = Control::new(budget, cancelled);
+    let at = EnvironmentPosition {
+        constant: 0,
+        field: EnvironmentField::Name,
+        index: 0,
+    };
+    if let Err(stop) = control.step(at) {
+        return EnvironmentOutcome::Inconclusive(stop);
+    }
+    if let Err(stop) = control.constant(at) {
+        return EnvironmentOutcome::Inconclusive(stop);
+    }
+    let (name, declaration) = entry.into_parts();
+    if let Err(stop) = control.owned_units(name_owned_units(&name), at) {
+        return EnvironmentOutcome::Inconclusive(stop);
+    }
+    if environment.find(&name).is_some() {
+        return EnvironmentOutcome::Refused {
+            refusal: EnvironmentRefusal::DuplicateConstant { name },
+            progress: control.progress,
+        };
+    }
+    if let Err(failure) = validate_constant(&mut control, 0, &declaration) {
+        return validation_outcome(failure, control.progress);
+    }
+    let constants = match insert_constant(
+        &environment.constants,
+        name,
+        Arc::new(declaration),
+    ) {
+        Ok(constants) => constants,
+        Err(name) => {
+            return EnvironmentOutcome::Refused {
+                refusal: EnvironmentRefusal::DuplicateConstant { name },
+                progress: control.progress,
+            };
+        }
+    };
+    EnvironmentOutcome::Complete {
+        environment: ConstantEnvironment { constants },
+        progress: control.progress,
+    }
+}
+
 fn build_environment(
     entries: Vec<ConstantEntry>,
     budget: EnvironmentBudget,
@@ -739,13 +1131,10 @@ fn build_environment(
         if let Err(stop) = control.owned_units(name_owned_units(&name), at) {
             return EnvironmentOutcome::Inconclusive(stop);
         }
-        match constants.entry(name) {
-            Entry::Vacant(entry) => {
-                entry.insert(declaration);
-            }
-            Entry::Occupied(entry) => {
-                duplicates.insert(entry.key().clone());
-            }
+        if constants.contains_key(&name) {
+            duplicates.insert(name);
+        } else {
+            constants.insert(name, declaration);
         }
     }
 
@@ -757,87 +1146,27 @@ fn build_environment(
     }
 
     for (constant_index, declaration) in constants.values().enumerate() {
-        let mut parameters = BTreeMap::new();
-        for (parameter_index, parameter) in declaration.level_parameters.iter().enumerate() {
-            let at = EnvironmentPosition {
-                constant: constant_index,
-                field: EnvironmentField::LevelParameter,
-                index: parameter_index,
-            };
-            if let Err(stop) = control.step(at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
-            if let Err(stop) = control.level_parameter(at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
-            if let Err(stop) = control.owned_units(name_owned_units(parameter), at) {
-                return EnvironmentOutcome::Inconclusive(stop);
-            }
-            if let Some(first) = parameters.insert(parameter, parameter_index) {
+        if let Err(failure) = validate_constant(&mut control, constant_index, declaration) {
+            return validation_outcome(failure, control.progress);
+        }
+    }
+
+    let mut persistent = None;
+    for (name, declaration) in constants {
+        persistent = match insert_constant(&persistent, name, Arc::new(declaration)) {
+            Ok(constants) => constants,
+            Err(name) => {
                 return EnvironmentOutcome::Refused {
-                    refusal: EnvironmentRefusal::DuplicateLevelParameter {
-                        constant: constant_index,
-                        first,
-                        second: parameter_index,
-                    },
+                    refusal: EnvironmentRefusal::DuplicateConstant { name },
                     progress: control.progress,
                 };
             }
-        }
-
-        if let Err(halt) = validate_term(
-            &mut control,
-            constant_index,
-            EnvironmentTerm::Type,
-            &declaration.type_,
-        ) {
-            return match halt {
-                Halt::Stop(stop) => EnvironmentOutcome::Inconclusive(stop),
-                Halt::Fault(fault) => EnvironmentOutcome::InternalFault {
-                    fault,
-                    progress: control.progress,
-                },
-            };
-        }
-
-        if let Some(definition) = declaration.definition.as_ref() {
-            for (member_index, member) in definition.mutual.iter().enumerate() {
-                let at = EnvironmentPosition {
-                    constant: constant_index,
-                    field: EnvironmentField::MutualMember,
-                    index: member_index,
-                };
-                if let Err(stop) = control.step(at) {
-                    return EnvironmentOutcome::Inconclusive(stop);
-                }
-                if let Err(stop) = control.mutual_member(at) {
-                    return EnvironmentOutcome::Inconclusive(stop);
-                }
-                if let Err(stop) = control.owned_units(name_owned_units(member), at) {
-                    return EnvironmentOutcome::Inconclusive(stop);
-                }
-            }
-
-            if let Err(halt) = validate_term(
-                &mut control,
-                constant_index,
-                EnvironmentTerm::Value,
-                &definition.value,
-            ) {
-                return match halt {
-                    Halt::Stop(stop) => EnvironmentOutcome::Inconclusive(stop),
-                    Halt::Fault(fault) => EnvironmentOutcome::InternalFault {
-                        fault,
-                        progress: control.progress,
-                    },
-                };
-            }
-        }
+        };
     }
 
     EnvironmentOutcome::Complete {
         environment: ConstantEnvironment {
-            constants: Arc::new(constants),
+            constants: persistent,
         },
         progress: control.progress,
     }
