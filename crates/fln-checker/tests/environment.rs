@@ -146,6 +146,25 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
             DefinitionSafety::Unsafe,
             vec![checker_name("abbrev_safe"), checker_name("regular_unsafe")],
         ),
+        ConstantEntry::new(
+            checker_name("body_theorem"),
+            ConstantDeclaration::theorem(
+                Vec::new(),
+                leaf(6),
+                leaf(7),
+                vec![checker_name("body_theorem")],
+            ),
+        ),
+        ConstantEntry::new(
+            checker_name("body_opaque"),
+            ConstantDeclaration::opaque(
+                Vec::new(),
+                leaf(8),
+                ConstantSafety::Unsafe,
+                leaf(9),
+                vec![checker_name("body_opaque")],
+            ),
+        ),
     ];
     let header_kinds = [
         ("axiom", ConstantKind::Axiom),
@@ -220,6 +239,24 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
     assert_eq!(regular_body.value(), &leaf(5));
     assert!(regular.delta_body().is_none());
 
+    let theorem = environment
+        .find(&checker_name("body_theorem"))
+        .expect("body-bearing theorem remains addressable");
+    assert_eq!(theorem.kind(), ConstantKind::Theorem);
+    assert_eq!(theorem.safety(), ConstantSafety::Safe);
+    assert_eq!(theorem.body_value(), Some(&leaf(7)));
+    assert!(theorem.definition_body().is_none());
+    assert!(!theorem.is_delta_unfoldable());
+
+    let opaque = environment
+        .find(&checker_name("body_opaque"))
+        .expect("body-bearing opaque remains addressable");
+    assert_eq!(opaque.kind(), ConstantKind::Opaque);
+    assert_eq!(opaque.safety(), ConstantSafety::Unsafe);
+    assert_eq!(opaque.body_value(), Some(&leaf(9)));
+    assert!(opaque.definition_body().is_none());
+    assert!(!opaque.is_delta_unfoldable());
+
     for (index, (name, kind)) in header_kinds.iter().enumerate() {
         let header = environment
             .find(&checker_name(*name))
@@ -239,6 +276,7 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
             }
         );
         assert!(header.definition_body().is_none());
+        assert!(header.body_value().is_none());
         assert!(header.delta_body().is_none());
     }
 }

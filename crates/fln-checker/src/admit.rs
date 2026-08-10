@@ -202,7 +202,7 @@ pub enum AdmissionRejection {
     ///
     /// A REJECTION rather than an internal fault, and the classification was
     /// measured rather than assumed: `ConstantDeclaration::header` accepts any
-    /// `ConstantKind` and hardcodes `definition: None`, so a caller can build a
+    /// `ConstantKind` and hardcodes `body: None`, so a caller can build a
     /// bodyless `Definition`, `Theorem` or `Opaque`. That is malformed
     /// caller-supplied input, and FL-INV-07 reserves the fault arm for invariant
     /// failures, never user diagnostics.
@@ -736,11 +736,11 @@ fn reduces_to_a_sort(
     }
 }
 
-/// KR-973 and the boundary of this slice.
+/// KR-973 and the declaration-kind dispatch boundary.
 ///
-/// The `match` is exhaustive over `ConstantKind` on purpose. When KR-974 lands,
-/// moving `Theorem` out of the deferral arm is a compile error here rather than a
-/// silent behaviour change somewhere else.
+/// The `match` is exhaustive over `ConstantKind` on purpose, so adding or moving
+/// a declaration kind is a compile error here rather than a silent behaviour
+/// change somewhere else.
 fn terminal_rule(
     environment: &ConstantEnvironment,
     name: &WireName,
@@ -757,15 +757,15 @@ fn terminal_rule(
     match declaration.kind() {
         // KR-973. There is deliberately no "an axiom must not carry a body"
         // check, because that state is UNCONSTRUCTIBLE and a branch nothing can
-        // reach is a branch no mutation can kill. Measured at this commit:
-        // `ConstantDeclaration` has exactly two constructors and no public
-        // field; `header` hardcodes `definition: None`, and `definition`
-        // hardcodes `kind: ConstantKind::Definition`. So no caller can hand this
-        // rule an axiom with a body. The type already holds the law, and writing
-        // it again here would read as diligence while testing nothing.
+        // reach is a branch no mutation can kill. `ConstantDeclaration` has no
+        // public field; `header` hardcodes `body: None`, while every
+        // body-bearing constructor hardcodes a non-Axiom kind. So no caller can
+        // hand this rule an axiom with a body. The type already holds the law,
+        // and writing it again here would read as diligence while testing
+        // nothing.
         // `an_axiom_cannot_be_constructed_with_a_body` binds that measurement,
-        // so the day a third constructor lands, this comment fails rather than
-        // quietly becoming false.
+        // so any constructor that can pair Axiom with a body fails rather than
+        // quietly making this false.
         ConstantKind::Axiom => Verdict::Admitted(Admission {
             name: name.clone(),
             ground: ground_for(quarantine, AdmissionGround::AxiomPreamble),
@@ -783,7 +783,7 @@ fn terminal_rule(
                     name: name.clone(),
                 });
             }
-            let Some(body) = declaration.definition_body() else {
+            let Some(body) = declaration.body_value() else {
                 return Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody {
                     name: name.clone(),
                     kind,
@@ -793,7 +793,7 @@ fn terminal_rule(
                 environment,
                 name,
                 declaration,
-                body.value(),
+                body,
                 budget,
                 cancelled,
             ) {

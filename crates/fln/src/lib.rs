@@ -6,9 +6,9 @@
 //! already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
-//! Prelude support. Already-elaborated axioms and definitions can also advance
-//! an immutable engine snapshot through admission and publication without
-//! compiling or executing a body.
+//! Prelude support. Already-elaborated axioms, definitions, theorems, and
+//! opaques can also advance an immutable engine snapshot through admission and
+//! publication without compiling or executing a body.
 
 #![forbid(unsafe_code)]
 
@@ -47,7 +47,8 @@ pub use fln_core::outcome::Outcome;
 pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
 use fln_env::constants::ConstantInfo;
 pub use fln_env::constants::{
-    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal, ReducibilityHints,
+    TheoremVal,
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
@@ -163,7 +164,7 @@ impl Engine {
     /// This is the environment-building counterpart to
     /// [`Self::execute_definition`]. It currently accepts the declaration kinds
     /// on which both K1 and the independent checker can issue a completed
-    /// verdict: axioms and definitions. Theorems, opaques, mutual blocks,
+    /// verdict: axioms, definitions, theorems, and opaques. Mutual blocks,
     /// inductives, and quotient initialization remain explicit refusals until
     /// the independent checker can represent and decide their complete input.
     ///
@@ -176,7 +177,13 @@ impl Engine {
         options: &KVMap,
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<DeclarationAdmission>, EngineAdmissionError> {
-        if !matches!(declaration, Declaration::Axiom(_) | Declaration::Defn(_)) {
+        if !matches!(
+            declaration,
+            Declaration::Axiom(_)
+                | Declaration::Defn(_)
+                | Declaration::Thm(_)
+                | Declaration::Opaque(_)
+        ) {
             return Err(EngineAdmissionError::UnsupportedDeclaration {
                 kind: declaration_kind(&declaration),
             });
@@ -649,17 +656,18 @@ fn checker_entry(
                 body,
             )
         }
-        ConstantInfo::Thm(_) => CheckerConstantDeclaration::header(
+        ConstantInfo::Thm(value) => CheckerConstantDeclaration::theorem(
             level_parameters,
             type_,
-            CheckerConstantKind::Theorem,
-            CheckerConstantSafety::Safe,
+            decode_checker_expr(&value.value, budget)?,
+            decode_checker_names(&value.all, budget)?,
         ),
-        ConstantInfo::Opaque(value) => CheckerConstantDeclaration::header(
+        ConstantInfo::Opaque(value) => CheckerConstantDeclaration::opaque(
             level_parameters,
             type_,
-            CheckerConstantKind::Opaque,
             checker_constant_safety(value.is_unsafe),
+            decode_checker_expr(&value.value, budget)?,
+            decode_checker_names(&value.all, budget)?,
         ),
         ConstantInfo::Quot(_) => CheckerConstantDeclaration::header(
             level_parameters,
@@ -726,6 +734,12 @@ fn review_with_independent_checker(
         }
         Declaration::Defn(definition) => {
             checker_entry(&ConstantInfo::Defn(definition.clone()), limits.decode)
+        }
+        Declaration::Thm(theorem) => {
+            checker_entry(&ConstantInfo::Thm(theorem.clone()), limits.decode)
+        }
+        Declaration::Opaque(opaque) => {
+            checker_entry(&ConstantInfo::Opaque(opaque.clone()), limits.decode)
         }
         _ => {
             return CheckerReview::no_answer(
@@ -1437,11 +1451,11 @@ impl From<EngineAdmissionError> for EngineExecutionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantVal,
-        Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
+        AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
+        ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Expr, IngressError,
-        IngressResource, KVMap, Level, Literal, Name, NatLit, Outcome, ReducibilityHints,
-        RejectClass, VmExecutionLimits, execute_golem_with_options,
+        IngressResource, KVMap, Level, Literal, Name, NatLit, OpaqueVal, Outcome,
+        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, execute_golem_with_options,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, Function, FunctionId, Instruction, Program,
@@ -1540,6 +1554,44 @@ mod tests {
                 type_: nat_type(),
             },
             is_unsafe: false,
+        })
+    }
+
+    fn typed_axiom(name: &str, type_: Expr) -> Declaration {
+        Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::from_components([name]),
+                level_params: Vec::new(),
+                type_,
+            },
+            is_unsafe: false,
+        })
+    }
+
+    fn theorem(name: &str, type_: Expr, value: Expr) -> Declaration {
+        let name = Name::from_components([name]);
+        Declaration::Thm(TheoremVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_,
+            },
+            value,
+            all: vec![name],
+        })
+    }
+
+    fn opaque(name: &str, value: Expr) -> Declaration {
+        let name = Name::from_components([name]);
+        Declaration::Opaque(OpaqueVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: nat_type(),
+            },
+            value,
+            is_unsafe: false,
+            all: vec![name],
         })
     }
 
@@ -1867,6 +1919,134 @@ mod tests {
             !uncached
                 .environment()
                 .contains(&Name::from_components(["uncached_postulate"]))
+        );
+    }
+
+    #[test]
+    fn admission_only_theorems_and_opaques_are_checked_and_published() {
+        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let base_root = engine.logical_root(&options);
+
+        let proposition_name = Name::from_components(["P"]);
+        let proposition = engine
+            .admit_declaration(
+                typed_axiom("P", Expr::sort(Level::zero())),
+                &options,
+                limits,
+            )
+            .expect("the proposition constant is admitted");
+        let Outcome::Complete(proposition) = proposition else {
+            panic!("the proposition admission must answer completely");
+        };
+        let proof_name = Name::from_components(["h"]);
+        let proof = proposition
+            .engine
+            .admit_declaration(
+                typed_axiom("h", Expr::const_(proposition_name.clone(), Vec::new())),
+                &options,
+                limits,
+            )
+            .expect("the proof axiom is admitted");
+        let Outcome::Complete(proof) = proof else {
+            panic!("the proof admission must answer completely");
+        };
+
+        let theorem_name = Name::from_components(["proved"]);
+        let theorem_admission = proof
+            .engine
+            .admit_declaration(
+                theorem(
+                    "proved",
+                    Expr::const_(proposition_name, Vec::new()),
+                    Expr::const_(proof_name.clone(), Vec::new()),
+                ),
+                &options,
+                limits,
+            )
+            .expect("K1 and the independent checker admit the theorem");
+        let Outcome::Complete(theorem_admission) = theorem_admission else {
+            panic!("the theorem admission must answer completely");
+        };
+        assert_eq!(
+            theorem_admission.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert!(
+            theorem_admission
+                .engine
+                .environment()
+                .contains(&theorem_name)
+        );
+        match theorem_admission.engine.environment().find(&theorem_name) {
+            Some(ConstantInfo::Thm(value)) => {
+                assert_eq!(value.value, Expr::const_(proof_name, Vec::new()));
+            }
+            other => panic!("published theorem was not queryable as a theorem: {other:?}"),
+        }
+
+        let opaque_name = Name::from_components(["sealedNat"]);
+        let opaque_admission = theorem_admission
+            .engine
+            .admit_declaration(
+                opaque("sealedNat", Expr::lit(Literal::Nat(NatLit::from_u64(7)))),
+                &options,
+                limits,
+            )
+            .expect("K1 and the independent checker admit the opaque");
+        let Outcome::Complete(opaque_admission) = opaque_admission else {
+            panic!("the opaque admission must answer completely");
+        };
+        assert_eq!(
+            opaque_admission.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert!(opaque_admission.engine.environment().contains(&opaque_name));
+        assert!(matches!(
+            opaque_admission.engine.environment().find(&opaque_name),
+            Some(ConstantInfo::Opaque(value))
+                if value.value == Expr::lit(Literal::Nat(NatLit::from_u64(7)))
+        ));
+        assert_eq!(
+            opaque_admission.result_logical_root,
+            opaque_admission.engine.logical_root(&options)
+        );
+
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&theorem_name));
+        assert!(!engine.environment().contains(&opaque_name));
+
+        let rejected_name = Name::from_components(["notATheorem"]);
+        let before_rejection = opaque_admission.engine.logical_root(&options);
+        let rejection = opaque_admission
+            .engine
+            .admit_declaration(
+                theorem(
+                    "notATheorem",
+                    nat_type(),
+                    Expr::lit(Literal::Nat(NatLit::from_u64(9))),
+                ),
+                &options,
+                limits,
+            )
+            .expect_err("a theorem whose statement is Nat is rejected");
+        assert!(matches!(
+            rejection,
+            EngineAdmissionError::KernelRejected {
+                class: RejectClass::TheoremNotProp,
+                ..
+            }
+        ));
+        assert_eq!(
+            opaque_admission.engine.logical_root(&options),
+            before_rejection
+        );
+        assert!(
+            !opaque_admission
+                .engine
+                .environment()
+                .contains(&rejected_name)
         );
     }
 

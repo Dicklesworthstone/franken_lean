@@ -2,9 +2,10 @@
 //!
 //! This is intentionally not an adapter over `fln-env`. It preserves the
 //! common declaration header needed by checker-owned typing and the optional
-//! definition body needed by delta reduction while using a separate immutable
-//! map, separate validation, and separate resource taxonomy. Construction is
-//! failure-atomic: only a completely validated environment is published.
+//! theorem, opaque, or definition body needed by admission while using a
+//! separate immutable map, separate validation, and separate resource
+//! taxonomy. Construction is failure-atomic: only a completely validated
+//! environment is published.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,16 +109,45 @@ impl DefinitionBody {
     }
 }
 
-/// One constant declaration. Typing and reduction share this header; only a
-/// definition may carry a body, and header-only declarations never receive a
-/// fabricated value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConstantBody {
+    Definition(DefinitionBody),
+    Theorem {
+        value: WireExpr,
+        mutual: Vec<WireName>,
+    },
+    Opaque {
+        value: WireExpr,
+        mutual: Vec<WireName>,
+    },
+}
+
+impl ConstantBody {
+    fn value(&self) -> &WireExpr {
+        match self {
+            Self::Definition(body) => body.value(),
+            Self::Theorem { value, .. } | Self::Opaque { value, .. } => value,
+        }
+    }
+
+    fn mutual(&self) -> &[WireName] {
+        match self {
+            Self::Definition(body) => body.mutual(),
+            Self::Theorem { mutual, .. } | Self::Opaque { mutual, .. } => mutual,
+        }
+    }
+}
+
+/// One constant declaration. Typing and admission share this header;
+/// definitions, theorems, and opaques have distinct body shapes, while
+/// header-only declarations never receive a fabricated value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstantDeclaration {
     level_parameters: Vec<WireName>,
     type_: WireExpr,
     kind: ConstantKind,
     safety: ConstantSafety,
-    definition: Option<DefinitionBody>,
+    body: Option<ConstantBody>,
 }
 
 impl ConstantDeclaration {
@@ -132,7 +162,7 @@ impl ConstantDeclaration {
             type_,
             kind,
             safety,
-            definition: None,
+            body: None,
         }
     }
 
@@ -147,7 +177,38 @@ impl ConstantDeclaration {
             type_,
             kind: ConstantKind::Definition,
             safety,
-            definition: Some(definition),
+            body: Some(ConstantBody::Definition(definition)),
+        }
+    }
+
+    pub fn theorem(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        value: WireExpr,
+        mutual: Vec<WireName>,
+    ) -> ConstantDeclaration {
+        ConstantDeclaration {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Theorem,
+            safety: ConstantSafety::Safe,
+            body: Some(ConstantBody::Theorem { value, mutual }),
+        }
+    }
+
+    pub fn opaque(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        safety: ConstantSafety,
+        value: WireExpr,
+        mutual: Vec<WireName>,
+    ) -> ConstantDeclaration {
+        ConstantDeclaration {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Opaque,
+            safety,
+            body: Some(ConstantBody::Opaque { value, mutual }),
         }
     }
 
@@ -168,7 +229,15 @@ impl ConstantDeclaration {
     }
 
     pub fn definition_body(&self) -> Option<&DefinitionBody> {
-        self.definition.as_ref()
+        match self.body.as_ref() {
+            Some(ConstantBody::Definition(body)) => Some(body),
+            Some(ConstantBody::Theorem { .. } | ConstantBody::Opaque { .. }) | None => None,
+        }
+    }
+
+    /// Return the value carried by any body-bearing declaration kind.
+    pub fn body_value(&self) -> Option<&WireExpr> {
+        self.body.as_ref().map(ConstantBody::value)
     }
 
     /// Return the body only when every schema dimension permits delta
@@ -177,11 +246,11 @@ impl ConstantDeclaration {
         if self.kind == ConstantKind::Definition
             && self.safety == ConstantSafety::Safe
             && matches!(
-                self.definition.as_ref().map(DefinitionBody::safety),
+                self.definition_body().map(DefinitionBody::safety),
                 Some(DefinitionSafety::Safe)
             )
         {
-            self.definition.as_ref()
+            self.definition_body()
         } else {
             None
         }
@@ -1008,8 +1077,8 @@ fn validate_constant(
     )
     .map_err(ValidationFailure::Halt)?;
 
-    if let Some(definition) = declaration.definition.as_ref() {
-        for (member_index, member) in definition.mutual.iter().enumerate() {
+    if let Some(body) = declaration.body.as_ref() {
+        for (member_index, member) in body.mutual().iter().enumerate() {
             let at = EnvironmentPosition {
                 constant: constant_index,
                 field: EnvironmentField::MutualMember,
@@ -1030,7 +1099,7 @@ fn validate_constant(
             control,
             constant_index,
             EnvironmentTerm::Value,
-            &definition.value,
+            body.value(),
         )
         .map_err(ValidationFailure::Halt)?;
     }

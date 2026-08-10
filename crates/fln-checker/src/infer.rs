@@ -2328,13 +2328,8 @@ impl<'a> InferenceEngine<'a> {
                 self.control,
                 self.cancelled,
             )?;
-            if let Some(definition) = declaration.definition_body() {
-                reserve_free_names_in_term(
-                    definition.value(),
-                    &mut names,
-                    self.control,
-                    self.cancelled,
-                )?;
+            if let Some(body) = declaration.body_value() {
+                reserve_free_names_in_term(body, &mut names, self.control, self.cancelled)?;
             }
         }
         self.reserved_names = Some(names);

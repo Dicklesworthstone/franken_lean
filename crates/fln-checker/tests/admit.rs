@@ -809,7 +809,7 @@ fn an_axiom_cannot_be_constructed_with_a_body() {
         .collect();
     assert_eq!(
         constructors.len(),
-        2,
+        4,
         "ConstantDeclaration gained or lost a constructor, so the reachability \
          of an axiom-with-a-body must be re-measured: {constructors:?}"
     );
@@ -825,15 +825,36 @@ fn an_axiom_cannot_be_constructed_with_a_body() {
             .any(|line| line.contains("pub fn definition(")),
         "expected the definition constructor: {constructors:?}"
     );
-    // `header` is the only constructor reachable with `ConstantKind::Axiom`, and
-    // it hardcodes an absent body; `definition` hardcodes the Definition kind.
     assert!(
-        declaration_impl.contains("definition: None,"),
-        "the header constructor no longer hardcodes an absent definition body"
+        constructors
+            .iter()
+            .any(|line| line.contains("pub fn theorem(")),
+        "expected the theorem constructor: {constructors:?}"
+    );
+    assert!(
+        constructors
+            .iter()
+            .any(|line| line.contains("pub fn opaque(")),
+        "expected the opaque constructor: {constructors:?}"
+    );
+    // `header` is the only constructor reachable with `ConstantKind::Axiom`, and
+    // it hardcodes an absent body; every body-bearing constructor hardcodes its
+    // non-Axiom kind.
+    assert!(
+        declaration_impl.contains("body: None,"),
+        "the header constructor no longer hardcodes an absent body"
     );
     assert!(
         declaration_impl.contains("kind: ConstantKind::Definition,"),
         "the definition constructor no longer hardcodes the Definition kind"
+    );
+    assert!(
+        declaration_impl.contains("kind: ConstantKind::Theorem,"),
+        "the theorem constructor no longer hardcodes the Theorem kind"
+    );
+    assert!(
+        declaration_impl.contains("kind: ConstantKind::Opaque,"),
+        "the opaque constructor no longer hardcodes the Opaque kind"
     );
 }
 
@@ -933,19 +954,12 @@ fn kr974b_a_theorem_whose_declared_type_is_not_a_proposition_is_rejected() {
     // `Sort 0`'s own type is `Sort 1`, which does not normalize to zero, so a
     // theorem declared `Sort 0` has a non-Prop statement.
     //
-    // Built with `header`, NOT with the `definition` helper: measured,
-    // `ConstantDeclaration::definition` hardcodes `kind: ConstantKind::Definition`,
-    // so the helper cannot produce a Theorem at all and the first version of this
-    // cell was silently admitting a Definition. KR-974b is checked BEFORE the
-    // body-presence rule precisely so a bodyless theorem still reaches it.
+    // The body itself is well-typed for the declaration. This isolates KR-974b:
+    // the theorem must be rejected because its statement is not a proposition,
+    // before its otherwise-valid body can influence the result.
     let candidate = ConstantEntry::new(
         checker_name("T"),
-        header(
-            Vec::new(),
-            a_type(),
-            ConstantKind::Theorem,
-            ConstantSafety::Safe,
-        ),
+        ConstantDeclaration::theorem(Vec::new(), a_type(), nat_constant(), Vec::new()),
     );
     match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
         Verdict::Rejected(AdmissionRejection::TheoremTypeIsNotAProposition { name }) => {
@@ -982,95 +996,61 @@ fn kr974b_a_theorem_whose_declared_type_is_not_a_proposition_is_rejected() {
 
 #[test]
 fn kr974b_a_theorem_whose_statement_is_a_proposition_reaches_the_body_check() {
-    // `Nat : Sort 0`, so a theorem DECLARED `Nat` has a Prop statement (the
-    // declared type's own type is `Sort 0`, which normalizes to zero). It then
-    // reaches the body check and is rejected there on the BODY, not on KR-974b --
-    // which is what makes this the positive control for the Prop test rather
-    // than a second copy of the cell above.
+    // `Nat : Sort 0`, so a theorem DECLARED `Nat` has a Prop statement. A Nat
+    // literal inhabits that statement in this fixture, making this a completed
+    // theorem admission rather than merely proof that one rejection did not fire.
     let candidate = ConstantEntry::new(
         checker_name("T"),
-        header(
-            Vec::new(),
-            nat_constant(),
-            ConstantKind::Theorem,
-            ConstantSafety::Safe,
-        ),
+        ConstantDeclaration::theorem(Vec::new(), nat_constant(), not_a_type(), Vec::new()),
     );
-    let verdict = admit(&nat_environment(), &candidate, AdmissionBudget::unlimited());
-    assert!(
-        !matches!(
-            verdict,
-            Verdict::Rejected(AdmissionRejection::TheoremTypeIsNotAProposition { .. })
+    match admit(&nat_environment(), &candidate, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::BodyCheckedAgainstDeclaredType
         ),
-        "a theorem whose statement IS a proposition must get past KR-974b, got {verdict:?}"
-    );
+        other => panic!("expected a body-checked theorem admission, got {other:?}"),
+    }
 }
 
 #[test]
 fn kr974c_a_body_checked_opaque_is_unreachable_by_construction() {
-    // KR-974c as the bead scoped it -- "an opaque is body-checked and STAYS
-    // OPAQUE" -- CANNOT BE EXERCISED TODAY, and shipping a cell that appeared to
-    // exercise it would be worse than not having one.
-    //
-    // Measured: `ConstantDeclaration` has exactly two constructors. `header`
-    // hardcodes `definition: None`; `definition` hardcodes
-    // `kind: ConstantKind::Definition`. So the ONLY kind constructible WITH a
-    // body is `Definition` -- an Opaque carrying a body is unconstructible, and
-    // `is_delta_unfoldable` is `delta_body().is_some()`, which is therefore
-    // trivially false for every Opaque. A cell asserting "admitting an opaque did
-    // not make it unfoldable" would pass without admission having run at all.
-    //
-    // This is the SECOND instance of this shape in this module: the same two
-    // constructors already made an axiom-with-a-body unreachable
-    // (`an_axiom_cannot_be_constructed_with_a_body`). The environment's
-    // constructor surface cannot express three of the eight declaration kinds
-    // this checker has rules for, and that is a finding about environment.rs, not
-    // about KR-974.
-    //
-    // Bound here so it cannot rot: the day a kind-preserving body constructor
-    // lands, this fails and KR-974c becomes owed for real.
-    let source =
-        std::fs::read_to_string(workspace_root().join("crates/fln-checker/src/environment.rs"))
-            .expect("the environment module is readable");
-    let declaration_impl = source
-        .split_once("impl ConstantDeclaration {")
-        .expect("ConstantDeclaration has an impl block")
-        .1
-        .split_once("\n}\n")
-        .expect("that impl block ends")
-        .0;
-    assert!(
-        declaration_impl.contains("kind: ConstantKind::Definition,"),
-        "the body-carrying constructor no longer forces the Definition kind, so an \
-         Opaque CAN now carry a body and KR-974c is owed a real body-check cell"
-    );
-    assert!(
-        declaration_impl.contains("definition: None,"),
-        "the header constructor no longer forces an absent body"
-    );
-
-    // The reachable half, asserted rather than assumed: a declarable Opaque is
-    // refused for having no body, and it is not delta-unfoldable.
+    // The historical name is retained because the verification manifest binds
+    // it. The old unreachable condition is now false: this constructs a real
+    // body-bearing Opaque, admits it, and proves admission did not make it
+    // delta-unfoldable.
     let opaque = ConstantEntry::new(
         checker_name("O"),
-        header(
+        ConstantDeclaration::opaque(
             Vec::new(),
             a_type(),
-            ConstantKind::Opaque,
             ConstantSafety::Safe,
+            nat_constant(),
+            Vec::new(),
         ),
     );
     assert!(!opaque.declaration().is_delta_unfoldable());
-    assert!(
-        matches!(
-            admit(&nat_environment(), &opaque, AdmissionBudget::unlimited()),
-            Verdict::Rejected(AdmissionRejection::DeclarationCarriesNoBody {
-                kind: ConstantKind::Opaque,
-                ..
-            })
+    match admit(&nat_environment(), &opaque, AdmissionBudget::unlimited()) {
+        Verdict::Admitted(admission) => assert_eq!(
+            admission.ground(),
+            AdmissionGround::BodyCheckedAgainstDeclaredType
         ),
-        "a bodyless opaque must be refused by the body rule, naming its kind"
+        other => panic!("expected a body-checked opaque admission, got {other:?}"),
+    }
+
+    let mismatch = ConstantEntry::new(
+        checker_name("BadOpaque"),
+        ConstantDeclaration::opaque(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            a_type(),
+            Vec::new(),
+        ),
     );
+    assert!(matches!(
+        admit(&nat_environment(), &mismatch, AdmissionBudget::unlimited()),
+        Verdict::Rejected(AdmissionRejection::BodyTypeMismatch { .. })
+    ));
 
     // Anti-vacuity for the unfoldability assertion above: a Definition WITH a
     // body IS delta-unfoldable, so "not unfoldable" is a real property here and
@@ -1079,7 +1059,7 @@ fn kr974c_a_body_checked_opaque_is_unreachable_by_construction() {
         definition("O", a_type(), nat_constant())
             .declaration()
             .is_delta_unfoldable(),
-        "the control must be unfoldable, or the assertion above is vacuous"
+        "the definition control must be unfoldable, or opacity is vacuous"
     );
 }
 
