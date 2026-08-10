@@ -77,6 +77,7 @@ edge fln -> fln-elab               # bounded checked-source elaboration facade (
 edge fln -> fln-env                # immutable environment snapshots returned to embedders (franken_lean-7kc)
 edge fln -> fln-hash               # typed pre/post logical roots for embeddable executions (franken_lean-7kc)
 edge fln -> fln-kernel             # kernel admission and publication capability facade (franken_lean-7kc)
+edge fln -> fln-olean              # bounded public reader for pinned .olean artifacts
 edge fln -> fln-parse              # bounded source parser facade (franken_lean-7kc)
 edge fln -> fln-vm                 # canonical FLBC execution result facade (franken_lean-7kc)
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)

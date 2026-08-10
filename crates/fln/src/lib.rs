@@ -10,7 +10,8 @@
 //! and non-safe mutual definition blocks can also advance an immutable engine
 //! snapshot through admission and publication without compiling or executing a
 //! body. Embedders can also validate and execute an existing canonical FLBC
-//! artifact without reaching into the compiler or VM crates.
+//! artifact without reaching into the compiler or VM crates, and inspect a
+//! real pinned-format `.olean` through the codec's audited by-value reader.
 
 #![forbid(unsafe_code)]
 
@@ -47,10 +48,9 @@ pub use fln_core::name::Name;
 pub use fln_core::options::KVMap;
 pub use fln_core::outcome::Outcome;
 pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
-use fln_env::constants::ConstantInfo;
 pub use fln_env::constants::{
-    AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal, ReducibilityHints,
-    TheoremVal,
+    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
+    ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
@@ -63,6 +63,13 @@ use fln_kernel::council::{
     Council, CouncilOutcome, Seat, SeatBounds, SeatOrigin, SeatVerdict, convene,
 };
 pub use fln_kernel::verdict::{Budget, RejectClass};
+use fln_olean::decl::DeclDecoder;
+pub use fln_olean::decl::DeclError as OleanDeclarationError;
+use fln_olean::region::OleanView;
+pub use fln_olean::region::{
+    ModuleDataView as OleanModuleData, OleanHeader, RegionError as OleanRegionError,
+    WalkBudget as OleanWalkBudget, WalkReport as OleanWalkReport,
+};
 use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{ExecutionLimits as VmExecutionLimits, VmExit};
 use std::collections::BTreeSet;
@@ -133,6 +140,111 @@ pub fn execute_flbc_artifact(
 ) -> Result<Outcome<VmExit>, CodecError> {
     let executable = fln_comp::flbc::decode_canonical(artifact, limits.codec)?;
     Ok(execute_golem_with_options(&executable, options, limits.vm))
+}
+
+/// Independent resource ceilings for pinned-format `.olean` inspection.
+///
+/// The byte ceiling is checked before any parsing or whole-file auditing.
+/// Each object budget applies to its named pass rather than being silently
+/// shared across passes.
+#[derive(Debug, Clone, Copy)]
+pub struct OleanDecodeLimits {
+    pub max_bytes: usize,
+    pub graph: OleanWalkBudget,
+    pub module: OleanWalkBudget,
+    pub declarations: OleanWalkBudget,
+}
+
+impl OleanDecodeLimits {
+    /// Construct limits with an explicit whole-artifact ceiling and the
+    /// codec's conservative default object budgets.
+    pub fn new(max_bytes: usize) -> Self {
+        let objects = OleanWalkBudget::default();
+        Self {
+            max_bytes,
+            graph: objects,
+            module: objects,
+            declarations: objects,
+        }
+    }
+}
+
+/// A fully decoded, by-value view of one pinned-format `.olean` artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedOlean {
+    pub header: OleanHeader,
+    pub walk: OleanWalkReport,
+    pub module: OleanModuleData,
+    pub constants: Vec<ConstantInfo>,
+}
+
+/// Typed refusal from the public `.olean` read path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OleanDecodeError {
+    ArtifactTooLarge { bytes: usize, limit: usize },
+    Region(OleanRegionError),
+    Declaration(OleanDeclarationError),
+}
+
+impl fmt::Display for OleanDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArtifactTooLarge { bytes, limit } => {
+                write!(f, ".olean artifact has {bytes} bytes; limit is {limit}")
+            }
+            Self::Region(error) => write!(f, ".olean region: {error}"),
+            Self::Declaration(error) => write!(f, ".olean declaration: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OleanDecodeError {}
+
+impl From<OleanRegionError> for OleanDecodeError {
+    fn from(error: OleanRegionError) -> Self {
+        Self::Region(error)
+    }
+}
+
+impl From<OleanDeclarationError> for OleanDecodeError {
+    fn from(error: OleanDeclarationError) -> Self {
+        Self::Declaration(error)
+    }
+}
+
+/// Audit and decode one `.olean` produced by the pinned Reference epoch.
+///
+/// This is the existing Grimoire reader behind the embeddable facade: it
+/// validates the entire compacted region through the shared runtime audit,
+/// walks the reachable object graph, decodes `ModuleData`, and cross-checks
+/// every decoded declaration's stored computed fields. The returned values
+/// own their data and do not borrow the artifact.
+///
+/// This function does not resolve imports, admit or kernel-check declarations,
+/// advance an [`Engine`], or write/re-emit `.olean` bytes.
+pub fn decode_olean_artifact(
+    artifact: &[u8],
+    limits: OleanDecodeLimits,
+) -> Result<DecodedOlean, OleanDecodeError> {
+    if artifact.len() > limits.max_bytes {
+        return Err(OleanDecodeError::ArtifactTooLarge {
+            bytes: artifact.len(),
+            limit: limits.max_bytes,
+        });
+    }
+
+    let view = OleanView::parse(artifact)?;
+    view.shared_audit()?;
+    let walk = view.walk(limits.graph)?;
+    let module = view.module_data(limits.module)?;
+    let constants = DeclDecoder::new(&view, limits.declarations).decode_module_constants()?;
+
+    Ok(DecodedOlean {
+        header: view.header.clone(),
+        walk,
+        module,
+        constants,
+    })
 }
 
 /// One immutable embeddable engine snapshot.
@@ -1596,8 +1708,10 @@ mod tests {
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
         FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit,
-        OpaqueVal, Outcome, ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits,
-        execute_flbc_artifact, execute_golem_with_options,
+        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanRegionError,
+        OleanWalkBudget, OpaqueVal, Outcome, ReducibilityHints, RejectClass, TheoremVal,
+        VmExecutionLimits, decode_olean_artifact, execute_flbc_artifact,
+        execute_golem_with_options,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -1615,6 +1729,14 @@ mod tests {
 
     fn test_limits() -> EngineExecutionLimits {
         EngineExecutionLimits::new(test_budget())
+    }
+
+    fn olean_fixture(name: &str) -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tribunal/fixtures/c3")
+            .join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
     }
 
     fn heartbeat_program(new_count: u64, check_system: bool) -> ValidatedProgram {
@@ -1716,6 +1838,55 @@ mod tests {
         assert!(matches!(
             execute_flbc_artifact(&artifact, &KVMap::new(), limits),
             Ok(Outcome::Inconclusive(_))
+        ));
+    }
+
+    #[test]
+    fn public_olean_artifact_door_audits_and_decodes_real_reference_bytes() {
+        let bytes = olean_fixture("Init.BinderNameHint.olean");
+        let decoded = decode_olean_artifact(&bytes, OleanDecodeLimits::new(bytes.len()))
+            .expect("the real pinned artifact passes every public read stage");
+
+        assert_eq!(decoded.header.githash, fln_olean::format::PIN_COMMIT);
+        assert!(decoded.walk.objects > 0);
+        assert_eq!(decoded.module.constants as usize, decoded.constants.len());
+        assert_eq!(decoded.constants.len(), 2);
+        assert!(decoded.constants.iter().any(|constant| {
+            constant.name().to_display_string() == "binderNameHint"
+                && matches!(constant, ConstantInfo::Defn(_))
+        }));
+    }
+
+    #[test]
+    fn public_olean_artifact_door_preserves_malformed_input_as_a_typed_refusal() {
+        let mut bytes = olean_fixture("Init.BinderNameHint.olean");
+        bytes[0] ^= u8::MAX;
+
+        assert!(matches!(
+            decode_olean_artifact(&bytes, OleanDecodeLimits::new(bytes.len())),
+            Err(OleanDecodeError::Region(OleanRegionError::BadMagic))
+        ));
+    }
+
+    #[test]
+    fn public_olean_artifact_door_enforces_byte_and_declaration_budgets() {
+        let bytes = olean_fixture("Init.SizeOfLemmas.olean");
+        let too_small = bytes.len() - 1;
+        assert!(matches!(
+            decode_olean_artifact(&bytes, OleanDecodeLimits::new(too_small)),
+            Err(OleanDecodeError::ArtifactTooLarge {
+                bytes: observed,
+                limit,
+            }) if observed == bytes.len() && limit == too_small
+        ));
+
+        let mut limits = OleanDecodeLimits::new(bytes.len());
+        limits.declarations = OleanWalkBudget { max_objects: 5 };
+        assert!(matches!(
+            decode_olean_artifact(&bytes, limits),
+            Err(OleanDecodeError::Declaration(
+                OleanDeclarationError::Budget { .. }
+            ))
         ));
     }
 

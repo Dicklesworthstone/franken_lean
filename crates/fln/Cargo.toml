@@ -13,5 +13,6 @@ fln-elab = { path = "../fln-elab" }
 fln-env = { path = "../fln-env" }
 fln-hash = { path = "../fln-hash" }
 fln-kernel = { path = "../fln-kernel" }
+fln-olean = { path = "../fln-olean" }
 fln-parse = { path = "../fln-parse" }
 fln-vm = { path = "../fln-vm" }
