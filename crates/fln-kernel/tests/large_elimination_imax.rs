@@ -29,6 +29,7 @@
 //!    field. Non-recursive (`T`) and recursive/reflexive (`W`, Acc-shaped).
 //!  - `{P,Q}`: a two-type MUTUAL inductive block (k1_judgments has mutual
 //!    DEFINITIONS only), exercising cross-motive recursor regeneration.
+//!
 //! The remaining cases — `Ix` (indexed) and `Bad`/`Big`/`Wrong`
 //! (positivity/universe/return-type rejection) — OVERLAP k1_judgments' coverage and
 //! are belt-and-suspenders here, not unique. (An earlier version of this doc claimed
