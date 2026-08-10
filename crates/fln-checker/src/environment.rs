@@ -6,6 +6,7 @@
 //! map, separate validation, and separate resource taxonomy. Construction is
 //! failure-atomic: only a completely validated environment is published.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -1124,10 +1125,13 @@ fn build_environment(
         if let Err(stop) = control.owned_units(name_owned_units(&name), at) {
             return EnvironmentOutcome::Inconclusive(stop);
         }
-        if constants.contains_key(&name) {
-            duplicates.insert(name);
-        } else {
-            constants.insert(name, declaration);
+        match constants.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(declaration);
+            }
+            Entry::Occupied(entry) => {
+                duplicates.insert(entry.key().clone());
+            }
         }
     }
 
