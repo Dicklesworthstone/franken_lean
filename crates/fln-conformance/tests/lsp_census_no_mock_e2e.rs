@@ -164,17 +164,6 @@ impl ServerHarness {
         }
     }
 
-    fn drain_for(&mut self, duration: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if self.next_frame(remaining)?.is_none() {
-                break;
-            }
-        }
-        Ok(())
-    }
-
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<String>, String> {
         let frame = match self.frames.recv_timeout(timeout) {
             Ok(frame) => frame?,
@@ -207,6 +196,25 @@ impl ServerHarness {
             .iter()
             .map(|frame| compact_json(frame))
             .find(|frame| frame.contains(&needle))
+    }
+
+    fn wait_for_method(&mut self, method: &str, timeout: Duration) -> Result<String, String> {
+        if let Some(frame) = self.first_frame_for_method(method) {
+            return Ok(frame);
+        }
+        let needle = format!("\"method\":\"{method}\"");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(frame) = self.next_frame(remaining)? else {
+                return Err(format!(
+                    "timed out waiting for pinned server method {method}"
+                ));
+            };
+            if frame.contains(&needle) {
+                return Ok(frame);
+            }
+        }
     }
 
     fn finish(mut self) -> Result<Vec<String>, String> {
@@ -380,6 +388,30 @@ fn notification_frame(method: &str, params: &str) -> String {
         "{{\"jsonrpc\":\"2.0\",\"method\":{},\"params\":{params}}}",
         json_quote(method)
     )
+}
+
+fn wait_for_diagnostics(
+    server: &mut ServerHarness,
+    id: u64,
+    document_uri: &str,
+    version: u64,
+) -> Result<String, String> {
+    let params = format!(
+        "{{\"uri\":{},\"version\":{version}}}",
+        json_quote(document_uri)
+    );
+    server.send(&request_frame(
+        id,
+        "textDocument/waitForDiagnostics",
+        &params,
+    ))?;
+    let response = server.response(id)?;
+    if response_disposition(&response) != SemanticDisposition::Result {
+        return Err(format!(
+            "diagnostics barrier for version {version} failed: {response}"
+        ));
+    }
+    Ok(response)
 }
 
 fn normalized_probe_message(
@@ -588,13 +620,33 @@ fn manifest_probe(
         (workspace_root, toolchain_root),
     )?;
 
+    // This is the Reference server's synchronization surface: its response is
+    // delayed until both diagnostics and every command snapshot for this
+    // document version have finished.  Dispatching document requests before
+    // this point races the worker and makes identical fresh processes observe
+    // different call-hierarchy and ILean outcomes.
+    let diagnostics_response = wait_for_diagnostics(&mut server, 1, document_uri, 1)?;
+    insert_observation(
+        &mut observations,
+        method(
+            inventory,
+            MessageFamily::Request,
+            "textDocument/waitForDiagnostics",
+        )?,
+        "1",
+        SemanticDisposition::Result,
+        "none",
+        &diagnostics_response,
+        (workspace_root, toolchain_root),
+    )?;
+
     let semantic_params = format!(
         "{{\"textDocument\":{{\"uri\":{}}}}}",
         json_quote(document_uri)
     );
-    let semantic_frame = request_frame(1, "textDocument/semanticTokens/full", &semantic_params);
+    let semantic_frame = request_frame(2, "textDocument/semanticTokens/full", &semantic_params);
     server.send(&semantic_frame)?;
-    let semantic_response = server.response(1)?;
+    let semantic_response = server.response(2)?;
     if response_error_code(&semantic_response) == "-32601" {
         return Err(format!(
             "known semantic-token method was reported absent: {semantic_response}"
@@ -607,7 +659,7 @@ fn manifest_probe(
             MessageFamily::Request,
             "textDocument/semanticTokens/full",
         )?,
-        "1",
+        "2",
         response_disposition(&semantic_response),
         response_error_code(&semantic_response),
         &semantic_response,
@@ -620,9 +672,9 @@ fn manifest_probe(
          \"character\":0}},\"end\":{{\"line\":{line_count},\"character\":0}}}}}}",
         json_quote(document_uri)
     );
-    let inlay_frame = request_frame(2, "textDocument/inlayHint", &inlay_params);
+    let inlay_frame = request_frame(3, "textDocument/inlayHint", &inlay_params);
     server.send(&inlay_frame)?;
-    let inlay_response = server.response(2)?;
+    let inlay_response = server.response(3)?;
     if response_error_code(&inlay_response) == "-32601" {
         return Err(format!(
             "known inlay-hint method was reported absent: {inlay_response}"
@@ -631,7 +683,7 @@ fn manifest_probe(
     insert_observation(
         &mut observations,
         method(inventory, MessageFamily::Request, "textDocument/inlayHint")?,
-        "2",
+        "3",
         response_disposition(&inlay_response),
         response_error_code(&inlay_response),
         &inlay_response,
@@ -639,15 +691,15 @@ fn manifest_probe(
     )?;
 
     server.send(&request_frame(
-        3,
+        4,
         "$/lean/notARealMethod",
         "{\"future\":true}",
     ))?;
-    let unknown = server.response(3)?;
+    let unknown = server.response(4)?;
     if !unknown.contains("\"error\"") || response_error_code(&unknown) != "-32601" {
         return Err(format!("unknown method was not rejected: {unknown}"));
     }
-    let mut next_id = 4_u64;
+    let mut next_id = 5_u64;
     for protocol_method in &inventory.methods {
         if protocol_method.family != MessageFamily::Request
             || protocol_method.direction != MessageDirection::ClientToServer
@@ -795,20 +847,12 @@ fn manifest_probe(
         )?;
     }
 
-    server.drain_for(Duration::from_secs(5))?;
     for protocol_method in inventory
         .methods
         .iter()
         .filter(|method| method.direction == MessageDirection::ServerToClient)
     {
-        let frame = server
-            .first_frame_for_method(&protocol_method.method)
-            .ok_or_else(|| {
-                format!(
-                    "real server never emitted censused method {}",
-                    protocol_method.key
-                )
-            })?;
+        let frame = server.wait_for_method(&protocol_method.method, Duration::from_secs(20))?;
         let disposition = if protocol_method.family == MessageFamily::Request {
             SemanticDisposition::Request
         } else {
