@@ -363,6 +363,11 @@ semantic = [
     },
     {
         "fact_sha256": facts_digest,
+        "int_facts": sum(
+            1
+            for line in c4_facts.read_text(encoding="utf-8").splitlines()
+            if '"probe":"int.' in line
+        ),
         "nat_facts": sum(
             1
             for line in c4_facts.read_text(encoding="utf-8").splitlines()
@@ -581,9 +586,9 @@ markers = {
         b"fn kr313_the_pin_operation_table_computes_literal_results() {",
         b"#[test]\nfn kr313_comparisons_produce_bool_constants()",
     ),
-    "c4-nat-slice-v1": (
+    "c4-nat-slice-v2": (
         b"/* ---- slice 3: bignum-backed Nat families */",
-        b"/* ---- slice 3: Name equality",
+        b"    /* ---- end slice 3: bignum-backed Nat families ---- */",
     ),
 }
 try:
@@ -651,16 +656,19 @@ if [ -z "$c4_dir" ] || [ ! -s "$c4_dir/facts_marrow.ndjson" ] \
 fi
 marrow_nat_facts="$(grep -c '"probe":"nat\.' "$c4_dir/facts_marrow.ndjson")"
 reference_nat_facts="$(grep -c '"probe":"nat\.' "$c4_dir/facts_reference.ndjson")"
+marrow_int_facts="$(grep -c '"probe":"int\.' "$c4_dir/facts_marrow.ndjson")"
+reference_int_facts="$(grep -c '"probe":"int\.' "$c4_dir/facts_reference.ndjson")"
 if [ "$marrow_nat_facts" -ne 28 ] || [ "$reference_nat_facts" -ne 28 ] \
+    || [ "$marrow_int_facts" -ne 44 ] || [ "$reference_int_facts" -ne 44 ] \
     || ! cmp -s "$c4_dir/facts_marrow.ndjson" "$c4_dir/facts_reference.ndjson"; then
-  emit c4_gauntlet failed "\"detail\":\"Nat fact population or full differential drifted\",\"artifact\":\"c4.log\""
-    note "FAIL: C4 Nat facts drifted"
+  emit c4_gauntlet failed "\"detail\":\"Nat/Int fact population or full differential drifted\",\"artifact\":\"c4.log\""
+    note "FAIL: C4 Nat/Int facts drifted"
     exit 1
 fi
 cp "$c4_dir/run.ndjson" "$ART_DIR/c4-run.ndjson"
 cp "$c4_dir/facts_marrow.ndjson" "$ART_DIR/c4-facts-marrow.ndjson"
 cp "$c4_dir/facts_reference.ndjson" "$ART_DIR/c4-facts-reference.ndjson"
-emit c4_gauntlet passed "\"facts\":28,\"artifact\":\"c4.log\""
+emit c4_gauntlet passed "\"nat_facts\":28,\"int_facts\":44,\"artifact\":\"c4.log\""
 
 # ---- step 5: every named production mutant must be killed -------------------------------
 OVERLAY="$ART_DIR/overlay"

@@ -30,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+use fln_bignum::int::{BigInt, BigIntView};
 use fln_bignum::interop::{bignat_from_literal, literal_from_bignat};
 use fln_bignum::nat::{BigNat, BigNatView, KARATSUBA_THRESHOLD, TOOM3_THRESHOLD};
 
@@ -837,6 +838,83 @@ fn borrowed_limb_views_alias_storage_and_match_owned_arithmetic() {
                 "{origin}: power"
             );
             assert_eq!(a_view.to_owned(), a, "{origin}: explicit ownership");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, SEEDS.len() * TRIALS, "anti-vacuity floor");
+}
+
+#[test]
+fn signed_borrowed_views_alias_magnitudes_and_match_owned_arithmetic() {
+    let mut checked = 0usize;
+    for seed in SEEDS {
+        let mut rng = SplitMix64(seed ^ 0x5349_474e_4544);
+        for trial in 0..TRIALS {
+            let a_count = rng.below(MAX_LIMBS + 1);
+            let b_count = rng.below(MAX_LIMBS + 1);
+            let mut a_limbs: Vec<u64> = (0..a_count).map(|_| rng.limb()).collect();
+            let mut b_limbs: Vec<u64> = (0..b_count).map(|_| rng.limb()).collect();
+            if trial % 3 == 0 {
+                a_limbs.push(0);
+            }
+            if trial % 5 == 0 {
+                b_limbs.extend([0, 0]);
+            }
+            let a_negative = rng.next_u64() & 1 == 1;
+            let b_negative = rng.next_u64() & 1 == 1;
+            let a_view = BigIntView::from_sign_limbs_le(a_negative, &a_limbs);
+            let b_view = BigIntView::from_sign_limbs_le(b_negative, &b_limbs);
+            let a = BigInt::from_sign_limbs_le(a_negative, a_limbs.clone());
+            let b = BigInt::from_sign_limbs_le(b_negative, b_limbs.clone());
+            let origin = format!("signed seed {seed:#x} trial {trial}");
+
+            assert_eq!(
+                a_view.magnitude().limbs_le(),
+                a.magnitude().limbs_le(),
+                "{origin}: a magnitude"
+            );
+            assert_eq!(
+                b_view.magnitude().limbs_le(),
+                b.magnitude().limbs_le(),
+                "{origin}: b magnitude"
+            );
+            if !a_view.is_zero() {
+                assert_eq!(
+                    a_view.magnitude().limbs_le().as_ptr(),
+                    a_limbs.as_ptr(),
+                    "{origin}: a view copied its storage"
+                );
+            }
+            if !b_view.is_zero() {
+                assert_eq!(
+                    b_view.magnitude().limbs_le().as_ptr(),
+                    b_limbs.as_ptr(),
+                    "{origin}: b view copied its storage"
+                );
+            }
+
+            assert_eq!(a_view.to_owned(), a, "{origin}: explicit ownership");
+            assert_eq!(a_view.beq(b_view), a.beq(&b), "{origin}: equality");
+            assert_eq!(a_view.ble(b_view), a.ble(&b), "{origin}: ordering");
+            assert_eq!(a_view.add(b_view), a.add(&b), "{origin}: addition");
+            assert_eq!(a_view.sub(b_view), a.sub(&b), "{origin}: subtraction");
+            assert_eq!(a_view.mul(b_view), a.mul(&b), "{origin}: multiplication");
+            assert_eq!(
+                a_view.div_rem(b_view),
+                a.div_rem(&b),
+                "{origin}: truncating division"
+            );
+            assert_eq!(
+                a_view.ediv_rem(b_view),
+                a.ediv_rem(&b),
+                "{origin}: Euclidean division"
+            );
+            assert_eq!(
+                a_view.checked_div_exact(b_view),
+                a.checked_div_exact(&b),
+                "{origin}: exact division"
+            );
+            assert_eq!(a_view.low_u64(), a.low_u64(), "{origin}: low bits");
             checked += 1;
         }
     }

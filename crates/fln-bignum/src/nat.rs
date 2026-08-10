@@ -1242,7 +1242,7 @@ mod tests {
                     "crates/fln-kernel/tests/k1_judgments.rs",
                     "kr313-operation-test-body-v1"
                 ),
-                ("tribunal/fixtures/c4/probe_export.c", "c4-nat-slice-v1"),
+                ("tribunal/fixtures/c4/probe_export.c", "c4-nat-slice-v2"),
             ]),
             "profile source projections"
         );
