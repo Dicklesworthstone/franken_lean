@@ -243,7 +243,9 @@ fn constant_node(
     Arc::new(ConstantNode {
         name,
         declaration,
-        height: node_height(&left).max(node_height(&right)).saturating_add(1),
+        height: node_height(&left)
+            .max(node_height(&right))
+            .saturating_add(1),
         len: node_len(&left)
             .saturating_add(node_len(&right))
             .saturating_add(1),
@@ -437,10 +439,7 @@ pub struct ConstantEnvironment {
 
 impl fmt::Debug for ConstantEnvironment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_map()
-            .entries(self.constants())
-            .finish()
+        formatter.debug_map().entries(self.constants()).finish()
     }
 }
 
@@ -1046,9 +1045,7 @@ fn validation_outcome(
     progress: EnvironmentProgress,
 ) -> EnvironmentOutcome {
     match failure {
-        ValidationFailure::Refusal(refusal) => {
-            EnvironmentOutcome::Refused { refusal, progress }
-        }
+        ValidationFailure::Refusal(refusal) => EnvironmentOutcome::Refused { refusal, progress },
         ValidationFailure::Halt(Halt::Stop(stop)) => EnvironmentOutcome::Inconclusive(stop),
         ValidationFailure::Halt(Halt::Fault(fault)) => {
             EnvironmentOutcome::InternalFault { fault, progress }
@@ -1087,11 +1084,7 @@ fn extend_environment(
     if let Err(failure) = validate_constant(&mut control, 0, &declaration) {
         return validation_outcome(failure, control.progress);
     }
-    let constants = match insert_constant(
-        &environment.constants,
-        name,
-        Arc::new(declaration),
-    ) {
+    let constants = match insert_constant(&environment.constants, name, Arc::new(declaration)) {
         Ok(constants) => constants,
         Err(name) => {
             return EnvironmentOutcome::Refused {
