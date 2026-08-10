@@ -6,16 +6,17 @@
 //! already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
-//! Prelude support. Already-elaborated axioms, definitions, theorems, and
-//! opaques can also advance an immutable engine snapshot through admission and
-//! publication without compiling or executing a body.
+//! Prelude support. Already-elaborated axioms, definitions, theorems, opaques,
+//! and non-safe mutual definition blocks can also advance an immutable engine
+//! snapshot through admission and publication without compiling or executing a
+//! body.
 
 #![forbid(unsafe_code)]
 
-use fln_checker::admit::Verdict as CheckerVerdict;
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
 };
+use fln_checker::admit::{BlockVerdict as CheckerBlockVerdict, Verdict as CheckerVerdict};
 pub use fln_checker::environment::EnvironmentBudget as CheckerEnvironmentBudget;
 use fln_checker::environment::{
     ConstantDeclaration as CheckerConstantDeclaration, ConstantEntry as CheckerConstantEntry,
@@ -158,15 +159,15 @@ impl Engine {
         self.environment.logical_root(options)
     }
 
-    /// Admit and publish one non-block declaration without compiling or
-    /// executing it.
+    /// Admit and publish one declaration without compiling or executing it.
     ///
     /// This is the environment-building counterpart to
     /// [`Self::execute_definition`]. It currently accepts the declaration kinds
     /// on which both K1 and the independent checker can issue a completed
-    /// verdict: axioms, definitions, theorems, and opaques. Mutual blocks,
-    /// inductives, and quotient initialization remain explicit refusals until
-    /// the independent checker can represent and decide their complete input.
+    /// verdict: axioms, definitions, theorems, opaques, and non-safe mutual
+    /// definition blocks. Inductives and quotient initialization remain
+    /// explicit refusals until the independent checker can represent and decide
+    /// their complete input.
     ///
     /// Success returns a new immutable engine snapshot. A rejection,
     /// independent-checker non-answer, duplicate, resource stop, or internal
@@ -183,6 +184,7 @@ impl Engine {
                 | Declaration::Defn(_)
                 | Declaration::Thm(_)
                 | Declaration::Opaque(_)
+                | Declaration::Mutual(_)
         ) {
             return Err(EngineAdmissionError::UnsupportedDeclaration {
                 kind: declaration_kind(&declaration),
@@ -224,20 +226,31 @@ impl Engine {
                     .to_owned(),
             }
         })?;
+        let expects_block = matches!(declaration, Declaration::Mutual(_));
         let environment = match checked.publish(limits.declaration, limits.collisions, None) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
                 publication,
-            ))) => publication.environment,
+            ))) => {
+                if expects_block {
+                    return Err(EngineAdmissionError::UnexpectedPublication {
+                        detail: "a block declaration published as one constant",
+                    });
+                }
+                publication.environment
+            }
             Outcome::Complete(Published::Committed(DeclarationCommitted::DuplicateName {
                 name,
             }))
             | Outcome::Complete(Published::DuplicateName { name }) => {
                 return Err(EngineAdmissionError::DuplicateName { name });
             }
-            Outcome::Complete(Published::BlockCommitted(_)) => {
-                return Err(EngineAdmissionError::UnexpectedPublication {
-                    detail: "a non-block declaration published as a block",
-                });
+            Outcome::Complete(Published::BlockCommitted(publication)) => {
+                if !expects_block {
+                    return Err(EngineAdmissionError::UnexpectedPublication {
+                        detail: "a non-block declaration published as a block",
+                    });
+                }
+                publication.environment
             }
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -722,12 +735,117 @@ fn checker_environment(
     }
 }
 
+fn review_mutual_with_independent_checker(
+    environment: &Environment,
+    retained_environment: Option<&CheckerConstantEnvironment>,
+    definitions: &[DefinitionVal],
+    limits: CheckerExecutionLimits,
+) -> CheckerReview {
+    let mut candidates = Vec::new();
+    if candidates.try_reserve_exact(definitions.len()).is_err() {
+        return CheckerReview::no_answer(format!(
+            "could not reserve {} checker mutual-block members",
+            definitions.len()
+        ));
+    }
+    for (index, definition) in definitions.iter().enumerate() {
+        match checker_entry(&ConstantInfo::Defn(definition.clone()), limits.decode) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "mutual-block member {index} projection into fln-checker failed: {detail}"
+                ));
+            }
+        }
+    }
+
+    let environment = match retained_environment {
+        Some(environment) => environment.clone(),
+        None => match checker_environment(environment, limits) {
+            Ok(environment) => environment,
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "base projection into fln-checker failed: {detail}"
+                ));
+            }
+        },
+    };
+
+    match fln_checker::admit::admit_block(&environment, &candidates, limits.admission) {
+        CheckerBlockVerdict::Admitted(admission) => {
+            let agreement = CheckerAgreement {
+                schema: admission.schema(),
+                ground: admission.ground(),
+            };
+            let mut successor = environment;
+            for candidate in candidates {
+                let member = candidate.name().clone();
+                match successor.extend(candidate, limits.environment) {
+                    CheckerEnvironmentOutcome::Complete {
+                        environment: extended,
+                        ..
+                    } => successor = extended,
+                    CheckerEnvironmentOutcome::Refused { refusal, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker refused mutual member {member:?} retention: {refusal:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::Inconclusive(stop) => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker could not retain mutual member {member:?}: {stop:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker hit an internal fault while retaining mutual member \
+                             {member:?}: {fault:?}"
+                        ));
+                    }
+                }
+            }
+            CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+        }
+        CheckerBlockVerdict::Rejected(rejection) => CheckerReview::from_seat(
+            SeatVerdict::Disagrees {
+                detail: format!("fln-checker rejected the mutual block: {rejection:?}"),
+            },
+            None,
+            None,
+        ),
+        CheckerBlockVerdict::MemberRejected { member, rejection } => CheckerReview::from_seat(
+            SeatVerdict::Disagrees {
+                detail: format!("fln-checker rejected mutual member {member:?}: {rejection:?}"),
+            },
+            None,
+            None,
+        ),
+        CheckerBlockVerdict::MemberDeferred { member, deferred } => CheckerReview::no_answer(
+            format!("fln-checker deferred mutual member {member:?}: {deferred:?}"),
+        ),
+        CheckerBlockVerdict::MemberInconclusive { member, stop } => CheckerReview::no_answer(
+            format!("fln-checker exhausted or was cancelled on mutual member {member:?}: {stop:?}"),
+        ),
+        CheckerBlockVerdict::MemberFault { member, fault } => CheckerReview::no_answer(format!(
+            "fln-checker hit an internal fault on mutual member {member:?}: {fault:?}"
+        )),
+    }
+}
+
 fn review_with_independent_checker(
     environment: &Environment,
     retained_environment: Option<&CheckerConstantEnvironment>,
     declaration: &Declaration,
     limits: CheckerExecutionLimits,
 ) -> CheckerReview {
+    if let Declaration::Mutual(definitions) = declaration {
+        return review_mutual_with_independent_checker(
+            environment,
+            retained_environment,
+            definitions,
+            limits,
+        );
+    }
+
     let candidate = match declaration {
         Declaration::Axiom(axiom) => {
             checker_entry(&ConstantInfo::Axiom(axiom.clone()), limits.decode)
@@ -1453,8 +1571,8 @@ mod tests {
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
-        EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Expr, IngressError,
-        IngressResource, KVMap, Level, Literal, Name, NatLit, OpaqueVal, Outcome,
+        EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
+        IngressError, IngressResource, KVMap, Level, Literal, Name, NatLit, OpaqueVal, Outcome,
         ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, execute_golem_with_options,
     };
     use fln_comp::flbc::{
@@ -1593,6 +1711,20 @@ mod tests {
             is_unsafe: false,
             all: vec![name],
         })
+    }
+
+    fn partial_sort_definition(name: &str, value: Expr, all: Vec<Name>) -> DefinitionVal {
+        DefinitionVal {
+            base: ConstantVal {
+                name: Name::from_components([name]),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Partial,
+            all,
+        }
     }
 
     fn nested_let_definition() -> Declaration {
@@ -2048,6 +2180,125 @@ mod tests {
                 .environment()
                 .contains(&rejected_name)
         );
+    }
+
+    #[test]
+    fn admission_only_mutual_definitions_are_checked_published_and_failure_atomic() {
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(test_budget());
+        let base_root = engine.logical_root(&options);
+
+        let left_name = Name::from_components(["mutualLeft"]);
+        let right_name = Name::from_components(["mutualRight"]);
+        let members = vec![left_name.clone(), right_name.clone()];
+        let left = partial_sort_definition(
+            "mutualLeft",
+            Expr::const_(right_name.clone(), Vec::new()),
+            members.clone(),
+        );
+        let right = partial_sort_definition(
+            "mutualRight",
+            Expr::const_(left_name.clone(), Vec::new()),
+            members,
+        );
+        let admitted = engine
+            .admit_declaration(
+                Declaration::Mutual(vec![left.clone(), right.clone()]),
+                &options,
+                limits,
+            )
+            .expect("K1 and the independent checker admit genuine mutual recursion");
+        let Outcome::Complete(admitted) = admitted else {
+            panic!("the mutual admission must answer completely");
+        };
+
+        assert_eq!(
+            admitted.checker.ground,
+            CheckerAdmissionGround::PartialQuarantine
+        );
+        assert_eq!(admitted.base_logical_root, base_root);
+        assert_eq!(
+            admitted.result_logical_root,
+            admitted.engine.logical_root(&options)
+        );
+        assert_eq!(
+            admitted.engine.environment().find(&left_name),
+            Some(&ConstantInfo::Defn(left))
+        );
+        assert_eq!(
+            admitted.engine.environment().find(&right_name),
+            Some(&ConstantInfo::Defn(right))
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(engine.environment().is_empty());
+
+        let mut candidate_only = limits;
+        candidate_only.checker.environment = fln_checker::environment::EnvironmentBudget::new(
+            u64::MAX,
+            1,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
+        let follower_name = Name::from_components(["mutualFollower"]);
+        let retained = admitted
+            .engine
+            .admit_declaration(
+                typed_axiom("mutualFollower", Expr::sort(Level::zero())),
+                &options,
+                candidate_only,
+            )
+            .expect("the retained checker block leaves one-row budget for its consumer");
+        let Outcome::Complete(retained) = retained else {
+            panic!("the retained checker projection must answer completely");
+        };
+        assert!(retained.engine.environment().contains(&follower_name));
+
+        let uncached = Engine::from_environment(admitted.engine.environment().clone());
+        let uncached_name = Name::from_components(["uncachedMutualFollower"]);
+        let error = uncached
+            .admit_declaration(
+                typed_axiom("uncachedMutualFollower", Expr::sort(Level::zero())),
+                &options,
+                candidate_only,
+            )
+            .expect_err("one row cannot reconstruct an uncached two-member checker base");
+        assert!(matches!(
+            error,
+            EngineAdmissionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert!(!uncached.environment().contains(&uncached_name));
+
+        let bad_left_name = Name::from_components(["badMutualLeft"]);
+        let bad_right_name = Name::from_components(["badMutualRight"]);
+        let bad_members = vec![bad_left_name.clone(), bad_right_name.clone()];
+        let good_first = partial_sort_definition(
+            "badMutualLeft",
+            Expr::const_(bad_right_name.clone(), Vec::new()),
+            bad_members.clone(),
+        );
+        let bad_second =
+            partial_sort_definition("badMutualRight", Expr::sort(Level::zero()), bad_members);
+        let rejection = engine
+            .admit_declaration(
+                Declaration::Mutual(vec![good_first, bad_second]),
+                &options,
+                limits,
+            )
+            .expect_err("a late mutual-member body mismatch rejects the whole block");
+        assert!(matches!(
+            rejection,
+            EngineAdmissionError::KernelRejected {
+                class: RejectClass::DefinitionTypeMismatch,
+                ..
+            }
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&bad_left_name));
+        assert!(!engine.environment().contains(&bad_right_name));
     }
 
     #[test]
