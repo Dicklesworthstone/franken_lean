@@ -19,18 +19,20 @@
 //! is regenerated. Under the pre-`bbb464f1` code the regenerated recursor is one
 //! level-parameter short and the block is a `BlockMismatch`.
 //!
-//! These are also the only fast unit tests that admit an `InductiveBlock` through
-//! the public authority at all (the admission engine is otherwise exercised only by
-//! the Reference differential / corpus lane), so this file additionally guards the
-//! recursor-regeneration paths those cases reach: single-type non-recursive (`T`),
-//! single-type recursive/reflexive (`W`, Acc-shaped), a two-type MUTUAL block
-//! (`P`/`Q`) whose recursors each carry every block motive, and an INDEXED inductive
-//! (`Ix : A → Type`) whose recursor motive, minor, and major all carry the index.
-//! It also guards the REJECTION direction (soundness): a non-strictly-positive
-//! `Bad : Type` (`Bad.mk : (Bad → Bad) → Bad`) must be refused by KR-606, and a
-//! universe-too-large field (`Big : Type` with `Big.mk : Type → Big`, Girard's
-//! paradox) must be refused by the field-universe check, and a constructor whose
-//! result is a foreign type (`Wrong.mk : A`) must be refused by the return-type check.
+//! `crates/fln-kernel/tests/k1_judgments.rs` ALSO admits inductive blocks through
+//! the authority (MyNat, the nested MyTree, indexed types at `num_indices` ≥ 1, and
+//! the positivity / universe / return-type REJECTIONS at `kr701` and around lines
+//! 4700-4925). So the only cases below that k1_judgments does NOT already cover are:
+//!  - `T`/`W`: the d17i `imax(u,0)` semantically-Prop constructor FIELD — `kr701`
+//!    uses a genuine DATA field (`D : Sort 1`), which the pre-fix structural
+//!    `is_zero` also handled, so it never bit; the defect only bites a Pi-into-Prop
+//!    field. Non-recursive (`T`) and recursive/reflexive (`W`, Acc-shaped).
+//!  - `{P,Q}`: a two-type MUTUAL inductive block (k1_judgments has mutual
+//!    DEFINITIONS only), exercising cross-motive recursor regeneration.
+//! The remaining cases — `Ix` (indexed) and `Bad`/`Big`/`Wrong`
+//! (positivity/universe/return-type rejection) — OVERLAP k1_judgments' coverage and
+//! are belt-and-suspenders here, not unique. (An earlier version of this doc claimed
+//! these were the only fast tests admitting a block; that was false — see line 4252.)
 
 #![forbid(unsafe_code)]
 
