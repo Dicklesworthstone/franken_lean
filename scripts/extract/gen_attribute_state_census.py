@@ -950,10 +950,19 @@ def main() -> int:
         "--vendor-path",
         help="read pinned sources from this tree instead of vendor/lean4-src (the truncated-input leg)",
     )
+    parser.add_argument(
+        "--ready-file",
+        help="publish a readiness marker after cancellation handlers are installed",
+    )
     args = parser.parse_args()
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, _on_signal)
+    if args.ready_file:
+        Path(args.ready_file).write_text(
+            "attribute-census cancellation handlers installed\n",
+            encoding="utf-8",
+        )
 
     vendor = Path(args.vendor_path) if args.vendor_path else VENDOR
 

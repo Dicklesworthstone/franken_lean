@@ -347,6 +347,7 @@ fn cancellation_is_typed_and_nothing_partial_publishes() {
     // process's scratch root. A process-global temp name lets concurrent Cargo
     // test binaries replace or reclaim one another's cancellation evidence.
     let out = vendor.join("cancelled-census-output");
+    let ready = vendor.join("cancellation-handlers-ready");
     // Enough well-formed sources that the generation has a window to cancel in.
     for index in 0..40 {
         fs::write(
@@ -367,11 +368,28 @@ fn cancellation_is_typed_and_nothing_partial_publishes() {
         .arg(&vendor)
         .arg("--output")
         .arg(&out)
+        .arg("--ready-file")
+        .arg(&ready)
         .current_dir(root())
         .spawn()
         .expect("spawn generator");
-    // Cancel promptly; the fixed observation points are per-file. The signal
-    // goes through /bin/kill (the house drill pattern — no libc dependency).
+    // A signal sent during Python startup has the interpreter's default
+    // disposition and exits 1 with KeyboardInterrupt, before the generator can
+    // type it. Wait until the generator has installed both handlers; then use
+    // /bin/kill (the house drill pattern — no libc dependency). The bounded
+    // wait refuses a broken handshake instead of hanging the workspace suite.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            child.try_wait().expect("poll generator").is_none(),
+            "the generator exited before publishing cancellation readiness"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the generator did not publish cancellation readiness within five seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let _ = std::process::Command::new("kill")
         .arg("-INT")
         .arg(child.id().to_string())

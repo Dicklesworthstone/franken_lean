@@ -385,7 +385,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// the TLS bin remains borrowed, so the named test pins the production fallback's one-tick law.
 /// 97 -> 117 with the campaign's twenty audited native-cell resolvers (see the
 /// RESOLVING_CITATION_TOKENS and PROSE_EVIDENCE_ROWS histories, this change).
-const SYMBOL_RESOLVED_ROWS: usize = 117;
+/// 117 -> 120 after the apply tail: FLN-UL-0530, FLN-UL-0532, and FLN-UL-0533
+/// each cite `export_stdio_routes_nonfatal_panic_through_the_current_stderr_stream`,
+/// the exact boundary test their foreign-stream and environment-guard paths support.
+const SYMBOL_RESOLVED_ROWS: usize = 120;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -458,7 +461,10 @@ const SYMBOL_RESOLVED_ROWS: usize = 117;
 /// row's suite column (the error-string, stdin, panic-stream, once/task,
 /// decoder, dbg/mk, and string-tail cells) — audited row by row, all
 /// resolving to #[test] fns that run under plain cargo test.
-const RESOLVING_CITATION_TOKENS: usize = 142;
+/// 142 -> 145 at `e4625801` and `73826919`: the three symbol-resolved rows
+/// named above each add the same exact panic-stream test citation; no existing
+/// resolving token was removed or renamed.
+const RESOLVING_CITATION_TOKENS: usize = 145;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -489,13 +495,17 @@ const RESOLVING_CITATION_TOKENS: usize = 142;
 /// the campaign's named native cells (audited in RESOLVING_CITATION_TOKENS above); the
 /// prose growth is the getLine/handle-ctl/fs/uv/temp/metadata/env/exit/errstr/float/
 /// string-plane rows whose evidence is suite-phrase prose exactly as the stdio plane's.
-const PROSE_EVIDENCE_ROWS: usize = 388;
+/// 388 -> 405 across `a183a7aa`, `dcb65dcf`, and `73826919`: fourteen apply-tail
+/// export rows, the timeit and allocprof rows, and the backtrace implementation row
+/// carry suite-phrase or corpus-fact evidence. The separately landed foreign-stream
+/// cell and its two environment guards are the three symbol-side rows above.
+const PROSE_EVIDENCE_ROWS: usize = 405;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 506 rows: 1 cites an e2e lane, 117 carry \
-symbol-resolved evidence, and 388 remain prose; 142 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 526 rows: 1 cites an e2e lane, 120 carry \
+symbol-resolved evidence, and 405 remain prose; 145 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\
