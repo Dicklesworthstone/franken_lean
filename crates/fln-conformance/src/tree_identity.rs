@@ -411,6 +411,11 @@ pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
          naming the repair, and the decoy's own format string",
     ),
     (
+        "crates/fln/src/lib.rs",
+        "the public olean facade tests resolve the invoking crate directory at run time so a \
+         shared target cannot bake another checkout's pinned artifact into the test binary",
+    ),
+    (
         "crates/fln-syntax/tests/golden_vellum.rs",
         "the VDI4.1 Git audit reads CARGO_MANIFEST_DIR only at run time so a shared target cannot \
          bake another checkout's evidence root into this test binary",

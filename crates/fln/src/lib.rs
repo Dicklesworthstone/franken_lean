@@ -1732,9 +1732,12 @@ mod tests {
     }
 
     fn olean_fixture(name: &str) -> Vec<u8> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tribunal/fixtures/c3")
-            .join(name);
+        // Resolve the invoking tree at run time. A cached test binary from a
+        // different checkout must never silently read that checkout's fixture.
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("cargo identifies the invoking crate directory");
+        let path = manifest_dir.join("../../tribunal/fixtures/c3").join(name);
         std::fs::read(&path)
             .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
     }
