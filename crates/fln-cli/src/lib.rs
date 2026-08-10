@@ -29,18 +29,18 @@ use std::path::{Path, PathBuf};
 /// the codec's own structural budgets take over.
 pub const OLEAN_INSPECT_DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
 
-/// Default whole-file ceiling for the current bounded source runner.
+/// Default aggregate source ceiling for the current bounded source runner.
 pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 
 /// Native stack provided to the kernel worker used by `fln run`.
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/1";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/2";
 
 const USAGE: &str = concat!(
     "Usage:\n",
-    "  fln run [--json] [--max-bytes BYTES] PATH\n",
+    "  fln run [--json] [--max-bytes BYTES] PATH...\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
@@ -48,10 +48,12 @@ const USAGE: &str = concat!(
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
     "\n",
-    "`run` executes one currently supported closed Nat definition through the\n",
-    "native parser, elaborator, K1, independent checker, compiler, and Golem.\n",
-    "It is not general Lean, Prelude/import processing, a project build, or\n",
-    "evidence that `check-olean` is complete.\n",
+    "`run` executes one supported Nat definition per path, in dependency order,\n",
+    "through the native parser, elaborator, K1, independent checker, compiler,\n",
+    "and Golem. The final path must produce the closed Nat result to report. The\n",
+    "batch is atomic, and --max-bytes bounds all source inputs together. It is\n",
+    "not general Lean, Prelude/import processing, a project build, or evidence\n",
+    "that `check-olean` is complete.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -85,7 +87,7 @@ enum MultiplexerCommand {
     Help,
     Version,
     SourceRun {
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
     },
@@ -197,8 +199,8 @@ fn parse_path_options(
     arguments: Vec<OsString>,
     command: &'static str,
     default_max_bytes: usize,
-) -> Result<Option<(PathBuf, usize, bool)>, UsageError> {
-    let mut path = None;
+) -> Result<Option<(Vec<PathBuf>, usize, bool)>, UsageError> {
+    let mut paths = Vec::new();
     let mut max_bytes = default_max_bytes;
     let mut json = false;
     let mut options = true;
@@ -237,38 +239,41 @@ fn parse_path_options(
                 argument.to_string_lossy()
             )));
         }
-        if path.replace(PathBuf::from(&argument)).is_some() {
-            return Err(UsageError(format!(
-                "{command} accepts exactly one input path"
-            )));
-        }
+        paths.push(PathBuf::from(argument));
     }
 
-    let path = path.ok_or_else(|| UsageError(format!("{command} requires PATH")))?;
-    Ok(Some((path, max_bytes, json)))
+    if paths.is_empty() {
+        return Err(UsageError(format!("{command} requires PATH")));
+    }
+    Ok(Some((paths, max_bytes, json)))
 }
 
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let Some((path, max_bytes, json)) =
+    let Some((paths, max_bytes, json)) =
         parse_path_options(arguments, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?
     else {
         return Ok(MultiplexerCommand::Help);
     };
     Ok(MultiplexerCommand::SourceRun {
-        path,
+        paths,
         max_bytes,
         json,
     })
 }
 
 fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let Some((path, max_bytes, json)) =
+    let Some((paths, max_bytes, json)) =
         parse_path_options(arguments, "olean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
     else {
         return Ok(MultiplexerCommand::Help);
     };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "olean inspect accepts exactly one input path".to_owned(),
+        ));
+    };
     Ok(MultiplexerCommand::OleanInspect {
-        path,
+        path: path.clone(),
         max_bytes,
         json,
     })
@@ -479,8 +484,9 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
 }
 
 struct SourceSuccess<'a> {
+    definitions: usize,
     source_bytes: usize,
-    value: usize,
+    final_value: usize,
     flbc_bytes: usize,
     base_root: &'a str,
     result_root: &'a str,
@@ -496,18 +502,22 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
-                "\"sourceBytes\":{},\"value\":{},\"flbcBytes\":{},",
+                "\"definitions\":{},\"sourceBytes\":{},\"finalValue\":{},",
+                "\"flbcBytes\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
-                "\"checker\":{{\"schema\":{},\"ground\":{}}},",
-                "\"execution\":{{\"steps\":{},\"systemPolls\":{},",
+                "\"checker\":{{\"definitions\":{},\"finalSchema\":{},",
+                "\"finalGround\":{}}},",
+                "\"finalExecution\":{{\"steps\":{},\"systemPolls\":{},",
                 "\"peakStackDepth\":{}}}}}\n"
             ),
             json_string(SOURCE_RUN_SCHEMA),
+            result.definitions,
             result.source_bytes,
-            result.value,
+            result.final_value,
             result.flbc_bytes,
             json_string(result.base_root),
             json_string(result.result_root),
+            result.definitions,
             json_string(result.checker_schema),
             json_string(result.checker_ground),
             result.steps,
@@ -517,20 +527,23 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
     } else {
         format!(
             concat!(
-                "native source run: complete\n",
-                "value: {}\n",
+                "native source batch: complete\n",
+                "definitions: {}\n",
+                "final value: {}\n",
                 "source bytes: {}\n",
-                "canonical FLBC bytes: {}\n",
+                "canonical FLBC bytes: {} total\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
-                "independent checker: {} ({})\n",
-                "execution: {} steps, {} system polls, peak stack {}\n"
+                "independent checker: {} definitions agreed; final {} ({})\n",
+                "final execution: {} steps, {} system polls, peak stack {}\n"
             ),
-            result.value,
+            result.definitions,
+            result.final_value,
             result.source_bytes,
             result.flbc_bytes,
             result.base_root,
             result.result_root,
+            result.definitions,
             result.checker_schema,
             result.checker_ground,
             result.steps,
@@ -587,8 +600,41 @@ fn source_terminal(
     source_failure(class, &detail, true, json, 1)
 }
 
-fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
-    let source_bytes = source.len();
+fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static str, bool, u8) {
+    match error {
+        fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
+        fln::EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),
+        fln::EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+        fln::EngineExecutionError::CheckerBridge { .. }
+        | fln::EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
+        _ => ("execution", true, 1),
+    }
+}
+
+fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput {
+    let Some(source_bytes) = sources
+        .iter()
+        .try_fold(0_usize, |total, source| total.checked_add(source.len()))
+    else {
+        return source_failure(
+            "resource",
+            "aggregate source byte count exceeded this platform",
+            false,
+            json,
+            3,
+        );
+    };
+    let mut source_refs = Vec::new();
+    if source_refs.try_reserve_exact(sources.len()).is_err() {
+        return source_failure(
+            "resource",
+            "could not reserve the bounded source batch table",
+            false,
+            json,
+            3,
+        );
+    }
+    source_refs.extend(sources.iter().map(Vec::as_slice));
     let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
     let engine = match fln::Engine::with_nat_seed(kernel_budget) {
         Ok(engine) => engine,
@@ -602,21 +648,14 @@ fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
         }
     };
     let options = fln::KVMap::new();
-    let execution = match engine.execute_nat_definition(
-        &source,
+    let execution = match engine.execute_nat_definitions(
+        &source_refs,
         &options,
         fln::EngineExecutionLimits::new(kernel_budget),
     ) {
         Ok(execution) => execution,
         Err(error) => {
-            let (class, authority, exit_code) = match &error {
-                fln::EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
-                fln::EngineExecutionError::CheckerBridge { .. }
-                | fln::EngineExecutionError::UnexpectedPublication { .. } => {
-                    ("internal-fault", false, 4)
-                }
-                _ => ("execution", true, 1),
-            };
+            let (class, authority, exit_code) = execution_error_disposition(&error);
             return source_failure(class, &error.to_string(), authority, json, exit_code);
         }
     };
@@ -629,48 +668,129 @@ fn execute_source_bytes(source: Vec<u8>, json: bool) -> MultiplexerOutput {
             return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
         }
     };
+    let definitions = completed.executions.len();
+    let Some(final_execution) = completed.executions.last() else {
+        return source_failure(
+            "internal-fault",
+            "completed source batch contained no definition executions",
+            false,
+            json,
+            4,
+        );
+    };
+    let Some(flbc_bytes) = completed
+        .executions
+        .iter()
+        .try_fold(0_usize, |total, execution| {
+            total.checked_add(execution.flbc_artifact.len())
+        })
+    else {
+        return source_failure(
+            "internal-fault",
+            "completed source batch artifact byte count overflowed",
+            false,
+            json,
+            4,
+        );
+    };
+    for (index, execution) in completed.executions.iter().enumerate() {
+        match &execution.exit {
+            fln::VmExit::Returned(_) => {}
+            fln::VmExit::Panicked { message, usage } => {
+                return source_terminal(
+                    "program-panic",
+                    &format!("definition batch command {index} panicked: {message}"),
+                    usage.steps,
+                    usage.system_polls,
+                    usage.peak_stack_depth,
+                    json,
+                );
+            }
+            fln::VmExit::Refused { refusal, usage } => {
+                return source_terminal(
+                    "vm-refusal",
+                    &format!("definition batch command {index} was refused: {refusal}"),
+                    usage.steps,
+                    usage.system_polls,
+                    usage.peak_stack_depth,
+                    json,
+                );
+            }
+        }
+    }
     let base_root = completed.base_logical_root.to_string();
     let result_root = completed.result_logical_root.to_string();
-    let checker_ground = checker_ground_name(completed.checker.ground);
-    let flbc_bytes = completed.flbc_artifact.len();
-    match completed.exit {
-        fln::VmExit::Returned(returned) => render_source_success(
-            SourceSuccess {
-                source_bytes,
-                value: returned.value.unbox(),
-                flbc_bytes,
-                base_root: &base_root,
-                result_root: &result_root,
-                checker_schema: completed.checker.schema,
-                checker_ground,
-                steps: returned.usage.steps,
-                system_polls: returned.usage.system_polls,
-                peak_stack_depth: returned.usage.peak_stack_depth,
-            },
+    let checker_ground = checker_ground_name(final_execution.checker.ground);
+    let fln::VmExit::Returned(returned) = &final_execution.exit else {
+        return source_failure(
+            "internal-fault",
+            "non-returning final execution escaped source batch refusal handling",
+            false,
             json,
-        ),
-        fln::VmExit::Panicked { message, usage } => source_terminal(
-            "program-panic",
-            &message,
-            usage.steps,
-            usage.system_polls,
-            usage.peak_stack_depth,
+            4,
+        );
+    };
+    if !returned.value.is_scalar() {
+        return source_failure(
+            "execution",
+            "final definition did not produce a closed Nat scalar",
+            true,
             json,
-        ),
-        fln::VmExit::Refused { refusal, usage } => source_terminal(
-            "vm-refusal",
-            &refusal.to_string(),
-            usage.steps,
-            usage.system_polls,
-            usage.peak_stack_depth,
-            json,
-        ),
+            1,
+        );
     }
+    render_source_success(
+        SourceSuccess {
+            definitions,
+            source_bytes,
+            final_value: returned.value.unbox(),
+            flbc_bytes,
+            base_root: &base_root,
+            result_root: &result_root,
+            checker_schema: final_execution.checker.schema,
+            checker_ground,
+            steps: returned.usage.steps,
+            system_polls: returned.usage.system_polls,
+            peak_stack_depth: returned.usage.peak_stack_depth,
+        },
+        json,
+    )
 }
 
-fn run_source(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
-    let source = match read_bounded(path, max_bytes, "source file") {
-        Ok(source) => source,
+fn read_source_batch(
+    paths: &[PathBuf],
+    max_bytes: usize,
+) -> Result<Vec<Vec<u8>>, BoundedReadFailure> {
+    let mut sources = Vec::new();
+    let mut source_bytes = 0_usize;
+    for path in paths {
+        let remaining = max_bytes.saturating_sub(source_bytes);
+        let source = match read_bounded(path, remaining, "source batch") {
+            Ok(source) => source,
+            Err(BoundedReadFailure::TooLarge { observed, .. }) => {
+                return Err(BoundedReadFailure::TooLarge {
+                    subject: "source batch",
+                    observed: source_bytes.saturating_add(observed),
+                    limit: max_bytes,
+                });
+            }
+            Err(BoundedReadFailure::Allocation { requested, .. }) => {
+                return Err(BoundedReadFailure::Allocation {
+                    subject: "source batch",
+                    requested: source_bytes.saturating_add(requested),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        source_bytes = source_bytes.saturating_add(source.len());
+        sources.push(source);
+    }
+    Ok(sources)
+}
+
+fn run_sources(paths: &[PathBuf], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let sources = match read_source_batch(paths, max_bytes) {
+        Ok(sources) => sources,
         Err(error) => {
             let exit_code = if error.class() == "resource" { 3 } else { 1 };
             return source_failure(error.class(), &error.to_string(), false, json, exit_code);
@@ -679,7 +799,7 @@ fn run_source(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
     let worker = match std::thread::Builder::new()
         .name("fln-source-run".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
-        .spawn(move || execute_source_bytes(source, json))
+        .spawn(move || execute_source_bytes(sources, json))
     {
         Ok(worker) => worker,
         Err(error) => {
@@ -713,10 +833,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             MultiplexerOutput::success(format!("fln {}\n", env!("CARGO_PKG_VERSION")))
         }
         Ok(MultiplexerCommand::SourceRun {
-            path,
+            paths,
             max_bytes,
             json,
-        }) => run_source(&path, max_bytes, json),
+        }) => run_sources(&paths, max_bytes, json),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
@@ -1158,8 +1278,8 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        OLEAN_INSPECT_SCHEMA, SOURCE_RUN_SCHEMA, inspect_olean_bytes, read_bounded_from, run,
-        source_failure,
+        OLEAN_INSPECT_SCHEMA, SOURCE_RUN_SCHEMA, execute_source_bytes, execution_error_disposition,
+        inspect_olean_bytes, read_bounded_from, run, source_failure,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -1226,8 +1346,9 @@ mod tests {
         let human = run([OsString::from("run"), source.clone().into_os_string()]);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stderr.is_empty());
-        assert!(human.stdout.contains("native source run: complete"));
-        assert!(human.stdout.contains("value: 0\n"));
+        assert!(human.stdout.contains("native source batch: complete"));
+        assert!(human.stdout.contains("definitions: 1\n"));
+        assert!(human.stdout.contains("final value: 0\n"));
         assert!(human.stdout.contains("independent checker:"));
 
         let robot = run([
@@ -1244,11 +1365,110 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"outcome\":\"complete\""));
         assert!(robot.stdout.contains("\"authority\":true"));
-        assert!(robot.stdout.contains("\"value\":0"));
+        assert!(robot.stdout.contains("\"definitions\":1"));
+        assert!(robot.stdout.contains("\"finalValue\":0"));
         assert!(
             robot
                 .stdout
-                .contains("\"ground\":\"body-checked-against-declared-type\"")
+                .contains("\"finalGround\":\"body-checked-against-declared-type\"")
+        );
+    }
+
+    #[test]
+    fn source_run_executes_multiple_real_paths_in_order() {
+        let root = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
+        let same = repository_path("vendor/lean4-src/tests/pkg/mod_clash/depA/Same.lean");
+        let output = run([
+            OsString::from("run"),
+            OsString::from("--json"),
+            root.clone().into_os_string(),
+            same.clone().into_os_string(),
+        ]);
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"definitions\":2"));
+        assert!(output.stdout.contains("\"sourceBytes\":28"));
+        assert!(output.stdout.contains("\"finalValue\":0"));
+        assert!(output.stdout.contains("\"definitions\":2,\"finalSchema\""));
+
+        let exhausted = run([
+            OsString::from("run"),
+            OsString::from("--json"),
+            OsString::from("--max-bytes=14"),
+            root.into_os_string(),
+            same.into_os_string(),
+        ]);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"authority\":false"));
+        assert!(exhausted.stderr.contains("14-byte input limit"));
+        assert!(exhausted.stderr.contains("28 bytes"));
+    }
+
+    #[test]
+    fn source_run_worker_executes_a_dependent_definition_batch() {
+        let output = execute_source_bytes(
+            vec![
+                b"def first (x y : Nat) : Nat := x".to_vec(),
+                b"def selected : Nat := first 17 29".to_vec(),
+            ],
+            true,
+        );
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"definitions\":2"));
+        assert!(output.stdout.contains("\"finalValue\":17"));
+        assert!(output.stdout.contains("\"authority\":true"));
+    }
+
+    #[test]
+    fn source_run_refuses_a_nonclosed_final_definition_without_panicking() {
+        let output = execute_source_bytes(vec![b"def first (x y : Nat) : Nat := x".to_vec()], true);
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("\"authority\":true"));
+        assert!(output.stderr.contains("\"class\":\"execution\""));
+        assert!(
+            output
+                .stderr
+                .contains("final definition did not produce a closed Nat scalar")
+        );
+    }
+
+    #[test]
+    fn source_run_preserves_nested_nonanswers_and_internal_faults() {
+        let inconclusive = fln::EngineExecutionError::BatchCommand {
+            index: 1,
+            error: Box::new(fln::EngineExecutionError::CouncilHalted {
+                summary: "independent checker did not answer".to_owned(),
+            }),
+        };
+        assert_eq!(
+            execution_error_disposition(&inconclusive),
+            ("inconclusive", false, 3)
+        );
+
+        let internal = fln::EngineExecutionError::BatchCommand {
+            index: 1,
+            error: Box::new(fln::EngineExecutionError::CheckerBridge {
+                detail: "projection mismatch".to_owned(),
+            }),
+        };
+        assert_eq!(
+            execution_error_disposition(&internal),
+            ("internal-fault", false, 4)
+        );
+
+        let exhausted = fln::EngineExecutionError::AllocationFailure {
+            resource: "definition batch results",
+            requested: usize::MAX,
+        };
+        assert_eq!(
+            execution_error_disposition(&exhausted),
+            ("resource", false, 3)
         );
     }
 
