@@ -245,3 +245,156 @@ fn imax_field_permits_large_elimination() {
          its motive universe (bead franken_lean-d17i); got {verdict:?}"
     );
 }
+
+/// The `Acc`-shaped RECURSIVE reproducer: `W (α : Sort u) : Prop` with
+/// `W.sup : (α → W α) → W α`. The field `α → W α` has sort `imax u 0` AND is a
+/// reflexive recursive occurrence, so admission exercises the induction-hypothesis
+/// generation and the recursive iota right-hand side (`mk_rec_rules`) that the
+/// non-recursive `T` never reaches — the path the real `Acc`/`WellFounded` block
+/// takes. Same defect: pre-`bbb464f1`, the `imax u 0` field reads as data and the
+/// recursor loses its motive universe.
+fn w_block(u: &Name, mu: &Name) -> InductiveBlock {
+    let w = || Expr::const_(n("W"), vec![Level::param(u.clone())]);
+    let wsup = || Expr::const_(nn("W", "sup"), vec![Level::param(u.clone())]);
+    let wrec = || {
+        Expr::const_(
+            nn("W", "rec"),
+            vec![Level::param(mu.clone()), Level::param(u.clone())],
+        )
+    };
+
+    // W : ∀ (α : Sort u), Prop
+    let w_type = forall("α", sort(Level::param(u.clone())), prop());
+
+    // W.sup : ∀ (α : Sort u) (f : α → W α), W α
+    //   f's type at α=bvar0: ∀ (_ : α[bvar0]), W α[bvar1]
+    let sup_field = forall("_a", bvar(0), Expr::app(w(), bvar(1)));
+    let sup_type = forall(
+        "α",
+        sort(Level::param(u.clone())),
+        forall("f", sup_field, Expr::app(w(), bvar(1))), // result W α, α=bvar1
+    );
+
+    // W.rec.{mu,u} : {α} {motive : W α → Sort mu}
+    //   (sup : ∀ (f : α → W α) (ih : ∀ a, motive (f a)), motive (W.sup α f)) {t : W α}, motive t
+    let motive_ty = forall("t", Expr::app(w(), bvar(0)), sort(Level::param(mu.clone()))); // α=bvar0
+    // minor sup, scope α=bvar1 motive=bvar0
+    let sup_f_ty = forall("_a", bvar(1), Expr::app(w(), bvar(2)));
+    // ih : ∀ (a : α), motive (f a); scope α=2 motive=1 f=0, under a: motive=2 f=1 a=0
+    let sup_ih_ty = forall("a", bvar(2), Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))));
+    // result motive (W.sup α f); scope α=3 motive=2 f=1 ih=0
+    let sup_result = Expr::app(bvar(2), Expr::app(Expr::app(wsup(), bvar(3)), bvar(1)));
+    let sup_minor_ty = forall("f", sup_f_ty, forall("f_ih", sup_ih_ty, sup_result));
+    let major_ty = Expr::app(w(), bvar(2)); // t : W α; scope α=2 motive=1 sup=0
+    let rec_result = Expr::app(bvar(2), bvar(0)); // motive t; scope α=3 motive=2 sup=1 t=0
+    let rec_type = forall_impl(
+        "α",
+        sort(Level::param(u.clone())),
+        forall_impl(
+            "motive",
+            motive_ty,
+            forall("sup", sup_minor_ty, forall("t", major_ty, rec_result)),
+        ),
+    );
+
+    // iota rhs: fun α motive sup f => sup f (fun a => W.rec α motive sup (f a))
+    let rhs_motive_ty = forall("t", Expr::app(w(), bvar(0)), sort(Level::param(mu.clone())));
+    let rhs_sup_f_ty = forall("_a", bvar(1), Expr::app(w(), bvar(2)));
+    let rhs_sup_ih_ty = forall("a", bvar(2), Expr::app(bvar(2), Expr::app(bvar(1), bvar(0))));
+    let rhs_sup_result = Expr::app(bvar(2), Expr::app(Expr::app(wsup(), bvar(3)), bvar(1)));
+    let rhs_sup_ty = forall("f", rhs_sup_f_ty, forall("f_ih", rhs_sup_ih_ty, rhs_sup_result));
+    // f's type at scope α=2 motive=1 sup=0: ∀(_:α[bvar2]), W α[bvar3]
+    let rhs_f_ty = forall("_a", bvar(2), Expr::app(w(), bvar(3)));
+    // ih_value = fun (a : α) => W.rec α motive sup (f a); a:α=bvar3, under a shift +1
+    let ih_value = lam(
+        "a",
+        bvar(3),
+        Expr::app(
+            Expr::app(Expr::app(Expr::app(wrec(), bvar(4)), bvar(3)), bvar(2)),
+            Expr::app(bvar(1), bvar(0)),
+        ),
+    );
+    // body: sup f ih_value; sup=bvar1 f=bvar0
+    let rhs_body = Expr::app(Expr::app(bvar(1), bvar(0)), ih_value);
+    let rhs = lam(
+        "α",
+        sort(Level::param(u.clone())),
+        lam(
+            "motive",
+            rhs_motive_ty,
+            lam("sup", rhs_sup_ty, lam("f", rhs_f_ty, rhs_body)),
+        ),
+    );
+
+    let recursor = RecursorVal {
+        base: ConstantVal {
+            name: nn("W", "rec"),
+            level_params: vec![mu.clone(), u.clone()],
+            type_: rec_type,
+        },
+        all: vec![n("W")],
+        num_params: 1,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 1,
+        rules: vec![RecursorRule {
+            ctor: nn("W", "sup"),
+            nfields: 1,
+            rhs,
+        }],
+        k: false,
+        is_unsafe: false,
+    };
+
+    InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: n("W"),
+                level_params: vec![u.clone()],
+                type_: w_type,
+            },
+            num_params: 1,
+            num_indices: 0,
+            all: vec![n("W")],
+            ctors: vec![nn("W", "sup")],
+            num_nested: 0,
+            is_rec: true,
+            is_unsafe: false,
+            is_reflexive: true,
+        }],
+        ctors: vec![ConstructorVal {
+            base: ConstantVal {
+                name: nn("W", "sup"),
+                level_params: vec![u.clone()],
+                type_: sup_type,
+            },
+            induct: n("W"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 1,
+            is_unsafe: false,
+        }],
+        recursors: vec![recursor],
+    }
+}
+
+#[test]
+fn recursive_imax_field_permits_large_elimination() {
+    let u = n("u");
+    let mu = n("u_1");
+    let block = w_block(&u, &mu);
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(block),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "W (Acc-shaped recursive Prop) with an `imax u 0` recursive field must permit \
+         large elimination via the recursive recursor path (bead franken_lean-d17i); \
+         got {verdict:?}"
+    );
+}
