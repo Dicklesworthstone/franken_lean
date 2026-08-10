@@ -6,7 +6,7 @@
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed
 //! bounded Nat definition, explicit first-order `Nat` function, application, or
-//! local let becomes a real [`Declaration::Defn`] and is handed to Crucible's
+//! local let chain becomes a real [`Declaration::Defn`] and is handed to Crucible's
 //! sole check authority.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
@@ -672,13 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn source_let_becomes_a_nat_typed_core_let_expression() {
+    fn source_let_chain_becomes_nested_nat_typed_core_let_expressions() {
         let result = check_nat_definition_source(
-            b"def answer : Nat := let x := 41; x",
+            b"def answer : Nat := let x := 41; let y := x; y",
             &nat_environment(),
             Budget::DEFAULT,
         )
-        .expect("the bounded Nat let grammar elaborates");
+        .expect("the bounded Nat let chain elaborates");
         assert!(matches!(
             result.outcome,
             Outcome::Complete(Verdict::Accepted { .. })
@@ -691,9 +691,15 @@ mod tests {
             definition.value,
             Expr::let_e(
                 Name::from_components(["x"]),
-                nat,
+                nat.clone(),
                 Expr::lit(Literal::Nat(NatLit::from_u64(41))),
-                Expr::bvar(0).expect("one local binder fits the expression covenant"),
+                Expr::let_e(
+                    Name::from_components(["y"]),
+                    nat,
+                    Expr::bvar(0).expect("the outer local fits the expression covenant"),
+                    Expr::bvar(0).expect("the inner local fits the expression covenant"),
+                    false,
+                ),
                 false,
             )
         );

@@ -128,7 +128,7 @@ impl Engine {
     /// and execute one bounded Nat-valued definition command. The declaration
     /// may have explicit `Nat` parameters; its body may be a natural literal, a
     /// reference, or a saturated identifier-headed application of those atom
-    /// forms, optionally under one non-recursive local `Nat` let.
+    /// forms, optionally under a chain of non-recursive local `Nat` lets.
     ///
     /// The publication council is explicitly empty because no independent
     /// checker is configured on this bounded facade yet. This is a real K1
@@ -1382,13 +1382,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_source_batch_composes_first_order_nat_functions() {
+    fn bounded_source_batch_composes_first_order_nat_functions_through_a_let_chain() {
         let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
         let options = KVMap::new();
         let sources: [&[u8]; 3] = [
             b"def first (x y : Nat) : Nat := x",
             b"def choose (x : Nat) : Nat := first x 29",
-            b"def selected : Nat := let input := 17; choose input",
+            b"def selected : Nat := let input := 17; let copied := input; choose copied",
         ];
         let completed = engine
             .execute_nat_definitions(&sources, &options, test_limits())
