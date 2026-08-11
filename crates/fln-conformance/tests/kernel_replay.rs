@@ -69,7 +69,7 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{InconclusiveCause, Outcome, ResourceUsage};
-use fln_env::constants::{ConstantInfo, DefinitionSafety};
+use fln_env::constants::{ConstantInfo, ConstantVal, DefinitionSafety, OpaqueVal};
 use fln_env::decl_closure::{
     self, DeclClosureBudget, DeclClosureInput, DeclClosureStatus, MissingConstantFinding,
 };
@@ -317,15 +317,38 @@ fn reduction_gap_family(name: &Name) -> &'static str {
 
 /// The kernel `Declaration` for a singleton-unit constant. Definitions of
 /// EVERY safety level check (bead franken_lean-ap6: unsafe definitions take
-/// the pin's two-phase path, partial definitions the safe path). `None` only
-/// for kinds with no admission rule yet (opaques — none in Init.Prelude).
+/// the pin's two-phase path, partial definitions the safe path). Inductive and
+/// quotient members are assembled into their block envelopes by
+/// `prepare_replay_from`; every remaining singleton kind has a kernel envelope.
 fn as_declaration(info: &ConstantInfo) -> Option<Declaration> {
     match info {
         ConstantInfo::Axiom(v) => Some(Declaration::Axiom(v.clone())),
         ConstantInfo::Thm(v) => Some(Declaration::Thm(v.clone())),
         ConstantInfo::Defn(v) => Some(Declaration::Defn(v.clone())),
+        ConstantInfo::Opaque(v) => Some(Declaration::Opaque(v.clone())),
         _ => None,
     }
+}
+
+#[test]
+fn singleton_opaque_reaches_the_existing_kernel_admission_envelope() {
+    let name = Name::str(Name::anonymous(), "opaqueAdapterProbe");
+    let opaque = OpaqueVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: Vec::new(),
+            type_: Expr::sort(fln_core::level::Level::zero()),
+        },
+        value: Expr::sort(fln_core::level::Level::zero()),
+        is_unsafe: false,
+        all: vec![name],
+    };
+
+    assert_eq!(
+        as_declaration(&ConstantInfo::Opaque(opaque.clone())),
+        Some(Declaration::Opaque(opaque)),
+        "the replay adapter must not bypass the kernel's existing opaque admission rule"
+    );
 }
 
 /// Locate the pinned Reference stdlib. Override with FLN_REFERENCE_LIB; the
