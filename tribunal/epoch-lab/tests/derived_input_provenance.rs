@@ -900,13 +900,13 @@ fn real_closure() -> fln_epoch_lab::derive::ClosureAvailability {
 }
 
 #[test]
-fn no_classification_row_is_contradicted_by_the_reviewed_crate_map() {
-    // The premise check. `ci/WORKSPACE_GRAPH.txt` is authored and reviewed
-    // elsewhere, so where it CAN witness a row it is a genuinely independent
-    // source. A contradiction means one of the two is wrong and the scan cannot
-    // tell which, so neither may be trusted.
+fn the_product_closure_names_every_currently_unwired_product_crate() {
+    // The first product binary makes the dependency closure a real second
+    // source. Its disagreements are the current integration backlog: policy
+    // says these crates belong to a release, while no product binary reaches
+    // them yet. Keep the exact set visible until real wiring removes each row.
     let rows = corroborated_rows();
-    let bad: Vec<_> = rows
+    let contradicted: Vec<&str> = rows
         .iter()
         .filter(|r| {
             matches!(
@@ -914,10 +914,26 @@ fn no_classification_row_is_contradicted_by_the_reviewed_crate_map() {
                 fln_epoch_lab::derive::Corroboration::Contradicted { .. }
             )
         })
+        .map(|r| r.crate_name.as_str())
         .collect();
-    assert!(
-        bad.is_empty(),
-        "the crate map contradicts the policy: {bad:?}"
+    assert_eq!(
+        contradicted,
+        [
+            "fln-anvil",
+            "fln-doc",
+            "fln-hound",
+            "fln-lake",
+            "fln-ledger",
+            "fln-libm",
+            "fln-mcp",
+            "fln-server",
+            "fln-trace",
+            "fln-tui",
+            "fln-unsafe-jit",
+            "fln-verdict",
+            "fln-wasm",
+        ],
+        "the product-wiring gap set moved; review whether real integration landed or regressed"
     );
     assert_eq!(rows.len(), 33, "every crate must have a standing");
 }
@@ -927,8 +943,9 @@ fn the_crate_map_is_not_read_as_a_shippability_oracle() {
     // The correction this cross-check produced. `kind=ordinary` means "a ranked
     // product crate under crates/" — a LAYERING fact. Reading it as "shippable"
     // conflates two vocabularies, and doing so would have reported two false
-    // disagreements (fln-bench, fln-conformance) and hidden the real situation,
-    // which is that the crate map simply cannot witness those rows.
+    // disagreements (fln-bench, fln-conformance) and hidden the real situation.
+    // The dependency closure now gives these rows a separate standing, but the
+    // crate map's ordinary/unsafe-boundary vocabulary still must not do so.
     let rows = corroborated_rows();
     for name in ["fln-bench", "fln-conformance", "fln-kernel"] {
         let r = rows
@@ -936,29 +953,33 @@ fn the_crate_map_is_not_read_as_a_shippability_oracle() {
             .find(|r| r.crate_name == name)
             .unwrap_or_else(|| panic!("{name} missing"));
         assert!(
-            matches!(
-                r.standing,
-                fln_epoch_lab::derive::Corroboration::SingleSource { .. }
-            ),
-            "{name} was given a standing the crate map cannot support: {:?}",
+            r.standing
+                .witnesses()
+                .iter()
+                .all(|w| w.source != "ci/WORKSPACE_GRAPH.txt kind=tool"),
+            "{name} was given a witness the crate map's kind cannot support: {:?}",
             r.standing
         );
     }
-    // And where it CAN witness, it does: the one tool crate is corroborated.
+    // And where it CAN witness, it does: the one tool crate carries that
+    // witness as well as the now-available dependency-closure witness.
     let sg = rows
         .iter()
         .find(|r| r.crate_name == "structure-guard")
         .expect("structure-guard missing");
-    assert!(matches!(
-        sg.standing,
-        fln_epoch_lab::derive::Corroboration::Corroborated { .. }
-    ));
+    assert!(
+        sg.standing
+            .witnesses()
+            .iter()
+            .any(|w| w.source == "ci/WORKSPACE_GRAPH.txt kind=tool")
+    );
 }
 
 #[test]
-fn the_single_source_rows_are_counted_and_named_not_assumed_away() {
-    // A classification that only one derivation produces is an opinion with
-    // good hygiene. The weakness must be a number on the page.
+fn the_product_closure_eliminates_every_single_source_row() {
+    // The first product binary activates a complete second source. No row may
+    // remain in the old single-source state, and disagreements stay visible
+    // rather than being outvoted.
     let rows = corroborated_rows();
     let single = rows
         .iter()
@@ -969,37 +990,41 @@ fn the_single_source_rows_are_counted_and_named_not_assumed_away() {
             )
         })
         .count();
-    assert_eq!(single, 32, "the single-source count moved without review");
+    assert_eq!(single, 0, "the product closure failed to witness every row");
     let text = fln_epoch_lab::derive::corroboration_report(&rows);
-    assert!(text.contains("single_source=32"));
-    assert!(text.contains("corroborated=1"));
-    assert!(text.contains("verdict=no-contradiction"));
+    assert!(text.contains("single_source=0"));
+    assert!(text.contains("corroborated=20"));
+    assert!(text.contains("contradicted=13"));
+    assert!(text.contains("verdict=contradicted"));
 }
 
 #[test]
-fn the_rows_that_would_suppress_a_finding_are_named() {
+fn the_dependency_closure_clears_the_previous_oracle_suppression() {
     // THE HIGHEST-RISK ROWS IN THE CLASSIFICATION. A crate carrying a real
     // oracle edge, called development-only on one source's say-so, is doing all
     // the work of keeping the reachability scan clean. If that call is wrong
     // the scan reports Clean over a shippable target that reaches the
     // Reference — with full confidence, because the classification is its own
-    // premise. These get named, so a reviewer is told where to look.
+    // premise. The product closure now independently witnesses that
+    // fln-conformance is absent from the product, so the old suppression is
+    // resolved rather than silently forgotten.
     let rows = corroborated_rows();
     let suppressions = fln_epoch_lab::derive::uncorroborated_suppressions(&rows);
-    let names: Vec<&str> = suppressions.iter().map(|r| r.crate_name.as_str()).collect();
     assert!(
-        names.contains(&"fln-conformance"),
-        "fln-conformance carries an ORACLE_FALLBACK edge and is development-only \
-         on a single source; it must be flagged. got {names:?}"
+        suppressions.is_empty(),
+        "the product closure left an oracle-carrying development-only row unsupported: {suppressions:?}"
     );
+    let conformance = rows
+        .iter()
+        .find(|r| r.crate_name == "fln-conformance")
+        .expect("fln-conformance missing");
+    assert!(matches!(
+        conformance.standing,
+        fln_epoch_lab::derive::Corroboration::Corroborated { .. }
+    ));
     let text = fln_epoch_lab::derive::corroboration_report(&rows);
-    assert!(text.contains("uncorroborated-suppression crate=fln-conformance"));
-    // The count is asserted so a new suppression cannot appear silently.
-    assert_eq!(
-        suppressions.len(),
-        1,
-        "the set of finding-suppressing rows changed: {names:?}"
-    );
+    assert!(!text.contains("uncorroborated-suppression"));
+    assert!(text.contains("suppressions=0"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1074,41 @@ fn the_closure_derivation_is_correct_over_a_known_graph() {
 }
 
 #[test]
+fn reviewed_edge_comments_are_not_part_of_dependency_names() {
+    let root = scratch("reviewed-edge-comments");
+    let graph = root.join("WORKSPACE_GRAPH.txt");
+    std::fs::write(
+        &graph,
+        "schema fln-workspace-graph/1\n\
+         edge cli -> engine # the executable delegates to the engine\n\
+         edge engine -> core # the engine owns the core surface\n",
+    )
+    .expect("write graph");
+
+    let edges = fln_epoch_lab::derive::read_graph_edges(&graph).expect("read graph edges");
+    assert_eq!(
+        edges,
+        vec![
+            ("cli".to_string(), "engine".to_string()),
+            ("engine".to_string(), "core".to_string()),
+        ],
+        "review comments must not silently become dependency-name bytes"
+    );
+    match fln_epoch_lab::derive::derive_dependency_closure(&edges, &["cli".to_string()]) {
+        fln_epoch_lab::derive::ClosureAvailability::Available { reachable } => {
+            assert_eq!(
+                reachable,
+                ["cli", "core", "engine"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+        }
+        other => panic!("a nonempty reviewed graph was not available: {other:?}"),
+    }
+}
+
+#[test]
 fn an_empty_root_set_is_unavailable_not_the_answer_nothing_ships() {
     // THE TRAP THIS DERIVATION HAD TO AVOID. Returning the empty closure as a
     // positive answer would witness DevelopmentOnly for all 33 crates,
@@ -1070,26 +1130,45 @@ fn an_empty_root_set_is_unavailable_not_the_answer_nothing_ships() {
 }
 
 #[test]
-fn the_closure_is_honestly_unavailable_over_this_workspace_today() {
-    // The state of the tree, asserted so it is visible rather than assumed —
-    // and so that the day a product binary lands, this test fails and tells
-    // whoever landed it that a second source has just become available.
+fn the_real_product_binary_activates_the_dependency_closure() {
+    // `fln-cli` is the first real product binary. Pin both its root identity and
+    // the complete reachable set so a dropped or fake edge cannot silently
+    // rewrite the shippability evidence.
     use fln_epoch_lab::derive::ClosureAvailability;
     let graph_path = repo_root().join("ci/WORKSPACE_GRAPH.txt");
     let kinds = fln_epoch_lab::derive::read_graph_kinds(&graph_path).expect("readable");
     let targets = fln_epoch_lab::derive::derive_targets(&repo_root()).expect("readable");
     let roots = fln_epoch_lab::derive::product_binary_roots(targets.value(), &kinds);
-    assert!(
-        roots.is_empty(),
-        "a product binary now exists ({roots:?}) — the dependency-closure \
-         derivation has become available and every single-source row in \
-         SHIPPABILITY_POLICY.txt can now be independently witnessed. Wire it in \
-         and update fln-8fwh."
-    );
-    assert!(matches!(
-        real_closure(),
-        ClosureAvailability::Unavailable { .. }
-    ));
+    assert_eq!(roots, ["fln-cli"]);
+    match real_closure() {
+        ClosureAvailability::Available { reachable } => assert_eq!(
+            reachable,
+            [
+                "fln",
+                "fln-bignum",
+                "fln-checker",
+                "fln-cli",
+                "fln-comp",
+                "fln-core",
+                "fln-elab",
+                "fln-env",
+                "fln-hash",
+                "fln-kernel",
+                "fln-olean",
+                "fln-parse",
+                "fln-rt",
+                "fln-syntax",
+                "fln-unsafe-abi",
+                "fln-unsafe-region",
+                "fln-vm",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            "the real product dependency closure moved"
+        ),
+        other => panic!("the real product binary produced no closure: {other:?}"),
+    }
 }
 
 #[test]
@@ -1137,14 +1216,13 @@ fn per_source_coverage_is_reported_so_partial_cannot_read_as_full() {
         text.contains("source-coverage source=ci/WORKSPACE_GRAPH.txt kind=tool witnessed=1 of=33"),
         "per-source coverage is not reported: {text}"
     );
-    // The closure witnessed nothing today, so it must not appear as a source at
-    // all — a source with zero coverage listed alongside real ones would read
-    // as participation.
     assert!(
-        !text.contains("source=dependency closure"),
-        "an unavailable source was reported as having participated: {text}"
+        text.contains(
+            "source-coverage source=dependency closure from product binaries witnessed=33 of=33"
+        ),
+        "the product closure did not account for every row: {text}"
     );
-    assert!(text.contains("single_source=32"));
+    assert!(text.contains("single_source=0"));
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,16 @@ version = 4
 name = "fln"
 version = "0.0.0"
 dependencies = [
+ "fln-checker",
+ "fln-comp",
  "fln-core",
+ "fln-elab",
+ "fln-env",
+ "fln-hash",
+ "fln-kernel",
+ "fln-olean",
+ "fln-parse",
+ "fln-vm",
 ]
 
 [[package]]
@@ -17,10 +26,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fln-checker"
+version = "0.0.0"
+dependencies = [
+ "fln-hash",
+]
+
+[[package]]
 name = "fln-cli"
 version = "0.0.0"
 dependencies = [
+ "fln",
  "fln-core",
+]
+
+[[package]]
+name = "fln-comp"
+version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-rt",
 ]
 
 [[package]]
@@ -43,6 +68,18 @@ dependencies = [
 [[package]]
 name = "fln-core"
 version = "0.0.0"
+
+[[package]]
+name = "fln-elab"
+version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+ "fln-core",
+ "fln-env",
+ "fln-kernel",
+ "fln-parse",
+ "fln-syntax",
+]
 
 [[package]]
 name = "fln-env"
@@ -83,6 +120,7 @@ version = "0.0.0"
 dependencies = [
  "fln-core",
  "fln-env",
+ "fln-hash",
  "fln-rt",
  "fln-unsafe-region",
 ]
@@ -138,4 +176,14 @@ dependencies = [
  "fln-env",
  "fln-hash",
  "fln-kernel",
+]
+
+[[package]]
+name = "fln-vm"
+version = "0.0.0"
+dependencies = [
+ "fln-comp",
+ "fln-core",
+ "fln-hash",
+ "fln-rt",
 ]

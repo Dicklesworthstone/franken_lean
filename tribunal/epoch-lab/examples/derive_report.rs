@@ -17,11 +17,14 @@
 #![forbid(unsafe_code)]
 
 use fln_epoch_lab::derive::{
-    classify, derive_epoch_tree, derive_g0_roster, derive_module_scan, derive_oracle_edges,
-    derive_targets, derive_workspace_inventory, render_epoch_tree, render_module_artifact,
+    Corroboration, TargetScan, classify, corroborate, corroboration_report,
+    derive_dependency_closure, derive_epoch_tree, derive_g0_roster, derive_module_scan,
+    derive_oracle_edges, derive_targets, derive_workspace_inventory, product_binary_roots,
+    read_graph_edges, read_graph_kinds, read_shippability_policy, render_epoch_tree,
+    render_module_artifact,
 };
-use fln_epoch_lab::poison::Shippability;
-use std::path::PathBuf;
+use fln_epoch_lab::poison::OracleEdge;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     fln_conformance::checked_manifest_dir!().join("../..")
@@ -50,6 +53,57 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(2)
         }
     }
+}
+
+fn report_shippability(root: &Path, targets: &[TargetScan], oracle_edges: &[OracleEdge]) -> bool {
+    let policy_path = root.join("tribunal/derived/SHIPPABILITY_POLICY.txt");
+    let policy = match read_shippability_policy(&policy_path) {
+        Ok(policy) => policy,
+        Err(error) => {
+            println!("derive: shippability verdict=fail reason={error}");
+            return true;
+        }
+    };
+    let (_, gaps) = classify(targets, &policy);
+    if !gaps.is_empty() {
+        println!(
+            "derive: shippability verdict=fail unclassified_or_stale_crates={} detail={gaps:?}",
+            gaps.len()
+        );
+        return true;
+    }
+
+    let graph_path = root.join("ci/WORKSPACE_GRAPH.txt");
+    let graph_kinds = match read_graph_kinds(&graph_path) {
+        Ok(graph) => graph,
+        Err(error) => {
+            println!("derive: shippability verdict=fail reason={error}");
+            return true;
+        }
+    };
+    let graph_edges = match read_graph_edges(&graph_path) {
+        Ok(edges) => edges,
+        Err(error) => {
+            println!("derive: shippability verdict=fail reason={error}");
+            return true;
+        }
+    };
+    let roots = product_binary_roots(targets, &graph_kinds);
+    let closure = derive_dependency_closure(&graph_edges, &roots);
+    let oracle_edge_crates: Vec<String> = oracle_edges
+        .iter()
+        .filter_map(|edge| {
+            targets
+                .iter()
+                .find(|target| target.name == edge.target)
+                .map(|target| target.crate_name.clone())
+        })
+        .collect();
+    let rows = corroborate(&policy, &graph_kinds, &closure, &oracle_edge_crates);
+    print!("{}", corroboration_report(&rows));
+
+    rows.iter()
+        .any(|row| matches!(row.standing, Corroboration::Contradicted { .. }))
 }
 
 fn report() -> std::process::ExitCode {
@@ -98,10 +152,6 @@ fn report() -> std::process::ExitCode {
                 "derive: rule={} verdict=pass targets={} digest={}",
                 p.rule, p.item_count, p.source_digest
             );
-            // No policy file yet: every crate is unclassified, which is the
-            // honest starting state and blocks rather than defaulting.
-            let (_, gaps) = classify(d.value(), &[]);
-            println!("derive: shippability unclassified_crates={}", gaps.len());
             match derive_oracle_edges(&root, d.value()) {
                 Ok(e) => {
                     println!(
@@ -117,13 +167,13 @@ fn report() -> std::process::ExitCode {
                             edge.capability.as_str()
                         );
                     }
+                    failed |= report_shippability(&root, d.value(), e.value());
                 }
                 Err(err) => {
                     println!("derive: rule=oracle-edges verdict=fail reason={err}");
                     failed = true;
                 }
             }
-            let _ = Shippability::Shippable;
         }
         Err(e) => {
             println!("derive: rule=cargo-targets verdict=fail reason={e}");

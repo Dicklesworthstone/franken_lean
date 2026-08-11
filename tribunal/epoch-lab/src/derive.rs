@@ -1826,7 +1826,14 @@ pub fn read_graph_edges(path: &Path) -> Result<Vec<(String, String)>, DeriveErro
     let text = read(path)?;
     let mut out = Vec::new();
     for line in text.lines() {
-        let l = line.trim();
+        // WORKSPACE_GRAPH's grammar permits review comments after an edge.
+        // Keeping the comment in `to` makes a real edge such as
+        // `fln-cli -> fln # executable surface` point at a nonexistent crate,
+        // which turns the entire product closure into the root alone.
+        let l = line
+            .split_once('#')
+            .map_or(line, |(before, _)| before)
+            .trim();
         let Some(rest) = l.strip_prefix("edge ") else {
             continue;
         };
@@ -2070,12 +2077,10 @@ pub struct NormalDepEdge {
 
 /// Derive every member-to-member `[dependencies]` edge from the real manifests.
 ///
-/// [`derive_dependency_closure`] already witnesses shippability over the
-/// *declared* edges of `ci/WORKSPACE_GRAPH.txt`, from product-binary roots —
-/// and is honestly [`ClosureAvailability::Unavailable`] today, because no
-/// product binary exists yet. This derivation answers the question that IS
-/// answerable today, from the bytes cargo itself reads: which crates does each
-/// crate pull into a release closure? Its consumer is
+/// [`derive_dependency_closure`] witnesses shippability over the *declared*
+/// edges of `ci/WORKSPACE_GRAPH.txt`, from product-binary roots. This derivation
+/// independently answers the lower-level question from the bytes Cargo itself
+/// reads: which crates does each crate pull into a release closure? Its consumer is
 /// [`policy_closure_violations`], the policy's own coherence law.
 ///
 /// The reader is deliberately strict, like every reader in this file: inside a
