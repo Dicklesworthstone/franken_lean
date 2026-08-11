@@ -99,7 +99,7 @@ pub use fln_vm::interpreter::{
     ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit,
     value_kind as vm_value_kind,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +320,532 @@ pub fn decode_olean_artifact(
     })
 }
 
+/// Independent ceilings for decoding and checking standalone `.olean` input.
+///
+/// `max_declarations` bounds the planning tables before they are allocated;
+/// `max_dependency_presentations` bounds the iterative walk used to recover a
+/// deterministic declaration order. The kernel and independent checker retain
+/// their own, separate limits in [`EngineAdmissionLimits`].
+#[derive(Debug, Clone, Copy)]
+pub struct OleanCheckLimits {
+    pub decode: OleanDecodeLimits,
+    pub admission: EngineAdmissionLimits,
+    pub max_modules: usize,
+    pub max_total_bytes: usize,
+    pub max_declarations: usize,
+    pub max_dependency_presentations: usize,
+}
+
+impl OleanCheckLimits {
+    /// Construct conservative product limits around explicit artifact and
+    /// kernel-stack ceilings.
+    pub fn new(max_bytes: usize, kernel: Budget) -> Self {
+        Self {
+            decode: OleanDecodeLimits::new(max_bytes),
+            admission: EngineAdmissionLimits::new(kernel),
+            max_modules: 100_000,
+            max_total_bytes: max_bytes,
+            max_declarations: 1_000_000,
+            max_dependency_presentations: 100_000_000,
+        }
+    }
+}
+
+/// One declaration whose K1 verdict and independent-checker veto both
+/// completed while checking an `.olean`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OleanCheckedDeclaration {
+    pub name: Name,
+    pub checker: CheckerAgreement,
+}
+
+/// Authoritative result of checking every decoded declaration in one
+/// standalone `.olean`.
+///
+/// The returned engine is the only successor. Every error or non-answer
+/// exposes no partially advanced snapshot, so checking is atomic from the
+/// caller's point of view.
+#[derive(Debug)]
+pub struct CheckedOlean {
+    pub engine: Engine,
+    pub decoded: DecodedOlean,
+    pub base_logical_root: LogicalRoot,
+    pub result_logical_root: LogicalRoot,
+    pub declarations: Vec<OleanCheckedDeclaration>,
+}
+
+/// Borrowed bytes and their authoritative module name in a closed import set.
+#[derive(Debug, Clone, Copy)]
+pub struct OleanModuleInput<'a> {
+    pub name: &'a Name,
+    pub artifact: &'a [u8],
+}
+
+/// One checked module inside a closed `.olean` import set.
+#[derive(Debug)]
+pub struct CheckedOleanModule {
+    pub name: Name,
+    pub decoded: DecodedOlean,
+    pub base_logical_root: LogicalRoot,
+    pub result_logical_root: LogicalRoot,
+    pub declarations: Vec<OleanCheckedDeclaration>,
+}
+
+/// Atomic result of checking a closed set of named `.olean` modules.
+#[derive(Debug)]
+pub struct CheckedOleanSet {
+    pub engine: Engine,
+    pub base_logical_root: LogicalRoot,
+    pub result_logical_root: LogicalRoot,
+    pub modules: Vec<CheckedOleanModule>,
+}
+
+/// Typed non-success from the `.olean` declaration-checking doors.
+///
+/// This first production slice intentionally refuses imports, complete
+/// inductive/quotient units, and mutual declaration envelopes. Those are not
+/// silently inserted as trusted context. Environment extensions are decoded
+/// and counted by [`DecodedOlean`] but are not interpreted by this
+/// declaration-only operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OleanCheckError {
+    Decode(OleanDecodeError),
+    EmptyModuleSet,
+    ModuleLimit {
+        observed: usize,
+        limit: usize,
+    },
+    TotalBytesLimit {
+        observed: usize,
+        limit: usize,
+    },
+    ImportsRequireResolver {
+        imports: Vec<Name>,
+    },
+    DuplicateModule {
+        module: Name,
+    },
+    ModuleDecode {
+        module: Name,
+        error: OleanDecodeError,
+    },
+    MissingModuleImports {
+        module: Name,
+        imports: Vec<Name>,
+    },
+    ModuleImportCycle {
+        modules: Vec<Name>,
+    },
+    InternalInvariant {
+        detail: &'static str,
+    },
+    DeclarationLimit {
+        observed: usize,
+        limit: usize,
+    },
+    DependencyPresentationLimit {
+        observed: usize,
+        limit: usize,
+    },
+    AllocationFailure {
+        resource: &'static str,
+        requested: usize,
+    },
+    DuplicateDeclaration {
+        name: Name,
+    },
+    UnsupportedDeclaration {
+        name: Name,
+        kind: &'static str,
+    },
+    MutualEnvelopeUnsupported {
+        name: Name,
+        members: Vec<Name>,
+    },
+    MissingConstants {
+        declaration: Name,
+        names: Vec<Name>,
+    },
+    DependencyCycle {
+        declarations: Vec<Name>,
+    },
+    Admission(EngineAdmissionError),
+}
+
+impl fmt::Display for OleanCheckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(error) => error.fmt(formatter),
+            Self::EmptyModuleSet => write!(formatter, ".olean module set must not be empty"),
+            Self::ModuleLimit { observed, limit } => write!(
+                formatter,
+                ".olean set contains {observed} modules; planning limit is {limit}"
+            ),
+            Self::TotalBytesLimit { observed, limit } => write!(
+                formatter,
+                ".olean set contains {observed} bytes; aggregate limit is {limit}"
+            ),
+            Self::ImportsRequireResolver { imports } => write!(
+                formatter,
+                "standalone declaration checking cannot resolve imports: {}",
+                display_names(imports)
+            ),
+            Self::DuplicateModule { module } => write!(
+                formatter,
+                ".olean set repeats module `{}`",
+                module.to_display_string()
+            ),
+            Self::ModuleDecode { module, error } => write!(
+                formatter,
+                "module `{}` failed to decode: {error}",
+                module.to_display_string()
+            ),
+            Self::MissingModuleImports { module, imports } => write!(
+                formatter,
+                "module `{}` imports modules absent from the closed set: {}",
+                module.to_display_string(),
+                display_names(imports)
+            ),
+            Self::ModuleImportCycle { modules } => write!(
+                formatter,
+                "module import graph contains a cycle: {}",
+                display_names(modules)
+            ),
+            Self::InternalInvariant { detail } => {
+                write!(
+                    formatter,
+                    "internal .olean checking invariant failed: {detail}"
+                )
+            }
+            Self::DeclarationLimit { observed, limit } => write!(
+                formatter,
+                ".olean contains {observed} declarations; planning limit is {limit}"
+            ),
+            Self::DependencyPresentationLimit { observed, limit } => write!(
+                formatter,
+                ".olean dependency walk reached {observed} expression presentations; limit is {limit}"
+            ),
+            Self::AllocationFailure {
+                resource,
+                requested,
+            } => write!(
+                formatter,
+                "could not reserve {requested} entries for {resource}"
+            ),
+            Self::DuplicateDeclaration { name } => write!(
+                formatter,
+                ".olean repeats declaration `{}`",
+                name.to_display_string()
+            ),
+            Self::UnsupportedDeclaration { name, kind } => write!(
+                formatter,
+                "cannot check {kind} `{}` through the independent-checker facade yet",
+                name.to_display_string()
+            ),
+            Self::MutualEnvelopeUnsupported { name, members } => write!(
+                formatter,
+                "cannot reconstruct the mutual declaration envelope for `{}` with members {}",
+                name.to_display_string(),
+                display_names(members)
+            ),
+            Self::MissingConstants { declaration, names } => write!(
+                formatter,
+                "declaration `{}` references constants absent from the base environment and artifact: {}",
+                declaration.to_display_string(),
+                display_names(names)
+            ),
+            Self::DependencyCycle { declarations } => write!(
+                formatter,
+                "cannot reconstruct declaration units for dependency cycle: {}",
+                display_names(declarations)
+            ),
+            Self::Admission(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for OleanCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::ModuleDecode { error, .. } => Some(error),
+            Self::Admission(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<OleanDecodeError> for OleanCheckError {
+    fn from(error: OleanDecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+fn display_names(names: &[Name]) -> String {
+    names
+        .iter()
+        .map(Name::to_display_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn checked_olean_declaration(info: &ConstantInfo) -> Result<Declaration, OleanCheckError> {
+    let name = info.name().clone();
+    match info {
+        ConstantInfo::Axiom(value) => Ok(Declaration::Axiom(value.clone())),
+        ConstantInfo::Defn(value) => {
+            if value.all.len() > 1 {
+                return Err(OleanCheckError::MutualEnvelopeUnsupported {
+                    name,
+                    members: value.all.clone(),
+                });
+            }
+            Ok(Declaration::Defn(value.clone()))
+        }
+        ConstantInfo::Thm(value) => {
+            if value.all.len() > 1 {
+                return Err(OleanCheckError::MutualEnvelopeUnsupported {
+                    name,
+                    members: value.all.clone(),
+                });
+            }
+            Ok(Declaration::Thm(value.clone()))
+        }
+        ConstantInfo::Opaque(value) => {
+            if value.all.len() > 1 {
+                return Err(OleanCheckError::MutualEnvelopeUnsupported {
+                    name,
+                    members: value.all.clone(),
+                });
+            }
+            Ok(Declaration::Opaque(value.clone()))
+        }
+        ConstantInfo::Quot(_)
+        | ConstantInfo::Induct(_)
+        | ConstantInfo::Ctor(_)
+        | ConstantInfo::Rec(_) => Err(OleanCheckError::UnsupportedDeclaration {
+            name,
+            kind: info.kind_name(),
+        }),
+    }
+}
+
+fn collect_olean_dependencies(
+    expression: &Expr,
+    names: &mut BTreeSet<Name>,
+    presentations: &mut usize,
+    limit: usize,
+) -> Result<(), OleanCheckError> {
+    use fln_core::expr::ExprNode;
+
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| OleanCheckError::AllocationFailure {
+            resource: ".olean dependency worklist",
+            requested: 1,
+        })?;
+    pending.push(expression);
+    while let Some(expression) = pending.pop() {
+        *presentations = presentations.saturating_add(1);
+        if *presentations > limit {
+            return Err(OleanCheckError::DependencyPresentationLimit {
+                observed: *presentations,
+                limit,
+            });
+        }
+        match expression.node() {
+            ExprNode::Const { name, .. } => {
+                names.insert(name.clone());
+            }
+            ExprNode::App { f, a } => {
+                pending
+                    .try_reserve(2)
+                    .map_err(|_| OleanCheckError::AllocationFailure {
+                        resource: ".olean dependency worklist",
+                        requested: pending.len().saturating_add(2),
+                    })?;
+                pending.push(a);
+                pending.push(f);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                pending
+                    .try_reserve(2)
+                    .map_err(|_| OleanCheckError::AllocationFailure {
+                        resource: ".olean dependency worklist",
+                        requested: pending.len().saturating_add(2),
+                    })?;
+                pending.push(body);
+                pending.push(binder_type);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                pending
+                    .try_reserve(3)
+                    .map_err(|_| OleanCheckError::AllocationFailure {
+                        resource: ".olean dependency worklist",
+                        requested: pending.len().saturating_add(3),
+                    })?;
+                pending.push(body);
+                pending.push(value);
+                pending.push(type_);
+            }
+            ExprNode::MData { expr, .. } => pending.push(expr),
+            ExprNode::Proj {
+                struct_name, expr, ..
+            } => {
+                names.insert(struct_name.clone());
+                pending.push(expr);
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn olean_dependencies(
+    info: &ConstantInfo,
+    presentations: &mut usize,
+    limit: usize,
+) -> Result<BTreeSet<Name>, OleanCheckError> {
+    let mut names = BTreeSet::new();
+    collect_olean_dependencies(&info.constant_val().type_, &mut names, presentations, limit)?;
+    match info {
+        ConstantInfo::Defn(value) => {
+            collect_olean_dependencies(&value.value, &mut names, presentations, limit)?
+        }
+        ConstantInfo::Thm(value) => {
+            collect_olean_dependencies(&value.value, &mut names, presentations, limit)?
+        }
+        ConstantInfo::Opaque(value) => {
+            collect_olean_dependencies(&value.value, &mut names, presentations, limit)?
+        }
+        ConstantInfo::Axiom(_)
+        | ConstantInfo::Quot(_)
+        | ConstantInfo::Induct(_)
+        | ConstantInfo::Ctor(_)
+        | ConstantInfo::Rec(_) => {}
+    }
+    Ok(names)
+}
+
+fn plan_olean_declarations(
+    base: &Environment,
+    constants: &[ConstantInfo],
+    limits: OleanCheckLimits,
+) -> Result<Vec<usize>, OleanCheckError> {
+    if constants.len() > limits.max_declarations {
+        return Err(OleanCheckError::DeclarationLimit {
+            observed: constants.len(),
+            limit: limits.max_declarations,
+        });
+    }
+    let mut owners = BTreeMap::new();
+    for (index, info) in constants.iter().enumerate() {
+        checked_olean_declaration(info)?;
+        if owners.insert(info.name().clone(), index).is_some() {
+            return Err(OleanCheckError::DuplicateDeclaration {
+                name: info.name().clone(),
+            });
+        }
+    }
+
+    let mut remaining = vec![0_usize; constants.len()];
+    let mut dependents = vec![Vec::new(); constants.len()];
+    let mut presentations = 0_usize;
+    for (index, info) in constants.iter().enumerate() {
+        let mut missing = Vec::new();
+        for dependency in olean_dependencies(
+            info,
+            &mut presentations,
+            limits.max_dependency_presentations,
+        )? {
+            match owners.get(&dependency).copied() {
+                Some(owner) if owner != index => {
+                    remaining[index] = remaining[index].saturating_add(1);
+                    dependents[owner].push(index);
+                }
+                Some(_) => {}
+                None if base.find(&dependency).is_some() => {}
+                None => missing.push(dependency),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(OleanCheckError::MissingConstants {
+                declaration: info.name().clone(),
+                names: missing,
+            });
+        }
+    }
+
+    let mut ready: BTreeSet<Name> = constants
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| remaining[*index] == 0)
+        .map(|(_, info)| info.name().clone())
+        .collect();
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(constants.len())
+        .map_err(|_| OleanCheckError::AllocationFailure {
+            resource: ".olean declaration order",
+            requested: constants.len(),
+        })?;
+    while let Some(name) = ready.pop_first() {
+        let Some(&index) = owners.get(&name) else {
+            return Err(OleanCheckError::InternalInvariant {
+                detail: "ready declaration has no owner",
+            });
+        };
+        order.push(index);
+        let Some(next) = dependents.get(index) else {
+            return Err(OleanCheckError::InternalInvariant {
+                detail: "declaration owner is outside the dependent table",
+            });
+        };
+        for dependent in next {
+            let Some(count) = remaining.get_mut(*dependent) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "dependent declaration is outside the remaining table",
+                });
+            };
+            *count = count
+                .checked_sub(1)
+                .ok_or(OleanCheckError::InternalInvariant {
+                    detail: "declaration dependency count underflowed",
+                })?;
+            if *count == 0 {
+                let Some(constant) = constants.get(*dependent) else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "ready dependent is outside the constant table",
+                    });
+                };
+                ready.insert(constant.name().clone());
+            }
+        }
+    }
+    if order.len() != constants.len() {
+        let declarations = constants
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| remaining[*index] != 0)
+            .map(|(_, info)| info.name().clone())
+            .collect();
+        return Err(OleanCheckError::DependencyCycle { declarations });
+    }
+    Ok(order)
+}
+
 /// One immutable embeddable engine snapshot.
 ///
 /// The currently live constructor seeds only the axiomatic `Nat : Sort 1` name
@@ -365,6 +891,316 @@ impl Engine {
     /// elaboration-relevant options.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
         self.environment.logical_root(options)
+    }
+
+    /// Decode and atomically check every declaration in one standalone
+    /// pinned-format `.olean`.
+    ///
+    /// The declaration array is not trusted to be dependency-ordered. This
+    /// method derives a stable Kahn order from exact constant references, then
+    /// sends every declaration through the same K1-plus-independent-checker
+    /// council as [`Self::admit_declaration`]. The artifact must be import-free:
+    /// resolving module names to exact predecessor environments belongs to the
+    /// module loader, and treating unresolved imports as axioms would violate
+    /// the Oracle-Only and single-authority laws.
+    ///
+    /// A completed result means all decoded declarations were checked and the
+    /// returned engine contains all of them. It does not mean environment
+    /// extension payloads were interpreted, that companion artifact parts were
+    /// loaded, or that K2/receipt/release gates were satisfied.
+    pub fn check_olean_artifact(
+        &self,
+        artifact: &[u8],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
+        let decoded = decode_olean_artifact(artifact, limits.decode)?;
+        if !decoded.module.imports.is_empty() {
+            return Err(OleanCheckError::ImportsRequireResolver {
+                imports: decoded
+                    .module
+                    .imports
+                    .iter()
+                    .map(|import| import.module.clone())
+                    .collect(),
+            });
+        }
+        self.check_decoded_olean(decoded, options, limits)
+    }
+
+    /// Decode and atomically check a closed set of named `.olean` modules.
+    ///
+    /// Every direct import must name another input row. Modules are checked in
+    /// a deterministic import-topological order; declarations within each
+    /// module are independently dependency-sorted. Nothing from a missing
+    /// import is synthesized, and no prefix engine is returned on a later
+    /// failure or non-answer.
+    pub fn check_olean_modules(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<Outcome<CheckedOleanSet>, OleanCheckError> {
+        if modules.is_empty() {
+            return Err(OleanCheckError::EmptyModuleSet);
+        }
+        if modules.len() > limits.max_modules {
+            return Err(OleanCheckError::ModuleLimit {
+                observed: modules.len(),
+                limit: limits.max_modules,
+            });
+        }
+        let mut total_bytes = 0_usize;
+        let mut owners = BTreeMap::new();
+        for (index, module) in modules.iter().enumerate() {
+            total_bytes = total_bytes.checked_add(module.artifact.len()).ok_or(
+                OleanCheckError::TotalBytesLimit {
+                    observed: usize::MAX,
+                    limit: limits.max_total_bytes,
+                },
+            )?;
+            if total_bytes > limits.max_total_bytes {
+                return Err(OleanCheckError::TotalBytesLimit {
+                    observed: total_bytes,
+                    limit: limits.max_total_bytes,
+                });
+            }
+            if owners.insert(module.name.clone(), index).is_some() {
+                return Err(OleanCheckError::DuplicateModule {
+                    module: module.name.clone(),
+                });
+            }
+        }
+
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(modules.len()).map_err(|_| {
+            OleanCheckError::AllocationFailure {
+                resource: ".olean decoded module set",
+                requested: modules.len(),
+            }
+        })?;
+        for module in modules {
+            let artifact =
+                decode_olean_artifact(module.artifact, limits.decode).map_err(|error| {
+                    OleanCheckError::ModuleDecode {
+                        module: module.name.clone(),
+                        error,
+                    }
+                })?;
+            decoded.push(Some((module.name.clone(), artifact)));
+        }
+
+        let mut remaining = vec![0_usize; modules.len()];
+        let mut dependents = vec![Vec::new(); modules.len()];
+        for (index, module) in decoded.iter().enumerate() {
+            let Some((_, artifact)) = module.as_ref() else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "decoded module disappeared before planning",
+                });
+            };
+            let mut missing = BTreeSet::new();
+            let mut dependencies = BTreeSet::new();
+            for import in &artifact.module.imports {
+                match owners.get(&import.module).copied() {
+                    Some(owner) if owner != index => {
+                        dependencies.insert(owner);
+                    }
+                    Some(_) => {
+                        dependencies.insert(index);
+                    }
+                    None => {
+                        missing.insert(import.module.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                let Some(input) = modules.get(index) else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "decoded module has no corresponding input",
+                    });
+                };
+                return Err(OleanCheckError::MissingModuleImports {
+                    module: input.name.clone(),
+                    imports: missing.into_iter().collect(),
+                });
+            }
+            remaining[index] = dependencies.len();
+            for dependency in dependencies {
+                dependents[dependency].push(index);
+            }
+        }
+
+        let mut ready: BTreeSet<Name> = modules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| remaining[*index] == 0)
+            .map(|(_, module)| module.name.clone())
+            .collect();
+        let mut order = Vec::new();
+        order
+            .try_reserve_exact(modules.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean module order",
+                requested: modules.len(),
+            })?;
+        while let Some(name) = ready.pop_first() {
+            let Some(&index) = owners.get(&name) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "ready module has no owner",
+                });
+            };
+            order.push(index);
+            let Some(next) = dependents.get(index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "module owner is outside the dependent table",
+                });
+            };
+            for dependent in next {
+                let Some(count) = remaining.get_mut(*dependent) else {
+                    return Err(OleanCheckError::InternalInvariant {
+                        detail: "dependent module is outside the remaining table",
+                    });
+                };
+                *count = count
+                    .checked_sub(1)
+                    .ok_or(OleanCheckError::InternalInvariant {
+                        detail: "module dependency count underflowed",
+                    })?;
+                if *count == 0 {
+                    let Some(module) = modules.get(*dependent) else {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "ready dependent is outside the module table",
+                        });
+                    };
+                    ready.insert(module.name.clone());
+                }
+            }
+        }
+        if order.len() != modules.len() {
+            return Err(OleanCheckError::ModuleImportCycle {
+                modules: modules
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| remaining[*index] != 0)
+                    .map(|(_, module)| module.name.clone())
+                    .collect(),
+            });
+        }
+
+        let base_logical_root = self.logical_root(options);
+        let mut engine = self.clone();
+        let mut checked_modules = Vec::new();
+        checked_modules
+            .try_reserve_exact(modules.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean checked module records",
+                requested: modules.len(),
+            })?;
+        for index in order {
+            let Some(slot) = decoded.get_mut(index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "topological module is outside the decoded table",
+                });
+            };
+            let Some((name, artifact)) = slot.take() else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "topological module was consumed more than once",
+                });
+            };
+            let checked = match engine.check_decoded_olean(artifact, options, limits)? {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            engine = checked.engine;
+            checked_modules.push(CheckedOleanModule {
+                name,
+                decoded: checked.decoded,
+                base_logical_root: checked.base_logical_root,
+                result_logical_root: checked.result_logical_root,
+                declarations: checked.declarations,
+            });
+        }
+        let result_logical_root = engine.logical_root(options);
+        Ok(Outcome::Complete(CheckedOleanSet {
+            engine,
+            base_logical_root,
+            result_logical_root,
+            modules: checked_modules,
+        }))
+    }
+
+    fn check_decoded_olean(
+        &self,
+        decoded: DecodedOlean,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
+        let order = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
+        let base_logical_root = self.logical_root(options);
+        if order.is_empty() {
+            return Ok(Outcome::Complete(CheckedOlean {
+                engine: self.clone(),
+                decoded,
+                base_logical_root,
+                result_logical_root: base_logical_root,
+                declarations: Vec::new(),
+            }));
+        }
+
+        let mut declarations = Vec::new();
+        declarations.try_reserve_exact(order.len()).map_err(|_| {
+            OleanCheckError::AllocationFailure {
+                resource: ".olean declaration batch",
+                requested: order.len(),
+            }
+        })?;
+        for index in &order {
+            let Some(info) = decoded.constants.get(*index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "planned declaration is outside the decoded constant table",
+                });
+            };
+            declarations.push(checked_olean_declaration(info)?);
+        }
+        let admitted = match self
+            .admit_declarations(&declarations, options, limits.admission)
+            .map_err(OleanCheckError::Admission)?
+        {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let mut checked = Vec::new();
+        checked
+            .try_reserve_exact(admitted.admissions.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean completed declaration records",
+                requested: admitted.admissions.len(),
+            })?;
+        for (constant_index, admission) in order.iter().zip(&admitted.admissions) {
+            let Some(info) = decoded.constants.get(*constant_index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "completed declaration is outside the decoded constant table",
+                });
+            };
+            checked.push(OleanCheckedDeclaration {
+                name: info.name().clone(),
+                checker: admission.checker,
+            });
+        }
+        if checked.len() != order.len() {
+            return Err(OleanCheckError::InternalInvariant {
+                detail: "admission result count differs from the declaration plan",
+            });
+        }
+        Ok(Outcome::Complete(CheckedOlean {
+            engine: admitted.engine,
+            decoded,
+            base_logical_root: admitted.base_logical_root,
+            result_logical_root: admitted.result_logical_root,
+            declarations: checked,
+        }))
     }
 
     /// Admit and publish one declaration without compiling or executing it.
@@ -1824,11 +2660,11 @@ mod tests {
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
         FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name,
-        NatDefinitionFrontendError, NatLit, OleanDeclarationError, OleanDecodeError,
-        OleanDecodeLimits, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal,
-        Outcome, ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits,
-        decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
-        rebuild_olean_artifact,
+        NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
+        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
+        OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
+        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, decode_olean_artifact,
+        execute_flbc_artifact, execute_golem_with_options, rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -1838,6 +2674,7 @@ mod tests {
     use fln_core::diag::ResourceReason;
     use fln_core::options::DataValue;
     use fln_core::outcome::InconclusiveCause;
+    use fln_env::constants::{QuotKind, QuotVal};
     use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
 
     fn test_budget() -> Budget {
@@ -1857,6 +2694,69 @@ mod tests {
         let path = manifest_dir.join("../../tribunal/fixtures/c3").join(name);
         std::fs::read(&path)
             .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+    }
+
+    fn standalone_olean(constants: &[ConstantInfo]) -> Vec<u8> {
+        olean_with_imports(constants, &[])
+    }
+
+    fn olean_with_imports(constants: &[ConstantInfo], imports: &[OleanModuleImport]) -> Vec<u8> {
+        let lean_version = super::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the extracted pin tag carries its v prefix");
+        super::encode_olean_module(
+            super::OleanModuleWriteInput {
+                is_module: false,
+                imports,
+                constants,
+                extra_const_names: &[],
+            },
+            super::OleanWriteHeader {
+                version: super::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version,
+                githash: super::OLEAN_PIN_COMMIT,
+                base_addr: (super::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            super::OleanWriteBudget::default(),
+        )
+        .expect("the public writer emits the standalone checking fixture")
+        .bytes
+    }
+
+    fn standalone_declarations() -> Vec<ConstantInfo> {
+        let proposition = Name::from_components(["Fixture", "P"]);
+        let witness = Name::from_components(["Fixture", "p"]);
+        let theorem = Name::from_components(["Fixture", "t"]);
+        let proposition_expr = Expr::const_(proposition.clone(), Vec::new());
+        let witness_expr = Expr::const_(witness.clone(), Vec::new());
+        vec![
+            ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: theorem,
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr,
+                all: Vec::new(),
+            }),
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: witness,
+                    level_params: Vec::new(),
+                    type_: proposition_expr,
+                },
+                is_unsafe: false,
+            }),
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: proposition,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+        ]
     }
 
     fn heartbeat_program(new_count: u64, check_system: bool) -> ValidatedProgram {
@@ -2019,6 +2919,235 @@ mod tests {
                 .expect("the public facade reads its ilean JSON"),
             semantic
         );
+    }
+
+    #[test]
+    fn standalone_olean_check_derives_dependency_order_and_uses_both_checkers() {
+        let constants = standalone_declarations();
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let outcome = engine
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("the import-free artifact reaches admission");
+        let Outcome::Complete(checked) = outcome else {
+            panic!("the fixture must complete: {outcome:?}");
+        };
+
+        let names: Vec<String> = checked
+            .declarations
+            .iter()
+            .map(|declaration| declaration.name.to_display_string())
+            .collect();
+        assert_eq!(names, ["Fixture.P", "Fixture.p", "Fixture.t"]);
+        assert_eq!(checked.engine.environment().len(), 3);
+        assert_eq!(checked.decoded.constants, constants);
+        assert_ne!(checked.base_logical_root, checked.result_logical_root);
+        assert!(checked.declarations.iter().all(|declaration| {
+            declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
+        }));
+    }
+
+    #[test]
+    fn standalone_olean_check_is_atomic_on_kernel_rejection() {
+        let mut constants = standalone_declarations();
+        let ConstantInfo::Thm(theorem) = &mut constants[0] else {
+            panic!("fixture starts with its theorem")
+        };
+        theorem.value = Expr::sort(Level::zero());
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let result = engine.check_olean_artifact(
+            &bytes,
+            &KVMap::new(),
+            OleanCheckLimits::new(bytes.len(), test_budget()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(OleanCheckError::Admission(
+                EngineAdmissionError::BatchDeclaration { index: 2, .. }
+            ))
+        ));
+        assert_eq!(
+            engine.environment().len(),
+            0,
+            "a failed batch cannot expose its two successful prefixes"
+        );
+    }
+
+    #[test]
+    fn standalone_olean_check_refuses_unresolved_imports_and_unsupported_units() {
+        let reference = olean_fixture("Init.BinderNameHint.olean");
+        let engine = Engine::from_environment(Environment::new());
+        let imported = engine.check_olean_artifact(
+            &reference,
+            &KVMap::new(),
+            OleanCheckLimits::new(reference.len(), test_budget()),
+        );
+        assert!(matches!(
+            imported,
+            Err(OleanCheckError::ImportsRequireResolver { ref imports }) if !imports.is_empty()
+        ));
+
+        let quotient_name = Name::from_components(["Fixture", "Quot"]);
+        let quotient = ConstantInfo::Quot(QuotVal {
+            base: ConstantVal {
+                name: quotient_name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            kind: QuotKind::Type,
+        });
+        let bytes = standalone_olean(&[quotient]);
+        assert!(matches!(
+            engine.check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            ),
+            Err(OleanCheckError::UnsupportedDeclaration { name, kind: "quotient" })
+                if name == quotient_name
+        ));
+    }
+
+    #[test]
+    fn standalone_olean_check_preserves_decode_and_planning_resource_refusals() {
+        let constants = standalone_declarations();
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let too_small = engine.check_olean_artifact(
+            &bytes,
+            &KVMap::new(),
+            OleanCheckLimits::new(bytes.len() - 1, test_budget()),
+        );
+        assert!(matches!(
+            too_small,
+            Err(OleanCheckError::Decode(
+                OleanDecodeError::ArtifactTooLarge { .. }
+            ))
+        ));
+
+        let mut planning = OleanCheckLimits::new(bytes.len(), test_budget());
+        planning.max_dependency_presentations = 0;
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), planning),
+            Err(OleanCheckError::DependencyPresentationLimit {
+                observed: 1,
+                limit: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn closed_olean_module_set_resolves_imports_in_deterministic_order() {
+        let constants = standalone_declarations();
+        let base_name = Name::from_components(["Fixture", "Base"]);
+        let child_name = Name::from_components(["Fixture", "Child"]);
+        let import = OleanModuleImport {
+            module: base_name.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        };
+        let base = standalone_olean(&constants[2..]);
+        let child = olean_with_imports(&constants[..2], &[import]);
+        let inputs = [
+            OleanModuleInput {
+                name: &child_name,
+                artifact: &child,
+            },
+            OleanModuleInput {
+                name: &base_name,
+                artifact: &base,
+            },
+        ];
+        let engine = Engine::from_environment(Environment::new());
+        let checked = engine
+            .check_olean_modules(
+                &inputs,
+                &KVMap::new(),
+                OleanCheckLimits::new(base.len() + child.len(), test_budget()),
+            )
+            .expect("the closed import graph reaches admission");
+        let Outcome::Complete(checked) = checked else {
+            panic!("the closed import graph must complete: {checked:?}")
+        };
+
+        assert_eq!(checked.modules.len(), 2);
+        assert_eq!(checked.modules[0].name, base_name);
+        assert_eq!(checked.modules[1].name, child_name);
+        assert_eq!(checked.modules[0].declarations.len(), 1);
+        assert_eq!(checked.modules[1].declarations.len(), 2);
+        assert_eq!(checked.engine.environment().len(), 3);
+        assert_eq!(
+            checked.modules[0].result_logical_root,
+            checked.modules[1].base_logical_root
+        );
+        assert_ne!(checked.base_logical_root, checked.result_logical_root);
+    }
+
+    #[test]
+    fn closed_olean_module_set_refuses_missing_imports_cycles_and_aggregate_exhaustion() {
+        let base_name = Name::from_components(["Fixture", "Base"]);
+        let child_name = Name::from_components(["Fixture", "Child"]);
+        let import_base = OleanModuleImport {
+            module: base_name.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        };
+        let child = olean_with_imports(&[], &[import_base]);
+        let engine = Engine::from_environment(Environment::new());
+        let child_only = [OleanModuleInput {
+            name: &child_name,
+            artifact: &child,
+        }];
+        assert!(matches!(
+            engine.check_olean_modules(
+                &child_only,
+                &KVMap::new(),
+                OleanCheckLimits::new(child.len(), test_budget()),
+            ),
+            Err(OleanCheckError::MissingModuleImports { module, imports })
+                if module == child_name && imports == vec![base_name.clone()]
+        ));
+
+        let import_child = OleanModuleImport {
+            module: child_name.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        };
+        let base = olean_with_imports(&[], &[import_child]);
+        let cycle = [
+            OleanModuleInput {
+                name: &base_name,
+                artifact: &base,
+            },
+            OleanModuleInput {
+                name: &child_name,
+                artifact: &child,
+            },
+        ];
+        assert!(matches!(
+            engine.check_olean_modules(
+                &cycle,
+                &KVMap::new(),
+                OleanCheckLimits::new(base.len() + child.len(), test_budget()),
+            ),
+            Err(OleanCheckError::ModuleImportCycle { modules }) if modules.len() == 2
+        ));
+
+        let mut exhausted = OleanCheckLimits::new(base.len() + child.len(), test_budget());
+        exhausted.max_total_bytes = base.len() + child.len() - 1;
+        assert!(matches!(
+            engine.check_olean_modules(&cycle, &KVMap::new(), exhausted),
+            Err(OleanCheckError::TotalBytesLimit { .. })
+        ));
     }
 
     #[test]
