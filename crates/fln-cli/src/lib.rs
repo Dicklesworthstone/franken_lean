@@ -37,11 +37,13 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
+const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/1";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/2";
 
 const USAGE: &str = concat!(
     "Usage:\n",
+    "  fln check-olean [--json] [--max-bytes BYTES] PATH\n",
     "  fln run [--json] [--max-bytes BYTES] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
@@ -54,6 +56,11 @@ const USAGE: &str = concat!(
     "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
     "semantics and requires byte identity with no codec findings. It is not\n",
     "fresh emission and does not kernel-check declarations.\n",
+    "`check-olean` checks every declaration in one import-free pinned-format\n",
+    ".olean, or a directory containing a closed import set, through K1 and the\n",
+    "independent checker, atomically. It derives dependency order but does not\n",
+    "reconstruct inductive/quotient or mutual units, interpret extensions, run\n",
+    "K2, load companion parts, or satisfy G1.\n",
     "\n",
     "`run` executes supported Nat definitions from each path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
@@ -96,6 +103,11 @@ impl MultiplexerOutput {
 enum MultiplexerCommand {
     Help,
     Version,
+    CheckOlean {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
     SourceRun {
         paths: Vec<PathBuf>,
         max_bytes: usize,
@@ -289,6 +301,24 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     })
 }
 
+fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(arguments, "check-olean", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "check-olean accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::CheckOlean {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let Some((paths, max_bytes, json)) = parse_path_options(
         arguments,
@@ -364,6 +394,9 @@ fn parse_command(
     }
     if command == "run" {
         return parse_source_run(arguments.collect());
+    }
+    if command == "check-olean" {
+        return parse_check_olean(arguments.collect());
     }
     if command == "flbc" {
         let Some(subcommand) = arguments.next() else {
@@ -914,6 +947,533 @@ fn verify_olean_rebuild(path: &Path, max_bytes: usize, json: bool) -> Multiplexe
     verify_olean_rebuild_bytes(&bytes, max_bytes, json)
 }
 
+fn admission_error_disposition(error: &fln::EngineAdmissionError) -> (&'static str, bool, u8) {
+    match error {
+        fln::EngineAdmissionError::BatchDeclaration { error, .. } => {
+            admission_error_disposition(error)
+        }
+        fln::EngineAdmissionError::AllocationFailure { .. } => ("resource", false, 3),
+        fln::EngineAdmissionError::KernelRejected { .. } => ("kernel-rejection", true, 1),
+        fln::EngineAdmissionError::CouncilHalted { .. } => ("checker-disagreement", false, 1),
+        fln::EngineAdmissionError::CheckerBridge { .. }
+        | fln::EngineAdmissionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
+        fln::EngineAdmissionError::EmptyBatch
+        | fln::EngineAdmissionError::UnsupportedDeclaration { .. }
+        | fln::EngineAdmissionError::DuplicateName { .. } => ("admission", false, 1),
+    }
+}
+
+fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str, bool, u8) {
+    match error {
+        fln::OleanCheckError::Decode(fln::OleanDecodeError::ArtifactTooLarge { .. })
+        | fln::OleanCheckError::ModuleDecode {
+            error: fln::OleanDecodeError::ArtifactTooLarge { .. },
+            ..
+        }
+        | fln::OleanCheckError::Decode(fln::OleanDecodeError::Region(
+            fln::OleanRegionError::BudgetExhausted { .. },
+        ))
+        | fln::OleanCheckError::ModuleDecode {
+            error: fln::OleanDecodeError::Region(fln::OleanRegionError::BudgetExhausted { .. }),
+            ..
+        }
+        | fln::OleanCheckError::Decode(fln::OleanDecodeError::Declaration(
+            fln::OleanDeclarationError::Budget { .. },
+        ))
+        | fln::OleanCheckError::ModuleDecode {
+            error: fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Budget { .. }),
+            ..
+        }
+        | fln::OleanCheckError::ModuleLimit { .. }
+        | fln::OleanCheckError::TotalBytesLimit { .. }
+        | fln::OleanCheckError::DeclarationLimit { .. }
+        | fln::OleanCheckError::DependencyPresentationLimit { .. }
+        | fln::OleanCheckError::AllocationFailure { .. } => ("resource", false, 3),
+        fln::OleanCheckError::Decode(_) | fln::OleanCheckError::ModuleDecode { .. } => {
+            ("decode", false, 1)
+        }
+        fln::OleanCheckError::EmptyModuleSet => ("input", false, 1),
+        fln::OleanCheckError::ImportsRequireResolver { .. } => ("unresolved-imports", false, 1),
+        fln::OleanCheckError::MissingModuleImports { .. } => ("unresolved-imports", false, 1),
+        fln::OleanCheckError::DuplicateModule { .. }
+        | fln::OleanCheckError::ModuleImportCycle { .. } => ("module-graph", false, 1),
+        fln::OleanCheckError::InternalInvariant { .. } => ("internal-fault", false, 4),
+        fln::OleanCheckError::UnsupportedDeclaration { .. }
+        | fln::OleanCheckError::MutualEnvelopeUnsupported { .. } => {
+            ("unsupported-declaration-unit", false, 1)
+        }
+        fln::OleanCheckError::DuplicateDeclaration { .. }
+        | fln::OleanCheckError::MissingConstants { .. }
+        | fln::OleanCheckError::DependencyCycle { .. } => ("declaration-closure", false, 1),
+        fln::OleanCheckError::Admission(error) => admission_error_disposition(error),
+    }
+}
+
+fn check_olean_failure(
+    class: &'static str,
+    detail: &str,
+    authority: bool,
+    json: bool,
+    exit_code: u8,
+) -> MultiplexerOutput {
+    let detail = BoundedText::new(detail.to_owned());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(CHECK_OLEAN_SCHEMA),
+            authority,
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        let truncation = if detail.truncated() {
+            format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
+        } else {
+            String::new()
+        };
+        format!("fln check-olean: {class}: {}{truncation}\n", detail.text())
+    };
+    MultiplexerOutput::failure(stderr, exit_code)
+}
+
+fn render_check_olean_success(
+    bytes: usize,
+    checked: &fln::CheckedOlean,
+    json: bool,
+) -> MultiplexerOutput {
+    let constants = checked.declarations.len();
+    let extensions = checked.decoded.module.extensions.len();
+    let stdout = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "\"scope\":\"decoded-declarations\",\"artifactBytes\":{},",
+                "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
+                "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
+                "\"module\":{{\"isModulePart\":{},\"imports\":0,",
+                "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
+                "\"companionPartsLoaded\":false}},",
+                "\"k2Checked\":false,\"g1Satisfied\":false}}\n"
+            ),
+            json_string(CHECK_OLEAN_SCHEMA),
+            bytes,
+            constants,
+            json_string(&checked.base_logical_root.to_string()),
+            json_string(&checked.result_logical_root.to_string()),
+            checked.decoded.module.is_module,
+            extensions,
+        )
+    } else {
+        format!(
+            concat!(
+                "standalone .olean declaration check: complete\n",
+                "authority: K1 + independent checker\n",
+                "artifact bytes: {}\n",
+                "declarations checked: {}\n",
+                "dependency order: derived\n",
+                "base logical root: {}\n",
+                "result logical root: {}\n",
+                "extension blocks observed: {} (not interpreted)\n",
+                "companion artifact parts loaded: no\n",
+                "K2 checked: no\n",
+                "G1 satisfied: no\n"
+            ),
+            bytes, constants, checked.base_logical_root, checked.result_logical_root, extensions,
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn check_olean_bytes(bytes: Vec<u8>, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let worker = match std::thread::Builder::new()
+        .name("fln-check-olean".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let engine = fln::Engine::from_environment(fln::Environment::new());
+            match engine.check_olean_artifact(
+                &bytes,
+                &fln::KVMap::new(),
+                fln::OleanCheckLimits::new(
+                    max_bytes,
+                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                ),
+            ) {
+                Ok(fln::Outcome::Complete(checked)) => {
+                    render_check_olean_success(bytes.len(), &checked, json)
+                }
+                Ok(fln::Outcome::Inconclusive(reason)) => {
+                    check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
+                }
+                Ok(fln::Outcome::InternalFault(fault)) => {
+                    check_olean_failure("internal-fault", &format!("{fault:?}"), false, json, 4)
+                }
+                Err(error) => {
+                    let (class, authority, exit_code) = check_olean_error_disposition(&error);
+                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                }
+            }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return check_olean_failure(
+                "internal-fault",
+                &format!("could not start bounded kernel worker: {error}"),
+                false,
+                json,
+                4,
+            );
+        }
+    };
+    match worker.join() {
+        Ok(output) => output,
+        Err(_) => check_olean_failure(
+            "internal-fault",
+            "bounded kernel worker panicked",
+            false,
+            json,
+            4,
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct NamedOleanBytes {
+    name: fln::Name,
+    bytes: Vec<u8>,
+}
+
+fn module_name_from_relative(path: &Path) -> Result<fln::Name, String> {
+    let without_extension = path.with_extension("");
+    let mut components = Vec::new();
+    for component in without_extension.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!(
+                "module path {} is not a normalized relative path",
+                path.display()
+            ));
+        };
+        let Some(component) = component.to_str() else {
+            return Err(format!(
+                "module path {} contains a non-UTF-8 component",
+                path.display()
+            ));
+        };
+        if component.is_empty() {
+            return Err(format!(
+                "module path {} contains an empty component",
+                path.display()
+            ));
+        }
+        components.push(component.to_owned());
+    }
+    if components.is_empty() {
+        return Err(format!(
+            "module path {} has no name components",
+            path.display()
+        ));
+    }
+    Ok(fln::Name::from_components(
+        components.iter().map(String::as_str),
+    ))
+}
+
+fn collect_olean_directory(
+    root: &Path,
+    max_bytes: usize,
+) -> Result<Vec<NamedOleanBytes>, BoundedReadFailure> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| BoundedReadFailure::Input {
+            subject: ".olean directory",
+            detail: format!("cannot read {}: {error}", directory.display()),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| BoundedReadFailure::Input {
+                subject: ".olean directory",
+                detail: format!(
+                    "cannot read an entry under {}: {error}",
+                    directory.display()
+                ),
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| BoundedReadFailure::Input {
+                    subject: ".olean directory",
+                    detail: format!("cannot classify {}: {error}", entry.path().display()),
+                })?;
+            if file_type.is_symlink() {
+                return Err(BoundedReadFailure::Input {
+                    subject: ".olean directory",
+                    detail: format!(
+                        "refusing symlink {} while deriving a closed module set",
+                        entry.path().display()
+                    ),
+                });
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry.path().extension() == Some(std::ffi::OsStr::new("olean"))
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+
+    let module_limit = fln::OleanCheckLimits::new(
+        max_bytes,
+        fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+    )
+    .max_modules;
+    if paths.len() > module_limit {
+        return Err(BoundedReadFailure::TooLarge {
+            subject: ".olean module count",
+            observed: paths.len(),
+            limit: module_limit,
+        });
+    }
+    let mut modules = Vec::new();
+    modules
+        .try_reserve_exact(paths.len())
+        .map_err(|_| BoundedReadFailure::Allocation {
+            subject: ".olean module table",
+            requested: paths.len(),
+        })?;
+    let mut total_bytes = 0_usize;
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| BoundedReadFailure::Input {
+                subject: ".olean directory",
+                detail: format!("cannot relativize {}: {error}", path.display()),
+            })?;
+        let name =
+            module_name_from_relative(relative).map_err(|detail| BoundedReadFailure::Input {
+                subject: ".olean directory",
+                detail,
+            })?;
+        let remaining = max_bytes.saturating_sub(total_bytes);
+        let bytes = read_bounded(&path, remaining, ".olean module set")?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        modules.push(NamedOleanBytes { name, bytes });
+    }
+    if modules.is_empty() {
+        return Err(BoundedReadFailure::Input {
+            subject: ".olean directory",
+            detail: format!("{} contains no .olean files", root.display()),
+        });
+    }
+    Ok(modules)
+}
+
+fn render_check_olean_set_success(
+    bytes: usize,
+    checked: &fln::CheckedOleanSet,
+    json: bool,
+) -> MultiplexerOutput {
+    let declarations: usize = checked
+        .modules
+        .iter()
+        .map(|module| module.declarations.len())
+        .sum();
+    let imports: usize = checked
+        .modules
+        .iter()
+        .map(|module| module.decoded.module.imports.len())
+        .sum();
+    let extensions: usize = checked
+        .modules
+        .iter()
+        .map(|module| module.decoded.module.extensions.len())
+        .sum();
+    let stdout = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
+                "\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},",
+                "\"modulesChecked\":{},\"importsResolved\":{},",
+                "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
+                "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
+                "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
+                "\"companionPartsLoaded\":false,\"k2Checked\":false,",
+                "\"g1Satisfied\":false}}\n"
+            ),
+            json_string(CHECK_OLEAN_SCHEMA),
+            bytes,
+            checked.modules.len(),
+            imports,
+            declarations,
+            json_string(&checked.base_logical_root.to_string()),
+            json_string(&checked.result_logical_root.to_string()),
+            extensions,
+        )
+    } else {
+        format!(
+            concat!(
+                "closed .olean module-set declaration check: complete\n",
+                "authority: K1 + independent checker\n",
+                "artifact bytes: {}\n",
+                "modules checked: {}\n",
+                "imports resolved: {}\n",
+                "declarations checked: {}\n",
+                "module and declaration dependency order: derived\n",
+                "base logical root: {}\n",
+                "result logical root: {}\n",
+                "extension blocks observed: {} (not interpreted)\n",
+                "companion artifact parts loaded: no\n",
+                "K2 checked: no\n",
+                "G1 satisfied: no\n"
+            ),
+            bytes,
+            checked.modules.len(),
+            imports,
+            declarations,
+            checked.base_logical_root,
+            checked.result_logical_root,
+            extensions,
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn check_olean_module_bytes(
+    modules: Vec<NamedOleanBytes>,
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let total_bytes = modules.iter().fold(0_usize, |total, module| {
+        total.saturating_add(module.bytes.len())
+    });
+    let worker = match std::thread::Builder::new()
+        .name("fln-check-olean-set".to_owned())
+        .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
+        .spawn(move || {
+            let inputs: Vec<fln::OleanModuleInput<'_>> = modules
+                .iter()
+                .map(|module| fln::OleanModuleInput {
+                    name: &module.name,
+                    artifact: &module.bytes,
+                })
+                .collect();
+            let engine = fln::Engine::from_environment(fln::Environment::new());
+            match engine.check_olean_modules(
+                &inputs,
+                &fln::KVMap::new(),
+                fln::OleanCheckLimits::new(
+                    max_bytes,
+                    fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES),
+                ),
+            ) {
+                Ok(fln::Outcome::Complete(checked)) => {
+                    render_check_olean_set_success(total_bytes, &checked, json)
+                }
+                Ok(fln::Outcome::Inconclusive(reason)) => {
+                    check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
+                }
+                Ok(fln::Outcome::InternalFault(fault)) => {
+                    check_olean_failure("internal-fault", &format!("{fault:?}"), false, json, 4)
+                }
+                Err(error) => {
+                    let (class, authority, exit_code) = check_olean_error_disposition(&error);
+                    check_olean_failure(class, &error.to_string(), authority, json, exit_code)
+                }
+            }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return check_olean_failure(
+                "internal-fault",
+                &format!("could not start bounded kernel worker: {error}"),
+                false,
+                json,
+                4,
+            );
+        }
+    };
+    match worker.join() {
+        Ok(output) => output,
+        Err(_) => check_olean_failure(
+            "internal-fault",
+            "bounded kernel worker panicked",
+            false,
+            json,
+            4,
+        ),
+    }
+}
+
+fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return check_olean_failure(
+                "input",
+                &format!("cannot inspect {}: {error}", path.display()),
+                false,
+                json,
+                1,
+            );
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return check_olean_failure(
+            "input",
+            &format!("refusing symlink {} as a check root", path.display()),
+            false,
+            json,
+            1,
+        );
+    }
+    if metadata.is_dir() {
+        let modules = match collect_olean_directory(path, max_bytes) {
+            Ok(modules) => modules,
+            Err(error) => {
+                let class = error.class();
+                return check_olean_failure(
+                    class,
+                    &error.to_string(),
+                    false,
+                    json,
+                    if class == "resource" { 3 } else { 1 },
+                );
+            }
+        };
+        return check_olean_module_bytes(modules, max_bytes, json);
+    }
+    if !metadata.is_file() {
+        return check_olean_failure(
+            "input",
+            &format!(
+                "{} is neither a regular file nor a directory",
+                path.display()
+            ),
+            false,
+            json,
+            1,
+        );
+    }
+    let bytes = match read_bounded(path, max_bytes, ".olean artifact") {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let class = error.class();
+            return check_olean_failure(
+                class,
+                &error.to_string(),
+                false,
+                json,
+                if class == "resource" { 3 } else { 1 },
+            );
+        }
+    };
+    check_olean_bytes(bytes, max_bytes, json)
+}
+
 fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
     match ground {
         fln::CheckerAdmissionGround::AxiomPreamble => "axiom-preamble",
@@ -1274,6 +1834,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
         Ok(MultiplexerCommand::Version) => {
             MultiplexerOutput::success(format!("fln {}\n", env!("CARGO_PKG_VERSION")))
         }
+        Ok(MultiplexerCommand::CheckOlean {
+            path,
+            max_bytes,
+            json,
+        }) => check_olean(&path, max_bytes, json),
         Ok(MultiplexerCommand::SourceRun {
             paths,
             max_bytes,
@@ -1730,9 +2295,11 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        FLBC_RUN_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES,
-        SOURCE_RUN_SCHEMA, execute_flbc_bytes, execute_source_bytes, execution_error_disposition,
-        inspect_olean_bytes, read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
+        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_INSPECT_SCHEMA,
+        OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, check_olean_bytes,
+        check_olean_module_bytes, execute_flbc_bytes, execute_source_bytes,
+        execution_error_disposition, inspect_olean_bytes, module_name_from_relative,
+        read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -1770,6 +2337,85 @@ mod tests {
             fln::Outcome::Complete(execution) => execution.flbc_artifact,
             fln::Outcome::Inconclusive(_) | fln::Outcome::InternalFault(_) => Vec::new(),
         }
+    }
+
+    fn checkable_olean_fixture() -> Vec<u8> {
+        let proposition = fln::Name::from_components(["CliFixture", "P"]);
+        let witness = fln::Name::from_components(["CliFixture", "p"]);
+        let theorem = fln::Name::from_components(["CliFixture", "t"]);
+        let proposition_expr = fln::Expr::const_(proposition.clone(), Vec::new());
+        let constants = vec![
+            fln::ConstantInfo::Thm(fln::TheoremVal {
+                base: fln::ConstantVal {
+                    name: theorem,
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: fln::Expr::const_(witness.clone(), Vec::new()),
+                all: Vec::new(),
+            }),
+            fln::ConstantInfo::Axiom(fln::AxiomVal {
+                base: fln::ConstantVal {
+                    name: witness,
+                    level_params: Vec::new(),
+                    type_: proposition_expr,
+                },
+                is_unsafe: false,
+            }),
+            fln::ConstantInfo::Axiom(fln::AxiomVal {
+                base: fln::ConstantVal {
+                    name: proposition,
+                    level_params: Vec::new(),
+                    type_: fln::Expr::sort(fln::Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+        ];
+        let lean_version = fln::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the pin tag starts with v");
+        fln::encode_olean_module(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            fln::OleanWriteHeader {
+                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version,
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr: (fln::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            fln::OleanWriteBudget::default(),
+        )
+        .expect("the CLI check fixture encodes")
+        .bytes
+    }
+
+    fn empty_olean_fixture(imports: &[fln::OleanModuleImport]) -> Vec<u8> {
+        let lean_version = fln::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the pin tag starts with v");
+        fln::encode_olean_module(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports,
+                constants: &[],
+                extra_const_names: &[],
+            },
+            fln::OleanWriteHeader {
+                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version,
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr: (fln::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            fln::OleanWriteBudget::default(),
+        )
+        .expect("the empty module fixture encodes")
+        .bytes
     }
 
     #[test]
@@ -1851,6 +2497,140 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"outcome\":\"complete\""));
         assert!(robot.stdout.contains("\"decodedConstants\":2"));
+    }
+
+    #[test]
+    fn check_olean_reaches_k1_and_the_independent_checker_in_human_and_robot_forms() {
+        let artifact = checkable_olean_fixture();
+        let human = check_olean_bytes(artifact.clone(), artifact.len(), false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(
+            human
+                .stdout
+                .contains("standalone .olean declaration check: complete")
+        );
+        assert!(human.stdout.contains("authority: K1 + independent checker"));
+        assert!(human.stdout.contains("declarations checked: 3"));
+        assert!(human.stdout.contains("K2 checked: no"));
+        assert!(human.stdout.contains("G1 satisfied: no"));
+
+        let robot = check_olean_bytes(artifact.clone(), artifact.len(), true);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{CHECK_OLEAN_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"outcome\":\"complete\""));
+        assert!(robot.stdout.contains("\"authority\":true"));
+        assert!(robot.stdout.contains("\"declarationsChecked\":3"));
+        assert!(robot.stdout.contains("\"extensionsInterpreted\":false"));
+        assert!(robot.stdout.contains("\"k2Checked\":false"));
+        assert!(robot.stdout.contains("\"g1Satisfied\":false"));
+
+        let exhausted = check_olean_bytes(artifact.clone(), artifact.len() - 1, true);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+        assert!(exhausted.stderr.contains("\"authority\":false"));
+
+        let mut corrupted = artifact;
+        corrupted[0] ^= u8::MAX;
+        let malformed = check_olean_bytes(corrupted.clone(), corrupted.len(), true);
+        assert_eq!(malformed.exit_code, 1);
+        assert!(malformed.stdout.is_empty());
+        assert!(malformed.stderr.contains("\"class\":\"decode\""));
+        assert!(malformed.stderr.contains("bad magic"));
+    }
+
+    #[test]
+    fn check_olean_path_wiring_preserves_import_refusal_and_arity_errors() {
+        let artifact = repository_path("tribunal/fixtures/c3/Init.BinderNameHint.olean");
+        let imported = run([
+            OsString::from("check-olean"),
+            OsString::from("--json"),
+            artifact.into_os_string(),
+        ]);
+        assert_eq!(imported.exit_code, 1);
+        assert!(imported.stdout.is_empty());
+        assert!(imported.stderr.contains("\"class\":\"unresolved-imports\""));
+
+        let missing = run([OsString::from("check-olean")]);
+        assert_eq!(missing.exit_code, 2);
+        assert!(missing.stderr.contains("check-olean requires PATH"));
+        let extra = run([
+            OsString::from("check-olean"),
+            OsString::from("first.olean"),
+            OsString::from("second.olean"),
+        ]);
+        assert_eq!(extra.exit_code, 2);
+        assert!(
+            extra
+                .stderr
+                .contains("check-olean accepts exactly one input path")
+        );
+    }
+
+    #[test]
+    fn check_olean_closed_module_set_and_directory_traversal_are_live() {
+        let base_name = fln::Name::from_components(["Fixture", "Base"]);
+        let child_name = fln::Name::from_components(["Fixture", "Child"]);
+        let base = empty_olean_fixture(&[]);
+        let child = empty_olean_fixture(&[fln::OleanModuleImport {
+            module: base_name.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        }]);
+        let total = base.len() + child.len();
+        let output = check_olean_module_bytes(
+            vec![
+                NamedOleanBytes {
+                    name: child_name,
+                    bytes: child,
+                },
+                NamedOleanBytes {
+                    name: base_name,
+                    bytes: base,
+                },
+            ],
+            total,
+            true,
+        );
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"modulesChecked\":2"));
+        assert!(output.stdout.contains("\"importsResolved\":1"));
+        assert!(output.stdout.contains("\"declarationsChecked\":0"));
+        assert!(
+            output
+                .stdout
+                .contains("\"scope\":\"closed-module-set-declarations\"")
+        );
+
+        assert_eq!(
+            module_name_from_relative(std::path::Path::new("Init/Prelude.olean"))
+                .expect("normalized module path")
+                .to_display_string(),
+            "Init.Prelude"
+        );
+
+        let fixture_directory = repository_path("tribunal/fixtures/c3");
+        let traversed = run([
+            OsString::from("check-olean"),
+            OsString::from("--json"),
+            fixture_directory.into_os_string(),
+        ]);
+        assert_eq!(traversed.exit_code, 1);
+        assert!(traversed.stdout.is_empty());
+        assert!(
+            traversed
+                .stderr
+                .contains("\"class\":\"unresolved-imports\"")
+        );
+        assert!(traversed.stderr.contains("module `Init"));
     }
 
     #[test]
@@ -2127,7 +2907,8 @@ mod tests {
     fn multiplexer_help_and_usage_errors_have_distinct_exit_codes() {
         let help = run(std::iter::empty());
         assert_eq!(help.exit_code, 0);
-        assert!(help.stdout.starts_with("Usage:\n  fln run"));
+        assert!(help.stdout.starts_with("Usage:\n  fln check-olean"));
+        assert!(help.stdout.contains("\n  fln run"));
 
         let error = run([OsString::from("olean"), OsString::from("decode")]);
         assert_eq!(error.exit_code, 2);
