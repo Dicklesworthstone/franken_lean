@@ -926,7 +926,6 @@ fn the_product_closure_names_every_currently_unwired_product_crate() {
             "fln-ledger",
             "fln-libm",
             "fln-mcp",
-            "fln-server",
             "fln-trace",
             "fln-tui",
             "fln-unsafe-jit",
@@ -992,8 +991,8 @@ fn the_product_closure_eliminates_every_single_source_row() {
     assert_eq!(single, 0, "the product closure failed to witness every row");
     let text = fln_epoch_lab::derive::corroboration_report(&rows);
     assert!(text.contains("single_source=0"));
-    assert!(text.contains("corroborated=21"));
-    assert!(text.contains("contradicted=12"));
+    assert!(text.contains("corroborated=22"));
+    assert!(text.contains("contradicted=11"));
     assert!(text.contains("verdict=contradicted"));
 }
 
@@ -1156,6 +1155,7 @@ fn the_real_product_binary_activates_the_dependency_closure() {
                 "fln-olean",
                 "fln-parse",
                 "fln-rt",
+                "fln-server",
                 "fln-syntax",
                 "fln-unsafe-abi",
                 "fln-unsafe-region",

@@ -14,7 +14,9 @@
 //! re-derive a real pinned-format `.olean` through the codec's audited reader.
 //! Verdict's proof-producing `bv_decide` pipeline is also available through an
 //! atomic engine transition whose theorem must survive both Verdict's proof
-//! replay/K1 path and the facade's independent-checker council.
+//! replay/K1 path and the facade's independent-checker council. Lantern's typed
+//! LSP diagnostic projection is reachable here as a pure protocol adapter; the
+//! long-lived server transport remains a separate, unfinished product surface.
 
 #![forbid(unsafe_code)]
 
@@ -41,9 +43,11 @@ use fln_comp::flbc::CallableResultOwnership;
 pub use fln_comp::flbc::{CodecError, CodecLimits};
 use fln_comp::ingress::{FunctionBinding, IngressResource, LambdaBinding, LambdaRecursion};
 pub use fln_comp::ingress::{IngressError, IngressLimits};
-use fln_core::diag::{
-    DiagnosticChannel, DiagnosticColorPolicy, DiagnosticFormat, DiagnosticFrontend, ExitClass,
-    ProjectionRefusal, ProjectionRequest, ProjectionSnapshot,
+pub use fln_core::diag::{
+    DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
+    DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, ExitClass, ProjectionRefusal,
+    ProjectionRequest, ProjectionSnapshot, RelatedSpan, Severity, StructuredDiagnostic,
+    StructuredInconclusive, StructuredInternalFault,
 };
 pub use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 pub use fln_core::level::Level;
@@ -99,6 +103,7 @@ pub use fln_olean::write::{
     WriteError as OleanWriteError, WriteResource as OleanWriteResource,
     encode_expr_region as encode_olean_expr_region, encode_module as encode_olean_module,
 };
+pub use fln_server::LspProjection;
 pub use fln_verdict as verdict;
 pub use fln_verdict::{
     BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp, BvComparison, BvDecideCounterexample,
@@ -157,6 +162,20 @@ pub fn project_diagnostics(
         disposition: snapshot.exit_class(),
         semantic: snapshot.clone(),
     })
+}
+
+/// Project one typed diagnostic snapshot to canonical LSP notifications.
+///
+/// This exposes Lantern's existing diagnostic adapter through the embeddable
+/// product facade. It is a pure protocol projection, not a long-lived server,
+/// transport loop, request parser, or claim that the broader LSP surface is
+/// complete. Inconclusive and internal-fault snapshots remain on the distinct
+/// `$/lean/diagnosticOutcome` channel defined by `fln-server`.
+pub fn project_lsp_diagnostics(
+    request: ProjectionRequest,
+    snapshot: &ProjectionSnapshot,
+) -> Result<LspProjection, ProjectionRefusal> {
+    fln_server::project(request, snapshot)
 }
 
 /// Independent resource ceilings for canonical FLBC decoding and execution.
@@ -2916,15 +2935,19 @@ impl From<EngineAdmissionError> for EngineExecutionError {
 mod tests {
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
-        ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
+        ConstantVal, Declaration, DefinitionSafety, DefinitionVal, DiagnosticChannel,
+        DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat, DiagnosticFrontend,
+        DiagnosticOrderPolicy, DiagnosticPathPolicy, Engine, EngineAdmissionError,
         EngineAdmissionLimits, EngineBvDecideError, EngineBvDecideInconclusive,
         EngineBvDecideLimits, EngineBvDecideOutcome, EngineExecutionError, EngineExecutionLimits,
-        Environment, Expr, FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level,
-        Literal, Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
-        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
-        OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
+        Environment, ExitClass, Expr, FlbcExecutionLimits, IngressError, IngressResource, KVMap,
+        Level, Literal, Name, NatDefinitionFrontendError, NatLit, OleanCheckError,
+        OleanCheckLimits, OleanDeclarationError, OleanDecodeError, OleanDecodeLimits,
+        OleanModuleImport, OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget,
+        OpaqueVal, Outcome, ProjectionRefusal, ProjectionRequest, ProjectionSnapshot,
         ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, decode_olean_artifact,
-        execute_flbc_artifact, execute_golem_with_options, rebuild_olean_artifact,
+        execute_flbc_artifact, execute_golem_with_options, project_lsp_diagnostics,
+        rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -3111,6 +3134,45 @@ mod tests {
                 None,
             ),
             Outcome::Complete(VmExit::Returned(_))
+        ));
+    }
+
+    #[test]
+    fn public_lsp_projection_is_reachable_through_the_embeddable_facade() {
+        let request = ProjectionRequest {
+            epoch: DiagnosticEpoch::V4_32_0,
+            mode: Mode::Sound,
+            frontend: DiagnosticFrontend::Lsp,
+            format: DiagnosticFormat::Lsp,
+            channel: DiagnosticChannel::Protocol,
+            color: DiagnosticColorPolicy::Never,
+            path: DiagnosticPathPolicy::Preserve,
+            ordering: DiagnosticOrderPolicy::SourcePositionV1,
+        };
+        let snapshot = ProjectionSnapshot::Complete {
+            diagnostics: Vec::new(),
+        };
+        let projection = project_lsp_diagnostics(request, &snapshot)
+            .expect("the registered LSP tuple projects through fln-server");
+        assert_eq!(projection.disposition, ExitClass::Success);
+        assert_eq!(projection.semantic, snapshot);
+        assert_eq!(projection.messages.len(), 1);
+        assert!(projection.messages[0].contains("\"method\":\"$/lean/diagnosticOutcome\""));
+        assert!(projection.messages[0].contains("\"outcome\":\"complete\""));
+        assert!(projection.messages[0].contains("\"authority\":true"));
+
+        let wrong_frontend = ProjectionRequest {
+            frontend: DiagnosticFrontend::Library,
+            format: DiagnosticFormat::Typed,
+            channel: DiagnosticChannel::ReturnValue,
+            ..request
+        };
+        assert!(matches!(
+            project_lsp_diagnostics(wrong_frontend, &snapshot),
+            Err(ProjectionRefusal::Frontend {
+                expected: DiagnosticFrontend::Lsp,
+                actual: DiagnosticFrontend::Library,
+            })
         ));
     }
 
