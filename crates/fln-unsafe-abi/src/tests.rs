@@ -1700,6 +1700,213 @@ fn small_heap_reentrant_tls_borrow_charges_one_semantic_tick() {
 }
 
 #[test]
+fn deterministic_bare_float_exports_route_every_pinned_symbol() {
+    use crate::libm_symbols as symbols;
+
+    assert_eq!(
+        symbols::export_fabs(-2.5).to_bits(),
+        fln_libm::abs(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_acos(0.25).to_bits(),
+        fln_libm::acos(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_acosh(1.25).to_bits(),
+        fln_libm::acosh(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_asin(0.25).to_bits(),
+        fln_libm::asin(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_asinh(0.25).to_bits(),
+        fln_libm::asinh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atan(0.25).to_bits(),
+        fln_libm::atan(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atan2(1.0, -1.0).to_bits(),
+        fln_libm::atan2(1.0, -1.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atanh(0.25).to_bits(),
+        fln_libm::atanh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_cbrt(8.0).to_bits(),
+        fln_libm::cbrt(8.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_ceil(-2.5).to_bits(),
+        fln_libm::ceil(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_cos(0.25).to_bits(),
+        fln_libm::cos(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_cosh(0.25).to_bits(),
+        fln_libm::cosh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_exp(0.25).to_bits(),
+        fln_libm::exp(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_exp2(0.25).to_bits(),
+        fln_libm::exp2(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_floor(-2.5).to_bits(),
+        fln_libm::floor(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_log(1.25).to_bits(),
+        fln_libm::log(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_log10(1.25).to_bits(),
+        fln_libm::log10(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_log2(1.25).to_bits(),
+        fln_libm::log2(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_pow(2.0, 3.0).to_bits(),
+        fln_libm::pow(2.0, 3.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_round(-2.5).to_bits(),
+        fln_libm::round(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sin(0.25).to_bits(),
+        fln_libm::sin(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sinh(0.25).to_bits(),
+        fln_libm::sinh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sqrt(4.0).to_bits(),
+        fln_libm::sqrt(4.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_tan(0.25).to_bits(),
+        fln_libm::tan(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_tanh(0.25).to_bits(),
+        fln_libm::tanh(0.25).to_bits()
+    );
+
+    assert_eq!(
+        symbols::export_fabsf(-2.5).to_bits(),
+        fln_libm::f32::abs(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_acosf(0.25).to_bits(),
+        fln_libm::f32::acos(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_acoshf(1.25).to_bits(),
+        fln_libm::f32::acosh(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_asinf(0.25).to_bits(),
+        fln_libm::f32::asin(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_asinhf(0.25).to_bits(),
+        fln_libm::f32::asinh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atanf(0.25).to_bits(),
+        fln_libm::f32::atan(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atan2f(1.0, -1.0).to_bits(),
+        fln_libm::f32::atan2(1.0, -1.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_atanhf(0.25).to_bits(),
+        fln_libm::f32::atanh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_cbrtf(8.0).to_bits(),
+        fln_libm::f32::cbrt(8.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_ceilf(-2.5).to_bits(),
+        fln_libm::f32::ceil(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_cosf(0.25).to_bits(),
+        fln_libm::f32::cos(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_coshf(0.25).to_bits(),
+        fln_libm::f32::cosh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_expf(0.25).to_bits(),
+        fln_libm::f32::exp(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_exp2f(0.25).to_bits(),
+        fln_libm::f32::exp2(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_floorf(-2.5).to_bits(),
+        fln_libm::f32::floor(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_logf(1.25).to_bits(),
+        fln_libm::f32::log(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_log10f(1.25).to_bits(),
+        fln_libm::f32::log10(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_log2f(1.25).to_bits(),
+        fln_libm::f32::log2(1.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_powf(2.0, 3.0).to_bits(),
+        fln_libm::f32::pow(2.0, 3.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_roundf(-2.5).to_bits(),
+        fln_libm::f32::round(-2.5).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sinf(0.25).to_bits(),
+        fln_libm::f32::sin(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sinhf(0.25).to_bits(),
+        fln_libm::f32::sinh(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_sqrtf(4.0).to_bits(),
+        fln_libm::f32::sqrt(4.0).to_bits()
+    );
+    assert_eq!(
+        symbols::export_tanf(0.25).to_bits(),
+        fln_libm::f32::tan(0.25).to_bits()
+    );
+    assert_eq!(
+        symbols::export_tanhf(0.25).to_bits(),
+        fln_libm::f32::tanh(0.25).to_bits()
+    );
+}
+
+#[test]
 fn small_heap_reentrant_semantic_fallback_is_one_tick_in_every_class() {
     let _g = lock();
     use crate::export::{export_lean_free_small, export_lean_small_mem_size};

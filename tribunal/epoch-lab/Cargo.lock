@@ -117,6 +117,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fln-libm"
+version = "0.0.0"
+
+[[package]]
 name = "fln-olean"
 version = "0.0.0"
 dependencies = [
@@ -164,6 +168,7 @@ name = "fln-unsafe-abi"
 version = "0.0.0"
 dependencies = [
  "fln-bignum",
+ "fln-libm",
 ]
 
 [[package]]

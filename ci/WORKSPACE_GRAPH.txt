@@ -105,6 +105,7 @@ edge fln-olean -> fln-unsafe-region # mmap-backed codec load over the shared reg
 edge fln-rt -> fln-core            # Compat/native conversion projects canonical term-plane values (fln-lld; §6.1b; commit 3b34d5c5)
 edge fln-rt -> fln-unsafe-abi      # safe Marrow surface over the CompatHeap membrane, BOUNDARY_API-governed (fln-lld)
 edge fln-unsafe-abi -> fln-bignum  # exported lean_nat_big_* family over the owned bignum (franken_lean-83r; §8.4 shim)
+edge fln-unsafe-abi -> fln-libm    # generated-C Float/Float32 bare symbols route to the owned deterministic numerics plane (§6.8, D21)
 edge fln-rt -> fln-unsafe-region   # region engine drives the mmap/seal primitives, BOUNDARY_API-governed (fln-wgp)
 edge fln-olean -> fln-core         # declaration decoder builds term-plane values (franken_lean-z6c)
 edge fln-syntax -> fln-core        # SyntaxNodeKind and identifiers are Name (franken_lean-vrmi; §21, AGENTS.md crate map)

@@ -199,6 +199,7 @@ name = "fln-unsafe-abi"
 version = "0.0.0"
 dependencies = [
  "fln-bignum",
+ "fln-libm",
 ]
 
 [[package]]

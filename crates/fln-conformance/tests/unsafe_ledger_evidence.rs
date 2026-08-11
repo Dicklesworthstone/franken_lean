@@ -391,7 +391,10 @@ const LANE_CITED_ROWS: usize = 1;
 /// 120 -> 121 in the signed-Int ABI recovery: FLN-UL-0559 cites
 /// `export_int_big_arithmetic_division_and_truncation_match_pin_laws`, the exact boundary
 /// test covering the new constructors, arithmetic, ownership, zero, and truncation arms.
-const SYMBOL_RESOLVED_ROWS: usize = 121;
+/// 121 -> 171 in the deterministic generated-C Float bridge: FLN-UL-0569 through
+/// FLN-UL-0618 all cite `deterministic_bare_float_exports_route_every_pinned_symbol`,
+/// which calls every one of their binary64 and binary32 wrappers.
+const SYMBOL_RESOLVED_ROWS: usize = 171;
 
 /// Every citation token, across all rows, that resolves to a boundary-crate function.
 ///
@@ -469,7 +472,9 @@ const SYMBOL_RESOLVED_ROWS: usize = 121;
 /// resolving token was removed or renamed.
 /// 145 -> 146 in the signed-Int ABI recovery: FLN-UL-0559 adds the exact boundary-test
 /// citation named in the row history above; no existing resolving token moved.
-const RESOLVING_CITATION_TOKENS: usize = 146;
+/// 146 -> 196 in the deterministic generated-C Float bridge: each of its 50 site rows
+/// gains the exact test-function citation named in the row history above.
+const RESOLVING_CITATION_TOKENS: usize = 196;
 
 /// Rows whose evidence is prose — the permanent, named remainder.
 ///
@@ -510,13 +515,15 @@ const RESOLVING_CITATION_TOKENS: usize = 146;
 /// evidence rewrite remains prose, so no pre-existing row changed class.
 /// 430 -> 439 in the remaining Nat ABI wiring: FLN-UL-0560 through FLN-UL-0568
 /// add nine implementation-site rows backed by the existing export suite and C4 lane.
+/// The 50 deterministic Float bridge rows are all symbol-resolved, so this remainder
+/// stays 439 rather than growing with the implementation surface.
 const PROSE_EVIDENCE_ROWS: usize = 439;
 
 /// Why prose stays prose, and what that costs.
 const EVIDENCE_REMAINDER_REASON: &str = "\
 Decided 2026-07-26 (option (b) on the parked question in \
-franken_lean-d3-safety-note-unenforced-cdbg). 561 rows: 1 cites an e2e lane, 121 carry \
-symbol-resolved evidence, and 439 remain prose; 146 individual tokens resolve. The exact \
+franken_lean-d3-safety-note-unenforced-cdbg). 611 rows: 1 cites an e2e lane, 171 carry \
+symbol-resolved evidence, and 439 remain prose; 196 individual tokens resolve. The exact \
 counts live in the constants above and move only with a named, commit-anchored cause. The \
 resolvable ones are ratcheted; the prose is a \
 declared, COUNTED remainder rather than a rewrite.\n\

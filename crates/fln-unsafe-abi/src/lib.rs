@@ -73,6 +73,7 @@ mod export;
 mod fs;
 pub mod handle;
 mod layout;
+mod libm_symbols;
 mod membrane;
 mod object;
 pub mod rc;

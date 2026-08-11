@@ -28,6 +28,7 @@
 #include <lean/lean.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -359,6 +360,38 @@ static void facts_mode(void) {
      * 5a): the Reference's stream globals are built in initialize_io, and
      * Marrow's twin seeds its trio + the SIGPIPE disposition here. */
     lean_initialize_runtime_module();
+
+    /* ---- generated-C Float/Float32 bare-symbol plane
+     * Every call uses an exact-result anchor and the gauntlet compiles this
+     * file with -fno-builtin.  Consequently the Marrow link must resolve all
+     * 50 pinned extern-census symbols from fln-unsafe-abi itself; no platform
+     * libm is present on that link line. */
+    volatile double d0 = 0.0, d1 = 1.0, d2 = 2.0, d3 = 3.0, d4 = 4.0, d8 = 8.0;
+    long long math64_sum =
+        (long long)fabs(-d2) + (long long)acos(d1) + (long long)acosh(d1) +
+        (long long)asin(d0) + (long long)asinh(d0) + (long long)atan(d0) +
+        (long long)atan2(d0, d1) + (long long)atanh(d0) + (long long)cbrt(d8) +
+        (long long)ceil(d1) + (long long)cos(d0) + (long long)cosh(d0) +
+        (long long)exp(d0) + (long long)exp2(d3) + (long long)floor(d1) +
+        (long long)log(d1) + (long long)log10(d1) + (long long)log2(d1) +
+        (long long)pow(d2, d3) + (long long)round(d2) + (long long)sin(d0) +
+        (long long)sinh(d0) + (long long)sqrt(d4) + (long long)tan(d0) +
+        (long long)tanh(d0);
+    fact("float.extern.binary64_exact_sum", math64_sum);
+
+    volatile float f0 = 0.0f, f1 = 1.0f, f2 = 2.0f, f3 = 3.0f, f4 = 4.0f,
+                   f8 = 8.0f;
+    long long math32_sum =
+        (long long)fabsf(-f2) + (long long)acosf(f1) + (long long)acoshf(f1) +
+        (long long)asinf(f0) + (long long)asinhf(f0) + (long long)atanf(f0) +
+        (long long)atan2f(f0, f1) + (long long)atanhf(f0) + (long long)cbrtf(f8) +
+        (long long)ceilf(f1) + (long long)cosf(f0) + (long long)coshf(f0) +
+        (long long)expf(f0) + (long long)exp2f(f3) + (long long)floorf(f1) +
+        (long long)logf(f1) + (long long)log10f(f1) + (long long)log2f(f1) +
+        (long long)powf(f2, f3) + (long long)roundf(f2) + (long long)sinf(f0) +
+        (long long)sinhf(f0) + (long long)sqrtf(f4) + (long long)tanf(f0) +
+        (long long)tanhf(f0);
+    fact("float.extern.binary32_exact_sum", math32_sum);
 
     /* ---- heartbeat through the real generated-C small path
      * The direct IO externs are intentionally reset before this cell.  The

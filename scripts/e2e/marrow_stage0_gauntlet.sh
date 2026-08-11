@@ -2,8 +2,8 @@
 # marrow_stage0_gauntlet.sh — the stage0 ABI gauntlet, slice 1 (bead
 # franken_lean-83r; plan §6.6/§18.2, corpus family C4).
 #
-# The exported lean_* C symbol surface under upstream's own generated code:
-#   * symbol-surface audit — the staticlib's defined lean_*/mi_* symbols must
+# The exported C symbol surface under upstream's own generated code:
+#   * symbol-surface audit — the staticlib's defined rowed symbols must
 #     equal the implemented rows of ci/ABI_EXPORT_STATUS.txt exactly;
 #   * stage0 symbol-demand audit — real stage0 translation units compiled by
 #     the D2 cc against stage0's OWN lean.h; every demanded lean_*/mi_*
@@ -85,10 +85,14 @@ if ! CARGO_TARGET_DIR="$BUILD_TARGET" cargo rustc --offline -q -p fln-unsafe-abi
 fi
 STATICLIB="$BUILD_TARGET/release/libfln_unsafe_abi.a"
 [ -f "$STATICLIB" ] || fail staticlib_build "\"detail\":\"staticlib artifact missing\""
-nm -g "$STATICLIB" 2>/dev/null | awk '$2=="T" && ($3 ~ /^lean_/ || $3 ~ /^mi_/) {print $3}' | sort -u >"$ART_DIR/symbols_defined.txt"
 grep -E '^(row|support|extern) ' "$STATUS_FILE" \
     | awk -F'|' '{status=$2; gsub(/ /,"",status); if (status != "Unsupported") {sym=$1; sub(/^(row|support|extern) /,"",sym); gsub(/ /,"",sym); print sym}}' \
     | sort -u >"$ART_DIR/symbols_rowed.txt"
+nm -g "$STATICLIB" 2>/dev/null | awk '$2=="T" {print $3}' | sort -u >"$ART_DIR/symbols_all_defined.txt"
+{
+    awk '$0 ~ /^(lean_|mi_)/' "$ART_DIR/symbols_all_defined.txt"
+    comm -12 "$ART_DIR/symbols_rowed.txt" "$ART_DIR/symbols_all_defined.txt"
+} | sort -u >"$ART_DIR/symbols_defined.txt"
 if diff -u "$ART_DIR/symbols_rowed.txt" "$ART_DIR/symbols_defined.txt" >"$ART_DIR/symbols.diff"; then
     emit symbol_surface passed "\"symbols\":$(wc -l <"$ART_DIR/symbols_defined.txt"),\"artifact\":\"symbols_defined.txt\""
 else
@@ -202,8 +206,8 @@ emit stage0_demand_audit passed "\"demanded\":$(wc -l <"$ART_DIR/demand.txt"),\"
 note "lane 5: probe_export.c linked against the Marrow staticlib"
 PROBE_SRC="$ROOT/tribunal/fixtures/c4/probe_export.c"
 probe_sha=$(sha256sum "$PROBE_SRC" | cut -d' ' -f1)
-if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
-    "$PROBE_SRC" "$STATICLIB" -lpthread -ldl -lm \
+if ! "$GCC_BIN" -O1 -fno-builtin -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" "$STATICLIB" -lpthread -ldl \
     -o "$ART_DIR/probe_marrow" >"$ART_DIR/gcc_marrow.log" 2>&1; then
     fail marrow_link "\"artifact\":\"gcc_marrow.log\""
 fi
@@ -215,8 +219,8 @@ fi
 
 # ---- lane 6: the differential (Reference direction + diff + negative control) --
 note "lane 6: same probe against libleanshared; facts must be byte-identical"
-if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
-    "$PROBE_SRC" -L "$ELAN_TC/lib/lean" -lleanshared -Wl,-rpath,"$ELAN_TC/lib/lean" \
+if ! "$GCC_BIN" -O1 -fno-builtin -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
+    "$PROBE_SRC" -L "$ELAN_TC/lib/lean" -lleanshared -lm -Wl,-rpath,"$ELAN_TC/lib/lean" \
     -o "$ART_DIR/probe_reference" >"$ART_DIR/gcc_reference.log" 2>&1; then
     fail reference_link "\"artifact\":\"gcc_reference.log\""
 fi
@@ -246,7 +250,7 @@ driver_sha=$(sha256sum "$DRIVER_SRC" | cut -d' ' -f1)
 PRELUDE_OBJ="$ART_DIR/Init_Prelude.c.o"
 [ -f "$PRELUDE_OBJ" ] || fail stage0_exec_setup "\"detail\":\"lane-4 Prelude object missing\""
 if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
-    "$DRIVER_SRC" "$PRELUDE_OBJ" "$STATICLIB" -lpthread -ldl -lm \
+    "$DRIVER_SRC" "$PRELUDE_OBJ" "$STATICLIB" -lpthread -ldl \
     -o "$ART_DIR/stage0_marrow" >"$ART_DIR/gcc_stage0_marrow.log" 2>&1; then
     fail stage0_exec_link "\"artifact\":\"gcc_stage0_marrow.log\""
 fi
@@ -287,7 +291,7 @@ for obj in "${CHAIN_OBJS[@]}"; do
     [ -f "$obj" ] || fail chain_exec_setup "\"detail\":\"lane-4 object missing: $(basename "$obj")\""
 done
 if ! "$GCC_BIN" -O1 -DNDEBUG -Wall -Werror -I "$ELAN_TC/include" \
-    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" "$STATICLIB" -lpthread -ldl -lm \
+    "$CHAIN_DRIVER_SRC" "${CHAIN_OBJS[@]}" "$STATICLIB" -lpthread -ldl \
     -o "$ART_DIR/chain_marrow" >"$ART_DIR/gcc_chain_marrow.log" 2>&1; then
     fail chain_exec_link "\"artifact\":\"gcc_chain_marrow.log\""
 fi
@@ -364,9 +368,10 @@ done
 note "lane 8: mutant drill 83r-M1 (lean_dec_ref_cold dropped in a copy)"
 MUT_WS="$ART_DIR/mutant-ws"
 mkdir -p "$MUT_WS"
-# The crate's path-dependency closure rides along (fln-bignum -> fln-core).
+# The crate's path-dependency closure rides along.
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT_WS/"
 printf '\n[workspace]\n' >>"$MUT_WS/fln-unsafe-abi/Cargo.toml"
@@ -408,6 +413,7 @@ MUT2_WS="$ART_DIR/mutant-ws-m2"
 mkdir -p "$MUT2_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT2_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT2_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT2_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT2_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT2_WS/"
 printf '\n[workspace]\n' >>"$MUT2_WS/fln-unsafe-abi/Cargo.toml"
@@ -450,6 +456,7 @@ MUT3_WS="$ART_DIR/mutant-ws-m3"
 mkdir -p "$MUT3_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT3_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT3_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT3_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT3_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT3_WS/"
 printf '\n[workspace]\n' >>"$MUT3_WS/fln-unsafe-abi/Cargo.toml"
@@ -491,6 +498,7 @@ MUT4_WS="$ART_DIR/mutant-ws-m4"
 mkdir -p "$MUT4_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT4_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT4_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT4_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT4_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT4_WS/"
 printf '\n[workspace]\n' >>"$MUT4_WS/fln-unsafe-abi/Cargo.toml"
@@ -532,6 +540,7 @@ MUT5_WS="$ART_DIR/mutant-ws-m5"
 mkdir -p "$MUT5_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT5_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT5_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT5_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT5_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT5_WS/"
 printf '\n[workspace]\n' >>"$MUT5_WS/fln-unsafe-abi/Cargo.toml"
@@ -575,6 +584,7 @@ MUT6_WS="$ART_DIR/mutant-ws-m6"
 mkdir -p "$MUT6_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT6_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT6_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT6_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT6_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT6_WS/"
 printf '\n[workspace]\n' >>"$MUT6_WS/fln-unsafe-abi/Cargo.toml"
@@ -610,6 +620,7 @@ MUT7_WS="$ART_DIR/mutant-ws-m7"
 mkdir -p "$MUT7_WS"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT7_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT7_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT7_WS/fln-libm"
 cp -r "$ROOT/crates/fln-core" "$MUT7_WS/fln-core"
 cp "$ROOT/rust-toolchain.toml" "$MUT7_WS/"
 printf '\n[workspace]\n' >>"$MUT7_WS/fln-unsafe-abi/Cargo.toml"
@@ -647,6 +658,7 @@ cp -r "$ROOT/crates/fln-core" "$MUT8_WS/fln-core"
 cp -r "$ROOT/crates/fln-unsafe-region" "$MUT8_WS/fln-unsafe-region"
 cp -r "$ROOT/crates/fln-unsafe-abi" "$MUT8_WS/fln-unsafe-abi"
 cp -r "$ROOT/crates/fln-bignum" "$MUT8_WS/fln-bignum"
+cp -r "$ROOT/crates/fln-libm" "$MUT8_WS/fln-libm"
 cp "$ROOT/rust-toolchain.toml" "$MUT8_WS/"
 printf '\n[workspace]\n' >>"$MUT8_WS/fln-rt/Cargo.toml"
 real_sha_before_m8=$(sha256sum "$ROOT/crates/fln-rt/src/native_heap.rs" | cut -d' ' -f1)
