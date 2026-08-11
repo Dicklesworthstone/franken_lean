@@ -15,4 +15,5 @@ fln-hash = { path = "../fln-hash" }
 fln-kernel = { path = "../fln-kernel" }
 fln-olean = { path = "../fln-olean" }
 fln-parse = { path = "../fln-parse" }
+fln-verdict = { path = "../fln-verdict" }
 fln-vm = { path = "../fln-vm" }

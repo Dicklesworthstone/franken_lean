@@ -12,6 +12,9 @@
 //! body. Embedders can also validate and execute an existing canonical FLBC
 //! artifact without reaching into the compiler or VM crates, and inspect or
 //! re-derive a real pinned-format `.olean` through the codec's audited reader.
+//! Verdict's proof-producing `bv_decide` pipeline is also available through an
+//! atomic engine transition whose theorem must survive both Verdict's proof
+//! replay/K1 path and the facade's independent-checker council.
 
 #![forbid(unsafe_code)]
 
@@ -44,9 +47,10 @@ use fln_core::diag::{
 };
 pub use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 pub use fln_core::level::Level;
+pub use fln_core::mode::{Mode, ReproducibilityProfile};
 pub use fln_core::name::Name;
 pub use fln_core::options::KVMap;
-pub use fln_core::outcome::Outcome;
+pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
 pub use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
@@ -54,6 +58,7 @@ pub use fln_env::constants::{
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
+pub use fln_env::modules::CancellationProbe;
 pub use fln_env::pmap::CollisionBudget;
 use fln_hash::canon::Canonical;
 pub use fln_hash::root::LogicalRoot;
@@ -93,6 +98,13 @@ pub use fln_olean::write::{
     ModuleWriteReport as OleanModuleWriteReport, OleanWriteHeader, WriteBudget as OleanWriteBudget,
     WriteError as OleanWriteError, WriteResource as OleanWriteResource,
     encode_expr_region as encode_olean_expr_region, encode_module as encode_olean_module,
+};
+pub use fln_verdict as verdict;
+pub use fln_verdict::{
+    BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp, BvComparison, BvDecideCounterexample,
+    BvDecideInconclusive, BvDecideInputAssignment, BvDecideInputValue, BvDecideInternalFault,
+    BvDecideLimits, BvDecidePublication, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry,
+    BvExpr, BvShiftOp, BvUnaryOp, UnsupportedBvOp,
 };
 use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{
@@ -846,6 +858,143 @@ fn plan_olean_declarations(
     Ok(order)
 }
 
+/// Caller-supplied bounds for one proof-producing bitvector decision and its
+/// publication into an immutable [`Engine`] successor.
+///
+/// Verdict and the facade council have separate kernel budgets because the
+/// exact reflected theorem is deliberately checked on both authority paths.
+/// [`Self::new`] initializes both from one calibrated native-stack budget;
+/// callers can then tighten either phase independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineBvDecideLimits {
+    pub verdict: BvDecideLimits,
+    pub admission: EngineAdmissionLimits,
+}
+
+impl EngineBvDecideLimits {
+    pub fn new(kernel: Budget) -> Self {
+        let mut verdict = BvDecideLimits::default();
+        verdict.reflection.kernel = kernel;
+        Self {
+            verdict,
+            admission: EngineAdmissionLimits::new(kernel),
+        }
+    }
+}
+
+/// A completed theorem publication that survived Verdict's proof replay and
+/// the embeddable facade's independent-checker council.
+#[derive(Debug)]
+pub struct EngineBvDecidePublication {
+    pub engine: Engine,
+    pub verdict: BvDecidePublication,
+    pub base_logical_root: LogicalRoot,
+    pub result_logical_root: LogicalRoot,
+    pub checker: CheckerAgreement,
+}
+
+/// A resource or cancellation stop in either authority path. It is never a
+/// negative theorem verdict and carries no successor engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineBvDecideInconclusive {
+    Verdict(BvDecideInconclusive),
+    Admission(Inconclusive),
+}
+
+/// An invariant failure in either authority path. It carries no successor
+/// engine or partially reviewed publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineBvDecideInternalFault {
+    Verdict(BvDecideInternalFault),
+    Admission(InternalFault),
+}
+
+/// Disjoint terminal classes for the embeddable `bv_decide` door.
+///
+/// Only [`Self::Proved`] contains an engine successor. In particular, a SAT
+/// counterexample is a completed negative answer about the proposition but has
+/// no declaration-publication authority.
+#[derive(Debug)]
+#[must_use]
+pub enum EngineBvDecideOutcome {
+    Proved(Box<EngineBvDecidePublication>),
+    Counterexample(Box<BvDecideCounterexample>),
+    Refused(BvDecideRefusal),
+    Inconclusive(EngineBvDecideInconclusive),
+    InternalFault(EngineBvDecideInternalFault),
+}
+
+impl EngineBvDecideOutcome {
+    pub const fn publication(&self) -> Option<&EngineBvDecidePublication> {
+        match self {
+            Self::Proved(publication) => Some(publication),
+            Self::Counterexample(_)
+            | Self::Refused(_)
+            | Self::Inconclusive(_)
+            | Self::InternalFault(_) => None,
+        }
+    }
+
+    pub const fn counterexample(&self) -> Option<&BvDecideCounterexample> {
+        match self {
+            Self::Counterexample(counterexample) => Some(counterexample),
+            Self::Proved(_) | Self::Refused(_) | Self::Inconclusive(_) | Self::InternalFault(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// A completed integration refusal. Verdict's domain refusals remain inside
+/// [`EngineBvDecideOutcome`]; these variants mean the already-published
+/// candidate could not be exposed as the exact facade successor.
+#[derive(Debug)]
+pub enum EngineBvDecideError {
+    PublishedTheoremMissing { name: Name },
+    PublishedConstantWasNotTheorem { name: Name, kind: &'static str },
+    Admission(EngineAdmissionError),
+    SuccessorMismatch { name: Name },
+}
+
+impl fmt::Display for EngineBvDecideError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PublishedTheoremMissing { name } => write!(
+                formatter,
+                "Verdict published no constant named {}",
+                name.to_display_string()
+            ),
+            Self::PublishedConstantWasNotTheorem { name, kind } => write!(
+                formatter,
+                "Verdict published {} as {kind}, not a theorem",
+                name.to_display_string()
+            ),
+            Self::Admission(error) => {
+                write!(
+                    formatter,
+                    "facade council refused Verdict publication: {error}"
+                )
+            }
+            Self::SuccessorMismatch { name } => write!(
+                formatter,
+                "Verdict and the facade council produced different successors for {}",
+                name.to_display_string()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineBvDecideError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::PublishedTheoremMissing { .. }
+            | Self::PublishedConstantWasNotTheorem { .. }
+            | Self::SuccessorMismatch { .. } => None,
+        }
+    }
+}
+
 /// One immutable embeddable engine snapshot.
 ///
 /// The currently live constructor seeds only the axiomatic `Nat : Sort 1` name
@@ -891,6 +1040,116 @@ impl Engine {
     /// elaboration-relevant options.
     pub fn logical_root(&self, options: &KVMap) -> LogicalRoot {
         self.environment.logical_root(options)
+    }
+
+    /// Prove or refute one supported Boolean/bitvector proposition through
+    /// Verdict, then expose a successor engine only after the exact reflected
+    /// theorem completes the facade's independent-checker council.
+    ///
+    /// Verdict first bitblasts the negated proposition, deterministically solves
+    /// it, independently replays an UNSAT proof, and publishes through K1. The
+    /// facade then re-admits that exact theorem through [`Self::admit_declaration`]
+    /// and requires the two immutable successor environments to be identical.
+    /// This deliberate second K1 pass keeps the existing council as the sole
+    /// embeddable admission door instead of manufacturing authority from an
+    /// already-materialized environment.
+    pub fn decide_bv(
+        &self,
+        request: BvDecideRequest,
+        options: &KVMap,
+        limits: EngineBvDecideLimits,
+    ) -> Result<EngineBvDecideOutcome, EngineBvDecideError> {
+        self.decide_bv_with_cancel(request, options, limits, None)
+    }
+
+    /// Cancellation-aware form of [`Self::decide_bv`]. Cancellation is sampled
+    /// throughout Verdict and once more before the facade council. The existing
+    /// admission council itself remains bounded but is not yet cooperatively
+    /// cancellable.
+    pub fn decide_bv_with_cancel(
+        &self,
+        request: BvDecideRequest,
+        options: &KVMap,
+        limits: EngineBvDecideLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<EngineBvDecideOutcome, EngineBvDecideError> {
+        let theorem_name = request.theorem_name().clone();
+        let verdict = fln_verdict::bv_decide_with_cancel(
+            &self.environment,
+            request,
+            limits.verdict,
+            cancellation,
+        );
+        let publication = match verdict {
+            fln_verdict::BvDecideOutcome::Proved(publication) => publication,
+            fln_verdict::BvDecideOutcome::Counterexample(counterexample) => {
+                return Ok(EngineBvDecideOutcome::Counterexample(counterexample));
+            }
+            fln_verdict::BvDecideOutcome::Refused(refusal) => {
+                return Ok(EngineBvDecideOutcome::Refused(refusal));
+            }
+            fln_verdict::BvDecideOutcome::Inconclusive(inconclusive) => {
+                return Ok(EngineBvDecideOutcome::Inconclusive(
+                    EngineBvDecideInconclusive::Verdict(inconclusive),
+                ));
+            }
+            fln_verdict::BvDecideOutcome::InternalFault(fault) => {
+                return Ok(EngineBvDecideOutcome::InternalFault(
+                    EngineBvDecideInternalFault::Verdict(fault),
+                ));
+            }
+        };
+
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(EngineBvDecideOutcome::Inconclusive(
+                EngineBvDecideInconclusive::Admission(Inconclusive::cancelled(
+                    "engine-bv-decide/before-facade-council",
+                )),
+            ));
+        }
+
+        let verdict_environment = publication.reflection().publication.environment.clone();
+        let theorem = match verdict_environment.find(&theorem_name) {
+            Some(ConstantInfo::Thm(theorem)) => theorem.clone(),
+            Some(other) => {
+                return Err(EngineBvDecideError::PublishedConstantWasNotTheorem {
+                    name: theorem_name,
+                    kind: other.kind_name(),
+                });
+            }
+            None => {
+                return Err(EngineBvDecideError::PublishedTheoremMissing { name: theorem_name });
+            }
+        };
+        let admission = self
+            .admit_declaration(Declaration::Thm(theorem), options, limits.admission)
+            .map_err(EngineBvDecideError::Admission)?;
+        let admission = match admission {
+            Outcome::Complete(admission) => admission,
+            Outcome::Inconclusive(inconclusive) => {
+                return Ok(EngineBvDecideOutcome::Inconclusive(
+                    EngineBvDecideInconclusive::Admission(inconclusive),
+                ));
+            }
+            Outcome::InternalFault(fault) => {
+                return Ok(EngineBvDecideOutcome::InternalFault(
+                    EngineBvDecideInternalFault::Admission(fault),
+                ));
+            }
+        };
+        if admission.engine.environment != verdict_environment {
+            return Err(EngineBvDecideError::SuccessorMismatch { name: theorem_name });
+        }
+
+        Ok(EngineBvDecideOutcome::Proved(Box::new(
+            EngineBvDecidePublication {
+                engine: admission.engine,
+                verdict: *publication,
+                base_logical_root: admission.base_logical_root,
+                result_logical_root: admission.result_logical_root,
+                checker: admission.checker,
+            },
+        )))
     }
 
     /// Decode and atomically check every declaration in one standalone
@@ -2658,9 +2917,10 @@ mod tests {
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
         ConstantVal, Declaration, DefinitionSafety, DefinitionVal, Engine, EngineAdmissionError,
-        EngineAdmissionLimits, EngineExecutionError, EngineExecutionLimits, Environment, Expr,
-        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name,
-        NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
+        EngineAdmissionLimits, EngineBvDecideError, EngineBvDecideInconclusive,
+        EngineBvDecideLimits, EngineBvDecideOutcome, EngineExecutionError, EngineExecutionLimits,
+        Environment, Expr, FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level,
+        Literal, Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
         ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, decode_olean_artifact,
@@ -2672,9 +2932,11 @@ mod tests {
         validate,
     };
     use fln_core::diag::ResourceReason;
+    use fln_core::mode::{Mode, ReproducibilityProfile};
     use fln_core::options::DataValue;
     use fln_core::outcome::InconclusiveCause;
     use fln_env::constants::{QuotKind, QuotVal};
+    use fln_verdict::{BoolExpr, BvDecideRequest};
     use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
 
     fn test_budget() -> Budget {
@@ -2683,6 +2945,46 @@ mod tests {
 
     fn test_limits() -> EngineExecutionLimits {
         EngineExecutionLimits::new(test_budget())
+    }
+
+    fn bv_identity_type() -> Expr {
+        Expr::forall_e(
+            Name::from_components(["p"]),
+            Expr::sort(Level::zero()),
+            Expr::forall_e(
+                Name::from_components(["h"]),
+                Expr::bvar(0).expect("test bound variable is in range"),
+                Expr::bvar(1).expect("test bound variable is in range"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    }
+
+    fn bv_identity_proof() -> Expr {
+        Expr::lam(
+            Name::from_components(["p"]),
+            Expr::sort(Level::zero()),
+            Expr::lam(
+                Name::from_components(["h"]),
+                Expr::bvar(0).expect("test bound variable is in range"),
+                Expr::bvar(0).expect("test bound variable is in range"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    }
+
+    fn bv_request(proposition: BoolExpr, theorem: &str) -> BvDecideRequest {
+        BvDecideRequest::new(
+            proposition,
+            Name::from_components([theorem]),
+            Vec::new(),
+            bv_identity_type(),
+            bv_identity_proof(),
+            Mode::Sound,
+            ReproducibilityProfile::Standard,
+        )
     }
 
     fn olean_fixture(name: &str) -> Vec<u8> {
@@ -3411,6 +3713,177 @@ mod tests {
         };
         assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
         assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn bv_decide_publishes_only_the_exact_dually_checked_successor() {
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let theorem = Name::from_components(["bv.facade.positive"]);
+        let outcome = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.positive"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+            )
+            .expect("Verdict and the facade council accept the identity theorem");
+        let EngineBvDecideOutcome::Proved(publication) = outcome else {
+            panic!("a true proposition must produce the only successor-carrying arm");
+        };
+
+        assert!(engine.environment().is_empty(), "the receiver is immutable");
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert_eq!(publication.base_logical_root, base_root);
+        assert_eq!(
+            publication.result_logical_root,
+            publication.engine.logical_root(&options)
+        );
+        assert_ne!(publication.result_logical_root, base_root);
+        assert!(publication.engine.environment().contains(&theorem));
+        assert_eq!(
+            publication.engine.environment(),
+            &publication.verdict.reflection().publication.environment,
+            "the two authority paths must expose the same immutable successor"
+        );
+        assert_eq!(
+            publication.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+    }
+
+    #[test]
+    fn bv_decide_counterexample_cancellation_and_exhaustion_have_no_successor() {
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+
+        let counterexample = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(false), "bv.facade.counterexample"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+            )
+            .expect("false has a completed SAT counterexample");
+        assert!(matches!(
+            counterexample,
+            EngineBvDecideOutcome::Counterexample(_)
+        ));
+        assert!(counterexample.publication().is_none());
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let cancellation = engine
+            .decide_bv_with_cancel(
+                bv_request(BoolExpr::Constant(true), "bv.facade.cancelled"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+                Some(&cancelled),
+            )
+            .expect("cancellation is a typed non-answer");
+        assert!(matches!(
+            cancellation,
+            EngineBvDecideOutcome::Inconclusive(EngineBvDecideInconclusive::Verdict(
+                fln_verdict::BvDecideInconclusive::Pipeline(_)
+            ))
+        ));
+        assert!(cancellation.publication().is_none());
+
+        let mut exhausted_limits = EngineBvDecideLimits::new(test_budget());
+        exhausted_limits.verdict.bitblast.max_ast_nodes = 0;
+        let exhausted = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.exhausted"),
+                &options,
+                exhausted_limits,
+            )
+            .expect("resource exhaustion is a typed non-answer");
+        assert!(matches!(
+            exhausted,
+            EngineBvDecideOutcome::Inconclusive(EngineBvDecideInconclusive::Verdict(
+                fln_verdict::BvDecideInconclusive::Bitblast(_)
+            ))
+        ));
+        assert!(exhausted.publication().is_none());
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(engine.environment().is_empty());
+    }
+
+    #[test]
+    fn bv_decide_facade_checker_veto_is_atomic_and_recoverable() {
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+        let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+        let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+        let mut constrained = EngineBvDecideLimits::new(test_budget());
+        constrained.admission.checker.admission =
+            CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+
+        let error = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.vetoed"),
+                &options,
+                constrained,
+            )
+            .expect_err("the facade checker non-answer must veto the Verdict successor");
+        assert!(matches!(
+            error,
+            EngineBvDecideError::Admission(EngineAdmissionError::CouncilHalted {
+                ref summary
+            }) if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(engine.environment().is_empty());
+
+        let recovered = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.recovered"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+            )
+            .expect("a veto does not poison the immutable receiver");
+        assert!(matches!(recovered, EngineBvDecideOutcome::Proved(_)));
+    }
+
+    #[test]
+    fn bv_decide_duplicate_is_a_refusal_without_a_second_successor() {
+        let engine = Engine::from_environment(Environment::new());
+        let options = KVMap::new();
+        let first = engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.duplicate"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+            )
+            .expect("the first theorem publishes");
+        let EngineBvDecideOutcome::Proved(first) = first else {
+            panic!("the first theorem must publish");
+        };
+        let successor_root = first.engine.logical_root(&options);
+        let duplicate = first
+            .engine
+            .decide_bv(
+                bv_request(BoolExpr::Constant(true), "bv.facade.duplicate"),
+                &options,
+                EngineBvDecideLimits::new(test_budget()),
+            )
+            .expect("a duplicate is a completed Verdict refusal");
+        assert!(
+            matches!(
+                &duplicate,
+                EngineBvDecideOutcome::Refused(fln_verdict::BvDecideRefusal::Reflection(
+                    fln_verdict::ReflectedTheoremRefusal::Kernel {
+                        class: RejectClass::AlreadyDeclared,
+                        ..
+                    }
+                ))
+            ),
+            "unexpected duplicate outcome: {duplicate:?}"
+        );
+        assert!(duplicate.publication().is_none());
+        assert_eq!(first.engine.logical_root(&options), successor_root);
+        assert_eq!(first.engine.environment().len(), 1);
     }
 
     #[test]

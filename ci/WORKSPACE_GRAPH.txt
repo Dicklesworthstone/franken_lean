@@ -79,6 +79,7 @@ edge fln -> fln-hash               # typed pre/post logical roots for embeddable
 edge fln -> fln-kernel             # kernel admission and publication capability facade (franken_lean-7kc)
 edge fln -> fln-olean              # bounded public reader for pinned .olean artifacts
 edge fln -> fln-parse              # bounded source parser facade (franken_lean-7kc)
+edge fln -> fln-verdict            # checked bv_decide publication through the embeddable Engine council
 edge fln -> fln-vm                 # canonical FLBC execution result facade (franken_lean-7kc)
 edge fln-cli -> fln                # executable multiplexer delegates to the embeddable engine
 edge fln-cli -> fln-core           # CLI and robot diagnostic adapters (franken_lean-wlan)

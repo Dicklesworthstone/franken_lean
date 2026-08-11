@@ -15,6 +15,7 @@ dependencies = [
  "fln-kernel",
  "fln-olean",
  "fln-parse",
+ "fln-verdict",
  "fln-vm",
 ]
 
