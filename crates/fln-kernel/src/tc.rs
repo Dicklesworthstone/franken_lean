@@ -992,6 +992,129 @@ impl InstantiateRevCache {
     }
 }
 
+struct InstantiateRevContext {
+    values: Vec<Expr>,
+    id: u32,
+}
+
+/// Cross-call cache for batched beta/opening substitutions. Contexts intern
+/// the complete argument vector once, then all recursive source subgraphs can
+/// reuse results reached from a different top-level body under that vector.
+/// Full structural equality is the authority after every packed prefilter.
+struct InstantiateRevContextCache {
+    contexts: HashMap<(u64, usize), Vec<InstantiateRevContext>>,
+    context_count: usize,
+    results: HashMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
+    entries: usize,
+    argument_cells: usize,
+    max_contexts: usize,
+    max_entries: usize,
+    max_bucket_entries: usize,
+    max_argument_cells: usize,
+}
+
+impl InstantiateRevContextCache {
+    fn new() -> Self {
+        Self::bounded(
+            TYPE_CHECKER_CACHE_MAX_ENTRIES,
+            TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS,
+        )
+    }
+
+    fn bounded(max_entries: usize, max_bucket_entries: usize, max_argument_cells: usize) -> Self {
+        Self {
+            contexts: HashMap::new(),
+            context_count: 0,
+            results: HashMap::new(),
+            entries: 0,
+            argument_cells: 0,
+            max_contexts: max_entries.min(4_096),
+            max_entries,
+            max_bucket_entries,
+            max_argument_cells,
+        }
+    }
+
+    fn context_key(values: &[Expr]) -> (u64, usize) {
+        let hash = values
+            .iter()
+            .fold(0x9e37_79b9_7f4a_7c15_u64, |state, value| {
+                state.rotate_left(11) ^ value.data().0.wrapping_add(0x517c_c1b7_2722_0a95)
+            });
+        (hash, values.len())
+    }
+
+    fn context_id(&mut self, values: &[Expr]) -> Option<u32> {
+        if values.is_empty() || values.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+            return None;
+        }
+        let key = Self::context_key(values);
+        if let Some(id) = self.contexts.get(&key).and_then(|bucket| {
+            bucket
+                .iter()
+                .find_map(|context| (context.values == values).then_some(context.id))
+        }) {
+            return Some(id);
+        }
+        if self.context_count >= self.max_contexts
+            || self.max_bucket_entries == 0
+            || self
+                .contexts
+                .get(&key)
+                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+            || self
+                .argument_cells
+                .checked_add(values.len())
+                .is_none_or(|cells| cells > self.max_argument_cells)
+        {
+            return None;
+        }
+        let id = u32::try_from(self.context_count).ok()?;
+        self.contexts
+            .entry(key)
+            .or_default()
+            .push(InstantiateRevContext {
+                values: values.to_vec(),
+                id,
+            });
+        self.context_count += 1;
+        self.argument_cells += values.len();
+        Some(id)
+    }
+
+    fn get(&self, context: u32, source: &Expr, bound: u32) -> Option<Expr> {
+        self.results
+            .get(&(context, source.data().0, bound))?
+            .iter()
+            .find_map(|(candidate, result)| (candidate == source).then(|| result.clone()))
+    }
+
+    fn insert(&mut self, context: u32, source: Expr, bound: u32, result: Expr) {
+        let packed = (context, source.data().0, bound);
+        if let Some(bucket) = self.results.get_mut(&packed) {
+            if let Some((_, existing)) = bucket
+                .iter_mut()
+                .find(|(candidate, _)| candidate == &source)
+            {
+                *existing = result;
+                return;
+            }
+            if self.entries >= self.max_entries || bucket.len() >= self.max_bucket_entries {
+                return;
+            }
+            bucket.push((source, result));
+            self.entries += 1;
+            return;
+        }
+        if self.entries >= self.max_entries || self.max_bucket_entries == 0 {
+            return;
+        }
+        self.results.insert(packed, vec![(source, result)]);
+        self.entries += 1;
+    }
+}
+
 struct LParamContext {
     params: Vec<Name>,
     levels: Vec<Level>,
@@ -1213,7 +1336,13 @@ pub(crate) struct TypeChecker<'a> {
     whnf_core_cache: ExprResultCache,
     whnf_cache: ExprResultCache,
     positive_def_eq_cache: PositiveDefEqCache,
+    /// Pinned `equiv_manager` companion for the equal-regular-head shortcut.
+    /// A failed argument comparison is not a negative verdict: it only tells
+    /// lazy delta to unfold this pair. Retaining that fact prevents a repeated
+    /// proof-producing argument comparison from being re-run at every retry.
+    regular_app_def_eq_failure_cache: PositiveDefEqCache,
     instantiate_cache: InstantiateCache,
+    instantiate_rev_context_cache: InstantiateRevContextCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
     recursor_major_cache: RecursorMajorCache,
     defer_recursor_major: bool,
@@ -1245,7 +1374,9 @@ impl<'a> TypeChecker<'a> {
             whnf_core_cache: ExprResultCache::rolling(),
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
+            regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
             instantiate_cache: InstantiateCache::new(),
+            instantiate_rev_context_cache: InstantiateRevContextCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: false,
@@ -1446,8 +1577,9 @@ impl<'a> TypeChecker<'a> {
         bound: u32,
         depth: u32,
     ) -> KResult<Expr> {
+        let context = self.instantiate_rev_context_cache.context_id(fvars);
         let mut cache = InstantiateRevCache::new();
-        self.instantiate_rev_cached(e, fvars, bound, depth, &mut cache)
+        self.instantiate_rev_cached(e, fvars, bound, depth, &mut cache, context)
     }
 
     fn instantiate_rev_cached(
@@ -1457,9 +1589,14 @@ impl<'a> TypeChecker<'a> {
         bound: u32,
         depth: u32,
         cache: &mut InstantiateRevCache,
+        context: Option<u32>,
     ) -> KResult<Expr> {
         self.step(depth)?;
-        if let Some(cached) = cache.get(e, bound) {
+        let cached = match context {
+            Some(context) => self.instantiate_rev_context_cache.get(context, e, bound),
+            None => cache.get(e, bound),
+        };
+        if let Some(cached) = cached {
             return Ok(cached);
         }
         if e.loose_bvar_range() <= bound || fvars.is_empty() {
@@ -1478,8 +1615,8 @@ impl<'a> TypeChecker<'a> {
             }
             ExprNode::BVar { .. } => e.clone(),
             ExprNode::App { f, a } => Expr::app(
-                self.instantiate_rev_cached(f, fvars, bound, depth + 1, cache)?,
-                self.instantiate_rev_cached(a, fvars, bound, depth + 1, cache)?,
+                self.instantiate_rev_cached(f, fvars, bound, depth + 1, cache, context)?,
+                self.instantiate_rev_cached(a, fvars, bound, depth + 1, cache, context)?,
             ),
             ExprNode::Lam {
                 binder_name,
@@ -1488,8 +1625,8 @@ impl<'a> TypeChecker<'a> {
                 binder_info,
             } => Expr::lam(
                 binder_name.clone(),
-                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache)?,
+                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache, context)?,
+                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
                 *binder_info,
             ),
             ExprNode::ForallE {
@@ -1499,8 +1636,8 @@ impl<'a> TypeChecker<'a> {
                 binder_info,
             } => Expr::forall_e(
                 binder_name.clone(),
-                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache)?,
+                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache, context)?,
+                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
                 *binder_info,
             ),
             ExprNode::LetE {
@@ -1511,14 +1648,14 @@ impl<'a> TypeChecker<'a> {
                 non_dep,
             } => Expr::let_e(
                 decl_name.clone(),
-                self.instantiate_rev_cached(type_, fvars, bound, depth + 1, cache)?,
-                self.instantiate_rev_cached(value, fvars, bound, depth + 1, cache)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache)?,
+                self.instantiate_rev_cached(type_, fvars, bound, depth + 1, cache, context)?,
+                self.instantiate_rev_cached(value, fvars, bound, depth + 1, cache, context)?,
+                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
                 *non_dep,
             ),
             ExprNode::MData { data, expr } => Expr::mdata(
                 data.clone(),
-                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache)?,
+                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache, context)?,
             ),
             ExprNode::Proj {
                 struct_name,
@@ -1527,7 +1664,7 @@ impl<'a> TypeChecker<'a> {
             } => Expr::proj(
                 struct_name.clone(),
                 *idx,
-                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache)?,
+                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache, context)?,
             ),
             ExprNode::FVar { .. }
             | ExprNode::MVar { .. }
@@ -1535,7 +1672,17 @@ impl<'a> TypeChecker<'a> {
             | ExprNode::Const { .. }
             | ExprNode::Lit { .. } => e.clone(),
         };
-        cache.insert(e.clone(), bound, result.clone());
+        match context {
+            Some(context) => {
+                self.instantiate_rev_context_cache.insert(
+                    context,
+                    e.clone(),
+                    bound,
+                    result.clone(),
+                );
+            }
+            None => cache.insert(e.clone(), bound, result.clone()),
+        }
         Ok(result)
     }
 
@@ -1654,18 +1801,31 @@ impl<'a> TypeChecker<'a> {
 
     /// KR-201..204: mdata, beta (batched), zeta (let + let-fvar), proj.
     fn whnf_core(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
+        self.whnf_core_mode(e, depth, false)
+    }
+
+    /// The pin's defeq pre-pass uses `cheap_proj = true`: reduce a projection
+    /// scrutinee without delta so `a.i =?= b.i` can compare `a` and `b` before
+    /// either side opens an expensive definition. Cheap results are not mixed
+    /// into the full-WHNF cache.
+    fn whnf_core_for_defeq(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
+        self.whnf_core_mode(e, depth, true)
+    }
+
+    fn whnf_core_mode(&mut self, e: &Expr, depth: u32, cheap_proj: bool) -> KResult<Expr> {
         self.step(depth)?;
-        if let Some(cached) = self
-            .whnf_core_cache
-            .get(e, &self.locals, &self.local_positions)
+        if !cheap_proj
+            && let Some(cached) = self
+                .whnf_core_cache
+                .get(e, &self.locals, &self.local_positions)
         {
             return Ok(cached);
         }
         let result = match e.node() {
-            ExprNode::MData { expr, .. } => self.whnf_core(expr, depth + 1)?,
+            ExprNode::MData { expr, .. } => self.whnf_core_mode(expr, depth + 1, cheap_proj)?,
             ExprNode::FVar { id } => match self.find_local(id).and_then(|d| d.value.clone()) {
                 // KR-203: a let-bound fvar unfolds to its value.
-                Some(value) => self.whnf_core(&value, depth + 1)?,
+                Some(value) => self.whnf_core_mode(&value, depth + 1, cheap_proj)?,
                 None => e.clone(),
             },
             ExprNode::LetE { value, body, .. } => {
@@ -1673,12 +1833,12 @@ impl<'a> TypeChecker<'a> {
                 let value = value.clone();
                 let body = body.clone();
                 let reduced = self.instantiate(&body, 0, &value, depth + 1)?;
-                self.whnf_core(&reduced, depth + 1)?
+                self.whnf_core_mode(&reduced, depth + 1, cheap_proj)?
             }
             ExprNode::App { .. } => {
                 // Collect the spine, whnf the head, then KR-202 batched beta.
                 let (head0, args) = app_spine(e);
-                let head = self.whnf_core(&head0, depth + 1)?;
+                let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
                 if matches!(head.node(), ExprNode::Lam { .. }) {
                     let mut body = head;
                     let mut consumed = 0usize;
@@ -1698,12 +1858,12 @@ impl<'a> TypeChecker<'a> {
                     for arg in &args[consumed..] {
                         current = Expr::app(current, arg.clone());
                     }
-                    self.whnf_core(&current, depth + 1)?
+                    self.whnf_core_mode(&current, depth + 1, cheap_proj)?
                 } else if head == head0 {
                     // KR-205: the head is stable — try quotient computation, then
                     // inductive iota, on the original application.
                     match self.reduce_recursor(e, depth + 1)? {
-                        Some(reduced) => self.whnf_core(&reduced, depth + 1)?,
+                        Some(reduced) => self.whnf_core_mode(&reduced, depth + 1, cheap_proj)?,
                         None => e.clone(),
                     }
                 } else {
@@ -1713,7 +1873,7 @@ impl<'a> TypeChecker<'a> {
                     for arg in args {
                         rebuilt = Expr::app(rebuilt, arg);
                     }
-                    self.whnf_core(&rebuilt, depth + 1)?
+                    self.whnf_core_mode(&rebuilt, depth + 1, cheap_proj)?
                 }
             }
             ExprNode::Proj {
@@ -1724,7 +1884,11 @@ impl<'a> TypeChecker<'a> {
                 // KR-204: projection of a constructor application.
                 let struct_name = struct_name.clone();
                 let idx = *idx;
-                let scrutinee = self.whnf(&expr.clone(), depth + 1)?;
+                let scrutinee = if cheap_proj {
+                    self.whnf_core_mode(expr, depth + 1, true)?
+                } else {
+                    self.whnf(&expr.clone(), depth + 1)?
+                };
                 // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a
                 // String-literal scrutinee expands to its constructor spine
                 // (whnf'd so `String.ofList` unfolds to the real constructor)
@@ -1739,7 +1903,7 @@ impl<'a> TypeChecker<'a> {
                     scrutinee
                 };
                 match self.reduce_proj(&struct_name, idx, &scrutinee) {
-                    Some(field) => self.whnf_core(&field, depth + 1)?,
+                    Some(field) => self.whnf_core_mode(&field, depth + 1, cheap_proj)?,
                     None => Expr::proj(struct_name, idx, scrutinee),
                 }
             }
@@ -1755,7 +1919,7 @@ impl<'a> TypeChecker<'a> {
             e.node(),
             ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
         );
-        if result != *e || cache_identity {
+        if !cheap_proj && (result != *e || cache_identity) {
             self.whnf_core_cache.insert(
                 e.clone(),
                 result.clone(),
@@ -2492,8 +2656,8 @@ impl<'a> TypeChecker<'a> {
         // KR-305: normalize both sides without delta, then RE-RUN the head
         // rules on the reduced pair (beta/zeta/iota can expose Sort or binder
         // heads whose levels are equivalent but not structurally equal).
-        let tn = self.whnf_core(t, depth + 1)?;
-        let sn = self.whnf_core(s, depth + 1)?;
+        let tn = self.whnf_core_for_defeq(t, depth + 1)?;
+        let sn = self.whnf_core_for_defeq(s, depth + 1)?;
         if (tn != *t || sn != *s)
             && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
         {
@@ -2532,12 +2696,9 @@ impl<'a> TypeChecker<'a> {
             return Ok(true);
         }
         // KR-310's projection half (pin is_def_eq_core:1101 via
-        // lazy_delta_proj_reduction): same-index projections close on defeq
-        // scrutinees. Not decisive on failure — the pin falls through to the
-        // rest of the ladder. (Our whnf_core reduces projections with full
-        // whnf, so the pin's deferred-projection retry is already spent by the
-        // time a Proj pair is stuck here — both scrutinees are maximally
-        // reduced non-constructors, e.g. recursors stuck on a free variable.)
+        // lazy_delta_proj_reduction): same-index projections first compare
+        // their scrutinees by lazy delta, then try constructor-field reduction
+        // on both sides before the ordinary scrutinee-defeq fallback.
         if let (
             ExprNode::Proj {
                 idx: i1, expr: e1, ..
@@ -2549,9 +2710,18 @@ impl<'a> TypeChecker<'a> {
             && i1 == i2
         {
             let (e1, e2) = (e1.clone(), e2.clone());
-            if self.is_def_eq(&e1, &e2, depth + 1)? {
+            if self.lazy_delta_proj_reduction(e1, e2, *i1, depth + 1)? {
                 return Ok(true);
             }
+        }
+        // The cheap pre-pass deliberately leaves projection scrutinees short
+        // of full WHNF. Retry both sides with the ordinary reducer only after
+        // the scrutinee-level shortcut above has had its chance, exactly as at
+        // the pin. A changed pair restarts the complete ladder.
+        let tn_full = self.whnf_core(&tn, depth + 1)?;
+        let sn_full = self.whnf_core(&sn, depth + 1)?;
+        if tn_full != tn || sn_full != sn {
+            return self.is_def_eq_core(&tn_full, &sn_full, depth + 1);
         }
         // KR-311 application congruence.
         if let (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) =
@@ -2745,23 +2915,23 @@ impl<'a> TypeChecker<'a> {
             match (ht, hs) {
                 (None, None) => return Ok(LazyDelta::Stuck(t, s)),
                 (Some(_), None) => match self.unfold_definition(&t, depth)? {
-                    Some(next) => t = self.whnf_core(&next, depth)?,
+                    Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (None, Some(_)) => match self.unfold_definition(&s, depth)? {
-                    Some(next) => s = self.whnf_core(&next, depth)?,
+                    Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (Some(a), Some(b)) => {
                     if a >= b {
                         match self.unfold_definition(&t, depth)? {
-                            Some(next) => t = self.whnf_core(&next, depth)?,
+                            Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
                     if b >= a {
                         match self.unfold_definition(&s, depth)? {
-                            Some(next) => s = self.whnf_core(&next, depth)?,
+                            Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
@@ -2771,6 +2941,32 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         }
+    }
+
+    /// Pinned `lazy_delta_proj_reduction`: unfold the projection scrutinees
+    /// lazily. If that alone does not prove equality, reduce both constructor
+    /// fields at the requested index and compare the fields; only then compare
+    /// the residual scrutinees themselves.
+    fn lazy_delta_proj_reduction(
+        &mut self,
+        t: Expr,
+        s: Expr,
+        idx: u64,
+        depth: u32,
+    ) -> KResult<bool> {
+        let (t, s) = match self.lazy_delta(t, s, depth + 1)? {
+            LazyDelta::Decided(true) => return Ok(true),
+            LazyDelta::Decided(false) => return Ok(false),
+            LazyDelta::Stuck(t, s) => (t, s),
+        };
+        let placeholder = Name::anonymous();
+        if let (Some(t_field), Some(s_field)) = (
+            self.reduce_proj(&placeholder, idx, &t),
+            self.reduce_proj(&placeholder, idx, &s),
+        ) {
+            return self.is_def_eq(&t_field, &s_field, depth + 1);
+        }
+        self.is_def_eq(&t, &s, depth + 1)
     }
 
     /// The positive branch of the pin's equal-regular-definition shortcut.
@@ -2815,8 +3011,20 @@ impl<'a> TypeChecker<'a> {
         ) {
             return Ok(false);
         }
+        if self
+            .regular_app_def_eq_failure_cache
+            .contains(t, s, &self.locals, &self.local_positions)
+        {
+            return Ok(false);
+        }
         for (t_arg, s_arg) in t_args.iter().zip(&s_args) {
             if !self.is_def_eq(t_arg, s_arg, depth)? {
+                self.regular_app_def_eq_failure_cache.insert(
+                    t.clone(),
+                    s.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                );
                 return Ok(false);
             }
         }
@@ -4350,6 +4558,40 @@ mod tests {
     }
 
     #[test]
+    fn repeated_batched_instantiation_reuses_the_completed_walk() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bvar = Expr::bvar(0).expect("packs");
+        let mut body = bvar.clone();
+        for _ in 0..64 {
+            body = Expr::app(body, bvar.clone());
+        }
+        let value = Expr::sort(Level::zero());
+        let values = [value];
+
+        let first = tc
+            .instantiate_rev(&body, &values, 0, 0)
+            .expect("first batched substitution completes");
+        let steps_after_first = tc.consumption().steps_used;
+        assert!(
+            steps_after_first > 1 && tc.instantiate_rev_context_cache.entries > 1,
+            "the first call must perform and retain the structural walk"
+        );
+        let second = tc
+            .instantiate_rev(&body, &values, 0, 0)
+            .expect("repeated batched substitution completes");
+        assert!(
+            first == second,
+            "cached substitution must preserve the term"
+        );
+        assert_eq!(
+            tc.consumption().steps_used - steps_after_first,
+            1,
+            "a repeated batched substitution must pay only its entry hook"
+        );
+    }
+
+    #[test]
     fn level_substitution_uses_the_pin_smart_constructors() {
         let u = Name::str(Name::anonymous(), "u");
         let v = Name::str(Name::anonymous(), "v");
@@ -4875,6 +5117,161 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= budget.depth,
             "an expensive regular body must remain unopened on a positive congruence"
+        );
+    }
+
+    #[test]
+    fn lazy_delta_remembers_failed_regular_head_arguments_before_retrying() {
+        use fln_env::constants::{AxiomVal, ConstantVal, DefinitionVal};
+
+        let nat_name = Name::str(Name::anonymous(), "Nat");
+        let nat = Expr::const_(nat_name.clone(), Vec::new());
+        let function_name = Name::str(Name::anonymous(), "regularFailureMemo");
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: nat_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: function_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        nat.clone(),
+                        nat.clone(),
+                        BinderInfo::Default,
+                    ),
+                },
+                value: Expr::lam(
+                    Name::anonymous(),
+                    nat,
+                    Expr::bvar(0).expect("packs"),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![function_name.clone()],
+            }),
+        );
+        let left = Expr::app(
+            Expr::const_(function_name.clone(), Vec::new()),
+            Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+        );
+        let right = Expr::app(
+            Expr::const_(function_name, Vec::new()),
+            Expr::lit(Literal::Nat(NatLit::from_u64(1))),
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+
+        assert!(
+            !tc.regular_same_head_apps_def_eq(&left, &right, 0)
+                .expect("the first unequal-argument comparison completes"),
+            "unequal arguments cannot close the regular-head shortcut"
+        );
+        assert_eq!(
+            tc.regular_app_def_eq_failure_cache.entries, 1,
+            "the failed shortcut pair must be retained"
+        );
+        let steps_after_first = tc.consumption().steps_used;
+        assert!(
+            !tc.regular_same_head_apps_def_eq(&left, &right, 0)
+                .expect("the repeated shortcut lookup completes"),
+            "a remembered failure still means lazy delta must unfold"
+        );
+        assert_eq!(
+            tc.consumption().steps_used,
+            steps_after_first,
+            "a repeated failed shortcut must not re-run recursive defeq"
+        );
+        assert!(
+            !tc.def_eq_public(&left, &right, 0)
+                .expect("ordinary unfolding still decides the unequal pair"),
+            "the failure memo is an optimization, never a cached rejection"
+        );
+    }
+
+    #[test]
+    fn defeq_compares_projection_scrutinees_before_full_reduction() {
+        use fln_core::options::KVMap;
+        use fln_env::constants::{AxiomVal, ConstantVal, DefinitionVal};
+
+        let nat_name = Name::str(Name::anonymous(), "Nat");
+        let nat = Expr::const_(nat_name.clone(), Vec::new());
+        let function_name = Name::str(Name::anonymous(), "expensiveProjectionSource");
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: nat_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let mut function_value = Expr::lam(
+            Name::anonymous(),
+            nat.clone(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        );
+        for _ in 0..128 {
+            function_value = Expr::mdata(KVMap::default(), function_value);
+        }
+        let env = publish_checked(
+            &env,
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: function_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        nat.clone(),
+                        nat.clone(),
+                        BinderInfo::Default,
+                    ),
+                },
+                value: function_value,
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![function_name.clone()],
+            }),
+        );
+        let zero = Expr::lit(Literal::Nat(NatLit::from_u64(0)));
+        let beta_zero = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                nat,
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            ),
+            zero.clone(),
+        );
+        let source =
+            |argument| Expr::app(Expr::const_(function_name.clone(), Vec::new()), argument);
+        let structure_name = Name::str(Name::anonymous(), "ProjectionProbe");
+        let left = Expr::proj(structure_name.clone(), 0, source(beta_zero));
+        let right = Expr::proj(structure_name, 0, source(zero));
+        let budget = Budget::DEFAULT.narrowed(10_000, 32);
+        let mut tc = TypeChecker::new(&env, &[], budget);
+
+        assert!(
+            tc.def_eq_public(&left, &right, 0)
+                .expect("cheap projection congruence stays inside the shallow budget"),
+            "defeq must compare projection scrutinees before opening their regular head"
+        );
+        assert!(
+            tc.consumption().max_depth <= budget.depth,
+            "the projection pre-pass must not traverse the expensive definition body"
         );
     }
 
