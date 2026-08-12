@@ -73,7 +73,7 @@ fn translation_mutant_that_skips_negation_is_killed() {
         BvDecideLimits::default(),
     );
     assert!(
-        matches!(correct, BvDecideOutcome::Proved(_)),
+        matches!(correct, BvDecideOutcome::Candidate(_)),
         "the negation of true must be certified UNSAT"
     );
 
@@ -198,7 +198,7 @@ fn sat_negation_returns_an_independently_checked_counterexample_only() {
 fn every_internal_fault_shape_is_structurally_nonpublishing() {
     let outcome =
         BvDecideOutcome::InternalFault(BvDecideInternalFault::SatModelDoesNotSatisfyNegation);
-    assert!(outcome.publication().is_none());
+    assert!(outcome.candidate().is_none());
     assert!(outcome.counterexample().is_none());
 }
 
@@ -208,5 +208,5 @@ fn orchestration_source_has_no_unchecked_authority_route() {
     assert!(!source.contains("std::process::Command"));
     assert!(!source.contains(concat!("fln_kernel::", "check(")));
     assert!(!source.contains(concat!(".plan_", "add_decl(")));
-    assert!(source.contains("publish_reflected_theorem("));
+    assert!(source.contains("check_reflected_theorem("));
 }

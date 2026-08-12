@@ -1,4 +1,4 @@
-//! Real in-process Verdict-to-Crucible publication, refusal, and recovery.
+//! Real in-process Verdict-to-Crucible candidate checking, refusal, and recovery.
 
 #![forbid(unsafe_code)]
 
@@ -10,11 +10,12 @@ use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::mode::{Mode, ReproducibilityProfile};
 use fln_core::name::Name;
+use fln_env::constants::ConstantInfo;
 use fln_env::environment::Environment;
 use fln_kernel::verdict::RejectClass;
 use fln_verdict::{
-    BoolExpr, BvDecideInconclusive, BvDecideInternalFault, BvDecideLimits, BvDecideOutcome,
-    BvDecidePublication, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry, ProofCheckLimits,
+    BoolExpr, BvDecideCandidate, BvDecideInconclusive, BvDecideInternalFault, BvDecideLimits,
+    BvDecideOutcome, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry, ProofCheckLimits,
     ProofCheckOutcome, ProofCheckReceipt, ReflectedTheoremRefusal, SolverStatistics, bv_decide,
     bv_decide_with_cancel, check_unsat_streams,
 };
@@ -116,17 +117,19 @@ fn unhex(encoded: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn semantic_ndjson(theorem: &str, publication: &BvDecidePublication) -> String {
-    let reflection = publication.reflection();
+fn semantic_ndjson(theorem: &str, candidate: &BvDecideCandidate) -> String {
+    let reflection = candidate.reflection();
+    let declaration_digest =
+        Environment::decl_content_digest(&ConstantInfo::Thm(reflection.theorem().clone()));
     format!(
         "{{\"bead\":\"fln-zti3\",\"cleanup\":\"none-required\",\
          \"cnf_hex\":\"{}\",\"declaration_digest\":\"{}\",\
-         \"final_state\":\"published-environment-len-1\",\"mode\":\"sound\",\
+         \"final_state\":\"checked-candidate-no-successor\",\"mode\":\"sound\",\
          \"policy\":\"{}\",\"proof_hex\":\"{}\",\"reproducibility\":\"standard\",\
          \"scenario\":\"bv_decide_no_mock_e2e\",\"schema\":\"{SEMANTIC_SCHEMA}\",\
-         \"status\":\"published\",\"theorem\":\"{theorem}\"}}\n",
+         \"status\":\"checked-candidate\",\"theorem\":\"{theorem}\"}}\n",
         hex(reflection.cnf_bytes()),
-        reflection.publication.digest,
+        declaration_digest,
         fln_verdict::BV_DECIDE_POLICY_ID,
         hex(reflection.proof_bytes()),
     )
@@ -184,13 +187,13 @@ fn validate_semantic_ndjson(line: &str) -> Result<ProofCheckReceipt, String> {
     let expected = [
         ("bead", "fln-zti3"),
         ("cleanup", "none-required"),
-        ("final_state", "published-environment-len-1"),
+        ("final_state", "checked-candidate-no-successor"),
         ("mode", "sound"),
         ("policy", fln_verdict::BV_DECIDE_POLICY_ID),
         ("reproducibility", "standard"),
         ("scenario", "bv_decide_no_mock_e2e"),
         ("schema", SEMANTIC_SCHEMA),
-        ("status", "published"),
+        ("status", "checked-candidate"),
     ];
     for (key, value) in expected {
         if fields.get(key).map(String::as_str) != Some(value) {
@@ -241,15 +244,18 @@ fn run_evidence() -> RunEvidence {
         request("bv.deterministic"),
         BvDecideLimits::default(),
     );
-    let BvDecideOutcome::Proved(publication) = outcome else {
-        panic!("determinism fixture must publish");
+    let BvDecideOutcome::Candidate(candidate) = outcome else {
+        panic!("determinism fixture must produce a checked candidate");
     };
-    let reflection = publication.reflection();
+    let reflection = candidate.reflection();
     RunEvidence {
         cnf: reflection.cnf_bytes().to_vec(),
         proof: reflection.proof_bytes().to_vec(),
         receipt: reflection.proof_receipt,
-        declaration_digest: reflection.publication.digest.to_string(),
+        declaration_digest: Environment::decl_content_digest(&ConstantInfo::Thm(
+            reflection.theorem().clone(),
+        ))
+        .to_string(),
     }
 }
 
@@ -257,11 +263,14 @@ fn run_evidence() -> RunEvidence {
 fn real_positive_failure_and_recovery_are_failure_atomic() {
     let base = Environment::new();
     let positive = bv_decide(&base, request("bv.e2e.positive"), BvDecideLimits::default());
-    let BvDecideOutcome::Proved(positive) = positive else {
-        panic!("valid reflected theorem must publish");
+    let BvDecideOutcome::Candidate(positive) = positive else {
+        panic!("valid reflected theorem must produce a checked candidate");
     };
     assert!(base.is_empty(), "the immutable base must remain unchanged");
-    assert_eq!(positive.reflection().publication.environment.len(), 1);
+    assert_eq!(
+        positive.reflection().theorem().base.name,
+        name("bv.e2e.positive")
+    );
 
     let failure_base = Environment::new();
     let failure = bv_decide(
@@ -285,15 +294,18 @@ fn real_positive_failure_and_recovery_are_failure_atomic() {
         request("bv.e2e.recovered"),
         BvDecideLimits::default(),
     );
-    let BvDecideOutcome::Proved(recovered) = recovered else {
+    let BvDecideOutcome::Candidate(recovered) = recovered else {
         panic!("a refusal must not poison the next independent request");
     };
-    assert_eq!(recovered.reflection().publication.environment.len(), 1);
+    assert_eq!(
+        recovered.reflection().theorem().base.name,
+        name("bv.e2e.recovered")
+    );
     assert!(failure_base.is_empty());
 }
 
 #[test]
-fn cancellation_resource_and_internal_fault_never_publish() {
+fn cancellation_resource_and_internal_fault_never_produce_a_candidate() {
     let environment = Environment::new();
     let cancelled = AtomicBool::new(true);
     let cancellation = bv_decide_with_cancel(
@@ -306,7 +318,7 @@ fn cancellation_resource_and_internal_fault_never_publish() {
         cancellation,
         BvDecideOutcome::Inconclusive(BvDecideInconclusive::Pipeline(_))
     ));
-    assert!(cancellation.publication().is_none());
+    assert!(cancellation.candidate().is_none());
 
     let mut limits = BvDecideLimits::default();
     limits.bitblast.max_ast_nodes = 0;
@@ -315,16 +327,16 @@ fn cancellation_resource_and_internal_fault_never_publish() {
         exhausted,
         BvDecideOutcome::Inconclusive(BvDecideInconclusive::Bitblast(_))
     ));
-    assert!(exhausted.publication().is_none());
+    assert!(exhausted.candidate().is_none());
 
     let internal =
         BvDecideOutcome::InternalFault(BvDecideInternalFault::SatModelDoesNotSatisfyNegation);
-    assert!(internal.publication().is_none());
+    assert!(internal.candidate().is_none());
     let allocation =
         BvDecideOutcome::Inconclusive(BvDecideInconclusive::CounterexampleAllocationRefused {
             requested: 1,
         });
-    assert!(allocation.publication().is_none());
+    assert!(allocation.candidate().is_none());
     assert!(environment.is_empty());
 }
 
@@ -336,18 +348,15 @@ fn semantic_ndjson_is_canonical_independent_and_telemetry_free() {
         request("bv.e2e.semantic"),
         BvDecideLimits::default(),
     );
-    let BvDecideOutcome::Proved(publication) = outcome else {
-        panic!("semantic fixture must publish");
+    let BvDecideOutcome::Candidate(candidate) = outcome else {
+        panic!("semantic fixture must produce a candidate");
     };
-    let semantic = semantic_ndjson("bv.e2e.semantic", &publication);
+    let semantic = semantic_ndjson("bv.e2e.semantic", &candidate);
     let independently_replayed =
         validate_semantic_ndjson(&semantic).expect("semantic record must validate independently");
-    assert_eq!(
-        independently_replayed,
-        publication.reflection().proof_receipt
-    );
+    assert_eq!(independently_replayed, candidate.reflection().proof_receipt);
 
-    let telemetry = telemetry_ndjson(publication.telemetry());
+    let telemetry = telemetry_ndjson(candidate.telemetry());
     assert!(
         telemetry.len() <= 512,
         "telemetry record is explicitly bounded"
@@ -361,7 +370,7 @@ fn semantic_ndjson_is_canonical_independent_and_telemetry_free() {
     assert!(!semantic.contains("work_units"));
     assert!(!semantic.contains("conflicts"));
 
-    let mut changed = publication.telemetry();
+    let mut changed = candidate.telemetry();
     changed.solver = SolverStatistics {
         work_units: changed.solver.work_units.saturating_add(1),
         ..changed.solver
@@ -369,11 +378,11 @@ fn semantic_ndjson_is_canonical_independent_and_telemetry_free() {
     assert_ne!(telemetry, telemetry_ndjson(changed));
     assert_eq!(
         semantic,
-        semantic_ndjson("bv.e2e.semantic", &publication),
+        semantic_ndjson("bv.e2e.semantic", &candidate),
         "telemetry changes cannot affect semantic evidence bytes"
     );
 
-    let mutated = semantic.replace("\"status\":\"published\"", "\"status\":\"refused\"");
+    let mutated = semantic.replace("\"status\":\"checked-candidate\"", "\"status\":\"refused\"");
     assert!(
         validate_semantic_ndjson(&mutated).is_err(),
         "the independent validator must be fail-capable"

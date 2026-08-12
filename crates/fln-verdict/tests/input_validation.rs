@@ -1807,9 +1807,9 @@ const EXPECTED_VERDICT_BOUNDARIES: [ExpectedBoundary; 9] = [
         function: "from_bitblast_unsat",
     },
     ExpectedBoundary {
-        id: "kernel-capability-publication",
+        id: "kernel-checked-candidate",
         path: "crates/fln-verdict/src/reflection.rs",
-        function: "publish_reflected_theorem",
+        function: "check_reflected_theorem",
     },
     ExpectedBoundary {
         id: "cached-certificate-verify-or-recompute",
@@ -1851,7 +1851,7 @@ const EXPECTED_VERDICT_CALLS: [ExpectedCall; 7] = [
     ExpectedCall {
         needle: "check_unsat_streams_with_cancel(",
         path: "crates/fln-verdict/src/reflection.rs",
-        function: "publish_reflected_theorem",
+        function: "check_reflected_theorem",
         count: 1,
     },
     ExpectedCall {
@@ -1974,7 +1974,7 @@ fn verdict_inventory(tree: &CensusTree) -> VerdictInventory {
                     "check_unsat_streams"
                         | "check_unsat_streams_with_cancel"
                         | "finish_unsat"
-                        | "publish_reflected_theorem"
+                        | "check_reflected_theorem"
                         | "from_bitblast_unsat"
                 );
             let allowed_projection = site.path == "crates/fln-verdict/src/solver.rs"

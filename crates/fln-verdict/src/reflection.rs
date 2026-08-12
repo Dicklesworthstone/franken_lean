@@ -1,33 +1,29 @@
-//! Kernel-bound publication of a Verdict-reflected theorem.
+//! Kernel-bound checking of a Verdict-reflected theorem candidate.
 //!
 //! The solver and proof checker are deliberately untrusted. This module therefore
-//! exposes one whole-pipeline operation rather than a public "checked" token:
+//! exposes one whole-pipeline operation rather than a kernel capability:
 //!
 //! 1. replay the exact canonical CNF and proof streams with the independent checker;
-//! 2. move the one owned theorem declaration into Crucible's opaque
-//!    checked-declaration capability;
-//! 3. consume that capability to publish into the exact base environment against
-//!    which Crucible checked it.
+//! 2. ask Crucible to check the exact reflected theorem against the supplied
+//!    environment;
+//! 3. return the theorem and replay evidence as a non-authoritative candidate.
 //!
 //! There is no second declaration parameter, reconstructed theorem, caller-selected
-//! publication base, or equality-based handoff between steps 2 and 3. The capability
-//! owns the declaration Crucible accepted, borrows its checked base, and is consumed
-//! by publication. Rust's type system is therefore the check-A/publish-A witness.
+//! publication base or environment successor. Verdict cannot publish at all. The
+//! caller that owns an admission policy must move this exact candidate through its
+//! own kernel-and-council door.
 
 use fln_core::expr::Expr;
 use fln_core::mode::{Mode, ReproducibilityProfile};
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 use fln_env::constants::{ConstantVal, TheoremVal};
-use fln_env::environment::{
-    DeclarationBudget, DeclarationCommitted, DeclarationPublication, Environment,
-};
+use fln_env::environment::Environment;
 use fln_env::modules::CancellationProbe;
-use fln_env::pmap::CollisionBudget;
 use fln_kernel::Declaration;
-use fln_kernel::capability::{Published as KernelPublished, admit as kernel_admit};
-use fln_kernel::council::{Council, CouncilOutcome, convene};
-use fln_kernel::verdict::{Budget as KernelBudget, Consumption as KernelConsumption, RejectClass};
+use fln_kernel::verdict::{
+    Budget as KernelBudget, Consumption as KernelConsumption, RejectClass, Verdict as KernelVerdict,
+};
 
 use crate::{
     BITBLAST_MANIFEST_ID, BITBLAST_MANIFEST_VERSION, BitblastArtifact, BitblastFacts, CNF_SCHEMA,
@@ -37,11 +33,11 @@ use crate::{
     check_unsat_streams_with_cancel,
 };
 
-/// The registered algorithm policy for the in-memory reflection/publication path.
+/// The registered algorithm policy for the in-memory checked-candidate path.
 ///
 /// This is not a new durable schema. The only byte streams consumed here retain the
 /// already-registered CNF and UNSAT-proof schemas.
-pub const REFLECTED_THEOREM_POLICY_ID: &str = "fln.verdict.reflected-theorem-publication/1";
+pub const REFLECTED_THEOREM_POLICY_ID: &str = "fln.verdict.reflected-theorem-candidate/1";
 
 /// Refusal while constructing the non-authoritative reflection candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +52,9 @@ pub enum ReflectedArtifactError {
 
 /// Non-authoritative provenance bundled with the exact certificate and theorem.
 ///
-/// Provenance does not certify itself. Authority comes only from replaying the
-/// certificate, kernel-checking the theorem, and publishing the same owned theorem.
+/// Provenance does not certify itself. This crate replays the certificate and asks
+/// K1 about the theorem; environment authority can come only from a later
+/// policy-owning admission door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReflectedTheoremProvenance {
     mode: Mode,
@@ -117,9 +114,10 @@ impl ReflectedTheoremProvenance {
 /// Verdict's independent checker.
 ///
 /// The fields are private and the type is intentionally not `Clone`: the whole value
-/// is consumed by [`publish_reflected_theorem`]. The streams are moved out of
-/// [`CheckedUnsat`] without re-encoding, and the theorem has exactly one owned copy in
-/// this pipeline.
+/// is consumed by [`check_reflected_theorem`]. The streams are moved out of
+/// [`CheckedUnsat`] without re-encoding. The returned candidate retains the exact
+/// theorem assembled here; K1 sees only a temporary structural clone because its
+/// checking API borrows a declaration.
 #[derive(Debug)]
 pub struct ReflectedTheoremArtifact {
     cnf_bytes: Box<[u8]>,
@@ -137,8 +135,8 @@ impl ReflectedTheoremArtifact {
     /// The theorem declaration is assembled here from the exact source
     /// proposition and reflected proof term. Callers cannot hand this boundary an
     /// already-assembled declaration with a different type or membership list.
-    /// Crucible still validates the resulting proof term before the opaque
-    /// capability can exist.
+    /// Crucible still validates the resulting proof term before a candidate can
+    /// leave this crate.
     // FLN-FL-INV-06-CERTIFICATE-BOUNDARY: reflected-artifact-construction
     pub fn from_bitblast_unsat(
         bitblast: BitblastArtifact,
@@ -203,13 +201,11 @@ impl ReflectedTheoremArtifact {
     }
 }
 
-/// Independent checker, kernel, and bounded publication limits.
+/// Independent proof-checker and kernel limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReflectedTheoremLimits {
     pub proof: ProofCheckLimits,
     pub kernel: KernelBudget,
-    pub declaration: DeclarationBudget,
-    pub collisions: CollisionBudget,
 }
 
 impl Default for ReflectedTheoremLimits {
@@ -217,8 +213,6 @@ impl Default for ReflectedTheoremLimits {
         Self {
             proof: ProofCheckLimits::default(),
             kernel: KernelBudget::DEFAULT,
-            declaration: DeclarationBudget::UNBOUNDED,
-            collisions: CollisionBudget::UNBOUNDED,
         }
     }
 }
@@ -227,14 +221,14 @@ impl Default for ReflectedTheoremLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflectedTheoremCheckpoint {
     BeforeKernel,
-    BeforeAdmission,
+    BeforeCandidate,
 }
 
 impl ReflectedTheoremCheckpoint {
     const fn as_str(self) -> &'static str {
         match self {
             Self::BeforeKernel => "reflected-theorem/before-kernel",
-            Self::BeforeAdmission => "reflected-theorem/before-admission",
+            Self::BeforeCandidate => "reflected-theorem/before-candidate",
         }
     }
 }
@@ -248,9 +242,6 @@ pub enum ReflectedTheoremRefusal {
         message: String,
         consumption: KernelConsumption,
     },
-    DuplicateName {
-        name: Name,
-    },
 }
 
 /// A non-answer. It can never carry a publication or theorem verdict.
@@ -259,7 +250,6 @@ pub enum ReflectedTheoremInconclusive {
     Proof(ProofCheckInconclusive),
     Pipeline(Inconclusive),
     Kernel(Inconclusive),
-    Admission(Inconclusive),
 }
 
 /// An implementation fault. It can never carry a publication or theorem verdict.
@@ -268,13 +258,14 @@ pub enum ReflectedTheoremInternalFault {
     Proof(ProofCheckInternalFault),
     Bridge(InternalFault),
     Kernel(InternalFault),
-    Admission(InternalFault),
 }
 
-/// The evidence that survives only after the exact theorem was published.
+/// The exact K1-checked theorem candidate and its independently replayed evidence.
+///
+/// This type contains no environment successor and grants no publication right.
 #[derive(Debug, Clone)]
-pub struct ReflectedTheoremPublication {
-    pub publication: DeclarationPublication,
+pub struct ReflectedTheoremCandidate {
+    theorem: TheoremVal,
     pub proof_receipt: ProofCheckReceipt,
     pub kernel_consumption: KernelConsumption,
     pub provenance: ReflectedTheoremProvenance,
@@ -283,7 +274,13 @@ pub struct ReflectedTheoremPublication {
     bitblast_facts: BitblastFacts,
 }
 
-impl ReflectedTheoremPublication {
+impl ReflectedTheoremCandidate {
+    /// The exact theorem checked by K1. A policy-owning caller must submit this
+    /// value to its own admission council before an environment may contain it.
+    pub const fn theorem(&self) -> &TheoremVal {
+        &self.theorem
+    }
+
     /// The exact canonical CNF stream independently checked before admission.
     pub fn cnf_bytes(&self) -> &[u8] {
         &self.cnf_bytes
@@ -299,11 +296,11 @@ impl ReflectedTheoremPublication {
     }
 }
 
-/// The disjoint terminal classes of reflected theorem publication.
+/// The disjoint terminal classes of reflected theorem checking.
 #[derive(Debug)]
 #[must_use]
 pub enum ReflectedTheoremOutcome {
-    Published(Box<ReflectedTheoremPublication>),
+    Checked(Box<ReflectedTheoremCandidate>),
     Refused(ReflectedTheoremRefusal),
     Inconclusive(ReflectedTheoremInconclusive),
     InternalFault(ReflectedTheoremInternalFault),
@@ -319,14 +316,14 @@ fn cancelled(checkpoint: ReflectedTheoremCheckpoint) -> ReflectedTheoremOutcome 
     ))
 }
 
-/// Replay a certificate, kernel-check its reflected theorem, and publish that exact
-/// theorem through Grimoire's bounded admission transaction.
+/// Replay a certificate and kernel-check its reflected theorem candidate.
 ///
-/// No intermediate authority token is public. Every refusal, cancellation,
-/// exhaustion, internal fault, stale plan, or duplicate name returns without an
-/// environment containing the candidate theorem.
-// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: kernel-capability-publication
-pub fn publish_reflected_theorem(
+/// The result never contains an environment successor or kernel capability.
+/// Every refusal, cancellation, exhaustion, or internal fault returns without
+/// a candidate, and even the completed candidate must pass a caller-owned
+/// admission council before it can enter an environment.
+// FLN-FL-INV-06-CERTIFICATE-BOUNDARY: kernel-checked-candidate
+pub fn check_reflected_theorem(
     environment: &Environment,
     artifact: ReflectedTheoremArtifact,
     limits: ReflectedTheoremLimits,
@@ -375,46 +372,20 @@ pub fn publish_reflected_theorem(
         theorem,
         provenance,
     } = artifact;
-    let checked = match kernel_admit(environment, Declaration::Thm(theorem), limits.kernel) {
-        // NAMES ITS COUNCIL (bead `fln-glml`, cross-crate consequence of a
-        // kernel change; cc_2, coordinated on that bead). This site published
-        // straight off the acceptance and was therefore invisible to the
-        // consensus seat — not misbehaving, since an empty council agrees
-        // vacuously and the outcome is byte-identical, but indistinguishable
-        // from a site that had a policy and skipped it. `Reviewable` no longer
-        // has a `publish`, so the question has to be answered here.
-        //
-        // The answer today is `nobody_was_asked`, and it is the honest one:
-        // §8.3c's sampling/full-closure/paranoid policies need seats, and there
-        // are no in-repo seats to convene. When there are, THIS is the line
-        // that changes, and it is now a line rather than an absence.
-        Outcome::Complete(admitted) => match convene(&Council::nobody_was_asked(), admitted) {
-            CouncilOutcome::Agreed(checked) => checked,
-            CouncilOutcome::KernelRejected {
+    let declaration = Declaration::Thm(theorem.clone());
+    let kernel_consumption = match fln_kernel::check(environment, &declaration, limits.kernel) {
+        Outcome::Complete(KernelVerdict::Accepted { consumption }) => consumption,
+        Outcome::Complete(KernelVerdict::Rejected {
+            class,
+            message,
+            consumption,
+        }) => {
+            return ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::Kernel {
                 class,
                 message,
                 consumption,
-            } => {
-                return ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::Kernel {
-                    class,
-                    message,
-                    consumption,
-                });
-            }
-            // Unreachable with an empty council — it has no seat that could
-            // object — so reaching it means OUR accounting broke, which is an
-            // internal fault and never a verdict about the theorem (FL-INV-07).
-            // Typed rather than `unreachable!`: a panic here would be the same
-            // event with less information.
-            CouncilOutcome::Halted(halt) => {
-                return ReflectedTheoremOutcome::InternalFault(
-                    ReflectedTheoremInternalFault::Admission(InternalFault::new(
-                        "FL-INV-07",
-                        format!("an empty council halted publication: {}", halt.summary()),
-                    )),
-                );
-            }
-        },
+            });
+        }
         Outcome::Inconclusive(inconclusive) => {
             return ReflectedTheoremOutcome::Inconclusive(ReflectedTheoremInconclusive::Kernel(
                 inconclusive,
@@ -428,46 +399,18 @@ pub fn publish_reflected_theorem(
     };
 
     if is_cancelled(cancellation) {
-        return cancelled(ReflectedTheoremCheckpoint::BeforeAdmission);
+        return cancelled(ReflectedTheoremCheckpoint::BeforeCandidate);
     }
 
-    let kernel_consumption = checked.consumption();
-    match checked.publish(limits.declaration, limits.collisions, cancellation) {
-        Outcome::Complete(KernelPublished::Committed(DeclarationCommitted::Published(
-            publication,
-        ))) => ReflectedTheoremOutcome::Published(Box::new(ReflectedTheoremPublication {
-            publication,
-            proof_receipt,
-            kernel_consumption,
-            provenance,
-            cnf_bytes,
-            proof_bytes,
-            bitblast_facts,
-        })),
-        Outcome::Complete(KernelPublished::Committed(DeclarationCommitted::DuplicateName {
-            name,
-        }))
-        | Outcome::Complete(KernelPublished::DuplicateName { name }) => {
-            ReflectedTheoremOutcome::Refused(ReflectedTheoremRefusal::DuplicateName { name })
-        }
-        Outcome::Complete(KernelPublished::BlockCommitted(publication)) => {
-            ReflectedTheoremOutcome::InternalFault(ReflectedTheoremInternalFault::Bridge(
-                InternalFault::new(
-                    "FL-INV-06",
-                    format!(
-                        "single-theorem capability produced a {}-member block publication",
-                        publication.names.len()
-                    ),
-                ),
-            ))
-        }
-        Outcome::Inconclusive(inconclusive) => ReflectedTheoremOutcome::Inconclusive(
-            ReflectedTheoremInconclusive::Admission(inconclusive),
-        ),
-        Outcome::InternalFault(fault) => {
-            ReflectedTheoremOutcome::InternalFault(ReflectedTheoremInternalFault::Admission(fault))
-        }
-    }
+    ReflectedTheoremOutcome::Checked(Box::new(ReflectedTheoremCandidate {
+        theorem,
+        proof_receipt,
+        kernel_consumption,
+        provenance,
+        cnf_bytes,
+        proof_bytes,
+        bitblast_facts,
+    }))
 }
 
 #[cfg(test)]
@@ -478,7 +421,6 @@ mod tests {
     use fln_core::level::Level;
     use fln_core::mode::{Mode, ReproducibilityProfile};
     use fln_core::name::Name;
-    use fln_core::options::KVMap;
     use fln_env::constants::{ConstantInfo, ConstantVal, TheoremVal};
     use fln_env::environment::Environment;
     use fln_kernel::verdict::{Budget as KernelBudget, RejectClass};
@@ -489,7 +431,7 @@ mod tests {
         ReflectedTheoremArtifact, ReflectedTheoremInconclusive, ReflectedTheoremInternalFault,
         ReflectedTheoremLimits, ReflectedTheoremOutcome, ReflectedTheoremProvenance,
         ReflectedTheoremRefusal, STREAMING_PROOF_CHECKER_POLICY_ID, SolverLimits, SolverOutcome,
-        UNSAT_PROOF_SCHEMA, bitblast, publish_reflected_theorem, solve,
+        UNSAT_PROOF_SCHEMA, bitblast, check_reflected_theorem, solve,
     };
 
     fn name(text: &str) -> Name {
@@ -590,82 +532,60 @@ mod tests {
             .expect("certificate belongs to the canonical bitblast")
     }
 
-    fn published(
+    fn checked(
         environment: &Environment,
         artifact: ReflectedTheoremArtifact,
         limits: ReflectedTheoremLimits,
-    ) -> Result<super::ReflectedTheoremPublication, String> {
-        match publish_reflected_theorem(environment, artifact, limits, None) {
-            ReflectedTheoremOutcome::Published(publication) => Ok(*publication),
+    ) -> Result<super::ReflectedTheoremCandidate, String> {
+        match check_reflected_theorem(environment, artifact, limits, None) {
+            ReflectedTheoremOutcome::Checked(candidate) => Ok(*candidate),
             other => Err(format!(
-                "expected reflected theorem publication, got {other:?}"
+                "expected reflected theorem candidate, got {other:?}"
             )),
         }
     }
 
     #[test]
-    fn reflected_theorem_replay_publishes_the_kernel_checked_owner() {
+    fn reflected_theorem_replay_returns_the_kernel_checked_candidate_without_publication() {
         let environment = Environment::new();
         let expected = valid_theorem("reflected.identity");
-        let expected_type = expected.base.type_.clone();
-        let publication = published(
+        let candidate = checked(
             &environment,
-            artifact(expected),
+            artifact(expected.clone()),
             ReflectedTheoremLimits::default(),
         )
-        .expect("valid reflected theorem publishes");
+        .expect("valid reflected theorem becomes a candidate");
 
         assert!(
             environment.is_empty(),
-            "publication mutated the immutable base"
+            "Verdict must not create a successor"
         );
-        let published_theorem = publication
-            .publication
-            .environment
-            .find(&name("reflected.identity"));
-        assert!(matches!(published_theorem, Some(ConstantInfo::Thm(_))));
-        let Some(ConstantInfo::Thm(theorem)) = published_theorem else {
-            return;
-        };
+        assert_eq!(candidate.theorem(), &expected);
         assert_eq!(
-            theorem.base.type_, expected_type,
-            "the exact source proposition must become the checked theorem type"
-        );
-        assert_eq!(
-            publication.publication.digest,
-            Environment::decl_content_digest(
-                publication
-                    .publication
-                    .environment
-                    .find(&name("reflected.identity"))
-                    .expect("published theorem exists")
-            )
-        );
-        assert_eq!(
-            publication.provenance.bitblast_manifest_id(),
+            candidate.provenance.bitblast_manifest_id(),
             BITBLAST_MANIFEST_ID
         );
         assert_eq!(
-            publication.provenance.bitblast_manifest_version(),
+            candidate.provenance.bitblast_manifest_version(),
             BITBLAST_MANIFEST_VERSION
         );
-        assert_eq!(publication.provenance.cnf_schema(), CNF_SCHEMA);
-        assert_eq!(publication.provenance.proof_schema(), UNSAT_PROOF_SCHEMA);
+        assert_eq!(candidate.provenance.cnf_schema(), CNF_SCHEMA);
+        assert_eq!(candidate.provenance.proof_schema(), UNSAT_PROOF_SCHEMA);
         assert_eq!(
-            publication.provenance.proof_checker_policy_id(),
+            candidate.provenance.proof_checker_policy_id(),
             STREAMING_PROOF_CHECKER_POLICY_ID
         );
         assert_eq!(
-            publication.cnf_bytes().len() as u64,
-            publication.proof_receipt.cnf_bytes_read
+            candidate.cnf_bytes().len() as u64,
+            candidate.proof_receipt.cnf_bytes_read
         );
         assert_eq!(
-            publication.proof_bytes().len() as u64,
-            publication.proof_receipt.proof_bytes_read
+            candidate.proof_bytes().len() as u64,
+            candidate.proof_receipt.proof_bytes_read
         );
         assert_eq!(
-            publication.bitblast_facts().encoded_bytes,
-            publication.proof_receipt.cnf_bytes_read
+            candidate.bitblast_facts().encoded_bytes,
+            candidate.proof_receipt.cnf_bytes_read
         );
     }
 
@@ -694,26 +614,34 @@ mod tests {
     }
 
     #[test]
-    fn kernel_admission_boundary_has_no_raw_check_or_environment_plan_route() {
+    fn kernel_candidate_boundary_has_no_environment_publication_route() {
         let source = include_str!("reflection.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _tests)| production);
         assert!(
-            !source.contains(concat!("fln_kernel::", "check(")),
-            "Verdict must enter Crucible through the opaque capability producer"
+            production.contains(concat!("fln_kernel::", "check(")),
+            "Verdict must ask K1 about the exact candidate"
         );
         assert!(
-            !source.contains(concat!(".plan_", "add_decl(")),
-            "Verdict must not publish a caller-owned declaration directly"
+            !production.contains(concat!(".plan_", "add_decl("))
+                && !production.contains(concat!(".add_", "decl(")),
+            "Verdict must not construct an environment successor"
         );
         assert!(
-            source.contains("checked.publish("),
-            "the accepted capability must be the publication input"
+            !production.contains(concat!("checked.", "publish(")),
+            "Verdict must not consume any publication capability"
+        );
+        assert!(
+            !production.contains(concat!("con", "vene(")),
+            "a crate with no publication authority must not convene a council"
         );
     }
 
     #[test]
     fn kernel_admission_boundary_refuses_corrupted_reflected_term() {
         let environment = Environment::new();
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             artifact(invalid_theorem("reflected.invalid")),
             ReflectedTheoremLimits::default(),
@@ -735,7 +663,7 @@ mod tests {
         let environment = Environment::new();
         let mut candidate = artifact(invalid_theorem("reflected.unreachable"));
         candidate.proof_bytes[0] ^= 0xff;
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             candidate,
             ReflectedTheoremLimits::default(),
@@ -754,7 +682,7 @@ mod tests {
         let environment = Environment::new();
         let mut candidate = artifact(valid_theorem("reflected.receiptDrift"));
         candidate.proof_receipt.work_units = candidate.proof_receipt.work_units.saturating_add(1);
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             candidate,
             ReflectedTheoremLimits::default(),
@@ -773,7 +701,7 @@ mod tests {
         let environment = Environment::new();
         let mut candidate = artifact(valid_theorem("reflected.unknownVersion"));
         candidate.proof_bytes[9..11].copy_from_slice(&u16::MAX.to_le_bytes());
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             candidate,
             ReflectedTheoremLimits::default(),
@@ -799,7 +727,7 @@ mod tests {
             },
             ..ReflectedTheoremLimits::default()
         };
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             artifact(valid_theorem("reflected.checkerBudget")),
             limits,
@@ -825,7 +753,7 @@ mod tests {
             kernel: KernelBudget::DEFAULT.narrowed(0, 1),
             ..ReflectedTheoremLimits::default()
         };
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             artifact(valid_theorem("reflected.kernelBudget")),
             limits,
@@ -843,7 +771,7 @@ mod tests {
     fn kernel_admission_boundary_never_promotes_cancellation() {
         let environment = Environment::new();
         let cancelled = AtomicBool::new(true);
-        let outcome = publish_reflected_theorem(
+        let outcome = check_reflected_theorem(
             &environment,
             artifact(valid_theorem("reflected.cancelled")),
             ReflectedTheoremLimits::default(),
@@ -861,17 +789,13 @@ mod tests {
 
     #[test]
     fn kernel_admission_boundary_refuses_duplicate_without_overwrite() {
-        let first = published(
-            &Environment::new(),
-            artifact(valid_theorem("reflected.duplicate")),
-            ReflectedTheoremLimits::default(),
-        )
-        .expect("first declaration publishes");
-        let environment = first.publication.environment;
-        let before = environment.logical_root(&KVMap::new());
-        let outcome = publish_reflected_theorem(
+        let existing = valid_theorem("reflected.duplicate");
+        let environment = Environment::new()
+            .add_decl(ConstantInfo::Thm(existing.clone()))
+            .expect("test setup contains the existing theorem");
+        let outcome = check_reflected_theorem(
             &environment,
-            artifact(valid_theorem("reflected.duplicate")),
+            artifact(existing),
             ReflectedTheoremLimits::default(),
             None,
         );
@@ -883,26 +807,32 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(before, environment.logical_root(&KVMap::new()));
+        assert_eq!(environment.len(), 1);
     }
 
     fn replay_identity() -> (Vec<u8>, Vec<u8>, String, crate::ProofCheckReceipt) {
-        let (bitblast, checked) = checked_bitblast(&BoolExpr::Constant(false))
+        let (bitblast, certificate) = checked_bitblast(&BoolExpr::Constant(false))
             .expect("false bitblast produces a certificate");
-        let cnf_bytes = checked.cnf_bytes().to_vec();
-        let proof_bytes = checked.proof_bytes().to_vec();
-        let publication = published(
+        let cnf_bytes = certificate.cnf_bytes().to_vec();
+        let proof_bytes = certificate.proof_bytes().to_vec();
+        let candidate = checked(
             &Environment::new(),
-            artifact_from_pair(bitblast, checked, valid_theorem("reflected.deterministic"))
-                .expect("certificate belongs to the canonical bitblast"),
+            artifact_from_pair(
+                bitblast,
+                certificate,
+                valid_theorem("reflected.deterministic"),
+            )
+            .expect("certificate belongs to the canonical bitblast"),
             ReflectedTheoremLimits::default(),
         )
-        .expect("determinism sample publishes");
+        .expect("determinism sample checks");
+        let digest =
+            Environment::decl_content_digest(&ConstantInfo::Thm(candidate.theorem().clone()));
         (
             cnf_bytes,
             proof_bytes,
-            publication.publication.digest.to_string(),
-            publication.proof_receipt,
+            digest.to_string(),
+            candidate.proof_receipt,
         )
     }
 

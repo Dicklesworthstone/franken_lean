@@ -15,6 +15,10 @@
 //!   versions/opcodes/extensions refused as typed values;
 //! * cancellation, resource exhaustion, and internal faults have no publication
 //!   path to a SAT model or UNSAT proof (FL-INV-07).
+//!
+//! A successful reflected theorem is likewise only a K1-checked candidate.
+//! Verdict returns no environment successor and owns no council; the facade that
+//! owns admission policy must move the exact candidate through its own council.
 
 #![forbid(unsafe_code)]
 
@@ -37,9 +41,9 @@ pub use bitblast::{
     CANONICAL_BITBLAST_POLICY_ID, UnsupportedBvOp, bitblast, bitblast_with_cancel,
 };
 pub use bv_decide::{
-    BV_DECIDE_POLICY_ID, BvDecideCounterexample, BvDecideInconclusive, BvDecideInputAssignment,
-    BvDecideInputValue, BvDecideInternalFault, BvDecideLimits, BvDecideOutcome,
-    BvDecidePublication, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry, bv_decide,
+    BV_DECIDE_POLICY_ID, BvDecideCandidate, BvDecideCounterexample, BvDecideInconclusive,
+    BvDecideInputAssignment, BvDecideInputValue, BvDecideInternalFault, BvDecideLimits,
+    BvDecideOutcome, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry, bv_decide,
     bv_decide_with_cancel,
 };
 pub use checker::{
@@ -49,9 +53,9 @@ pub use checker::{
 };
 pub use reflection::{
     REFLECTED_THEOREM_POLICY_ID, ReflectedArtifactError, ReflectedTheoremArtifact,
-    ReflectedTheoremCheckpoint, ReflectedTheoremInconclusive, ReflectedTheoremInternalFault,
-    ReflectedTheoremLimits, ReflectedTheoremOutcome, ReflectedTheoremProvenance,
-    ReflectedTheoremPublication, ReflectedTheoremRefusal, publish_reflected_theorem,
+    ReflectedTheoremCandidate, ReflectedTheoremCheckpoint, ReflectedTheoremInconclusive,
+    ReflectedTheoremInternalFault, ReflectedTheoremLimits, ReflectedTheoremOutcome,
+    ReflectedTheoremProvenance, ReflectedTheoremRefusal, check_reflected_theorem,
 };
 pub use solver::{
     CdclDeterminismPolicy, CheckedSat, CheckedSolverArtifact, CheckedUnsat,

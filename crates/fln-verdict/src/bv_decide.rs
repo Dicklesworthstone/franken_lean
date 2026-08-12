@@ -2,9 +2,10 @@
 //!
 //! The proposition is negated before bitblasting. An UNSAT result therefore
 //! establishes the proposition, but it is still non-authoritative until the exact
-//! proof stream is independently replayed and the reflected theorem is admitted
-//! through Crucible's opaque checked-declaration capability. A SAT result is an
-//! independently re-decoded counterexample and has no environment-publication path.
+//! proof stream is independently replayed and the reflected theorem is checked by
+//! Crucible. Even then the result is only a candidate: this crate exposes no
+//! environment-publication path. A SAT result is an independently re-decoded
+//! counterexample.
 
 #![forbid(unsafe_code)]
 
@@ -18,11 +19,11 @@ use fln_env::modules::CancellationProbe;
 use crate::{
     BitblastArtifact, BitblastFacts, BitblastInconclusive, BitblastInputKind,
     BitblastInternalFault, BitblastLimits, BitblastOutcome, BitblastRefusal, BitblastSymbol,
-    BoolExpr, Cnf, ReflectedArtifactError, ReflectedTheoremArtifact, ReflectedTheoremInconclusive,
-    ReflectedTheoremInternalFault, ReflectedTheoremLimits, ReflectedTheoremOutcome,
-    ReflectedTheoremProvenance, ReflectedTheoremPublication, ReflectedTheoremRefusal, SatModel,
+    BoolExpr, Cnf, ReflectedArtifactError, ReflectedTheoremArtifact, ReflectedTheoremCandidate,
+    ReflectedTheoremInconclusive, ReflectedTheoremInternalFault, ReflectedTheoremLimits,
+    ReflectedTheoremOutcome, ReflectedTheoremProvenance, ReflectedTheoremRefusal, SatModel,
     SchemaError, SchemaLimits, SolverInconclusive, SolverInternalFault, SolverLimits,
-    SolverOutcome, SolverStatistics, VariableId, bitblast_with_cancel, publish_reflected_theorem,
+    SolverOutcome, SolverStatistics, VariableId, bitblast_with_cancel, check_reflected_theorem,
     solve_with_cancel,
 };
 
@@ -160,16 +161,18 @@ impl BvDecideCounterexample {
     }
 }
 
-/// The only successful theorem result: a Crucible-checked, capability-published
-/// declaration plus non-semantic resource telemetry.
+/// A Crucible-checked theorem candidate plus non-semantic resource telemetry.
+///
+/// It is deliberately not a publication: no environment successor or admission
+/// capability leaves this crate.
 #[derive(Debug)]
-pub struct BvDecidePublication {
-    reflection: ReflectedTheoremPublication,
+pub struct BvDecideCandidate {
+    reflection: ReflectedTheoremCandidate,
     telemetry: BvDecideTelemetry,
 }
 
-impl BvDecidePublication {
-    pub const fn reflection(&self) -> &ReflectedTheoremPublication {
+impl BvDecideCandidate {
+    pub const fn reflection(&self) -> &ReflectedTheoremCandidate {
         &self.reflection
     }
 
@@ -227,12 +230,13 @@ pub enum BvDecideInternalFault {
     Reflection(ReflectedTheoremInternalFault),
 }
 
-/// The five disjoint terminal classes. Only [`Self::Proved`] carries a published
-/// environment; resource or cancellation outcomes cannot be mistaken for false.
+/// The five disjoint terminal classes. [`Self::Candidate`] carries a K1-checked
+/// theorem but no publication authority; resource or cancellation outcomes cannot
+/// be mistaken for false.
 #[derive(Debug)]
 #[must_use]
 pub enum BvDecideOutcome {
-    Proved(Box<BvDecidePublication>),
+    Candidate(Box<BvDecideCandidate>),
     Counterexample(Box<BvDecideCounterexample>),
     Refused(BvDecideRefusal),
     Inconclusive(BvDecideInconclusive),
@@ -240,9 +244,9 @@ pub enum BvDecideOutcome {
 }
 
 impl BvDecideOutcome {
-    pub const fn publication(&self) -> Option<&BvDecidePublication> {
+    pub const fn candidate(&self) -> Option<&BvDecideCandidate> {
         match self {
-            Self::Proved(publication) => Some(publication),
+            Self::Candidate(candidate) => Some(candidate),
             Self::Counterexample(_)
             | Self::Refused(_)
             | Self::Inconclusive(_)
@@ -253,9 +257,10 @@ impl BvDecideOutcome {
     pub const fn counterexample(&self) -> Option<&BvDecideCounterexample> {
         match self {
             Self::Counterexample(counterexample) => Some(counterexample),
-            Self::Proved(_) | Self::Refused(_) | Self::Inconclusive(_) | Self::InternalFault(_) => {
-                None
-            }
+            Self::Candidate(_)
+            | Self::Refused(_)
+            | Self::Inconclusive(_)
+            | Self::InternalFault(_) => None,
         }
     }
 }
@@ -430,7 +435,7 @@ pub fn bv_decide(
 }
 
 /// Canonical bitblast, deterministic solve, independent artifact validation, and
-/// capability-bound theorem publication.
+/// K1-checked theorem-candidate construction.
 pub fn bv_decide_with_cancel(
     environment: &Environment,
     request: BvDecideRequest,
@@ -509,13 +514,12 @@ pub fn bv_decide_with_cancel(
                     );
                 }
             };
-            match publish_reflected_theorem(environment, reflected, limits.reflection, cancellation)
-            {
-                ReflectedTheoremOutcome::Published(publication) => {
-                    let proof_checker_work_units = Some(publication.proof_receipt.work_units);
-                    let bitblast = publication.bitblast_facts();
-                    BvDecideOutcome::Proved(Box::new(BvDecidePublication {
-                        reflection: *publication,
+            match check_reflected_theorem(environment, reflected, limits.reflection, cancellation) {
+                ReflectedTheoremOutcome::Checked(candidate) => {
+                    let proof_checker_work_units = Some(candidate.proof_receipt.work_units);
+                    let bitblast = candidate.bitblast_facts();
+                    BvDecideOutcome::Candidate(Box::new(BvDecideCandidate {
+                        reflection: *candidate,
                         telemetry: BvDecideTelemetry {
                             bitblast,
                             solver: statistics,

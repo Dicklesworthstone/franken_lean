@@ -106,9 +106,9 @@ pub use fln_olean::write::{
 pub use fln_server::LspProjection;
 pub use fln_verdict as verdict;
 pub use fln_verdict::{
-    BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp, BvComparison, BvDecideCounterexample,
-    BvDecideInconclusive, BvDecideInputAssignment, BvDecideInputValue, BvDecideInternalFault,
-    BvDecideLimits, BvDecidePublication, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry,
+    BitblastSymbol, BoolBinaryOp, BoolExpr, BvBinaryOp, BvComparison, BvDecideCandidate,
+    BvDecideCounterexample, BvDecideInconclusive, BvDecideInputAssignment, BvDecideInputValue,
+    BvDecideInternalFault, BvDecideLimits, BvDecideRefusal, BvDecideRequest, BvDecideTelemetry,
     BvExpr, BvShiftOp, BvUnaryOp, UnsupportedBvOp,
 };
 use fln_vm::interpreter::CommandExecutionContext;
@@ -1125,7 +1125,7 @@ impl EngineBvDecideLimits {
 #[derive(Debug)]
 pub struct EngineBvDecidePublication {
     pub engine: Engine,
-    pub verdict: BvDecidePublication,
+    pub verdict: BvDecideCandidate,
     pub base_logical_root: LogicalRoot,
     pub result_logical_root: LogicalRoot,
     pub checker: CheckerAgreement,
@@ -1184,28 +1184,22 @@ impl EngineBvDecideOutcome {
 }
 
 /// A completed integration refusal. Verdict's domain refusals remain inside
-/// [`EngineBvDecideOutcome`]; these variants mean the already-published
-/// candidate could not be exposed as the exact facade successor.
+/// [`EngineBvDecideOutcome`]; these variants mean its non-authoritative
+/// candidate could not pass the facade publication door.
 #[derive(Debug)]
 pub enum EngineBvDecideError {
-    PublishedTheoremMissing { name: Name },
-    PublishedConstantWasNotTheorem { name: Name, kind: &'static str },
+    CandidateTheoremMismatch { expected: Name, actual: Name },
     Admission(EngineAdmissionError),
-    SuccessorMismatch { name: Name },
 }
 
 impl fmt::Display for EngineBvDecideError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PublishedTheoremMissing { name } => write!(
+            Self::CandidateTheoremMismatch { expected, actual } => write!(
                 formatter,
-                "Verdict published no constant named {}",
-                name.to_display_string()
-            ),
-            Self::PublishedConstantWasNotTheorem { name, kind } => write!(
-                formatter,
-                "Verdict published {} as {kind}, not a theorem",
-                name.to_display_string()
+                "Verdict returned candidate {} for requested theorem {}",
+                actual.to_display_string(),
+                expected.to_display_string()
             ),
             Self::Admission(error) => {
                 write!(
@@ -1213,11 +1207,6 @@ impl fmt::Display for EngineBvDecideError {
                     "facade council refused Verdict publication: {error}"
                 )
             }
-            Self::SuccessorMismatch { name } => write!(
-                formatter,
-                "Verdict and the facade council produced different successors for {}",
-                name.to_display_string()
-            ),
         }
     }
 }
@@ -1226,9 +1215,7 @@ impl std::error::Error for EngineBvDecideError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Admission(error) => Some(error),
-            Self::PublishedTheoremMissing { .. }
-            | Self::PublishedConstantWasNotTheorem { .. }
-            | Self::SuccessorMismatch { .. } => None,
+            Self::CandidateTheoremMismatch { .. } => None,
         }
     }
 }
@@ -1296,12 +1283,10 @@ impl Engine {
     /// theorem completes the facade's independent-checker council.
     ///
     /// Verdict first bitblasts the negated proposition, deterministically solves
-    /// it, independently replays an UNSAT proof, and publishes through K1. The
-    /// facade then re-admits that exact theorem through [`Self::admit_declaration`]
-    /// and requires the two immutable successor environments to be identical.
-    /// This deliberate second K1 pass keeps the existing council as the sole
-    /// embeddable admission door instead of manufacturing authority from an
-    /// already-materialized environment.
+    /// it, independently replays an UNSAT proof, and asks K1 to check a candidate
+    /// without publishing it. The facade then moves that exact theorem through
+    /// [`Self::admit_declaration`]. The independent-checker council is therefore
+    /// the only environment publication door.
     pub fn decide_bv(
         &self,
         request: BvDecideRequest,
@@ -1329,8 +1314,8 @@ impl Engine {
             limits.verdict,
             cancellation,
         );
-        let publication = match verdict {
-            fln_verdict::BvDecideOutcome::Proved(publication) => publication,
+        let candidate = match verdict {
+            fln_verdict::BvDecideOutcome::Candidate(candidate) => candidate,
             fln_verdict::BvDecideOutcome::Counterexample(counterexample) => {
                 return Ok(EngineBvDecideOutcome::Counterexample(counterexample));
             }
@@ -1357,19 +1342,13 @@ impl Engine {
             ));
         }
 
-        let verdict_environment = publication.reflection().publication.environment.clone();
-        let theorem = match verdict_environment.find(&theorem_name) {
-            Some(ConstantInfo::Thm(theorem)) => theorem.clone(),
-            Some(other) => {
-                return Err(EngineBvDecideError::PublishedConstantWasNotTheorem {
-                    name: theorem_name,
-                    kind: other.kind_name(),
-                });
-            }
-            None => {
-                return Err(EngineBvDecideError::PublishedTheoremMissing { name: theorem_name });
-            }
-        };
+        let theorem = candidate.reflection().theorem().clone();
+        if theorem.base.name != theorem_name {
+            return Err(EngineBvDecideError::CandidateTheoremMismatch {
+                expected: theorem_name,
+                actual: theorem.base.name,
+            });
+        }
         let admission = self
             .admit_declaration(Declaration::Thm(theorem), options, limits.admission)
             .map_err(EngineBvDecideError::Admission)?;
@@ -1386,14 +1365,10 @@ impl Engine {
                 ));
             }
         };
-        if admission.engine.environment != verdict_environment {
-            return Err(EngineBvDecideError::SuccessorMismatch { name: theorem_name });
-        }
-
         Ok(EngineBvDecideOutcome::Proved(Box::new(
             EngineBvDecidePublication {
                 engine: admission.engine,
-                verdict: *publication,
+                verdict: *candidate,
                 base_logical_root: admission.base_logical_root,
                 result_logical_root: admission.result_logical_root,
                 checker: admission.checker,
@@ -4149,11 +4124,12 @@ mod tests {
         );
         assert_ne!(publication.result_logical_root, base_root);
         assert!(publication.engine.environment().contains(&theorem));
-        assert_eq!(
-            publication.engine.environment(),
-            &publication.verdict.reflection().publication.environment,
-            "the two authority paths must expose the same immutable successor"
-        );
+        let candidate = publication.verdict.reflection().theorem();
+        assert_eq!(&candidate.base.name, &theorem);
+        assert!(matches!(
+            publication.engine.environment().find(&theorem),
+            Some(ConstantInfo::Thm(published)) if published == candidate
+        ));
         assert_eq!(
             publication.checker.ground,
             CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
@@ -4227,6 +4203,17 @@ mod tests {
         let mut constrained = EngineBvDecideLimits::new(test_budget());
         constrained.admission.checker.admission =
             CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+
+        let raw = fln_verdict::bv_decide(
+            engine.environment(),
+            bv_request(BoolExpr::Constant(true), "bv.facade.raw-candidate"),
+            constrained.verdict,
+        );
+        assert!(matches!(raw, fln_verdict::BvDecideOutcome::Candidate(_)));
+        assert!(
+            engine.environment().is_empty(),
+            "a raw Verdict candidate must carry no environment successor"
+        );
 
         let error = engine
             .decide_bv(
