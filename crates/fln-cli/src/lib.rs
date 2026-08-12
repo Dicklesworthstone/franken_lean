@@ -1220,7 +1220,11 @@ fn admission_error_disposition(error: &fln::EngineAdmissionError) -> (&'static s
         }
         fln::EngineAdmissionError::AllocationFailure { .. } => ("resource", false, 3),
         fln::EngineAdmissionError::KernelRejected { .. } => ("kernel-rejection", true, 1),
-        fln::EngineAdmissionError::CouncilHalted { .. } => ("checker-disagreement", false, 1),
+        // A halt is "kernel accepted ∧ some seat objected". The objection may be
+        // Disagrees, NoAnswer, Exhausted, or incomparable bounds. `run` already
+        // renders the same variant as inconclusive; folding a checker non-answer
+        // into checker-disagreement / exit 1 is an FL-INV-07 promotion.
+        fln::EngineAdmissionError::CouncilHalted { .. } => ("inconclusive", false, 3),
         fln::EngineAdmissionError::CheckerBridge { .. }
         | fln::EngineAdmissionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
         fln::EngineAdmissionError::EmptyBatch
@@ -2949,11 +2953,11 @@ pub fn project(
 mod tests {
     use super::{
         CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_INSPECT_SCHEMA,
-        OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, check_olean_bytes,
-        check_olean_module_bytes, execute_flbc_bytes, execute_source_bytes,
-        execute_source_bytes_with_publisher, execution_error_disposition, inspect_olean_bytes,
-        module_name_from_relative, parse_source_run, read_bounded_from, run, source_failure,
-        verify_olean_rebuild_bytes,
+        OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA,
+        admission_error_disposition, check_olean_bytes, check_olean_module_bytes,
+        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
+        execution_error_disposition, inspect_olean_bytes, module_name_from_relative,
+        parse_source_run, read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -3803,6 +3807,20 @@ mod tests {
             output
                 .stderr
                 .contains("final definition did not produce a closed Nat scalar")
+        );
+    }
+
+    #[test]
+    fn check_olean_renders_a_council_halt_as_inconclusive() {
+        let halted = fln::EngineAdmissionError::BatchDeclaration {
+            index: 0,
+            error: Box::new(fln::EngineAdmissionError::CouncilHalted {
+                summary: "independent checker did not answer".to_owned(),
+            }),
+        };
+        assert_eq!(
+            admission_error_disposition(&halted),
+            ("inconclusive", false, 3)
         );
     }
 
