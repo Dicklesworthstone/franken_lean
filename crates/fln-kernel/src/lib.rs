@@ -120,7 +120,6 @@ pub fn check(env: &Environment, decl: &Declaration, budget: Budget) -> Outcome<V
     let mut checker = TypeChecker::new(env, decl.level_params(), budget);
     let outcome = check_inner(env, decl, &mut checker);
     let consumption = checker.consumption();
-    checker.emit_temporary_cache_diagnostics();
     check_result_to_outcome(outcome, consumption, budget)
 }
 
