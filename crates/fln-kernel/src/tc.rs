@@ -74,14 +74,19 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // authority and never shared across environments, safety modes, or budgets.
 //
 // A hostile term controls the cached expressions and their 32-bit Reference
-// hashes, so every dimension is bounded. Four structural candidates per
-// packed-data bucket cap collision work; 65,536 rows cap reuse. Fvar-bearing
-// rows may retain at most 262,144 local-generation snapshots per cache, with no
-// one row retaining more than 256 or scanning more than 65,536 expression
-// nodes to discover them. Each cache may spend at most 33,554,432 node visits
-// on dependency discovery in total. The two aggregate budgets admit many
-// narrow proof contexts without allowing a few wide contexts to dominate
-// retained memory or bookkeeping.
+// hashes, so the row, collision, dependency-cell, and dependency-scan counts
+// are bounded. Four structural candidates per packed-data bucket cap collision
+// work; 65,536 rows cap reuse. Fvar-bearing rows may retain at most 262,144
+// local-generation snapshots per cache, with no one row retaining more than
+// 256 or scanning more than 65,536 distinct expression allocations to discover
+// them. Each cache may spend at most 33,554,432 node visits on dependency
+// discovery in total. A bounded packed-key refusal set prevents an expression
+// beyond those limits from repeatedly consuming that allowance; a hash
+// collision can therefore suppress reuse, never manufacture a result.
+// Dead-generation rows are reclaimed from a touched bucket before its collision
+// cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
+// allocator failure, cancellation, and Consumption-accounted cache bookkeeping
+// remain outside them, so they do not by themselves close FL-INV-07.
 // Saturation simply stops admitting new cache rows. It cannot evict an answer,
 // change a completed result, or turn an interrupted computation into one.
 const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 65_536;
@@ -128,6 +133,7 @@ fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
     seen_ids: &mut HashMap<FVarId, ()>,
+    seen_nodes: &mut HashMap<usize, ()>,
     nodes_left: &mut usize,
 ) -> bool {
     if !expr.has_fvar() {
@@ -135,6 +141,12 @@ fn collect_fvar_ids(
     }
     let mut pending = vec![expr.clone()];
     while let Some(current) = pending.pop() {
+        if seen_nodes
+            .insert(current.allocation_identity(), ())
+            .is_some()
+        {
+            continue;
+        }
         let Some(remaining) = nodes_left.checked_sub(1) else {
             return false;
         };
@@ -192,8 +204,15 @@ fn local_dependencies(
 ) -> Option<Vec<LocalDependency>> {
     let mut ids = Vec::new();
     let mut seen_ids = HashMap::new();
+    let mut seen_nodes = HashMap::new();
     for expression in expressions {
-        if !collect_fvar_ids(expression, &mut ids, &mut seen_ids, nodes_left) {
+        if !collect_fvar_ids(
+            expression,
+            &mut ids,
+            &mut seen_ids,
+            &mut seen_nodes,
+            nodes_left,
+        ) {
             return None;
         }
     }
@@ -207,11 +226,17 @@ fn local_dependencies(
         let local = local_positions
             .get(&id)
             .and_then(|position| locals.get(*position))?;
-        if !collect_fvar_ids(&local.type_, &mut ids, &mut seen_ids, nodes_left) {
+        if !collect_fvar_ids(
+            &local.type_,
+            &mut ids,
+            &mut seen_ids,
+            &mut seen_nodes,
+            nodes_left,
+        ) {
             return None;
         }
         if let Some(value) = &local.value
-            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, nodes_left)
+            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, &mut seen_nodes, nodes_left)
         {
             return None;
         }
@@ -248,6 +273,7 @@ struct ExprResultCacheEntry {
 
 struct ExprResultCache {
     buckets: HashMap<u64, Vec<ExprResultCacheEntry>>,
+    dependency_scan_refusals: HashMap<u64, ()>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -266,6 +292,7 @@ impl ExprResultCache {
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
             buckets: HashMap::new(),
+            dependency_scan_refusals: HashMap::new(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -295,6 +322,22 @@ impl ExprResultCache {
         local_positions: &HashMap<FVarId, usize>,
     ) {
         let packed = key.data().0;
+        if let Some(bucket) = self.buckets.get_mut(&packed) {
+            let before = bucket.len();
+            let mut removed_cells = 0_usize;
+            bucket.retain(|entry| {
+                let live = dependencies_are_live(&entry.dependencies, locals, local_positions);
+                if !live {
+                    removed_cells += entry.dependencies.len();
+                }
+                live
+            });
+            self.entries -= before - bucket.len();
+            self.local_dependency_cells -= removed_cells;
+        }
+        if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
+            self.buckets.remove(&packed);
+        }
         if self.entries >= self.max_entries
             || self.max_bucket_entries == 0
             || self
@@ -309,6 +352,11 @@ impl ExprResultCache {
         {
             return;
         }
+        if self.dependency_scan_refusals.contains_key(&packed)
+            || self.dependency_scan_refusals.len() >= self.max_entries
+        {
+            return;
+        }
         let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
             .saturating_sub(self.local_dependency_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
@@ -317,6 +365,9 @@ impl ExprResultCache {
             local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
         let Some(dependencies) = dependencies else {
+            if self.dependency_scan_refusals.len() < self.max_entries {
+                self.dependency_scan_refusals.insert(packed, ());
+            }
             return;
         };
         let dependency_count = dependencies.len();
@@ -325,6 +376,9 @@ impl ExprResultCache {
             .checked_add(dependency_count)
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
+            if self.dependency_scan_refusals.len() < self.max_entries {
+                self.dependency_scan_refusals.insert(packed, ());
+            }
             return;
         }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
@@ -359,6 +413,7 @@ impl ExprResultCache {
 
 struct PositiveDefEqCache {
     buckets: HashMap<(u64, u64), Vec<PositiveDefEqCacheEntry>>,
+    dependency_scan_refusals: HashMap<(u64, u64), ()>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -383,6 +438,7 @@ impl PositiveDefEqCache {
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
             buckets: HashMap::new(),
+            dependency_scan_refusals: HashMap::new(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
@@ -427,6 +483,22 @@ impl PositiveDefEqCache {
         local_positions: &HashMap<FVarId, usize>,
     ) {
         let packed = Self::packed_key(&left, &right);
+        if let Some(bucket) = self.buckets.get_mut(&packed) {
+            let before = bucket.len();
+            let mut removed_cells = 0_usize;
+            bucket.retain(|entry| {
+                let live = dependencies_are_live(&entry.dependencies, locals, local_positions);
+                if !live {
+                    removed_cells += entry.dependencies.len();
+                }
+                live
+            });
+            self.entries -= before - bucket.len();
+            self.local_dependency_cells -= removed_cells;
+        }
+        if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
+            self.buckets.remove(&packed);
+        }
         if self.entries >= self.max_entries
             || self.max_bucket_entries == 0
             || self
@@ -441,6 +513,11 @@ impl PositiveDefEqCache {
         {
             return;
         }
+        if self.dependency_scan_refusals.contains_key(&packed)
+            || self.dependency_scan_refusals.len() >= self.max_entries
+        {
+            return;
+        }
         let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
             .saturating_sub(self.local_dependency_scan_nodes)
             .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
@@ -449,6 +526,9 @@ impl PositiveDefEqCache {
             local_dependencies(&[&left, &right], locals, local_positions, &mut nodes_left);
         self.local_dependency_scan_nodes += scan_limit - nodes_left;
         let Some(dependencies) = dependencies else {
+            if self.dependency_scan_refusals.len() < self.max_entries {
+                self.dependency_scan_refusals.insert(packed, ());
+            }
             return;
         };
         let dependency_count = dependencies.len();
@@ -457,6 +537,9 @@ impl PositiveDefEqCache {
             .checked_add(dependency_count)
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
+            if self.dependency_scan_refusals.len() < self.max_entries {
+                self.dependency_scan_refusals.insert(packed, ());
+            }
             return;
         }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
@@ -4564,8 +4647,134 @@ mod tests {
         tc.infer(&value_local, 0)
             .expect("the dependent local still infers under the shadow");
         assert!(
-            tc.infer_cache.entries == rows_before_shadow + 1,
-            "changing a transitive type dependency must miss and retain a new generation row"
+            tc.infer_cache.entries == rows_before_shadow,
+            "changing a transitive dependency must replace the dead row with the live generation"
+        );
+        assert!(
+            tc.infer_cache
+                .buckets
+                .get(&value_local.data().0)
+                .is_some_and(|bucket| bucket.iter().all(|entry| {
+                    dependencies_are_live(&entry.dependencies, &tc.locals, &tc.local_positions)
+                })),
+            "the retained row must name only the current transitive generations"
+        );
+    }
+
+    #[test]
+    fn dead_generations_cannot_saturate_a_live_fvar_cache_bucket() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let mut result_cache = ExprResultCache::bounded(4, 4);
+        let mut defeq_cache = PositiveDefEqCache::bounded(4, 4);
+        let id = FVarId(Name::str(Name::anonymous(), "rebound"));
+        let local = Expr::fvar(id.clone());
+        let type_ = Expr::sort(Level::zero());
+
+        for generation in 0..5 {
+            tc.adopt_local(id.clone(), type_.clone());
+            result_cache.insert(
+                local.clone(),
+                type_.clone(),
+                &tc.locals,
+                &tc.local_positions,
+            );
+            defeq_cache.insert(
+                local.clone(),
+                type_.clone(),
+                &tc.locals,
+                &tc.local_positions,
+            );
+            assert!(
+                result_cache.get(&local, &tc.locals, &tc.local_positions) == Some(type_.clone()),
+                "generation {generation} must retain its currently live result"
+            );
+            assert!(
+                defeq_cache.contains(&local, &type_, &tc.locals, &tc.local_positions),
+                "generation {generation} must retain its currently live equality"
+            );
+            tc.drop_local();
+        }
+
+        assert!(
+            result_cache.entries == 1
+                && result_cache.local_dependency_cells == 1
+                && defeq_cache.entries == 1
+                && defeq_cache.local_dependency_cells == 1,
+            "four dead generations must be reclaimed before the collision ceiling is applied"
+        );
+    }
+
+    #[test]
+    fn dependency_discovery_visits_a_shared_expression_dag_once() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "shared"));
+        let mut shared = Expr::fvar(id.clone());
+        tc.adopt_local(id.clone(), Expr::sort(Level::zero()));
+
+        // Its expanded tree has more nodes than the per-entry ceiling, while
+        // the immutable DAG contains only the leaf plus these applications.
+        for _ in 0..17 {
+            shared = Expr::app(shared.clone(), shared);
+        }
+        let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+        let dependencies =
+            local_dependencies(&[&shared], &tc.locals, &tc.local_positions, &mut nodes_left)
+                .expect("shared nodes are scanned by allocation, not expanded as a tree");
+
+        assert!(
+            dependencies
+                == vec![LocalDependency {
+                    id,
+                    generation: tc.locals[0].generation.expect("live generation"),
+                }],
+            "the shared graph must retain its one real local dependency"
+        );
+        assert_eq!(
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left,
+            18,
+            "the dependency walk must charge each immutable allocation exactly once"
+        );
+    }
+
+    #[test]
+    fn dependency_discovery_never_aliases_distinct_packed_hash_collisions() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let left_id = FVarId(Name::num_overflowing(Name::anonymous(), u64::MAX - 1));
+        let right_id = FVarId(Name::num_overflowing(Name::anonymous(), u64::MAX));
+        let left = Expr::fvar(left_id.clone());
+        let right = Expr::fvar(right_id.clone());
+        assert_ne!(left, right, "the colliding locals must remain distinct");
+        assert_eq!(
+            left.data(),
+            right.data(),
+            "overflowing numeric name components provide a real packed-data collision"
+        );
+        tc.adopt_local(left_id.clone(), Expr::sort(Level::zero()));
+        tc.adopt_local(right_id.clone(), Expr::sort(Level::zero()));
+
+        let application = Expr::app(left, right);
+        let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+        let dependencies = local_dependencies(
+            &[&application],
+            &tc.locals,
+            &tc.local_positions,
+            &mut nodes_left,
+        )
+        .expect("a packed-data collision cannot suppress dependency discovery");
+
+        assert_eq!(dependencies.len(), 2);
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.id == left_id)
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.id == right_id)
         );
     }
 
@@ -4638,6 +4847,129 @@ mod tests {
             )
             .is_none(),
             "dependency discovery must refuse a hostile expression beyond its node ceiling"
+        );
+
+        let mut scan_refused = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let scan_id = FVarId(Name::str(Name::anonymous(), "scan_refused"));
+        let scan_local = Expr::fvar(scan_id.clone());
+        let scan_key = Expr::mdata(fln_core::options::KVMap::default(), scan_local);
+        scan_refused.adopt_local(scan_id, Expr::sort(Level::zero()));
+        scan_refused.infer_cache.local_dependency_scan_nodes =
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES - 1;
+        scan_refused.infer_cache.insert(
+            scan_key.clone(),
+            scan_key.clone(),
+            &scan_refused.locals,
+            &scan_refused.local_positions,
+        );
+        assert!(
+            scan_refused
+                .infer_cache
+                .dependency_scan_refusals
+                .contains_key(&scan_key.data().0),
+            "an over-limit key must retain a bounded reuse-refusal marker"
+        );
+        scan_refused.infer_cache.local_dependency_scan_nodes = 0;
+        scan_refused.infer_cache.insert(
+            scan_key.clone(),
+            scan_key,
+            &scan_refused.locals,
+            &scan_refused.local_positions,
+        );
+        assert!(
+            scan_refused.infer_cache.entries == 0
+                && scan_refused.infer_cache.local_dependency_scan_nodes == 0,
+            "a refused hash may suppress only another cache attempt, without rescanning or a row"
+        );
+
+        let mut cell_refused = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let left_id = FVarId(Name::str(Name::anonymous(), "cell_left"));
+        let right_id = FVarId(Name::str(Name::anonymous(), "cell_right"));
+        let left = Expr::fvar(left_id.clone());
+        let right = Expr::fvar(right_id.clone());
+        let pair = Expr::app(left.clone(), right.clone());
+        cell_refused.adopt_local(left_id, Expr::sort(Level::zero()));
+        cell_refused.adopt_local(right_id, Expr::sort(Level::zero()));
+        cell_refused.infer_cache.local_dependency_cells =
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS - 1;
+        cell_refused.infer_cache.insert(
+            pair.clone(),
+            pair.clone(),
+            &cell_refused.locals,
+            &cell_refused.local_positions,
+        );
+        cell_refused.positive_def_eq_cache.local_dependency_cells =
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS - 1;
+        cell_refused.positive_def_eq_cache.insert(
+            left.clone(),
+            right.clone(),
+            &cell_refused.locals,
+            &cell_refused.local_positions,
+        );
+        let result_scans = cell_refused.infer_cache.local_dependency_scan_nodes;
+        let defeq_scans = cell_refused
+            .positive_def_eq_cache
+            .local_dependency_scan_nodes;
+        cell_refused.infer_cache.local_dependency_cells = 0;
+        cell_refused.positive_def_eq_cache.local_dependency_cells = 0;
+        cell_refused.infer_cache.insert(
+            pair.clone(),
+            pair,
+            &cell_refused.locals,
+            &cell_refused.local_positions,
+        );
+        cell_refused.positive_def_eq_cache.insert(
+            left,
+            right,
+            &cell_refused.locals,
+            &cell_refused.local_positions,
+        );
+        assert!(
+            cell_refused.infer_cache.entries == 0
+                && cell_refused.positive_def_eq_cache.entries == 0
+                && cell_refused.infer_cache.local_dependency_scan_nodes == result_scans
+                && cell_refused
+                    .positive_def_eq_cache
+                    .local_dependency_scan_nodes
+                    == defeq_scans,
+            "a dependency-cell refusal must not rescan after capacity later becomes available"
+        );
+
+        let mut refusal_full = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let full_id = FVarId(Name::str(Name::anonymous(), "refusal_full"));
+        let full_local = Expr::fvar(full_id.clone());
+        refusal_full.adopt_local(full_id, Expr::sort(Level::zero()));
+        refusal_full.infer_cache = ExprResultCache::bounded(1, 4);
+        refusal_full.positive_def_eq_cache = PositiveDefEqCache::bounded(1, 4);
+        refusal_full
+            .infer_cache
+            .dependency_scan_refusals
+            .insert(u64::MAX, ());
+        refusal_full
+            .positive_def_eq_cache
+            .dependency_scan_refusals
+            .insert((u64::MAX, u64::MAX), ());
+        refusal_full.infer_cache.insert(
+            full_local.clone(),
+            full_local.clone(),
+            &refusal_full.locals,
+            &refusal_full.local_positions,
+        );
+        refusal_full.positive_def_eq_cache.insert(
+            full_local.clone(),
+            Expr::mdata(fln_core::options::KVMap::default(), full_local),
+            &refusal_full.locals,
+            &refusal_full.local_positions,
+        );
+        assert!(
+            refusal_full.infer_cache.entries == 0
+                && refusal_full.infer_cache.local_dependency_scan_nodes == 0
+                && refusal_full.positive_def_eq_cache.entries == 0
+                && refusal_full
+                    .positive_def_eq_cache
+                    .local_dependency_scan_nodes
+                    == 0,
+            "a full refusal table must stop new scans instead of retrying unrecorded keys"
         );
 
         let mut too_many = TypeChecker::new(&env, &[], Budget::DEFAULT);

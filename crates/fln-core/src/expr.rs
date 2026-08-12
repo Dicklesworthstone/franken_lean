@@ -988,6 +988,20 @@ impl Expr {
     pub fn node(&self) -> &ExprNode {
         self.node_arc()
     }
+
+    /// Process-local identity of this immutable node allocation.
+    ///
+    /// This is deliberately not a semantic hash and must never enter an
+    /// artifact, diagnostic, cache key, or deterministic ordering. It exists
+    /// only so bounded in-process graph walks can avoid expanding shared DAGs
+    /// as trees. Equal independently allocated expressions may have different
+    /// identities; clones of one expression retain the same identity. The
+    /// number is unique only while both allocations being compared remain
+    /// alive and must not be retained as a cross-lifetime identifier.
+    #[doc(hidden)]
+    pub fn allocation_identity(&self) -> usize {
+        Arc::as_ptr(self.node_arc()) as usize
+    }
 }
 
 impl Drop for Expr {
@@ -1275,6 +1289,21 @@ mod tests {
             Expr::bvar(0).expect("packs"),
         );
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn allocation_identity_distinguishes_sharing_from_structural_equality() {
+        let shared = Expr::sort(Level::zero());
+        let cloned = shared.clone();
+        let independent = Expr::sort(Level::zero());
+
+        assert_eq!(shared, independent);
+        assert_eq!(shared.allocation_identity(), cloned.allocation_identity());
+        assert_ne!(
+            shared.allocation_identity(),
+            independent.allocation_identity(),
+            "independently allocated structural twins are not one DAG node"
+        );
     }
 
     #[test]
