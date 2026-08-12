@@ -2351,7 +2351,7 @@ struct NestedAux {
 
 /// Lower one nested-head parameter while keeping binders introduced inside the
 /// parameter distinct from loose locals surrounding the occurrence.
-fn lower_param_expr(
+pub(crate) fn lower_param_expr(
     e: &Expr,
     nparams: usize,
     site_inner: u32,
@@ -2597,7 +2597,10 @@ fn compare_recursors(generated: &RecursorVal, decoded: &RecursorVal) -> KResult<
 /// Match regenerated recursors by their semantic identity, not by artifact row
 /// position. A block's decoded rows retain module order, which need not equal
 /// the inductive types' block order.
-fn compare_recursor_sets(generated: &[RecursorVal], decoded: &[RecursorVal]) -> KResult<()> {
+pub(crate) fn compare_recursor_sets(
+    generated: &[RecursorVal],
+    decoded: &[RecursorVal],
+) -> KResult<()> {
     for generated in generated {
         let Some(decoded) = decoded
             .iter()
@@ -3116,86 +3119,5 @@ pub(crate) fn scratch_admit(
             "scratch publication of `{}` faulted: {fault:?}",
             name.to_display_string()
         ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_recursor(name: &str) -> RecursorVal {
-        RecursorVal {
-            base: fln_env::constants::ConstantVal {
-                name: Name::str(Name::anonymous(), name),
-                level_params: Vec::new(),
-                type_: Expr::sort(Level::zero()),
-            },
-            all: Vec::new(),
-            num_params: 0,
-            num_indices: 0,
-            num_motives: 0,
-            num_minors: 0,
-            rules: Vec::new(),
-            k: false,
-            is_unsafe: false,
-        }
-    }
-
-    #[test]
-    fn decoded_recursor_rows_are_matched_by_name_not_artifact_position() {
-        let left = empty_recursor("Left.rec");
-        let right = empty_recursor("Right.rec");
-        let generated = [left.clone(), right.clone()];
-
-        assert!(
-            compare_recursor_sets(&generated, &[right.clone(), left]).is_ok(),
-            "module row order is not block order"
-        );
-        assert!(matches!(
-            compare_recursor_sets(&generated, &[right.clone(), right]),
-            Err(Stop::Reject(RejectClass::BlockMismatch, message))
-                if message.contains("Left.rec")
-        ));
-    }
-
-    #[test]
-    fn nested_parameter_canonicalization_distinguishes_internal_binders_from_field_locals() {
-        let sort = Expr::sort(Level::zero());
-        let eta_expanded_block_param = Expr::lam(
-            Name::str(Name::anonymous(), "x"),
-            sort.clone(),
-            Expr::app(
-                Expr::bvar(2).expect("block parameter under a field local and lambda"),
-                Expr::bvar(0).expect("lambda-bound argument"),
-            ),
-            BinderInfo::Default,
-        );
-        let canonical = lower_param_expr(&eta_expanded_block_param, 1, 1, 0, 0)
-            .expect("an internal binder is not a loose field-local capture");
-        let expected = Expr::lam(
-            Name::str(Name::anonymous(), "x"),
-            sort.clone(),
-            Expr::app(
-                Expr::bvar(1).expect("canonical block parameter under the lambda"),
-                Expr::bvar(0).expect("lambda-bound argument"),
-            ),
-            BinderInfo::Default,
-        );
-        assert_eq!(canonical, expected);
-
-        let captures_field_local = Expr::lam(
-            Name::str(Name::anonymous(), "x"),
-            sort,
-            Expr::app(
-                Expr::bvar(1).expect("field local under the lambda"),
-                Expr::bvar(0).expect("lambda-bound argument"),
-            ),
-            BinderInfo::Default,
-        );
-        assert!(matches!(
-            lower_param_expr(&captures_field_local, 1, 1, 0, 0),
-            Err(Stop::Reject(RejectClass::BlockMismatch, message))
-                if message.contains("cannot contain local variables")
-        ));
     }
 }

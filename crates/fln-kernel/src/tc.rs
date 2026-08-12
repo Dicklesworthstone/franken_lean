@@ -3551,6 +3551,7 @@ fn collect_undeclared_param(level: &Level, declared: &[Name], found: &mut Option
 mod tests {
     use super::*;
     use crate::Declaration;
+    use crate::admit::{compare_recursor_sets, lower_param_expr};
     use crate::capability::{Admitted, Published, admit};
     use crate::council::{Council, CouncilOutcome, convene};
     use fln_core::outcome::Outcome;
@@ -4316,5 +4317,81 @@ mod tests {
             short.positive_def_eq_cache.entries == 0,
             "an interrupted sequence cannot manufacture a positive defeq cache row"
         );
+    }
+
+    fn empty_recursor(name: &str) -> fln_env::constants::RecursorVal {
+        fln_env::constants::RecursorVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::str(Name::anonymous(), name),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            all: Vec::new(),
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 0,
+            num_minors: 0,
+            rules: Vec::new(),
+            k: false,
+            is_unsafe: false,
+        }
+    }
+
+    #[test]
+    fn decoded_recursor_rows_are_matched_by_name_not_artifact_position() {
+        let left = empty_recursor("Left.rec");
+        let right = empty_recursor("Right.rec");
+        let generated = [left.clone(), right.clone()];
+
+        assert!(
+            compare_recursor_sets(&generated, &[right.clone(), left]).is_ok(),
+            "module row order is not block order"
+        );
+        assert!(matches!(
+            compare_recursor_sets(&generated, &[right.clone(), right]),
+            Err(Stop::Reject(RejectClass::BlockMismatch, message))
+                if message.contains("Left.rec")
+        ));
+    }
+
+    #[test]
+    fn nested_parameter_canonicalization_distinguishes_internal_binders_from_field_locals() {
+        let sort = Expr::sort(Level::zero());
+        let eta_expanded_block_param = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort.clone(),
+            Expr::app(
+                Expr::bvar(2).expect("block parameter under a field local and lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        let canonical = lower_param_expr(&eta_expanded_block_param, 1, 1, 0, 0)
+            .expect("an internal binder is not a loose field-local capture");
+        let expected = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort.clone(),
+            Expr::app(
+                Expr::bvar(1).expect("canonical block parameter under the lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        assert!(canonical == expected);
+
+        let captures_field_local = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort,
+            Expr::app(
+                Expr::bvar(1).expect("field local under the lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        assert!(matches!(
+            lower_param_expr(&captures_field_local, 1, 1, 0, 0),
+            Err(Stop::Reject(RejectClass::BlockMismatch, message))
+                if message.contains("cannot contain local variables")
+        ));
     }
 }
