@@ -40,12 +40,12 @@ const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/1";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/2";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/3";
 
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--max-bytes BYTES] PATH\n",
-    "  fln run [--json] [--max-bytes BYTES] PATH...\n",
+    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
@@ -67,9 +67,11 @@ const USAGE: &str = concat!(
     "`run` executes supported Nat definitions from each path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
     "and Golem. The final path must produce the closed Nat result to report. The\n",
-    "batch is atomic, and --max-bytes bounds all source inputs together. It is\n",
-    "not general Lean, Prelude/import processing, a project build, or evidence\n",
-    "that `check-olean` is complete.\n",
+    "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
+    "--emit-flbc, the final definition's exact executed artifact atomically\n",
+    "replaces PATH only after the whole batch succeeds. It is not general Lean,\n",
+    "Prelude/import processing, a project build, a certified build product, or\n",
+    "evidence that `check-olean` is complete.\n",
     "\n",
     "`flbc run` validates and executes one canonical FLBC artifact through Golem.\n",
     "It does not admit declarations or prove how the artifact was compiled.\n",
@@ -114,6 +116,7 @@ enum MultiplexerCommand {
         paths: Vec<PathBuf>,
         max_bytes: usize,
         json: bool,
+        emit_flbc: Option<PathBuf>,
     },
     FlbcRun {
         path: PathBuf,
@@ -284,8 +287,46 @@ fn parse_path_options(
 }
 
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut filtered = Vec::new();
+    let mut emit_flbc = None;
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument);
+            continue;
+        }
+        if options && (argument == "--help" || argument == "-h") {
+            return Ok(MultiplexerCommand::Help);
+        }
+        let emitted = if options && argument == "--emit-flbc" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--emit-flbc requires a following output path".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--emit-flbc="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(path) = emitted {
+            if path.is_empty() {
+                return Err(UsageError("--emit-flbc path must not be empty".to_owned()));
+            }
+            if emit_flbc.replace(PathBuf::from(path)).is_some() {
+                return Err(UsageError(
+                    "--emit-flbc may be supplied at most once".to_owned(),
+                ));
+            }
+            continue;
+        }
+        filtered.push(argument);
+    }
     let Some((paths, max_bytes, json)) =
-        parse_path_options(arguments, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?
+        parse_path_options(filtered, "run", SOURCE_RUN_DEFAULT_MAX_BYTES)?
     else {
         return Ok(MultiplexerCommand::Help);
     };
@@ -293,6 +334,7 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         paths,
         max_bytes,
         json,
+        emit_flbc,
     })
 }
 
@@ -1650,18 +1692,28 @@ struct SourceSuccess<'a> {
     result_root: &'a str,
     checker_schema: &'a str,
     checker_ground: &'a str,
+    emitted_flbc: Option<(&'a Path, usize)>,
     steps: u64,
     system_polls: u64,
     peak_stack_depth: u64,
 }
 
 fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOutput {
+    let emitted_flbc_json = result.emitted_flbc.map_or_else(
+        || "null".to_owned(),
+        |(path, bytes)| {
+            format!(
+                "{{\"path\":{},\"bytes\":{bytes}}}",
+                json_string(&path.to_string_lossy())
+            )
+        },
+    );
     let stdout = if json {
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
                 "\"definitions\":{},\"sourceBytes\":{},\"finalValue\":{},",
-                "\"flbcBytes\":{},",
+                "\"flbcBytes\":{},\"emittedFlbc\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"checker\":{{\"definitions\":{},\"finalSchema\":{},",
                 "\"finalGround\":{}}},",
@@ -1673,6 +1725,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.source_bytes,
             result.final_value,
             result.flbc_bytes,
+            emitted_flbc_json,
             json_string(result.base_root),
             json_string(result.result_root),
             result.definitions,
@@ -1683,6 +1736,11 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.peak_stack_depth,
         )
     } else {
+        let emitted_flbc = result
+            .emitted_flbc
+            .map_or_else(String::new, |(path, bytes)| {
+                format!("emitted FLBC: {bytes} bytes to {}\n", path.display())
+            });
         format!(
             concat!(
                 "native source batch: complete\n",
@@ -1690,6 +1748,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
                 "final value: {}\n",
                 "source bytes: {}\n",
                 "canonical FLBC bytes: {} total\n",
+                "{}",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
                 "independent checker: {} definitions agreed; final {} ({})\n",
@@ -1699,6 +1758,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.final_value,
             result.source_bytes,
             result.flbc_bytes,
+            emitted_flbc,
             result.base_root,
             result.result_root,
             result.definitions,
@@ -1769,7 +1829,15 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
     }
 }
 
-fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput {
+fn execute_source_bytes_with_publisher<P>(
+    sources: Vec<Vec<u8>>,
+    emit_flbc: Option<PathBuf>,
+    json: bool,
+    mut publish: P,
+) -> MultiplexerOutput
+where
+    P: FnMut(&[u8], &Path) -> std::io::Result<()>,
+{
     let Some(source_bytes) = sources
         .iter()
         .try_fold(0_usize, |total, source| total.checked_add(source.len()))
@@ -1906,6 +1974,23 @@ fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput 
             1,
         );
     }
+    let emitted_flbc = if let Some(path) = emit_flbc.as_deref() {
+        if let Err(error) = publish(&final_execution.flbc_artifact, path) {
+            return source_failure(
+                "output",
+                &format!(
+                    "could not durably publish final FLBC artifact to {}: {error}; target is either the previous complete file or the complete new artifact",
+                    path.display()
+                ),
+                true,
+                json,
+                1,
+            );
+        }
+        Some((path, final_execution.flbc_artifact.len()))
+    } else {
+        None
+    };
     render_source_success(
         SourceSuccess {
             definitions,
@@ -1916,12 +2001,26 @@ fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput 
             result_root: &result_root,
             checker_schema: final_execution.checker.schema,
             checker_ground,
+            emitted_flbc,
             steps: returned.usage.steps,
             system_polls: returned.usage.system_polls,
             peak_stack_depth: returned.usage.peak_stack_depth,
         },
         json,
     )
+}
+
+#[cfg(test)]
+fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput {
+    execute_source_bytes_with_publisher(sources, None, json, fln::publish_file_atomic)
+}
+
+fn execute_source_bytes_with_output(
+    sources: Vec<Vec<u8>>,
+    emit_flbc: Option<PathBuf>,
+    json: bool,
+) -> MultiplexerOutput {
+    execute_source_bytes_with_publisher(sources, emit_flbc, json, fln::publish_file_atomic)
 }
 
 fn read_source_batch(
@@ -1955,7 +2054,12 @@ fn read_source_batch(
     Ok(sources)
 }
 
-fn run_sources(paths: &[PathBuf], max_bytes: usize, json: bool) -> MultiplexerOutput {
+fn run_sources(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    json: bool,
+    emit_flbc: Option<PathBuf>,
+) -> MultiplexerOutput {
     let sources = match read_source_batch(paths, max_bytes) {
         Ok(sources) => sources,
         Err(error) => {
@@ -1966,7 +2070,7 @@ fn run_sources(paths: &[PathBuf], max_bytes: usize, json: bool) -> MultiplexerOu
     let worker = match std::thread::Builder::new()
         .name("fln-source-run".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
-        .spawn(move || execute_source_bytes(sources, json))
+        .spawn(move || execute_source_bytes_with_output(sources, emit_flbc, json))
     {
         Ok(worker) => worker,
         Err(error) => {
@@ -2008,7 +2112,8 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             paths,
             max_bytes,
             json,
-        }) => run_sources(&paths, max_bytes, json),
+            emit_flbc,
+        }) => run_sources(&paths, max_bytes, json, emit_flbc),
         Ok(MultiplexerCommand::FlbcRun {
             path,
             max_bytes,
@@ -2463,8 +2568,9 @@ mod tests {
         CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_INSPECT_SCHEMA,
         OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, check_olean_bytes,
         check_olean_module_bytes, execute_flbc_bytes, execute_source_bytes,
-        execution_error_disposition, inspect_olean_bytes, module_name_from_relative,
-        read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
+        execute_source_bytes_with_publisher, execution_error_disposition, inspect_olean_bytes,
+        module_name_from_relative, parse_source_run, read_bounded_from, run, source_failure,
+        verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -2972,6 +3078,112 @@ mod tests {
         assert!(output.stdout.contains("\"definitions\":2"));
         assert!(output.stdout.contains("\"finalValue\":17"));
         assert!(output.stdout.contains("\"authority\":true"));
+    }
+
+    #[test]
+    fn source_run_emits_only_the_final_executed_artifact_after_success() {
+        let target = PathBuf::from("retained-final.flbc");
+        let expected = scalar_flbc_fixture(17);
+        let mut publications = Vec::new();
+        let output = execute_source_bytes_with_publisher(
+            vec![
+                b"def earlier : Nat := 11".to_vec(),
+                b"def emitted : Nat := 17".to_vec(),
+            ],
+            Some(target.clone()),
+            true,
+            |bytes, path| {
+                publications.push((path.to_path_buf(), bytes.to_vec()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert_eq!(publications, vec![(target, expected.clone())]);
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/3\""));
+        assert!(
+            output
+                .stdout
+                .contains(&format!("\"bytes\":{}", expected.len()))
+        );
+        assert!(output.stdout.contains("\"path\":\"retained-final.flbc\""));
+
+        let mut failed_batch_publications = 0;
+        let failed_batch = execute_source_bytes_with_publisher(
+            vec![
+                b"def earlier : Nat := 11".to_vec(),
+                b"def open (x : Nat) : Nat := x".to_vec(),
+            ],
+            Some(PathBuf::from("must-not-publish.flbc")),
+            true,
+            |_bytes, _path| {
+                failed_batch_publications += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(failed_batch.exit_code, 1);
+        assert_eq!(failed_batch_publications, 0);
+
+        let publication_failure = execute_source_bytes_with_publisher(
+            vec![b"def emitted : Nat := 17".to_vec()],
+            Some(PathBuf::from("refused.flbc")),
+            true,
+            |_bytes, _path| Err(std::io::Error::other("injected output refusal")),
+        );
+        assert_eq!(publication_failure.exit_code, 1);
+        assert!(publication_failure.stdout.is_empty());
+        assert!(publication_failure.stderr.contains("\"authority\":true"));
+        assert!(publication_failure.stderr.contains("\"class\":\"output\""));
+        assert!(
+            publication_failure
+                .stderr
+                .contains("injected output refusal")
+        );
+    }
+
+    #[test]
+    fn source_run_emit_option_is_single_and_respects_the_option_terminator() {
+        let parsed = parse_source_run(vec![
+            OsString::from("--emit-flbc=product.flbc"),
+            OsString::from("input.lean"),
+        ])
+        .expect("one emission path is valid");
+        assert!(matches!(
+            parsed,
+            super::MultiplexerCommand::SourceRun {
+                emit_flbc: Some(path),
+                paths,
+                ..
+            } if path.as_path() == std::path::Path::new("product.flbc")
+                && paths.len() == 1
+                && paths[0].as_path() == std::path::Path::new("input.lean")
+        ));
+
+        let duplicate = parse_source_run(vec![
+            OsString::from("--emit-flbc"),
+            OsString::from("one.flbc"),
+            OsString::from("--emit-flbc=two.flbc"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("duplicate emission paths are ambiguous");
+        assert!(duplicate.to_string().contains("at most once"));
+
+        let terminated = parse_source_run(vec![
+            OsString::from("--"),
+            OsString::from("--emit-flbc=ordinary-source-name"),
+        ])
+        .expect("the option terminator makes the spelling an input path");
+        assert!(matches!(
+            terminated,
+            super::MultiplexerCommand::SourceRun {
+                emit_flbc: None,
+                paths,
+                ..
+            } if paths.len() == 1
+                && paths[0].as_path()
+                    == std::path::Path::new("--emit-flbc=ordinary-source-name")
+        ));
     }
 
     #[test]

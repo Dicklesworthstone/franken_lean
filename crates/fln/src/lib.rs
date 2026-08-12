@@ -78,7 +78,7 @@ pub use fln_olean::artifact::{
     ArtifactSemanticHash, ArtifactSetManifest, ArtifactSetRoot, ArtifactStore,
     ArtifactStoreDirectory, BoundArtifactSet, InjectedIoError, PublicationControl,
     PublicationIoPoint, PublicationPoint, ResolvedArtifactSet, SCHEMA_ARTIFACT_SET_MANIFEST,
-    StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash,
+    StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash, publish_file_atomic,
 };
 use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;

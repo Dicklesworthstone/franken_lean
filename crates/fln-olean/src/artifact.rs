@@ -32,6 +32,15 @@ use fln_hash::canon::{CanonReader, CanonWriter, SchemaId, registered};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
 use fln_rt::region::{AtomicWriteError, AtomicWriteStep, write_file_atomic_controlled};
 
+/// Atomically replace one conventional artifact path with complete bytes.
+///
+/// This is the single-file publication primitive for products such as FLBC.
+/// Multi-file `.olean`/`.ilean` sets must use [`ArtifactStore`] instead so one
+/// manifest and active pointer bind the complete generation.
+pub fn publish_file_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
+    fln_rt::region::write_file_atomic(bytes, path)
+}
+
 /// The one durable manifest encoding used by artifact generations.
 ///
 /// This identity is joined in both directions against
