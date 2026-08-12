@@ -1544,11 +1544,7 @@ impl<'a> Engine<'a> {
             );
         }
         let generated = self.generate_recursors()?;
-        for (d_idx, generated) in generated.iter().enumerate() {
-            let decoded = &self.block.recursors[d_idx];
-            compare_recursors(generated, decoded)?;
-        }
-        Ok(())
+        compare_recursor_sets(&generated, &self.block.recursors)
     }
 
     // ---- driver ------------------------------------------------------------------------
@@ -2037,81 +2033,7 @@ impl<'a> Engine<'a> {
     /// telescope — the pin rejects nested parameters that capture local
     /// variables (inductive.cpp:949).
     fn lower_to_param_canonical(&self, e: &Expr, inner: u32, depth: u32) -> KResult<Expr> {
-        depth_guard(depth)?;
-        if e.loose_bvar_range() == 0 {
-            return Ok(e.clone());
-        }
-        Ok(match e.node() {
-            ExprNode::BVar { idx } => {
-                if *idx < inner {
-                    return reject(
-                        RejectClass::BlockMismatch,
-                        "nested inductive datatype parameters cannot contain local variables",
-                    );
-                }
-                let lowered = idx - inner;
-                if lowered as usize >= self.nparams {
-                    return reject(
-                        RejectClass::BlockMismatch,
-                        "nested occurrence parameter reference escapes the telescope",
-                    );
-                }
-                Expr::bvar(lowered).unwrap_or_else(|_| e.clone())
-            }
-            ExprNode::App { f, a } => Expr::app(
-                self.lower_to_param_canonical(f, inner, depth + 1)?,
-                self.lower_to_param_canonical(a, inner, depth + 1)?,
-            ),
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                self.lower_to_param_canonical(binder_type, inner, depth + 1)?,
-                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                self.lower_to_param_canonical(binder_type, inner, depth + 1)?,
-                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                self.lower_to_param_canonical(type_, inner, depth + 1)?,
-                self.lower_to_param_canonical(value, inner, depth + 1)?,
-                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => Expr::mdata(
-                data.clone(),
-                self.lower_to_param_canonical(expr, inner, depth + 1)?,
-            ),
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.lower_to_param_canonical(expr, inner, depth + 1)?,
-            ),
-            _ => e.clone(),
-        })
+        lower_param_expr(e, self.nparams, inner, 0, depth)
     }
 
     /// Mint auxiliaries for the WHOLE mutual block of a nested head (pin
@@ -2427,6 +2349,106 @@ struct NestedAux {
     ctor_names: Vec<(Name, Name)>,
 }
 
+/// Lower one nested-head parameter while keeping binders introduced inside the
+/// parameter distinct from loose locals surrounding the occurrence.
+fn lower_param_expr(
+    e: &Expr,
+    nparams: usize,
+    site_inner: u32,
+    bound_inside_arg: u32,
+    depth: u32,
+) -> KResult<Expr> {
+    depth_guard(depth)?;
+    if e.loose_bvar_range() == 0 {
+        return Ok(e.clone());
+    }
+    Ok(match e.node() {
+        ExprNode::BVar { idx } if *idx < bound_inside_arg => e.clone(),
+        ExprNode::BVar { idx } => {
+            let loose = idx - bound_inside_arg;
+            if loose < site_inner {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    "nested inductive datatype parameters cannot contain local variables",
+                );
+            }
+            let lowered = loose - site_inner;
+            if lowered as usize >= nparams {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    "nested occurrence parameter reference escapes the telescope",
+                );
+            }
+            Expr::bvar(bound_inside_arg + lowered).unwrap_or_else(|_| e.clone())
+        }
+        ExprNode::App { f, a } => Expr::app(
+            lower_param_expr(f, nparams, site_inner, bound_inside_arg, depth + 1)?,
+            lower_param_expr(a, nparams, site_inner, bound_inside_arg, depth + 1)?,
+        ),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            lower_param_expr(
+                binder_type,
+                nparams,
+                site_inner,
+                bound_inside_arg,
+                depth + 1,
+            )?,
+            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            lower_param_expr(
+                binder_type,
+                nparams,
+                site_inner,
+                bound_inside_arg,
+                depth + 1,
+            )?,
+            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            lower_param_expr(type_, nparams, site_inner, bound_inside_arg, depth + 1)?,
+            lower_param_expr(value, nparams, site_inner, bound_inside_arg, depth + 1)?,
+            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr } => Expr::mdata(
+            data.clone(),
+            lower_param_expr(expr, nparams, site_inner, bound_inside_arg, depth + 1)?,
+        ),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => Expr::proj(
+            struct_name.clone(),
+            *idx,
+            lower_param_expr(expr, nparams, site_inner, bound_inside_arg, depth + 1)?,
+        ),
+        _ => e.clone(),
+    })
+}
+
 /// The forward translation's accumulating state.
 #[derive(Default)]
 struct NestedState {
@@ -2568,6 +2590,28 @@ fn compare_recursors(generated: &RecursorVal, decoded: &RecursorVal) -> KResult<
                 ),
             );
         }
+    }
+    Ok(())
+}
+
+/// Match regenerated recursors by their semantic identity, not by artifact row
+/// position. A block's decoded rows retain module order, which need not equal
+/// the inductive types' block order.
+fn compare_recursor_sets(generated: &[RecursorVal], decoded: &[RecursorVal]) -> KResult<()> {
+    for generated in generated {
+        let Some(decoded) = decoded
+            .iter()
+            .find(|decoded| decoded.base.name == generated.base.name)
+        else {
+            return reject(
+                RejectClass::BlockMismatch,
+                format!(
+                    "decoded block lacks recursor `{}`",
+                    generated.base.name.to_display_string()
+                ),
+            );
+        };
+        compare_recursors(generated, decoded)?;
     }
     Ok(())
 }
@@ -3072,5 +3116,86 @@ pub(crate) fn scratch_admit(
             "scratch publication of `{}` faulted: {fault:?}",
             name.to_display_string()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_recursor(name: &str) -> RecursorVal {
+        RecursorVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::str(Name::anonymous(), name),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            all: Vec::new(),
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 0,
+            num_minors: 0,
+            rules: Vec::new(),
+            k: false,
+            is_unsafe: false,
+        }
+    }
+
+    #[test]
+    fn decoded_recursor_rows_are_matched_by_name_not_artifact_position() {
+        let left = empty_recursor("Left.rec");
+        let right = empty_recursor("Right.rec");
+        let generated = [left.clone(), right.clone()];
+
+        assert!(
+            compare_recursor_sets(&generated, &[right.clone(), left]).is_ok(),
+            "module row order is not block order"
+        );
+        assert!(matches!(
+            compare_recursor_sets(&generated, &[right.clone(), right]),
+            Err(Stop::Reject(RejectClass::BlockMismatch, message))
+                if message.contains("Left.rec")
+        ));
+    }
+
+    #[test]
+    fn nested_parameter_canonicalization_distinguishes_internal_binders_from_field_locals() {
+        let sort = Expr::sort(Level::zero());
+        let eta_expanded_block_param = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort.clone(),
+            Expr::app(
+                Expr::bvar(2).expect("block parameter under a field local and lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        let canonical = lower_param_expr(&eta_expanded_block_param, 1, 1, 0, 0)
+            .expect("an internal binder is not a loose field-local capture");
+        let expected = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort.clone(),
+            Expr::app(
+                Expr::bvar(1).expect("canonical block parameter under the lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        assert_eq!(canonical, expected);
+
+        let captures_field_local = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            sort,
+            Expr::app(
+                Expr::bvar(1).expect("field local under the lambda"),
+                Expr::bvar(0).expect("lambda-bound argument"),
+            ),
+            BinderInfo::Default,
+        );
+        assert!(matches!(
+            lower_param_expr(&captures_field_local, 1, 1, 0, 0),
+            Err(Stop::Reject(RejectClass::BlockMismatch, message))
+                if message.contains("cannot contain local variables")
+        ));
     }
 }
