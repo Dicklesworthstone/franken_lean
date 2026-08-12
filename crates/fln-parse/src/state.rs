@@ -493,6 +493,9 @@ pub fn null_kind() -> Name {
 ///
 /// `left` is the already-parsed left operand for a trailing production, pushed before each
 /// candidate runs so every candidate sees the same input. Leading productions pass `None`.
+///
+/// Each candidate is then forced through the pin's one-node law
+/// (`runLongestMatchParser`, `Basic.lean:1409-1416`) before it is scored.
 pub fn longest_match(
     state: &mut ParserState,
     left: Option<Syntax>,
@@ -527,6 +530,22 @@ pub fn longest_match(
             state.push(left.clone());
         }
         (production.run)(state);
+
+        // `runLongestMatchParser` (`Basic.lean:1409-1416`): each candidate must
+        // leave exactly one node above the pre-left mark. An error with the
+        // wrong count is replaced by `Syntax.missing`. A success with the wrong
+        // count is not a success — it is `invalidLongestMatchParser`.
+        if state.stack_size() != start_size + 1 {
+            if state.has_error() {
+                state.shrink(start_size);
+                state.push(Syntax::Missing);
+            } else {
+                state.set_error(ParseError::new(
+                    "longestMatch parsers must generate exactly one Syntax node",
+                    state.pos(),
+                ));
+            }
+        }
 
         let score = Score::of(state, production.priority);
         let produced: Vec<Syntax> = state.stack()[start_size.min(state.stack_size())..].to_vec();
@@ -1065,6 +1084,63 @@ mod tests {
             "node choice[2]",
             "no choice node may be built from failures"
         );
+    }
+
+    /// `runLongestMatchParser`: a success that left 0 or ≥2 nodes is not a parse.
+    /// `make_result`'s null wrap is a later, leading-only belt; this law fires first
+    /// and turns the candidate into a failure with the pin's message.
+    #[test]
+    fn a_successful_candidate_must_leave_exactly_one_node() {
+        let none = Production::new(name("none"), 0, |state| {
+            state.set_pos(BytePos(4));
+        });
+        let (resolution, state) = run(&[none]);
+        assert_eq!(resolution, Resolution::Failed);
+        assert_eq!(
+            state.error().expect("arity error").message(),
+            "longestMatch parsers must generate exactly one Syntax node"
+        );
+
+        let two = Production::new(name("two"), 0, |state| {
+            state.set_pos(BytePos(4));
+            state.push(atom("a", 0, 2));
+            state.push(atom("b", 2, 4));
+        });
+        let (resolution, state) = run(&[two]);
+        assert_eq!(resolution, Resolution::Failed);
+        assert_eq!(
+            state.error().expect("arity error").message(),
+            "longestMatch parsers must generate exactly one Syntax node"
+        );
+        assert_eq!(
+            state.stack_size(),
+            2,
+            "a successful wrong-count candidate keeps its nodes, as the pin does"
+        );
+    }
+
+    /// A failing candidate that popped its left operand and pushed nothing must
+    /// still leave `Syntax.missing`, not an empty stack. Without this the next
+    /// combinator sees a short stack and the already-parsed term vanishes.
+    #[test]
+    fn a_failing_trailing_candidate_that_drops_left_is_replaced_by_missing() {
+        let left = atom("left", 0, 3);
+        let drop_left = Production::new(name("drop"), 0, |state| {
+            let _ = state.pop();
+            state.set_pos(BytePos(7));
+            state.set_error(ParseError::consuming("malformed", BytePos(7)));
+        });
+
+        let mut state = ParserState::new(0);
+        let resolution = longest_match(&mut state, Some(left), &[&drop_left]);
+        assert_eq!(resolution, Resolution::Failed);
+        assert_eq!(state.stack_size(), 1);
+        assert_eq!(
+            describe(state.back()),
+            "missing",
+            "the pin shrinks to the mark and pushes Syntax.missing"
+        );
+        assert_eq!(state.error().expect("kept").message(), "malformed");
     }
 
     /// An empty production list is a typed refusal, not a panic and not a silent success.
