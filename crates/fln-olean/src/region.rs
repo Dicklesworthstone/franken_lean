@@ -438,6 +438,20 @@ impl<'a> OleanView<'a> {
                 Self::address_range(region.base_addr, region.payload_offset, region.payload_len)
             })
             .collect::<RResult<Vec<_>>>()?;
+        // `deref` keeps the current file on file offsets and earlier parts on
+        // absolute compacted addresses, then `read_u64`/`read_bytes` have to
+        // tell those two number spaces apart. File offsets live in
+        // `[0, bytes.len())`. If a dependency's compacted range intersects
+        // that interval, the same integer is both a local offset and a
+        // foreign address, and any length-or-range heuristic silently reads
+        // the wrong region. Refuse that configuration instead of guessing.
+        let local_end = view.bytes.len() as u64;
+        if ranges.iter().any(|(start, _end)| *start < local_end) {
+            return Err(RegionError::DecodeShape {
+                offset: 0,
+                reason: "dependency compacted addresses collide with local file offsets",
+            });
+        }
         ranges.push(Self::address_range(
             view.header.base_addr,
             view.payload_offset,
@@ -499,8 +513,25 @@ impl<'a> OleanView<'a> {
         })
     }
 
+    fn dependency_region_containing(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<&DependencyRegion<'a>> {
+        let end = address.checked_add(len)?;
+        self.dependencies.iter().find(|region| {
+            let Some(start) = region.base_addr.checked_add(region.payload_offset as u64) else {
+                return false;
+            };
+            let Some(region_end) = start.checked_add(region.payload_len as u64) else {
+                return false;
+            };
+            address >= start && end <= region_end
+        })
+    }
+
     pub(crate) fn read_u64(&self, off: u64) -> RResult<u64> {
-        if !self.dependencies.is_empty() && off >= self.bytes.len() as u64 {
+        if self.dependency_region_containing(off, 8).is_some() {
             let bytes = self.read_dependency_bytes(off, 8)?;
             let mut word = [0_u8; 8];
             word.copy_from_slice(bytes);
@@ -524,7 +555,7 @@ impl<'a> OleanView<'a> {
     }
 
     pub(crate) fn read_bytes(&self, off: u64, len: u64) -> RResult<&'a [u8]> {
-        if !self.dependencies.is_empty() && off >= self.bytes.len() as u64 {
+        if self.dependency_region_containing(off, len).is_some() {
             return self.read_dependency_bytes(off, len);
         }
         let end = off.checked_add(len).ok_or(RegionError::Truncated {
@@ -570,9 +601,6 @@ impl<'a> OleanView<'a> {
     /// loaded after it.
     pub(crate) fn object_precedes(&self, child: u64, parent: u64) -> bool {
         let position = |address: u64| {
-            if address < self.bytes.len() as u64 {
-                return Some((self.dependencies.len(), address));
-            }
             self.dependencies
                 .iter()
                 .enumerate()
@@ -583,6 +611,10 @@ impl<'a> OleanView<'a> {
                     let end = start.saturating_add(region.payload_len as u64);
                     (address >= start && address < end)
                         .then_some((index, address - region.base_addr))
+                })
+                .or_else(|| {
+                    (address < self.bytes.len() as u64)
+                        .then_some((self.dependencies.len(), address))
                 })
         };
         matches!(
@@ -1269,5 +1301,93 @@ impl MappedOlean {
             payload_len: self.payload_len,
             header: self.header.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod dependency_address_dispatch_tests {
+    use super::*;
+    use crate::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn header(base_addr: u64) -> OleanWriteHeader<'static> {
+        OleanWriteHeader {
+            version: 2,
+            flags: 1,
+            lean_version: "4.32.0",
+            githash: HASH,
+            base_addr,
+        }
+    }
+
+    fn empty_module(base_addr: u64) -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: true,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            header(base_addr),
+            WriteBudget::default(),
+        )
+        .expect("empty module encodes")
+        .bytes
+    }
+
+    #[test]
+    fn sidecar_reads_public_objects_through_dependency_address_space() {
+        let public_base = format::REGION_ALIGN as u64;
+        let sidecar_base = public_base * 2;
+        let public = empty_module(public_base);
+        let sidecar = empty_module(sidecar_base);
+        let public_view = OleanView::parse(&public).expect("public");
+        let stored_root = public_view.root_ptr().expect("public root word");
+        assert!(
+            stored_root >= sidecar.len() as u64,
+            "non-colliding fixture requires the public address to sit above the sidecar file"
+        );
+
+        let sidecar_view =
+            OleanView::parse_with_dependencies(&sidecar, &[&public]).expect("sidecar");
+        let public_off = public_view.deref(stored_root).expect("public deref");
+        let sidecar_off = sidecar_view.deref(stored_root).expect("sidecar deref");
+        assert_eq!(
+            public_view.obj_header(public_off).expect("public header"),
+            sidecar_view
+                .obj_header(sidecar_off)
+                .expect("sidecar header")
+        );
+        sidecar_view
+            .walk(WalkBudget::default())
+            .expect("reachable walk");
+    }
+
+    #[test]
+    fn sidecar_refuses_when_dependency_addresses_collide_with_file_offsets() {
+        let public_base = format::REGION_ALIGN as u64;
+        let sidecar_base = public_base * 2;
+        let public = empty_module(public_base);
+        let mut sidecar = empty_module(sidecar_base);
+        let public_view = OleanView::parse(&public).expect("public");
+        let stored_root = public_view.root_ptr().expect("public root word");
+        // Grow the sidecar so its file-offset space swallows the public
+        // object's compacted address. The previous dispatch
+        // (`off >= sidecar.len()`) then treated that address as local and
+        // read the padded bytes.
+        sidecar.resize(stored_root as usize + 64, 0);
+        let error = OleanView::parse_with_dependencies(&sidecar, &[&public])
+            .expect_err("colliding address spaces must be refused");
+        assert!(
+            matches!(
+                error,
+                RegionError::DecodeShape {
+                    reason: "dependency compacted addresses collide with local file offsets",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }
