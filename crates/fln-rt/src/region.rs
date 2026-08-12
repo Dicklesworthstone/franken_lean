@@ -37,6 +37,11 @@ use crate::obj::Obj;
 use crate::region_contract as rc;
 use std::collections::HashMap;
 
+/// Envelope framings this shared reader actually implements. The generated
+/// Reference contract also accepts v3, but v3's size prefix, closure offsets,
+/// and library relocation trailer require a different payload boundary.
+const OLEAN_READER_VERSIONS: &[u8] = &[2];
+
 /// Typed region failure. Every variant carries the region offset (bytes from
 /// the start of the payload) where the law broke.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +50,7 @@ pub enum RegionFault {
     Truncated { offset: usize, wanted: usize },
     /// Envelope magic differs from the generated contract's.
     BadMagic,
-    /// Envelope version outside the contract's accepted set.
+    /// Envelope version outside this reader's implemented framing set.
     UnsupportedVersion(u8),
     /// `base_addr` violates the contract's alignment law.
     MisalignedBase { base: u64 },
@@ -162,6 +167,9 @@ pub fn parse_olean_envelope(file: &[u8]) -> RResult<OleanEnvelope> {
     let (ver_off, _) = header_field("version");
     let version = file[ver_off];
     if !rc::OLEAN_ACCEPTED_VERSIONS.contains(&version) {
+        return Err(RegionFault::UnsupportedVersion(version));
+    }
+    if !OLEAN_READER_VERSIONS.contains(&version) {
         return Err(RegionFault::UnsupportedVersion(version));
     }
     let (base_off, base_sz) = header_field("base_addr");

@@ -37,7 +37,7 @@ pub enum RegionError {
     Truncated { wanted_end: u64, len: u64 },
     /// Magic bytes differ from the contract's `OLEAN_MAGIC`.
     BadMagic,
-    /// Header version not in the contract's `OLEAN_ACCEPTED_VERSIONS`.
+    /// Header version whose envelope framing this reader does not implement.
     UnsupportedVersion(u8),
     /// `base_addr` violates the contract's `REGION_ALIGN` law.
     MisalignedBase { base_addr: u64 },
@@ -368,12 +368,12 @@ impl DecodeBudget {
 
 impl<'a> OleanView<'a> {
     /// Parse and validate the fixed header. The envelope laws (length gate,
-    /// magic, accepted-version set, base alignment) are judged by the SHARED
-    /// region engine — `fln_rt::region::parse_olean_envelope`, the same code
-    /// path the runtime's mmap loader runs (§6.4 shared-code-path law); this
-    /// codec adds only the identity fields the runtime does not need
-    /// (`lean_version`, `githash`, `flags`), read at their generated-contract
-    /// offsets.
+    /// magic, implemented framing subset of the generated accepted-version
+    /// set, base alignment) are judged by the SHARED region engine —
+    /// `fln_rt::region::parse_olean_envelope`, the same code path the runtime's
+    /// mmap loader runs (§6.4 shared-code-path law); this codec adds only the
+    /// identity fields the runtime does not need (`lean_version`, `githash`,
+    /// `flags`), read at their generated-contract offsets.
     pub fn parse(bytes: &'a [u8]) -> RResult<Self> {
         let envelope = fln_rt::region::parse_olean_envelope(bytes)
             .map_err(|fault| shared_fault(fault, 0, 0, bytes.len() as u64))?;

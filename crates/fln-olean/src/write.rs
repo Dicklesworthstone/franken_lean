@@ -30,6 +30,14 @@ use crate::region::ModuleImport;
 
 type WResult<T> = Result<T, WriteError>;
 
+/// Fresh writer formats implemented by this module.
+///
+/// The generated loader contract also accepts v3, but v3 adds a data-size
+/// prefix, closure offsets, and a library-relocation trailer. Emitting the v2
+/// body under a v3 header would be a corrupt artifact, so loader acceptance is
+/// deliberately a wider set than writer support.
+const OLEAN_WRITER_VERSIONS: &[u8] = &[2];
+
 /// The resource whose writer limit was reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteResource {
@@ -198,6 +206,11 @@ fn build_header(spec: OleanWriteHeader<'_>) -> WResult<Vec<u8>> {
     if !format::OLEAN_ACCEPTED_VERSIONS.contains(&spec.version) {
         return Err(WriteError::Contract {
             what: "header version is outside the generated accepted set",
+        });
+    }
+    if !OLEAN_WRITER_VERSIONS.contains(&spec.version) {
+        return Err(WriteError::Unsupported {
+            what: "olean v3 framing is not implemented by the fresh writer",
         });
     }
     if !spec.base_addr.is_multiple_of(format::REGION_ALIGN as u64) {
@@ -993,11 +1006,11 @@ struct FinishedRegion {
 fn finish_region(
     encoder: Encoder,
     root_object: Obj,
-    header: OleanWriteHeader<'_>,
+    header: Vec<u8>,
+    base_addr: u64,
 ) -> WResult<FinishedRegion> {
-    let mut file = build_header(header)?;
-    let payload_base = header
-        .base_addr
+    let mut file = header;
+    let payload_base = base_addr
         .checked_add(format::OLEAN_HEADER_SIZE as u64)
         .ok_or(WriteError::Contract {
             what: "payload base overflows",
@@ -1023,8 +1036,7 @@ fn finish_region(
             what: "pre-construction byte charge differs from compacted bytes",
         });
     }
-    header
-        .base_addr
+    base_addr
         .checked_add(file_bytes)
         .ok_or(WriteError::Contract {
             what: "final mapped address range overflows",
@@ -1046,9 +1058,10 @@ pub fn encode_expr_region(
     header: OleanWriteHeader<'_>,
     budget: WriteBudget,
 ) -> WResult<EncodedExprRegion> {
+    let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget)?;
     let root_object = encoder.expression(expression)?;
-    let finished = finish_region(encoder, root_object, header)?;
+    let finished = finish_region(encoder, root_object, header_bytes, header.base_addr)?;
     let expr_nodes =
         u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
             what: "expression node count overflows",
@@ -1085,9 +1098,10 @@ pub fn encode_module(
     header: OleanWriteHeader<'_>,
     budget: WriteBudget,
 ) -> WResult<EncodedModule> {
+    let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget)?;
     let root_object = encoder.module_root(input)?;
-    let finished = finish_region(encoder, root_object, header)?;
+    let finished = finish_region(encoder, root_object, header_bytes, header.base_addr)?;
     let expr_nodes =
         u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
             what: "expression node count overflows",
@@ -1519,6 +1533,30 @@ mod tests {
             encode_expr_region(&expression, invalid, WriteBudget::default()),
             Err(WriteError::Contract {
                 what: "header version is outside the generated accepted set"
+            })
+        ));
+        invalid = header();
+        invalid.version = 3;
+        assert!(format::OLEAN_ACCEPTED_VERSIONS.contains(&invalid.version));
+        assert!(matches!(
+            encode_expr_region(&expression, invalid, WriteBudget::default()),
+            Err(WriteError::Unsupported {
+                what: "olean v3 framing is not implemented by the fresh writer"
+            })
+        ));
+        assert!(matches!(
+            encode_module(
+                ModuleWriteInput {
+                    is_module: false,
+                    imports: &[],
+                    constants: &[],
+                    extra_const_names: &[],
+                },
+                invalid,
+                WriteBudget::default(),
+            ),
+            Err(WriteError::Unsupported {
+                what: "olean v3 framing is not implemented by the fresh writer"
             })
         ));
         invalid = header();

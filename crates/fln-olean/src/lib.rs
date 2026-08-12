@@ -14,9 +14,10 @@
 //! fln-8mj).
 //!
 //! **Not implemented, and therefore not claimed above:** fresh serialization of
-//! environment-extension payloads, byte-identical emission against Reference-built fresh
-//! modules, collection of fresh `.ilean` data from elaboration, and olean-next. Publication
-//! is atomic only for consumers resolving the generation through [`artifact::ArtifactStore`];
+//! v3 envelope framing, environment-extension payloads, byte-identical emission against
+//! Reference-built fresh modules, collection of fresh `.ilean` data from elaboration, and
+//! olean-next. Publication is atomic only for consumers resolving the generation through
+//! [`artifact::ArtifactStore`];
 //! independently opening conventional flat sibling paths is not a multi-file transaction.
 //! The remaining gaps stay owned by bead `franken_lean-0nz` and still block full FL-INV-04
 //! write fidelity.

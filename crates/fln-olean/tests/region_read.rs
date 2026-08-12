@@ -483,6 +483,18 @@ fn header_rejections_are_typed() {
         "{r:?}"
     );
 
+    // The pinned loader accepts v3, but this reader does not yet implement
+    // its different framing. Relabeling a v2 body must fail closed instead of
+    // being interpreted at the legacy payload offset.
+    let mut bad = good.clone();
+    bad[5] = 3;
+    assert!(format::OLEAN_ACCEPTED_VERSIONS.contains(&3));
+    let r = OleanView::parse(&bad);
+    assert!(
+        matches!(r, Err(RegionError::UnsupportedVersion(3))),
+        "{r:?}"
+    );
+
     // Misaligned base address (violates REGION_ALIGN).
     let mut bad = good.clone();
     bad[80] = 8;

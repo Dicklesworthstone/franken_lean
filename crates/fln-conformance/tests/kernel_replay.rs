@@ -66,10 +66,13 @@ use std::time::{Duration, Instant};
 use fln_conformance::pin;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
+use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{InconclusiveCause, Outcome, ResourceUsage};
-use fln_env::constants::{ConstantInfo, ConstantVal, DefinitionSafety, OpaqueVal};
+use fln_env::constants::{
+    ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal, ReducibilityHints,
+};
 use fln_env::decl_closure::{
     self, DeclClosureBudget, DeclClosureInput, DeclClosureStatus, MissingConstantFinding,
 };
@@ -78,7 +81,9 @@ use fln_hash::domain::{Domain, hash};
 use fln_kernel::Declaration;
 use fln_kernel::verdict::{Budget, ExecConfig, StackMeasurement, Verdict};
 use fln_olean::decl::DeclDecoder;
+use fln_olean::format;
 use fln_olean::region::{OleanView, WalkBudget};
+use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
 /// Bounded term-shape rendering for the `FLN_REPLAY_PROBE` lane (bead
 /// fln-d4x): enough to see how a rejected declaration's value is compiled —
@@ -1691,17 +1696,27 @@ fn run_leanchecker(
     reference_lib: &Path,
     targets: &[String],
 ) -> Result<ReferenceCorpusVerdict, String> {
+    run_leanchecker_with_search_roots(reference_lib, &[reference_lib], targets)
+}
+
+fn run_leanchecker_with_search_roots(
+    reference_lib: &Path,
+    search_roots: &[&Path],
+    targets: &[String],
+) -> Result<ReferenceCorpusVerdict, String> {
     let binary = leanchecker_path(reference_lib)?;
     let pinned_bin = binary
         .parent()
         .ok_or_else(|| format!("leanchecker {} has no bin directory", binary.display()))?;
+    let lean_path = std::env::join_paths(search_roots)
+        .map_err(|error| format!("construct pinned leanchecker search path: {error}"))?;
     let mut command = Command::new(&binary);
     command
         .env_clear()
         // `Lean.findSysroot` invokes the sibling `lean --print-prefix` by
         // basename. Give it only the pinned bin directory, never ambient PATH.
         .env("PATH", pinned_bin)
-        .env("LEAN_PATH", reference_lib)
+        .env("LEAN_PATH", lean_path)
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("TZ", "UTC")
@@ -1804,6 +1819,153 @@ fn run_leanchecker(
             stdout,
             stderr,
         })
+    }
+}
+
+/// Outbound FL-INV-04 evidence for the exact fresh-writer subset that exists:
+/// one import-free v2 module with one ordinary polymorphic definition. The
+/// output directory is operator-supplied and retained so the oracle input can
+/// be inspected after the run; existing paths are refused rather than
+/// overwritten.
+#[ignore = "cost: invokes the pinned Reference kernel over freshly emitted olean modules"]
+#[test]
+fn fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected() {
+    fn identity_definition(module: &str, well_typed: bool) -> ConstantInfo {
+        let universe_name = Name::str(Name::anonymous(), "u");
+        let alpha_name = Name::str(Name::anonymous(), "alpha");
+        let value_name = Name::str(Name::anonymous(), "value");
+        let declaration_name =
+            Name::str(Name::str(Name::anonymous(), module), "polymorphicIdentity");
+        let alpha_sort = Expr::sort(Level::param(universe_name.clone()));
+        let identity_type = Expr::forall_e(
+            alpha_name.clone(),
+            alpha_sort.clone(),
+            Expr::forall_e(
+                value_name.clone(),
+                Expr::bvar(0).expect("alpha binder"),
+                Expr::bvar(1).expect("alpha result"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let body = if well_typed {
+            Expr::bvar(0).expect("identity value")
+        } else {
+            Expr::sort(Level::zero())
+        };
+        let identity_value = Expr::lam(
+            alpha_name,
+            alpha_sort,
+            Expr::lam(
+                value_name,
+                Expr::bvar(0).expect("value binder type"),
+                body,
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: declaration_name.clone(),
+                level_params: vec![universe_name],
+                type_: identity_type,
+            },
+            value: identity_value,
+            hints: ReducibilityHints::Regular(0),
+            safety: DefinitionSafety::Safe,
+            all: vec![declaration_name],
+        })
+    }
+
+    fn write_new(path: &Path, bytes: &[u8]) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap_or_else(|error| panic!("create retained probe {}: {error}", path.display()));
+        file.write_all(bytes)
+            .unwrap_or_else(|error| panic!("write retained probe {}: {error}", path.display()));
+        file.sync_all()
+            .unwrap_or_else(|error| panic!("sync retained probe {}: {error}", path.display()));
+    }
+
+    let reference_lib = reference_lib().expect("pinned Reference stdlib required");
+    let toolchain = reference_lib
+        .parent()
+        .and_then(Path::parent)
+        .expect("Reference library belongs to a toolchain");
+    let pinned_lean = toolchain.join("bin/lean");
+    let version = Command::new(&pinned_lean)
+        .env_clear()
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("run pinned lean {}: {error}", pinned_lean.display()));
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version.status.success() && version_text.contains(format::PIN_COMMIT),
+        "Reference executable must match generated olean pin {}: {version_text}",
+        format::PIN_COMMIT
+    );
+    let output_dir = PathBuf::from(
+        std::env::var_os("FLN_OLEAN_REFERENCE_PROBE_DIR")
+            .expect("FLN_OLEAN_REFERENCE_PROBE_DIR must name a new retained directory"),
+    );
+    fs::create_dir(&output_dir).unwrap_or_else(|error| {
+        panic!(
+            "create new retained probe directory {}: {error}",
+            output_dir.display()
+        )
+    });
+
+    let header = OleanWriteHeader {
+        version: 2,
+        flags: 1,
+        lean_version: format::PIN_TAG
+            .strip_prefix('v')
+            .expect("generated pin tag starts with v"),
+        githash: format::PIN_COMMIT,
+        base_addr: 0x2f00_0000_0000,
+    };
+    let good_module = "FlnWriterReferenceV2";
+    let bad_module = "FlnWriterReferenceV2Bad";
+    for (module, well_typed) in [(good_module, true), (bad_module, false)] {
+        let definition = identity_definition(module, well_typed);
+        let encoded = encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[definition],
+                extra_const_names: &[],
+            },
+            header,
+            WriteBudget::default(),
+        )
+        .expect("fresh v2 module encoding");
+        write_new(&output_dir.join(format!("{module}.olean")), &encoded.bytes);
+    }
+
+    let search_roots = [output_dir.as_path(), reference_lib.as_path()];
+    match run_leanchecker_with_search_roots(
+        &reference_lib,
+        &search_roots,
+        &[good_module.to_owned()],
+    )
+    .expect("run pinned Reference over fresh good module")
+    {
+        ReferenceCorpusVerdict::Accepted { stdout, stderr, .. } => {
+            assert!(stdout.contains("replaying FlnWriterReferenceV2"));
+            assert!(stderr.is_empty(), "accepted module wrote stderr: {stderr}");
+        }
+        verdict => panic!("pinned Reference did not accept fresh v2 module: {verdict:?}"),
+    }
+    match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[bad_module.to_owned()])
+        .expect("run pinned Reference over fresh ill-typed module")
+    {
+        ReferenceCorpusVerdict::Rejected { stderr, .. } => {
+            assert!(stderr.contains("(kernel) declaration type mismatch"));
+            assert!(stderr.contains("FlnWriterReferenceV2Bad.polymorphicIdentity"));
+        }
+        verdict => panic!("pinned Reference did not reject ill-typed sibling: {verdict:?}"),
     }
 }
 
