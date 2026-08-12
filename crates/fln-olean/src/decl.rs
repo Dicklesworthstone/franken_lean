@@ -178,8 +178,20 @@ impl<'a> DeclDecoder<'a> {
         }
     }
 
-    fn decode_bool(byte: u8) -> bool {
-        byte != 0
+    /// Lean stores `Bool` as a single byte that is only ever 0 or 1. The
+    /// region reader already refuses any other value on `ModuleData`/`Import`
+    /// (`read_canonical_bool`). Declaration flags (`isUnsafe`, `k`, `nonDep`,
+    /// `DataValue.ofBool`) are the same type on the same wire; treating `2` as
+    /// `true` would accept a malformed object the rest of this crate refuses.
+    fn decode_bool(byte: u8, offset: u64) -> DResult<bool> {
+        match byte {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DeclError::Shape {
+                offset,
+                what: "noncanonical Bool",
+            }),
+        }
     }
 
     fn decode_int(&mut self, ptr: u64) -> DResult<i64> {
@@ -510,7 +522,8 @@ impl<'a> DeclDecoder<'a> {
                 }
                 Ok(DataValue::OfBool(Self::decode_bool(
                     self.view.read_bytes_at(off + 8, 1)?[0],
-                )))
+                    off + 8,
+                )?))
             }
             2 => Ok(DataValue::OfName(
                 self.decode_name(self.view.read_u64(off + 8)?)?,
@@ -728,7 +741,9 @@ impl<'a> DeclDecoder<'a> {
                 let type_ = self.expr_at(off, 1)?;
                 let value = self.expr_at(off, 2)?;
                 let body = self.expr_at(off, 3)?;
-                let non_dep = Self::decode_bool(self.view.read_bytes_at(scalar_base + 8, 1)?[0]);
+                let non_dep_off = scalar_base + 8;
+                let non_dep =
+                    Self::decode_bool(self.view.read_bytes_at(non_dep_off, 1)?[0], non_dep_off)?;
                 Expr::let_e(decl_name, type_, value, body, non_dep)
             }
             9 => Expr::lit(self.decode_literal(slot(self, 0)?)?),
@@ -814,6 +829,9 @@ impl<'a> DeclDecoder<'a> {
         let scalar_base = voff + 8 + 8 * vother as u64;
         let scalar_u8 =
             |d: &Self, i: u64| -> DResult<u8> { Ok(d.view.read_bytes_at(scalar_base + i, 1)?[0]) };
+        let scalar_bool = |d: &Self, i: u64| -> DResult<bool> {
+            Self::decode_bool(scalar_u8(d, i)?, scalar_base + i)
+        };
         Ok(match tag {
             0 => {
                 // AxiomVal: base slot + isUnsafe u8
@@ -825,7 +843,7 @@ impl<'a> DeclDecoder<'a> {
                 }
                 ConstantInfo::Axiom(AxiomVal {
                     base: self.decode_constant_val(slot(self, 0)?)?,
-                    is_unsafe: Self::decode_bool(scalar_u8(self, 0)?),
+                    is_unsafe: scalar_bool(self, 0)?,
                 })
             }
             1 => {
@@ -880,7 +898,7 @@ impl<'a> DeclDecoder<'a> {
                 ConstantInfo::Opaque(OpaqueVal {
                     base: self.decode_constant_val(slot(self, 0)?)?,
                     value: self.decode_expr(slot(self, 1)?)?,
-                    is_unsafe: Self::decode_bool(scalar_u8(self, 0)?),
+                    is_unsafe: scalar_bool(self, 0)?,
                     all: self.decode_name_list(slot(self, 2)?)?,
                 })
             }
@@ -925,9 +943,9 @@ impl<'a> DeclDecoder<'a> {
                     all: self.decode_name_list(slot(self, 3)?)?,
                     ctors: self.decode_name_list(slot(self, 4)?)?,
                     num_nested: self.decode_nat_u32(slot(self, 5)?, "numNested")?,
-                    is_rec: Self::decode_bool(scalar_u8(self, 0)?),
-                    is_unsafe: Self::decode_bool(scalar_u8(self, 1)?),
-                    is_reflexive: Self::decode_bool(scalar_u8(self, 2)?),
+                    is_rec: scalar_bool(self, 0)?,
+                    is_unsafe: scalar_bool(self, 1)?,
+                    is_reflexive: scalar_bool(self, 2)?,
                 })
             }
             6 => {
@@ -945,7 +963,7 @@ impl<'a> DeclDecoder<'a> {
                     cidx: self.decode_nat_u32(slot(self, 2)?, "cidx")?,
                     num_params: self.decode_nat_u32(slot(self, 3)?, "numParams")?,
                     num_fields: self.decode_nat_u32(slot(self, 4)?, "numFields")?,
-                    is_unsafe: Self::decode_bool(scalar_u8(self, 0)?),
+                    is_unsafe: scalar_bool(self, 0)?,
                 })
             }
             7 => {
@@ -981,8 +999,8 @@ impl<'a> DeclDecoder<'a> {
                     num_motives: self.decode_nat_u32(slot(self, 4)?, "numMotives")?,
                     num_minors: self.decode_nat_u32(slot(self, 5)?, "numMinors")?,
                     rules,
-                    k: Self::decode_bool(scalar_u8(self, 0)?),
-                    is_unsafe: Self::decode_bool(scalar_u8(self, 1)?),
+                    k: scalar_bool(self, 0)?,
+                    is_unsafe: scalar_bool(self, 1)?,
                 })
             }
             _ => {
@@ -1019,5 +1037,87 @@ impl<'a> DeclDecoder<'a> {
             out.push(info);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::region::{OleanView, WalkBudget};
+    use crate::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+    use fln_core::level::Level;
+
+    fn axiom_module(is_unsafe: bool) -> Vec<u8> {
+        let type_ = Expr::sort(Level::zero());
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "ax"]),
+                        level_params: Vec::new(),
+                        type_,
+                    },
+                    is_unsafe,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("axiom module encodes")
+        .bytes
+    }
+
+    #[test]
+    fn noncanonical_bool_bytes_are_refused() {
+        assert!(!DeclDecoder::decode_bool(0, 0).unwrap());
+        assert!(DeclDecoder::decode_bool(1, 9).unwrap());
+        assert!(matches!(
+            DeclDecoder::decode_bool(2, 7),
+            Err(DeclError::Shape {
+                offset: 7,
+                what: "noncanonical Bool"
+            })
+        ));
+    }
+
+    #[test]
+    fn axiom_is_unsafe_byte_two_is_not_decoded_as_true() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_ptr = view
+            .read_u64(arrays.constants.0 + 24)
+            .expect("first ConstantInfo");
+        let info_off = view.deref(info_ptr).expect("ConstantInfo object");
+        let val_ptr = view.read_u64(info_off + 8).expect("AxiomVal pointer");
+        let val_off = view.deref(val_ptr).expect("AxiomVal object");
+        let (_, vother, _) = view.obj_header(val_off).expect("AxiomVal header");
+        let bool_off = val_off + 8 + 8 * u64::from(vother);
+        assert_eq!(bytes[bool_off as usize], 0, "fixture starts safe");
+        bytes[bool_off as usize] = 2;
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("byte 2 is not a Bool");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "noncanonical Bool",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }
