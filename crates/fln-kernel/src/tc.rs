@@ -75,8 +75,13 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 //
 // A hostile term controls the cached expressions and their 32-bit Reference
 // hashes, so the row, collision, dependency-cell, and dependency-scan counts
-// are bounded. Four structural candidates per packed-data bucket cap collision
-// work; 65,536 rows cap reuse. Fvar-bearing rows may retain at most 262,144
+// are bounded. Four structural candidates per packed-data-and-telescope-length
+// bucket plus four cross-scope candidates cap one lookup at twelve structural
+// comparisons; 65,536 rows and 65,536 cross-scope pointers cap reuse. The scope
+// partition prevents the Reference's common 32-bit hash
+// collisions from crowding out useful rows, while dependency validation on the
+// bounded cross-scope index retains reuse across unrelated binder churn.
+// Fvar-bearing rows may retain at most 262,144
 // local-generation snapshots per cache, with no one row retaining more than
 // 256 or scanning more than 65,536 distinct expression allocations to discover
 // them. Each cache may spend at most 33,554,432 node visits on dependency
@@ -275,9 +280,13 @@ struct ExprResultCacheEntry {
     dependencies: Vec<LocalDependency>,
 }
 
+type ExprResultCrossScopeEntry = (Expr, usize);
+
 struct ExprResultCache {
-    buckets: HashMap<u64, Vec<ExprResultCacheEntry>>,
-    dependency_scan_refusals: HashMap<u64, ()>,
+    buckets: HashMap<(u64, usize), Vec<ExprResultCacheEntry>>,
+    cross_scope: HashMap<u64, Vec<ExprResultCrossScopeEntry>>,
+    cross_scope_entries: usize,
+    dependency_scan_refusals: HashMap<(u64, usize), ()>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -303,6 +312,8 @@ impl ExprResultCache {
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
             buckets: HashMap::new(),
+            cross_scope: HashMap::new(),
+            cross_scope_entries: 0,
             dependency_scan_refusals: HashMap::new(),
             entries: 0,
             local_dependency_cells: 0,
@@ -319,11 +330,47 @@ impl ExprResultCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) -> Option<Expr> {
-        self.buckets.get(&key.data().0)?.iter().find_map(|entry| {
-            (entry.key == *key
-                && dependencies_are_live(&entry.dependencies, locals, local_positions))
-            .then(|| entry.value.clone())
-        })
+        let packed = (key.data().0, locals.len());
+        if let Some(value) = self.buckets.get(&packed).and_then(|bucket| {
+            bucket.iter().find_map(|entry| {
+                (entry.key == *key
+                    && dependencies_are_live(&entry.dependencies, locals, local_positions))
+                .then(|| entry.value.clone())
+            })
+        }) {
+            return Some(value);
+        }
+        let alternate_scope = self
+            .cross_scope
+            .get(&key.data().0)?
+            .iter()
+            .find_map(|(candidate, scope)| (candidate == key).then_some(*scope))?;
+        self.buckets
+            .get(&(key.data().0, alternate_scope))?
+            .iter()
+            .find_map(|entry| {
+                (entry.key == *key
+                    && dependencies_are_live(&entry.dependencies, locals, local_positions))
+                .then(|| entry.value.clone())
+            })
+    }
+
+    fn record_cross_scope(&mut self, key: &Expr, scope: usize) {
+        let has_capacity = self.cross_scope_entries < self.max_entries;
+        if let Some(bucket) = self.cross_scope.get_mut(&key.data().0) {
+            if let Some((_, existing_scope)) =
+                bucket.iter_mut().find(|(candidate, _)| candidate == key)
+            {
+                *existing_scope = scope;
+            } else if has_capacity && bucket.len() < self.max_bucket_entries {
+                bucket.push((key.clone(), scope));
+                self.cross_scope_entries += 1;
+            }
+        } else if has_capacity && self.max_bucket_entries > 0 {
+            self.cross_scope
+                .insert(key.data().0, vec![(key.clone(), scope)]);
+            self.cross_scope_entries += 1;
+        }
     }
 
     fn insert(
@@ -333,7 +380,33 @@ impl ExprResultCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) {
-        let packed = key.data().0;
+        let packed = (key.data().0, locals.len());
+        let prior_scope = self.cross_scope.get(&key.data().0).and_then(|bucket| {
+            bucket
+                .iter()
+                .find_map(|(candidate, scope)| (candidate == &key).then_some(*scope))
+        });
+        if let Some(prior_scope) = prior_scope
+            && prior_scope != locals.len()
+        {
+            let prior_packed = (key.data().0, prior_scope);
+            if let Some(bucket) = self.buckets.get_mut(&prior_packed) {
+                let before = bucket.len();
+                let mut removed_cells = 0_usize;
+                bucket.retain(|entry| {
+                    let live = dependencies_are_live(&entry.dependencies, locals, local_positions);
+                    if !live {
+                        removed_cells += entry.dependencies.len();
+                    }
+                    live
+                });
+                self.entries -= before - bucket.len();
+                self.local_dependency_cells -= removed_cells;
+            }
+            if self.buckets.get(&prior_packed).is_some_and(Vec::is_empty) {
+                self.buckets.remove(&prior_packed);
+            }
+        }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             let before = bucket.len();
             let mut removed_cells = 0_usize;
@@ -350,21 +423,31 @@ impl ExprResultCache {
         if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
             self.buckets.remove(&packed);
         }
-        if self.entries >= self.max_entries {
+        if self.max_bucket_entries == 0 {
+            return;
+        }
+        let replacement = self.buckets.get(&packed).and_then(|bucket| {
+            (bucket.len() >= self.max_bucket_entries)
+                .then(|| bucket.iter().position(|entry| entry.key == key))
+                .flatten()
+        });
+        if self
+            .buckets
+            .get(&packed)
+            .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+            && replacement.is_none()
+        {
+            return;
+        }
+        if self.entries >= self.max_entries && replacement.is_none() {
             if !self.rollover_on_saturation || self.max_entries == 0 {
                 return;
             }
             self.buckets.clear();
+            self.cross_scope.clear();
+            self.cross_scope_entries = 0;
             self.entries = 0;
             self.local_dependency_cells = 0;
-        }
-        if self.max_bucket_entries == 0
-            || self
-                .buckets
-                .get(&packed)
-                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
-        {
-            return;
         }
         if self.local_dependency_cells >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS
             && (key.has_fvar() || value.has_fvar())
@@ -390,8 +473,12 @@ impl ExprResultCache {
             return;
         };
         let dependency_count = dependencies.len();
+        let replaced_dependency_count = replacement
+            .and_then(|index| self.buckets.get(&packed)?.get(index))
+            .map_or(0, |entry| entry.dependencies.len());
         if self
             .local_dependency_cells
+            .saturating_sub(replaced_dependency_count)
             .checked_add(dependency_count)
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
@@ -400,12 +487,28 @@ impl ExprResultCache {
             }
             return;
         }
+        self.record_cross_scope(&key, locals.len());
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             if let Some(existing) = bucket
                 .iter_mut()
                 .find(|entry| entry.key == key && entry.dependencies == dependencies)
             {
                 existing.value = value;
+                return;
+            }
+            if let Some(index) = replacement {
+                let Some(replaced) = bucket.get_mut(index) else {
+                    return;
+                };
+                self.local_dependency_cells = self
+                    .local_dependency_cells
+                    .saturating_sub(replaced.dependencies.len())
+                    .saturating_add(dependency_count);
+                *replaced = ExprResultCacheEntry {
+                    key,
+                    value,
+                    dependencies,
+                };
                 return;
             }
             bucket.push(ExprResultCacheEntry {
@@ -431,8 +534,10 @@ impl ExprResultCache {
 }
 
 struct PositiveDefEqCache {
-    buckets: HashMap<(u64, u64), Vec<PositiveDefEqCacheEntry>>,
-    dependency_scan_refusals: HashMap<(u64, u64), ()>,
+    buckets: HashMap<(u64, u64, usize), Vec<PositiveDefEqCacheEntry>>,
+    cross_scope: HashMap<(u64, u64), Vec<PositiveDefEqCrossScopeEntry>>,
+    cross_scope_entries: usize,
+    dependency_scan_refusals: HashMap<(u64, u64, usize), ()>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
@@ -446,6 +551,8 @@ struct PositiveDefEqCacheEntry {
     dependencies: Vec<LocalDependency>,
 }
 
+type PositiveDefEqCrossScopeEntry = (Expr, Expr, usize);
+
 impl PositiveDefEqCache {
     fn new() -> Self {
         Self::bounded(
@@ -457,6 +564,8 @@ impl PositiveDefEqCache {
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
         Self {
             buckets: HashMap::new(),
+            cross_scope: HashMap::new(),
+            cross_scope_entries: 0,
             dependency_scan_refusals: HashMap::new(),
             entries: 0,
             local_dependency_cells: 0,
@@ -476,6 +585,11 @@ impl PositiveDefEqCache {
         }
     }
 
+    fn scoped_key(left: &Expr, right: &Expr, local_count: usize) -> (u64, u64, usize) {
+        let (left, right) = Self::packed_key(left, right);
+        (left, right, local_count)
+    }
+
     fn contains(
         &self,
         left: &Expr,
@@ -483,8 +597,34 @@ impl PositiveDefEqCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) -> bool {
+        let matches = |bucket: &Vec<PositiveDefEqCacheEntry>| {
+            bucket.iter().any(|entry| {
+                ((entry.left == *left && entry.right == *right)
+                    || (entry.left == *right && entry.right == *left))
+                    && dependencies_are_live(&entry.dependencies, locals, local_positions)
+            })
+        };
+        if self
+            .buckets
+            .get(&Self::scoped_key(left, right, locals.len()))
+            .is_some_and(matches)
+        {
+            return true;
+        }
+        let packed = Self::packed_key(left, right);
+        let Some(alternate_scope) = self.cross_scope.get(&packed).and_then(|bucket| {
+            bucket
+                .iter()
+                .find_map(|(cached_left, cached_right, scope)| {
+                    ((cached_left == left && cached_right == right)
+                        || (cached_left == right && cached_right == left))
+                        .then_some(*scope)
+                })
+        }) else {
+            return false;
+        };
         self.buckets
-            .get(&Self::packed_key(left, right))
+            .get(&(packed.0, packed.1, alternate_scope))
             .is_some_and(|bucket| {
                 bucket.iter().any(|entry| {
                     ((entry.left == *left && entry.right == *right)
@@ -494,6 +634,28 @@ impl PositiveDefEqCache {
             })
     }
 
+    fn record_cross_scope(&mut self, left: &Expr, right: &Expr, scope: usize) {
+        let packed = Self::packed_key(left, right);
+        let has_capacity = self.cross_scope_entries < self.max_entries;
+        if let Some(bucket) = self.cross_scope.get_mut(&packed) {
+            if let Some((_, _, existing_scope)) =
+                bucket.iter_mut().find(|(cached_left, cached_right, _)| {
+                    (cached_left == left && cached_right == right)
+                        || (cached_left == right && cached_right == left)
+                })
+            {
+                *existing_scope = scope;
+            } else if has_capacity && bucket.len() < self.max_bucket_entries {
+                bucket.push((left.clone(), right.clone(), scope));
+                self.cross_scope_entries += 1;
+            }
+        } else if has_capacity && self.max_bucket_entries > 0 {
+            self.cross_scope
+                .insert(packed, vec![(left.clone(), right.clone(), scope)]);
+            self.cross_scope_entries += 1;
+        }
+    }
+
     fn insert(
         &mut self,
         left: Expr,
@@ -501,7 +663,38 @@ impl PositiveDefEqCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) {
-        let packed = Self::packed_key(&left, &right);
+        let packed = Self::scoped_key(&left, &right, locals.len());
+        let identity = Self::packed_key(&left, &right);
+        let prior_scope = self.cross_scope.get(&identity).and_then(|bucket| {
+            bucket
+                .iter()
+                .find_map(|(cached_left, cached_right, scope)| {
+                    ((cached_left == &left && cached_right == &right)
+                        || (cached_left == &right && cached_right == &left))
+                        .then_some(*scope)
+                })
+        });
+        if let Some(prior_scope) = prior_scope
+            && prior_scope != locals.len()
+        {
+            let prior_packed = (identity.0, identity.1, prior_scope);
+            if let Some(bucket) = self.buckets.get_mut(&prior_packed) {
+                let before = bucket.len();
+                let mut removed_cells = 0_usize;
+                bucket.retain(|entry| {
+                    let live = dependencies_are_live(&entry.dependencies, locals, local_positions);
+                    if !live {
+                        removed_cells += entry.dependencies.len();
+                    }
+                    live
+                });
+                self.entries -= before - bucket.len();
+                self.local_dependency_cells -= removed_cells;
+            }
+            if self.buckets.get(&prior_packed).is_some_and(Vec::is_empty) {
+                self.buckets.remove(&prior_packed);
+            }
+        }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             let before = bucket.len();
             let mut removed_cells = 0_usize;
@@ -518,12 +711,23 @@ impl PositiveDefEqCache {
         if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
             self.buckets.remove(&packed);
         }
-        if self.entries >= self.max_entries
+        let replacement = self.buckets.get(&packed).and_then(|bucket| {
+            (bucket.len() >= self.max_bucket_entries)
+                .then(|| {
+                    bucket.iter().position(|entry| {
+                        (entry.left == left && entry.right == right)
+                            || (entry.left == right && entry.right == left)
+                    })
+                })
+                .flatten()
+        });
+        if (self.entries >= self.max_entries && replacement.is_none())
             || self.max_bucket_entries == 0
-            || self
+            || (self
                 .buckets
                 .get(&packed)
                 .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+                && replacement.is_none())
         {
             return;
         }
@@ -551,8 +755,12 @@ impl PositiveDefEqCache {
             return;
         };
         let dependency_count = dependencies.len();
+        let replaced_dependency_count = replacement
+            .and_then(|index| self.buckets.get(&packed)?.get(index))
+            .map_or(0, |entry| entry.dependencies.len());
         if self
             .local_dependency_cells
+            .saturating_sub(replaced_dependency_count)
             .checked_add(dependency_count)
             .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
         {
@@ -561,12 +769,28 @@ impl PositiveDefEqCache {
             }
             return;
         }
+        self.record_cross_scope(&left, &right, locals.len());
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             if bucket.iter().any(|entry| {
                 ((entry.left == left && entry.right == right)
                     || (entry.left == right && entry.right == left))
                     && entry.dependencies == dependencies
             }) {
+                return;
+            }
+            if let Some(index) = replacement {
+                let Some(replaced) = bucket.get_mut(index) else {
+                    return;
+                };
+                self.local_dependency_cells = self
+                    .local_dependency_cells
+                    .saturating_sub(replaced.dependencies.len())
+                    .saturating_add(dependency_count);
+                *replaced = PositiveDefEqCacheEntry {
+                    left,
+                    right,
+                    dependencies,
+                };
                 return;
             }
             bucket.push(PositiveDefEqCacheEntry {
@@ -4175,7 +4399,7 @@ mod tests {
         rolling.insert(second.clone(), second, &tc.locals, &tc.local_positions);
         assert!(rolling.entries == 2 && rolling.local_dependency_cells == 2);
         let scans_before_rollover = rolling.local_dependency_scan_nodes;
-        rolling.dependency_scan_refusals.insert(u64::MAX, ());
+        rolling.dependency_scan_refusals.insert((u64::MAX, 0), ());
 
         rolling.insert(
             next_phase.clone(),
@@ -4189,7 +4413,9 @@ mod tests {
         );
         assert!(
             rolling.local_dependency_scan_nodes >= scans_before_rollover
-                && rolling.dependency_scan_refusals.contains_key(&u64::MAX),
+                && rolling
+                    .dependency_scan_refusals
+                    .contains_key(&(u64::MAX, 0)),
             "rollover must not renew either lifetime dependency-discovery allowance"
         );
         assert!(
@@ -4737,7 +4963,7 @@ mod tests {
         assert!(
             tc.infer_cache
                 .buckets
-                .get(&value_local.data().0)
+                .get(&(value_local.data().0, tc.locals.len()))
                 .is_some_and(|bucket| bucket.iter().all(|entry| {
                     dependencies_are_live(&entry.dependencies, &tc.locals, &tc.local_positions)
                 })),
@@ -4948,7 +5174,7 @@ mod tests {
             scan_refused
                 .infer_cache
                 .dependency_scan_refusals
-                .contains_key(&scan_key.data().0),
+                .contains_key(&(scan_key.data().0, scan_refused.locals.len())),
             "an over-limit key must retain a bounded reuse-refusal marker"
         );
         scan_refused.infer_cache.local_dependency_scan_nodes = 0;
@@ -5026,11 +5252,11 @@ mod tests {
         refusal_full
             .infer_cache
             .dependency_scan_refusals
-            .insert(u64::MAX, ());
+            .insert((u64::MAX, refusal_full.locals.len()), ());
         refusal_full
             .positive_def_eq_cache
             .dependency_scan_refusals
-            .insert((u64::MAX, u64::MAX), ());
+            .insert((u64::MAX, u64::MAX, refusal_full.locals.len()), ());
         refusal_full.infer_cache.insert(
             full_local.clone(),
             full_local.clone(),
@@ -5095,7 +5321,7 @@ mod tests {
         let mut collided = TypeChecker::new(&env, &[], Budget::DEFAULT);
         collided.infer_cache = ExprResultCache::bounded(1, 1);
         collided.infer_cache.buckets.insert(
-            pi.data().0,
+            (pi.data().0, 0),
             vec![ExprResultCacheEntry {
                 key: unrelated.clone(),
                 value: unrelated.clone(),
@@ -5105,7 +5331,7 @@ mod tests {
         collided.infer_cache.entries = 1;
         collided.whnf_cache = ExprResultCache::bounded(1, 1);
         collided.whnf_cache.buckets.insert(
-            redex.data().0,
+            (redex.data().0, 0),
             vec![ExprResultCacheEntry {
                 key: unrelated.clone(),
                 value: unrelated.clone(),
@@ -5115,7 +5341,7 @@ mod tests {
         collided.whnf_cache.entries = 1;
         collided.positive_def_eq_cache = PositiveDefEqCache::bounded(1, 1);
         collided.positive_def_eq_cache.buckets.insert(
-            PositiveDefEqCache::packed_key(&redex, &sort),
+            PositiveDefEqCache::scoped_key(&redex, &sort, 0),
             vec![PositiveDefEqCacheEntry {
                 left: unrelated.clone(),
                 right: pi.clone(),
@@ -5151,6 +5377,64 @@ mod tests {
                 && collided.whnf_cache.entries == 1
                 && collided.positive_def_eq_cache.entries == 1,
             "full collision buckets must stay bounded instead of growing during fallback work"
+        );
+    }
+
+    #[test]
+    fn packed_collision_capacity_is_partitioned_by_telescope_length() {
+        let env = Environment::new();
+        let (pi, redex, sort) = closed_cache_fixture();
+        let unrelated = Expr::sort(Level::one());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+
+        let mut result_cache = ExprResultCache::bounded(2, 1);
+        result_cache.buckets.insert(
+            (pi.data().0, 0),
+            vec![ExprResultCacheEntry {
+                key: unrelated.clone(),
+                value: unrelated.clone(),
+                dependencies: Vec::new(),
+            }],
+        );
+        result_cache.entries = 1;
+
+        let mut defeq_cache = PositiveDefEqCache::bounded(2, 1);
+        defeq_cache.buckets.insert(
+            PositiveDefEqCache::scoped_key(&redex, &sort, 0),
+            vec![PositiveDefEqCacheEntry {
+                left: unrelated,
+                right: pi.clone(),
+                dependencies: Vec::new(),
+            }],
+        );
+        defeq_cache.entries = 1;
+
+        tc.adopt_local(
+            FVarId(Name::str(Name::anonymous(), "scope_partition")),
+            Expr::sort(Level::zero()),
+        );
+        result_cache.insert(pi.clone(), sort.clone(), &tc.locals, &tc.local_positions);
+        defeq_cache.insert(redex.clone(), sort.clone(), &tc.locals, &tc.local_positions);
+
+        assert!(
+            result_cache.entries == 2
+                && result_cache
+                    .get(&pi, &tc.locals, &tc.local_positions)
+                    .is_some_and(|value| value == sort),
+            "a collision in another telescope length must not consume this scope's row capacity"
+        );
+        assert!(
+            defeq_cache.entries == 2
+                && defeq_cache.contains(&redex, &sort, &tc.locals, &tc.local_positions),
+            "positive-defeq collision capacity must use the same deterministic scope partition"
+        );
+
+        let mut bounded_index = ExprResultCache::bounded(1, 4);
+        bounded_index.record_cross_scope(&pi, 0);
+        bounded_index.record_cross_scope(&sort, 0);
+        assert!(
+            bounded_index.cross_scope_entries == 1 && bounded_index.cross_scope.len() == 1,
+            "cross-scope acceleration must retain no more roots than the row bound"
         );
     }
 
