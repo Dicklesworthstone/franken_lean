@@ -70,8 +70,9 @@ const USAGE: &str = concat!(
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
     "and Golem. The final path must produce the closed Nat result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
-    "--emit-flbc, the final definition's exact executed artifact atomically\n",
-    "replaces PATH only after the whole batch succeeds. --emit-sidecar requires\n",
+    "--emit-flbc, the final definition's exact executed artifact is published\n",
+    "only after the whole batch succeeds; any existing PATH is refused, never\n",
+    "replaced. --emit-sidecar requires\n",
     "--emit-flbc and publishes a standard-profile closure manifest before the\n",
     "product, so any interrupted pair fails closed by root mismatch. It is not\n",
     "general Lean,\n",
@@ -380,6 +381,21 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         return Err(UsageError(
             "--emit-sidecar and --emit-flbc must name different paths".to_owned(),
         ));
+    }
+    for output in [emit_flbc.as_deref(), emit_sidecar.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(source) = paths
+            .iter()
+            .find(|source| output_paths_alias(output, source))
+        {
+            return Err(UsageError(format!(
+                "output path {} aliases source input {}",
+                output.display(),
+                source.display()
+            )));
+        }
     }
     Ok(MultiplexerCommand::SourceRun {
         paths,
@@ -2078,7 +2094,63 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
     }
 }
 
-fn execute_source_bytes_with_publisher<P>(
+trait SourcePublicationFailure: std::fmt::Display {
+    fn target_created(&self) -> Option<bool> {
+        None
+    }
+
+    fn is_resource_exhaustion(&self) -> bool {
+        false
+    }
+}
+
+const fn publication_io_kind_is_resource(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::StorageFull
+            | std::io::ErrorKind::QuotaExceeded
+            | std::io::ErrorKind::OutOfMemory
+    )
+}
+
+impl SourcePublicationFailure for std::io::Error {
+    fn is_resource_exhaustion(&self) -> bool {
+        publication_io_kind_is_resource(self.kind())
+    }
+}
+
+impl SourcePublicationFailure for fln::AtomicCreateError<std::convert::Infallible> {
+    fn target_created(&self) -> Option<bool> {
+        Some(self.target_created())
+    }
+
+    fn is_resource_exhaustion(&self) -> bool {
+        self.primary_io_error_kind()
+            .is_some_and(publication_io_kind_is_resource)
+    }
+}
+
+fn publication_state(error: &impl SourcePublicationFailure) -> &'static str {
+    match error.target_created() {
+        Some(true) => {
+            "the complete target already exists, but later cleanup or directory durability did not complete"
+        }
+        Some(false) => "the target was not created",
+        None => "the injected publisher did not report whether the target was created",
+    }
+}
+
+fn publication_failure_disposition(
+    error: &impl SourcePublicationFailure,
+) -> (&'static str, bool, u8) {
+    if error.is_resource_exhaustion() {
+        ("resource", false, 3)
+    } else {
+        ("output", true, 1)
+    }
+}
+
+fn execute_source_bytes_with_publisher<P, E>(
     sources: Vec<Vec<u8>>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
@@ -2087,7 +2159,8 @@ fn execute_source_bytes_with_publisher<P>(
     mut publish: P,
 ) -> MultiplexerOutput
 where
-    P: FnMut(&[u8], &Path) -> std::io::Result<()>,
+    P: FnMut(&[u8], &Path) -> Result<(), E>,
+    E: SourcePublicationFailure,
 {
     let Some(source_bytes) = sources
         .iter()
@@ -2248,15 +2321,17 @@ where
         };
         let bytes = fln::encode_flbc_product_sidecar(&sidecar);
         if let Err(error) = publish(&bytes, path) {
+            let state = publication_state(&error);
+            let (class, authority, exit_code) = publication_failure_disposition(&error);
             return source_failure(
-                "output",
+                class,
                 &format!(
-                    "could not durably publish FLBC sidecar to {}: {error}; the FLBC product was not replaced",
+                    "could not complete durable FLBC sidecar publication to {}: {error}; {state}; the FLBC product was not published",
                     path.display()
                 ),
-                true,
+                authority,
                 json,
-                1,
+                exit_code,
             );
         }
         Some((
@@ -2270,15 +2345,17 @@ where
     };
     let emitted_flbc = if let Some(path) = emit_flbc.as_deref() {
         if let Err(error) = publish(&final_execution.flbc_artifact, path) {
+            let state = publication_state(&error);
+            let (class, authority, exit_code) = publication_failure_disposition(&error);
             return source_failure(
-                "output",
+                class,
                 &format!(
-                    "could not durably publish final FLBC artifact to {}: {error}; the sidecar may name the new bytes, but consumers will refuse an old product by root mismatch",
+                    "could not complete durable FLBC artifact publication to {}: {error}; {state}",
                     path.display()
                 ),
-                true,
+                authority,
                 json,
-                1,
+                exit_code,
             );
         }
         Some((path, final_execution.flbc_artifact.len()))
@@ -2322,7 +2399,7 @@ fn execute_source_bytes_with_output(
         emit_sidecar,
         None,
         json,
-        fln::publish_file_atomic,
+        fln::publish_file_atomic_new,
     )
 }
 
@@ -3426,7 +3503,7 @@ mod tests {
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
-                Ok(())
+                Ok::<(), std::io::Error>(())
             },
         );
 
@@ -3453,7 +3530,7 @@ mod tests {
             true,
             |_bytes, _path| {
                 failed_batch_publications += 1;
-                Ok(())
+                Ok::<(), std::io::Error>(())
             },
         );
         assert_eq!(failed_batch.exit_code, 1);
@@ -3479,6 +3556,86 @@ mod tests {
     }
 
     #[test]
+    fn source_run_publication_exhaustion_is_a_nonanswer_on_both_sides_of_link() {
+        let cases = [
+            (
+                false,
+                fln::AtomicCreateStep::WriteChunk {
+                    offset: 0,
+                    chunk_len: 1,
+                    total_len: 1,
+                },
+                "the target was not created",
+            ),
+            (
+                true,
+                fln::AtomicCreateStep::SyncDirectoryAfterLink,
+                "the complete target already exists",
+            ),
+        ];
+
+        for (target_created, step, state) in cases {
+            let output = execute_source_bytes_with_publisher(
+                vec![b"def emitted : Nat := 17".to_vec()],
+                Some(PathBuf::from("resource-exhausted.flbc")),
+                None,
+                None,
+                true,
+                |_bytes, _path| {
+                    Err::<(), _>(fln::AtomicCreateError::<std::convert::Infallible>::Io {
+                        step,
+                        target_created,
+                        source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    })
+                },
+            );
+
+            assert_eq!(output.exit_code, 3, "{}", output.stderr);
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.contains("\"authority\":false"));
+            assert!(output.stderr.contains("\"class\":\"resource\""));
+            assert!(output.stderr.contains("publication I/O failed at"));
+            assert!(output.stderr.contains(state));
+        }
+
+        let compound = execute_source_bytes_with_publisher(
+            vec![b"def emitted : Nat := 17".to_vec()],
+            Some(PathBuf::from("resource-exhausted-compound.flbc")),
+            None,
+            None,
+            true,
+            |_bytes, _path| {
+                Err::<(), _>(
+                    fln::AtomicCreateError::<std::convert::Infallible>::Cleanup {
+                        primary: Box::new(fln::AtomicCreateError::Io {
+                            step: fln::AtomicCreateStep::WriteChunk {
+                                offset: 0,
+                                chunk_len: 1,
+                                total_len: 1,
+                            },
+                            target_created: false,
+                            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                        }),
+                        cleanup: Box::new(fln::AtomicCreateError::Io {
+                            step: fln::AtomicCreateStep::RemoveStaging,
+                            target_created: false,
+                            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                        }),
+                    },
+                )
+            },
+        );
+        assert_eq!(compound.exit_code, 3, "{}", compound.stderr);
+        assert!(compound.stdout.is_empty());
+        assert!(compound.stderr.contains("\"authority\":false"));
+        assert!(compound.stderr.contains("\"class\":\"resource\""));
+        assert!(compound.stderr.contains("publication I/O failed at write"));
+        assert!(compound.stderr.contains("staging cleanup also failed"));
+        assert!(compound.stderr.contains("remove staging link"));
+        assert!(compound.stderr.contains("the target was not created"));
+    }
+
+    #[test]
     fn source_run_sidecar_is_exact_and_published_before_its_product() {
         let flbc_path = PathBuf::from("bound-product.flbc");
         let sidecar_path = PathBuf::from("bound-product.flbc.sidecar");
@@ -3492,7 +3649,7 @@ mod tests {
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
-                Ok(())
+                Ok::<(), std::io::Error>(())
             },
         );
 
@@ -3526,7 +3683,7 @@ mod tests {
             true,
             |_bytes, _path| {
                 failed_publications += 1;
-                Ok(())
+                Ok::<(), std::io::Error>(())
             },
         );
         assert_eq!(failed.exit_code, 1);
