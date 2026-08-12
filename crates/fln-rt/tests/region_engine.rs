@@ -7,8 +7,9 @@
 
 use fln_rt::obj::Obj;
 use fln_rt::region::{
-    AtomicWriteError, AtomicWriteStep, RegionFault, atomic_staging_path, canonical_digest, compact,
-    materialize, parse_olean_envelope, relocate, write_file_atomic_controlled,
+    AtomicCreateError, AtomicCreateStep, AtomicWriteError, AtomicWriteStep, RegionFault,
+    atomic_staging_path, canonical_digest, compact, materialize, parse_olean_envelope, relocate,
+    write_file_atomic_controlled, write_file_atomic_new, write_file_atomic_new_controlled,
 };
 use fln_unsafe_region::mapping::RegionMapping;
 use std::sync::{Mutex, MutexGuard};
@@ -200,7 +201,8 @@ fn real_olean_mmap_relocate_materialize() {
         let mut m = RegionMapping::map_file_private(&path).expect("mmap olean");
         let env = parse_olean_envelope(m.as_slice()).expect("envelope");
         let target = (m.addr() + env.payload_offset) as u64;
-        let buf = &mut m.as_mut_slice().expect("mut")[env.payload_offset..];
+        let payload_end = env.payload_offset + env.payload_len;
+        let buf = &mut m.as_mut_slice().expect("mut")[env.payload_offset..payload_end];
         let report = relocate(buf, env.payload_base(), target).expect("relocate");
         assert!(report.objects > 0, "{target_tag}: region walked");
         let digest = canonical_digest(buf, target).expect("digest");
@@ -235,7 +237,8 @@ fn real_olean_recompaction_fixpoint() {
     };
     let file = std::fs::read(&path).expect("read olean");
     let env = parse_olean_envelope(&file).expect("envelope");
-    let mut payload = file[env.payload_offset..].to_vec();
+    let payload_end = env.payload_offset + env.payload_len;
+    let mut payload = file[env.payload_offset..payload_end].to_vec();
     relocate(&mut payload, env.payload_base(), BASE_A).expect("relocate");
     let graph = materialize(&payload, BASE_A).expect("materialize");
 
@@ -370,6 +373,214 @@ fn concurrent_publication_of_one_target_never_yields_a_mixture() {
     assert_ne!(
         mine, theirs,
         "two threads must not share a staging file for the same target"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_no_clobber_publication_admits_exactly_one_complete_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "fln-rt-pubnew-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("new-region.bin");
+    let a = vec![0xA5; 2 * 64 * 1024 + 17];
+    let b = vec![0x5A; 2 * 64 * 1024 + 17];
+
+    let outcomes = std::thread::scope(|scope| {
+        let a_bytes = &a;
+        let first_target = target.clone();
+        let first = scope.spawn(move || write_file_atomic_new(a_bytes, &first_target));
+        let b_bytes = &b;
+        let second_target = target.clone();
+        let second = scope.spawn(move || write_file_atomic_new(b_bytes, &second_target));
+        [
+            first.join().expect("first publisher"),
+            second.join().expect("second publisher"),
+        ]
+    });
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "the atomic no-clobber link must elect exactly one publisher"
+    );
+    let loser = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .expect("one publisher loses the target-link race");
+    assert!(!loser.target_created());
+    assert_eq!(loser.step(), AtomicCreateStep::LinkTarget);
+    assert!(matches!(
+        loser,
+        AtomicCreateError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    let published = std::fs::read(&target).expect("one complete target was published");
+    assert!(
+        published == a || published == b,
+        "the winning target must equal one caller's bytes exactly"
+    );
+    let refused = write_file_atomic_new(b"replacement", &target)
+        .expect_err("a later publisher must not replace the existing target");
+    assert!(!refused.target_created());
+    assert_eq!(refused.step(), AtomicCreateStep::LinkTarget);
+    assert!(matches!(
+        refused,
+        AtomicCreateError::Io { ref source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(std::fs::read(&target).expect("retained winner"), published);
+    assert!(
+        std::fs::read_dir(&dir)
+            .expect("list publication directory")
+            .all(|entry| !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".new.")),
+        "successful and losing publishers must both remove their staging links"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn controlled_no_clobber_publication_names_every_linearization_boundary() {
+    const CHUNK: u64 = 64 * 1024;
+    let dir = std::env::temp_dir().join(format!(
+        "fln-rt-pubnew-fault-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let payload = vec![0xC3; (2 * CHUNK + 17) as usize];
+    let cases = [
+        ("create", AtomicCreateStep::CreateStaging, false, false),
+        (
+            "write",
+            AtomicCreateStep::WriteChunk {
+                offset: CHUNK,
+                chunk_len: CHUNK,
+                total_len: payload.len() as u64,
+            },
+            false,
+            false,
+        ),
+        ("stage-sync", AtomicCreateStep::SyncStaging, false, false),
+        ("link", AtomicCreateStep::LinkTarget, false, false),
+        (
+            "link-dir-sync",
+            AtomicCreateStep::SyncDirectoryAfterLink,
+            true,
+            true,
+        ),
+        ("cleanup", AtomicCreateStep::RemoveStaging, true, true),
+        (
+            "cleanup-dir-sync",
+            AtomicCreateStep::SyncDirectoryAfterCleanup,
+            true,
+            false,
+        ),
+    ];
+
+    for (label, fault_step, target_created, staging_remains) in cases {
+        let target = dir.join(format!("{label}.flbc"));
+        let error = write_file_atomic_new_controlled(&payload, &target, &mut |step| {
+            (step != fault_step)
+                .then_some(())
+                .ok_or(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .expect_err("the selected no-clobber boundary is refused");
+        assert_eq!(error.step(), fault_step, "{label}");
+        assert_eq!(error.target_created(), target_created, "{label}");
+        assert!(matches!(error, AtomicCreateError::Control { .. }));
+        match std::fs::read(&target) {
+            Ok(bytes) => {
+                assert!(target_created, "{label}: unexpected target");
+                assert_eq!(bytes, payload, "{label}: target must already be complete");
+            }
+            Err(error) => {
+                assert!(!target_created, "{label}: missing created target");
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{label}");
+            }
+        }
+        let staging_count = std::fs::read_dir(&dir)
+            .expect("list fault directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".{label}.flbc.new."))
+            })
+            .count();
+        assert_eq!(staging_count, usize::from(staging_remains), "{label}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_clobber_cleanup_failure_retains_the_primary_publication_cause() {
+    let dir = std::env::temp_dir().join(format!(
+        "fln-rt-pubnew-compound-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("compound.flbc");
+    let write_step = AtomicCreateStep::WriteChunk {
+        offset: 0,
+        chunk_len: 7,
+        total_len: 7,
+    };
+    let mut primary_injected = false;
+    let mut cleanup_injected = false;
+    let error = write_file_atomic_new_controlled(b"payload", &target, &mut |step| {
+        if step == write_step && !primary_injected {
+            primary_injected = true;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        } else if step == AtomicCreateStep::RemoveStaging && !cleanup_injected {
+            cleanup_injected = true;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("both the write and its staging cleanup are refused");
+
+    assert!(primary_injected);
+    assert!(cleanup_injected);
+    assert_eq!(error.step(), write_step);
+    assert!(!error.target_created());
+    let rendered = error.to_string();
+    assert!(rendered.contains("publication control refused at write"));
+    assert!(rendered.contains("staging cleanup also failed"));
+    let AtomicCreateError::Cleanup { primary, cleanup } = error else {
+        panic!("cleanup failure must retain both typed causes");
+    };
+    assert!(matches!(
+        primary.as_ref(),
+        AtomicCreateError::Control { step, source, .. }
+            if *step == write_step && source.kind() == std::io::ErrorKind::StorageFull
+    ));
+    assert!(matches!(
+        cleanup.as_ref(),
+        AtomicCreateError::Control {
+            step: AtomicCreateStep::RemoveStaging,
+            source,
+            ..
+        } if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read_dir(&dir)
+            .expect("list compound fault directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".new."))
+            .count(),
+        1,
+        "a refused cleanup must leave the exact staging entry visible"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

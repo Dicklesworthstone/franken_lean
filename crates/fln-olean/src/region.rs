@@ -49,8 +49,8 @@ pub enum RegionError {
     NonPersistentRc { offset: u64, rc: i32 },
     /// An object tag that must not appear in a compacted region.
     ForbiddenTag { offset: u64, tag: u8 },
-    /// Closure objects are only legal in v3 regions.
-    ClosureInV2 { offset: u64 },
+    /// Closure relocation is not implemented by this safe by-value reader.
+    ClosureUnsupported { offset: u64 },
     /// String object violating its own size/terminator/UTF-8 laws.
     StringIntegrity { offset: u64, reason: &'static str },
     /// Bignum object with an incoherent limb region.
@@ -84,8 +84,11 @@ impl fmt::Display for RegionError {
             Self::ForbiddenTag { offset, tag } => {
                 write!(f, "forbidden object tag {tag} at {offset}")
             }
-            Self::ClosureInV2 { offset } => {
-                write!(f, "closure object at {offset} in a v2 region")
+            Self::ClosureUnsupported { offset } => {
+                write!(
+                    f,
+                    "closure object at {offset} requires v3 library relocation support"
+                )
             }
             Self::StringIntegrity { offset, reason } => {
                 write!(f, "string object at {offset}: {reason}")
@@ -129,6 +132,10 @@ fn shared_fault(
         },
         F::BadMagic => RegionError::BadMagic,
         F::UnsupportedVersion(v) => RegionError::UnsupportedVersion(v),
+        F::MalformedV3 { offset, reason } => RegionError::DecodeShape {
+            offset: offset as u64,
+            reason,
+        },
         F::MisalignedBase { base } => RegionError::MisalignedBase { base_addr: base },
         F::RaggedPayload { len } => RegionError::DecodeShape {
             offset: shift + len as u64,
@@ -153,7 +160,7 @@ fn shared_fault(
         },
         // The shared audit has no version context; closure support arrives
         // with the plugin-door beads (sno/83r), so any closure is refused.
-        F::ClosureUnsupported { offset } => RegionError::ClosureInV2 {
+        F::ClosureUnsupported { offset } => RegionError::ClosureUnsupported {
             offset: shift + offset as u64,
         },
         F::StringIntegrity { offset, reason } => RegionError::StringIntegrity {
@@ -261,6 +268,8 @@ pub(crate) struct ModuleArrays {
 pub struct OleanView<'a> {
     bytes: &'a [u8],
     dependencies: Vec<DependencyRegion<'a>>,
+    payload_offset: usize,
+    payload_len: usize,
     pub header: OleanHeader,
 }
 
@@ -268,6 +277,8 @@ pub struct OleanView<'a> {
 struct DependencyRegion<'a> {
     bytes: &'a [u8],
     base_addr: u64,
+    payload_offset: usize,
+    payload_len: usize,
 }
 
 fn field_offset(name: &str) -> u64 {
@@ -387,6 +398,8 @@ impl<'a> OleanView<'a> {
         Ok(Self {
             bytes,
             dependencies: Vec::new(),
+            payload_offset: envelope.payload_offset,
+            payload_len: envelope.payload_len,
             header: OleanHeader {
                 version: envelope.version,
                 flags,
@@ -414,16 +427,21 @@ impl<'a> OleanView<'a> {
             regions.push(DependencyRegion {
                 bytes,
                 base_addr: dependency.header.base_addr,
+                payload_offset: dependency.payload_offset,
+                payload_len: dependency.payload_len,
             });
         }
 
         let mut ranges = regions
             .iter()
-            .map(|region| Self::address_range(region.base_addr, region.bytes.len()))
+            .map(|region| {
+                Self::address_range(region.base_addr, region.payload_offset, region.payload_len)
+            })
             .collect::<RResult<Vec<_>>>()?;
         ranges.push(Self::address_range(
             view.header.base_addr,
-            view.bytes.len(),
+            view.payload_offset,
+            view.payload_len,
         )?);
         ranges.sort_unstable_by_key(|range| range.0);
         if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
@@ -436,15 +454,20 @@ impl<'a> OleanView<'a> {
         Ok(view)
     }
 
-    fn address_range(base_addr: u64, len: usize) -> RResult<(u64, u64)> {
-        let start = base_addr
-            .checked_add(format::OLEAN_HEADER_SIZE as u64)
-            .ok_or(RegionError::DecodeShape {
-                offset: 0,
-                reason: "compacted region address range overflows",
-            })?;
-        let end = base_addr
-            .checked_add(len as u64)
+    fn address_range(
+        base_addr: u64,
+        payload_offset: usize,
+        payload_len: usize,
+    ) -> RResult<(u64, u64)> {
+        let start =
+            base_addr
+                .checked_add(payload_offset as u64)
+                .ok_or(RegionError::DecodeShape {
+                    offset: 0,
+                    reason: "compacted region address range overflows",
+                })?;
+        let end = start
+            .checked_add(payload_len as u64)
             .ok_or(RegionError::DecodeShape {
                 offset: 0,
                 reason: "compacted region address range overflows",
@@ -459,19 +482,17 @@ impl<'a> OleanView<'a> {
     /// this is the §6.4 single-code-path integrity authority the runtime's
     /// own loader enforces.
     pub fn shared_audit(&self) -> RResult<fln_rt::region::RegionReport> {
-        let header = format::OLEAN_HEADER_SIZE as u64;
-        let payload = self.read_bytes(header, self.bytes.len() as u64 - header)?;
-        let base =
-            self.header
-                .base_addr
-                .checked_add(header)
-                .ok_or(RegionError::MisalignedBase {
-                    base_addr: self.header.base_addr,
-                })?;
+        let payload_offset = self.payload_offset as u64;
+        let payload = self.read_bytes(payload_offset, self.payload_len as u64)?;
+        let base = self.header.base_addr.checked_add(payload_offset).ok_or(
+            RegionError::MisalignedBase {
+                base_addr: self.header.base_addr,
+            },
+        )?;
         fln_rt::region::audit(payload, base).map_err(|fault| {
             shared_fault(
                 fault,
-                header,
+                payload_offset,
                 self.header.base_addr,
                 self.bytes.len() as u64,
             )
@@ -487,12 +508,14 @@ impl<'a> OleanView<'a> {
         }
         let end = off.checked_add(8).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
-            len: self.bytes.len() as u64,
+            len: (self.payload_offset + self.payload_len) as u64,
         })?;
-        if end > self.bytes.len() as u64 {
+        let payload_start = self.payload_offset as u64;
+        let payload_end = payload_start + self.payload_len as u64;
+        if off < payload_start || end > payload_end {
             return Err(RegionError::Truncated {
                 wanted_end: end,
-                len: self.bytes.len() as u64,
+                len: payload_end,
             });
         }
         let mut b = [0u8; 8];
@@ -506,12 +529,14 @@ impl<'a> OleanView<'a> {
         }
         let end = off.checked_add(len).ok_or(RegionError::Truncated {
             wanted_end: u64::MAX,
-            len: self.bytes.len() as u64,
+            len: (self.payload_offset + self.payload_len) as u64,
         })?;
-        if end > self.bytes.len() as u64 {
+        let payload_start = self.payload_offset as u64;
+        let payload_end = payload_start + self.payload_len as u64;
+        if off < payload_start || end > payload_end {
             return Err(RegionError::Truncated {
                 wanted_end: end,
-                len: self.bytes.len() as u64,
+                len: payload_end,
             });
         }
         Ok(&self.bytes[off as usize..end as usize])
@@ -525,8 +550,8 @@ impl<'a> OleanView<'a> {
         for region in &self.dependencies {
             let data_start = region
                 .base_addr
-                .saturating_add(format::OLEAN_HEADER_SIZE as u64);
-            let region_end = region.base_addr.saturating_add(region.bytes.len() as u64);
+                .saturating_add(region.payload_offset as u64);
+            let region_end = data_start.saturating_add(region.payload_len as u64);
             if address >= data_start && end <= region_end {
                 let start = (address - region.base_addr) as usize;
                 let end = (end - region.base_addr) as usize;
@@ -554,8 +579,8 @@ impl<'a> OleanView<'a> {
                 .find_map(|(index, region)| {
                     let start = region
                         .base_addr
-                        .saturating_add(format::OLEAN_HEADER_SIZE as u64);
-                    let end = region.base_addr.saturating_add(region.bytes.len() as u64);
+                        .saturating_add(region.payload_offset as u64);
+                    let end = start.saturating_add(region.payload_len as u64);
                     (address >= start && address < end)
                         .then_some((index, address - region.base_addr))
                 })
@@ -572,8 +597,9 @@ impl<'a> OleanView<'a> {
     /// interior pointer to `base_addr + file_offset` (OLEAN_CONTRACT §1).
     pub(crate) fn deref(&self, ptr: u64) -> RResult<u64> {
         let resolved = ptr as i128 - self.header.base_addr as i128;
-        let header_size = format::OLEAN_HEADER_SIZE as i128;
-        if resolved >= header_size && resolved < self.bytes.len() as i128 {
+        let payload_start = self.payload_offset as i128;
+        let payload_end = payload_start + self.payload_len as i128;
+        if resolved >= payload_start && resolved < payload_end {
             if resolved % 8 != 0 {
                 return Err(RegionError::MisalignedPtr { ptr });
             }
@@ -581,7 +607,9 @@ impl<'a> OleanView<'a> {
         }
         for region in &self.dependencies {
             let dependency_offset = ptr as i128 - region.base_addr as i128;
-            if dependency_offset >= header_size && dependency_offset < region.bytes.len() as i128 {
+            let dependency_start = region.payload_offset as i128;
+            let dependency_end = dependency_start + region.payload_len as i128;
+            if dependency_offset >= dependency_start && dependency_offset < dependency_end {
                 if dependency_offset % 8 != 0 {
                     return Err(RegionError::MisalignedPtr { ptr });
                 }
@@ -613,7 +641,7 @@ impl<'a> OleanView<'a> {
     fn root_ptr(&self) -> RResult<u64> {
         // The root slot is the first word of the data region (allocated first,
         // written last by the compactor).
-        self.read_u64(format::OLEAN_HEADER_SIZE as u64)
+        self.read_u64(self.payload_offset as u64)
     }
 
     /// Walk the entire object graph from the root, checking every pointer,
@@ -714,8 +742,7 @@ impl<'a> OleanView<'a> {
                 report.refs += 1;
                 stack.push(self.read_u64(off + 8)?);
             } else if tag == abi::TAG_CLOSURE {
-                // v3-only; this reader's traversal supports the v2 payload.
-                return Err(RegionError::ClosureInV2 { offset: off });
+                return Err(RegionError::ClosureUnsupported { offset: off });
             } else {
                 // External can never be compacted; StructArray is unused at
                 // the pin; Promise/Reserved must not appear in module data.
@@ -1193,6 +1220,8 @@ impl std::error::Error for MappedOleanError {}
 pub struct MappedOlean {
     mapping: RegionMapping,
     header: OleanHeader,
+    payload_offset: usize,
+    payload_len: usize,
 }
 
 impl MappedOlean {
@@ -1200,13 +1229,18 @@ impl MappedOlean {
     /// releases the mapping (no half-open state).
     pub fn open(path: &Path) -> Result<MappedOlean, MappedOleanError> {
         let mut mapping = RegionMapping::map_file_private(path).map_err(MappedOleanError::Map)?;
-        let header = {
+        let (header, payload_offset, payload_len) = {
             let view = OleanView::parse(mapping.as_slice()).map_err(MappedOleanError::Region)?;
             view.shared_audit().map_err(MappedOleanError::Region)?;
-            view.header
+            (view.header, view.payload_offset, view.payload_len)
         };
         mapping.seal().map_err(MappedOleanError::Map)?;
-        Ok(MappedOlean { mapping, header })
+        Ok(MappedOlean {
+            mapping,
+            header,
+            payload_offset,
+            payload_len,
+        })
     }
 
     pub fn header(&self) -> &OleanHeader {
@@ -1231,6 +1265,8 @@ impl MappedOlean {
         OleanView {
             bytes: self.mapping.as_slice(),
             dependencies: Vec::new(),
+            payload_offset: self.payload_offset,
+            payload_len: self.payload_len,
             header: self.header.clone(),
         }
     }

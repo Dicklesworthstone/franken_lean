@@ -68,8 +68,9 @@ fn main() {
     );
     let target = (mapping.addr() + env.payload_offset) as u64;
     let payload_offset = env.payload_offset;
+    let payload_end = payload_offset + env.payload_len;
     let buf = match mapping.as_mut_slice() {
-        Ok(b) => &mut b[payload_offset..],
+        Ok(b) => &mut b[payload_offset..payload_end],
         Err(e) => fail("borrow", e),
     };
     let report = match relocate(buf, env.payload_base(), target) {
@@ -106,6 +107,7 @@ fn main() {
         };
         let mut file_bytes = mapping.as_slice()[..payload_offset].to_vec();
         file_bytes.extend_from_slice(&payload);
+        file_bytes.extend_from_slice(&mapping.as_slice()[payload_end..]);
         if crash_after_temp {
             // The staging drill: die between temp write and rename.
             let tmp = atomic_staging_path(out);

@@ -11,8 +11,8 @@
 //!
 //! The same substrate also constructs complete basic `ModuleData` images for
 //! imports and every `ConstantInfo` variant. Serialized environment-extension
-//! payloads, `.ilean`, and transactional artifact publication remain later
-//! slices of the same bead.
+//! payloads, closure-bearing v3 regions, `.ilean`, and transactional artifact
+//! publication remain later slices of the same bead.
 
 use std::collections::HashMap;
 
@@ -32,11 +32,11 @@ type WResult<T> = Result<T, WriteError>;
 
 /// Fresh writer formats implemented by this module.
 ///
-/// The generated loader contract also accepts v3, but v3 adds a data-size
-/// prefix, closure offsets, and a library-relocation trailer. Emitting the v2
-/// body under a v3 header would be a corrupt artifact, so loader acceptance is
-/// deliberately a wider set than writer support.
-const OLEAN_WRITER_VERSIONS: &[u8] = &[2];
+/// The safe object graph emitted here cannot contain closures, so v3 writes a
+/// real length-prefixed data section followed by empty closure and library
+/// relocation tables. Closure-bearing v3 regions remain typed-unsupported in
+/// the shared compactor.
+const OLEAN_WRITER_VERSIONS: &[u8] = &[2, 3];
 
 /// The resource whose writer limit was reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +210,7 @@ fn build_header(spec: OleanWriteHeader<'_>) -> WResult<Vec<u8>> {
     }
     if !OLEAN_WRITER_VERSIONS.contains(&spec.version) {
         return Err(WriteError::Unsupported {
-            what: "olean v3 framing is not implemented by the fresh writer",
+            what: "accepted olean version is not implemented by the fresh writer",
         });
     }
     if !spec.base_addr.is_multiple_of(format::REGION_ALIGN as u64) {
@@ -316,12 +316,22 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new(budget: WriteBudget) -> WResult<Self> {
+    fn new(budget: WriteBudget, version: u8) -> WResult<Self> {
+        let framing = match version {
+            2 => 0,
+            3 => size_of::<u64>() + 2 * size_of::<u32>(),
+            _ => {
+                return Err(WriteError::Contract {
+                    what: "writer accounting received an unsupported version",
+                });
+            }
+        };
         let initial = u64::try_from(format::OLEAN_HEADER_SIZE)
             .ok()
+            .and_then(|size| size.checked_add(framing as u64))
             .and_then(|size| size.checked_add(8))
             .ok_or(WriteError::Contract {
-                what: "header and root size overflow",
+                what: "framing and root size overflow",
             })?;
         if initial > budget.max_bytes {
             return Err(WriteError::Budget {
@@ -1007,11 +1017,22 @@ fn finish_region(
     encoder: Encoder,
     root_object: Obj,
     header: Vec<u8>,
+    version: u8,
     base_addr: u64,
 ) -> WResult<FinishedRegion> {
     let mut file = header;
+    let data_prefix = match version {
+        2 => 0,
+        3 => size_of::<u64>(),
+        _ => {
+            return Err(WriteError::Contract {
+                what: "region finalization received an unsupported version",
+            });
+        }
+    };
     let payload_base = base_addr
         .checked_add(format::OLEAN_HEADER_SIZE as u64)
+        .and_then(|base| base.checked_add(data_prefix as u64))
         .ok_or(WriteError::Contract {
             what: "payload base overflows",
         })?;
@@ -1025,9 +1046,16 @@ fn finish_region(
     let payload_bytes = u64::try_from(region.bytes).map_err(|_| WriteError::Contract {
         what: "payload byte count overflows",
     })?;
+    let trailer_bytes = if version == 3 {
+        2 * size_of::<u32>()
+    } else {
+        0
+    };
     let file_bytes = u64::try_from(file.len())
         .ok()
+        .and_then(|size| size.checked_add(data_prefix as u64))
         .and_then(|size| size.checked_add(payload_bytes))
+        .and_then(|size| size.checked_add(trailer_bytes as u64))
         .ok_or(WriteError::Contract {
             what: "final file size overflows",
         })?;
@@ -1042,7 +1070,14 @@ fn finish_region(
             what: "final mapped address range overflows",
         })?;
     let root = region.root;
+    if version == 3 {
+        file.extend_from_slice(&payload_bytes.to_le_bytes());
+    }
     file.extend_from_slice(&payload);
+    if version == 3 {
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+    }
     Ok(FinishedRegion {
         bytes: file,
         root,
@@ -1059,9 +1094,15 @@ pub fn encode_expr_region(
     budget: WriteBudget,
 ) -> WResult<EncodedExprRegion> {
     let header_bytes = build_header(header)?;
-    let mut encoder = Encoder::new(budget)?;
+    let mut encoder = Encoder::new(budget, header.version)?;
     let root_object = encoder.expression(expression)?;
-    let finished = finish_region(encoder, root_object, header_bytes, header.base_addr)?;
+    let finished = finish_region(
+        encoder,
+        root_object,
+        header_bytes,
+        header.version,
+        header.base_addr,
+    )?;
     let expr_nodes =
         u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
             what: "expression node count overflows",
@@ -1099,9 +1140,15 @@ pub fn encode_module(
     budget: WriteBudget,
 ) -> WResult<EncodedModule> {
     let header_bytes = build_header(header)?;
-    let mut encoder = Encoder::new(budget)?;
+    let mut encoder = Encoder::new(budget, header.version)?;
     let root_object = encoder.module_root(input)?;
-    let finished = finish_region(encoder, root_object, header_bytes, header.base_addr)?;
+    let finished = finish_region(
+        encoder,
+        root_object,
+        header_bytes,
+        header.version,
+        header.base_addr,
+    )?;
     let expr_nodes =
         u64::try_from(finished.encoder.exprs.len()).map_err(|_| WriteError::Contract {
             what: "expression node count overflows",
@@ -1160,6 +1207,13 @@ mod tests {
             lean_version: "4.32.0",
             githash: HASH,
             base_addr: 0x20_000,
+        }
+    }
+
+    fn v3_header() -> OleanWriteHeader<'static> {
+        OleanWriteHeader {
+            version: 3,
+            ..header()
         }
     }
 
@@ -1360,6 +1414,115 @@ mod tests {
     }
 
     #[test]
+    fn v3_framing_roundtrips_real_data_and_rejects_legacy_or_corrupt_bodies() {
+        let expression = Expr::app(
+            Expr::const_(name("Demo.f"), vec![Level::zero()]),
+            Expr::lit(Literal::Str("v3".to_owned())),
+        );
+        let encoded = encode_expr_region(&expression, v3_header(), WriteBudget::default())
+            .expect("encode v3 expression");
+        let envelope = fln_rt::region::parse_olean_envelope(&encoded.bytes).expect("v3 envelope");
+        assert_eq!(envelope.version, 3);
+        assert_eq!(
+            envelope.payload_offset,
+            format::OLEAN_HEADER_SIZE + size_of::<u64>()
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                encoded.bytes[format::OLEAN_HEADER_SIZE..envelope.payload_offset]
+                    .try_into()
+                    .expect("data-size prefix"),
+            ),
+            envelope.payload_len as u64
+        );
+        let trailer = envelope.payload_offset + envelope.payload_len;
+        assert_eq!(
+            &encoded.bytes[trailer..],
+            &[0; 2 * size_of::<u32>()],
+            "closure and library relocation tables are explicitly empty"
+        );
+        let view = OleanView::parse(&encoded.bytes).expect("v3 view");
+        view.shared_audit().expect("v3 shared audit");
+        let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+        assert_eq!(
+            decoder.decode_expr(encoded.root).expect("v3 decode"),
+            expression
+        );
+        let exact_budget = WriteBudget {
+            max_objects: WriteBudget::default().max_objects,
+            max_bytes: encoded.report.file_bytes,
+        };
+        encode_expr_region(&expression, v3_header(), exact_budget)
+            .expect("v3 framing is fully charged at the exact byte boundary");
+        assert!(matches!(
+            encode_expr_region(
+                &expression,
+                v3_header(),
+                WriteBudget {
+                    max_bytes: encoded.report.file_bytes - 1,
+                    ..exact_budget
+                },
+            ),
+            Err(WriteError::Budget {
+                resource: WriteResource::Bytes,
+                ..
+            })
+        ));
+
+        let module = encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[name("Demo.extra")],
+            },
+            v3_header(),
+            WriteBudget::default(),
+        )
+        .expect("encode v3 ModuleData");
+        let view = OleanView::parse(&module.bytes).expect("v3 module view");
+        assert_eq!(
+            view.module_data(WalkBudget::default())
+                .expect("v3 ModuleData")
+                .extra_const_names,
+            1
+        );
+
+        let mut legacy_body = roundtrip(&expression).bytes;
+        legacy_body[5] = 3;
+        assert!(OleanView::parse(&legacy_body).is_err());
+
+        let mut corrupt_size = encoded.bytes.clone();
+        let oversized = (envelope.payload_len as u64 + 8).to_le_bytes();
+        corrupt_size[format::OLEAN_HEADER_SIZE..envelope.payload_offset]
+            .copy_from_slice(&oversized);
+        assert!(OleanView::parse(&corrupt_size).is_err());
+
+        let mut truncated_trailer = encoded.bytes.clone();
+        truncated_trailer.pop();
+        assert!(OleanView::parse(&truncated_trailer).is_err());
+
+        let mut overflowing_closure_table = encoded.bytes.clone();
+        overflowing_closure_table[trailer..trailer + size_of::<u32>()]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(OleanView::parse(&overflowing_closure_table).is_err());
+
+        let mut truncated_library_table = encoded.bytes.clone();
+        truncated_library_table[trailer + size_of::<u32>()..trailer + 2 * size_of::<u32>()]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(OleanView::parse(&truncated_library_table).is_err());
+
+        let mut invalid_closure_offset = encoded.bytes.clone();
+        invalid_closure_offset[trailer..trailer + size_of::<u32>()]
+            .copy_from_slice(&1u32.to_le_bytes());
+        invalid_closure_offset.splice(
+            trailer + size_of::<u32>()..trailer + size_of::<u32>(),
+            (envelope.payload_len as u64 - 4).to_le_bytes(),
+        );
+        assert!(OleanView::parse(&invalid_closure_offset).is_err());
+    }
+
+    #[test]
     fn every_expression_constructor_roundtrips_with_computed_fields_checked() {
         let zero = Level::zero();
         let successor = zero.clone().succ().expect("successor");
@@ -1533,30 +1696,6 @@ mod tests {
             encode_expr_region(&expression, invalid, WriteBudget::default()),
             Err(WriteError::Contract {
                 what: "header version is outside the generated accepted set"
-            })
-        ));
-        invalid = header();
-        invalid.version = 3;
-        assert!(format::OLEAN_ACCEPTED_VERSIONS.contains(&invalid.version));
-        assert!(matches!(
-            encode_expr_region(&expression, invalid, WriteBudget::default()),
-            Err(WriteError::Unsupported {
-                what: "olean v3 framing is not implemented by the fresh writer"
-            })
-        ));
-        assert!(matches!(
-            encode_module(
-                ModuleWriteInput {
-                    is_module: false,
-                    imports: &[],
-                    constants: &[],
-                    extra_const_names: &[],
-                },
-                invalid,
-                WriteBudget::default(),
-            ),
-            Err(WriteError::Unsupported {
-                what: "olean v3 framing is not implemented by the fresh writer"
             })
         ));
         invalid = header();

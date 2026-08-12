@@ -483,17 +483,14 @@ fn header_rejections_are_typed() {
         "{r:?}"
     );
 
-    // The pinned loader accepts v3, but this reader does not yet implement
-    // its different framing. Relabeling a v2 body must fail closed instead of
-    // being interpreted at the legacy payload offset.
+    // Relabeling a v2 body must fail closed instead of being interpreted at
+    // the legacy payload offset. The v3 reader treats the old root word as a
+    // data-size prefix and rejects the incoherent section table.
     let mut bad = good.clone();
     bad[5] = 3;
     assert!(format::OLEAN_ACCEPTED_VERSIONS.contains(&3));
     let r = OleanView::parse(&bad);
-    assert!(
-        matches!(r, Err(RegionError::UnsupportedVersion(3))),
-        "{r:?}"
-    );
+    assert!(matches!(r, Err(RegionError::DecodeShape { .. })), "{r:?}");
 
     // Misaligned base address (violates REGION_ALIGN).
     let mut bad = good.clone();

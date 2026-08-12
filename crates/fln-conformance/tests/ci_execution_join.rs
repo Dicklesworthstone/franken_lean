@@ -326,10 +326,11 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
-        "fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected",
-        "not per-commit evidence — an operator-run outbound FL-INV-04 probe that requires a \
-         new retained output directory. Its own good/bad pair binds acceptance and rejection \
-         to the pinned Reference; no coverage row may cite the ignored function as a CI run",
+        "closure_free_v2_and_v3_modules_cross_load_with_the_pin_and_reject_bad_semantics",
+        "not per-commit evidence — an operator-run bounded two-way Reference cross-load probe \
+         requiring a new retained output directory. Its v2 and closure-free-v3 good/bad pairs \
+         bind acceptance and rejection to the pin, and its verified pin-produced v3 ModuleData \
+         is decoded by our reader; no coverage row may cite the ignored function as a CI run",
     ),
     (
         "crates/fln-conformance/tests/mutation_kill_ledger_model.rs",

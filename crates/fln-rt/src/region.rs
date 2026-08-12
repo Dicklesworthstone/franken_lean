@@ -38,12 +38,13 @@ use crate::region_contract as rc;
 use std::collections::HashMap;
 
 /// Envelope framings this shared reader actually implements. The generated
-/// Reference contract also accepts v3, but v3's size prefix, closure offsets,
-/// and library relocation trailer require a different payload boundary.
-const OLEAN_READER_VERSIONS: &[u8] = &[2];
+/// Envelope framings implemented by the shared reader. Closure objects inside
+/// a v3 payload remain a separate, typed-unsupported runtime category until
+/// the relocation table is wired into the object walk.
+const OLEAN_READER_VERSIONS: &[u8] = &[2, 3];
 
-/// Typed region failure. Every variant carries the region offset (bytes from
-/// the start of the payload) where the law broke.
+/// Typed region failure. Payload-walk variants carry payload-relative offsets;
+/// [`RegionFault::MalformedV3`] instead names the offending file-framing byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionFault {
     /// Payload shorter than the fixed envelope or a read past its end.
@@ -52,6 +53,8 @@ pub enum RegionFault {
     BadMagic,
     /// Envelope version outside this reader's implemented framing set.
     UnsupportedVersion(u8),
+    /// A v3 length-prefixed section is truncated or structurally incoherent.
+    MalformedV3 { offset: usize, reason: &'static str },
     /// `base_addr` violates the contract's alignment law.
     MisalignedBase { base: u64 },
     /// Payload length is not a whole number of 8-byte words.
@@ -87,6 +90,9 @@ impl std::fmt::Display for RegionFault {
             }
             Self::BadMagic => write!(f, "bad olean magic"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported olean version {v}"),
+            Self::MalformedV3 { offset, reason } => {
+                write!(f, "malformed olean v3 section at {offset}: {reason}")
+            }
             Self::MisalignedBase { base } => write!(f, "misaligned base_addr {base:#x}"),
             Self::RaggedPayload { len } => write!(f, "payload length {len} not word-aligned"),
             Self::NonPersistentRc { offset, rc } => {
@@ -135,6 +141,39 @@ pub struct OleanEnvelope {
     pub base_addr: u64,
     pub payload_offset: usize,
     pub payload_len: usize,
+}
+
+fn checked_section_end(
+    start: usize,
+    len: usize,
+    file_len: usize,
+    reason: &'static str,
+) -> RResult<usize> {
+    let end = start.checked_add(len).ok_or(RegionFault::MalformedV3 {
+        offset: start,
+        reason,
+    })?;
+    if end > file_len {
+        return Err(RegionFault::MalformedV3 {
+            offset: start,
+            reason,
+        });
+    }
+    Ok(end)
+}
+
+fn read_v3_u32(file: &[u8], offset: usize, reason: &'static str) -> RResult<u32> {
+    let end = checked_section_end(offset, size_of::<u32>(), file.len(), reason)?;
+    Ok(u32::from_le_bytes(
+        file[offset..end].try_into().expect("checked u32 width"),
+    ))
+}
+
+fn read_v3_u64(file: &[u8], offset: usize, reason: &'static str) -> RResult<u64> {
+    let end = checked_section_end(offset, size_of::<u64>(), file.len(), reason)?;
+    Ok(u64::from_le_bytes(
+        file[offset..end].try_into().expect("checked u64 width"),
+    ))
 }
 
 impl OleanEnvelope {
@@ -190,11 +229,122 @@ pub fn parse_olean_envelope(file: &[u8]) -> RResult<OleanEnvelope> {
         .checked_add(file.len() as u64)
         .ok_or(RegionFault::MisalignedBase { base: base_addr })?;
     let _ = extent;
+
+    let (payload_offset, payload_len) = if version == 2 {
+        (data_off, file.len() - data_off)
+    } else {
+        let word_size = base_sz;
+        if word_size != size_of::<u64>() {
+            return Err(RegionFault::MalformedV3 {
+                offset: data_off,
+                reason: "generated size_t width is unsupported",
+            });
+        }
+        let data_size = usize::try_from(read_v3_u64(
+            file,
+            data_off,
+            "missing or overflowing data-size prefix",
+        )?)
+        .map_err(|_| RegionFault::MalformedV3 {
+            offset: data_off,
+            reason: "data size does not fit the host address space",
+        })?;
+        let payload_offset = data_off
+            .checked_add(word_size)
+            .ok_or(RegionFault::MalformedV3 {
+                offset: data_off,
+                reason: "payload offset overflows",
+            })?;
+        let payload_end = checked_section_end(
+            payload_offset,
+            data_size,
+            file.len(),
+            "data section exceeds the file",
+        )?;
+
+        let closure_count = usize::try_from(read_v3_u32(
+            file,
+            payload_end,
+            "missing closure-offset count",
+        )?)
+        .expect("u32 fits usize");
+        let closure_table = payload_end + size_of::<u32>();
+        let closure_bytes =
+            closure_count
+                .checked_mul(size_of::<u64>())
+                .ok_or(RegionFault::MalformedV3 {
+                    offset: closure_table,
+                    reason: "closure-offset table size overflows",
+                })?;
+        let mut cursor = checked_section_end(
+            closure_table,
+            closure_bytes,
+            file.len(),
+            "closure-offset table exceeds the file",
+        )?;
+        for index in 0..closure_count {
+            let offset = usize::try_from(read_v3_u64(
+                file,
+                closure_table + index * size_of::<u64>(),
+                "truncated closure offset",
+            )?)
+            .map_err(|_| RegionFault::MalformedV3 {
+                offset: closure_table + index * size_of::<u64>(),
+                reason: "closure offset does not fit the host address space",
+            })?;
+            if !offset.is_multiple_of(size_of::<u64>())
+                || offset
+                    .checked_add(size_of::<u64>())
+                    .is_none_or(|end| end > data_size)
+            {
+                return Err(RegionFault::MalformedV3 {
+                    offset: closure_table + index * size_of::<u64>(),
+                    reason: "closure m_fun offset is outside the data section",
+                });
+            }
+        }
+
+        let library_count = usize::try_from(read_v3_u32(
+            file,
+            cursor,
+            "missing library-relocation count",
+        )?)
+        .expect("u32 fits usize");
+        cursor += size_of::<u32>();
+        for _ in 0..library_count {
+            cursor = checked_section_end(
+                cursor,
+                word_size,
+                file.len(),
+                "truncated library base address",
+            )?;
+            let id_len = usize::try_from(read_v3_u32(
+                file,
+                cursor,
+                "missing library identifier length",
+            )?)
+            .expect("u32 fits usize");
+            cursor += size_of::<u32>();
+            cursor = checked_section_end(
+                cursor,
+                id_len,
+                file.len(),
+                "library identifier exceeds the file",
+            )?;
+        }
+        if cursor != file.len() {
+            return Err(RegionFault::MalformedV3 {
+                offset: cursor,
+                reason: "trailing bytes follow the relocation table",
+            });
+        }
+        (payload_offset, data_size)
+    };
     Ok(OleanEnvelope {
         version,
         base_addr,
-        payload_offset: data_off,
-        payload_len: file.len() - data_off,
+        payload_offset,
+        payload_len,
     })
 }
 
@@ -928,6 +1078,313 @@ pub fn write_file_atomic(bytes: &[u8], path: &std::path::Path) -> std::io::Resul
         Err(AtomicWriteError::Io { source, .. }) => Err(source),
         Err(AtomicWriteError::Control { source, .. }) => match source {},
     }
+}
+
+static NEW_FILE_STAGING_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const NEW_FILE_STAGING_ATTEMPTS: usize = 1_024;
+
+fn new_file_staging_path(path: &std::path::Path, sequence: u64) -> std::path::PathBuf {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let thread: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_owned());
+    dir.join(format!(
+        ".{name}.new.{}.{}.{sequence}",
+        std::process::id(),
+        thread
+    ))
+}
+
+/// One fallible boundary in atomic no-clobber publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicCreateStep {
+    CreateStaging,
+    WriteChunk {
+        offset: u64,
+        chunk_len: u64,
+        total_len: u64,
+    },
+    SyncStaging,
+    LinkTarget,
+    SyncDirectoryAfterLink,
+    RemoveStaging,
+    SyncDirectoryAfterCleanup,
+}
+
+impl std::fmt::Display for AtomicCreateStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateStaging => f.write_str("create unique staging file"),
+            Self::WriteChunk {
+                offset,
+                chunk_len,
+                total_len,
+            } => write!(
+                f,
+                "write {chunk_len} bytes at offset {offset} of {total_len}"
+            ),
+            Self::SyncStaging => f.write_str("sync staging file"),
+            Self::LinkTarget => f.write_str("create target link"),
+            Self::SyncDirectoryAfterLink => f.write_str("sync target directory after link"),
+            Self::RemoveStaging => f.write_str("remove staging link"),
+            Self::SyncDirectoryAfterCleanup => {
+                f.write_str("sync target directory after staging cleanup")
+            }
+        }
+    }
+}
+
+/// Typed failure from [`write_file_atomic_new_controlled`].
+///
+/// `target_created` is the linearization boundary. When true, the final name
+/// already denotes the complete, file-synced bytes even though later cleanup or
+/// directory durability work failed.
+#[derive(Debug)]
+pub enum AtomicCreateError<E> {
+    Control {
+        step: AtomicCreateStep,
+        target_created: bool,
+        source: E,
+    },
+    Io {
+        step: AtomicCreateStep,
+        target_created: bool,
+        source: std::io::Error,
+    },
+    Cleanup {
+        primary: Box<Self>,
+        cleanup: Box<Self>,
+    },
+}
+
+impl<E> AtomicCreateError<E> {
+    pub const fn step(&self) -> AtomicCreateStep {
+        match self {
+            Self::Control { step, .. } | Self::Io { step, .. } => *step,
+            Self::Cleanup { primary, .. } => primary.step(),
+        }
+    }
+
+    pub const fn target_created(&self) -> bool {
+        match self {
+            Self::Control { target_created, .. } | Self::Io { target_created, .. } => {
+                *target_created
+            }
+            Self::Cleanup { primary, .. } => primary.target_created(),
+        }
+    }
+
+    /// Returns the primary I/O failure kind, retaining the cause that made
+    /// publication fail even when removing its staging link also failed.
+    pub fn primary_io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Control { .. } => None,
+            Self::Io { source, .. } => Some(source.kind()),
+            Self::Cleanup { primary, .. } => primary.primary_io_error_kind(),
+        }
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AtomicCreateError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = if self.target_created() {
+            "complete target already created"
+        } else {
+            "target not created"
+        };
+        match self {
+            Self::Control { step, source, .. } => {
+                write!(
+                    f,
+                    "publication control refused at {step} ({state}): {source}"
+                )
+            }
+            Self::Io { step, source, .. } => {
+                write!(f, "publication I/O failed at {step} ({state}): {source}")
+            }
+            Self::Cleanup { primary, cleanup } => write!(
+                f,
+                "{primary}; staging cleanup also failed without replacing the primary cause: {cleanup}"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for AtomicCreateError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control { source, .. } => Some(source),
+            Self::Io { source, .. } => Some(source),
+            Self::Cleanup { primary, .. } => Some(primary.as_ref()),
+        }
+    }
+}
+
+fn atomic_create_checkpoint<E, C>(
+    control: &mut C,
+    step: AtomicCreateStep,
+    target_created: bool,
+) -> Result<(), AtomicCreateError<E>>
+where
+    C: FnMut(AtomicCreateStep) -> Result<(), E> + ?Sized,
+{
+    control(step).map_err(|source| AtomicCreateError::Control {
+        step,
+        target_created,
+        source,
+    })
+}
+
+fn atomic_create_io<E>(
+    step: AtomicCreateStep,
+    target_created: bool,
+    source: std::io::Error,
+) -> AtomicCreateError<E> {
+    AtomicCreateError::Io {
+        step,
+        target_created,
+        source,
+    }
+}
+
+fn cleanup_staging_after_create_failure<E, C>(
+    tmp: &std::path::Path,
+    control: &mut C,
+    primary: AtomicCreateError<E>,
+) -> AtomicCreateError<E>
+where
+    C: FnMut(AtomicCreateStep) -> Result<(), E> + ?Sized,
+{
+    let cleanup = atomic_create_checkpoint(control, AtomicCreateStep::RemoveStaging, false)
+        .and_then(|()| {
+            std::fs::remove_file(tmp)
+                .map_err(|error| atomic_create_io(AtomicCreateStep::RemoveStaging, false, error))
+        });
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => AtomicCreateError::Cleanup {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+/// Atomically publish a new file without replacing any existing directory entry.
+///
+/// The bytes are written and synced through a sibling staging file, then linked
+/// into place with [`std::fs::hard_link`]. Creating that final hard link is one
+/// atomic no-clobber operation: if another process, a symlink, a directory, or
+/// any prior file already names `path`, publication fails and the existing entry
+/// is untouched. A check followed by [`std::fs::rename`] cannot provide this
+/// property because another publisher can win between those two operations.
+///
+/// Filesystems without same-directory hard-link support refuse this operation;
+/// they never fall back to replacement or expose a partially written target.
+/// The parent directory is assumed to be a trusted, stable namespace; safe
+/// `std` does not expose directory-handle-relative operations that would defend
+/// against a same-user ancestor or staging-name replacement race.
+pub fn write_file_atomic_new(
+    bytes: &[u8],
+    path: &std::path::Path,
+) -> Result<(), AtomicCreateError<std::convert::Infallible>> {
+    let mut control = |_step| Ok::<(), std::convert::Infallible>(());
+    write_file_atomic_new_controlled(bytes, path, &mut control)
+}
+
+/// Controlled form of [`write_file_atomic_new`] for exact fault drills.
+pub fn write_file_atomic_new_controlled<E, C>(
+    bytes: &[u8],
+    path: &std::path::Path,
+    control: &mut C,
+) -> Result<(), AtomicCreateError<E>>
+where
+    C: FnMut(AtomicCreateStep) -> Result<(), E> + ?Sized,
+{
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let (tmp, mut file) = {
+        let mut selected = None;
+        for _ in 0..NEW_FILE_STAGING_ATTEMPTS {
+            atomic_create_checkpoint(control, AtomicCreateStep::CreateStaging, false)?;
+            let sequence =
+                NEW_FILE_STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate = new_file_staging_path(path, sequence);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    selected = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(atomic_create_io(
+                        AtomicCreateStep::CreateStaging,
+                        false,
+                        error,
+                    ));
+                }
+            }
+        }
+        selected.ok_or_else(|| {
+            atomic_create_io(
+                AtomicCreateStep::CreateStaging,
+                false,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "no unique staging name remained within the bounded attempt budget",
+                ),
+            )
+        })?
+    };
+    let staged = (|| -> Result<(), AtomicCreateError<E>> {
+        let mut offset = 0_u64;
+        for chunk in bytes.chunks(ATOMIC_WRITE_CHUNK_BYTES) {
+            let step = AtomicCreateStep::WriteChunk {
+                offset,
+                chunk_len: chunk.len() as u64,
+                total_len: bytes.len() as u64,
+            };
+            atomic_create_checkpoint(control, step, false)?;
+            std::io::Write::write_all(&mut file, chunk)
+                .map_err(|error| atomic_create_io(step, false, error))?;
+            offset = offset.saturating_add(chunk.len() as u64);
+        }
+        atomic_create_checkpoint(control, AtomicCreateStep::SyncStaging, false)?;
+        file.sync_all()
+            .map_err(|error| atomic_create_io(AtomicCreateStep::SyncStaging, false, error))
+    })();
+    drop(file);
+    if let Err(error) = staged {
+        return Err(cleanup_staging_after_create_failure(&tmp, control, error));
+    }
+    if let Err(error) = atomic_create_checkpoint(control, AtomicCreateStep::LinkTarget, false) {
+        return Err(cleanup_staging_after_create_failure(&tmp, control, error));
+    }
+    if let Err(error) = std::fs::hard_link(&tmp, path) {
+        let primary = atomic_create_io(AtomicCreateStep::LinkTarget, false, error);
+        return Err(cleanup_staging_after_create_failure(&tmp, control, primary));
+    }
+    atomic_create_checkpoint(control, AtomicCreateStep::SyncDirectoryAfterLink, true)?;
+    let directory = std::fs::File::open(dir)
+        .map_err(|error| atomic_create_io(AtomicCreateStep::SyncDirectoryAfterLink, true, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| atomic_create_io(AtomicCreateStep::SyncDirectoryAfterLink, true, error))?;
+    atomic_create_checkpoint(control, AtomicCreateStep::RemoveStaging, true)?;
+    std::fs::remove_file(&tmp)
+        .map_err(|error| atomic_create_io(AtomicCreateStep::RemoveStaging, true, error))?;
+    atomic_create_checkpoint(control, AtomicCreateStep::SyncDirectoryAfterCleanup, true)?;
+    directory
+        .sync_all()
+        .map_err(|error| atomic_create_io(AtomicCreateStep::SyncDirectoryAfterCleanup, true, error))
 }
 
 const ATOMIC_WRITE_CHUNK_BYTES: usize = 64 * 1024;

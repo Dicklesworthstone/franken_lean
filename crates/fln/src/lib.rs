@@ -84,9 +84,10 @@ pub use fln_olean::artifact::{
     ArtifactByteHash, ArtifactError, ArtifactIdentityPlane, ArtifactLimits, ArtifactMemberInput,
     ArtifactMemberRecord, ArtifactPointer, ArtifactPublication, ArtifactResource,
     ArtifactSemanticHash, ArtifactSetManifest, ArtifactSetRoot, ArtifactStore,
-    ArtifactStoreDirectory, BoundArtifactSet, InjectedIoError, PublicationControl,
-    PublicationIoPoint, PublicationPoint, ResolvedArtifactSet, SCHEMA_ARTIFACT_SET_MANIFEST,
-    StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash, publish_file_atomic,
+    ArtifactStoreDirectory, AtomicCreateError, AtomicCreateStep, BoundArtifactSet, InjectedIoError,
+    PublicationControl, PublicationIoPoint, PublicationPoint, ResolvedArtifactSet,
+    SCHEMA_ARTIFACT_SET_MANIFEST, StagedArtifactSet, artifact_byte_hash, artifact_semantic_hash,
+    publish_file_atomic, publish_file_atomic_new,
 };
 use fln_olean::decl::DeclDecoder;
 pub use fln_olean::decl::DeclError as OleanDeclarationError;

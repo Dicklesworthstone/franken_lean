@@ -1822,14 +1822,16 @@ fn run_leanchecker_with_search_roots(
     }
 }
 
-/// Outbound FL-INV-04 evidence for the exact fresh-writer subset that exists:
-/// one import-free v2 module with one ordinary polymorphic definition. The
-/// output directory is operator-supplied and retained so the oracle input can
-/// be inspected after the run; existing paths are refused rather than
-/// overwritten.
+/// Bounded two-way cross-load evidence for the exact closure-free subset that
+/// exists: the pinned Reference consumes fresh import-free v2/v3 modules with
+/// one ordinary polymorphic definition, and our reader consumes a closure-free
+/// v3 `ModuleData` emitted by the same verified pin. This does not by itself
+/// establish FL-INV-04 byte identity. The output directory is operator-supplied
+/// and retained so every oracle input can be inspected after the run; existing
+/// paths are refused rather than overwritten.
 #[ignore = "cost: invokes the pinned Reference kernel over freshly emitted olean modules"]
 #[test]
-fn fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected() {
+fn closure_free_v2_and_v3_modules_cross_load_with_the_pin_and_reject_bad_semantics() {
     fn identity_definition(module: &str, well_typed: bool) -> ConstantInfo {
         let universe_name = Name::str(Name::anonymous(), "u");
         let alpha_name = Name::str(Name::anonymous(), "alpha");
@@ -1917,18 +1919,13 @@ fn fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected() 
         )
     });
 
-    let header = OleanWriteHeader {
-        version: 2,
-        flags: 1,
-        lean_version: format::PIN_TAG
-            .strip_prefix('v')
-            .expect("generated pin tag starts with v"),
-        githash: format::PIN_COMMIT,
-        base_addr: 0x2f00_0000_0000,
-    };
-    let good_module = "FlnWriterReferenceV2";
-    let bad_module = "FlnWriterReferenceV2Bad";
-    for (module, well_typed) in [(good_module, true), (bad_module, false)] {
+    let cases = [
+        ("FlnWriterReferenceV2", 2, true),
+        ("FlnWriterReferenceV2Bad", 2, false),
+        ("FlnWriterReferenceV3", 3, true),
+        ("FlnWriterReferenceV3Bad", 3, false),
+    ];
+    for (module, version, well_typed) in cases {
         let definition = identity_definition(module, well_typed);
         let encoded = encode_module(
             ModuleWriteInput {
@@ -1937,36 +1934,98 @@ fn fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected() 
                 constants: &[definition],
                 extra_const_names: &[],
             },
-            header,
+            OleanWriteHeader {
+                version,
+                flags: 1,
+                lean_version: format::PIN_TAG
+                    .strip_prefix('v')
+                    .expect("generated pin tag starts with v"),
+                githash: format::PIN_COMMIT,
+                base_addr: 0x2f00_0000_0000,
+            },
             WriteBudget::default(),
         )
-        .expect("fresh v2 module encoding");
+        .expect("fresh module encoding");
+        let view = OleanView::parse(&encoded.bytes).expect("fresh module framing");
+        assert_eq!(view.header.version, version);
+        view.shared_audit().expect("fresh module region audit");
         write_new(&output_dir.join(format!("{module}.olean")), &encoded.bytes);
     }
 
     let search_roots = [output_dir.as_path(), reference_lib.as_path()];
-    match run_leanchecker_with_search_roots(
-        &reference_lib,
-        &search_roots,
-        &[good_module.to_owned()],
-    )
-    .expect("run pinned Reference over fresh good module")
-    {
-        ReferenceCorpusVerdict::Accepted { stdout, stderr, .. } => {
-            assert!(stdout.contains("replaying FlnWriterReferenceV2"));
-            assert!(stderr.is_empty(), "accepted module wrote stderr: {stderr}");
+    for module in ["FlnWriterReferenceV2", "FlnWriterReferenceV3"] {
+        match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[module.to_owned()])
+            .expect("run pinned Reference over fresh good module")
+        {
+            ReferenceCorpusVerdict::Accepted { stdout, stderr, .. } => {
+                assert!(stdout.contains(&format!("replaying {module}")));
+                assert!(stderr.is_empty(), "accepted module wrote stderr: {stderr}");
+            }
+            verdict => panic!("pinned Reference did not accept fresh {module}: {verdict:?}"),
         }
-        verdict => panic!("pinned Reference did not accept fresh v2 module: {verdict:?}"),
     }
-    match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[bad_module.to_owned()])
-        .expect("run pinned Reference over fresh ill-typed module")
-    {
-        ReferenceCorpusVerdict::Rejected { stderr, .. } => {
-            assert!(stderr.contains("(kernel) declaration type mismatch"));
-            assert!(stderr.contains("FlnWriterReferenceV2Bad.polymorphicIdentity"));
+    for module in ["FlnWriterReferenceV2Bad", "FlnWriterReferenceV3Bad"] {
+        match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[module.to_owned()])
+            .expect("run pinned Reference over fresh ill-typed module")
+        {
+            ReferenceCorpusVerdict::Rejected { stderr, .. } => {
+                assert!(stderr.contains("(kernel) declaration type mismatch"));
+                assert!(stderr.contains(&format!("{module}.polymorphicIdentity")));
+            }
+            verdict => panic!("pinned Reference did not reject fresh {module}: {verdict:?}"),
         }
-        verdict => panic!("pinned Reference did not reject ill-typed sibling: {verdict:?}"),
     }
+
+    let producer_source = output_dir.join("FlnReferenceV3Producer.lean");
+    let reference_v3 = output_dir.join("FlnReferenceProducedV3.olean");
+    write_new(
+        &producer_source,
+        br#"import Lean.Environment
+import Lean.CompactedRegion
+
+unsafe def main (args : List String) : IO UInt32 := do
+  let some path := args.head? | return 2
+  let data : Lean.ModuleData := {
+    isModule := false
+    imports := #[]
+    constNames := #[]
+    constants := #[]
+    extraConstNames := #[`Fln.Reference.V3]
+    entries := #[]
+  }
+  let _ <- Lean.CompactedRegion.save path `FlnReferenceProducedV3 data #[] none true
+  return 0
+"#,
+    );
+    let produced = Command::new(&pinned_lean)
+        .env_clear()
+        .arg("--run")
+        .arg(&producer_source)
+        .arg(&reference_v3)
+        .output()
+        .expect("run pinned Reference v3 producer");
+    assert!(
+        produced.status.success(),
+        "pinned Reference v3 producer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+    assert!(produced.stdout.is_empty());
+    assert!(produced.stderr.is_empty());
+    let reference_bytes = fs::read(&reference_v3).expect("read Reference-produced v3 module");
+    let view = OleanView::parse(&reference_bytes).expect("parse Reference-produced v3 module");
+    assert_eq!(view.header.version, 3);
+    let audit = view
+        .shared_audit()
+        .expect("audit Reference-produced v3 module");
+    assert!(audit.objects > 0);
+    let module = view
+        .module_data(WalkBudget::default())
+        .expect("decode Reference-produced v3 ModuleData");
+    assert!(!module.is_module);
+    assert!(module.imports.is_empty());
+    assert_eq!(module.constants, 0);
+    assert_eq!(module.extra_const_names, 1);
 }
 
 fn oracle_binary_hash(reference_lib: &Path) -> Result<String, String> {

@@ -117,7 +117,8 @@ fn real_seed() -> Option<Vec<u8>> {
         .join("../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
     let file = std::fs::read(path).ok()?;
     let env = parse_olean_envelope(&file).ok()?;
-    let mut payload = file[env.payload_offset..].to_vec();
+    let payload_end = env.payload_offset.checked_add(env.payload_len)?;
+    let mut payload = file[env.payload_offset..payload_end].to_vec();
     relocate(&mut payload, env.payload_base(), BASE_A).ok()?;
     Some(payload)
 }
@@ -437,12 +438,12 @@ fn boundary_constant_sweep_covers_every_category_header_field() {
     worker.join().expect("boundary sweep must not die");
 }
 
-/// Envelope fuzz: hostile 64-byte headers over a real file image — parse
-/// yields a typed fault or a self-consistent envelope, never a panic, and
-/// header damage cannot smuggle an out-of-file payload window.
+/// Envelope fuzz: hostile framing bytes over real v2 data and a coherent v3
+/// wrapper — parse yields a typed fault or a self-consistent envelope, never
+/// a panic, and size/table damage cannot smuggle an out-of-file payload window.
 #[test]
 fn hostile_envelopes_fault_typed() {
-    let file = {
+    let v2 = {
         // A minimal well-formed file image: real header laws come from the
         // generated contract, so build one valid envelope then attack it.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -455,28 +456,71 @@ fn hostile_envelopes_fault_typed() {
             }
         }
     };
-    let header_span = parse_olean_envelope(&file)
-        .expect("fixture parses")
-        .payload_offset;
+    let v2_env = parse_olean_envelope(&v2).expect("fixture parses");
+    let header_span = v2_env.payload_offset;
+    let payload_end = v2_env.payload_offset + v2_env.payload_len;
+    let mut v3 = Vec::with_capacity(v2.len() + 2 * size_of::<u64>());
+    v3.extend_from_slice(&v2[..header_span]);
+    v3[5] = 3;
+    v3.extend_from_slice(&(v2_env.payload_len as u64).to_le_bytes());
+    v3.extend_from_slice(&v2[v2_env.payload_offset..payload_end]);
+    v3.extend_from_slice(&0u32.to_le_bytes());
+    v3.extend_from_slice(&0u32.to_le_bytes());
+    let v3_env = parse_olean_envelope(&v3).expect("coherent v3 wrapper parses");
+    assert_eq!(v3_env.version, 3);
+
     let cases = case_count();
-    for case in 0..cases {
-        let mut rng = Rng::new(MASTER_SEED ^ 0xE47 ^ case);
-        let mut image = file.clone();
-        // 1-3 byte edits confined to the header partition.
-        for _ in 0..rng.below(3) + 1 {
-            let at = rng.below(header_span);
-            image[at] = (rng.next() & 0xFF) as u8;
+    for (seed_index, (file, framing_bytes)) in [
+        (&v2, (0..header_span).collect::<Vec<_>>()),
+        (
+            &v3,
+            (0..header_span + size_of::<u64>())
+                .chain(v3_env.payload_offset + v3_env.payload_len..v3.len())
+                .collect::<Vec<_>>(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for case in 0..cases {
+            let mut rng = Rng::new(MASTER_SEED ^ 0xE47 ^ (seed_index as u64) << 32 ^ case);
+            let mut image = file.clone();
+            // 1-3 edits confined to framing rather than opaque compacted data.
+            for _ in 0..rng.below(3) + 1 {
+                let at = framing_bytes[rng.below(framing_bytes.len())];
+                image[at] = (rng.next() & 0xFF) as u8;
+            }
+            let outcome = catch_unwind(AssertUnwindSafe(|| parse_olean_envelope(&image)));
+            match outcome {
+                Ok(Ok(env)) => {
+                    assert!(
+                        env.payload_offset + env.payload_len <= image.len(),
+                        "seed {seed_index} case {case}: envelope claims a window beyond the file"
+                    );
+                }
+                Ok(Err(_)) => {} // typed fault — the law
+                Err(_) => panic!(
+                    "seed {seed_index} case {case}: envelope parser panicked (seed {MASTER_SEED:#x})"
+                ),
+            }
         }
-        let outcome = catch_unwind(AssertUnwindSafe(|| parse_olean_envelope(&image)));
+    }
+
+    // Every v3 truncation is likewise total. Cuts through the data section or
+    // either trailer table must never turn attacker-controlled lengths into a
+    // panic or an out-of-file window.
+    for cut in 0..v3.len() {
+        let image = &v3[..cut];
+        let outcome = catch_unwind(AssertUnwindSafe(|| parse_olean_envelope(image)));
         match outcome {
             Ok(Ok(env)) => {
                 assert!(
                     env.payload_offset + env.payload_len <= image.len(),
-                    "case {case}: envelope claims a window beyond the file"
+                    "cut {cut}: envelope claims a window beyond the file"
                 );
             }
             Ok(Err(_)) => {} // typed fault — the law
-            Err(_) => panic!("case {case}: envelope parser panicked (seed {MASTER_SEED:#x})"),
+            Err(_) => panic!("cut {cut}: v3 envelope parser panicked"),
         }
     }
 }

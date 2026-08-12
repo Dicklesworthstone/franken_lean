@@ -93,7 +93,8 @@ fn main() {
     let env = parse_olean_envelope(a.as_slice()).expect("envelope");
     let target = (a.addr() + env.payload_offset) as u64;
     let payload_offset = env.payload_offset;
-    let buf = &mut a.as_mut_slice().expect("mut a")[payload_offset..];
+    let payload_end = payload_offset + env.payload_len;
+    let buf = &mut a.as_mut_slice().expect("mut a")[payload_offset..payload_end];
     let report = relocate(buf, env.payload_base(), target).expect("relocate a");
     let (shared_a1, _clean_a1, dirty_a1, _) = smaps_facts(a.addr());
     let (shared_b1, clean_b1, dirty_b1, _) = smaps_facts(b.addr());

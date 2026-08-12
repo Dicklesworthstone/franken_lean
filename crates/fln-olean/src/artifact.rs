@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fln_hash::canon::{CanonReader, CanonWriter, SchemaId, registered};
 use fln_hash::domain::{Digest, Domain, DomainHasher};
+pub use fln_rt::region::{AtomicCreateError, AtomicCreateStep};
 use fln_rt::region::{AtomicWriteError, AtomicWriteStep, write_file_atomic_controlled};
 
 /// Atomically replace one conventional artifact path with complete bytes.
@@ -39,6 +40,15 @@ use fln_rt::region::{AtomicWriteError, AtomicWriteStep, write_file_atomic_contro
 /// manifest and active pointer bind the complete generation.
 pub fn publish_file_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     fln_rt::region::write_file_atomic(bytes, path)
+}
+
+/// Atomically publish one new conventional artifact path without clobbering an
+/// existing file, symlink, directory, or concurrent publisher.
+pub fn publish_file_atomic_new(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(), AtomicCreateError<std::convert::Infallible>> {
+    fln_rt::region::write_file_atomic_new(bytes, path)
 }
 
 /// The one durable manifest encoding used by artifact generations.

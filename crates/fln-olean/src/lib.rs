@@ -13,10 +13,10 @@
 //! content root. The crate map and layering are governed by `WORKSPACE_GRAPH.txt` (bead
 //! fln-8mj).
 //!
-//! **Not implemented, and therefore not claimed above:** fresh serialization of
-//! v3 envelope framing, environment-extension payloads, byte-identical emission against
-//! Reference-built fresh modules, collection of fresh `.ilean` data from elaboration, and
-//! olean-next. Publication is atomic only for consumers resolving the generation through
+//! **Not implemented, and therefore not claimed above:** closure-bearing v3 regions and their
+//! native-library relocation tables, environment-extension payloads, byte-identical emission
+//! against Reference-built fresh modules, collection of fresh `.ilean` data from elaboration,
+//! and olean-next. Publication is atomic only for consumers resolving the generation through
 //! [`artifact::ArtifactStore`];
 //! independently opening conventional flat sibling paths is not a multi-file transaction.
 //! The remaining gaps stay owned by bead `franken_lean-0nz` and still block full FL-INV-04
