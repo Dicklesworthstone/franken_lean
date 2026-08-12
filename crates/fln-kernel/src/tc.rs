@@ -74,12 +74,22 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // authority and never shared across environments, safety modes, or budgets.
 //
 // A hostile term controls the cached expressions and their 32-bit Reference
-// hashes, so both dimensions are bounded. Four structural candidates per
-// packed-data bucket cap collision work; 65,536 Arc pairs cap retained memory.
+// hashes, so every dimension is bounded. Four structural candidates per
+// packed-data bucket cap collision work; 65,536 rows cap reuse. Fvar-bearing
+// rows may retain at most 262,144 local-generation snapshots per cache, with no
+// one row retaining more than 256 or scanning more than 65,536 expression
+// nodes to discover them. Each cache may spend at most 33,554,432 node visits
+// on dependency discovery in total. The two aggregate budgets admit many
+// narrow proof contexts without allowing a few wide contexts to dominate
+// retained memory or bookkeeping.
 // Saturation simply stops admitting new cache rows. It cannot evict an answer,
 // change a completed result, or turn an interrupted computation into one.
 const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 65_536;
 const TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES: usize = 4;
+const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
+const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY: usize = 256;
+const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES: usize = 33_554_432;
+const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY: usize = 65_536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InferMode {
@@ -87,9 +97,160 @@ enum InferMode {
     Only,
 }
 
+/// One local binding on which a cached result actually depends.
+///
+/// The Reference keeps established equivalences across temporary binder
+/// pushes.  Keying every fvar-bearing result by the whole telescope epoch
+/// throws that reuse away whenever an unrelated binder is opened or closed.
+/// The opposite shortcut -- treating fvar terms as closed -- is unsound when
+/// an externally adopted identifier is later reused with another binding.
+/// Store the transitive binding slice instead: a hit is valid exactly while
+/// every referenced local still names the same immutable binding generation.
+#[derive(Clone, PartialEq, Eq)]
+struct LocalDependency {
+    id: FVarId,
+    generation: u64,
+}
+
+/// One local binder introduced during descent.
+struct LocalDecl {
+    id: FVarId,
+    previous_same_id: Option<usize>,
+    /// Monotonic identity for this immutable binding within one checker.
+    /// `None` disables fvar-bearing cache rows after theoretical u64 overflow.
+    generation: Option<u64>,
+    type_: Expr,
+    /// Present for let-bound locals (zeta target, KR-203).
+    value: Option<Expr>,
+}
+
+fn collect_fvar_ids(
+    expr: &Expr,
+    ids: &mut Vec<FVarId>,
+    seen_ids: &mut HashMap<FVarId, ()>,
+    nodes_left: &mut usize,
+) -> bool {
+    if !expr.has_fvar() {
+        return true;
+    }
+    let mut pending = vec![expr.clone()];
+    while let Some(current) = pending.pop() {
+        let Some(remaining) = nodes_left.checked_sub(1) else {
+            return false;
+        };
+        *nodes_left = remaining;
+        if !current.has_fvar() {
+            continue;
+        }
+        match current.node() {
+            ExprNode::FVar { id } => {
+                if seen_ids.insert(id.clone(), ()).is_none() {
+                    ids.push(id.clone());
+                    if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+                        return false;
+                    }
+                }
+            }
+            ExprNode::App { f, a } => {
+                pending.push(f.clone());
+                pending.push(a.clone());
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                pending.push(binder_type.clone());
+                pending.push(body.clone());
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                pending.push(type_.clone());
+                pending.push(value.clone());
+                pending.push(body.clone());
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                pending.push(expr.clone());
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    true
+}
+
+fn local_dependencies(
+    expressions: &[&Expr],
+    locals: &[LocalDecl],
+    local_positions: &HashMap<FVarId, usize>,
+    nodes_left: &mut usize,
+) -> Option<Vec<LocalDependency>> {
+    let mut ids = Vec::new();
+    let mut seen_ids = HashMap::new();
+    for expression in expressions {
+        if !collect_fvar_ids(expression, &mut ids, &mut seen_ids, nodes_left) {
+            return None;
+        }
+    }
+    if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+        return None;
+    }
+    let mut next = 0;
+    let mut dependencies = Vec::new();
+    while let Some(id) = ids.get(next).cloned() {
+        next += 1;
+        let local = local_positions
+            .get(&id)
+            .and_then(|position| locals.get(*position))?;
+        if !collect_fvar_ids(&local.type_, &mut ids, &mut seen_ids, nodes_left) {
+            return None;
+        }
+        if let Some(value) = &local.value
+            && !collect_fvar_ids(value, &mut ids, &mut seen_ids, nodes_left)
+        {
+            return None;
+        }
+        if ids.len() > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+            return None;
+        }
+        dependencies.push(LocalDependency {
+            id,
+            generation: local.generation?,
+        });
+    }
+    dependencies.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    Some(dependencies)
+}
+
+fn dependencies_are_live(
+    dependencies: &[LocalDependency],
+    locals: &[LocalDecl],
+    local_positions: &HashMap<FVarId, usize>,
+) -> bool {
+    dependencies.iter().all(|dependency| {
+        local_positions
+            .get(&dependency.id)
+            .and_then(|position| locals.get(*position))
+            .is_some_and(|local| local.generation == Some(dependency.generation))
+    })
+}
+
+struct ExprResultCacheEntry {
+    key: Expr,
+    value: Expr,
+    dependencies: Vec<LocalDependency>,
+}
+
 struct ExprResultCache {
-    buckets: HashMap<(u64, u64), Vec<(Expr, Expr)>>,
+    buckets: HashMap<u64, Vec<ExprResultCacheEntry>>,
     entries: usize,
+    local_dependency_cells: usize,
+    local_dependency_scan_nodes: usize,
     max_entries: usize,
     max_bucket_entries: usize,
 }
@@ -106,53 +267,109 @@ impl ExprResultCache {
         Self {
             buckets: HashMap::new(),
             entries: 0,
+            local_dependency_cells: 0,
+            local_dependency_scan_nodes: 0,
             max_entries,
             max_bucket_entries,
         }
     }
 
-    fn scoped_key(key: &Expr, local_epoch: Option<u64>) -> Option<(u64, u64)> {
-        let scope = if key.has_fvar() { local_epoch? } else { 0 };
-        Some((scope, key.data().0))
+    fn get(
+        &self,
+        key: &Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) -> Option<Expr> {
+        self.buckets.get(&key.data().0)?.iter().find_map(|entry| {
+            (entry.key == *key
+                && dependencies_are_live(&entry.dependencies, locals, local_positions))
+            .then(|| entry.value.clone())
+        })
     }
 
-    fn get(&self, key: &Expr, local_epoch: Option<u64>) -> Option<Expr> {
-        self.buckets
-            .get(&Self::scoped_key(key, local_epoch)?)?
-            .iter()
-            .find_map(|(candidate, value)| (candidate == key).then(|| value.clone()))
-    }
-
-    fn insert(&mut self, key: Expr, value: Expr, local_epoch: Option<u64>) {
-        let Some(packed) = Self::scoped_key(&key, local_epoch) else {
+    fn insert(
+        &mut self,
+        key: Expr,
+        value: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) {
+        let packed = key.data().0;
+        if self.entries >= self.max_entries
+            || self.max_bucket_entries == 0
+            || self
+                .buckets
+                .get(&packed)
+                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+        {
+            return;
+        }
+        if self.local_dependency_cells >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS
+            && (key.has_fvar() || value.has_fvar())
+        {
+            return;
+        }
+        let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
+            .saturating_sub(self.local_dependency_scan_nodes)
+            .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
+        let mut nodes_left = scan_limit;
+        let dependencies =
+            local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
+        self.local_dependency_scan_nodes += scan_limit - nodes_left;
+        let Some(dependencies) = dependencies else {
             return;
         };
+        let dependency_count = dependencies.len();
+        if self
+            .local_dependency_cells
+            .checked_add(dependency_count)
+            .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
+        {
+            return;
+        }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
-            if let Some((_, existing)) = bucket.iter_mut().find(|(candidate, _)| candidate == &key)
+            if let Some(existing) = bucket
+                .iter_mut()
+                .find(|entry| entry.key == key && entry.dependencies == dependencies)
             {
-                *existing = value;
+                existing.value = value;
                 return;
             }
-            if self.entries >= self.max_entries || bucket.len() >= self.max_bucket_entries {
-                return;
-            }
-            bucket.push((key, value));
+            bucket.push(ExprResultCacheEntry {
+                key,
+                value,
+                dependencies,
+            });
             self.entries += 1;
+            self.local_dependency_cells += dependency_count;
             return;
         }
-        if self.entries >= self.max_entries || self.max_bucket_entries == 0 {
-            return;
-        }
-        self.buckets.insert(packed, vec![(key, value)]);
+        self.buckets.insert(
+            packed,
+            vec![ExprResultCacheEntry {
+                key,
+                value,
+                dependencies,
+            }],
+        );
         self.entries += 1;
+        self.local_dependency_cells += dependency_count;
     }
 }
 
 struct PositiveDefEqCache {
-    buckets: HashMap<(u64, u64), Vec<(Expr, Expr)>>,
+    buckets: HashMap<(u64, u64), Vec<PositiveDefEqCacheEntry>>,
     entries: usize,
+    local_dependency_cells: usize,
+    local_dependency_scan_nodes: usize,
     max_entries: usize,
     max_bucket_entries: usize,
+}
+
+struct PositiveDefEqCacheEntry {
+    left: Expr,
+    right: Expr,
+    dependencies: Vec<LocalDependency>,
 }
 
 impl PositiveDefEqCache {
@@ -167,6 +384,8 @@ impl PositiveDefEqCache {
         Self {
             buckets: HashMap::new(),
             entries: 0,
+            local_dependency_cells: 0,
+            local_dependency_scan_nodes: 0,
             max_entries,
             max_bucket_entries,
         }
@@ -182,44 +401,91 @@ impl PositiveDefEqCache {
         }
     }
 
-    fn contains(&self, left: &Expr, right: &Expr) -> bool {
-        if left.has_fvar() || right.has_fvar() {
-            return false;
-        }
+    fn contains(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) -> bool {
         self.buckets
             .get(&Self::packed_key(left, right))
             .is_some_and(|bucket| {
-                bucket.iter().any(|(cached_left, cached_right)| {
-                    (cached_left == left && cached_right == right)
-                        || (cached_left == right && cached_right == left)
+                bucket.iter().any(|entry| {
+                    ((entry.left == *left && entry.right == *right)
+                        || (entry.left == *right && entry.right == *left))
+                        && dependencies_are_live(&entry.dependencies, locals, local_positions)
                 })
             })
     }
 
-    fn insert(&mut self, left: Expr, right: Expr) {
-        if left.has_fvar() || right.has_fvar() {
+    fn insert(
+        &mut self,
+        left: Expr,
+        right: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) {
+        let packed = Self::packed_key(&left, &right);
+        if self.entries >= self.max_entries
+            || self.max_bucket_entries == 0
+            || self
+                .buckets
+                .get(&packed)
+                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+        {
             return;
         }
-        let packed = Self::packed_key(&left, &right);
+        if self.local_dependency_cells >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS
+            && (left.has_fvar() || right.has_fvar())
+        {
+            return;
+        }
+        let scan_limit = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES
+            .saturating_sub(self.local_dependency_scan_nodes)
+            .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
+        let mut nodes_left = scan_limit;
+        let dependencies =
+            local_dependencies(&[&left, &right], locals, local_positions, &mut nodes_left);
+        self.local_dependency_scan_nodes += scan_limit - nodes_left;
+        let Some(dependencies) = dependencies else {
+            return;
+        };
+        let dependency_count = dependencies.len();
+        if self
+            .local_dependency_cells
+            .checked_add(dependency_count)
+            .is_none_or(|cells| cells > TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS)
+        {
+            return;
+        }
         if let Some(bucket) = self.buckets.get_mut(&packed) {
-            if bucket.iter().any(|(cached_left, cached_right)| {
-                (cached_left == &left && cached_right == &right)
-                    || (cached_left == &right && cached_right == &left)
+            if bucket.iter().any(|entry| {
+                ((entry.left == left && entry.right == right)
+                    || (entry.left == right && entry.right == left))
+                    && entry.dependencies == dependencies
             }) {
                 return;
             }
-            if self.entries >= self.max_entries || bucket.len() >= self.max_bucket_entries {
-                return;
-            }
-            bucket.push((left, right));
+            bucket.push(PositiveDefEqCacheEntry {
+                left,
+                right,
+                dependencies,
+            });
             self.entries += 1;
+            self.local_dependency_cells += dependency_count;
             return;
         }
-        if self.entries >= self.max_entries || self.max_bucket_entries == 0 {
-            return;
-        }
-        self.buckets.insert(packed, vec![(left, right)]);
+        self.buckets.insert(
+            packed,
+            vec![PositiveDefEqCacheEntry {
+                left,
+                right,
+                dependencies,
+            }],
+        );
         self.entries += 1;
+        self.local_dependency_cells += dependency_count;
     }
 }
 
@@ -551,20 +817,13 @@ enum WhnfRecursorContinuation {
     Retry(Expr),
 }
 
-/// One local binder introduced during descent.
-struct LocalDecl {
-    id: FVarId,
-    type_: Expr,
-    /// Present for let-bound locals (zeta target, KR-203).
-    value: Option<Expr>,
-}
-
 pub(crate) struct TypeChecker<'a> {
     env: &'a Environment,
     lparams: &'a [Name],
     locals: Vec<LocalDecl>,
+    local_positions: HashMap<FVarId, usize>,
     fresh: u64,
-    local_cache_epoch: Option<u64>,
+    next_local_generation: Option<u64>,
     budget: Budget,
     used: Consumption,
     /// The checking context's safety mode (pin `m_definition_safety`): gates
@@ -601,8 +860,9 @@ impl<'a> TypeChecker<'a> {
             env,
             lparams,
             locals: Vec::new(),
+            local_positions: HashMap::new(),
             fresh: 0,
-            local_cache_epoch: Some(1),
+            next_local_generation: Some(1),
             budget,
             used: Consumption::default(),
             safety,
@@ -621,12 +881,7 @@ impl<'a> TypeChecker<'a> {
     /// Adopt an externally-created local (the admission engine's telescopes,
     /// bead franken_lean-ap6) so `infer`/`whnf`/`def_eq` resolve its fvar.
     pub(crate) fn adopt_local(&mut self, id: FVarId, type_: Expr) {
-        self.locals.push(LocalDecl {
-            id,
-            type_,
-            value: None,
-        });
-        self.bump_local_cache_epoch();
+        self.push_local(id, type_, None);
     }
 
     pub(crate) fn consumption(&self) -> Consumption {
@@ -663,35 +918,49 @@ impl<'a> TypeChecker<'a> {
             Name::str(Name::anonymous(), "_kernel"),
             self.fresh,
         ));
-        self.locals.push(LocalDecl {
-            id: id.clone(),
-            type_,
-            value,
-        });
-        self.bump_local_cache_epoch();
+        self.push_local(id.clone(), type_, value);
         id
     }
 
     fn drop_local(&mut self) {
-        self.locals.pop();
-        self.bump_local_cache_epoch();
-    }
-
-    fn truncate_locals(&mut self, len: usize) {
-        if self.locals.len() != len {
-            self.locals.truncate(len);
-            self.bump_local_cache_epoch();
+        let Some(local) = self.locals.pop() else {
+            return;
+        };
+        if let Some(previous) = local.previous_same_id {
+            self.local_positions.insert(local.id, previous);
+        } else {
+            self.local_positions.remove(&local.id);
         }
     }
 
-    fn bump_local_cache_epoch(&mut self) {
-        self.local_cache_epoch = self
-            .local_cache_epoch
-            .and_then(|epoch| epoch.checked_add(1));
+    fn truncate_locals(&mut self, len: usize) {
+        while self.locals.len() > len {
+            self.drop_local();
+        }
     }
 
     fn find_local(&self, id: &FVarId) -> Option<&LocalDecl> {
-        self.locals.iter().rev().find(|d| &d.id == id)
+        self.local_positions
+            .get(id)
+            .and_then(|position| self.locals.get(*position))
+    }
+
+    fn take_local_generation(&mut self) -> Option<u64> {
+        let generation = self.next_local_generation?;
+        self.next_local_generation = generation.checked_add(1);
+        Some(generation)
+    }
+
+    fn push_local(&mut self, id: FVarId, type_: Expr, value: Option<Expr>) {
+        let generation = self.take_local_generation();
+        let previous_same_id = self.local_positions.insert(id.clone(), self.locals.len());
+        self.locals.push(LocalDecl {
+            id,
+            previous_same_id,
+            generation,
+            type_,
+            value,
+        });
     }
 
     // ---- de Bruijn machinery -----------------------------------------------------------
@@ -987,7 +1256,7 @@ impl<'a> TypeChecker<'a> {
     /// follow-up slice: its absence leaves those applications stuck —
     /// under-acceptance, never over-acceptance.
     fn whnf(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
-        if let Some(cached) = self.whnf_cache.get(e, self.local_cache_epoch) {
+        if let Some(cached) = self.whnf_cache.get(e, &self.locals, &self.local_positions) {
             return Ok(cached);
         }
         let mut current = self.whnf_core(e, depth)?;
@@ -1000,15 +1269,22 @@ impl<'a> TypeChecker<'a> {
                 None => break current,
             }
         };
-        self.whnf_cache
-            .insert(e.clone(), result.clone(), self.local_cache_epoch);
+        self.whnf_cache.insert(
+            e.clone(),
+            result.clone(),
+            &self.locals,
+            &self.local_positions,
+        );
         Ok(result)
     }
 
     /// KR-201..204: mdata, beta (batched), zeta (let + let-fvar), proj.
     fn whnf_core(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
         self.step(depth)?;
-        if let Some(cached) = self.whnf_core_cache.get(e, self.local_cache_epoch) {
+        if let Some(cached) = self
+            .whnf_core_cache
+            .get(e, &self.locals, &self.local_positions)
+        {
             return Ok(cached);
         }
         let result = match e.node() {
@@ -1106,8 +1382,12 @@ impl<'a> TypeChecker<'a> {
             ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
         );
         if result != *e || cache_identity {
-            self.whnf_core_cache
-                .insert(e.clone(), result.clone(), self.local_cache_epoch);
+            self.whnf_core_cache.insert(
+                e.clone(),
+                result.clone(),
+                &self.locals,
+                &self.local_positions,
+            );
         }
         Ok(result)
     }
@@ -1433,32 +1713,34 @@ impl<'a> TypeChecker<'a> {
         let mut continuations = Vec::new();
         let mut current = e.clone();
         loop {
-            let mut normalized =
-                if let Some(cached) = self.whnf_cache.get(&current, self.local_cache_epoch) {
-                    cached
-                } else if let Some((frame, major)) =
-                    self.prepare_inductive_reduction(&current, depth)?
-                {
-                    self.step(depth)?;
-                    continuations.push(WhnfRecursorContinuation::Finish(frame));
-                    current = major;
-                    continue;
-                } else {
-                    let previous = self.defer_recursor_major;
-                    self.defer_recursor_major = true;
-                    let result = self.whnf(&current, depth);
-                    self.defer_recursor_major = previous;
-                    match result {
-                        Ok(normalized) => normalized,
-                        Err(Stop::DeferredRecursor { frame, major }) => {
-                            continuations.push(WhnfRecursorContinuation::Retry(current.clone()));
-                            continuations.push(WhnfRecursorContinuation::Finish(*frame));
-                            current = major;
-                            continue;
-                        }
-                        Err(stop) => return Err(stop),
+            let mut normalized = if let Some(cached) =
+                self.whnf_cache
+                    .get(&current, &self.locals, &self.local_positions)
+            {
+                cached
+            } else if let Some((frame, major)) =
+                self.prepare_inductive_reduction(&current, depth)?
+            {
+                self.step(depth)?;
+                continuations.push(WhnfRecursorContinuation::Finish(frame));
+                current = major;
+                continue;
+            } else {
+                let previous = self.defer_recursor_major;
+                self.defer_recursor_major = true;
+                let result = self.whnf(&current, depth);
+                self.defer_recursor_major = previous;
+                match result {
+                    Ok(normalized) => normalized,
+                    Err(Stop::DeferredRecursor { frame, major }) => {
+                        continuations.push(WhnfRecursorContinuation::Retry(current.clone()));
+                        continuations.push(WhnfRecursorContinuation::Finish(*frame));
+                        current = major;
+                        continue;
                     }
-                };
+                    Err(stop) => return Err(stop),
+                }
+            };
 
             loop {
                 match continuations.pop() {
@@ -1466,7 +1748,8 @@ impl<'a> TypeChecker<'a> {
                         self.whnf_cache.insert(
                             origin.clone(),
                             normalized.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         );
                         // A recursor is reduced from `whnf_core`. If its RHS
                         // reaches a stuck nested match, the enclosing retry
@@ -1477,7 +1760,8 @@ impl<'a> TypeChecker<'a> {
                         self.whnf_core_cache.insert(
                             origin,
                             normalized.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         );
                     }
                     Some(WhnfRecursorContinuation::Retry(retry)) => {
@@ -1739,7 +2023,10 @@ impl<'a> TypeChecker<'a> {
     fn quick_def_eq_rules(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<Option<bool>> {
         // KR-301 positive equivalence cache, then quick structural equality
         // (data-word fast path inside Expr::eq).
-        if self.positive_def_eq_cache.contains(t, s) {
+        if self
+            .positive_def_eq_cache
+            .contains(t, s, &self.locals, &self.local_positions)
+        {
             return Ok(Some(true));
         }
         if t == s {
@@ -1800,7 +2087,12 @@ impl<'a> TypeChecker<'a> {
     fn is_def_eq(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
         let result = self.is_def_eq_core(t, s, depth);
         if matches!(result, Ok(true)) {
-            self.positive_def_eq_cache.insert(t.clone(), s.clone());
+            self.positive_def_eq_cache.insert(
+                t.clone(),
+                s.clone(),
+                &self.locals,
+                &self.local_positions,
+            );
         }
         result
     }
@@ -2289,8 +2581,10 @@ impl<'a> TypeChecker<'a> {
     fn infer_core_mode(&mut self, e: &Expr, depth: u32, mode: InferMode) -> KResult<Expr> {
         self.step(depth)?;
         let cached = match mode {
-            InferMode::Check => self.infer_cache.get(e, self.local_cache_epoch),
-            InferMode::Only => self.infer_only_cache.get(e, self.local_cache_epoch),
+            InferMode::Check => self.infer_cache.get(e, &self.locals, &self.local_positions),
+            InferMode::Only => self
+                .infer_only_cache
+                .get(e, &self.locals, &self.local_positions),
         };
         if let Some(cached) = cached {
             return Ok(cached);
@@ -2391,13 +2685,15 @@ impl<'a> TypeChecker<'a> {
                         InferMode::Check => self.infer_cache.insert(
                             e.clone(),
                             inferred.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         ),
                         InferMode::Only => {
                             self.infer_only_cache.insert(
                                 e.clone(),
                                 inferred.clone(),
-                                self.local_cache_epoch,
+                                &self.locals,
+                                &self.local_positions,
                             );
                         }
                     }
@@ -2412,13 +2708,15 @@ impl<'a> TypeChecker<'a> {
                         InferMode::Check => self.infer_cache.insert(
                             e.clone(),
                             inferred.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         ),
                         InferMode::Only => {
                             self.infer_only_cache.insert(
                                 e.clone(),
                                 inferred.clone(),
-                                self.local_cache_epoch,
+                                &self.locals,
+                                &self.local_positions,
                             );
                         }
                     }
@@ -2433,13 +2731,15 @@ impl<'a> TypeChecker<'a> {
                         InferMode::Check => self.infer_cache.insert(
                             e.clone(),
                             inferred.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         ),
                         InferMode::Only => {
                             self.infer_only_cache.insert(
                                 e.clone(),
                                 inferred.clone(),
-                                self.local_cache_epoch,
+                                &self.locals,
+                                &self.local_positions,
                             );
                         }
                     }
@@ -2454,13 +2754,15 @@ impl<'a> TypeChecker<'a> {
                         InferMode::Check => self.infer_cache.insert(
                             e.clone(),
                             inferred.clone(),
-                            self.local_cache_epoch,
+                            &self.locals,
+                            &self.local_positions,
                         ),
                         InferMode::Only => {
                             self.infer_only_cache.insert(
                                 e.clone(),
                                 inferred.clone(),
-                                self.local_cache_epoch,
+                                &self.locals,
+                                &self.local_positions,
                             );
                         }
                     }
@@ -2496,14 +2798,19 @@ impl<'a> TypeChecker<'a> {
         if let Ok(inferred) = &result {
             match mode {
                 InferMode::Check => {
-                    self.infer_cache
-                        .insert(e.clone(), inferred.clone(), self.local_cache_epoch);
+                    self.infer_cache.insert(
+                        e.clone(),
+                        inferred.clone(),
+                        &self.locals,
+                        &self.local_positions,
+                    );
                 }
                 InferMode::Only => {
                     self.infer_only_cache.insert(
                         e.clone(),
                         inferred.clone(),
-                        self.local_cache_epoch,
+                        &self.locals,
+                        &self.local_positions,
                     );
                 }
             }
@@ -2552,7 +2859,8 @@ impl<'a> TypeChecker<'a> {
             self.infer_cache.insert(
                 prefix.clone(),
                 function_type.clone(),
-                self.local_cache_epoch,
+                &self.locals,
+                &self.local_positions,
             );
         }
         Ok(function_type)
@@ -3003,10 +3311,18 @@ impl<'a> TypeChecker<'a> {
     /// on every retry and rebuild the continuation until the step budget is
     /// exhausted.
     fn cache_stuck_recursor(&mut self, stuck: Expr) -> Expr {
-        self.whnf_cache
-            .insert(stuck.clone(), stuck.clone(), self.local_cache_epoch);
-        self.whnf_core_cache
-            .insert(stuck.clone(), stuck.clone(), self.local_cache_epoch);
+        self.whnf_cache.insert(
+            stuck.clone(),
+            stuck.clone(),
+            &self.locals,
+            &self.local_positions,
+        );
+        self.whnf_core_cache.insert(
+            stuck.clone(),
+            stuck.clone(),
+            &self.locals,
+            &self.local_positions,
+        );
         stuck
     }
 }
@@ -4136,7 +4452,7 @@ mod tests {
         );
         assert!(
             tc.infer_cache.entries == 1,
-            "a live local result may be retained only under its current telescope epoch"
+            "a live local result must retain its exact dependency slice"
         );
         tc.drop_local();
         assert!(
@@ -4150,7 +4466,7 @@ mod tests {
         tc.adopt_local(id, replacement_type.clone());
         assert!(
             tc.infer(&local, 0).expect("replacement local infers") == replacement_type,
-            "reusing an fvar identifier under a new telescope epoch must not hit the old type"
+            "reusing an fvar identifier with another binding must not hit the old type"
         );
 
         let mut whnf_tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
@@ -4171,7 +4487,85 @@ mod tests {
                 .whnf_public(&let_local, 0)
                 .expect("replacement non-let local normalizes")
                 == let_local,
-            "a new telescope epoch must not reuse the former let-local normal form"
+            "a changed binding must not reuse the former let-local normal form"
+        );
+    }
+
+    #[test]
+    fn fvar_cache_dependencies_survive_unrelated_binders_but_not_rebinding() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let zero = Expr::sort(Level::zero());
+        let let_id = tc.fresh_fvar(Expr::sort(Level::one()), Some(zero.clone()));
+        let let_local = Expr::fvar(let_id.clone());
+
+        assert!(
+            tc.def_eq_public(&let_local, &zero, 0)
+                .expect("the let local reduces to its value"),
+            "the initial positive result is the fact being cached"
+        );
+        let after_first = tc.consumption().steps_used;
+        assert!(
+            tc.positive_def_eq_cache.entries == 1,
+            "the fvar-bearing positive result must retain a dependency snapshot"
+        );
+
+        tc.adopt_local(
+            FVarId(Name::str(Name::anonymous(), "unrelated")),
+            Expr::sort(Level::zero()),
+        );
+        assert!(
+            tc.def_eq_public(&let_local, &zero, 0)
+                .expect("an unrelated binder preserves the cached fact"),
+            "unrelated telescope growth must not invalidate the dependency slice"
+        );
+        assert!(
+            tc.consumption().steps_used - after_first == 1,
+            "a valid positive-equivalence hit charges only the KR-300 entry hook"
+        );
+
+        tc.drop_local();
+        tc.adopt_local(let_id.clone(), Expr::sort(Level::one()));
+        assert!(
+            !tc.def_eq_public(&let_local, &zero, 0)
+                .expect("rebinding must force an ordinary comparison"),
+            "shadowing an fvar identifier with another binding must invalidate the old fact"
+        );
+
+        tc.drop_local();
+        let restored_generation_steps = tc.consumption().steps_used;
+        assert!(
+            tc.def_eq_public(&let_local, &zero, 0)
+                .expect("dropping the shadow restores the original binding"),
+            "revealing a still-live prior generation must recover its cached fact"
+        );
+        assert!(
+            tc.consumption().steps_used - restored_generation_steps == 1,
+            "the restored generation must hit the original cache row"
+        );
+
+        tc.drop_local();
+        tc.adopt_local(let_id, Expr::sort(Level::one()));
+        assert!(
+            !tc.def_eq_public(&let_local, &zero, 0)
+                .expect("reusing a closed identifier must force an ordinary comparison"),
+            "a new generation must not borrow the closed binding's cached fact"
+        );
+
+        let type_id = FVarId(Name::str(Name::anonymous(), "type_dependency"));
+        let value_id = FVarId(Name::str(Name::anonymous(), "transitive"));
+        let value_local = Expr::fvar(value_id.clone());
+        tc.adopt_local(type_id.clone(), Expr::sort(Level::zero()));
+        tc.adopt_local(value_id, Expr::fvar(type_id.clone()));
+        tc.infer(&value_local, 0)
+            .expect("the dependent local infers under its original context");
+        let rows_before_shadow = tc.infer_cache.entries;
+        tc.adopt_local(type_id, Expr::sort(Level::one()));
+        tc.infer(&value_local, 0)
+            .expect("the dependent local still infers under the shadow");
+        assert!(
+            tc.infer_cache.entries == rows_before_shadow + 1,
+            "changing a transitive type dependency must miss and retain a new generation row"
         );
     }
 
@@ -4213,6 +4607,60 @@ mod tests {
                 && saturated.instantiate_lparams_cache.entries == 0,
             "zero-capacity caches must remain bounded at zero"
         );
+
+        let mut fvar_saturated = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "bounded"));
+        let local = Expr::fvar(id.clone());
+        let local_type = Expr::sort(Level::zero());
+        fvar_saturated.adopt_local(id, local_type.clone());
+        fvar_saturated.infer_cache.local_dependency_cells =
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS;
+        assert!(
+            fvar_saturated
+                .infer(&local, 0)
+                .expect("fvar inference still runs when its cache partition is full")
+                == local_type,
+            "fvar cache saturation must degrade to ordinary inference"
+        );
+        assert!(
+            fvar_saturated.infer_cache.entries == 0,
+            "the separate fvar ceiling must refuse another retained dependency slice"
+        );
+
+        let oversized_scan = Expr::mdata(fln_core::options::KVMap::default(), local);
+        let mut one_node_left = 1;
+        assert!(
+            local_dependencies(
+                &[&oversized_scan],
+                &fvar_saturated.locals,
+                &fvar_saturated.local_positions,
+                &mut one_node_left,
+            )
+            .is_none(),
+            "dependency discovery must refuse a hostile expression beyond its node ceiling"
+        );
+
+        let mut too_many = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let mut wide = Expr::sort(Level::zero());
+        for index in 0..=TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY {
+            let id = FVarId(Name::num(
+                Name::str(Name::anonymous(), "wide"),
+                index as u64,
+            ));
+            let local = Expr::fvar(id.clone());
+            too_many.adopt_local(id, Expr::sort(Level::zero()));
+            wide = Expr::app(wide, local);
+        }
+        too_many.infer_cache.insert(
+            wide.clone(),
+            wide,
+            &too_many.locals,
+            &too_many.local_positions,
+        );
+        assert!(
+            too_many.infer_cache.entries == 0,
+            "a row with too many distinct dependencies must be an uncached fallback"
+        );
     }
 
     #[test]
@@ -4233,20 +4681,32 @@ mod tests {
         let mut collided = TypeChecker::new(&env, &[], Budget::DEFAULT);
         collided.infer_cache = ExprResultCache::bounded(1, 1);
         collided.infer_cache.buckets.insert(
-            (0, pi.data().0),
-            vec![(unrelated.clone(), unrelated.clone())],
+            pi.data().0,
+            vec![ExprResultCacheEntry {
+                key: unrelated.clone(),
+                value: unrelated.clone(),
+                dependencies: Vec::new(),
+            }],
         );
         collided.infer_cache.entries = 1;
         collided.whnf_cache = ExprResultCache::bounded(1, 1);
         collided.whnf_cache.buckets.insert(
-            (0, redex.data().0),
-            vec![(unrelated.clone(), unrelated.clone())],
+            redex.data().0,
+            vec![ExprResultCacheEntry {
+                key: unrelated.clone(),
+                value: unrelated.clone(),
+                dependencies: Vec::new(),
+            }],
         );
         collided.whnf_cache.entries = 1;
         collided.positive_def_eq_cache = PositiveDefEqCache::bounded(1, 1);
         collided.positive_def_eq_cache.buckets.insert(
             PositiveDefEqCache::packed_key(&redex, &sort),
-            vec![(unrelated.clone(), pi.clone())],
+            vec![PositiveDefEqCacheEntry {
+                left: unrelated.clone(),
+                right: pi.clone(),
+                dependencies: Vec::new(),
+            }],
         );
         collided.positive_def_eq_cache.entries = 1;
 
