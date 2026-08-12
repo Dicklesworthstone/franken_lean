@@ -1710,7 +1710,7 @@ fn run_leanchecker_with_search_roots(
         .ok_or_else(|| format!("leanchecker {} has no bin directory", binary.display()))?;
     let lean_path = std::env::join_paths(search_roots)
         .map_err(|error| format!("construct pinned leanchecker search path: {error}"))?;
-    let mut command = Command::new(&binary);
+    let mut command = Command::new(&binary); // ubs:ignore — path is derived from the SUITE.lock-pinned Reference installation.
     command
         .env_clear()
         // `Lean.findSysroot` invokes the sibling `lean --print-prefix` by

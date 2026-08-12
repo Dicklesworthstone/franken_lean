@@ -24,6 +24,7 @@ fn utf8(bytes: &[u8]) -> &str {
 
 #[test]
 fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
+    // ubs:ignore — test-only retained scratch discriminator, not a security token.
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "flbc-product-e2e-{}-{:?}",
         std::process::id(),
