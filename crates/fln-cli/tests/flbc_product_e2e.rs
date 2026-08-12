@@ -169,3 +169,261 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     assert!(recovered.stderr.is_empty());
     assert!(utf8(&recovered.stdout).contains("\"scalarValue\":42"));
 }
+
+/// Real-process D18 increment for the live `fln-cli` product root.
+///
+/// This proves the sidecar that the CLI actually emits: two isolated producer
+/// invocations are byte-identical, the sound consumer binds that pair, a
+/// frontier-tagged sidecar and a 12-component (omitted-closure) sidecar are
+/// both refused before Golem runs, and restoring the original pair recovers.
+/// Concurrent consumers of the restored pair return identical JSON.
+///
+/// It does not claim a certified profile, mode-separated cache reuse, 1/8/32
+/// engine scheduling, or general Lean. Those remain open on
+/// `fln-d18-product-half-rgsg`.
+#[test]
+fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
+    // ubs:ignore — test-only retained scratch discriminator, not a security token.
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "d18-sidecar-e2e-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir(&root).expect("create retained D18 integration-test directory");
+    let source = root.join("Answer.lean");
+    std::fs::write(
+        &source,
+        b"def first (x y : Nat) : Nat := x\ndef answer : Nat := first 42 9\n",
+    )
+    .expect("write supported dependent source batch");
+
+    let first_product = root.join("first.flbc");
+    let first_sidecar = root.join("first.sidecar");
+    let second_product = root.join("second.flbc");
+    let second_sidecar = root.join("second.sidecar");
+
+    let first = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &first_product,
+        Path::new("--emit-sidecar"),
+        &first_sidecar,
+        &source,
+    ]);
+    assert!(
+        first.status.success(),
+        "first isolated producer stderr: {}",
+        utf8(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    let first_stdout = utf8(&first.stdout);
+    assert!(first_stdout.contains("\"schema\":\"fln.source-run/4\""));
+    assert!(first_stdout.contains("\"finalValue\":42"));
+    assert!(first_stdout.contains("\"emittedSidecar\":{"));
+    assert!(first_stdout.contains("\"profile\":\"standard\""));
+
+    let second = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &second_product,
+        Path::new("--emit-sidecar"),
+        &second_sidecar,
+        &source,
+    ]);
+    assert!(
+        second.status.success(),
+        "second isolated producer stderr: {}",
+        utf8(&second.stderr)
+    );
+    assert!(second.stderr.is_empty());
+    let product = std::fs::read(&first_product).expect("read first product");
+    let sidecar = std::fs::read(&first_sidecar).expect("read first sidecar");
+    assert_eq!(
+        product,
+        std::fs::read(&second_product).expect("read second product"),
+        "two isolated standard-profile builds must emit byte-identical FLBC"
+    );
+    assert_eq!(
+        sidecar,
+        std::fs::read(&second_sidecar).expect("read second sidecar"),
+        "two isolated standard-profile builds must emit byte-identical sidecars"
+    );
+    assert!(!product.is_empty());
+    assert!(!sidecar.is_empty());
+    fln::decode_flbc_product_sidecar(&sidecar).expect("emitted sidecar decodes");
+
+    let bound = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--sidecar"),
+        &first_sidecar,
+        &first_product,
+    ]);
+    assert!(
+        bound.status.success(),
+        "bound consumer stderr: {}",
+        utf8(&bound.stderr)
+    );
+    assert!(bound.stderr.is_empty());
+    let bound_stdout = utf8(&bound.stdout).to_owned();
+    assert!(bound_stdout.contains("\"schema\":\"fln.flbc-run/2\""));
+    assert!(bound_stdout.contains("\"scalarValue\":42"));
+    assert!(bound_stdout.contains("\"sidecar\":{\"verified\":true"));
+
+    let mode_at = sidecar_mode_offset(&sidecar);
+    assert_eq!(sidecar[mode_at], 2, "producer emits the sound mode tag");
+    let mut frontier = sidecar.clone();
+    frontier[mode_at] = 3;
+    fln::publish_file_atomic(&frontier, &first_sidecar).expect("plant frontier-tagged sidecar");
+    let contaminated = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--sidecar"),
+        &first_sidecar,
+        &first_product,
+    ]);
+    assert!(!contaminated.status.success());
+    assert!(contaminated.stdout.is_empty());
+    let contaminated_stderr = utf8(&contaminated.stderr);
+    assert!(contaminated_stderr.contains("\"schema\":\"fln.flbc-run/2\""));
+    assert!(contaminated_stderr.contains("\"class\":\"sidecar\""));
+    assert!(contaminated_stderr.contains("product coordinate mode"));
+
+    fln::publish_file_atomic(&sidecar, &first_sidecar).expect("restore exact sidecar");
+    let after_frontier = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--sidecar"),
+        &first_sidecar,
+        &first_product,
+    ]);
+    assert!(
+        after_frontier.status.success(),
+        "post-frontier recovery stderr: {}",
+        utf8(&after_frontier.stderr)
+    );
+    assert_eq!(utf8(&after_frontier.stdout), bound_stdout);
+
+    let count_at = sidecar_component_count_offset(&sidecar);
+    let mut omitted = sidecar.clone();
+    omitted[count_at..count_at + 8].copy_from_slice(&12_u64.to_le_bytes());
+    let planted = fln::decode_flbc_product_sidecar(&omitted)
+        .expect_err("a 12-component sidecar must not decode");
+    let planted_text = planted.to_string();
+    assert!(
+        planted_text.contains("all 13 closure components"),
+        "component-count plant must be the omission refusal, not a nearby field: {planted_text}"
+    );
+    fln::publish_file_atomic(&omitted, &first_sidecar).expect("plant omitted-closure sidecar");
+    let omitted_run = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--sidecar"),
+        &first_sidecar,
+        &first_product,
+    ]);
+    assert!(!omitted_run.status.success());
+    assert!(omitted_run.stdout.is_empty());
+    let omitted_stderr = utf8(&omitted_run.stderr);
+    assert!(
+        omitted_stderr.contains("\"class\":\"sidecar\""),
+        "omitted-closure consumer stderr: {omitted_stderr}"
+    );
+    assert!(
+        omitted_stderr.contains("all 13 closure components"),
+        "omitted-closure consumer must quote the planted decode refusal: {omitted_stderr}"
+    );
+
+    fln::publish_file_atomic(&sidecar, &first_sidecar)
+        .expect("restore exact sidecar after omission");
+    let recovered = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--sidecar"),
+        &first_sidecar,
+        &first_product,
+    ]);
+    assert!(
+        recovered.status.success(),
+        "post-omission recovery stderr: {}",
+        utf8(&recovered.stderr)
+    );
+    assert_eq!(utf8(&recovered.stdout), bound_stdout);
+
+    let product_path = first_product.clone();
+    let sidecar_path = first_sidecar.clone();
+    let expected = bound_stdout.clone();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let product_path = product_path.clone();
+                let sidecar_path = sidecar_path.clone();
+                let expected = expected.clone();
+                scope.spawn(move || {
+                    let output = run_fln(&[
+                        Path::new("flbc"),
+                        Path::new("run"),
+                        Path::new("--json"),
+                        Path::new("--sidecar"),
+                        &sidecar_path,
+                        &product_path,
+                    ]);
+                    assert!(
+                        output.status.success(),
+                        "concurrent consumer stderr: {}",
+                        utf8(&output.stderr)
+                    );
+                    assert_eq!(utf8(&output.stdout), expected);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("concurrent consumer thread");
+        }
+    });
+}
+
+fn sidecar_schema_body_offset(bytes: &[u8]) -> usize {
+    const NAME: &[u8] = b"fln.canon.flbc-product-sidecar";
+    assert!(
+        bytes.len() >= 10,
+        "sidecar is too small to carry a schema header"
+    );
+    let name_len = usize::try_from(u64::from_le_bytes(
+        bytes[0..8].try_into().expect("schema name length"),
+    ))
+    .expect("schema name length fits this host");
+    let name_end = 8 + name_len;
+    assert_eq!(
+        &bytes[8..name_end],
+        NAME,
+        "plant offsets are only valid for the live sidecar schema"
+    );
+    name_end + 2
+}
+
+fn sidecar_mode_offset(bytes: &[u8]) -> usize {
+    sidecar_schema_body_offset(bytes)
+}
+
+fn sidecar_component_count_offset(bytes: &[u8]) -> usize {
+    // write_u128 is length-prefixed (`u64` length + 16 payload bytes), not a
+    // bare 16-byte integer. After the mode tag: epoch, CGSE, determinism u8,
+    // profile u8, target, build profile, then the component count.
+    const PREFIXED_U128: usize = 8 + 16;
+    sidecar_schema_body_offset(bytes)
+        + 1
+        + PREFIXED_U128
+        + PREFIXED_U128
+        + 1
+        + 1
+        + PREFIXED_U128
+        + PREFIXED_U128
+}
