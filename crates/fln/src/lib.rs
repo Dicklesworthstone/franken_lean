@@ -234,12 +234,46 @@ pub struct DecodedOlean {
     pub walk: OleanWalkReport,
     pub module: OleanModuleData,
     pub constants: Vec<ConstantInfo>,
+    /// Whether the authoritative module-system server and private parts were
+    /// loaded in addition to the exported public part.
+    pub companion_parts_loaded: bool,
+}
+
+/// One non-public compacted region in a module-system `.olean` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OleanCompanionPart {
+    Server,
+    Private,
+}
+
+impl fmt::Display for OleanCompanionPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Server => ".olean.server",
+            Self::Private => ".olean.private",
+        })
+    }
 }
 
 /// Typed refusal from the public `.olean` read path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OleanDecodeError {
-    ArtifactTooLarge { bytes: usize, limit: usize },
+    ArtifactTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
+    UnexpectedCompanionParts,
+    CompanionHeaderMismatch {
+        part: OleanCompanionPart,
+    },
+    CompanionRegion {
+        part: OleanCompanionPart,
+        error: OleanRegionError,
+    },
+    CompanionDeclaration {
+        part: OleanCompanionPart,
+        error: OleanDeclarationError,
+    },
     Region(OleanRegionError),
     Declaration(OleanDeclarationError),
 }
@@ -250,6 +284,20 @@ impl fmt::Display for OleanDecodeError {
             Self::ArtifactTooLarge { bytes, limit } => {
                 write!(f, ".olean artifact has {bytes} bytes; limit is {limit}")
             }
+            Self::UnexpectedCompanionParts => write!(
+                f,
+                "standalone .olean artifact must not have module-system companion parts"
+            ),
+            Self::CompanionHeaderMismatch { part } => write!(
+                f,
+                "{part} identity fields do not match the exported .olean part"
+            ),
+            Self::CompanionRegion { part, error } => {
+                write!(f, "{part} region: {error}")
+            }
+            Self::CompanionDeclaration { part, error } => {
+                write!(f, "{part} declaration: {error}")
+            }
             Self::Region(error) => write!(f, ".olean region: {error}"),
             Self::Declaration(error) => write!(f, ".olean declaration: {error}"),
         }
@@ -257,6 +305,34 @@ impl fmt::Display for OleanDecodeError {
 }
 
 impl std::error::Error for OleanDecodeError {}
+
+impl OleanDecodeError {
+    /// Whether this refusal is solely an explicit byte/object budget rather
+    /// than malformed input or a companion-chain identity failure.
+    pub const fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::ArtifactTooLarge { .. }
+                | Self::Region(OleanRegionError::BudgetExhausted { .. })
+                | Self::Declaration(OleanDeclarationError::Budget { .. })
+                | Self::Declaration(OleanDeclarationError::Region(
+                    OleanRegionError::BudgetExhausted { .. }
+                ))
+                | Self::CompanionRegion {
+                    error: OleanRegionError::BudgetExhausted { .. },
+                    ..
+                }
+                | Self::CompanionDeclaration {
+                    error: OleanDeclarationError::Budget { .. },
+                    ..
+                }
+                | Self::CompanionDeclaration {
+                    error: OleanDeclarationError::Region(OleanRegionError::BudgetExhausted { .. }),
+                    ..
+                }
+        )
+    }
+}
 
 impl From<OleanRegionError> for OleanDecodeError {
     fn from(error: OleanRegionError) -> Self {
@@ -348,6 +424,125 @@ pub fn decode_olean_artifact(
         walk,
         module,
         constants,
+        companion_parts_loaded: false,
+    })
+}
+
+/// Audit and decode one complete module-system `.olean` artifact chain.
+///
+/// The exported part supplies the import graph and public module metadata.
+/// The private part supplies the authoritative constant array used by Lean's
+/// `import all` path, including definition bodies and private equation-compiler
+/// auxiliaries. The server and private regions are parsed in their original
+/// compacted address spaces, walked through their dependency-aware object
+/// graphs, and declaration-decoded before any result is returned. The shared
+/// runtime's full-surface auditor is single-region, so it audits the exported
+/// part only; extending that auditor across dependency regions remains a
+/// separate integrity obligation. This function does not resolve imports or
+/// admit any declaration into an [`Engine`].
+pub fn decode_olean_module_artifacts(
+    artifact: &[u8],
+    server_artifact: &[u8],
+    private_artifact: &[u8],
+    limits: OleanDecodeLimits,
+) -> Result<DecodedOlean, OleanDecodeError> {
+    let bytes = artifact
+        .len()
+        .checked_add(server_artifact.len())
+        .and_then(|total| total.checked_add(private_artifact.len()))
+        .ok_or(OleanDecodeError::ArtifactTooLarge {
+            bytes: usize::MAX,
+            limit: limits.max_bytes,
+        })?;
+    if bytes > limits.max_bytes {
+        return Err(OleanDecodeError::ArtifactTooLarge {
+            bytes,
+            limit: limits.max_bytes,
+        });
+    }
+
+    let public_view = OleanView::parse(artifact)?;
+    public_view.shared_audit()?;
+    public_view.walk(limits.graph)?;
+    let module = public_view.module_data(limits.module)?;
+    if !module.is_module {
+        return Err(OleanDecodeError::UnexpectedCompanionParts);
+    }
+    DeclDecoder::new(&public_view, limits.declarations).decode_module_constants()?;
+
+    let same_identity = |header: &OleanHeader| {
+        header.version == public_view.header.version
+            && header.flags == public_view.header.flags
+            && header.lean_version == public_view.header.lean_version
+            && header.githash == public_view.header.githash
+    };
+
+    let server_part = OleanCompanionPart::Server;
+    let server_view =
+        OleanView::parse_with_dependencies(server_artifact, &[artifact]).map_err(|error| {
+            OleanDecodeError::CompanionRegion {
+                part: server_part,
+                error,
+            }
+        })?;
+    if !same_identity(&server_view.header) {
+        return Err(OleanDecodeError::CompanionHeaderMismatch { part: server_part });
+    }
+    server_view
+        .walk(limits.graph)
+        .map_err(|error| OleanDecodeError::CompanionRegion {
+            part: server_part,
+            error,
+        })?;
+    server_view
+        .module_data(limits.module)
+        .map_err(|error| OleanDecodeError::CompanionRegion {
+            part: server_part,
+            error,
+        })?;
+    DeclDecoder::new(&server_view, limits.declarations)
+        .decode_module_constants()
+        .map_err(|error| OleanDecodeError::CompanionDeclaration {
+            part: server_part,
+            error,
+        })?;
+
+    let private_part = OleanCompanionPart::Private;
+    let private_view =
+        OleanView::parse_with_dependencies(private_artifact, &[artifact, server_artifact])
+            .map_err(|error| OleanDecodeError::CompanionRegion {
+                part: private_part,
+                error,
+            })?;
+    if !same_identity(&private_view.header) {
+        return Err(OleanDecodeError::CompanionHeaderMismatch { part: private_part });
+    }
+    let walk =
+        private_view
+            .walk(limits.graph)
+            .map_err(|error| OleanDecodeError::CompanionRegion {
+                part: private_part,
+                error,
+            })?;
+    private_view
+        .module_data(limits.module)
+        .map_err(|error| OleanDecodeError::CompanionRegion {
+            part: private_part,
+            error,
+        })?;
+    let constants = DeclDecoder::new(&private_view, limits.declarations)
+        .decode_module_constants()
+        .map_err(|error| OleanDecodeError::CompanionDeclaration {
+            part: private_part,
+            error,
+        })?;
+
+    Ok(DecodedOlean {
+        header: public_view.header.clone(),
+        walk,
+        module,
+        constants,
+        companion_parts_loaded: true,
     })
 }
 
@@ -410,6 +605,8 @@ pub struct CheckedOlean {
 pub struct OleanModuleInput<'a> {
     pub name: &'a Name,
     pub artifact: &'a [u8],
+    pub server_artifact: Option<&'a [u8]>,
+    pub private_artifact: Option<&'a [u8]>,
 }
 
 /// One checked module inside a closed `.olean` import set.
@@ -449,6 +646,11 @@ pub enum OleanCheckError {
     TotalBytesLimit {
         observed: usize,
         limit: usize,
+    },
+    MissingCompanionParts {
+        module: Option<Name>,
+        missing_server: bool,
+        missing_private: bool,
     },
     ImportsRequireResolver {
         imports: Vec<Name>,
@@ -516,6 +718,23 @@ impl fmt::Display for OleanCheckError {
                 formatter,
                 ".olean set contains {observed} bytes; aggregate limit is {limit}"
             ),
+            Self::MissingCompanionParts {
+                module,
+                missing_server,
+                missing_private,
+            } => {
+                let subject = module.as_ref().map_or_else(
+                    || "module-system .olean artifact".to_owned(),
+                    |name| format!("module `{}`", name.to_display_string()),
+                );
+                let missing = match (*missing_server, *missing_private) {
+                    (true, true) => ".olean.server and .olean.private",
+                    (true, false) => ".olean.server",
+                    (false, true) => ".olean.private",
+                    (false, false) => "no companion parts",
+                };
+                write!(formatter, "{subject} is missing {missing}")
+            }
             Self::ImportsRequireResolver { imports } => write!(
                 formatter,
                 "standalone declaration checking cannot resolve imports: {}",
@@ -1184,15 +1403,54 @@ impl Engine {
     ///
     /// A completed result means all decoded declarations were checked and the
     /// returned engine contains all of them. It does not mean environment
-    /// extension payloads were interpreted, that companion artifact parts were
-    /// loaded, or that K2/receipt/release gates were satisfied.
+    /// extension payloads were interpreted or that K2/receipt/release gates
+    /// were satisfied. Module-system artifacts are refused here because this
+    /// convenience door has no companion-part arguments; use
+    /// [`Self::check_olean_artifact_parts`] for those.
     pub fn check_olean_artifact(
         &self,
         artifact: &[u8],
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
-        let decoded = decode_olean_artifact(artifact, limits.decode)?;
+        self.check_olean_artifact_parts(artifact, None, None, options, limits)
+    }
+
+    /// Decode and atomically check one standalone or complete module-system
+    /// pinned-format `.olean` artifact.
+    ///
+    /// Module-system inputs must provide both companion parts. Refusing an
+    /// incomplete chain is load-bearing: checking only the exported part would
+    /// turn stripped definitions into axioms and omit private auxiliaries.
+    pub fn check_olean_artifact_parts(
+        &self,
+        artifact: &[u8],
+        server_artifact: Option<&[u8]>,
+        private_artifact: Option<&[u8]>,
+        options: &KVMap,
+        limits: OleanCheckLimits,
+    ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
+        let decoded = match (server_artifact, private_artifact) {
+            (Some(server), Some(private)) => {
+                decode_olean_module_artifacts(artifact, server, private, limits.decode)?
+            }
+            (server, private) => {
+                let decoded = decode_olean_artifact(artifact, limits.decode)?;
+                if decoded.module.is_module {
+                    return Err(OleanCheckError::MissingCompanionParts {
+                        module: None,
+                        missing_server: server.is_none(),
+                        missing_private: private.is_none(),
+                    });
+                }
+                if server.is_some() || private.is_some() {
+                    return Err(OleanCheckError::Decode(
+                        OleanDecodeError::UnexpectedCompanionParts,
+                    ));
+                }
+                decoded
+            }
+        };
         if !decoded.module.imports.is_empty() {
             return Err(OleanCheckError::ImportsRequireResolver {
                 imports: decoded
@@ -1231,12 +1489,21 @@ impl Engine {
         let mut total_bytes = 0_usize;
         let mut owners = BTreeMap::new();
         for (index, module) in modules.iter().enumerate() {
-            total_bytes = total_bytes.checked_add(module.artifact.len()).ok_or(
-                OleanCheckError::TotalBytesLimit {
-                    observed: usize::MAX,
-                    limit: limits.max_total_bytes,
-                },
-            )?;
+            for artifact in [
+                Some(module.artifact),
+                module.server_artifact,
+                module.private_artifact,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                total_bytes = total_bytes.checked_add(artifact.len()).ok_or(
+                    OleanCheckError::TotalBytesLimit {
+                        observed: usize::MAX,
+                        limit: limits.max_total_bytes,
+                    },
+                )?;
+            }
             if total_bytes > limits.max_total_bytes {
                 return Err(OleanCheckError::TotalBytesLimit {
                     observed: total_bytes,
@@ -1258,13 +1525,33 @@ impl Engine {
             }
         })?;
         for module in modules {
-            let artifact =
-                decode_olean_artifact(module.artifact, limits.decode).map_err(|error| {
-                    OleanCheckError::ModuleDecode {
-                        module: module.name.clone(),
-                        error,
+            let artifact = match (module.server_artifact, module.private_artifact) {
+                (Some(server), Some(private)) => {
+                    decode_olean_module_artifacts(module.artifact, server, private, limits.decode)
+                }
+                (server, private) => {
+                    let decoded = decode_olean_artifact(module.artifact, limits.decode);
+                    match decoded {
+                        Ok(decoded) if decoded.module.is_module => {
+                            return Err(OleanCheckError::MissingCompanionParts {
+                                module: Some(module.name.clone()),
+                                missing_server: server.is_none(),
+                                missing_private: private.is_none(),
+                            });
+                        }
+                        Ok(_) if server.is_some() || private.is_some() => {
+                            return Err(OleanCheckError::Decode(
+                                OleanDecodeError::UnexpectedCompanionParts,
+                            ));
+                        }
+                        other => other,
                     }
-                })?;
+                }
+            }
+            .map_err(|error| OleanCheckError::ModuleDecode {
+                module: module.name.clone(),
+                error,
+            })?;
             decoded.push(Some((module.name.clone(), artifact)));
         }
 
@@ -3345,7 +3632,15 @@ mod tests {
 
     #[test]
     fn standalone_olean_check_refuses_unresolved_imports_and_unsupported_units() {
-        let reference = olean_fixture("Init.BinderNameHint.olean");
+        let reference = olean_with_imports(
+            &[],
+            &[OleanModuleImport {
+                module: Name::from_components(["Fixture", "Missing"]),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            }],
+        );
         let engine = Engine::from_environment(Environment::new());
         let imported = engine.check_olean_artifact(
             &reference,
@@ -3407,6 +3702,29 @@ mod tests {
     }
 
     #[test]
+    fn module_system_public_part_is_refused_before_stripped_bodies_reach_admission() {
+        let bytes = olean_fixture("Init.BinderNameHint.olean");
+        let decoded = decode_olean_artifact(&bytes, OleanDecodeLimits::new(bytes.len()))
+            .expect("the exported module part remains inspectable on its own");
+        assert!(decoded.module.is_module, "fixture must require companions");
+        assert!(!decoded.companion_parts_loaded);
+
+        let engine = Engine::from_environment(Environment::new());
+        assert!(matches!(
+            engine.check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            ),
+            Err(OleanCheckError::MissingCompanionParts {
+                module: None,
+                missing_server: true,
+                missing_private: true,
+            })
+        ));
+    }
+
+    #[test]
     fn closed_olean_module_set_resolves_imports_in_deterministic_order() {
         let constants = standalone_declarations();
         let base_name = Name::from_components(["Fixture", "Base"]);
@@ -3423,10 +3741,14 @@ mod tests {
             OleanModuleInput {
                 name: &child_name,
                 artifact: &child,
+                server_artifact: None,
+                private_artifact: None,
             },
             OleanModuleInput {
                 name: &base_name,
                 artifact: &base,
+                server_artifact: None,
+                private_artifact: None,
             },
         ];
         let engine = Engine::from_environment(Environment::new());
@@ -3469,6 +3791,8 @@ mod tests {
         let child_only = [OleanModuleInput {
             name: &child_name,
             artifact: &child,
+            server_artifact: None,
+            private_artifact: None,
         }];
         assert!(matches!(
             engine.check_olean_modules(
@@ -3491,10 +3815,14 @@ mod tests {
             OleanModuleInput {
                 name: &base_name,
                 artifact: &base,
+                server_artifact: None,
+                private_artifact: None,
             },
             OleanModuleInput {
                 name: &child_name,
                 artifact: &child,
+                server_artifact: None,
+                private_artifact: None,
             },
         ];
         assert!(matches!(
