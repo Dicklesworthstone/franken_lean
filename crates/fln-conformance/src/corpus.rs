@@ -49,7 +49,8 @@ use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity, Structura
 use fln_core::expr::{BinderInfo, Expr, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::mode::{
-    BuildProfileId, CgsePolicyId, ContentRoot, EpochId, Mode, ReproducibilityProfile, TargetId,
+    BuildProfileId, CgsePolicyId, ClosureComponent, ContentRoot, DeterminismClass, EpochId, Mode,
+    ReproducibilityProfile, TargetId,
 };
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap};
@@ -68,9 +69,10 @@ use fln_env::provenance::{
 };
 use fln_hash::canon::{
     CanonWriter, Canonical, SCHEMA_CARTRIDGE_ARCHIVE, SCHEMA_CARTRIDGE_MANIFEST,
-    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_KVMAP_SET, SCHEMA_NAME, SCHEMA_REGISTRY,
-    SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON,
-    SCHEMA_WARM_DEFEQ_CACHE, SchemaId, SchemaRow, kvmap_canonical_set_bytes,
+    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_FLBC_PRODUCT_SIDECAR, SCHEMA_KVMAP_SET, SCHEMA_NAME,
+    SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON,
+    SCHEMA_SHADOW_TELEMETRY_NDJSON, SCHEMA_WARM_DEFEQ_CACHE, SchemaId, SchemaRow,
+    kvmap_canonical_set_bytes,
 };
 use fln_hash::cartridge::{
     AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
@@ -84,6 +86,9 @@ use fln_hash::certificate::{
     NatOperationV1, ReductionHintV1, TermDagV1, TermNodeId, TermNodeV1,
 };
 use fln_hash::domain::{Digest, Domain, DomainHasher};
+use fln_hash::product::{
+    ClosureMaterialV1, FlbcProductSidecarV1, ProductSidecarRefusal, StandardProductCoordinatesV1,
+};
 use fln_hash::shadow::{
     CandidateResultV1, ClaimTypeV1, ComparisonClassV1, EngineVersionV1, FixtureManifestV1,
     ParityRowV1, PolicyVersionV1, ProductV1, SamplingObligationV1, SemanticResultV1,
@@ -325,7 +330,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 19] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 20] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -407,6 +412,15 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 19] = [
                    environment, policy and fuel root around a shared term DAG, one \
                    literal-reduction hint and one advisory extension",
         run: exercise_declaration_certificate,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.flbc-product-sidecar",
+        version: 1,
+        exercise: "construct from all thirteen actual closure-component byte strings and exact \
+                   FLBC bytes, round trip and re-encode byte-identically, preserve every \
+                   coordinate and root, verify the original product, and refuse a substituted \
+                   product before execution",
+        run: exercise_flbc_product_sidecar,
     },
     CorpusCoverage {
         schema: "fln.canon.warm-defeq-cache",
@@ -1046,6 +1060,52 @@ fn exercise_declaration_certificate(row: &SchemaRow) -> Result<(), String> {
         return Err(
             "re-encoded declaration certificate is not byte-identical to its source".to_string(),
         );
+    }
+    Ok(())
+}
+
+fn exercise_flbc_product_sidecar(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_FLBC_PRODUCT_SIDECAR)?;
+    let material: Vec<_> = ClosureComponent::ALL
+        .into_iter()
+        .map(|component| {
+            (
+                component,
+                format!("corpus-sidecar-{component:?}").into_bytes(),
+            )
+        })
+        .collect();
+    let entries: Vec<_> = material
+        .iter()
+        .map(|(component, bytes)| ClosureMaterialV1 {
+            component: *component,
+            bytes,
+        })
+        .collect();
+    let sidecar = ok(
+        FlbcProductSidecarV1::build_standard(
+            StandardProductCoordinatesV1 {
+                mode: Mode::Sound,
+                epoch: EpochId::new(4_032_000),
+                cgse_policy: CgsePolicyId::new(1),
+                determinism: DeterminismClass::D1Canonicalized,
+                target: TargetId::new(1),
+                build_profile: BuildProfileId::new(1),
+            },
+            &entries,
+            b"corpus-flbc-product",
+        ),
+        "construct FLBC product sidecar",
+    )?;
+    round_trip(&sidecar, "FLBC product sidecar")?;
+    ok(
+        sidecar.verify_product(b"corpus-flbc-product", Mode::Sound),
+        "verify exact FLBC product binding",
+    )?;
+    if sidecar.verify_product(b"substituted-product", Mode::Sound)
+        != Err(ProductSidecarRefusal::ProductRootMismatch)
+    {
+        return Err("FLBC product sidecar accepted substituted product bytes".to_string());
     }
     Ok(())
 }

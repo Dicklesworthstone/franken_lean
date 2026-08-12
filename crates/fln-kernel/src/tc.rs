@@ -4731,9 +4731,8 @@ mod tests {
                 }],
             "the shared graph must retain its one real local dependency"
         );
-        assert_eq!(
-            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left,
-            18,
+        assert!(
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left == 18,
             "the dependency walk must charge each immutable allocation exactly once"
         );
     }
@@ -4746,10 +4745,9 @@ mod tests {
         let right_id = FVarId(Name::num_overflowing(Name::anonymous(), u64::MAX));
         let left = Expr::fvar(left_id.clone());
         let right = Expr::fvar(right_id.clone());
-        assert_ne!(left, right, "the colliding locals must remain distinct");
-        assert_eq!(
-            left.data(),
-            right.data(),
+        assert!(left != right, "the colliding locals must remain distinct");
+        assert!(
+            left.data() == right.data(),
             "overflowing numeric name components provide a real packed-data collision"
         );
         tc.adopt_local(left_id.clone(), Expr::sort(Level::zero()));
@@ -4765,7 +4763,7 @@ mod tests {
         )
         .expect("a packed-data collision cannot suppress dependency discovery");
 
-        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.len() == 2);
         assert!(
             dependencies
                 .iter()

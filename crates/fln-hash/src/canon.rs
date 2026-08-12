@@ -86,6 +86,11 @@ pub const SCHEMA_CARTRIDGE_ARCHIVE: SchemaId = SchemaId {
     name: "fln.canon.cartridge-archive",
     version: 1,
 };
+/// Standard-profile manifest binding one canonical FLBC product to an explicit closure.
+pub const SCHEMA_FLBC_PRODUCT_SIDECAR: SchemaId = SchemaId {
+    name: "fln.canon.flbc-product-sidecar",
+    version: 1,
+};
 
 /// The crate that defines a durable format's codec.
 ///
@@ -165,7 +170,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 19] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 20] = [
     SchemaRow {
         id: SCHEMA_NAME,
         owner: SchemaOwner::Hash,
@@ -230,6 +235,11 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 19] = [
         id: SCHEMA_CARTRIDGE_ARCHIVE,
         owner: SchemaOwner::Hash,
         covers: "a canonical thin, partial, sealed, or complete cartridge transport",
+    },
+    SchemaRow {
+        id: SCHEMA_FLBC_PRODUCT_SIDECAR,
+        owner: SchemaOwner::Hash,
+        covers: "a standard-profile FLBC product root and its complete typed closure",
     },
     SchemaRow {
         id: SchemaId {
@@ -1879,6 +1889,10 @@ mod tests {
             (SCHEMA_WARM_DEFEQ_CACHE, "fln.canon.warm-defeq-cache"),
             (SCHEMA_CARTRIDGE_MANIFEST, "fln.canon.cartridge-manifest"),
             (SCHEMA_CARTRIDGE_ARCHIVE, "fln.canon.cartridge-archive"),
+            (
+                SCHEMA_FLBC_PRODUCT_SIDECAR,
+                "fln.canon.flbc-product-sidecar",
+            ),
         ] {
             assert_eq!(constant.name, expected);
             let row = registered(constant.name)
@@ -1896,7 +1910,7 @@ mod tests {
             .filter(|row| row.owner == SchemaOwner::Hash)
             .count();
         assert_eq!(
-            hash_rows, 13,
+            hash_rows, 14,
             "fln-hash owns a schema the constant join above does not cover"
         );
     }

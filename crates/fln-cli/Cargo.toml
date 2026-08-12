@@ -5,6 +5,8 @@ edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 default-run = "fln"
+# fln-product-root: sound
+# fln-mode-provenance: sound
 
 [dependencies]
 fln = { path = "../fln" }

@@ -29,5 +29,6 @@ pub mod canon;
 pub mod cartridge;
 pub mod certificate;
 pub mod domain;
+pub mod product;
 pub mod root;
 pub mod shadow;

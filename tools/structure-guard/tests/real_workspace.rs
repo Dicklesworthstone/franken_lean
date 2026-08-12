@@ -472,7 +472,7 @@ fn the_deferred_d18_product_half_stays_owned_while_the_scan_is_vacuous() {
 /// matches the prefix and accepts the three registered mode words, so it can over-count
 /// relative to the production parser but never under-count, which is the safe direction
 /// for a floor. One host, one commit, class `bounded_model`.
-const D18_DECLARED_PRODUCT_ROOTS: usize = 0;
+const D18_DECLARED_PRODUCT_ROOTS: usize = 1;
 
 /// A members resolution smaller than this is a broken scan, not a small workspace. The
 /// tree carries 33; the floor is set well below it so an ordinary crate removal does not
@@ -588,36 +588,19 @@ fn the_d18_product_population_disclosure_matches_the_measured_workspace() {
     // is not re-added as an improvement.
 }
 
-/// **The sidecar has no producer, and the ORDERING is the finding rather than the gap.**
+/// **The sidecar producer population is bound to the live product root.**
 ///
-/// Bead `fln-d18-product-half-rgsg`, measured at `732fdba5` on 2026-07-28. The bead's
-/// acceptance opens with *"Emit a registered canonical sidecar binding mode, epoch, CGSE
-/// policy, determinism class, target, build profile, closure root, and product root"*,
-/// and the obvious reading is that nothing of it exists. That reading is wrong in a way
-/// that matters, so it is recorded here with its measurement.
+/// The predecessor of this guard held the population at zero while the workspace had
+/// no product root. The first real root is now the sound `fln-cli` binary: its dependency
+/// cone contains the producer, the registered canonical codec, and the runtime consumer.
+/// `fln-hash::product` constructs the core artifact-coordinates value only from all
+/// thirteen actual component byte strings and the exact FLBC bytes; the CLI emits that
+/// sidecar and verifies it before Golem executes the product.
 ///
-/// **The value type already exists and binds exactly those eight fields.**
-/// `fln_core::mode`'s coordinates struct carries `epoch`, `cgse_policy`, `determinism`,
-/// `reproducibility`, `target`, `build_profile`, `closure_root` and `product_root`, with
-/// the mode itself carried by the artifact's type parameter. So the sidecar is not
-/// undesigned. What is missing is a **canonical encoding** — `mode.rs`'s own header puts
-/// that in `fln-hash`, which has none — and a **producer**.
-///
-/// **Why the producer cannot be written yet, which is the ordering.** Two of the eight
-/// fields, `closure_root` and `product_root`, are content roots *of a built product*.
-/// Measured on this workspace: 0 declared product roots, 0 closures scanned, 0 product
-/// binaries. Registering a durable `SchemaId` now would freeze a canonical format whose
-/// two defining fields hash an artifact that does not exist, with no producer and no
-/// consumer — which is what G0 exists to prevent, and is this bead's own recorded
-/// position rather than a preference of mine. The rest of the acceptance hangs off the
-/// same peg: byte-identical builds and the no-mock product E2E cannot be evidence about a
-/// product root that does not denote.
-///
-/// So the honest artifact is **the ordering, filed and bound** — not a sidecar built for
-/// a population of zero. This guard holds that population at zero and fails when it
-/// moves, in **both** directions: a producer appearing before a product root exists is
-/// the wrong-order construction this bead exists to prevent, and a producer appearing
-/// after one does is the moment the disclosure above becomes false.
+/// This equality remains intentional. It fails if the producer disappears, is copied,
+/// or a second producer arrives without revisiting the disclosed population. It is a
+/// cardinality tripwire, not evidence that the sidecar is correct; codec, substitution,
+/// frontier-contamination, and filesystem-path tests carry those claims.
 ///
 /// **The positive control is what makes the zero mean anything**, and it is the half a
 /// scan like this normally omits. A misspelt needle finds nothing everywhere and reads
@@ -635,9 +618,8 @@ fn the_d18_product_population_disclosure_matches_the_measured_workspace() {
 /// counting producers: a file naming it in prose would count, and a producer that
 /// constructs the record through a re-export under another name would not. That is the
 /// safe direction for a floor — it can over-count and not under-count. It says nothing
-/// about whether a sidecar, once written, is correct. One host, one commit, class
-/// `bounded_model`.
-const D18_SIDECAR_PRODUCER_FILES: usize = 0;
+/// about whether a sidecar is correct. One host, one commit, class `bounded_model`.
+const D18_SIDECAR_PRODUCER_FILES: usize = 1;
 
 /// The defining module, excluded from the count and required to match by the control.
 const D18_SIDECAR_HOME: &str = "crates/fln-core/src/mode.rs";
@@ -675,7 +657,7 @@ fn workspace_rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn the_d18_sidecar_has_no_producer_and_the_ordering_is_the_finding() {
+fn the_d18_sidecar_producer_population_matches_the_live_product() {
     let root = fln_conformance::checked_workspace_root!();
     // Assembled so the literal is absent from this file; the self-check below is then a
     // real assertion rather than a needle matching its own source.
@@ -733,14 +715,9 @@ fn the_d18_sidecar_has_no_producer_and_the_ordering_is_the_finding() {
         producers.len(),
         D18_SIDECAR_PRODUCER_FILES,
         "the D18 sidecar coordinates type is named by {} file(s) outside its defining \
-         module — {producers:?} — against a disclosed population of \
-         {D18_SIDECAR_PRODUCER_FILES}. BOTH directions matter here. If a product root \
-         does NOT yet exist, this is a sidecar being built for a population of zero: its \
-         closure_root and product_root fields are content roots of an artifact that does \
-         not exist, and registering a canonical SchemaId for it freezes a durable format \
-         with no producer and no consumer. If a product root DOES now exist, this is the \
-         good direction — raise D18_SIDECAR_PRODUCER_FILES in the same commit and revise \
-         the ordering disclosure above, which has just become false.",
+         module — {producers:?} — against a disclosed live-producer population of \
+         {D18_SIDECAR_PRODUCER_FILES}. A producer disappearing, being copied, or arriving \
+         without a corresponding product-boundary review must move this equality.",
         producers.len(),
     );
 }

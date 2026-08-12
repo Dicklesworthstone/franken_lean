@@ -325,6 +325,13 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          from the lane's own docstring after `e81c57fc` landed it undeclared",
     ),
     (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "fresh_v2_module_is_checked_by_the_pin_and_an_ill_typed_sibling_is_rejected",
+        "not per-commit evidence — an operator-run outbound FL-INV-04 probe that requires a \
+         new retained output directory. Its own good/bad pair binds acceptance and rejection \
+         to the pinned Reference; no coverage row may cite the ignored function as a CI run",
+    ),
+    (
         "crates/fln-conformance/tests/mutation_kill_ledger_model.rs",
         "the_module_apply_mutants_are_killed_for_their_recipe_bound_reasons",
         "its per-commit sibling `module_apply_receipts_are_canonical_current_complete_and_\
@@ -385,7 +392,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// operator-selected diagnostic recovered with the checker resource repair. It
 /// carries no per-commit or corpus-wide claim, so the declaration records that
 /// absence rather than inventing a compensating ceremony.
-const IGNORED_PRODUCER_CEILING: usize = 10;
+///
+/// 10 -> 11 for the fresh-v2 outbound Reference probe: it requires an explicitly
+/// retained, previously absent output directory and therefore cannot run in the
+/// ordinary per-commit suite. The declaration keeps that scope honest; it does not
+/// manufacture a replacement gate or a compatibility claim.
+const IGNORED_PRODUCER_CEILING: usize = 11;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];

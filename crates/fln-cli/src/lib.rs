@@ -39,14 +39,16 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
-const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/1";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/3";
+const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/2";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/4";
+const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
+const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--max-bytes BYTES] PATH\n",
-    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] PATH...\n",
-    "  fln flbc run [--json] [--max-bytes BYTES] PATH\n",
+    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] PATH...\n",
+    "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
@@ -69,12 +71,18 @@ const USAGE: &str = concat!(
     "and Golem. The final path must produce the closed Nat result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
     "--emit-flbc, the final definition's exact executed artifact atomically\n",
-    "replaces PATH only after the whole batch succeeds. It is not general Lean,\n",
+    "replaces PATH only after the whole batch succeeds. --emit-sidecar requires\n",
+    "--emit-flbc and publishes a standard-profile closure manifest before the\n",
+    "product, so any interrupted pair fails closed by root mismatch. It is not\n",
+    "general Lean,\n",
     "Prelude/import processing, a project build, a certified build product, or\n",
     "evidence that `check-olean` is complete.\n",
     "\n",
     "`flbc run` validates and executes one canonical FLBC artifact through Golem.\n",
-    "It does not admit declarations or prove how the artifact was compiled.\n",
+    "With --sidecar it first binds the exact artifact, current toolchain image,\n",
+    "mode, epoch, target, profile, and static closure inputs. The v1 sidecar is\n",
+    "standard-profile provenance, not certified source reproducibility. It does\n",
+    "not admit declarations or prove how the artifact was compiled.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -117,11 +125,13 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
         emit_flbc: Option<PathBuf>,
+        emit_sidecar: Option<PathBuf>,
     },
     FlbcRun {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
+        sidecar: Option<PathBuf>,
     },
     OleanInspect {
         path: PathBuf,
@@ -289,6 +299,7 @@ fn parse_path_options(
 fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut filtered = Vec::new();
     let mut emit_flbc = None;
+    let mut emit_sidecar = None;
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -299,6 +310,31 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         }
         if options && (argument == "--help" || argument == "-h") {
             return Ok(MultiplexerCommand::Help);
+        }
+        let sidecar = if options && argument == "--emit-sidecar" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--emit-sidecar requires a following output path".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--emit-sidecar="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(path) = sidecar {
+            if path.is_empty() {
+                return Err(UsageError(
+                    "--emit-sidecar path must not be empty".to_owned(),
+                ));
+            }
+            if emit_sidecar.replace(PathBuf::from(path)).is_some() {
+                return Err(UsageError(
+                    "--emit-sidecar may be supplied at most once".to_owned(),
+                ));
+            }
+            continue;
         }
         let emitted = if options && argument == "--emit-flbc" {
             Some(arguments.next().ok_or_else(|| {
@@ -330,12 +366,47 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     else {
         return Ok(MultiplexerCommand::Help);
     };
+    if emit_sidecar.is_some() && emit_flbc.is_none() {
+        return Err(UsageError(
+            "--emit-sidecar requires --emit-flbc so the manifest has a published product"
+                .to_owned(),
+        ));
+    }
+    if emit_sidecar
+        .as_deref()
+        .zip(emit_flbc.as_deref())
+        .is_some_and(|(sidecar, product)| output_paths_alias(sidecar, product))
+    {
+        return Err(UsageError(
+            "--emit-sidecar and --emit-flbc must name different paths".to_owned(),
+        ));
+    }
     Ok(MultiplexerCommand::SourceRun {
         paths,
         max_bytes,
         json,
         emit_flbc,
+        emit_sidecar,
     })
+}
+
+fn output_paths_alias(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let identity = |path: &Path| {
+        let file_name = path.file_name()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::canonicalize(parent)
+            .ok()
+            .map(|parent| parent.join(file_name))
+    };
+    identity(left)
+        .zip(identity(right))
+        .is_some_and(|pair| pair.0 == pair.1)
 }
 
 fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
@@ -357,8 +428,43 @@ fn parse_check_olean(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usa
 }
 
 fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let mut filtered = Vec::new();
+    let mut sidecar = None;
+    let mut options = true;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument);
+            continue;
+        }
+        let selected = if options && argument == "--sidecar" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--sidecar requires a following input path".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--sidecar="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(path) = selected {
+            if path.is_empty() {
+                return Err(UsageError("--sidecar path must not be empty".to_owned()));
+            }
+            if sidecar.replace(PathBuf::from(path)).is_some() {
+                return Err(UsageError(
+                    "--sidecar may be supplied at most once".to_owned(),
+                ));
+            }
+            continue;
+        }
+        filtered.push(argument);
+    }
     let Some((paths, max_bytes, json)) = parse_path_options(
-        arguments,
+        filtered,
         "flbc run",
         fln::CodecLimits::default().max_artifact_bytes,
     )?
@@ -374,6 +480,7 @@ fn parse_flbc_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageE
         path: path.clone(),
         max_bytes,
         json,
+        sidecar,
     })
 }
 
@@ -546,7 +653,21 @@ fn vm_value_kind_name(kind: fln::VmValueKind) -> String {
     }
 }
 
-fn render_flbc_success(bytes: usize, returned: &fln::VmExit, json: bool) -> MultiplexerOutput {
+fn root_hex(root: fln::ContentRoot) -> String {
+    let mut rendered = String::with_capacity(64);
+    for byte in root.bytes() {
+        rendered.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble < 16"));
+        rendered.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble < 16"));
+    }
+    rendered
+}
+
+fn render_flbc_success(
+    bytes: usize,
+    returned: &fln::VmExit,
+    sidecar: Option<&fln::FlbcProductSidecarV1>,
+    json: bool,
+) -> MultiplexerOutput {
     let fln::VmExit::Returned(returned) = returned else {
         return flbc_failure(
             "internal-fault",
@@ -568,10 +689,25 @@ fn render_flbc_success(bytes: usize, returned: &fln::VmExit, json: bool) -> Mult
         let value = scalar
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned());
+        let sidecar = sidecar.map_or_else(
+            || "null".to_owned(),
+            |sidecar| {
+                format!(
+                    concat!(
+                        "{{\"verified\":true,\"mode\":\"sound\",",
+                        "\"profile\":\"standard\",\"closureRoot\":{},",
+                        "\"productRoot\":{}}}"
+                    ),
+                    json_string(&root_hex(sidecar.closure_root())),
+                    json_string(&root_hex(sidecar.product_root())),
+                )
+            },
+        );
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
                 "\"artifactBytes\":{},\"returnKind\":{},\"scalarValue\":{},",
+                "\"sidecar\":{},",
                 "\"execution\":{{\"steps\":{},\"systemPolls\":{},",
                 "\"peakStackDepth\":{}}}}}\n"
             ),
@@ -579,6 +715,7 @@ fn render_flbc_success(bytes: usize, returned: &fln::VmExit, json: bool) -> Mult
             bytes,
             json_string(&kind),
             value,
+            sidecar,
             usage.0,
             usage.1,
             usage.2,
@@ -587,15 +724,27 @@ fn render_flbc_success(bytes: usize, returned: &fln::VmExit, json: bool) -> Mult
         let value = scalar
             .map(|value| value.to_string())
             .unwrap_or_else(|| "not a scalar".to_owned());
+        let sidecar = sidecar.map_or_else(String::new, |sidecar| {
+            format!(
+                concat!(
+                    "sidecar: verified sound/standard\n",
+                    "closure root: {}\n",
+                    "product root: {}\n"
+                ),
+                root_hex(sidecar.closure_root()),
+                root_hex(sidecar.product_root()),
+            )
+        });
         format!(
             concat!(
                 "canonical FLBC execution: complete\n",
                 "artifact bytes: {}\n",
                 "return kind: {}\n",
                 "scalar value: {}\n",
+                "{}",
                 "execution: {} steps, {} system polls, peak stack {}\n"
             ),
-            bytes, kind, value, usage.0, usage.1, usage.2,
+            bytes, kind, value, sidecar, usage.0, usage.1, usage.2,
         )
     };
     MultiplexerOutput::success(stdout)
@@ -648,7 +797,12 @@ fn flbc_failure(
     MultiplexerOutput::failure(stderr, exit_code)
 }
 
-fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+fn execute_flbc_bytes_with_sidecar(
+    bytes: &[u8],
+    max_bytes: usize,
+    sidecar: Option<&fln::FlbcProductSidecarV1>,
+    json: bool,
+) -> MultiplexerOutput {
     let mut limits = fln::FlbcExecutionLimits::default();
     limits.codec.max_artifact_bytes = max_bytes;
     let outcome = match fln::execute_flbc_artifact(bytes, &fln::KVMap::new(), limits) {
@@ -664,7 +818,7 @@ fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> Multiplexer
     };
     match outcome {
         fln::Outcome::Complete(exit @ fln::VmExit::Returned(_)) => {
-            render_flbc_success(bytes.len(), &exit, json)
+            render_flbc_success(bytes.len(), &exit, sidecar, json)
         }
         fln::Outcome::Complete(fln::VmExit::Panicked { message, usage }) => flbc_failure(
             "program-panic",
@@ -701,7 +855,32 @@ fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> Multiplexer
     }
 }
 
-fn run_flbc(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+#[cfg(test)]
+fn execute_flbc_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    execute_flbc_bytes_with_sidecar(bytes, max_bytes, None, json)
+}
+
+fn read_current_toolchain_image() -> Result<Vec<u8>, BoundedReadFailure> {
+    // The v1 producer is registered only for Linux. `/proc/self/exe` keeps the
+    // executing inode open even if the pathname returned by `current_exe` is
+    // replaced concurrently, so the sidecar binds the producer that is actually
+    // running rather than whatever later appeared at the same filesystem name.
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let path = std::env::current_exe().map_err(|error| BoundedReadFailure::Input {
+        subject: "current toolchain image",
+        detail: error.to_string(),
+    })?;
+    read_bounded(&path, TOOLCHAIN_IMAGE_MAX_BYTES, "current toolchain image")
+}
+
+fn run_flbc(
+    path: &Path,
+    max_bytes: usize,
+    sidecar_path: Option<&Path>,
+    json: bool,
+) -> MultiplexerOutput {
     let bytes = match read_bounded(path, max_bytes, "FLBC artifact") {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -716,7 +895,41 @@ fn run_flbc(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
             );
         }
     };
-    execute_flbc_bytes(&bytes, max_bytes, json)
+    let verified_sidecar = if let Some(sidecar_path) = sidecar_path {
+        let sidecar_bytes = match read_bounded(
+            sidecar_path,
+            PRODUCT_SIDECAR_MAX_BYTES,
+            "FLBC product sidecar",
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let class = error.class();
+                return flbc_failure(
+                    class,
+                    &error.to_string(),
+                    false,
+                    None,
+                    json,
+                    if class == "resource" { 3 } else { 1 },
+                );
+            }
+        };
+        let toolchain_image = match read_current_toolchain_image() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return flbc_failure("internal-fault", &error.to_string(), false, None, json, 4);
+            }
+        };
+        match fln::verify_source_run_flbc_sidecar(&sidecar_bytes, &bytes, &toolchain_image) {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) => {
+                return flbc_failure("sidecar", &error.to_string(), true, None, json, 1);
+            }
+        }
+    } else {
+        None
+    };
+    execute_flbc_bytes_with_sidecar(&bytes, max_bytes, verified_sidecar.as_ref(), json)
 }
 
 fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean) -> String {
@@ -1693,6 +1906,7 @@ struct SourceSuccess<'a> {
     checker_schema: &'a str,
     checker_ground: &'a str,
     emitted_flbc: Option<(&'a Path, usize)>,
+    emitted_sidecar: Option<(&'a Path, usize, fln::ContentRoot, fln::ContentRoot)>,
     steps: u64,
     system_polls: u64,
     peak_stack_depth: u64,
@@ -1708,12 +1922,28 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             )
         },
     );
+    let emitted_sidecar_json = result.emitted_sidecar.map_or_else(
+        || "null".to_owned(),
+        |(path, bytes, closure_root, product_root)| {
+            format!(
+                concat!(
+                    "{{\"path\":{},\"bytes\":{},\"mode\":\"sound\",",
+                    "\"profile\":\"standard\",\"closureRoot\":{},",
+                    "\"productRoot\":{}}}"
+                ),
+                json_string(&path.to_string_lossy()),
+                bytes,
+                json_string(&root_hex(closure_root)),
+                json_string(&root_hex(product_root)),
+            )
+        },
+    );
     let stdout = if json {
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
                 "\"definitions\":{},\"sourceBytes\":{},\"finalValue\":{},",
-                "\"flbcBytes\":{},\"emittedFlbc\":{},",
+                "\"flbcBytes\":{},\"emittedFlbc\":{},\"emittedSidecar\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"checker\":{{\"definitions\":{},\"finalSchema\":{},",
                 "\"finalGround\":{}}},",
@@ -1726,6 +1956,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.final_value,
             result.flbc_bytes,
             emitted_flbc_json,
+            emitted_sidecar_json,
             json_string(result.base_root),
             json_string(result.result_root),
             result.definitions,
@@ -1741,6 +1972,22 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             .map_or_else(String::new, |(path, bytes)| {
                 format!("emitted FLBC: {bytes} bytes to {}\n", path.display())
             });
+        let emitted_sidecar = result.emitted_sidecar.map_or_else(
+            String::new,
+            |(path, bytes, closure_root, product_root)| {
+                format!(
+                    concat!(
+                        "emitted sidecar: {} bytes to {}\n",
+                        "closure root: {}\n",
+                        "product root: {}\n"
+                    ),
+                    bytes,
+                    path.display(),
+                    root_hex(closure_root),
+                    root_hex(product_root),
+                )
+            },
+        );
         format!(
             concat!(
                 "native source batch: complete\n",
@@ -1748,6 +1995,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
                 "final value: {}\n",
                 "source bytes: {}\n",
                 "canonical FLBC bytes: {} total\n",
+                "{}",
                 "{}",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -1759,6 +2007,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.source_bytes,
             result.flbc_bytes,
             emitted_flbc,
+            emitted_sidecar,
             result.base_root,
             result.result_root,
             result.definitions,
@@ -1832,6 +2081,8 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
 fn execute_source_bytes_with_publisher<P>(
     sources: Vec<Vec<u8>>,
     emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
+    toolchain_image: Option<Vec<u8>>,
     json: bool,
     mut publish: P,
 ) -> MultiplexerOutput
@@ -1974,12 +2225,55 @@ where
             1,
         );
     }
+    let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
+        let toolchain_image = match toolchain_image {
+            Some(image) => image,
+            None => match read_current_toolchain_image() {
+                Ok(image) => image,
+                Err(error) => {
+                    return source_failure("internal-fault", &error.to_string(), false, json, 4);
+                }
+            },
+        };
+        let sidecar = match fln::build_source_run_flbc_sidecar(
+            &source_refs,
+            &options,
+            &toolchain_image,
+            &completed,
+        ) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                return source_failure("sidecar", &error.to_string(), false, json, 1);
+            }
+        };
+        let bytes = fln::encode_flbc_product_sidecar(&sidecar);
+        if let Err(error) = publish(&bytes, path) {
+            return source_failure(
+                "output",
+                &format!(
+                    "could not durably publish FLBC sidecar to {}: {error}; the FLBC product was not replaced",
+                    path.display()
+                ),
+                true,
+                json,
+                1,
+            );
+        }
+        Some((
+            path,
+            bytes.len(),
+            sidecar.closure_root(),
+            sidecar.product_root(),
+        ))
+    } else {
+        None
+    };
     let emitted_flbc = if let Some(path) = emit_flbc.as_deref() {
         if let Err(error) = publish(&final_execution.flbc_artifact, path) {
             return source_failure(
                 "output",
                 &format!(
-                    "could not durably publish final FLBC artifact to {}: {error}; target is either the previous complete file or the complete new artifact",
+                    "could not durably publish final FLBC artifact to {}: {error}; the sidecar may name the new bytes, but consumers will refuse an old product by root mismatch",
                     path.display()
                 ),
                 true,
@@ -2002,6 +2296,7 @@ where
             checker_schema: final_execution.checker.schema,
             checker_ground,
             emitted_flbc,
+            emitted_sidecar,
             steps: returned.usage.steps,
             system_polls: returned.usage.system_polls,
             peak_stack_depth: returned.usage.peak_stack_depth,
@@ -2012,15 +2307,23 @@ where
 
 #[cfg(test)]
 fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput {
-    execute_source_bytes_with_publisher(sources, None, json, fln::publish_file_atomic)
+    execute_source_bytes_with_publisher(sources, None, None, None, json, fln::publish_file_atomic)
 }
 
 fn execute_source_bytes_with_output(
     sources: Vec<Vec<u8>>,
     emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
     json: bool,
 ) -> MultiplexerOutput {
-    execute_source_bytes_with_publisher(sources, emit_flbc, json, fln::publish_file_atomic)
+    execute_source_bytes_with_publisher(
+        sources,
+        emit_flbc,
+        emit_sidecar,
+        None,
+        json,
+        fln::publish_file_atomic,
+    )
 }
 
 fn read_source_batch(
@@ -2059,6 +2362,7 @@ fn run_sources(
     max_bytes: usize,
     json: bool,
     emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
 ) -> MultiplexerOutput {
     let sources = match read_source_batch(paths, max_bytes) {
         Ok(sources) => sources,
@@ -2070,7 +2374,7 @@ fn run_sources(
     let worker = match std::thread::Builder::new()
         .name("fln-source-run".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
-        .spawn(move || execute_source_bytes_with_output(sources, emit_flbc, json))
+        .spawn(move || execute_source_bytes_with_output(sources, emit_flbc, emit_sidecar, json))
     {
         Ok(worker) => worker,
         Err(error) => {
@@ -2113,12 +2417,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
             emit_flbc,
-        }) => run_sources(&paths, max_bytes, json, emit_flbc),
+            emit_sidecar,
+        }) => run_sources(&paths, max_bytes, json, emit_flbc, emit_sidecar),
         Ok(MultiplexerCommand::FlbcRun {
             path,
             max_bytes,
             json,
-        }) => run_flbc(&path, max_bytes, json),
+            sidecar,
+        }) => run_flbc(&path, max_bytes, sidecar.as_deref(), json),
         Ok(MultiplexerCommand::OleanInspect {
             path,
             max_bytes,
@@ -2751,6 +3057,30 @@ mod tests {
                 .stderr
                 .contains("flbc run accepts exactly one input path")
         );
+
+        let parsed = super::parse_flbc_run(vec![
+            OsString::from("--sidecar=product.sidecar"),
+            OsString::from("product.flbc"),
+        ])
+        .expect("one explicit sidecar is valid");
+        assert!(matches!(
+            parsed,
+            super::MultiplexerCommand::FlbcRun {
+                path,
+                sidecar: Some(sidecar),
+                ..
+            } if path == std::path::Path::new("product.flbc")
+                && sidecar == std::path::Path::new("product.sidecar")
+        ));
+
+        let duplicate = super::parse_flbc_run(vec![
+            OsString::from("--sidecar=one.sidecar"),
+            OsString::from("--sidecar"),
+            OsString::from("two.sidecar"),
+            OsString::from("product.flbc"),
+        ])
+        .expect_err("duplicate sidecars are ambiguous");
+        assert!(duplicate.to_string().contains("at most once"));
     }
 
     #[test]
@@ -3091,6 +3421,8 @@ mod tests {
                 b"def emitted : Nat := 17".to_vec(),
             ],
             Some(target.clone()),
+            None,
+            None,
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
@@ -3101,7 +3433,7 @@ mod tests {
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
         assert_eq!(publications, vec![(target, expected.clone())]);
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/3\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/4\""));
         assert!(
             output
                 .stdout
@@ -3116,6 +3448,8 @@ mod tests {
                 b"def open (x : Nat) : Nat := x".to_vec(),
             ],
             Some(PathBuf::from("must-not-publish.flbc")),
+            None,
+            None,
             true,
             |_bytes, _path| {
                 failed_batch_publications += 1;
@@ -3128,6 +3462,8 @@ mod tests {
         let publication_failure = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 17".to_vec()],
             Some(PathBuf::from("refused.flbc")),
+            None,
+            None,
             true,
             |_bytes, _path| Err(std::io::Error::other("injected output refusal")),
         );
@@ -3140,6 +3476,61 @@ mod tests {
                 .stderr
                 .contains("injected output refusal")
         );
+    }
+
+    #[test]
+    fn source_run_sidecar_is_exact_and_published_before_its_product() {
+        let flbc_path = PathBuf::from("bound-product.flbc");
+        let sidecar_path = PathBuf::from("bound-product.flbc.sidecar");
+        let expected_product = scalar_flbc_fixture(23);
+        let mut publications = Vec::new();
+        let output = execute_source_bytes_with_publisher(
+            vec![b"def emitted : Nat := 23".to_vec()],
+            Some(flbc_path.clone()),
+            Some(sidecar_path.clone()),
+            Some(b"injected toolchain image".to_vec()),
+            true,
+            |bytes, path| {
+                publications.push((path.to_path_buf(), bytes.to_vec()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(publications.len(), 2);
+        assert_eq!(publications[0].0, sidecar_path);
+        assert_eq!(publications[1], (flbc_path, expected_product.clone()));
+        let verified = fln::verify_source_run_flbc_sidecar(
+            &publications[0].1,
+            &expected_product,
+            b"injected toolchain image",
+        )
+        .expect("the emitted sidecar binds the exact emitted product");
+        let replay = super::execute_flbc_bytes_with_sidecar(
+            &expected_product,
+            expected_product.len(),
+            Some(&verified),
+            true,
+        );
+        assert_eq!(replay.exit_code, 0, "{}", replay.stderr);
+        assert!(replay.stdout.contains("\"sidecar\":{\"verified\":true"));
+        assert!(output.stdout.contains("\"emittedSidecar\":{"));
+        assert!(output.stdout.contains("\"profile\":\"standard\""));
+
+        let mut failed_publications = 0;
+        let failed = execute_source_bytes_with_publisher(
+            vec![b"def open (x : Nat) : Nat := x".to_vec()],
+            Some(PathBuf::from("not-published.flbc")),
+            Some(PathBuf::from("not-published.sidecar")),
+            Some(b"injected toolchain image".to_vec()),
+            true,
+            |_bytes, _path| {
+                failed_publications += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(failed.exit_code, 1);
+        assert_eq!(failed_publications, 0);
     }
 
     #[test]
@@ -3168,6 +3559,49 @@ mod tests {
         ])
         .expect_err("duplicate emission paths are ambiguous");
         assert!(duplicate.to_string().contains("at most once"));
+
+        let sidecar_without_product = parse_source_run(vec![
+            OsString::from("--emit-sidecar=product.sidecar"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("a sidecar without a product is ambiguous");
+        assert!(
+            sidecar_without_product
+                .to_string()
+                .contains("requires --emit-flbc")
+        );
+
+        let same_path = parse_source_run(vec![
+            OsString::from("--emit-flbc=product.flbc"),
+            OsString::from("--emit-sidecar=product.flbc"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("one path cannot carry two schemas");
+        assert!(same_path.to_string().contains("different paths"));
+
+        let aliased_path = parse_source_run(vec![
+            OsString::from("--emit-flbc=product.flbc"),
+            OsString::from("--emit-sidecar=./product.flbc"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("lexical aliases cannot carry two schemas");
+        assert!(aliased_path.to_string().contains("different paths"));
+
+        let both = parse_source_run(vec![
+            OsString::from("--emit-flbc=product.flbc"),
+            OsString::from("--emit-sidecar=product.sidecar"),
+            OsString::from("input.lean"),
+        ])
+        .expect("the product and sidecar pair is explicit");
+        assert!(matches!(
+            both,
+            super::MultiplexerCommand::SourceRun {
+                emit_flbc: Some(flbc),
+                emit_sidecar: Some(sidecar),
+                ..
+            } if flbc == std::path::Path::new("product.flbc")
+                && sidecar == std::path::Path::new("product.sidecar")
+        ));
 
         let terminated = parse_source_run(vec![
             OsString::from("--"),

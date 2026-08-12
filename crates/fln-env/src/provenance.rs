@@ -3311,7 +3311,10 @@ mod tests {
         assert!(Domain::ALL.contains(&Domain::ShadowTelemetry));
         assert!(Domain::ALL.contains(&Domain::ShadowPublication));
         assert!(Domain::ALL.contains(&Domain::ShadowSampling));
-        assert_eq!(Domain::ALL.len(), 16);
+        assert!(Domain::ALL.contains(&Domain::ArtifactClosureComponent));
+        assert!(Domain::ALL.contains(&Domain::ArtifactClosure));
+        assert!(Domain::ALL.contains(&Domain::ArtifactProduct));
+        assert_eq!(Domain::ALL.len(), 19);
         assert_ne!(
             hash(Domain::LogicalRoot, b"same"),
             hash(Domain::ModuleProvenance, b"same")

@@ -144,6 +144,13 @@ const NONRESOLVING_ALLOWANCE: &[&str] = &[
     "fln-syntax:tree::tests::reconstruction_delegates_to_the_attachment_tiling",
     "fln-syntax:tree::tests::source_view_recovers_original_crlf_bytes",
     "fln-syntax:tree::tests::syntax_forms_match_the_pin",
+    // These three names describe Verdict's former direct publication authority. The
+    // product path now returns a kernel-checked candidate to the facade instead; keeping
+    // the historical citations unresolved is more honest than repointing old claims at
+    // tests whose semantics are deliberately different.
+    "fln-verdict:bv_decide_no_mock_e2e::cancellation_resource_and_internal_fault_never_publish",
+    "fln-verdict:reflection::tests::kernel_admission_boundary_has_no_raw_check_or_environment_plan_route",
+    "fln-verdict:reflection::tests::reflected_theorem_replay_publishes_the_kernel_checked_owner",
     "structure-guard:contract_inventory::tests::canonical_generation_is_deterministic_bijective_and_not_a_second_pin_authority",
     "tribunal/epoch-lab:epoch_lab_hash_chain::a_leftover_candidate_is_typed_inconclusive_not_consumed",
     "tribunal/epoch-lab:epoch_lab_hash_chain::a_rewritten_history_is_refused_even_when_internally_consistent",

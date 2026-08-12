@@ -422,7 +422,11 @@ mod tests {
     use fln_core::mode::{Mode, ReproducibilityProfile};
     use fln_core::name::Name;
     use fln_env::constants::{ConstantInfo, ConstantVal, TheoremVal};
-    use fln_env::environment::Environment;
+    use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::Declaration;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
     use fln_kernel::verdict::{Budget as KernelBudget, RejectClass};
 
     use crate::{
@@ -790,9 +794,32 @@ mod tests {
     #[test]
     fn kernel_admission_boundary_refuses_duplicate_without_overwrite() {
         let existing = valid_theorem("reflected.duplicate");
-        let environment = Environment::new()
-            .add_decl(ConstantInfo::Thm(existing.clone()))
-            .expect("test setup contains the existing theorem");
+        let base = Environment::new();
+        let admitted = admit(
+            &base,
+            Declaration::Thm(existing.clone()),
+            KernelBudget::DEFAULT,
+        )
+        .into_complete()
+        .expect("test setup admission must answer");
+        let checked = match convene(&Council::nobody_was_asked(), admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            _ => panic!("test setup theorem must pass its explicit empty council"),
+        };
+        let environment = match checked
+            .publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+            .into_complete()
+            .expect("test setup publication must answer")
+        {
+            Published::Committed(DeclarationCommitted::Published(publication)) => {
+                publication.environment
+            }
+            _ => panic!("test setup theorem must publish exactly once"),
+        };
         let outcome = check_reflected_theorem(
             &environment,
             artifact(existing),

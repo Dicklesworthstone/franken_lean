@@ -74,6 +74,12 @@ pub enum Domain {
     ShadowPublication,
     /// Deterministic continued-sampling decisions and receipts.
     ShadowSampling,
+    /// One typed input in an artifact's explicit reproducibility closure.
+    ArtifactClosureComponent,
+    /// The ordered aggregate of every required artifact-closure component root.
+    ArtifactClosure,
+    /// Exact bytes of one emitted executable artifact.
+    ArtifactProduct,
     /// Tribunal fixture and corpus identity (test apparatus only).
     Fixture,
 }
@@ -97,13 +103,16 @@ impl Domain {
             Domain::ShadowTelemetry => "fln 2026 domain shadow-telemetry/1",
             Domain::ShadowPublication => "fln 2026 domain shadow-publication/1",
             Domain::ShadowSampling => "fln 2026 domain shadow-sampling/1",
+            Domain::ArtifactClosureComponent => "fln 2026 domain artifact-closure-component/1",
+            Domain::ArtifactClosure => "fln 2026 domain artifact-closure/1",
+            Domain::ArtifactProduct => "fln 2026 domain artifact-product/1",
             Domain::Fixture => "fln 2026 domain fixture/1",
         }
     }
 
     /// Every registered domain, for registry-wide tests (pairwise distinctness,
     /// frozen-vector stability).
-    pub const ALL: [Domain; 16] = [
+    pub const ALL: [Domain; 19] = [
         Domain::DeclContent,
         Domain::LogicalRoot,
         Domain::ExtensionDelta,
@@ -119,6 +128,9 @@ impl Domain {
         Domain::ShadowTelemetry,
         Domain::ShadowPublication,
         Domain::ShadowSampling,
+        Domain::ArtifactClosureComponent,
+        Domain::ArtifactClosure,
+        Domain::ArtifactProduct,
         Domain::Fixture,
     ];
 }
@@ -234,6 +246,9 @@ mod tests {
             Domain::ShadowTelemetry => "ShadowTelemetry",
             Domain::ShadowPublication => "ShadowPublication",
             Domain::ShadowSampling => "ShadowSampling",
+            Domain::ArtifactClosureComponent => "ArtifactClosureComponent",
+            Domain::ArtifactClosure => "ArtifactClosure",
+            Domain::ArtifactProduct => "ArtifactProduct",
             Domain::Fixture => "Fixture",
         }
     }

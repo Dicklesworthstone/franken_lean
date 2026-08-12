@@ -51,7 +51,10 @@ pub use fln_core::diag::{
 };
 pub use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 pub use fln_core::level::Level;
-pub use fln_core::mode::{Mode, ReproducibilityProfile};
+pub use fln_core::mode::{
+    BuildProfileId, CgsePolicyId, ClosureComponent, ContentRoot, DeterminismClass, EpochId, Mode,
+    ReproducibilityProfile, TargetId,
+};
 pub use fln_core::name::Name;
 pub use fln_core::options::KVMap;
 pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
@@ -64,7 +67,12 @@ use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
 pub use fln_env::modules::CancellationProbe;
 pub use fln_env::pmap::CollisionBudget;
-use fln_hash::canon::Canonical;
+pub use fln_hash::canon::CanonError as FlbcProductSidecarCodecError;
+use fln_hash::canon::{CanonWriter, Canonical};
+pub use fln_hash::product::{
+    ClosureMaterialV1, FlbcProductSidecarV1, ProductSidecarBuildRefusal, ProductSidecarRefusal,
+    StandardProductCoordinatesV1, flbc_product_root,
+};
 pub use fln_hash::root::LogicalRoot;
 pub use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
@@ -198,6 +206,66 @@ pub fn execute_flbc_artifact(
 ) -> Result<Outcome<VmExit>, CodecError> {
     let executable = fln_comp::flbc::decode_canonical(artifact, limits.codec)?;
     Ok(execute_golem_with_options(&executable, options, limits.vm))
+}
+
+/// Canonical bytes of one already-built FLBC product sidecar.
+pub fn encode_flbc_product_sidecar(sidecar: &FlbcProductSidecarV1) -> Vec<u8> {
+    sidecar.to_canonical_bytes()
+}
+
+/// Decode and structurally validate one FLBC product sidecar.
+pub fn decode_flbc_product_sidecar(
+    bytes: &[u8],
+) -> Result<FlbcProductSidecarV1, FlbcProductSidecarCodecError> {
+    FlbcProductSidecarV1::from_canonical_bytes(bytes)
+}
+
+/// Failure to derive the current bounded source runner's standard product closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRunSidecarBuildError {
+    EmptyExecutionBatch,
+    UnsupportedTarget { target: String },
+    Closure(ProductSidecarBuildRefusal),
+}
+
+impl std::fmt::Display for SourceRunSidecarBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyExecutionBatch => {
+                f.write_str("cannot bind a sidecar to an empty execution batch")
+            }
+            Self::UnsupportedTarget { target } => {
+                write!(
+                    f,
+                    "the source-run product sidecar has no registered target for {target}"
+                )
+            }
+            Self::Closure(refusal) => refusal.fmt(f),
+        }
+    }
+}
+
+/// Failure to bind a sidecar to actual bytes and the current bounded source runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRunSidecarVerificationError {
+    Codec(FlbcProductSidecarCodecError),
+    UnsupportedTarget { target: String },
+    Binding(ProductSidecarRefusal),
+}
+
+impl std::fmt::Display for SourceRunSidecarVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codec(error) => error.fmt(f),
+            Self::UnsupportedTarget { target } => {
+                write!(
+                    f,
+                    "the source-run product sidecar has no registered target for {target}"
+                )
+            }
+            Self::Binding(refusal) => refusal.fmt(f),
+        }
+    }
 }
 
 /// Independent resource ceilings for pinned-format `.olean` inspection.
@@ -2996,6 +3064,278 @@ pub struct DefinitionBatchExecution {
     pub executions: Vec<DefinitionExecution>,
 }
 
+const SOURCE_RUN_EPOCH_ID: EpochId = EpochId::new(4_032_000);
+const SOURCE_RUN_CGSE_POLICY_ID: CgsePolicyId = CgsePolicyId::new(1);
+const SOURCE_RUN_TARGET_X86_64_LINUX_GNU_ID: TargetId = TargetId::new(1);
+const SOURCE_RUN_DEBUG_PROFILE_ID: BuildProfileId = BuildProfileId::new(1);
+const SOURCE_RUN_RELEASE_PROFILE_ID: BuildProfileId = BuildProfileId::new(2);
+const SOURCE_RUN_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+const SOURCE_RUN_POLICY_TAG: &str = "fln.source-run.product-policy/1";
+
+fn source_run_build_profile() -> (BuildProfileId, &'static str) {
+    if cfg!(debug_assertions) {
+        (SOURCE_RUN_DEBUG_PROFILE_ID, "debug")
+    } else {
+        (SOURCE_RUN_RELEASE_PROFILE_ID, "release")
+    }
+}
+
+fn current_source_run_coordinates()
+-> Result<StandardProductCoordinatesV1, SourceRunSidecarBuildError> {
+    if !cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        return Err(SourceRunSidecarBuildError::UnsupportedTarget {
+            target: format!(
+                "{}-{}-{}",
+                std::env::consts::ARCH,
+                std::env::consts::OS,
+                std::env::consts::FAMILY
+            ),
+        });
+    }
+    Ok(StandardProductCoordinatesV1 {
+        mode: Mode::Sound,
+        epoch: SOURCE_RUN_EPOCH_ID,
+        cgse_policy: SOURCE_RUN_CGSE_POLICY_ID,
+        determinism: DeterminismClass::D1Canonicalized,
+        target: SOURCE_RUN_TARGET_X86_64_LINUX_GNU_ID,
+        build_profile: source_run_build_profile().0,
+    })
+}
+
+fn material_bytes(tag: &str, write: impl FnOnce(&mut CanonWriter)) -> Vec<u8> {
+    let mut writer = CanonWriter::new();
+    writer.str(tag);
+    write(&mut writer);
+    writer.into_bytes()
+}
+
+fn source_material(sources: &[&[u8]]) -> Vec<u8> {
+    material_bytes("fln.source-run.sources/1", |writer| {
+        writer.u64(sources.len() as u64);
+        for source in sources {
+            writer.bytes(source);
+        }
+    })
+}
+
+fn suite_lock_material() -> Vec<u8> {
+    material_bytes("fln.source-run.suite-lock/1", |writer| {
+        writer.bytes(include_bytes!("../../../SUITE.lock"));
+    })
+}
+
+fn options_material(options: &KVMap) -> Vec<u8> {
+    material_bytes("fln.source-run.options/1", |writer| {
+        writer.bytes(&options.to_canonical_bytes());
+    })
+}
+
+fn empty_set_material(tag: &str) -> Vec<u8> {
+    material_bytes(tag, |writer| writer.u64(0))
+}
+
+fn mode_material() -> Vec<u8> {
+    material_bytes("fln.source-run.mode/1", |writer| {
+        writer.u8(Mode::Sound.tag());
+    })
+}
+
+fn epoch_material() -> Vec<u8> {
+    material_bytes("fln.source-run.epoch/1", |writer| {
+        writer.bytes(&SOURCE_RUN_EPOCH_ID.get().to_le_bytes());
+        writer.str(OLEAN_PIN_TAG);
+        writer.str(OLEAN_PIN_COMMIT);
+    })
+}
+
+fn target_material() -> Vec<u8> {
+    material_bytes("fln.source-run.target/1", |writer| {
+        writer.bytes(&SOURCE_RUN_TARGET_X86_64_LINUX_GNU_ID.get().to_le_bytes());
+        writer.str(SOURCE_RUN_TARGET_TRIPLE);
+    })
+}
+
+fn build_profile_material() -> Vec<u8> {
+    let (profile, name) = source_run_build_profile();
+    material_bytes("fln.source-run.build-profile/1", |writer| {
+        writer.bytes(&profile.get().to_le_bytes());
+        writer.str(name);
+    })
+}
+
+fn policy_material() -> Vec<u8> {
+    material_bytes("fln.source-run.policy-epochs/1", |writer| {
+        writer.str(SOURCE_RUN_POLICY_TAG);
+        writer.bytes(&SOURCE_RUN_CGSE_POLICY_ID.get().to_le_bytes());
+        writer.u16(fln_comp::flbc::FLBC_SCHEMA_VERSION);
+        writer.u16(fln_comp::flbc::FLBC_WIRE_VERSION);
+        writer.u16(fln_comp::flbc::OWNERSHIP_WITNESS_VERSION);
+    })
+}
+
+fn semantic_input_material(completed: &DefinitionBatchExecution) -> Vec<u8> {
+    material_bytes("fln.source-run.semantic-inputs/1", |writer| {
+        writer.u64(completed.executions.len() as u64);
+        writer.bytes(&completed.base_logical_root.0.0);
+        writer.bytes(&completed.result_logical_root.0.0);
+        for execution in &completed.executions {
+            writer.bytes(&execution.base_logical_root.0.0);
+            writer.bytes(&execution.result_logical_root.0.0);
+            writer.bytes(&flbc_product_root(&execution.flbc_artifact).bytes());
+        }
+    })
+}
+
+fn source_run_material<'a>(
+    sources: &[&[u8]],
+    options: &KVMap,
+    toolchain_image: &'a [u8],
+    completed: &DefinitionBatchExecution,
+) -> Vec<(ClosureComponent, std::borrow::Cow<'a, [u8]>)> {
+    vec![
+        (
+            ClosureComponent::Sources,
+            std::borrow::Cow::Owned(source_material(sources)),
+        ),
+        (
+            ClosureComponent::Toolchain,
+            std::borrow::Cow::Borrowed(toolchain_image),
+        ),
+        (
+            ClosureComponent::SuiteLock,
+            std::borrow::Cow::Owned(suite_lock_material()),
+        ),
+        (
+            ClosureComponent::Options,
+            std::borrow::Cow::Owned(options_material(options)),
+        ),
+        (
+            ClosureComponent::Plugins,
+            std::borrow::Cow::Owned(empty_set_material("fln.source-run.plugins/1")),
+        ),
+        (
+            ClosureComponent::Mode,
+            std::borrow::Cow::Owned(mode_material()),
+        ),
+        (
+            ClosureComponent::Epoch,
+            std::borrow::Cow::Owned(epoch_material()),
+        ),
+        (
+            ClosureComponent::Target,
+            std::borrow::Cow::Owned(target_material()),
+        ),
+        (
+            ClosureComponent::BuildProfile,
+            std::borrow::Cow::Owned(build_profile_material()),
+        ),
+        (
+            ClosureComponent::Features,
+            std::borrow::Cow::Owned(empty_set_material("fln.source-run.features/1")),
+        ),
+        (
+            ClosureComponent::PolicyEpochs,
+            std::borrow::Cow::Owned(policy_material()),
+        ),
+        (
+            ClosureComponent::SemanticInputs,
+            std::borrow::Cow::Owned(semantic_input_material(completed)),
+        ),
+        (
+            ClosureComponent::ReplayInputs,
+            std::borrow::Cow::Owned(empty_set_material("fln.source-run.replay-inputs/1")),
+        ),
+    ]
+}
+
+/// Bind the bounded source runner's exact final FLBC bytes to its standard-profile
+/// closure. The toolchain component is the caller-supplied current executable image;
+/// this API makes no certified/reproducible claim and cannot construct that profile.
+pub fn build_source_run_flbc_sidecar(
+    sources: &[&[u8]],
+    options: &KVMap,
+    toolchain_image: &[u8],
+    completed: &DefinitionBatchExecution,
+) -> Result<FlbcProductSidecarV1, SourceRunSidecarBuildError> {
+    let final_execution = completed
+        .executions
+        .last()
+        .ok_or(SourceRunSidecarBuildError::EmptyExecutionBatch)?;
+    let coordinates = current_source_run_coordinates()?;
+    let material = source_run_material(sources, options, toolchain_image, completed);
+    let entries: Vec<_> = material
+        .iter()
+        .map(|(component, bytes)| ClosureMaterialV1 {
+            component: *component,
+            bytes: bytes.as_ref(),
+        })
+        .collect();
+    FlbcProductSidecarV1::build_standard(coordinates, &entries, &final_execution.flbc_artifact)
+        .map_err(SourceRunSidecarBuildError::Closure)
+}
+
+/// Validate a sidecar against exact FLBC bytes and every current source-run component
+/// the consumer can independently rederive. Source bytes and elaborated logical roots
+/// are intentionally not reconstructed from executable output; v1 is a standard
+/// binding, not a certified source-reproducibility proof.
+pub fn verify_source_run_flbc_sidecar(
+    sidecar_bytes: &[u8],
+    flbc_product: &[u8],
+    toolchain_image: &[u8],
+) -> Result<FlbcProductSidecarV1, SourceRunSidecarVerificationError> {
+    let sidecar = decode_flbc_product_sidecar(sidecar_bytes)
+        .map_err(SourceRunSidecarVerificationError::Codec)?;
+    let expected = current_source_run_coordinates().map_err(|error| match error {
+        SourceRunSidecarBuildError::UnsupportedTarget { target } => {
+            SourceRunSidecarVerificationError::UnsupportedTarget { target }
+        }
+        SourceRunSidecarBuildError::EmptyExecutionBatch
+        | SourceRunSidecarBuildError::Closure(_) => {
+            unreachable!("coordinate derivation cannot inspect an execution closure")
+        }
+    })?;
+    sidecar
+        .verify_coordinates(expected)
+        .map_err(SourceRunSidecarVerificationError::Binding)?;
+    sidecar
+        .verify_product(flbc_product, Mode::Sound)
+        .map_err(SourceRunSidecarVerificationError::Binding)?;
+    sidecar
+        .verify_component_material(ClosureComponent::Toolchain, toolchain_image)
+        .map_err(SourceRunSidecarVerificationError::Binding)?;
+    let options = KVMap::new();
+    for (component, material) in [
+        (ClosureComponent::SuiteLock, suite_lock_material()),
+        (ClosureComponent::Options, options_material(&options)),
+        (
+            ClosureComponent::Plugins,
+            empty_set_material("fln.source-run.plugins/1"),
+        ),
+        (ClosureComponent::Mode, mode_material()),
+        (ClosureComponent::Epoch, epoch_material()),
+        (ClosureComponent::Target, target_material()),
+        (ClosureComponent::BuildProfile, build_profile_material()),
+        (
+            ClosureComponent::Features,
+            empty_set_material("fln.source-run.features/1"),
+        ),
+        (ClosureComponent::PolicyEpochs, policy_material()),
+        (
+            ClosureComponent::ReplayInputs,
+            empty_set_material("fln.source-run.replay-inputs/1"),
+        ),
+    ] {
+        sidecar
+            .verify_component_material(component, &material)
+            .map_err(SourceRunSidecarVerificationError::Binding)?;
+    }
+    Ok(sidecar)
+}
+
 /// A completed refusal before an admission-only successor is exposed.
 /// Non-answers live in [`Outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4096,6 +4436,57 @@ mod tests {
         };
         assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
         assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn source_run_sidecar_binds_exact_product_toolchain_and_current_coordinates() {
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let sources: [&[u8]; 2] = [b"def first := 17", b"def answer := first"];
+        let completed = engine
+            .execute_nat_definitions(&sources, &options, test_limits())
+            .expect("the supported batch reaches Golem")
+            .into_complete()
+            .expect("the bounded batch answers completely");
+        let product = completed
+            .executions
+            .last()
+            .expect("the completed batch is nonempty")
+            .flbc_artifact
+            .clone();
+        let sidecar = super::build_source_run_flbc_sidecar(
+            &sources,
+            &options,
+            b"exact toolchain image",
+            &completed,
+        )
+        .expect("the current target has a standard closure");
+        let bytes = super::encode_flbc_product_sidecar(&sidecar);
+        let verified =
+            super::verify_source_run_flbc_sidecar(&bytes, &product, b"exact toolchain image")
+                .expect("the exact product closure verifies");
+        assert_eq!(verified, sidecar);
+        assert_eq!(verified.mode(), Mode::Sound);
+        assert_eq!(verified.reproducibility(), ReproducibilityProfile::Standard);
+
+        let mut substituted = product.clone();
+        substituted[0] ^= 1;
+        assert!(matches!(
+            super::verify_source_run_flbc_sidecar(&bytes, &substituted, b"exact toolchain image"),
+            Err(super::SourceRunSidecarVerificationError::Binding(
+                super::ProductSidecarRefusal::ProductRootMismatch
+            ))
+        ));
+        assert!(matches!(
+            super::verify_source_run_flbc_sidecar(&bytes, &product, b"other toolchain image"),
+            Err(super::SourceRunSidecarVerificationError::Binding(
+                super::ProductSidecarRefusal::ClosureComponentMismatch {
+                    component: super::ClosureComponent::Toolchain,
+                }
+            ))
+        ));
+        super::verify_source_run_flbc_sidecar(&bytes, &product, b"exact toolchain image")
+            .expect("both negative controls recover on exact inputs");
     }
 
     #[test]

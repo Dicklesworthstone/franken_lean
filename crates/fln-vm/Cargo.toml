@@ -1,3 +1,4 @@
+# fln-mode-provenance: neutral
 [package]
 name = "fln-vm"
 version = "0.0.0"

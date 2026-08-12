@@ -61,8 +61,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:2044` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:1984`/`2332`/`3258` decide
+//!   directly as its verdict — `tc.rs:2127` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:2067`/`2415`/`3341` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -72,9 +72,9 @@
 //!   `loose_bvar_range`, `has_fvar`, `has_expr_mvar`, `has_level_mvar`,
 //!   `has_level_param`, `approx_depth`. These are precomputed answers that the
 //!   kernel *skips work* on: `instantiate` returns early when
-//!   `loose_bvar_range() <= k` (`tc.rs:982`), and the iterative
+//!   `loose_bvar_range() <= k` (`tc.rs:1065`), and the iterative
 //!   `abstract_fvar_set` and `replace_fvar` paths return early when
-//!   `!has_fvar()` (`tc.rs:3072`/`3147`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:3155`/`3230`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -89,8 +89,8 @@
 //! `gii` requires this crate to bring "its OWN decoder over Grimoire canonical
 //! wire objects". The graph enforces that by prohibiting `fln-olean` — but
 //! `fln-hash` is *permitted*, and `fln-hash::canon` carries
-//! `impl Canonical for Expr` (`canon.rs:1150`) whose trait supplies
-//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:648-669`). A
+//! `impl Canonical for Expr` (`canon.rs:1160`) whose trait supplies
+//! `to_canonical_bytes` / `from_canonical_bytes` (`canon.rs:658-679`). A
 //! checker can therefore read canonical bytes, call `Expr::from_canonical_bytes`,
 //! and share the decode path with the rest of the workspace **while satisfying
 //! every prohibition structure-guard currently enforces**. The "own decoder"
@@ -156,7 +156,7 @@
 //!
 //! This section previously said two prohibitions were missing. **One of them has
 //! landed**, and the paragraph outlived it — which is the defect this crate's own
-//! matrix row was corrected for once already (`witness.rs:540`, where
+//! matrix row was corrected for once already (`witness.rs:542`, where
 //! `B3-INDEPENDENT-CHECKER` asserted a "6-line charter stub" at 149 lines, green
 //! throughout). So the state is measured here rather than remembered, at
 //! `53a5e3ec`:
@@ -314,17 +314,17 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:2044 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:1984 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:2332 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:3258 :: ExprNode::Sort { level } @@ fn infer_proj
-//! cite crates/fln-kernel/src/tc.rs:982 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:3072 :: !e.has_fvar() @@ fn abstract_fvar_set
-//! cite crates/fln-kernel/src/tc.rs:3147 :: !e.has_fvar() @@ fn replace_fvar
-//! cite crates/fln-hash/src/canon.rs:1150 :: impl Canonical for Expr
-//! cite crates/fln-hash/src/canon.rs:648 :: pub trait Canonical: Sized
+//! cite crates/fln-kernel/src/tc.rs:2127 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:2067 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:2415 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:3341 :: ExprNode::Sort { level } @@ fn infer_proj
+//! cite crates/fln-kernel/src/tc.rs:1065 :: e.loose_bvar_range() <= k
+//! cite crates/fln-kernel/src/tc.rs:3155 :: !e.has_fvar() @@ fn abstract_fvar_set
+//! cite crates/fln-kernel/src/tc.rs:3230 :: !e.has_fvar() @@ fn replace_fvar
+//! cite crates/fln-hash/src/canon.rs:1160 :: impl Canonical for Expr
+//! cite crates/fln-hash/src/canon.rs:658 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
-//! cite crates/fln-conformance/src/witness.rs:540 :: id: "B3-INDEPENDENT-CHECKER"
+//! cite crates/fln-conformance/src/witness.rs:542 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
 //! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
