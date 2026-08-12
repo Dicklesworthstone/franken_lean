@@ -1479,6 +1479,63 @@ fn kr316_iota_is_stuck_without_a_constructor_major_or_full_arity() {
     );
 }
 
+/// A safe definition can expose a recursor whose major is itself stuck.  This
+/// is the pin-independent shape behind `Init.PropLemmas.ite_not`:
+/// `instDecidableNot p h` unfolds to a match on the opaque decision `h`, and
+/// that stuck match becomes the major of an outer match.
+///
+/// Before the identity result was cached in `whnf_recursor_chain`, the
+/// suspended outer reduction reopened the safe definition forever.  The real
+/// declaration consumed every 10,000,001-step default budget; this structural
+/// witness must instead return the ordinary `NotDefEq` answer under 512 steps.
+#[test]
+fn kr316_stuck_recursor_exposed_by_a_definition_terminates_under_an_outer_recursor() {
+    let env = add_enum_e(&Environment::new());
+    let e = Expr::const_(n("E"), vec![]);
+    let motive = Expr::lam(n("_"), e.clone(), e.clone(), BinderInfo::Default);
+    let fold_e = |major: Expr| {
+        let mut app = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+        for arg in [
+            motive.clone(),
+            Expr::const_(nn("E", "a"), vec![]),
+            Expr::const_(nn("E", "b"), vec![]),
+            major,
+        ] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+
+    let env = admit(&env, &axiom("e0", e.clone()));
+    let exposing_body = Expr::lam(
+        n("major"),
+        e.clone(),
+        fold_e(Expr::bvar(0).expect("packs")),
+        BinderInfo::Default,
+    );
+    let exposing_type = Expr::forall_e(n("major"), e.clone(), e.clone(), BinderInfo::Default);
+    let env = admit(&env, &defn("exposeStuck", exposing_type, exposing_body));
+
+    let exposed = Expr::app(
+        Expr::const_(n("exposeStuck"), vec![]),
+        Expr::const_(n("e0"), vec![]),
+    );
+    let outer = fold_e(exposed);
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &outer,
+        &Expr::const_(nn("E", "a"), vec![]),
+        Budget::DEFAULT.narrowed(512, 32),
+    );
+
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "a nested stuck recursor must terminate as ordinary inequality, not exhaust: {verdict:?}"
+    );
+}
+
 #[test]
 fn kr316_iota_preserves_trailing_arguments() {
     // Trailing arguments after the major premise must be re-applied to the

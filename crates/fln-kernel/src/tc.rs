@@ -1492,7 +1492,7 @@ impl<'a> TypeChecker<'a> {
                                 break;
                             }
                             None => {
-                                normalized = frame.original;
+                                normalized = self.cache_stuck_recursor(frame.original);
                             }
                         }
                     }
@@ -2995,6 +2995,19 @@ impl<'a> TypeChecker<'a> {
             );
         }
         Ok(result)
+    }
+
+    /// Publish an irreducible recursor as its own WHNF before a suspended
+    /// outer recursor retries.  Without both entries, a safe definition such
+    /// as `instDecidableNot p h` can unfold to the same stuck recursor on `h`
+    /// on every retry and rebuild the continuation until the step budget is
+    /// exhausted.
+    fn cache_stuck_recursor(&mut self, stuck: Expr) -> Expr {
+        self.whnf_cache
+            .insert(stuck.clone(), stuck.clone(), self.local_cache_epoch);
+        self.whnf_core_cache
+            .insert(stuck.clone(), stuck.clone(), self.local_cache_epoch);
+        stuck
     }
 }
 
