@@ -2667,6 +2667,31 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
     .expect("decode the complete module chain through the product facade");
     assert!(decoded.companion_parts_loaded);
     let private_infos = decoded.constants;
+    assert!(matches!(
+        fln::decode_olean_module_artifacts(
+            &public,
+            &server,
+            &private,
+            fln::OleanDecodeLimits::new(total_bytes - 1),
+        ),
+        Err(fln::OleanDecodeError::ArtifactTooLarge {
+            bytes,
+            limit
+        }) if bytes == total_bytes && limit == total_bytes - 1
+    ));
+    let mut wrong_server = server.clone();
+    wrong_server[40] ^= 1;
+    assert!(matches!(
+        fln::decode_olean_module_artifacts(
+            &public,
+            &wrong_server,
+            &private,
+            fln::OleanDecodeLimits::new(total_bytes),
+        ),
+        Err(fln::OleanDecodeError::CompanionHeaderMismatch {
+            part: fln::OleanCompanionPart::Server,
+        })
+    ));
     assert!(
         private_infos.len() > public_infos.len(),
         "private level must restore declarations absent from the exported part"
