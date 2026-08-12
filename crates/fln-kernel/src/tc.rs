@@ -293,6 +293,7 @@ struct ExprResultCache {
     max_entries: usize,
     max_bucket_entries: usize,
     rollover_on_saturation: bool,
+    diagnostic_rollovers: usize,
 }
 
 impl ExprResultCache {
@@ -321,6 +322,7 @@ impl ExprResultCache {
             max_entries,
             max_bucket_entries,
             rollover_on_saturation: false,
+            diagnostic_rollovers: 0,
         }
     }
 
@@ -448,6 +450,7 @@ impl ExprResultCache {
             self.cross_scope_entries = 0;
             self.entries = 0;
             self.local_dependency_cells = 0;
+            self.diagnostic_rollovers += 1;
         }
         if self.local_dependency_cells >= TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS
             && (key.has_fvar() || value.has_fvar())
@@ -1212,6 +1215,35 @@ impl<'a> TypeChecker<'a> {
 
     pub(crate) fn consumption(&self) -> Consumption {
         self.used
+    }
+
+    pub(crate) fn emit_temporary_cache_diagnostics(&self) {
+        for (name, cache) in [
+            ("infer", &self.infer_cache),
+            ("infer_only", &self.infer_only_cache),
+            ("whnf_core", &self.whnf_core_cache),
+            ("whnf", &self.whnf_cache),
+        ] {
+            eprintln!(
+                "temporary_cache_diagnostics name={name} entries={} buckets={} cross_scope_entries={} refusals={} dependency_cells={} scan_nodes={} rollovers={}",
+                cache.entries,
+                cache.buckets.len(),
+                cache.cross_scope_entries,
+                cache.dependency_scan_refusals.len(),
+                cache.local_dependency_cells,
+                cache.local_dependency_scan_nodes,
+                cache.diagnostic_rollovers,
+            );
+        }
+        eprintln!(
+            "temporary_cache_diagnostics name=positive_defeq entries={} buckets={} cross_scope_entries={} refusals={} dependency_cells={} scan_nodes={} rollovers=0",
+            self.positive_def_eq_cache.entries,
+            self.positive_def_eq_cache.buckets.len(),
+            self.positive_def_eq_cache.cross_scope_entries,
+            self.positive_def_eq_cache.dependency_scan_refusals.len(),
+            self.positive_def_eq_cache.local_dependency_cells,
+            self.positive_def_eq_cache.local_dependency_scan_nodes,
+        );
     }
 
     /// Crate-facing whnf (the admission path's sort checks).
