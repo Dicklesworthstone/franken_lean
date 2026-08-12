@@ -4584,9 +4584,8 @@ mod tests {
             first == second,
             "cached substitution must preserve the term"
         );
-        assert_eq!(
-            tc.consumption().steps_used - steps_after_first,
-            1,
+        assert!(
+            tc.consumption().steps_used - steps_after_first == 1,
             "a repeated batched substitution must pay only its entry hook"
         );
     }
@@ -5177,8 +5176,8 @@ mod tests {
                 .expect("the first unequal-argument comparison completes"),
             "unequal arguments cannot close the regular-head shortcut"
         );
-        assert_eq!(
-            tc.regular_app_def_eq_failure_cache.entries, 1,
+        assert!(
+            tc.regular_app_def_eq_failure_cache.entries == 1,
             "the failed shortcut pair must be retained"
         );
         let steps_after_first = tc.consumption().steps_used;
@@ -5187,9 +5186,8 @@ mod tests {
                 .expect("the repeated shortcut lookup completes"),
             "a remembered failure still means lazy delta must unfold"
         );
-        assert_eq!(
-            tc.consumption().steps_used,
-            steps_after_first,
+        assert!(
+            tc.consumption().steps_used == steps_after_first,
             "a repeated failed shortcut must not re-run recursive defeq"
         );
         assert!(
@@ -5402,8 +5400,8 @@ mod tests {
         tc.infer(&value_local, 0)
             .expect("the dependent local still infers under the shadow");
         assert!(
-            tc.infer_cache.entries == rows_before_shadow,
-            "changing a transitive dependency must replace the dead row with the live generation"
+            tc.infer_cache.entries == rows_before_shadow + 1,
+            "a shadowed transitive generation must remain recoverable while the live generation gets its own row"
         );
         assert!(
             tc.infer_cache
@@ -5413,6 +5411,22 @@ mod tests {
                     dependencies_are_live(&entry.dependencies, &tc.locals, &tc.local_positions)
                 })),
             "the retained row must name only the current transitive generations"
+        );
+
+        tc.drop_local();
+        tc.adopt_local(
+            FVarId(Name::str(
+                Name::anonymous(),
+                "unrelated_after_transitive_shadow",
+            )),
+            zero,
+        );
+        let restored_transitive_steps = tc.consumption().steps_used;
+        tc.infer(&value_local, 0)
+            .expect("the revealed transitive generation infers");
+        assert!(
+            tc.consumption().steps_used - restored_transitive_steps == 2,
+            "dropping a transitive shadow must reveal the original inference row across unrelated binder churn"
         );
     }
 
@@ -5459,9 +5473,8 @@ mod tests {
                 == one,
             "dropping a shadow must reveal the still-live outer generation"
         );
-        assert_eq!(
-            tc.consumption().steps_used - infer_steps,
-            2,
+        assert!(
+            tc.consumption().steps_used - infer_steps == 2,
             "an unrelated binder must not hide the revealed generation's inference row"
         );
 
@@ -5494,9 +5507,8 @@ mod tests {
                 .expect("revealed outer let local reduces"),
             "dropping a shadow must reveal the still-live outer equality"
         );
-        assert_eq!(
-            defeq_tc.consumption().steps_used - defeq_steps,
-            1,
+        assert!(
+            defeq_tc.consumption().steps_used - defeq_steps == 1,
             "an unrelated binder must not hide the revealed generation's positive-defeq row"
         );
     }
