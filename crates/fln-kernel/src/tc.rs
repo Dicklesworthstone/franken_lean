@@ -87,8 +87,12 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
 // allocator failure, cancellation, and Consumption-accounted cache bookkeeping
 // remain outside them, so they do not by themselves close FL-INV-07.
-// Saturation simply stops admitting new cache rows. It cannot evict an answer,
-// change a completed result, or turn an interrupted computation into one.
+// Saturation normally stops admitting new rows. The WHNF-core cache is the one
+// exception: proof phases can produce more than 65,536 distinct stable spines,
+// so it retires a full generation as one deterministic unit before admitting
+// the next row. The live row/cell bounds stay unchanged, and retiring reusable
+// facts can only cause recomputation -- never manufacture a result or turn an
+// interrupted computation into a completed one.
 const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 65_536;
 const TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES: usize = 4;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
@@ -279,6 +283,7 @@ struct ExprResultCache {
     local_dependency_scan_nodes: usize,
     max_entries: usize,
     max_bucket_entries: usize,
+    rollover_on_saturation: bool,
 }
 
 impl ExprResultCache {
@@ -287,6 +292,12 @@ impl ExprResultCache {
             TYPE_CHECKER_CACHE_MAX_ENTRIES,
             TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
         )
+    }
+
+    fn rolling() -> Self {
+        let mut cache = Self::new();
+        cache.rollover_on_saturation = true;
+        cache
     }
 
     fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
@@ -298,6 +309,7 @@ impl ExprResultCache {
             local_dependency_scan_nodes: 0,
             max_entries,
             max_bucket_entries,
+            rollover_on_saturation: false,
         }
     }
 
@@ -338,8 +350,15 @@ impl ExprResultCache {
         if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
             self.buckets.remove(&packed);
         }
-        if self.entries >= self.max_entries
-            || self.max_bucket_entries == 0
+        if self.entries >= self.max_entries {
+            if !self.rollover_on_saturation || self.max_entries == 0 {
+                return;
+            }
+            self.buckets.clear();
+            self.entries = 0;
+            self.local_dependency_cells = 0;
+        }
+        if self.max_bucket_entries == 0
             || self
                 .buckets
                 .get(&packed)
@@ -951,7 +970,7 @@ impl<'a> TypeChecker<'a> {
             safety,
             infer_cache: ExprResultCache::new(),
             infer_only_cache: ExprResultCache::new(),
-            whnf_core_cache: ExprResultCache::new(),
+            whnf_core_cache: ExprResultCache::rolling(),
             whnf_cache: ExprResultCache::new(),
             positive_def_eq_cache: PositiveDefEqCache::new(),
             instantiate_cache: InstantiateCache::new(),
@@ -4118,6 +4137,71 @@ mod tests {
             fln_core::expr::BinderInfo::Default,
         );
         (pi, redex, sort)
+    }
+
+    #[test]
+    fn whnf_core_cache_rolls_full_generations_without_widening_its_live_bound() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(tc.whnf_core_cache.rollover_on_saturation);
+        assert!(
+            !tc.infer_cache.rollover_on_saturation
+                && !tc.infer_only_cache.rollover_on_saturation
+                && !tc.whnf_cache.rollover_on_saturation,
+            "only the observed phase-heavy WHNF-core cache may roll over"
+        );
+
+        let id = FVarId(Name::str(Name::anonymous(), "rolling"));
+        let local = Expr::fvar(id.clone());
+        tc.adopt_local(id, Expr::sort(Level::zero()));
+        let keyed = |leaf: &str| {
+            Expr::app(
+                Expr::const_(Name::str(Name::anonymous(), leaf), Vec::new()),
+                local.clone(),
+            )
+        };
+        let first = keyed("first");
+        let second = keyed("second");
+        let next_phase = keyed("nextPhase");
+
+        let mut rolling = ExprResultCache::bounded(2, 4);
+        rolling.rollover_on_saturation = true;
+        rolling.insert(
+            first.clone(),
+            first.clone(),
+            &tc.locals,
+            &tc.local_positions,
+        );
+        rolling.insert(second.clone(), second, &tc.locals, &tc.local_positions);
+        assert!(rolling.entries == 2 && rolling.local_dependency_cells == 2);
+        let scans_before_rollover = rolling.local_dependency_scan_nodes;
+        rolling.dependency_scan_refusals.insert(u64::MAX, ());
+
+        rolling.insert(
+            next_phase.clone(),
+            next_phase.clone(),
+            &tc.locals,
+            &tc.local_positions,
+        );
+        assert!(
+            rolling.entries == 1 && rolling.local_dependency_cells == 1,
+            "retiring a generation must release both its rows and dependency cells"
+        );
+        assert!(
+            rolling.local_dependency_scan_nodes >= scans_before_rollover
+                && rolling.dependency_scan_refusals.contains_key(&u64::MAX),
+            "rollover must not renew either lifetime dependency-discovery allowance"
+        );
+        assert!(
+            rolling
+                .get(&first, &tc.locals, &tc.local_positions)
+                .is_none(),
+            "retired facts must become ordinary cache misses"
+        );
+        assert!(
+            rolling.get(&next_phase, &tc.locals, &tc.local_positions) == Some(next_phase),
+            "the first row of the next proof phase must be reusable"
+        );
     }
 
     #[test]
