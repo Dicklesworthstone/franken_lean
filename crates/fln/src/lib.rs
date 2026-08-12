@@ -1259,13 +1259,24 @@ impl Engine {
         }
     }
 
-    /// Construct the bounded natural-definition engine through the same kernel
-    /// admission and publication capability used for ordinary declarations.
-    pub fn with_nat_seed(budget: Budget) -> Result<Self, SeedEnvironmentError> {
-        fln_elab::seed::bootstrap_nat_environment(budget).map(|environment| Self {
-            environment,
-            checker_environment: None,
-        })
+    /// Construct the bounded natural-definition engine through the same K1 and
+    /// independent-checker council used for ordinary declarations.
+    ///
+    /// The completed successor retains the checker's one-row projection, so a
+    /// later admission need not reconstruct the seed under the candidate's
+    /// resource budget. Kernel resource stops remain typed non-answers and an
+    /// independent-checker non-answer halts the council without exposing a
+    /// successor.
+    pub fn with_nat_seed(
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Self>, EngineAdmissionError> {
+        Self::from_environment(Environment::new())
+            .admit_declaration(
+                fln_elab::seed::nat_seed_declaration(),
+                &KVMap::new(),
+                limits,
+            )
+            .map(|outcome| outcome.map_complete(|admission| admission.engine))
     }
 
     /// The immutable environment snapshot against which the next declaration
@@ -3257,6 +3268,13 @@ mod tests {
         EngineExecutionLimits::new(test_budget())
     }
 
+    fn seeded_engine() -> Engine {
+        Engine::with_nat_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the Nat seed council does not reject")
+            .into_complete()
+            .expect("the bounded Nat seed council answers completely")
+    }
+
     fn bv_identity_type() -> Expr {
         Expr::forall_e(
             Name::from_components(["p"]),
@@ -4061,7 +4079,7 @@ mod tests {
 
     #[test]
     fn bounded_engine_executes_checked_source_and_returns_the_published_snapshot() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let completed = engine
@@ -4278,7 +4296,7 @@ mod tests {
 
     #[test]
     fn independent_checker_non_answer_vetoes_publication() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let before = engine.logical_root(&options);
         let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
@@ -4327,7 +4345,7 @@ mod tests {
 
     #[test]
     fn retained_checker_projection_advances_under_a_single_candidate_budget() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let answer = engine
             .execute_nat_definition(b"def answer := 41", &options, test_limits())
@@ -4399,8 +4417,58 @@ mod tests {
     }
 
     #[test]
+    fn nat_seed_requires_the_independent_checker_and_recovers_atomically() {
+        let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+        let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+        let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+        let mut constrained = EngineAdmissionLimits::new(test_budget());
+        constrained.checker.admission =
+            CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+
+        let error = Engine::with_nat_seed(constrained)
+            .expect_err("a checker non-answer must veto even the Nat seed successor");
+        assert!(matches!(
+            error,
+            EngineAdmissionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+
+        let recovered = Engine::with_nat_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the unchanged seed recovers when the checker can answer")
+            .into_complete()
+            .expect("the bounded seed admission answers completely");
+        assert_eq!(recovered.environment().len(), 1);
+        assert!(
+            recovered
+                .environment()
+                .contains(&Name::from_components(["Nat"]))
+        );
+
+        let mut candidate_only = EngineAdmissionLimits::new(test_budget());
+        candidate_only.checker.environment = fln_checker::environment::EnvironmentBudget::new(
+            u64::MAX,
+            1,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
+        let successor = recovered
+            .admit_declaration(axiom("after_seed"), &KVMap::new(), candidate_only)
+            .expect("the retained seed projection leaves one row for the candidate")
+            .into_complete()
+            .expect("the candidate admission answers completely");
+        assert!(
+            successor
+                .engine
+                .environment()
+                .contains(&Name::from_components(["after_seed"]))
+        );
+    }
+
+    #[test]
     fn admission_only_axioms_publish_and_retain_the_checker_projection() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let first = engine
@@ -4485,7 +4553,7 @@ mod tests {
 
     #[test]
     fn admission_only_theorems_and_opaques_are_checked_and_published() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let limits = EngineAdmissionLimits::new(test_budget());
         let base_root = engine.logical_root(&options);
@@ -4732,7 +4800,7 @@ mod tests {
 
     #[test]
     fn admission_batch_hides_a_valid_prefix_and_recovers_after_rejection() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let limits = EngineAdmissionLimits::new(test_budget());
@@ -4787,7 +4855,7 @@ mod tests {
 
     #[test]
     fn bounded_engine_refuses_unsupported_source_without_mutating_its_snapshot() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let before = engine.environment().clone();
         let error = engine
@@ -4801,7 +4869,7 @@ mod tests {
 
     #[test]
     fn bounded_engine_reports_duplicate_kernel_refusal_without_running_golem() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let first = engine
             .execute_nat_definition(b"def answer := 42", &options, test_limits())
@@ -4826,7 +4894,7 @@ mod tests {
 
     #[test]
     fn bounded_engine_preserves_vm_resource_exhaustion_as_a_non_answer() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let mut limits = test_limits();
         limits.vm.max_steps = 0;
@@ -4889,7 +4957,7 @@ mod tests {
 
     #[test]
     fn checked_definition_ingress_executes_the_compilers_richer_closed_subset() {
-        let seeded = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let seeded = seeded_engine();
         let engine = Engine::from_environment(seeded.environment().clone());
         let options = KVMap::new();
         assert_eq!(engine.logical_root(&options), seeded.logical_root(&options));
@@ -4919,7 +4987,7 @@ mod tests {
 
     #[test]
     fn checked_nat_dependencies_compile_from_the_published_environment_and_recover_after_refusal() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let answer = engine
             .execute_nat_definition(b"def answer := 41", &options, test_limits())
@@ -4981,7 +5049,7 @@ mod tests {
 
     #[test]
     fn checked_nat_functions_publish_execute_and_recover_after_a_bounded_refusal() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let identity = nat_identity_definition("identity");
         let identity_name = Name::from_components(["identity"]);
@@ -5038,7 +5106,7 @@ mod tests {
 
     #[test]
     fn checked_multi_parameter_nat_function_preserves_argument_order() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let first_name = Name::from_components(["first"]);
         let published = engine
@@ -5070,7 +5138,7 @@ mod tests {
 
     #[test]
     fn bounded_source_calls_checked_nat_functions_and_recovers_after_an_argument_bound() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let published = engine
             .execute_definition(first_nat_definition("first"), &options, test_limits())
@@ -5114,7 +5182,7 @@ mod tests {
 
     #[test]
     fn checked_definition_batch_publishes_a_function_and_dependent_call_atomically() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let identity_name = Name::from_components(["identity"]);
         let declarations = [
@@ -5157,7 +5225,7 @@ mod tests {
 
     #[test]
     fn checked_definition_batch_hides_partial_progress_and_recovers_after_refusal() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let empty: [Declaration; 0] = [];
@@ -5217,7 +5285,7 @@ mod tests {
 
     #[test]
     fn checked_definition_ingress_refuses_non_executable_declarations_atomically() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let declaration = Declaration::Axiom(AxiomVal {
@@ -5246,7 +5314,7 @@ mod tests {
 
     #[test]
     fn checked_definition_ingress_hides_a_successor_when_compilation_refuses() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let name = Name::from_components(["universe"]);
@@ -5272,7 +5340,7 @@ mod tests {
 
     #[test]
     fn bounded_source_batch_chains_real_root_transitions_in_order() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let sources: [&[u8]; 2] = [b"def first := 1", b"def second := first"];
         let completed = engine
@@ -5301,7 +5369,7 @@ mod tests {
 
     #[test]
     fn bounded_source_batch_flattens_multiple_commands_in_one_file() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let sources: [&[u8]; 1] = [
             b"-- def hidden\r\ndef first (x y : Nat) : Nat := x\r\ndef selected : Nat := first 17 29",
@@ -5327,7 +5395,7 @@ mod tests {
 
     #[test]
     fn bounded_source_batch_rebases_later_parse_refusals_to_the_file() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let sources: [&[u8]; 1] = [b"def first := 1\r\ndef second : String := first"];
@@ -5358,7 +5426,7 @@ mod tests {
 
     #[test]
     fn bounded_source_batch_composes_first_order_nat_functions_through_a_let_chain() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let sources: [&[u8]; 3] = [
             b"def first (x y : Nat) : Nat := x",
@@ -5399,7 +5467,7 @@ mod tests {
 
     #[test]
     fn bounded_source_batch_exposes_no_successor_after_a_later_refusal() {
-        let engine = Engine::with_nat_seed(test_budget()).expect("Nat seed publishes through K1");
+        let engine = seeded_engine();
         let options = KVMap::new();
         let base_root = engine.logical_root(&options);
         let empty: [&[u8]; 0] = [];

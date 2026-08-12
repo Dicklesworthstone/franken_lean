@@ -1794,15 +1794,24 @@ fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput 
     }
     source_refs.extend(sources.iter().map(Vec::as_slice));
     let kernel_budget = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-    let engine = match fln::Engine::with_nat_seed(kernel_budget) {
-        Ok(engine) => engine,
+    let engine = match fln::Engine::with_nat_seed(fln::EngineAdmissionLimits::new(kernel_budget)) {
+        Ok(fln::Outcome::Complete(engine)) => engine,
+        Ok(fln::Outcome::Inconclusive(inconclusive)) => {
+            return source_failure("inconclusive", &format!("{inconclusive:?}"), false, json, 3);
+        }
+        Ok(fln::Outcome::InternalFault(fault)) => {
+            return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
+        }
         Err(error) => {
-            let (class, exit_code) = match &error {
-                fln::SeedEnvironmentError::Inconclusive(_) => ("inconclusive", 3),
-                fln::SeedEnvironmentError::InternalFault(_) => ("internal-fault", 4),
-                _ => ("seed", 1),
+            let (class, authority, exit_code) = match &error {
+                fln::EngineAdmissionError::CouncilHalted { .. } => ("inconclusive", false, 3),
+                fln::EngineAdmissionError::CheckerBridge { .. }
+                | fln::EngineAdmissionError::UnexpectedPublication { .. } => {
+                    ("internal-fault", false, 4)
+                }
+                _ => ("seed", true, 1),
             };
-            return source_failure(class, &error.to_string(), false, json, exit_code);
+            return source_failure(class, &error.to_string(), authority, json, exit_code);
         }
     };
     let options = fln::KVMap::new();
@@ -2476,7 +2485,10 @@ mod tests {
 
     fn scalar_flbc_fixture(value: u64) -> Vec<u8> {
         let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
-        let engine = fln::Engine::with_nat_seed(kernel).expect("the Nat seed is valid");
+        let engine = fln::Engine::with_nat_seed(fln::EngineAdmissionLimits::new(kernel))
+            .expect("the Nat seed council does not reject")
+            .into_complete()
+            .expect("the Nat seed council answers completely");
         let source = format!("def flbcFixture : Nat := {value}");
         let outcome = engine
             .execute_nat_definition(

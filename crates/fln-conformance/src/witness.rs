@@ -530,10 +530,12 @@ pub const CLAIM_MATRIX: [ClaimRow; 18] = [
                    `fln-checker`, and presents its result as an IndependentImplementation seat. \
                    The positive facade test requires the body-checked admission ground; the \
                    constrained control proves a checker non-answer halts and publishes nothing. \
-                   This row remains TARGETED because that running policy covers only the bounded \
-                   embeddable definition path. The Nat seed and reflected-theorem publisher \
-                   still name empty councils, no sampled/release/paranoid policy dispatcher \
-                   exists, and the canonical Judgment substrate from plan §8.3c is absent.",
+                   Corrected again 2026-08-12: the embeddable Nat seed now enters through that \
+                   same facade council and retains the independent checker's successor \
+                   projection. This row remains TARGETED because the raw fln-elab seed fixture \
+                   and reflected-theorem publisher still name empty councils, no \
+                   sampled/release/paranoid policy dispatcher exists, and the canonical \
+                   Judgment substrate from plan §8.3c is absent.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {

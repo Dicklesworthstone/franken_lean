@@ -76,6 +76,22 @@ impl core::fmt::Display for SeedEnvironmentError {
 
 impl std::error::Error for SeedEnvironmentError {}
 
+/// Construct the seed's single candidate declaration without admitting it.
+///
+/// Keeping the candidate construction here gives the raw elaborator fixture
+/// and the embeddable facade one source of truth while leaving publication
+/// authority with their respective admission paths.
+pub fn nat_seed_declaration() -> Declaration {
+    Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: Name::from_components(["Nat"]),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        },
+        is_unsafe: false,
+    })
+}
+
 /// Build the seed's minimal environment.
 ///
 /// The kernel refuses a
@@ -84,14 +100,7 @@ impl std::error::Error for SeedEnvironmentError {}
 /// so even this bounded fixture goes through admission and publication.
 pub fn bootstrap_nat_environment(budget: Budget) -> Result<Environment, SeedEnvironmentError> {
     let env = Environment::new();
-    let nat_axiom = Declaration::Axiom(AxiomVal {
-        base: ConstantVal {
-            name: Name::from_components(["Nat"]),
-            level_params: Vec::new(),
-            type_: Expr::sort(Level::one()),
-        },
-        is_unsafe: false,
-    });
+    let nat_axiom = nat_seed_declaration();
 
     let checked = match admit(&env, nat_axiom, budget) {
         Outcome::Complete(admitted) => match convene(&Council::nobody_was_asked(), admitted) {
