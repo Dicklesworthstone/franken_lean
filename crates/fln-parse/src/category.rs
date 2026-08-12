@@ -161,8 +161,17 @@ impl Category {
     }
 
     /// `indexed` (`Basic.lean:1697`) for the leading table, plus the unindexed productions.
+    ///
+    /// Leading concatenation is `tables.leadingParsers ++ ps` (`Basic.lean:1913`):
+    /// unindexed first. Trailing is the other way around — see [`Self::trailing_at`].
     pub fn leading_at(&self, token: &LeadingToken) -> Lookup<'_> {
-        self.lookup(&self.leading, &self.leading_unindexed, token, self.behavior)
+        self.lookup(
+            &self.leading,
+            &self.leading_unindexed,
+            token,
+            self.behavior,
+            true,
+        )
     }
 
     /// `indexed` for the trailing table.
@@ -172,12 +181,16 @@ impl Category {
     /// field is called *Leading*IdentBehavior and it means it — punning applies to the position
     /// that opens a construct, not to positions inside one. A category that applied its behaviour
     /// to trailing lookups would let a keyword-like identifier act as an operator.
+    ///
+    /// Trailing concatenation is `ps ++ tables.trailingParsers` (`Basic.lean:1927`):
+    /// indexed first. Sharing the leading order would reverse a trailing tie.
     pub fn trailing_at(&self, token: &LeadingToken) -> Lookup<'_> {
         self.lookup(
             &self.trailing,
             &self.trailing_unindexed,
             token,
             LeadingIdentBehavior::Default,
+            false,
         )
     }
 
@@ -187,6 +200,7 @@ impl Category {
         unindexed: &'a [Production],
         token: &LeadingToken,
         behavior: LeadingIdentBehavior,
+        unindexed_first: bool,
     ) -> Lookup<'a> {
         let indexed: Vec<&Production> = match token {
             LeadingToken::Unlexable => {
@@ -203,10 +217,15 @@ impl Category {
             LeadingToken::Other => Vec::new(),
             LeadingToken::Ident(value) => Self::for_ident(map, value, behavior),
         };
-        // Upstream appends the unindexed parsers to the indexed ones
-        // (`tables.leadingParsers ++ ps`, `Basic.lean:1912`).
-        let mut productions: Vec<&Production> = unindexed.iter().collect();
-        productions.extend(indexed);
+        let productions = if unindexed_first {
+            let mut productions: Vec<&Production> = unindexed.iter().collect();
+            productions.extend(indexed);
+            productions
+        } else {
+            let mut productions = indexed;
+            productions.extend(unindexed.iter());
+            productions
+        };
         Lookup::Productions(productions)
     }
 
@@ -464,6 +483,28 @@ mod tests {
             labels(category.leading_at(&LeadingToken::Atom("!!".to_string()))),
             vec!["unindexed"],
             "an unknown token still reaches the unindexed productions"
+        );
+    }
+
+    /// Trailing concatenation is the other operand order: `ps ++ tables.trailingParsers`
+    /// (`Basic.lean:1927`). A shared helper that always used the leading order would reverse
+    /// a trailing tie and hand the elaborator the alternatives backwards.
+    #[test]
+    fn trailing_unindexed_productions_are_offered_after_indexed() {
+        let mut category = category(LeadingIdentBehavior::Default);
+        category
+            .trailing
+            .insert(ident_kind(), production("identTrailing"));
+        category.trailing_unindexed.push(production("unindexed"));
+        assert_eq!(
+            labels(category.trailing_at(&LeadingToken::Ident(name("pun")))),
+            vec!["identTrailing", "unindexed"],
+            "trailing unindexed productions follow the indexed ones"
+        );
+        assert_eq!(
+            labels(category.trailing_at(&LeadingToken::Atom("!!".to_string()))),
+            vec!["unindexed"],
+            "an unknown trailing token still reaches the unindexed productions"
         );
     }
 
