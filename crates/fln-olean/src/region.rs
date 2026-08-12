@@ -609,8 +609,7 @@ impl<'a> OleanView<'a> {
                         .base_addr
                         .saturating_add(region.payload_offset as u64);
                     let end = start.saturating_add(region.payload_len as u64);
-                    (address >= start && address < end)
-                        .then_some((index, address - region.base_addr))
+                    (address >= start && address < end).then(|| (index, address - region.base_addr))
                 })
                 .or_else(|| {
                     (address < self.bytes.len() as u64)
@@ -1389,5 +1388,20 @@ mod dependency_address_dispatch_tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn local_object_order_does_not_subtract_a_dependency_base() {
+        let public_base = format::REGION_ALIGN as u64;
+        let sidecar_base = public_base * 2;
+        let public = empty_module(public_base);
+        let sidecar = empty_module(sidecar_base);
+        let sidecar_view =
+            OleanView::parse_with_dependencies(&sidecar, &[&public]).expect("sidecar");
+        let first = sidecar_view.payload_offset as u64;
+        let second = first + 8;
+
+        assert!(sidecar_view.object_precedes(first, second));
+        assert!(!sidecar_view.object_precedes(second, first));
     }
 }
