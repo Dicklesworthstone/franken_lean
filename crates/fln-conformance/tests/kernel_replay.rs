@@ -2657,11 +2657,16 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
         .expect("decode public module part");
     assert_eq!(public_infos.len(), 5, "pin's public declaration census");
 
-    let private_view = OleanView::parse_with_dependencies(&private, &[&public, &server])
-        .expect("parse private module part with its compacted dependencies");
-    let private_infos = DeclDecoder::new(&private_view, WalkBudget::default())
-        .decode_module_constants()
-        .expect("decode private module part through dependency address space");
+    let total_bytes = public.len() + server.len() + private.len();
+    let decoded = fln::decode_olean_module_artifacts(
+        &public,
+        &server,
+        &private,
+        fln::OleanDecodeLimits::new(total_bytes),
+    )
+    .expect("decode the complete module chain through the product facade");
+    assert!(decoded.companion_parts_loaded);
+    let private_infos = decoded.constants;
     assert!(
         private_infos.len() > public_infos.len(),
         "private level must restore declarations absent from the exported part"
@@ -2682,6 +2687,38 @@ fn module_system_private_part_restores_bodies_and_private_auxiliaries() {
         ),
         "private level must retain the definition body rather than a weakened axiom"
     );
+
+    let cli = fln_cli::run([
+        std::ffi::OsString::from("check-olean"),
+        std::ffi::OsString::from("--json"),
+        module.clone().into_os_string(),
+    ]);
+    assert_eq!(cli.exit_code, 1, "{}", cli.stderr);
+    assert!(
+        cli.stderr.contains("\"class\":\"unresolved-imports\""),
+        "the product path must load companions before it reaches the expected standalone import refusal: {}",
+        cli.stderr
+    );
+    assert!(!cli.stderr.contains("missing .olean"));
+
+    let directory = module
+        .parent()
+        .expect("real module has a library directory")
+        .to_path_buf();
+    let directory_cli = fln_cli::run([
+        std::ffi::OsString::from("check-olean"),
+        std::ffi::OsString::from("--json"),
+        directory.into_os_string(),
+    ]);
+    assert_eq!(directory_cli.exit_code, 1, "{}", directory_cli.stderr);
+    assert!(
+        directory_cli
+            .stderr
+            .contains("\"class\":\"unresolved-imports\""),
+        "directory collection must associate every companion pair before closed-set planning: {}",
+        directory_cli.stderr
+    );
+    assert!(!directory_cli.stderr.contains("missing .olean"));
 }
 
 #[test]

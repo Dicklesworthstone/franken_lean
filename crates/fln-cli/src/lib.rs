@@ -17,6 +17,7 @@ use fln_core::diag::{
 };
 use fln_core::mode::Mode;
 use fln_core::outcome::BoundedText;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
@@ -60,7 +61,8 @@ const USAGE: &str = concat!(
     ".olean, or a directory containing a closed import set, through K1 and the\n",
     "independent checker, atomically. It derives dependency order but does not\n",
     "reconstruct inductive/quotient or mutual units, interpret extensions, run\n",
-    "K2, load companion parts, or satisfy G1.\n",
+    "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
+    ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
     "`run` executes supported Nat definitions from each path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
@@ -195,14 +197,7 @@ impl OleanInspectFailure {
     const fn class(&self) -> &'static str {
         match self {
             Self::Read(error) => error.class(),
-            Self::Decode(
-                fln::OleanDecodeError::ArtifactTooLarge { .. }
-                | fln::OleanDecodeError::Region(fln::OleanRegionError::BudgetExhausted { .. })
-                | fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Budget { .. })
-                | fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Region(
-                    fln::OleanRegionError::BudgetExhausted { .. },
-                )),
-            ) => "resource",
+            Self::Decode(error) if error.is_resource_exhaustion() => "resource",
             Self::Decode(_) => "decode",
         }
     }
@@ -965,26 +960,12 @@ fn admission_error_disposition(error: &fln::EngineAdmissionError) -> (&'static s
 
 fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str, bool, u8) {
     match error {
-        fln::OleanCheckError::Decode(fln::OleanDecodeError::ArtifactTooLarge { .. })
-        | fln::OleanCheckError::ModuleDecode {
-            error: fln::OleanDecodeError::ArtifactTooLarge { .. },
-            ..
+        fln::OleanCheckError::Decode(error) | fln::OleanCheckError::ModuleDecode { error, .. }
+            if error.is_resource_exhaustion() =>
+        {
+            ("resource", false, 3)
         }
-        | fln::OleanCheckError::Decode(fln::OleanDecodeError::Region(
-            fln::OleanRegionError::BudgetExhausted { .. },
-        ))
-        | fln::OleanCheckError::ModuleDecode {
-            error: fln::OleanDecodeError::Region(fln::OleanRegionError::BudgetExhausted { .. }),
-            ..
-        }
-        | fln::OleanCheckError::Decode(fln::OleanDecodeError::Declaration(
-            fln::OleanDeclarationError::Budget { .. },
-        ))
-        | fln::OleanCheckError::ModuleDecode {
-            error: fln::OleanDecodeError::Declaration(fln::OleanDeclarationError::Budget { .. }),
-            ..
-        }
-        | fln::OleanCheckError::ModuleLimit { .. }
+        fln::OleanCheckError::ModuleLimit { .. }
         | fln::OleanCheckError::TotalBytesLimit { .. }
         | fln::OleanCheckError::DeclarationLimit { .. }
         | fln::OleanCheckError::DependencyPresentationLimit { .. }
@@ -992,7 +973,8 @@ fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str,
         fln::OleanCheckError::Decode(_) | fln::OleanCheckError::ModuleDecode { .. } => {
             ("decode", false, 1)
         }
-        fln::OleanCheckError::EmptyModuleSet => ("input", false, 1),
+        fln::OleanCheckError::EmptyModuleSet
+        | fln::OleanCheckError::MissingCompanionParts { .. } => ("input", false, 1),
         fln::OleanCheckError::ImportsRequireResolver { .. } => ("unresolved-imports", false, 1),
         fln::OleanCheckError::MissingModuleImports { .. } => ("unresolved-imports", false, 1),
         fln::OleanCheckError::DuplicateModule { .. }
@@ -1056,7 +1038,7 @@ fn render_check_olean_success(
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
-                "\"companionPartsLoaded\":false}},",
+                "\"companionPartsLoaded\":{}}},",
                 "\"k2Checked\":false,\"g1Satisfied\":false}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
@@ -1066,6 +1048,7 @@ fn render_check_olean_success(
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
             extensions,
+            checked.decoded.companion_parts_loaded,
         )
     } else {
         format!(
@@ -1078,24 +1061,54 @@ fn render_check_olean_success(
                 "base logical root: {}\n",
                 "result logical root: {}\n",
                 "extension blocks observed: {} (not interpreted)\n",
-                "companion artifact parts loaded: no\n",
+                "companion artifact parts loaded: {}\n",
                 "K2 checked: no\n",
                 "G1 satisfied: no\n"
             ),
-            bytes, constants, checked.base_logical_root, checked.result_logical_root, extensions,
+            bytes,
+            constants,
+            checked.base_logical_root,
+            checked.result_logical_root,
+            extensions,
+            if checked.decoded.companion_parts_loaded {
+                "yes"
+            } else {
+                "no"
+            },
         )
     };
     MultiplexerOutput::success(stdout)
 }
 
+#[cfg(test)]
 fn check_olean_bytes(bytes: Vec<u8>, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    check_olean_part_bytes(bytes, None, None, max_bytes, json)
+}
+
+fn check_olean_part_bytes(
+    bytes: Vec<u8>,
+    server_bytes: Option<Vec<u8>>,
+    private_bytes: Option<Vec<u8>>,
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let total_bytes = [
+        Some(bytes.len()),
+        server_bytes.as_ref().map(Vec::len),
+        private_bytes.as_ref().map(Vec::len),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0_usize, usize::saturating_add);
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
         .spawn(move || {
             let engine = fln::Engine::from_environment(fln::Environment::new());
-            match engine.check_olean_artifact(
+            match engine.check_olean_artifact_parts(
                 &bytes,
+                server_bytes.as_deref(),
+                private_bytes.as_deref(),
                 &fln::KVMap::new(),
                 fln::OleanCheckLimits::new(
                     max_bytes,
@@ -1103,7 +1116,7 @@ fn check_olean_bytes(bytes: Vec<u8>, max_bytes: usize, json: bool) -> Multiplexe
                 ),
             ) {
                 Ok(fln::Outcome::Complete(checked)) => {
-                    render_check_olean_success(bytes.len(), &checked, json)
+                    render_check_olean_success(total_bytes, &checked, json)
                 }
                 Ok(fln::Outcome::Inconclusive(reason)) => {
                     check_olean_failure("inconclusive", &format!("{reason:?}"), false, json, 3)
@@ -1140,10 +1153,41 @@ fn check_olean_bytes(bytes: Vec<u8>, max_bytes: usize, json: bool) -> Multiplexe
     }
 }
 
+fn read_optional_olean_companion(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, BoundedReadFailure> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BoundedReadFailure::Input {
+                subject: ".olean companion part",
+                detail: format!("cannot inspect {}: {error}", path.display()),
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BoundedReadFailure::Input {
+            subject: ".olean companion part",
+            detail: format!("refusing symlink {}", path.display()),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(BoundedReadFailure::Input {
+            subject: ".olean companion part",
+            detail: format!("{} is not a regular file", path.display()),
+        });
+    }
+    read_bounded(path, max_bytes, ".olean artifact chain").map(Some)
+}
+
 #[derive(Debug)]
 struct NamedOleanBytes {
     name: fln::Name,
     bytes: Vec<u8>,
+    server_bytes: Option<Vec<u8>>,
+    private_bytes: Option<Vec<u8>>,
 }
 
 fn module_name_from_relative(path: &Path) -> Result<fln::Name, String> {
@@ -1187,6 +1231,7 @@ fn collect_olean_directory(
 ) -> Result<Vec<NamedOleanBytes>, BoundedReadFailure> {
     let mut pending = vec![root.to_path_buf()];
     let mut paths = Vec::new();
+    let mut companion_paths = BTreeMap::<PathBuf, (Option<PathBuf>, Option<PathBuf>)>::new();
     while let Some(directory) = pending.pop() {
         let entries = std::fs::read_dir(&directory).map_err(|error| BoundedReadFailure::Input {
             subject: ".olean directory",
@@ -1206,25 +1251,51 @@ fn collect_olean_directory(
                     subject: ".olean directory",
                     detail: format!("cannot classify {}: {error}", entry.path().display()),
                 })?;
+            let path = entry.path();
             if file_type.is_symlink() {
                 return Err(BoundedReadFailure::Input {
                     subject: ".olean directory",
                     detail: format!(
                         "refusing symlink {} while deriving a closed module set",
-                        entry.path().display()
+                        path.display()
                     ),
                 });
             }
             if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file()
-                && entry.path().extension() == Some(std::ffi::OsStr::new("olean"))
-            {
-                paths.push(entry.path());
+                pending.push(path);
+            } else if file_type.is_file() {
+                if path.extension() == Some(std::ffi::OsStr::new("olean")) {
+                    paths.push(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().ends_with(b".olean.server"))
+                {
+                    let public_path = path.with_extension("");
+                    companion_paths.entry(public_path).or_default().0 = Some(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().ends_with(b".olean.private"))
+                {
+                    let public_path = path.with_extension("");
+                    companion_paths.entry(public_path).or_default().1 = Some(path);
+                }
             }
         }
     }
     paths.sort();
+    let public_paths = paths.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(orphan) = companion_paths
+        .keys()
+        .find(|public| !public_paths.contains(*public))
+    {
+        return Err(BoundedReadFailure::Input {
+            subject: ".olean directory",
+            detail: format!(
+                "companion part has no exported .olean file at {}",
+                orphan.display()
+            ),
+        });
+    }
 
     let module_limit = fln::OleanCheckLimits::new(
         max_bytes,
@@ -1261,7 +1332,37 @@ fn collect_olean_directory(
         let remaining = max_bytes.saturating_sub(total_bytes);
         let bytes = read_bounded(&path, remaining, ".olean module set")?;
         total_bytes = total_bytes.saturating_add(bytes.len());
-        modules.push(NamedOleanBytes { name, bytes });
+        let (server_path, private_path) = companion_paths.remove(&path).unwrap_or_default();
+        let (server_bytes, private_bytes) = match (server_path, private_path) {
+            (Some(server), Some(private)) => {
+                let remaining = max_bytes.saturating_sub(total_bytes);
+                let server_bytes = read_bounded(&server, remaining, ".olean module set")?;
+                total_bytes = total_bytes.saturating_add(server_bytes.len());
+                let remaining = max_bytes.saturating_sub(total_bytes);
+                let private_bytes = read_bounded(&private, remaining, ".olean module set")?;
+                total_bytes = total_bytes.saturating_add(private_bytes.len());
+                (Some(server_bytes), Some(private_bytes))
+            }
+            (Some(_), None) => {
+                return Err(BoundedReadFailure::Input {
+                    subject: ".olean directory",
+                    detail: format!("{} has .olean.server but no .olean.private", path.display()),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(BoundedReadFailure::Input {
+                    subject: ".olean directory",
+                    detail: format!("{} has .olean.private but no .olean.server", path.display()),
+                });
+            }
+            (None, None) => (None, None),
+        };
+        modules.push(NamedOleanBytes {
+            name,
+            bytes,
+            server_bytes,
+            private_bytes,
+        });
     }
     if modules.is_empty() {
         return Err(BoundedReadFailure::Input {
@@ -1292,6 +1393,11 @@ fn render_check_olean_set_success(
         .iter()
         .map(|module| module.decoded.module.extensions.len())
         .sum();
+    let companion_modules = checked
+        .modules
+        .iter()
+        .filter(|module| module.decoded.companion_parts_loaded)
+        .count();
     let stdout = if json {
         format!(
             concat!(
@@ -1301,7 +1407,8 @@ fn render_check_olean_set_success(
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
-                "\"companionPartsLoaded\":false,\"k2Checked\":false,",
+                "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
+                "\"k2Checked\":false,",
                 "\"g1Satisfied\":false}}\n"
             ),
             json_string(CHECK_OLEAN_SCHEMA),
@@ -1312,6 +1419,8 @@ fn render_check_olean_set_success(
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
+            companion_modules > 0,
+            companion_modules,
         )
     } else {
         format!(
@@ -1326,7 +1435,7 @@ fn render_check_olean_set_success(
                 "base logical root: {}\n",
                 "result logical root: {}\n",
                 "extension blocks observed: {} (not interpreted)\n",
-                "companion artifact parts loaded: no\n",
+                "complete module companion chains loaded: {}\n",
                 "K2 checked: no\n",
                 "G1 satisfied: no\n"
             ),
@@ -1337,6 +1446,7 @@ fn render_check_olean_set_success(
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
+            companion_modules,
         )
     };
     MultiplexerOutput::success(stdout)
@@ -1348,7 +1458,14 @@ fn check_olean_module_bytes(
     json: bool,
 ) -> MultiplexerOutput {
     let total_bytes = modules.iter().fold(0_usize, |total, module| {
-        total.saturating_add(module.bytes.len())
+        [
+            Some(module.bytes.len()),
+            module.server_bytes.as_ref().map(Vec::len),
+            module.private_bytes.as_ref().map(Vec::len),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(total, usize::saturating_add)
     });
     let worker = match std::thread::Builder::new()
         .name("fln-check-olean-set".to_owned())
@@ -1359,6 +1476,8 @@ fn check_olean_module_bytes(
                 .map(|module| fln::OleanModuleInput {
                     name: &module.name,
                     artifact: &module.bytes,
+                    server_artifact: module.server_bytes.as_deref(),
+                    private_artifact: module.private_bytes.as_deref(),
                 })
                 .collect();
             let engine = fln::Engine::from_environment(fln::Environment::new());
@@ -1471,7 +1590,44 @@ fn check_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
             );
         }
     };
-    check_olean_bytes(bytes, max_bytes, json)
+    let mut total_bytes = bytes.len();
+    let mut read_companion = |companion: &Path| {
+        let remaining = max_bytes.saturating_sub(total_bytes);
+        let result = read_optional_olean_companion(companion, remaining);
+        if let Ok(Some(bytes)) = &result {
+            total_bytes = total_bytes.saturating_add(bytes.len());
+        }
+        result
+    };
+    let server_path = path.with_extension("olean.server");
+    let server_bytes = match read_companion(&server_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let class = error.class();
+            return check_olean_failure(
+                class,
+                &error.to_string(),
+                false,
+                json,
+                if class == "resource" { 3 } else { 1 },
+            );
+        }
+    };
+    let private_path = path.with_extension("olean.private");
+    let private_bytes = match read_companion(&private_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let class = error.class();
+            return check_olean_failure(
+                class,
+                &error.to_string(),
+                false,
+                json,
+                if class == "resource" { 3 } else { 1 },
+            );
+        }
+    };
+    check_olean_part_bytes(bytes, server_bytes, private_bytes, max_bytes, json)
 }
 
 fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
@@ -2546,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn check_olean_path_wiring_preserves_import_refusal_and_arity_errors() {
+    fn check_olean_path_wiring_refuses_a_module_system_public_part_without_companions() {
         let artifact = repository_path("tribunal/fixtures/c3/Init.BinderNameHint.olean");
         let imported = run([
             OsString::from("check-olean"),
@@ -2555,7 +2711,12 @@ mod tests {
         ]);
         assert_eq!(imported.exit_code, 1);
         assert!(imported.stdout.is_empty());
-        assert!(imported.stderr.contains("\"class\":\"unresolved-imports\""));
+        assert!(imported.stderr.contains("\"class\":\"input\""));
+        assert!(
+            imported
+                .stderr
+                .contains("missing .olean.server and .olean.private")
+        );
 
         let missing = run([OsString::from("check-olean")]);
         assert_eq!(missing.exit_code, 2);
@@ -2590,10 +2751,14 @@ mod tests {
                 NamedOleanBytes {
                     name: child_name,
                     bytes: child,
+                    server_bytes: None,
+                    private_bytes: None,
                 },
                 NamedOleanBytes {
                     name: base_name,
                     bytes: base,
+                    server_bytes: None,
+                    private_bytes: None,
                 },
             ],
             total,
@@ -2625,12 +2790,12 @@ mod tests {
         ]);
         assert_eq!(traversed.exit_code, 1);
         assert!(traversed.stdout.is_empty());
+        assert!(traversed.stderr.contains("\"class\":\"input\""));
         assert!(
             traversed
                 .stderr
-                .contains("\"class\":\"unresolved-imports\"")
+                .contains("is missing .olean.server and .olean.private")
         );
-        assert!(traversed.stderr.contains("module `Init"));
     }
 
     #[test]
