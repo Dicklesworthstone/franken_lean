@@ -2942,12 +2942,12 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
     let row_name = name.to_display_string();
     let (argument_types, result, type_family_anchor) = match row_name.as_str() {
         "Nat.add" | "Nat.sub" | "Nat.mul" | "Nat.div" | "Nat.gcd" | "Nat.land" | "Nat.lor"
-        | "Nat.mod" | "Nat.xor" => (
+        | "Nat.mod" | "Nat.pow" | "Nat.shiftLeft" | "Nat.shiftRight" | "Nat.xor" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Nat,
             Some("Nat.add"),
         ),
-        "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
+        "Nat.log2" | "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
         "Nat.beq" | "Nat.ble" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Bool,
@@ -6082,7 +6082,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 19);
+        assert_eq!(engine.environment().len(), 23);
         assert!(
             engine
                 .environment()
@@ -6113,7 +6113,19 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["Nat", "mul"]))
         );
-        for operation in ["div", "gcd", "land", "lor", "mod", "pred", "xor"] {
+        for operation in [
+            "div",
+            "gcd",
+            "land",
+            "log2",
+            "lor",
+            "mod",
+            "pow",
+            "pred",
+            "shiftLeft",
+            "shiftRight",
+            "xor",
+        ] {
             assert!(
                 engine
                     .environment()
@@ -6174,7 +6186,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 21);
+        assert_eq!(completed.engine.environment().len(), 25);
     }
 
     #[test]
@@ -6350,6 +6362,64 @@ mod tests {
                 closed_vm_value(&completed.exit),
                 Ok(Some(ClosedVmValue::Scalar(expected)))
             );
+        }
+    }
+
+    #[test]
+    fn checked_nat_power_log_and_shift_rows_reach_golem() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let base_root = nat_only.logical_root(&options);
+        let missing = nat_only
+            .execute_source_definition(b"def answer := Nat.log2 8", &options, test_limits())
+            .expect_err("the Nat type alone must not invent Nat.log2 authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(nat_only.logical_root(&options), base_root);
+        assert!(
+            !nat_only
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(
+                b"def answer := Nat.add (Nat.pow 3 4) (Nat.add (Nat.log2 8) (Nat.add (Nat.shiftLeft 7 3) (Nat.shiftRight 56 3)))",
+                &options,
+                test_limits(),
+            )
+            .expect("checked Nat power, log, and shift rows reach Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked Nat power/log/shift definition must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::Scalar(147)))
+        );
+
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed Nat power/log/shift artifact decodes canonically");
+        for expected in ["Nat.pow", "Nat.log2", "Nat.shiftLeft", "Nat.shiftRight"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the Nat power/log/shift row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
         }
     }
 
@@ -6768,7 +6838,11 @@ mod tests {
                     b"def Nat.land (left right : Nat) : Nat := left",
                     b"def Nat.lor (left right : Nat) : Nat := left",
                     b"def Nat.xor (left right : Nat) : Nat := left",
-                    b"def answer := Nat.xor (Nat.lor (Nat.land (Nat.gcd (Nat.mod (Nat.div (Nat.pred 1) 2) 3) 4) 5) 6) 7",
+                    b"def Nat.pow (left right : Nat) : Nat := left",
+                    b"def Nat.log2 (value : Nat) : Nat := value",
+                    b"def Nat.shiftLeft (left right : Nat) : Nat := left",
+                    b"def Nat.shiftRight (left right : Nat) : Nat := left",
+                    b"def answer := Nat.shiftRight (Nat.shiftLeft (Nat.log2 (Nat.pow (Nat.xor (Nat.lor (Nat.land (Nat.gcd (Nat.mod (Nat.div (Nat.pred 1) 2) 3) 4) 5) 6) 7) 8)) 9) 10",
                 ],
                 &options,
                 test_limits(),
@@ -6778,16 +6852,26 @@ mod tests {
             panic!("the ordinary bounded Nat batch must answer completely");
         };
         assert_eq!(
-            closed_vm_value(&completed.executions[7].exit),
+            closed_vm_value(&completed.executions[11].exit),
             Ok(Some(ClosedVmValue::Scalar(1)))
         );
         let executable = fln_comp::flbc::decode_canonical(
-            &completed.executions[7].flbc_artifact,
+            &completed.executions[11].flbc_artifact,
             CodecLimits::default(),
         )
         .expect("the exact executed ordinary bounded Nat artifact decodes canonically");
         for forbidden in [
-            "Nat.pred", "Nat.div", "Nat.mod", "Nat.gcd", "Nat.land", "Nat.lor", "Nat.xor",
+            "Nat.pred",
+            "Nat.div",
+            "Nat.mod",
+            "Nat.gcd",
+            "Nat.land",
+            "Nat.lor",
+            "Nat.xor",
+            "Nat.pow",
+            "Nat.log2",
+            "Nat.shiftLeft",
+            "Nat.shiftRight",
         ] {
             let row = fln_vm::extern_table_generated::EXTERN_ROWS
                 .iter()
