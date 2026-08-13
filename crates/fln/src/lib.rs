@@ -2854,17 +2854,16 @@ fn executable_dependencies(
         }
         if name == Name::from_components(["Nat", "add"])
             && environment.find(&name).is_some_and(is_nat_add_seed)
+            && let Some(binding) = nat_add_intrinsic_binding()
         {
-            if let Some(binding) = nat_add_intrinsic_binding() {
-                intrinsics
-                    .try_reserve(1)
-                    .map_err(|_| IngressError::AllocationFailure {
-                        resource: IngressResource::ProgramTables,
-                        requested: 1,
-                    })?;
-                intrinsics.push(binding);
-                continue;
-            }
+            intrinsics
+                .try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: 1,
+                })?;
+            intrinsics.push(binding);
+            continue;
         }
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
