@@ -1,7 +1,7 @@
 //! Real-process producer-to-consumer evidence for the bounded FLBC product seam.
 //!
 //! This is deliberately narrower than D18: it proves supported checked Nat
-//! arithmetic and String sources reach the filesystem only after batch success
+//! arithmetic, String, and Bool sources reach the filesystem only after batch success
 //! and that their exact bytes are consumed by Golem. It does not claim a
 //! certified build, general Lean source support, closure-complete
 //! reproducibility, or thread-matrix determinism.
@@ -36,11 +36,13 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let string_source = root.join("Message.lean");
     let string_metric_source = root.join("StringMetric.lean");
     let bounded_nat_source = root.join("BoundedNat.lean");
+    let comparison_source = root.join("Comparison.lean");
     let bad_source = root.join("Open.lean");
     let product = root.join("Answer.flbc");
     let string_product = root.join("Message.flbc");
     let string_metric_product = root.join("StringMetric.flbc");
     let bounded_nat_product = root.join("BoundedNat.flbc");
+    let comparison_product = root.join("Comparison.flbc");
     let failed_product = root.join("Failed.flbc");
     let collision = root.join("Collision.flbc");
     std::fs::write(
@@ -65,6 +67,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
         b"def answer := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\n",
     )
     .expect("write supported bounded Nat source");
+    std::fs::write(
+        &comparison_source,
+        "def choose (left right : Bool) : Bool := left\ndef natEq : Bool := Nat.beq 42 42\ndef natLe : Bool := Nat.ble 41 42\ndef stringEq : Bool := String.decEq \"βeta\" \"βeta\"\ndef answer : Bool := choose (choose natEq natLe) stringEq\n"
+            .as_bytes(),
+    )
+    .expect("write supported Bool comparison source");
     std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")
         .expect("write non-closed source");
 
@@ -255,6 +263,36 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(bounded_nat_consumed.stderr.is_empty());
     assert!(utf8(&bounded_nat_consumed.stdout).contains("\"returnValue\":47"));
+
+    let comparison_produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &comparison_product,
+        &comparison_source,
+    ]);
+    assert!(
+        comparison_produced.status.success(),
+        "comparison producer stderr: {}",
+        utf8(&comparison_produced.stderr)
+    );
+    assert!(comparison_produced.stderr.is_empty());
+    let comparison_stdout = utf8(&comparison_produced.stdout);
+    assert!(comparison_stdout.contains("\"definitions\":5"));
+    assert!(comparison_stdout.contains("\"finalValue\":1"));
+    let comparison_consumed = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &comparison_product,
+    ]);
+    assert!(
+        comparison_consumed.status.success(),
+        "comparison consumer stderr: {}",
+        utf8(&comparison_consumed.stderr)
+    );
+    assert!(comparison_consumed.stderr.is_empty());
+    assert!(utf8(&comparison_consumed.stdout).contains("\"returnValue\":1"));
 
     let mut corrupt_string = original_string.clone();
     corrupt_string[0] ^= 0xff;

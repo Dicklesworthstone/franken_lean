@@ -2,7 +2,7 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded exact Nat/String definition, checked scalar intrinsics, or first-order application
+//! from a bounded exact Nat/String/Bool definition, checked scalar intrinsics, or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -1422,12 +1422,12 @@ impl Engine {
             .map(|outcome| outcome.map_complete(|admission| admission.engine))
     }
 
-    /// Construct the bounded Nat/String source engine through the ordinary K1
+    /// Construct the bounded Nat/String/Bool source engine through the ordinary K1
     /// and independent-checker council, retaining every checker projection.
     ///
-    /// The two opaque type names check literals and exact first-order
-    /// signatures. The remaining declarations are an exact allowlist of
-    /// checked Nat scalar operations plus append and String length signatures
+    /// The three opaque type names check literals, Bool comparison results, and
+    /// exact first-order signatures. The remaining declarations are an exact
+    /// allowlist of checked Nat scalar operations plus String operations
     /// recognized by the compiler's generated-row bridge. This is not a
     /// Prelude substitute and grants no constructors or eliminators.
     pub fn with_source_seed(
@@ -2128,7 +2128,7 @@ impl Engine {
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
-    /// and execute one definition in the bounded exact Nat/String source slice.
+    /// and execute one definition in the bounded exact Nat/String/Bool source slice.
     ///
     /// Every declaration still crosses K1 and the retained independent checker;
     /// accepting String syntax does not add a second publication authority.
@@ -2207,7 +2207,7 @@ impl Engine {
         })
     }
 
-    /// Execute a nonempty source-file sequence in the bounded exact Nat/String
+    /// Execute a nonempty source-file sequence in the bounded exact Nat/String/Bool
     /// grammar atomically. Each command observes the checked successor of the
     /// prior command; any refusal or non-answer exposes no batch successor.
     pub fn execute_source_definitions(
@@ -6578,16 +6578,15 @@ mod tests {
             );
         }
 
-        for (execution, expected) in completed
-            .executions
-            .iter()
-            .zip(["Nat.beq", "Nat.ble", "String.decEq"])
+        for (execution, expected) in
+            completed
+                .executions
+                .iter()
+                .zip(["Nat.beq", "Nat.ble", "String.decEq"])
         {
-            let executable = fln_comp::flbc::decode_canonical(
-                &execution.flbc_artifact,
-                CodecLimits::default(),
-            )
-            .expect("the exact executed Bool comparison artifact decodes canonically");
+            let executable =
+                fln_comp::flbc::decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                    .expect("the exact executed Bool comparison artifact decodes canonically");
             let row = fln_vm::extern_table_generated::EXTERN_ROWS
                 .iter()
                 .find(|row| row.name == expected)
@@ -6631,11 +6630,9 @@ mod tests {
         );
 
         for execution in [&completed.executions[3], &completed.executions[4]] {
-            let executable = fln_comp::flbc::decode_canonical(
-                &execution.flbc_artifact,
-                CodecLimits::default(),
-            )
-            .expect("the exact ordinary comparison artifact decodes canonically");
+            let executable =
+                fln_comp::flbc::decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                    .expect("the exact ordinary comparison artifact decodes canonically");
             for forbidden in ["Nat.beq", "Nat.ble", "String.decEq"] {
                 let row = fln_vm::extern_table_generated::EXTERN_ROWS
                     .iter()

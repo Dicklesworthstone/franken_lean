@@ -270,12 +270,13 @@ the executed result, is [`crates/fln/examples/checked_source.rs`](./crates/fln/e
 cargo run -p fln --example checked_source
 ```
 
-This is the currently implemented bounded `Nat`/`String` source facade: caller-
+This is the currently implemented bounded `Nat`/`String`/`Bool` source facade: caller-
 supplied bytes, exact scalar signatures, parenthesized first-order applications,
 optionally ascribed local lets, the
 checked `Nat.add`/`Nat.sub`/`Nat.mul` plus bounded `Nat.div`/`Nat.mod`/`Nat.gcd`/
 `Nat.pred`/`Nat.land`/`Nat.lor`/`Nat.xor`, `String.append`, `String.length`, and
-`String.utf8ByteSize` intrinsics, explicit
+`String.utf8ByteSize`, plus Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq`
+intrinsics, explicit
 budgets, immutable environment successors, K1 plus the independent checker,
 canonical FLBC, and Golem. The planned `Cx`
 builder, project/import elaboration, and receipt API from §17.2 do not exist yet;
