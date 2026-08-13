@@ -229,6 +229,12 @@ pub fn nat_land_seed_declaration() -> Declaration {
     nat_binary_seed_declaration("land")
 }
 
+/// Construct the exact `Nat.log2 : Nat -> Nat` candidate recognized by the
+/// bounded compiler bridge.
+pub fn nat_log2_seed_declaration() -> Declaration {
+    nat_unary_seed_declaration("log2")
+}
+
 /// Construct the exact `Nat.lor : Nat -> Nat -> Nat` candidate recognized by
 /// the bounded compiler bridge.
 pub fn nat_lor_seed_declaration() -> Declaration {
@@ -241,10 +247,28 @@ pub fn nat_mod_seed_declaration() -> Declaration {
     nat_binary_seed_declaration("mod")
 }
 
+/// Construct the exact `Nat.pow : Nat -> Nat -> Nat` candidate recognized by
+/// the bounded compiler bridge.
+pub fn nat_pow_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("pow")
+}
+
 /// Construct the exact `Nat.pred : Nat -> Nat` candidate recognized by the
 /// bounded compiler bridge.
 pub fn nat_pred_seed_declaration() -> Declaration {
     nat_unary_seed_declaration("pred")
+}
+
+/// Construct the exact `Nat.shiftLeft : Nat -> Nat -> Nat` candidate recognized
+/// by the bounded compiler bridge.
+pub fn nat_shift_left_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("shiftLeft")
+}
+
+/// Construct the exact `Nat.shiftRight : Nat -> Nat -> Nat` candidate
+/// recognized by the bounded compiler bridge.
+pub fn nat_shift_right_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("shiftRight")
 }
 
 /// Construct the exact `Nat.xor : Nat -> Nat -> Nat` candidate recognized by
@@ -361,12 +385,20 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
         Some(nat_gcd_seed_declaration())
     } else if name == &Name::from_components(["Nat", "land"]) {
         Some(nat_land_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "log2"]) {
+        Some(nat_log2_seed_declaration())
     } else if name == &Name::from_components(["Nat", "lor"]) {
         Some(nat_lor_seed_declaration())
     } else if name == &Name::from_components(["Nat", "mod"]) {
         Some(nat_mod_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "pow"]) {
+        Some(nat_pow_seed_declaration())
     } else if name == &Name::from_components(["Nat", "pred"]) {
         Some(nat_pred_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "shiftLeft"]) {
+        Some(nat_shift_left_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "shiftRight"]) {
+        Some(nat_shift_right_seed_declaration())
     } else if name == &Name::from_components(["Nat", "xor"]) {
         Some(nat_xor_seed_declaration())
     } else if name == &Name::from_components(["Nat", "beq"]) {
@@ -389,7 +421,7 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// The exact declaration sequence required by the bounded Nat/String source
 /// frontend. Order is part of the deterministic seed contract: both types must
 /// exist before the intrinsic signature can be admitted.
-pub fn source_seed_declarations() -> [Declaration; 19] {
+pub fn source_seed_declarations() -> [Declaration; 23] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
@@ -400,9 +432,13 @@ pub fn source_seed_declarations() -> [Declaration; 19] {
         nat_div_seed_declaration(),
         nat_gcd_seed_declaration(),
         nat_land_seed_declaration(),
+        nat_log2_seed_declaration(),
         nat_lor_seed_declaration(),
         nat_mod_seed_declaration(),
+        nat_pow_seed_declaration(),
         nat_pred_seed_declaration(),
+        nat_shift_left_seed_declaration(),
+        nat_shift_right_seed_declaration(),
         nat_xor_seed_declaration(),
         string_append_seed_declaration(),
         string_length_seed_declaration(),
@@ -491,18 +527,22 @@ mod tests {
         assert_eq!(declarations[6], nat_div_seed_declaration());
         assert_eq!(declarations[7], nat_gcd_seed_declaration());
         assert_eq!(declarations[8], nat_land_seed_declaration());
-        assert_eq!(declarations[9], nat_lor_seed_declaration());
-        assert_eq!(declarations[10], nat_mod_seed_declaration());
-        assert_eq!(declarations[11], nat_pred_seed_declaration());
-        assert_eq!(declarations[12], nat_xor_seed_declaration());
-        assert_eq!(declarations[13], string_append_seed_declaration());
-        assert_eq!(declarations[14], string_length_seed_declaration());
-        assert_eq!(declarations[15], string_utf8_byte_size_seed_declaration());
-        assert_eq!(declarations[16], nat_beq_seed_declaration());
-        assert_eq!(declarations[17], nat_ble_seed_declaration());
-        assert_eq!(declarations[18], string_dec_eq_seed_declaration());
+        assert_eq!(declarations[9], nat_log2_seed_declaration());
+        assert_eq!(declarations[10], nat_lor_seed_declaration());
+        assert_eq!(declarations[11], nat_mod_seed_declaration());
+        assert_eq!(declarations[12], nat_pow_seed_declaration());
+        assert_eq!(declarations[13], nat_pred_seed_declaration());
+        assert_eq!(declarations[14], nat_shift_left_seed_declaration());
+        assert_eq!(declarations[15], nat_shift_right_seed_declaration());
+        assert_eq!(declarations[16], nat_xor_seed_declaration());
+        assert_eq!(declarations[17], string_append_seed_declaration());
+        assert_eq!(declarations[18], string_length_seed_declaration());
+        assert_eq!(declarations[19], string_utf8_byte_size_seed_declaration());
+        assert_eq!(declarations[20], nat_beq_seed_declaration());
+        assert_eq!(declarations[21], nat_ble_seed_declaration());
+        assert_eq!(declarations[22], string_dec_eq_seed_declaration());
         assert!(
-            source_intrinsic_seed_declaration(&Name::from_components(["Nat", "pow"])).is_none(),
+            source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"
         );
     }
