@@ -46,7 +46,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported dependent source batch");
     std::fs::write(
         &string_source,
-        "def copy (value : String) := value\ndef message := let output : String := copy \"artifact\\nβ\"; output\n"
+        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := String.append prefix \"β\"; output\n"
             .as_bytes(),
     )
     .expect("write supported String source");
@@ -157,7 +157,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(string_produced.stderr.is_empty());
     let string_producer_stdout = utf8(&string_produced.stdout);
-    assert!(string_producer_stdout.contains("\"definitions\":2"));
+    assert!(string_producer_stdout.contains("\"definitions\":3"));
     assert!(string_producer_stdout.contains("\"finalKind\":\"string\""));
     assert!(string_producer_stdout.contains("\"finalValue\":\"artifact\\nβ\""));
     assert!(string_producer_stdout.contains("\"emittedFlbc\":{"));
