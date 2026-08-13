@@ -57,7 +57,7 @@ fn seeded_engine() -> Result<Engine, Box<dyn Error>> {
 fn run_embedder() -> Result<EmbedderSummary, Box<dyn Error>> {
     let engine = seeded_engine()?;
     let options = KVMap::new();
-    let sources: [&[u8]; 2] = [
+    let sources: [&[u8]; 3] = [
         b"def product : Nat := Nat.mul 6 7",
         b"def incremented : Nat := Nat.add product 1",
         b"def answer : Nat := Nat.sub incremented 1",
@@ -119,7 +119,7 @@ mod tests {
     fn real_embedder_path_returns_and_publishes_a_queryable_answer() {
         let summary = run_embedder().expect("the checked embedder example completes");
 
-        assert_eq!(summary.definitions, 2);
+        assert_eq!(summary.definitions, 3);
         assert_eq!(summary.answer, 42);
         assert!(summary.answer_is_queryable);
         assert!(!summary.checker_schema.is_empty());
