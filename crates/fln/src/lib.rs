@@ -2115,9 +2115,10 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
-        let declaration = fln_elab::elaborate_nat_definition(parsed.syntax())
-            .map_err(NatDefinitionFrontendError::Elaborate)
-            .map_err(EngineExecutionError::Frontend)?;
+        let declaration =
+            fln_elab::elaborate_nat_definition_in(parsed.syntax(), self.environment())
+                .map_err(NatDefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?;
         self.execute_definition(declaration, options, limits)
     }
 
@@ -2144,7 +2145,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
-        let declaration = fln_elab::elaborate_definition(parsed.syntax())
+        let declaration = fln_elab::elaborate_definition_in(parsed.syntax(), self.environment())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         self.execute_definition(declaration, options, limits)
@@ -5881,6 +5882,33 @@ mod tests {
             "source\nconnected"
         );
         assert_eq!(completed.engine.environment().len(), 4);
+    }
+
+    #[test]
+    fn inferred_string_application_executes_on_the_source_door() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def copy (value : String) := value",
+                    b"def message := copy \"inferred\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("an un-ascribed String application must not be stamped Nat");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the inferred String application batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::String("inferred".to_owned())))
+        );
     }
 
     #[test]
