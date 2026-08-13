@@ -2,7 +2,7 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded exact Nat/String definition, checked Nat arithmetic, or first-order application
+//! from a bounded exact Nat/String definition, checked scalar intrinsics, or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -1378,7 +1378,7 @@ impl std::error::Error for EngineBvDecideError {
 ///
 /// The live source constructors seed only the opaque type names needed by their
 /// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String` and the
-/// checked `Nat.add`/`Nat.sub`/`Nat.mul` extern signatures. Neither seed is the
+/// checked Nat arithmetic and `String.append` extern signatures. Neither seed is the
 /// real Prelude. Successful admission or execution returns a new `Engine`
 /// snapshot containing the published declaration; the receiver is never
 /// mutated.
@@ -1427,9 +1427,9 @@ impl Engine {
     ///
     /// The two opaque type names check literals and exact first-order
     /// signatures. The remaining declarations are the exact checked Nat
-    /// arithmetic signatures recognized by the compiler's generated-row
-    /// bridge. This is not a Prelude substitute and grants no constructors or
-    /// eliminators.
+    /// arithmetic and String append signatures recognized by the compiler's
+    /// generated-row bridge. This is not a Prelude substitute and grants no
+    /// constructors or eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -2853,7 +2853,7 @@ fn executable_dependencies(
         if !resolved.insert(name.clone()) {
             continue;
         }
-        if let Some(binding) = source_nat_intrinsic_binding(environment, &name) {
+        if let Some(binding) = source_intrinsic_binding(environment, &name) {
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -2909,10 +2909,7 @@ fn executable_dependencies(
     })
 }
 
-fn source_nat_intrinsic_binding(
-    environment: &Environment,
-    name: &Name,
-) -> Option<IntrinsicBinding> {
+fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<IntrinsicBinding> {
     let info = environment.find(name)?;
     let ConstantInfo::Axiom(actual) = info else {
         return None;
@@ -2924,32 +2921,45 @@ fn source_nat_intrinsic_binding(
     if actual != &expected {
         return None;
     }
-    nat_binary_intrinsic_binding(name)
+    generated_source_intrinsic_binding(name)
 }
 
-fn nat_binary_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
+fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
     use fln_vm::extern_row::{
         ArgumentOwnership as ContractArgumentOwnership, EffectClass as ContractEffectClass,
         Ownership as ContractOwnership, ResultOwnership as ContractResultOwnership,
     };
 
     let row_name = name.to_display_string();
+    let (argument_types, result, nat_type_family) = match row_name.as_str() {
+        "Nat.add" | "Nat.sub" | "Nat.mul" => {
+            (vec![ValueType::Nat, ValueType::Nat], ValueType::Nat, true)
+        }
+        "String.append" => (
+            vec![ValueType::String, ValueType::String],
+            ValueType::String,
+            false,
+        ),
+        _ => return None,
+    };
     let row = fln_vm::extern_table_generated::EXTERN_ROWS
         .iter()
         .find(|row| row.name == row_name && row.levels == 0 && row.arity == 2)?;
-    let type_anchor = fln_vm::extern_table_generated::EXTERN_ROWS
-        .iter()
-        .find(|candidate| candidate.name == "Nat.add")?;
-    if row.type_hash != type_anchor.type_hash {
-        return None;
+    if nat_type_family {
+        let type_anchor = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|candidate| candidate.name == "Nat.add")?;
+        if row.type_hash != type_anchor.type_hash {
+            return None;
+        }
     }
     if ContractEffectClass::parse(row.effect).ok()? != ContractEffectClass::Pure {
         return None;
     }
     let ownership = ContractOwnership::parse(row.ownership).ok()?;
-    let arguments: [ContractArgumentOwnership; 2] =
+    let contract_arguments: [ContractArgumentOwnership; 2] =
         ownership.argument_ownership(2).ok()?.try_into().ok()?;
-    let argument_ownership = arguments
+    let argument_ownership = contract_arguments
         .map(|argument| match argument {
             ContractArgumentOwnership::Borrowed => fln_comp::flbc::ArgumentOwnership::Borrowed,
             ContractArgumentOwnership::Owned => fln_comp::flbc::ArgumentOwnership::Owned,
@@ -2968,9 +2978,9 @@ fn nat_binary_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
         name: name.clone(),
         universe_arity: 0,
         row: row.id.to_owned(),
-        arguments: vec![ValueType::Nat, ValueType::Nat],
+        arguments: argument_types,
         argument_ownership,
-        result: ValueType::Nat,
+        result,
         result_ownership,
         effect: fln_comp::fir::EffectClass::Pure,
     })
@@ -6056,7 +6066,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 5);
+        assert_eq!(engine.environment().len(), 6);
         assert!(
             engine
                 .environment()
@@ -6081,6 +6091,11 @@ mod tests {
             engine
                 .environment()
                 .contains(&Name::from_components(["Nat", "mul"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["String", "append"]))
         );
 
         let completed = engine
@@ -6107,7 +6122,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 7);
+        assert_eq!(completed.engine.environment().len(), 8);
     }
 
     #[test]
@@ -6210,6 +6225,65 @@ mod tests {
     }
 
     #[test]
+    fn checked_string_append_source_reaches_golem() {
+        let options = KVMap::new();
+        let string_only = engine_with_string_type();
+        let base_root = string_only.logical_root(&options);
+        let missing = string_only
+            .execute_source_definition(
+                b"def message := String.append \"not-\" \"seeded\"",
+                &options,
+                test_limits(),
+            )
+            .expect_err("the String-only engine must not invent String.append authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(string_only.logical_root(&options), base_root);
+        assert!(
+            !string_only
+                .environment()
+                .contains(&Name::from_components(["message"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(
+                b"def message := String.append \"source-\" \"golem\"",
+                &options,
+                test_limits(),
+            )
+            .expect("checked String.append reaches Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked String.append must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::String("source-golem".to_owned())))
+        );
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed FLBC artifact decodes canonically");
+        let append_row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.name == "String.append")
+            .expect("the generated pin census contains String.append")
+            .id;
+        assert!(executable.functions().iter().any(|function| {
+            function.code.iter().any(|instruction| {
+                matches!(instruction, Instruction::Intrinsic { row, .. } if row == append_row)
+            })
+        }));
+    }
+
+    #[test]
     fn checked_definition_named_nat_add_is_not_replaced_by_the_seed_intrinsic() {
         let options = KVMap::new();
         let engine = seeded_engine();
@@ -6290,6 +6364,44 @@ mod tests {
                 })
             }));
         }
+    }
+
+    #[test]
+    fn checked_definition_named_string_append_is_not_replaced_by_the_seed_intrinsic() {
+        let options = KVMap::new();
+        let engine = engine_with_string_type();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def String.append (left right : String) : String := left",
+                    b"def message := String.append \"ordinary\" \"intrinsic\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("an ordinary checked String.append remains an ordinary function");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary String.append definition batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::String("ordinary".to_owned())))
+        );
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[1].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed ordinary-function FLBC decodes canonically");
+        let append_row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.name == "String.append")
+            .expect("the generated pin census contains String.append")
+            .id;
+        assert!(executable.functions().iter().all(|function| {
+            function.code.iter().all(|instruction| {
+                !matches!(instruction, Instruction::Intrinsic { row, .. } if row == append_row)
+            })
+        }));
     }
 
     #[test]

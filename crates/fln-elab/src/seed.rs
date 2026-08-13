@@ -10,11 +10,11 @@
 //!
 //! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
 //! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
-//! `String : Sort 1` and exact `Nat.add`/`Nat.sub`/`Nat.mul` binary extern
-//! signatures. The types are enough to resolve literals, while those checked
-//! rows let the compiler reach Golem's matching intrinsic implementations; no
-//! constructor or eliminator is implied. The real inductive blocks belong to
-//! inductive elaboration and Prelude ingestion.
+//! `String : Sort 1` and exact `Nat.add`/`Nat.sub`/`Nat.mul` and
+//! `String.append` binary extern signatures. The types are enough to resolve
+//! literals, while those checked rows let the compiler reach Golem's matching
+//! intrinsic implementations; no constructor or eliminator is implied. The
+//! real inductive blocks belong to inductive elaboration and Prelude ingestion.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
@@ -153,6 +153,30 @@ pub fn nat_mul_seed_declaration() -> Declaration {
     nat_binary_seed_declaration("mul")
 }
 
+/// Construct the exact `String.append : String -> String -> String` candidate
+/// recognized by the bounded compiler bridge.
+pub fn string_append_seed_declaration() -> Declaration {
+    let string = Expr::const_(Name::from_components(["String"]), Vec::new());
+    Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: Name::from_components(["String", "append"]),
+            level_params: Vec::new(),
+            type_: Expr::forall_e(
+                Name::from_components(["left"]),
+                string.clone(),
+                Expr::forall_e(
+                    Name::from_components(["right"]),
+                    string.clone(),
+                    string,
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        },
+        is_unsafe: false,
+    })
+}
+
 /// Return the exact source-seed declaration for an executable intrinsic name.
 ///
 /// This is an allowlist, not a shape-based constructor: another generated row
@@ -164,6 +188,8 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
         Some(nat_sub_seed_declaration())
     } else if name == &Name::from_components(["Nat", "mul"]) {
         Some(nat_mul_seed_declaration())
+    } else if name == &Name::from_components(["String", "append"]) {
+        Some(string_append_seed_declaration())
     } else {
         None
     }
@@ -172,13 +198,14 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
 /// The exact declaration sequence required by the bounded Nat/String source
 /// frontend. Order is part of the deterministic seed contract: both types must
 /// exist before the intrinsic signature can be admitted.
-pub fn source_seed_declarations() -> [Declaration; 5] {
+pub fn source_seed_declarations() -> [Declaration; 6] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
         nat_add_seed_declaration(),
         nat_sub_seed_declaration(),
         nat_mul_seed_declaration(),
+        string_append_seed_declaration(),
     ]
 }
 
@@ -249,13 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn source_seed_orders_types_before_the_exact_arithmetic_signatures() {
+    fn source_seed_orders_types_before_the_exact_intrinsic_signatures() {
         let declarations = source_seed_declarations();
         assert_eq!(declarations[0], nat_seed_declaration());
         assert_eq!(declarations[1], string_seed_declaration());
         assert_eq!(declarations[2], nat_add_seed_declaration());
         assert_eq!(declarations[3], nat_sub_seed_declaration());
         assert_eq!(declarations[4], nat_mul_seed_declaration());
+        assert_eq!(declarations[5], string_append_seed_declaration());
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "div"])).is_none(),
             "an unimplemented generated row is not source authority"
