@@ -4,13 +4,15 @@
 //! Parsing, syntax validation, literal decoding, declaration construction, and
 //! kernel checking each have one implementation in the crate root. This module
 //! owns the one separate concern needed by the executable seed: constructing an
-//! environment in which `Nat` is known, through the same kernel admission,
-//! council, and publication capabilities as every other declaration.
+//! environment in which the bounded source types are known, through the same
+//! kernel admission, council, and publication capabilities as every other
+//! declaration.
 //!
-//! This is not FrankenLean's real Prelude. It admits an opaque `Nat : Sort 1`
-//! axiom, enough for the kernel to resolve a natural literal's synthesized type
-//! but not enough to compute, eliminate, or inspect a natural. The real
-//! inductive block belongs to inductive elaboration and Prelude ingestion.
+//! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
+//! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
+//! `String : Sort 1`. They are enough to resolve literal types but not to
+//! compute, eliminate, or inspect either type. The real inductive blocks belong
+//! to inductive elaboration and Prelude ingestion.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
@@ -90,6 +92,29 @@ pub fn nat_seed_declaration() -> Declaration {
         },
         is_unsafe: false,
     })
+}
+
+/// Construct the equally opaque `String : Sort 1` candidate needed to type
+/// string literals at the bounded source front door.
+///
+/// This grants no constructor, eliminator, or runtime authority. The embeddable
+/// engine admits it through the same K1 plus independent-checker council as the
+/// Nat seed before exposing a successor.
+pub fn string_seed_declaration() -> Declaration {
+    Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: Name::from_components(["String"]),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        },
+        is_unsafe: false,
+    })
+}
+
+/// The exact declaration sequence required by the bounded Nat/String source
+/// frontend. Order is part of the deterministic seed contract.
+pub fn source_seed_declarations() -> [Declaration; 2] {
+    [nat_seed_declaration(), string_seed_declaration()]
 }
 
 /// Build the seed's minimal environment.

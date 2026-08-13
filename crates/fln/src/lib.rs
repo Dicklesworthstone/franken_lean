@@ -2,8 +2,8 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded Nat definition or first-order application source, or from an
-//! already-elaborated definition, through Crucible, the compiler's validated
+//! from a bounded exact Nat/String definition or first-order application
+//! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
 //! Prelude support. Already-elaborated axioms, definitions, theorems, opaques,
@@ -58,7 +58,9 @@ pub use fln_core::mode::{
 pub use fln_core::name::Name;
 pub use fln_core::options::KVMap;
 pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
-pub use fln_elab::{NatDefinitionFrontendError, seed::SeedEnvironmentError};
+pub use fln_elab::{
+    DefinitionFrontendError, NatDefinitionFrontendError, seed::SeedEnvironmentError,
+};
 pub use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
     ReducibilityHints, TheoremVal,
@@ -1291,10 +1293,11 @@ impl std::error::Error for EngineBvDecideError {
 
 /// One immutable embeddable engine snapshot.
 ///
-/// The currently live constructor seeds only the axiomatic `Nat : Sort 1` name
-/// needed by the bounded natural-definition frontend. It is not the real
-/// Prelude. Successful admission or execution returns a new `Engine` snapshot
-/// containing the published declaration; the receiver is never mutated.
+/// The live source constructors seed only the opaque type names needed by their
+/// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String`. Neither is
+/// the real Prelude. Successful admission or execution returns a new `Engine`
+/// snapshot containing the published declaration; the receiver is never
+/// mutated.
 #[derive(Debug, Clone)]
 pub struct Engine {
     environment: Environment,
@@ -1333,6 +1336,27 @@ impl Engine {
                 limits,
             )
             .map(|outcome| outcome.map_complete(|admission| admission.engine))
+    }
+
+    /// Construct the bounded Nat/String source engine through the ordinary K1
+    /// and independent-checker council, retaining both checker projections.
+    ///
+    /// The two opaque type names are only enough to check literals and exact
+    /// first-order signatures. This is not a Prelude substitute and grants no
+    /// constructors, eliminators, or native intrinsic authority.
+    pub fn with_source_seed(
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<Self>, EngineAdmissionError> {
+        let mut engine = Self::from_environment(Environment::new());
+        for declaration in fln_elab::seed::source_seed_declarations() {
+            let admission = engine.admit_declaration(declaration, &KVMap::new(), limits)?;
+            match admission {
+                Outcome::Complete(admission) => engine = admission.engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        }
+        Ok(Outcome::Complete(engine))
     }
 
     /// The immutable environment snapshot against which the next declaration
@@ -2016,6 +2040,35 @@ impl Engine {
         self.execute_definition(declaration, options, limits)
     }
 
+    /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
+    /// and execute one definition in the bounded exact Nat/String source slice.
+    ///
+    /// Every declaration still crosses K1 and the retained independent checker;
+    /// accepting String syntax does not add a second publication authority.
+    pub fn execute_source_definition(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let parsed = fln_parse::parse_definition(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        self.execute_parsed_source_definition(parsed, options, limits)
+    }
+
+    fn execute_parsed_source_definition(
+        &self,
+        parsed: fln_parse::ParsedDefinition,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let declaration = fln_elab::elaborate_definition(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        self.execute_definition(declaration, options, limits)
+    }
+
     /// Execute the bounded Nat definitions in a nonempty sequence of source
     /// files atomically.
     ///
@@ -2064,6 +2117,50 @@ impl Engine {
                 .map_err(NatDefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
             engine.execute_parsed_nat_definition(parsed, options, limits)
+        })
+    }
+
+    /// Execute a nonempty source-file sequence in the bounded exact Nat/String
+    /// grammar atomically. Each command observes the checked successor of the
+    /// prior command; any refusal or non-answer exposes no batch successor.
+    pub fn execute_source_definitions(
+        &self,
+        sources: &[&[u8]],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+        let mut commands = Vec::new();
+        for source in sources {
+            let partitioned =
+                fln_parse::partition_definition_commands(source).map_err(|error| {
+                    EngineExecutionError::BatchCommand {
+                        index: commands.len(),
+                        error: Box::new(EngineExecutionError::Frontend(
+                            DefinitionFrontendError::Parse(error),
+                        )),
+                    }
+                })?;
+            let requested = commands.len().checked_add(partitioned.len()).ok_or(
+                EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested: usize::MAX,
+                },
+            )?;
+            commands.try_reserve(partitioned.len()).map_err(|_| {
+                EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested,
+                }
+            })?;
+            commands.extend(partitioned);
+        }
+        self.execute_batch(commands.len(), options, |engine, index| {
+            let (original_offset, source) = commands[index];
+            let parsed = fln_parse::parse_definition(source)
+                .map_err(|error| error.with_original_offset(original_offset))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend)?;
+            engine.execute_parsed_source_definition(parsed, options, limits)
         })
     }
 
@@ -5624,6 +5721,66 @@ mod tests {
             "facade-catalog"
         );
         assert_eq!(applied.engine.environment().len(), 4);
+    }
+
+    #[test]
+    fn checked_string_source_batch_reaches_the_existing_runtime_catalog() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let missing_type = nat_only
+            .execute_source_definition(
+                b"def message : String := \"not seeded\"",
+                &options,
+                test_limits(),
+            )
+            .expect_err("the Nat-only constructor must not silently invent String authority");
+        assert!(matches!(
+            missing_type,
+            EngineExecutionError::KernelRejected { ref message, .. }
+                if message.contains("String")
+        ));
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        assert_eq!(engine.environment().len(), 2);
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["Nat"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["String"]))
+        );
+
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def copy (value : String) : String := value",
+                    b"def message : String := copy \"source\\nconnected\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("the real source path reaches the checked String compiler catalog");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the small String source batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 2);
+        let VmExit::Returned(returned) = &completed.executions[1].exit else {
+            panic!("the checked String source application must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::String);
+        let (size, _, _, bytes) = returned.value.string_view();
+        assert_eq!(bytes.get(size - 1), Some(&0));
+        assert_eq!(
+            std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
+            "source\nconnected"
+        );
+        assert_eq!(completed.engine.environment().len(), 4);
     }
 
     #[test]

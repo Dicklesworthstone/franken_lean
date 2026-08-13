@@ -53,7 +53,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     ]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/4\""));
+    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/5\""));
     assert!(matches!(
         std::fs::symlink_metadata(&failed_product),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -73,7 +73,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(produced.stderr.is_empty());
     let producer_stdout = utf8(&produced.stdout);
-    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/4\""));
+    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/5\""));
     assert!(producer_stdout.contains("\"definitions\":2"));
     assert!(producer_stdout.contains("\"finalValue\":42"));
     assert!(producer_stdout.contains("\"emittedFlbc\":{"));
@@ -218,7 +218,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     );
     assert!(first.stderr.is_empty());
     let first_stdout = utf8(&first.stdout);
-    assert!(first_stdout.contains("\"schema\":\"fln.source-run/4\""));
+    assert!(first_stdout.contains("\"schema\":\"fln.source-run/5\""));
     assert!(first_stdout.contains("\"finalValue\":42"));
     assert!(first_stdout.contains("\"emittedSidecar\":{"));
     assert!(first_stdout.contains("\"profile\":\"standard\""));

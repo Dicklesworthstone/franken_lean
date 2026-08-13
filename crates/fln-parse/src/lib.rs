@@ -3,13 +3,14 @@
 //! never changes acceptance (plan §9).
 //!
 //! The general Pratt/category machinery lives in the modules below. The
-//! [`parse_nat_definition`] entry point is deliberately much smaller: it is the
-//! first production command seam for `fln-elab` (bead `fln-5720`) and accepts
-//! optional explicit `Nat` parameters followed by a natural literal, identifier,
-//! saturated identifier-headed application, or a chain of non-recursive local
-//! `Nat` lets over those forms. It uses the same source view, lexer, attachment, and
-//! canonical `Syntax` shape as the general engine. Being outside this seed
-//! grammar is a typed refusal, not a claim that the source is invalid Lean.
+//! [`parse_definition`] entry point is deliberately much smaller: it is the
+//! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
+//! signatures followed by a matching literal, identifier, saturated
+//! identifier-headed application, or non-recursive local let chain over those
+//! forms. [`parse_nat_definition`] retains the original Nat-only authority. Both
+//! use the same source view, lexer, attachment, and canonical `Syntax` shape as
+//! the general engine. Being outside these seed grammars is a typed refusal, not
+//! a claim that the source is invalid Lean.
 
 #![forbid(unsafe_code)]
 
@@ -47,16 +48,18 @@ pub enum NatDefinitionExpectation {
     ParameterIdentifier,
     ParameterTypeAscription,
     NaturalType,
+    ScalarType,
     ClosingParenthesis,
     Assignment,
     LocalIdentifier,
     LocalAssignment,
     LetSeparator,
     NaturalValue,
+    ScalarValue,
     EndOfCommand,
 }
 
-/// Why the bounded natural-definition command parser refused.
+/// Why a bounded definition command parser refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatDefinitionParseError {
     Source(SourceError),
@@ -94,7 +97,7 @@ impl std::fmt::Display for NatDefinitionParseError {
             },
             Self::OutsideSeedGrammar { at, expected } => write!(
                 formatter,
-                "source is outside the bounded Nat-definition grammar at {at}; expected {expected:?}"
+                "source is outside the bounded definition grammar at {at}; expected {expected:?}"
             ),
             Self::Build(error) => write!(formatter, "syntax construction failed: {error:?}"),
         }
@@ -175,14 +178,14 @@ impl From<BuildError> for NatDefinitionParseError {
 /// leaves name. Keeping the view makes both the byte-exact original and the
 /// parser-visible text recoverable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedNatDefinition {
+pub struct ParsedDefinition {
     source_view: SourceView,
     syntax: Syntax,
     epilogue: ByteSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExplicitNatBinderTokens {
+struct ExplicitBinderTokens {
     open: usize,
     names: std::ops::Range<usize>,
     colon: usize,
@@ -191,7 +194,7 @@ struct ExplicitNatBinderTokens {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LetNatBindingTokens {
+struct LetBindingTokens {
     keyword: usize,
     name: usize,
     assignment: usize,
@@ -199,7 +202,7 @@ struct LetNatBindingTokens {
     separator: usize,
 }
 
-impl ParsedNatDefinition {
+impl ParsedDefinition {
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
     }
@@ -219,6 +222,42 @@ impl ParsedNatDefinition {
 
     pub fn reconstruct_original(&self) -> Vec<u8> {
         self.source_view.reconstruct_original()
+    }
+}
+
+/// The exact tree type returned by the original Nat-only source door.
+///
+/// The alias preserves that public API while [`parse_definition`] admits the
+/// same canonical tree shape for the wider, still-bounded Nat/String slice.
+pub type ParsedNatDefinition = ParsedDefinition;
+
+/// Compatibility name for callers using the wider bounded source door.
+pub type DefinitionParseError = NatDefinitionParseError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefinitionGrammar {
+    NatOnly,
+    Scalar,
+}
+
+impl DefinitionGrammar {
+    fn accepts_type(self, name: &Name) -> bool {
+        name == &Name::from_components(["Nat"])
+            || (self == Self::Scalar && name == &Name::from_components(["String"]))
+    }
+
+    const fn type_expectation(self) -> NatDefinitionExpectation {
+        match self {
+            Self::NatOnly => NatDefinitionExpectation::NaturalType,
+            Self::Scalar => NatDefinitionExpectation::ScalarType,
+        }
+    }
+
+    const fn value_expectation(self) -> NatDefinitionExpectation {
+        match self {
+            Self::NatOnly => NatDefinitionExpectation::NaturalValue,
+            Self::Scalar => NatDefinitionExpectation::ScalarValue,
+        }
     }
 }
 
@@ -247,18 +286,24 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
     view.to_original(in_view)
 }
 
-fn validate_flat_nat_term(
+fn is_flat_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> bool {
+    matches!(
+        kind,
+        Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
+    ) || (grammar == DefinitionGrammar::Scalar
+        && matches!(kind, Some(TokenKind::Literal(LiteralKind::Str))))
+}
+
+fn validate_flat_term(
     view: &SourceView,
     tokens: &[LexedToken],
     range: std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
 ) -> Result<(), NatDefinitionParseError> {
-    if !matches!(
-        tokens.get(range.start).map(|token| &token.kind),
-        Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
-    ) {
+    if !is_flat_term_atom(tokens.get(range.start).map(|token| &token.kind), grammar) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, range.start),
-            expected: NatDefinitionExpectation::NaturalValue,
+            expected: grammar.value_expectation(),
         });
     }
     if range.len() > 1
@@ -273,13 +318,10 @@ fn validate_flat_nat_term(
         });
     }
     for index in range.start + 1..range.end {
-        if !matches!(
-            tokens.get(index).map(|token| &token.kind),
-            Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
-        ) {
+        if !is_flat_term_atom(tokens.get(index).map(|token| &token.kind), grammar) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, index),
-                expected: NatDefinitionExpectation::NaturalValue,
+                expected: grammar.value_expectation(),
             });
         }
     }
@@ -296,6 +338,22 @@ fn validate_flat_nat_term(
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
+    parse_definition_with_grammar(source, DefinitionGrammar::NatOnly)
+}
+
+/// Parse the bounded first-order source slice over exact `Nat` and `String`
+/// binder/result types, literals, references, applications, and local lets.
+///
+/// This does not claim general Lean elaboration. Unsupported syntax remains a
+/// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
+pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionParseError> {
+    parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
+}
+
+fn parse_definition_with_grammar(
+    source: &[u8],
+    grammar: DefinitionGrammar,
+) -> Result<ParsedDefinition, NatDefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let table = nat_definition_token_table();
@@ -373,11 +431,11 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         cursor += 1;
         if !matches!(
             tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Ident(name)) if name == &Name::from_components(["Nat"])
+            Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, cursor),
-                expected: NatDefinitionExpectation::NaturalType,
+                expected: grammar.type_expectation(),
             });
         }
         let type_name = cursor;
@@ -393,7 +451,7 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         }
         let close = cursor;
         cursor += 1;
-        parameter_groups.push(ExplicitNatBinderTokens {
+        parameter_groups.push(ExplicitBinderTokens {
             open,
             names: names_start..colon,
             colon,
@@ -409,11 +467,11 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         cursor += 1;
         if !matches!(
             tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Ident(name)) if name == &Name::from_components(["Nat"])
+            Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
         ) {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, cursor),
-                expected: NatDefinitionExpectation::NaturalType,
+                expected: grammar.type_expectation(),
             });
         }
         let type_name = cursor;
@@ -472,8 +530,8 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
                 expected: NatDefinitionExpectation::LetSeparator,
             });
         };
-        validate_flat_nat_term(&view, &tokens, value_start..separator)?;
-        let_bindings.push(LetNatBindingTokens {
+        validate_flat_term(&view, &tokens, value_start..separator, grammar)?;
+        let_bindings.push(LetBindingTokens {
             keyword,
             name,
             assignment,
@@ -482,7 +540,7 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         });
         body_start = separator + 1;
     }
-    validate_flat_nat_term(&view, &tokens, body_start..tokens.len())?;
+    validate_flat_term(&view, &tokens, body_start..tokens.len(), grammar)?;
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -544,10 +602,16 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
                 Name::str(Name::anonymous(), "num"),
                 vec![leaf],
             )),
+            Some(TokenKind::Literal(LiteralKind::Str)) if grammar == DefinitionGrammar::Scalar => {
+                Ok(Syntax::node(
+                    Name::str(Name::anonymous(), "str"),
+                    vec![leaf],
+                ))
+            }
             Some(TokenKind::Ident(_)) => Ok(leaf),
             _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, index),
-                expected: NatDefinitionExpectation::NaturalValue,
+                expected: grammar.value_expectation(),
             }),
         }
     };
@@ -619,29 +683,30 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
         vec![modifiers, definition],
     );
 
-    Ok(ParsedNatDefinition {
+    Ok(ParsedDefinition {
         source_view: view,
         syntax,
         epilogue,
     })
 }
 
-/// Partition one source file into bounded Nat-definition command slices.
+/// Partition one source file into bounded definition command slices.
 ///
 /// This is deliberately a lexical partition, not a second parser. In the seed
 /// grammar `def` cannot occur inside a definition body, while occurrences in
 /// comments remain trivia, so every `def` token after the first begins the next
 /// command. Each returned slice is still parsed independently by
-/// [`parse_nat_definition`], which remains the only acceptance authority.
+/// [`parse_definition`] or [`parse_nat_definition`], which remain the only
+/// acceptance authorities for their respective grammar slices.
 /// Boundaries are mapped back through [`SourceView`] before slicing, preserving
 /// original CRLF bytes exactly.
 ///
 /// A file containing zero or one `def` token is returned as one slice, including
 /// an empty file. That keeps malformed or unsupported input on the parser's typed
 /// refusal path instead of misclassifying it as an empty batch.
-pub fn partition_nat_definition_commands(
+pub fn partition_definition_commands(
     source: &[u8],
-) -> Result<Vec<(BytePos, &[u8])>, NatDefinitionParseError> {
+) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
     let table = nat_definition_token_table();
@@ -681,6 +746,14 @@ pub fn partition_nat_definition_commands(
     }
     commands.push((BytePos(start), &source[start..]));
     Ok(commands)
+}
+
+/// Partition a Nat-only source file without changing the original parser's
+/// acceptance authority.
+pub fn partition_nat_definition_commands(
+    source: &[u8],
+) -> Result<Vec<(BytePos, &[u8])>, NatDefinitionParseError> {
+    partition_definition_commands(source)
 }
 
 #[cfg(test)]
@@ -1159,5 +1232,24 @@ mod nat_definition_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn scalar_definition_door_accepts_string_without_widening_the_nat_door() {
+        let source = b"def copy (value : String) : String := value";
+        let parsed = parse_definition(source)
+            .expect("the bounded scalar grammar accepts an exact String signature");
+        assert_eq!(parsed.reconstruct_original(), source);
+        assert!(matches!(
+            parse_nat_definition(source),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalType,
+                ..
+            })
+        ));
+
+        let literal = parse_definition(b"def message : String := \"line\\nheart \\u2665\"")
+            .expect("the lexer-approved String literal reaches the canonical source tree");
+        assert!(literal.reconstruct_normalized().is_some());
     }
 }

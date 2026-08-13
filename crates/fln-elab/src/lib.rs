@@ -4,10 +4,10 @@
 //! dataflow scheduler (plan §10, §4.3).
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
-//! end-to-end production seam: one parsed
-//! bounded Nat definition, explicit first-order `Nat` function, application, or
-//! local let chain becomes a real [`Declaration::Defn`] and is handed to Crucible's
-//! sole check authority.
+//! end-to-end production seam: one parsed bounded exact `Nat`/`String`
+//! definition, explicit first-order function, application, or local let chain
+//! becomes a real [`Declaration::Defn`] and is handed to Crucible's sole check
+//! authority. The original Nat-only door remains strict.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
@@ -25,7 +25,10 @@ use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, Reducibil
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, check};
-use fln_parse::{NatDefinitionParseError, ParsedNatDefinition, parse_nat_definition};
+use fln_parse::{
+    NatDefinitionParseError, ParsedDefinition, ParsedNatDefinition, parse_definition,
+    parse_nat_definition,
+};
 use fln_syntax::tree::Syntax;
 
 /// Why the first elaboration subset refused an otherwise parsed tree.
@@ -35,6 +38,7 @@ pub enum NatDefinitionElabError {
     AnonymousDeclarationName,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
+    InvalidStringLiteral,
     TooManyParameters,
 }
 
@@ -47,6 +51,7 @@ impl std::fmt::Display for NatDefinitionElabError {
             Self::AnonymousDeclarationName => write!(formatter, "declaration name is anonymous"),
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
+            Self::InvalidStringLiteral => write!(formatter, "string literal is invalid"),
             Self::TooManyParameters => write!(formatter, "definition has too many parameters"),
         }
     }
@@ -61,6 +66,9 @@ pub enum NatDefinitionFrontendError {
     Parse(NatDefinitionParseError),
     Elaborate(NatDefinitionElabError),
 }
+
+/// Compatibility name for the wider bounded source door.
+pub type DefinitionFrontendError = NatDefinitionFrontendError;
 
 impl std::fmt::Display for NatDefinitionFrontendError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,6 +106,16 @@ impl From<NatDefinitionElabError> for NatDefinitionFrontendError {
 #[must_use = "the kernel outcome must not be discarded"]
 pub struct NatDefinitionCheck {
     pub parsed: ParsedNatDefinition,
+    pub declaration: Declaration,
+    pub outcome: Outcome<Verdict>,
+}
+
+/// The wider bounded source seam's parsed tree, declaration, and authoritative
+/// kernel answer. Publication remains outside this value.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "the kernel outcome must not be discarded"]
+pub struct DefinitionCheck {
+    pub parsed: ParsedDefinition,
     pub declaration: Declaration,
     pub outcome: Outcome<Verdict>,
 }
@@ -212,6 +230,104 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
     Ok(Literal::Nat(literal_from_bignat(&value)))
 }
 
+fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
+    let mut value = 0_u32;
+    for byte in bytes {
+        let digit = natural_digit(*byte).ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+        value = value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
+            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+    }
+    Ok(char::from_u32(value).unwrap_or('\0'))
+}
+
+fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
+    if spelling.starts_with('r') {
+        let bytes = spelling.as_bytes();
+        let mut opener = 1;
+        while bytes.get(opener) == Some(&b'#') {
+            opener += 1;
+        }
+        if bytes.get(opener) != Some(&b'"') {
+            return Err(NatDefinitionElabError::InvalidStringLiteral);
+        }
+        let hashes = opener - 1;
+        let suffix = 1_usize
+            .checked_add(hashes)
+            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+        let content_start = opener + 1;
+        let content_stop = spelling
+            .len()
+            .checked_sub(suffix)
+            .filter(|stop| *stop >= content_start)
+            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+        if bytes.get(content_stop) != Some(&b'"')
+            || bytes[content_stop + 1..].iter().any(|byte| *byte != b'#')
+        {
+            return Err(NatDefinitionElabError::InvalidStringLiteral);
+        }
+        return Ok(Literal::Str(
+            spelling[content_start..content_stop].to_owned(),
+        ));
+    }
+
+    let content = spelling
+        .strip_prefix('"')
+        .and_then(|spelling| spelling.strip_suffix('"'))
+        .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+    let mut decoded = String::new();
+    let mut chars = content.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
+        match escaped {
+            '\\' => decoded.push('\\'),
+            '"' => decoded.push('"'),
+            '\'' => decoded.push('\''),
+            'r' => decoded.push('\r'),
+            'n' => decoded.push('\n'),
+            't' => decoded.push('\t'),
+            'x' => {
+                let digits = chars.by_ref().take(2).collect::<String>();
+                if digits.len() != 2 {
+                    return Err(NatDefinitionElabError::InvalidStringLiteral);
+                }
+                decoded.push(decode_hex_scalar(digits.as_bytes())?);
+            }
+            'u' => {
+                let digits = chars.by_ref().take(4).collect::<String>();
+                if digits.len() != 4 {
+                    return Err(NatDefinitionElabError::InvalidStringLiteral);
+                }
+                decoded.push(decode_hex_scalar(digits.as_bytes())?);
+            }
+            whitespace if whitespace.is_whitespace() => {
+                while chars.clone().next().is_some_and(char::is_whitespace) {
+                    chars.next();
+                }
+            }
+            _ => return Err(NatDefinitionElabError::InvalidStringLiteral),
+        }
+    }
+    Ok(Literal::Str(decoded))
+}
+
+fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
+    if name == &Name::from_components(["Nat"])
+        || (allow_string && name == &Name::from_components(["String"]))
+    {
+        Some(Expr::const_(name.clone(), Vec::new()))
+    } else {
+        None
+    }
+}
+
 /// Elaborate the exact canonical tree produced by
 /// [`fln_parse::parse_nat_definition`].
 ///
@@ -222,6 +338,20 @@ fn decode_natural(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
 /// function, determines whether the function and arguments make the declaration
 /// admissible.
 pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_definition_with_types(syntax, false)
+}
+
+/// Elaborate the canonical bounded definition tree over exact `Nat` and
+/// `String` types. K1 remains responsible for checking every reference,
+/// application, literal type, and declared result before publication.
+pub fn elaborate_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_definition_with_types(syntax, true)
+}
+
+fn elaborate_definition_with_types(
+    syntax: &Syntax,
+    allow_string: bool,
+) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
         &parser_kind(&["Command", "declaration"]),
@@ -302,11 +432,11 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
             });
         };
         expect_atom(colon, ":", "explicit binder type ascription")?;
-        if parameter_type != &Name::from_components(["Nat"]) {
+        let Some(parameter_type) = scalar_type(parameter_type, allow_string) else {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "Nat parameter type",
+                expected: "supported scalar parameter type",
             });
-        }
+        };
         expect_empty_null(&parts[3], "absent explicit binder default")?;
         expect_atom(&parts[4], ")", "explicit binder closer")?;
         for name in names {
@@ -318,12 +448,12 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
             if parameter.is_anonymous() {
                 return Err(NatDefinitionElabError::AnonymousReferenceName);
             }
-            parameters.push(parameter.clone());
+            parameters.push((parameter.clone(), parameter_type.clone()));
         }
     }
     let result_type = expect_null_args(&signature[1], "optional explicit result type")?;
-    match result_type {
-        [] => {}
+    let result_type = match result_type {
+        [] => Expr::const_(Name::from_components(["Nat"]), Vec::new()),
         [result_type] => {
             let parts = expect_node(
                 result_type,
@@ -340,18 +470,18 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
                     expected: "Nat result type",
                 });
             };
-            if result_type != &Name::from_components(["Nat"]) {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "Nat result type",
-                });
-            }
+            scalar_type(result_type, allow_string).ok_or(
+                NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "supported scalar result type",
+                },
+            )?
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "optional explicit result type",
             });
         }
-    }
+    };
 
     let value = expect_node(
         &definition[3],
@@ -360,7 +490,11 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
         "Lean.Parser.Command.declValSimple",
     )?;
     expect_atom(&value[0], ":=", "definition assignment")?;
-    let mut expression = elaborate_nat_term(&value[1], &parameters)?;
+    let parameter_names = parameters
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let mut expression = elaborate_term(&value[1], &parameter_names, &result_type, allow_string)?;
 
     let termination = expect_node(
         &value[2],
@@ -375,19 +509,17 @@ pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefin
     expect_empty_null(&definition[4], "absent definition clauses")?;
 
     let name = declaration_name.clone();
-    let nat = Name::str(Name::anonymous(), "Nat");
-    let nat_type = Expr::const_(nat, Vec::new());
-    let mut declaration_type = nat_type.clone();
-    for parameter in parameters.iter().rev() {
+    let mut declaration_type = result_type.clone();
+    for (parameter, parameter_type) in parameters.iter().rev() {
         declaration_type = Expr::forall_e(
             parameter.clone(),
-            nat_type.clone(),
+            parameter_type.clone(),
             declaration_type,
             BinderInfo::Default,
         );
         expression = Expr::lam(
             parameter.clone(),
-            nat_type.clone(),
+            parameter_type.clone(),
             expression,
             BinderInfo::Default,
         );
@@ -423,9 +555,10 @@ fn elaborate_nat_reference(
     Ok(Expr::const_(name.clone(), Vec::new()))
 }
 
-fn elaborate_nat_atom(
+fn elaborate_atom(
     syntax: &Syntax,
     parameters: &[Name],
+    allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     Ok(match syntax {
         Syntax::Node { kind, args, .. }
@@ -438,27 +571,39 @@ fn elaborate_nat_atom(
             };
             Expr::lit(decode_natural(spelling)?)
         }
+        Syntax::Node { kind, args, .. }
+            if allow_string && kind == &Name::str(Name::anonymous(), "str") && args.len() == 1 =>
+        {
+            let Syntax::Atom { val: spelling, .. } = &args[0] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "string literal atom",
+                });
+            };
+            Expr::lit(decode_string(spelling)?)
+        }
         Syntax::Ident { val: name, .. } => elaborate_nat_reference(name, parameters)?,
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "natural literal or constant identifier",
+                expected: "supported scalar literal or constant identifier",
             });
         }
     })
 }
 
-fn elaborate_nat_term(
+fn elaborate_term(
     syntax: &Syntax,
     parameters: &[Name],
+    local_type: &Expr,
+    allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     let Syntax::Node { kind, args, .. } = syntax else {
-        return elaborate_nat_atom(syntax, parameters);
+        return elaborate_atom(syntax, parameters, allow_string);
     };
     if kind == &parser_kind(&["Term", "let"]) {
-        return elaborate_nat_let(args, parameters);
+        return elaborate_let(args, parameters, local_type, allow_string);
     }
     if kind != &parser_kind(&["Term", "app"]) {
-        return elaborate_nat_atom(syntax, parameters);
+        return elaborate_atom(syntax, parameters, allow_string);
     }
     if args.len() != 2 {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -491,14 +636,19 @@ fn elaborate_nat_term(
 
     let mut expression = elaborate_nat_reference(function, parameters)?;
     for argument in arguments {
-        expression = Expr::app(expression, elaborate_nat_atom(argument, parameters)?);
+        expression = Expr::app(
+            expression,
+            elaborate_atom(argument, parameters, allow_string)?,
+        );
     }
     Ok(expression)
 }
 
-fn elaborate_nat_let(
+fn elaborate_let(
     parts: &[Syntax],
     parameters: &[Name],
+    local_type: &Expr,
+    allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     let [keyword, config, declaration, separator, body] = parts else {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -545,15 +695,15 @@ fn elaborate_nat_let(
     expect_empty_null(&declaration[1], "empty let binder array")?;
     expect_empty_null(&declaration[2], "absent explicit let type")?;
     expect_atom(&declaration[3], ":=", "let assignment")?;
-    let value = elaborate_nat_term(&declaration[4], parameters)?;
+    let value = elaborate_term(&declaration[4], parameters, local_type, allow_string)?;
     expect_atom(separator, ";", "let body separator")?;
 
     let mut body_parameters = parameters.to_vec();
     body_parameters.push(local_name.clone());
-    let body = elaborate_nat_term(body, &body_parameters)?;
+    let body = elaborate_term(body, &body_parameters, local_type, allow_string)?;
     Ok(Expr::let_e(
         local_name.clone(),
-        Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+        local_type.clone(),
         value,
         body,
         false,
@@ -579,6 +729,25 @@ pub fn check_nat_definition_source(
     let declaration = elaborate_nat_definition(parsed.syntax())?;
     let outcome = check(environment, &declaration, budget);
     Ok(NatDefinitionCheck {
+        parsed,
+        declaration,
+        outcome,
+    })
+}
+
+/// Parse, elaborate, and kernel-check one bounded Nat/String definition.
+///
+/// Like the Nat-only door, this returns Crucible's typed outcome without
+/// publishing anything into the supplied immutable environment.
+pub fn check_definition_source(
+    source: &[u8],
+    environment: &Environment,
+    budget: Budget,
+) -> Result<DefinitionCheck, DefinitionFrontendError> {
+    let parsed = parse_definition(source)?;
+    let declaration = elaborate_definition(parsed.syntax())?;
+    let outcome = check(environment, &declaration, budget);
+    Ok(DefinitionCheck {
         parsed,
         declaration,
         outcome,
@@ -794,9 +963,11 @@ mod tests {
             Err(NatDefinitionElabError::UnexpectedSyntax { .. })
         ));
         assert!(matches!(
-            elaborate_nat_term(
+            elaborate_term(
                 &Syntax::node(parser_kind(&["Term", "app"]), Vec::new()),
                 &[],
+                &Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+                false,
             ),
             Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "Lean.Parser.Term.app"
@@ -806,6 +977,56 @@ mod tests {
             assert_eq!(
                 decode_natural(malformed),
                 Err(NatDefinitionElabError::InvalidNaturalLiteral)
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_source_elaboration_decodes_reference_string_literals_exactly() {
+        let parsed = parse_definition(b"def message : String := \"line\\nheart \\u2665\"")
+            .expect("the bounded scalar source parses");
+        let declaration = elaborate_definition(parsed.syntax())
+            .expect("the canonical String tree elaborates without inventing authority");
+        let Declaration::Defn(definition) = declaration else {
+            panic!("the source command must elaborate to a definition");
+        };
+        assert_eq!(
+            definition.base.type_,
+            Expr::const_(Name::from_components(["String"]), Vec::new())
+        );
+        assert!(matches!(
+            definition.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "line\nheart ♥"
+        ));
+
+        let raw = parse_definition(b"def raw : String := r##\"left \\\\ right\"##")
+            .expect("the lexer-approved raw String literal parses");
+        let Declaration::Defn(raw) =
+            elaborate_definition(raw.syntax()).expect("the raw String literal elaborates")
+        else {
+            panic!("the raw command must elaborate to a definition");
+        };
+        assert!(matches!(
+            raw.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "left \\\\ right"
+        ));
+
+        assert_eq!(
+            decode_string(r#""\\\"\'\r\n\t\x41\u2665""#),
+            Ok(Literal::Str("\\\"'\r\n\tA♥".to_owned()))
+        );
+        assert_eq!(
+            decode_string("\"left\\\n  right\""),
+            Ok(Literal::Str("leftright".to_owned()))
+        );
+        for malformed in ["", "\"unterminated", "\"\\z\"", "r#\"extra closer\"##"] {
+            assert_eq!(
+                decode_string(malformed),
+                Err(NatDefinitionElabError::InvalidStringLiteral)
             );
         }
     }
