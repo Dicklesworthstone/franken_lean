@@ -2871,11 +2871,9 @@ fn invoke_intrinsic(
             expect_arity(row, args, 2)?;
             let dividend = nat_value(&args[0], "Nat.div", 0)?;
             let divisor = nat_value(&args[1], "Nat.div", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(if divisor == 0 {
-                0
-            } else {
-                dividend / divisor
-            })))
+            Ok(IntrinsicResult::owned(Obj::mk_nat(
+                dividend.checked_div(divisor).unwrap_or(0),
+            )))
         }
         IntrinsicImplementation::NatGcd => {
             expect_arity(row, args, 2)?;
@@ -2902,11 +2900,9 @@ fn invoke_intrinsic(
             expect_arity(row, args, 2)?;
             let dividend = nat_value(&args[0], "Nat.mod", 0)?;
             let divisor = nat_value(&args[1], "Nat.mod", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(if divisor == 0 {
-                dividend
-            } else {
-                dividend % divisor
-            })))
+            Ok(IntrinsicResult::owned(Obj::mk_nat(
+                dividend.checked_rem(divisor).unwrap_or(dividend),
+            )))
         }
         IntrinsicImplementation::NatPred => {
             expect_arity(row, args, 1)?;
