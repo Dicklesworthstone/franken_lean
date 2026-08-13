@@ -7,7 +7,8 @@
 #![forbid(unsafe_code)]
 
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, Outcome, VmExit,
+    Budget, ClosedVmValue, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name,
+    Outcome, closed_vm_value,
 };
 use std::error::Error;
 use std::fmt;
@@ -79,19 +80,16 @@ fn run_embedder() -> Result<EmbedderSummary, Box<dyn Error>> {
         .executions
         .last()
         .ok_or_else(|| example_error("completed source batch contained no executions"))?;
-    let VmExit::Returned(returned) = &final_execution.exit else {
-        return Err(example_error("final definition did not return normally"));
-    };
-    if !returned.value.is_scalar() {
+    let Some(ClosedVmValue::Scalar(answer)) = closed_vm_value(&final_execution.exit)? else {
         return Err(example_error(
             "final definition did not return a Nat scalar",
         ));
-    }
+    };
 
     let answer_name = Name::from_components(["answer"]);
     Ok(EmbedderSummary {
         definitions: completed.executions.len(),
-        answer: returned.value.unbox(),
+        answer,
         answer_is_queryable: completed.engine.environment().find(&answer_name).is_some(),
         checker_schema: final_execution.checker.schema,
         artifact_bytes: final_execution.flbc_artifact.len(),
