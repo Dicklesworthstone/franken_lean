@@ -2851,6 +2851,7 @@ fn executable_dependencies(
             &string_type,
             &mut visited_nodes,
             limits,
+            true,
         )?
         else {
             continue;
@@ -2903,6 +2904,7 @@ fn executable_lambda(
         &string_type,
         &mut visited_nodes,
         limits,
+        false,
     )?
     else {
         return Ok(None);
@@ -2964,6 +2966,7 @@ fn executable_signature(
     string_type: &Expr,
     visited_nodes: &mut usize,
     limits: IngressLimits,
+    eta_expand: bool,
 ) -> Result<Option<ExecutableSignature>, IngressError> {
     use fln_core::expr::ExprNode;
 
@@ -2998,18 +3001,21 @@ fn executable_signature(
                     // first-order function (`fun ignored => copy`). Eta is
                     // sound only when the current body is closed; a body that
                     // already mentions peeled binders would need lifting.
-                    if body.has_loose_bvars() {
-                        return Ok(None);
+                    // Local-closure execution must not eta: it binds the
+                    // source lambda spine, whose binder count would then
+                    // disagree with the expanded signature.
+                    if eta_expand && !body.has_loose_bvars() {
+                        return eta_expand_signature(
+                            body,
+                            declared_type,
+                            parameters,
+                            nat_type,
+                            string_type,
+                            visited_nodes,
+                            limits,
+                        );
                     }
-                    return eta_expand_signature(
-                        body,
-                        declared_type,
-                        parameters,
-                        nat_type,
-                        string_type,
-                        visited_nodes,
-                        limits,
-                    );
+                    return Ok(None);
                 };
                 if value_binder_type != binder_type {
                     return Ok(None);

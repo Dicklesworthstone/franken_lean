@@ -558,7 +558,7 @@ fn elaborate_definition_with_types(
             .filter(|ty| acceptable_inferred(ty, allow_string))
             .unwrap_or_else(nat_const)
     });
-    if parameters.is_empty() {
+    if !expression.has_loose_bvars() {
         expression = eta_expand_nondependent(expression, &declaration_type)?;
     }
     for (parameter, parameter_type) in parameters.iter().rev() {
