@@ -507,6 +507,8 @@ struct IntrinsicPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
     NatAdd,
+    NatSub,
+    NatMul,
     StringAppend,
     ArraySize,
     ArrayGetInternal,
@@ -537,6 +539,8 @@ impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
             "extern:Nat.add" => Self::NatAdd,
+            "extern:Nat.sub" => Self::NatSub,
+            "extern:Nat.mul" => Self::NatMul,
             "extern:String.append" => Self::StringAppend,
             "extern:Array.size" => Self::ArraySize,
             "extern:Array.getInternal" => Self::ArrayGetInternal,
@@ -2825,6 +2829,26 @@ fn invoke_intrinsic(
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(sum)))
         }
+        IntrinsicImplementation::NatSub => {
+            expect_arity(row, args, 2)?;
+            let lhs = nat_value(&args[0], "Nat.sub", 0)?;
+            let rhs = nat_value(&args[1], "Nat.sub", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(lhs.saturating_sub(rhs))))
+        }
+        IntrinsicImplementation::NatMul => {
+            expect_arity(row, args, 2)?;
+            let lhs = nat_value(&args[0], "Nat.mul", 0)?;
+            let rhs = nat_value(&args[1], "Nat.mul", 1)?;
+            let product = lhs.checked_mul(rhs).ok_or(VmRefusal::NatOverflow {
+                operation: "Nat.mul",
+            })?;
+            if product > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "Nat.mul",
+                });
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(product)))
+        }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
             let mut lhs = string_value(&args[0], "String.append", 0)?;
@@ -3052,6 +3076,8 @@ fn managerless_task_application(
             })
         }
         IntrinsicImplementation::NatAdd
+        | IntrinsicImplementation::NatSub
+        | IntrinsicImplementation::NatMul
         | IntrinsicImplementation::StringAppend
         | IntrinsicImplementation::ArraySize
         | IntrinsicImplementation::ArrayGetInternal
