@@ -239,7 +239,7 @@ fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
             .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
             .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
     }
-    Ok(char::from_u32(value).unwrap_or('\0'))
+    char::from_u32(value).ok_or(NatDefinitionElabError::InvalidStringLiteral)
 }
 
 fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
@@ -307,11 +307,18 @@ fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
                 }
                 decoded.push(decode_hex_scalar(digits.as_bytes())?);
             }
-            whitespace if whitespace.is_whitespace() => {
-                while chars.clone().next().is_some_and(char::is_whitespace) {
-                    chars.next();
+            // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
+            // only on a newline after `\`. `stringGapFn` then eats other
+            // whitespace and refuses a second newline.
+            '\n' => loop {
+                match chars.clone().next() {
+                    Some('\n') => return Err(NatDefinitionElabError::InvalidStringLiteral),
+                    Some(whitespace) if whitespace.is_whitespace() => {
+                        chars.next();
+                    }
+                    _ => break,
                 }
-            }
+            },
             _ => return Err(NatDefinitionElabError::InvalidStringLiteral),
         }
     }
@@ -1023,11 +1030,23 @@ mod tests {
             decode_string("\"left\\\n  right\""),
             Ok(Literal::Str("leftright".to_owned()))
         );
-        for malformed in ["", "\"unterminated", "\"\\z\"", "r#\"extra closer\"##"] {
+        for malformed in [
+            "",
+            "\"unterminated",
+            "\"\\z\"",
+            "r#\"extra closer\"##",
+            "\"a\\ b\"",
+            "\"left\\\n\n  right\"",
+            "\"\\uD800\"",
+        ] {
             assert_eq!(
                 decode_string(malformed),
                 Err(NatDefinitionElabError::InvalidStringLiteral)
             );
         }
+        assert_eq!(
+            decode_string("\"\\u0000\""),
+            Ok(Literal::Str("\0".to_owned()))
+        );
     }
 }
