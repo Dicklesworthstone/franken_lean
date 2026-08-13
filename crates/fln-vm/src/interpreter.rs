@@ -2966,7 +2966,20 @@ fn invoke_intrinsic(
         }
         IntrinsicImplementation::StringLength => {
             expect_arity(row, args, 1)?;
-            let length = string_value(&args[0], "String.length", 0)?.chars().count();
+            // Pin `lean_string_length` boxes `m_length`, the stored UTF-8
+            // scalar count. Recounting `chars()` agrees on objects we minted,
+            // but would silently disagree with the Reference on a string whose
+            // header and payload had drifted.
+            if value_kind(&args[0]) != ValueKind::String {
+                return Err(type_mismatch("String.length", 0, "String", &args[0]));
+            }
+            let (size, _, length, bytes) = args[0].string_view();
+            if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
+                return Err(VmRefusal::InvalidStringObject);
+            }
+            if std::str::from_utf8(&bytes[..size - 1]).is_err() {
+                return Err(VmRefusal::InvalidStringObject);
+            }
             if length > usize::MAX >> 1 {
                 return Err(VmRefusal::NatOverflow {
                     operation: "String.length",
