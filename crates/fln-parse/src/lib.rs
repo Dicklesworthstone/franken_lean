@@ -250,7 +250,9 @@ enum DefinitionGrammar {
 impl DefinitionGrammar {
     fn accepts_type(self, name: &Name) -> bool {
         name == &Name::from_components(["Nat"])
-            || (self == Self::Scalar && name == &Name::from_components(["String"]))
+            || (self == Self::Scalar
+                && (name == &Name::from_components(["String"])
+                    || name == &Name::from_components(["Bool"])))
     }
 
     const fn type_expectation(self) -> NatDefinitionExpectation {
@@ -467,8 +469,9 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
     parse_definition_with_grammar(source, DefinitionGrammar::NatOnly)
 }
 
-/// Parse the bounded first-order source slice over exact `Nat` and `String`
-/// binder/result types, literals, references, applications, and local lets.
+/// Parse the bounded first-order source slice over exact `Nat`, `String`, and
+/// `Bool` binder/result types, literals, references, applications, and local
+/// lets.
 ///
 /// This does not claim general Lean elaboration. Unsupported syntax remains a
 /// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
@@ -1398,12 +1401,19 @@ mod nat_definition_tests {
         ));
 
         assert!(matches!(
-            parse_definition(b"def bad := let value : Bool := 1; value"),
+            parse_definition(b"def bad := let value : Array := 1; value"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
                 expected: NatDefinitionExpectation::ScalarType,
                 ..
             })
         ));
+        let bool_source = b"def answer : Bool := Nat.beq 42 42";
+        let bool_definition =
+            parse_definition(bool_source).expect("the bounded source grammar admits Bool types");
+        assert_eq!(
+            bool_definition.reconstruct_normalized().as_deref(),
+            Some(bool_source.as_slice())
+        );
         assert!(matches!(
             parse_nat_definition(b"def bad := let value : String := 1; value"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
