@@ -64,7 +64,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported String metric source");
     std::fs::write(
         &bounded_nat_source,
-        b"def answer := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\n",
+        b"def legacy := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\ndef power := Nat.pow 3 4\ndef shifted := Nat.add (Nat.shiftLeft 7 3) (Nat.shiftRight 56 3)\ndef answer := Nat.add legacy (Nat.add power (Nat.add (Nat.log2 8) shifted))\n",
     )
     .expect("write supported bounded Nat source");
     std::fs::write(
@@ -248,8 +248,8 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(bounded_nat_produced.stderr.is_empty());
     let bounded_nat_stdout = utf8(&bounded_nat_produced.stdout);
-    assert!(bounded_nat_stdout.contains("\"definitions\":1"));
-    assert!(bounded_nat_stdout.contains("\"finalValue\":47"));
+    assert!(bounded_nat_stdout.contains("\"definitions\":4"));
+    assert!(bounded_nat_stdout.contains("\"finalValue\":194"));
     let bounded_nat_consumed = run_fln(&[
         Path::new("flbc"),
         Path::new("run"),
@@ -262,7 +262,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
         utf8(&bounded_nat_consumed.stderr)
     );
     assert!(bounded_nat_consumed.stderr.is_empty());
-    assert!(utf8(&bounded_nat_consumed.stdout).contains("\"returnValue\":47"));
+    assert!(utf8(&bounded_nat_consumed.stdout).contains("\"returnValue\":194"));
 
     let comparison_produced = run_fln(&[
         Path::new("run"),
