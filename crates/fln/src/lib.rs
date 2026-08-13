@@ -6225,6 +6225,45 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_nested_application_reaches_checked_golem_intrinsics() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(
+                b"def answer := Nat.sub (Nat.mul 9 5) 3",
+                &options,
+                test_limits(),
+            )
+            .expect("a parenthesized nested application reaches the checked source path");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the nested arithmetic definition must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::Scalar(42)))
+        );
+
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed nested-application artifact decodes canonically");
+        for expected in ["Nat.mul", "Nat.sub"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the nested arithmetic row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
+    }
+
+    #[test]
     fn checked_string_append_source_reaches_golem() {
         let options = KVMap::new();
         let string_only = engine_with_string_type();
@@ -6332,9 +6371,8 @@ mod tests {
             .execute_source_definitions(
                 &[
                     b"def Nat.mul (left right : Nat) : Nat := left",
-                    b"def product := Nat.mul 40 2",
                     b"def Nat.sub (left right : Nat) : Nat := right",
-                    b"def answer := Nat.sub product 3",
+                    b"def answer := Nat.sub (Nat.mul 40 2) 3",
                 ],
                 &options,
                 test_limits(),
@@ -6344,11 +6382,11 @@ mod tests {
             panic!("the ordinary arithmetic definition batch must answer completely");
         };
         assert_eq!(
-            closed_vm_value(&completed.executions[3].exit),
+            closed_vm_value(&completed.executions[2].exit),
             Ok(Some(ClosedVmValue::Scalar(3)))
         );
         let executable = fln_comp::flbc::decode_canonical(
-            &completed.executions[3].flbc_artifact,
+            &completed.executions[2].flbc_artifact,
             CodecLimits::default(),
         )
         .expect("the exact executed ordinary-function FLBC decodes canonically");
@@ -6374,7 +6412,7 @@ mod tests {
             .execute_source_definitions(
                 &[
                     b"def String.append (left right : String) : String := left",
-                    b"def message := String.append \"ordinary\" \"intrinsic\"",
+                    b"def message := String.append (String.append \"ordinary\" \"ignored\") \"intrinsic\"",
                 ],
                 &options,
                 test_limits(),

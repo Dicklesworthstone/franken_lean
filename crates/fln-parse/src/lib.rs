@@ -5,9 +5,9 @@
 //! The general Pratt/category machinery lives in the modules below. The
 //! [`parse_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
-//! signatures followed by a matching literal, identifier, saturated
-//! identifier-headed application, or non-recursive local let chain with optional
-//! exact scalar type ascriptions over those forms. [`parse_nat_definition`]
+//! signatures followed by a matching literal, identifier, parenthesized first-order
+//! application, or non-recursive local let chain with optional exact scalar type
+//! ascriptions over those forms. [`parse_nat_definition`]
 //! retains the original Nat-only authority. Both use the same source view,
 //! lexer, attachment, and canonical `Syntax` shape as the general engine. Being
 //! outside these seed grammars is a typed refusal, not a claim that the source is
@@ -28,7 +28,7 @@ use build::{BuildError, Leaves};
 use fln_core::name::Name;
 use fln_syntax::literal::LiteralKind;
 use fln_syntax::run::{Event, lex_run};
-use fln_syntax::source::{BytePos, ByteSpan, SourceError, SourceText};
+use fln_syntax::source::{BytePos, ByteSpan, SourceError, SourceInfo, SourceText};
 use fln_syntax::token::{LexedToken, TokenKind, TokenTable};
 use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
@@ -204,6 +204,11 @@ struct LetBindingTokens {
     separator: usize,
 }
 
+struct BoundedTermFrame {
+    open: Option<usize>,
+    terms: Vec<(Syntax, usize)>,
+}
+
 impl ParsedDefinition {
     pub fn syntax(&self) -> &Syntax {
         &self.syntax
@@ -288,7 +293,7 @@ fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> 
     view.to_original(in_view)
 }
 
-fn is_flat_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> bool {
+fn is_bounded_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> bool {
     matches!(
         kind,
         Some(TokenKind::Literal(LiteralKind::Nat) | TokenKind::Ident(_))
@@ -296,38 +301,156 @@ fn is_flat_term_atom(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> bo
         && matches!(kind, Some(TokenKind::Literal(LiteralKind::Str))))
 }
 
-fn validate_flat_term(
+fn bounded_term_leaf(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    index: usize,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let leaf = leaves.leaf(index)?;
+    match tokens.get(index).map(|token| &token.kind) {
+        Some(TokenKind::Literal(LiteralKind::Nat)) => Ok(Syntax::node(
+            Name::str(Name::anonymous(), "num"),
+            vec![leaf],
+        )),
+        Some(TokenKind::Literal(LiteralKind::Str)) if grammar == DefinitionGrammar::Scalar => Ok(
+            Syntax::node(Name::str(Name::anonymous(), "str"), vec![leaf]),
+        ),
+        Some(TokenKind::Ident(_)) => Ok(leaf),
+        _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: grammar.value_expectation(),
+        }),
+    }
+}
+
+fn finish_bounded_term(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut terms: Vec<(Syntax, usize)>,
+    grammar: DefinitionGrammar,
+    empty_at: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let Some((_, first_index)) = terms.first() else {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, empty_at),
+            expected: grammar.value_expectation(),
+        });
+    };
+    if terms.len() == 1 {
+        return Ok(terms.pop().expect("the nonempty term has one member").0);
+    }
+    if !matches!(
+        tokens.get(*first_index).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    ) {
+        let at = terms.get(1).map_or(*first_index, |(_, index)| *index);
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, at),
+            expected: NatDefinitionExpectation::EndOfCommand,
+        });
+    }
+    let mut terms = terms.into_iter();
+    let head = terms.next().expect("the nonempty application has a head").0;
+    let arguments = terms.map(|(term, _)| term).collect();
+    Ok(Syntax::node(
+        parser_kind(&["Term", "app"]),
+        vec![head, null_node(arguments)],
+    ))
+}
+
+fn hygiene_ident() -> Syntax {
+    Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::empty_at(BytePos(0)),
+        val: Name::anonymous(),
+        preresolved: Vec::new(),
+    }
+}
+
+fn hygienic_lparen(lparen: Syntax) -> Syntax {
+    Syntax::node(
+        parser_kind(&["Term", "hygienicLParen"]),
+        vec![
+            lparen,
+            Syntax::node(
+                Name::str(Name::anonymous(), "hygieneInfo"),
+                vec![hygiene_ident()],
+            ),
+        ],
+    )
+}
+
+fn bounded_term(
+    leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
     range: std::ops::Range<usize>,
     grammar: DefinitionGrammar,
-) -> Result<(), NatDefinitionParseError> {
-    if !is_flat_term_atom(tokens.get(range.start).map(|token| &token.kind), grammar) {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(view, tokens, range.start),
-            expected: grammar.value_expectation(),
-        });
-    }
-    if range.len() > 1
-        && !matches!(
-            tokens.get(range.start).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        )
-    {
-        return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(view, tokens, range.start + 1),
-            expected: NatDefinitionExpectation::EndOfCommand,
-        });
-    }
-    for index in range.start + 1..range.end {
-        if !is_flat_term_atom(tokens.get(index).map(|token| &token.kind), grammar) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(view, tokens, index),
-                expected: grammar.value_expectation(),
-            });
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut frames = vec![BoundedTermFrame {
+        open: None,
+        terms: Vec::new(),
+    }];
+    for index in range.clone() {
+        match tokens.get(index).map(|token| &token.kind) {
+            kind if is_bounded_term_atom(kind, grammar) => {
+                let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
+                frames
+                    .last_mut()
+                    .expect("the root term frame remains live")
+                    .terms
+                    .push((term, index));
+            }
+            Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
+                frames.push(BoundedTermFrame {
+                    open: Some(index),
+                    terms: Vec::new(),
+                });
+            }
+            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
+                if frames.len() == 1 {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: original_position(view, tokens, index),
+                        expected: NatDefinitionExpectation::EndOfCommand,
+                    });
+                }
+                let frame = frames
+                    .pop()
+                    .expect("a closing parenthesis has an inner frame");
+                let open = frame.open.expect("only the root frame lacks an opener");
+                let inner = finish_bounded_term(view, tokens, frame.terms, grammar, index)?;
+                let grouped = Syntax::node(
+                    parser_kind(&["Term", "paren"]),
+                    vec![
+                        hygienic_lparen(leaves.leaf(open)?),
+                        inner,
+                        leaves.leaf(index)?,
+                    ],
+                );
+                frames
+                    .last_mut()
+                    .expect("the parent term frame remains live")
+                    .terms
+                    .push((grouped, open));
+            }
+            _ => {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: grammar.value_expectation(),
+                });
+            }
         }
     }
-    Ok(())
+    if frames.len() != 1 {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, range.end),
+            expected: NatDefinitionExpectation::ClosingParenthesis,
+        });
+    }
+    let frame = frames.pop().expect("the bounded term has a root frame");
+    finish_bounded_term(view, tokens, frame.terms, grammar, range.end)
 }
 
 /// Parse the first production command subset:
@@ -336,7 +459,8 @@ fn validate_flat_term(
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <natural-literal-or-identifier>
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <identifier> <natural-literal-or-identifier>+
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? :=
-///   (let <identifier> (: Nat)? := <flat-term>;)+ <flat-term>
+///   (let <identifier> (: Nat)? := <bounded-term>;)+ <bounded-term>
+/// <bounded-term> ::= <atom> | <identifier> <bounded-atom>+ | `(` <bounded-term> `)`
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -554,7 +678,6 @@ fn parse_definition_with_grammar(
                 expected: NatDefinitionExpectation::LetSeparator,
             });
         };
-        validate_flat_term(&view, &tokens, value_start..separator, grammar)?;
         let_bindings.push(LetBindingTokens {
             keyword,
             name,
@@ -565,7 +688,6 @@ fn parse_definition_with_grammar(
         });
         body_start = separator + 1;
     }
-    validate_flat_term(&view, &tokens, body_start..tokens.len(), grammar)?;
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -620,43 +742,9 @@ fn parse_definition_with_grammar(
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(parameters), result_type],
     );
-    let term_leaf = |index: usize| -> Result<Syntax, NatDefinitionParseError> {
-        let leaf = leaves.leaf(index)?;
-        match tokens.get(index).map(|token| &token.kind) {
-            Some(TokenKind::Literal(LiteralKind::Nat)) => Ok(Syntax::node(
-                Name::str(Name::anonymous(), "num"),
-                vec![leaf],
-            )),
-            Some(TokenKind::Literal(LiteralKind::Str)) if grammar == DefinitionGrammar::Scalar => {
-                Ok(Syntax::node(
-                    Name::str(Name::anonymous(), "str"),
-                    vec![leaf],
-                ))
-            }
-            Some(TokenKind::Ident(_)) => Ok(leaf),
-            _ => Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, index),
-                expected: grammar.value_expectation(),
-            }),
-        }
-    };
-    let flat_term = |range: std::ops::Range<usize>| -> Result<Syntax, NatDefinitionParseError> {
-        let head = term_leaf(range.start)?;
-        if range.len() == 1 {
-            return Ok(head);
-        }
-        let mut arguments = Vec::new();
-        for index in range.start + 1..range.end {
-            arguments.push(term_leaf(index)?);
-        }
-        Ok(Syntax::node(
-            parser_kind(&["Term", "app"]),
-            vec![head, null_node(arguments)],
-        ))
-    };
-    let mut value = flat_term(body_start..tokens.len())?;
+    let mut value = bounded_term(&leaves, &view, &tokens, body_start..tokens.len(), grammar)?;
     for binding in let_bindings.into_iter().rev() {
-        let local_value = flat_term(binding.value)?;
+        let local_value = bounded_term(&leaves, &view, &tokens, binding.value, grammar)?;
         let explicit_type = match binding.explicit_type {
             Some((colon, type_name)) => null_node(vec![Syntax::node(
                 parser_kind(&["Term", "typeSpec"]),
@@ -990,6 +1078,108 @@ mod nat_definition_tests {
             Syntax::Node { kind, args, .. }
                 if kind == &Name::str(Name::anonymous(), "num") && args.len() == 1
         )));
+    }
+
+    #[test]
+    fn command_slice_builds_the_reference_parenthesized_application_shape() {
+        let source = b"def answer := Nat.sub (Nat.mul 9 5) 3";
+        let parsed = parse_definition(source).expect("the bounded nested application parses");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        let Syntax::Node {
+            kind,
+            args: application,
+            ..
+        } = &value[1]
+        else {
+            panic!("the outer application must be a term node");
+        };
+        assert_eq!(kind, &parser_kind(&["Term", "app"]));
+        let Syntax::Node {
+            args: arguments, ..
+        } = &application[1]
+        else {
+            panic!("the outer application must carry its arguments");
+        };
+        let Syntax::Node {
+            kind: paren_kind,
+            args: parenthesized,
+            ..
+        } = &arguments[0]
+        else {
+            panic!("the nested application must retain its parentheses");
+        };
+        assert_eq!(paren_kind, &parser_kind(&["Term", "paren"]));
+        assert!(matches!(
+            &parenthesized[..],
+            [Syntax::Node { kind, args, .. }, Syntax::Node { kind: inner_kind, .. }, Syntax::Atom { val, .. }]
+                if kind == &parser_kind(&["Term", "hygienicLParen"])
+                    && args.len() == 2
+                    && inner_kind == &parser_kind(&["Term", "app"])
+                    && val == ")"
+        ));
+    }
+
+    #[test]
+    fn parenthesized_terms_keep_malformed_delimiters_and_nat_strings_typed() {
+        assert!(matches!(
+            parse_definition(b"def answer := Nat.add (40 2"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::ClosingParenthesis,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_definition(b"def answer := Nat.add () 2"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::ScalarValue,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_definition(b"def answer := Nat.add 40 2)"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::EndOfCommand,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def answer := identity (\"not Nat\")"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalValue,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn deeply_parenthesized_term_parses_without_host_stack_recursion() {
+        const DEPTH: usize = 20_000;
+        let mut source = b"def answer := ".to_vec();
+        source.extend(std::iter::repeat_n(b'(', DEPTH));
+        source.extend_from_slice(b"42");
+        source.extend(std::iter::repeat_n(b')', DEPTH));
+        let parsed =
+            parse_nat_definition(&source).expect("parenthesis handling uses explicit work stacks");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
     }
 
     #[test]
