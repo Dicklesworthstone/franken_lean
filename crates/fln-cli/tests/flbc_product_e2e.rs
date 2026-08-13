@@ -34,9 +34,11 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     std::fs::create_dir(&root).expect("create fresh retained integration-test directory");
     let source = root.join("Answer.lean");
     let string_source = root.join("Message.lean");
+    let string_metric_source = root.join("StringMetric.lean");
     let bad_source = root.join("Open.lean");
     let product = root.join("Answer.flbc");
     let string_product = root.join("Message.flbc");
+    let string_metric_product = root.join("StringMetric.flbc");
     let failed_product = root.join("Failed.flbc");
     let collision = root.join("Collision.flbc");
     std::fs::write(
@@ -50,6 +52,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
             .as_bytes(),
     )
     .expect("write supported String source");
+    std::fs::write(
+        &string_metric_source,
+        "def answer := Nat.add (String.length \"βeta\") (String.utf8ByteSize \"βeta\")\n"
+            .as_bytes(),
+    )
+    .expect("write supported String metric source");
     std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")
         .expect("write non-closed source");
 
@@ -180,6 +188,36 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     assert!(string_consumer_stdout.contains("\"schema\":\"fln.flbc-run/3\""));
     assert!(string_consumer_stdout.contains("\"returnKind\":\"string\""));
     assert!(string_consumer_stdout.contains("\"returnValue\":\"artifact\\nβ\""));
+
+    let string_metric_produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &string_metric_product,
+        &string_metric_source,
+    ]);
+    assert!(
+        string_metric_produced.status.success(),
+        "String metric producer stderr: {}",
+        utf8(&string_metric_produced.stderr)
+    );
+    assert!(string_metric_produced.stderr.is_empty());
+    let string_metric_stdout = utf8(&string_metric_produced.stdout);
+    assert!(string_metric_stdout.contains("\"definitions\":1"));
+    assert!(string_metric_stdout.contains("\"finalValue\":9"));
+    let string_metric_consumed = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &string_metric_product,
+    ]);
+    assert!(
+        string_metric_consumed.status.success(),
+        "String metric consumer stderr: {}",
+        utf8(&string_metric_consumed.stderr)
+    );
+    assert!(string_metric_consumed.stderr.is_empty());
+    assert!(utf8(&string_metric_consumed.stdout).contains("\"returnValue\":9"));
 
     let mut corrupt_string = original_string.clone();
     corrupt_string[0] ^= 0xff;
