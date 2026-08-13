@@ -233,19 +233,47 @@ fln = { git = "https://github.com/Dicklesworthstone/franken_lean" }
 ```
 
 ```rust
-use fln::{Engine, Cx};
+use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, Outcome};
+use std::error::Error;
 
-fn main() -> fln::Result<()> {
-    // Capability-first: the embedder hands the engine a Cx and gets
-    // determinism, cancellation, and budget enforcement structurally.
-    let engine = Engine::builder().toolchain_epoch("v4.32.0").build()?;
-    let env = engine.elaborate_project(&Cx::ambient(), "path/to/project")?;
-
-    let verdict = engine.check(&env, "MyProject.my_theorem")?;
-    println!("{}", verdict.receipt().to_json());
+fn main() -> Result<(), Box<dyn Error>> {
+    let kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
+    let engine = match Engine::with_source_seed(EngineAdmissionLimits::new(kernel))? {
+        Outcome::Complete(engine) => engine,
+        other => return Err(std::io::Error::other(format!("seed: {other:?}")).into()),
+    };
+    let sources: [&[u8]; 2] = [
+        b"def first (x y : Nat) : Nat := x",
+        b"def answer : Nat := first 42 9",
+    ];
+    let completed = match engine.execute_source_definitions(
+        &sources,
+        &KVMap::new(),
+        EngineExecutionLimits::new(kernel),
+    )? {
+        Outcome::Complete(completed) => completed,
+        other => return Err(std::io::Error::other(format!("run: {other:?}")).into()),
+    };
+    assert!(completed
+        .engine
+        .environment()
+        .contains(&Name::from_components(["answer"])));
     Ok(())
 }
 ```
+
+The complete runnable version, including typed handling for non-answers and
+the executed result, is [`crates/fln/examples/checked_source.rs`](./crates/fln/examples/checked_source.rs):
+
+```bash
+cargo run -p fln --example checked_source
+```
+
+This is the currently implemented bounded `Nat`/`String` source facade: caller-
+supplied bytes, explicit budgets, immutable environment successors, K1 plus the
+independent checker, canonical FLBC, and Golem. The planned `Cx` builder,
+project/import elaboration, and receipt API from §17.2 do not exist yet; the
+example deliberately does not pretend otherwise.
 
 ## Quick start
 
