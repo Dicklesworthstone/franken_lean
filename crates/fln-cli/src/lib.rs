@@ -700,8 +700,8 @@ fn closed_cli_value(exit: &fln::VmExit) -> Result<Option<SourceFinalValue>, &'st
         return Err("returned String did not contain its required trailing NUL");
     }
     let content = &bytes[..content_size];
-    let value = std::str::from_utf8(content)
-        .map_err(|_| "returned String payload was not UTF-8")?;
+    let value =
+        std::str::from_utf8(content).map_err(|_| "returned String payload was not UTF-8")?;
     Ok(Some(SourceFinalValue::String(value.to_owned())))
 }
 
