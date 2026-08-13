@@ -5912,6 +5912,81 @@ mod tests {
     }
 
     #[test]
+    fn explicit_source_let_type_executes_and_a_mismatch_publishes_nothing() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        let base_root = engine.logical_root(&options);
+        let broken_name = Name::from_components(["broken"]);
+
+        let mismatch = engine
+            .execute_source_definition(
+                b"def broken := let value : Nat := \"wrong\"; value",
+                &options,
+                test_limits(),
+            )
+            .expect_err("K1 must check an explicit let type against its value");
+        assert!(matches!(
+            &mismatch,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::TypeMismatch,
+                ..
+            }
+        ), "unexpected explicit let mismatch: {mismatch:?}");
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&broken_name));
+
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def copy (value : String) := value",
+                    b"def message := let value : String := copy \"typed\"; value",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("a corrected explicitly typed let recovers on the same engine");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the explicitly typed String let batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::String("typed".to_owned())))
+        );
+    }
+
+    #[test]
+    fn inferred_function_alias_is_callable_on_the_source_door() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def copy (value : String) := value",
+                    b"def alias := copy",
+                    b"def message := alias \"via-alias\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("an un-ascribed function alias must stay a String function, not Nat");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the function-alias batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 3);
+        assert_eq!(
+            closed_vm_value(&completed.executions[2].exit),
+            Ok(Some(ClosedVmValue::String("via-alias".to_owned())))
+        );
+    }
+
+    #[test]
     fn checked_runtime_catalog_refuses_unmapped_types_without_publishing() {
         let engine = engine_with_string_type();
         let options = KVMap::new();
