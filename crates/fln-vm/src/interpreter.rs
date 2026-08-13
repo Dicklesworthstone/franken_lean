@@ -507,6 +507,8 @@ struct IntrinsicPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
     NatAdd,
+    NatBeq,
+    NatBle,
     NatSub,
     NatMul,
     NatDiv,
@@ -517,6 +519,7 @@ enum IntrinsicImplementation {
     NatPred,
     NatXor,
     StringAppend,
+    StringDecEq,
     StringLength,
     StringUtf8ByteSize,
     ArraySize,
@@ -548,6 +551,8 @@ impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
             "extern:Nat.add" => Self::NatAdd,
+            "extern:Nat.beq" => Self::NatBeq,
+            "extern:Nat.ble" => Self::NatBle,
             "extern:Nat.sub" => Self::NatSub,
             "extern:Nat.mul" => Self::NatMul,
             "extern:Nat.div" => Self::NatDiv,
@@ -558,6 +563,7 @@ impl IntrinsicImplementation {
             "extern:Nat.pred" => Self::NatPred,
             "extern:Nat.xor" => Self::NatXor,
             "extern:String.append" => Self::StringAppend,
+            "extern:String.decEq" => Self::StringDecEq,
             "extern:String.length" => Self::StringLength,
             "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
             "extern:Array.size" => Self::ArraySize,
@@ -1096,6 +1102,13 @@ impl IntrinsicResult {
     fn raw_object(value: Obj) -> Self {
         Self {
             ownership: ResultOwnership::RawObject,
+            value,
+        }
+    }
+
+    fn scalar(value: Obj) -> Self {
+        Self {
+            ownership: ResultOwnership::Scalar,
             value,
         }
     }
@@ -2847,6 +2860,26 @@ fn invoke_intrinsic(
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(sum)))
         }
+        IntrinsicImplementation::NatBeq => {
+            expect_arity(row, args, 2)?;
+            let left = nat_value(&args[0], "Nat.beq", 0)?;
+            let right = nat_value(&args[1], "Nat.beq", 1)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(if left == right {
+                1
+            } else {
+                0
+            })))
+        }
+        IntrinsicImplementation::NatBle => {
+            expect_arity(row, args, 2)?;
+            let left = nat_value(&args[0], "Nat.ble", 0)?;
+            let right = nat_value(&args[1], "Nat.ble", 1)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(if left <= right {
+                1
+            } else {
+                0
+            })))
+        }
         IntrinsicImplementation::NatSub => {
             expect_arity(row, args, 2)?;
             let lhs = nat_value(&args[0], "Nat.sub", 0)?;
@@ -2920,6 +2953,16 @@ fn invoke_intrinsic(
             let mut lhs = string_value(&args[0], "String.append", 0)?;
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
+        }
+        IntrinsicImplementation::StringDecEq => {
+            expect_arity(row, args, 2)?;
+            let left = string_value(&args[0], "String.decEq", 0)?;
+            let right = string_value(&args[1], "String.decEq", 1)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(if left == right {
+                1
+            } else {
+                0
+            })))
         }
         IntrinsicImplementation::StringLength => {
             expect_arity(row, args, 1)?;
@@ -3162,6 +3205,8 @@ fn managerless_task_application(
             })
         }
         IntrinsicImplementation::NatAdd
+        | IntrinsicImplementation::NatBeq
+        | IntrinsicImplementation::NatBle
         | IntrinsicImplementation::NatSub
         | IntrinsicImplementation::NatMul
         | IntrinsicImplementation::NatDiv
@@ -3172,6 +3217,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatPred
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::StringDecEq
         | IntrinsicImplementation::StringLength
         | IntrinsicImplementation::StringUtf8ByteSize
         | IntrinsicImplementation::ArraySize

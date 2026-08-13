@@ -180,6 +180,9 @@ fn fixture_register_result(
                     | "extern:Nat.mod"
                     | "extern:Nat.pred"
                     | "extern:Nat.xor"
+                    | "extern:Nat.beq"
+                    | "extern:Nat.ble"
+                    | "extern:String.decEq"
                     | "extern:String.length"
                     | "extern:String.utf8ByteSize"
                     | "extern:Array.size"
@@ -530,6 +533,59 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
         )]);
         let completed = returned(execute(&program, ExecutionLimits::default(), None));
         assert_eq!(completed.value.unbox(), expected, "{row} {left} {right}");
+    }
+}
+
+#[test]
+fn generated_bool_comparison_rows_execute_on_scalar_and_string_values() {
+    let _guard = lock();
+    for (row, left, right, expected) in [
+        ("extern:Nat.beq", 42, 42, 1),
+        ("extern:Nat.beq", 42, 41, 0),
+        ("extern:Nat.ble", 41, 42, 1),
+        ("extern:Nat.ble", 43, 42, 0),
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: left,
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: right,
+                },
+                intrinsic(r(2), row, vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.unbox(), expected, "{row} {left} {right}");
+    }
+
+    for (left, right, expected) in [("βeta", "βeta", 1), ("βeta", "beta", 0)] {
+        let program = validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: left.to_owned(),
+                },
+                Instruction::String {
+                    dst: r(1),
+                    value: right.to_owned(),
+                },
+                intrinsic(r(2), "extern:String.decEq", vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.unbox(), expected, "{left:?} == {right:?}");
     }
 }
 
