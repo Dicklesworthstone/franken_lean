@@ -792,6 +792,10 @@ impl<'a> OleanView<'a> {
                 reason: "size/capacity",
             });
         }
+        // Pin `lean_string_object` (`lean.h:203-209`): `m_length` is the UTF-8
+        // scalar count, the same field `lean_string_length` boxes. A mismatch
+        // is a malformed object, not a different length convention.
+        let stored_length = self.read_u64(off + 24)?;
         let bytes = self.read_bytes(off + 32, size)?;
         if bytes[bytes.len() - 1] != 0 {
             return Err(RegionError::StringIntegrity {
@@ -799,10 +803,17 @@ impl<'a> OleanView<'a> {
                 reason: "missing NUL terminator",
             });
         }
-        if std::str::from_utf8(&bytes[..bytes.len() - 1]).is_err() {
-            return Err(RegionError::StringIntegrity {
+        let content = std::str::from_utf8(&bytes[..bytes.len() - 1]).map_err(|_| {
+            RegionError::StringIntegrity {
                 offset: off,
                 reason: "invalid UTF-8",
+            }
+        })?;
+        let scalars = u64::try_from(content.chars().count()).unwrap_or(u64::MAX);
+        if stored_length != scalars {
+            return Err(RegionError::StringIntegrity {
+                offset: off,
+                reason: "m_length is not the UTF-8 scalar count",
             });
         }
         Ok(())
