@@ -18,7 +18,7 @@ pub mod seed;
 
 use fln_bignum::interop::literal_from_bignat;
 use fln_bignum::nat::BigNat;
-use fln_core::expr::{BinderInfo, Expr, Literal};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal};
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
 use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
@@ -497,11 +497,7 @@ fn elaborate_definition_with_types(
         "Lean.Parser.Command.declValSimple",
     )?;
     expect_atom(&value[0], ":=", "definition assignment")?;
-    let parameter_names = parameters
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let mut expression = elaborate_term(&value[1], &parameter_names, &result_type, allow_string)?;
+    let mut expression = elaborate_term(&value[1], &parameters, &result_type, allow_string)?;
 
     let termination = expect_node(
         &value[2],
@@ -546,15 +542,15 @@ fn elaborate_definition_with_types(
 
 fn elaborate_nat_reference(
     name: &Name,
-    parameters: &[Name],
+    locals: &[(Name, Expr)],
 ) -> Result<Expr, NatDefinitionElabError> {
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousReferenceName);
     }
-    if let Some(index) = parameters
+    if let Some(index) = locals
         .iter()
         .rev()
-        .position(|parameter| parameter == name)
+        .position(|(parameter, _)| parameter == name)
     {
         let index = u32::try_from(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
         return Expr::bvar(index).map_err(|_| NatDefinitionElabError::TooManyParameters);
@@ -564,7 +560,7 @@ fn elaborate_nat_reference(
 
 fn elaborate_atom(
     syntax: &Syntax,
-    parameters: &[Name],
+    locals: &[(Name, Expr)],
     allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     Ok(match syntax {
@@ -588,7 +584,7 @@ fn elaborate_atom(
             };
             Expr::lit(decode_string(spelling)?)
         }
-        Syntax::Ident { val: name, .. } => elaborate_nat_reference(name, parameters)?,
+        Syntax::Ident { val: name, .. } => elaborate_nat_reference(name, locals)?,
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "supported scalar literal or constant identifier",
@@ -599,18 +595,18 @@ fn elaborate_atom(
 
 fn elaborate_term(
     syntax: &Syntax,
-    parameters: &[Name],
-    local_type: &Expr,
+    locals: &[(Name, Expr)],
+    result_type: &Expr,
     allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     let Syntax::Node { kind, args, .. } = syntax else {
-        return elaborate_atom(syntax, parameters, allow_string);
+        return elaborate_atom(syntax, locals, allow_string);
     };
     if kind == &parser_kind(&["Term", "let"]) {
-        return elaborate_let(args, parameters, local_type, allow_string);
+        return elaborate_let(args, locals, result_type, allow_string);
     }
     if kind != &parser_kind(&["Term", "app"]) {
-        return elaborate_atom(syntax, parameters, allow_string);
+        return elaborate_atom(syntax, locals, allow_string);
     }
     if args.len() != 2 {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -641,20 +637,42 @@ fn elaborate_term(
         });
     }
 
-    let mut expression = elaborate_nat_reference(function, parameters)?;
+    let mut expression = elaborate_nat_reference(function, locals)?;
     for argument in arguments {
-        expression = Expr::app(
-            expression,
-            elaborate_atom(argument, parameters, allow_string)?,
-        );
+        expression = Expr::app(expression, elaborate_atom(argument, locals, allow_string)?);
     }
     Ok(expression)
 }
 
+/// The type a `let` binder should carry. Literals and already-bound names
+/// have an exact scalar type. Applications and environment constants are
+/// left to the kernel: we fall back to the declaration result type there.
+fn infer_let_binder_type(value: &Expr, locals: &[(Name, Expr)]) -> Option<Expr> {
+    match value.node() {
+        ExprNode::Lit {
+            literal: Literal::Nat(_),
+        } => Some(Expr::const_(Name::from_components(["Nat"]), Vec::new())),
+        ExprNode::Lit {
+            literal: Literal::Str(_),
+        } => Some(Expr::const_(Name::from_components(["String"]), Vec::new())),
+        ExprNode::BVar { idx } => locals
+            .iter()
+            .rev()
+            .nth(usize::try_from(*idx).ok()?)
+            .map(|(_, ty)| ty.clone()),
+        ExprNode::LetE { type_, body, .. } => {
+            let mut extended = locals.to_vec();
+            extended.push((Name::anonymous(), type_.clone()));
+            infer_let_binder_type(body, &extended)
+        }
+        _ => None,
+    }
+}
+
 fn elaborate_let(
     parts: &[Syntax],
-    parameters: &[Name],
-    local_type: &Expr,
+    locals: &[(Name, Expr)],
+    result_type: &Expr,
     allow_string: bool,
 ) -> Result<Expr, NatDefinitionElabError> {
     let [keyword, config, declaration, separator, body] = parts else {
@@ -702,15 +720,16 @@ fn elaborate_let(
     expect_empty_null(&declaration[1], "empty let binder array")?;
     expect_empty_null(&declaration[2], "absent explicit let type")?;
     expect_atom(&declaration[3], ":=", "let assignment")?;
-    let value = elaborate_term(&declaration[4], parameters, local_type, allow_string)?;
+    let value = elaborate_term(&declaration[4], locals, result_type, allow_string)?;
     expect_atom(separator, ";", "let body separator")?;
 
-    let mut body_parameters = parameters.to_vec();
-    body_parameters.push(local_name.clone());
-    let body = elaborate_term(body, &body_parameters, local_type, allow_string)?;
+    let binder_type = infer_let_binder_type(&value, locals).unwrap_or_else(|| result_type.clone());
+    let mut body_locals = locals.to_vec();
+    body_locals.push((local_name.clone(), binder_type.clone()));
+    let body = elaborate_term(body, &body_locals, result_type, allow_string)?;
     Ok(Expr::let_e(
         local_name.clone(),
-        local_type.clone(),
+        binder_type,
         value,
         body,
         false,
@@ -1007,6 +1026,51 @@ mod tests {
                 literal: Literal::Str(value)
             } if value == "line\nheart ♥"
         ));
+
+        let mixed = parse_definition(b"def message : String := let n := 1; \"ok\"")
+            .expect("a Nat let inside a String definition is in the seed grammar");
+        let Declaration::Defn(mixed) = elaborate_definition(mixed.syntax())
+            .expect("the let binder must be Nat, not the String result type")
+        else {
+            panic!("the mixed let must elaborate to a definition");
+        };
+        let ExprNode::LetE {
+            type_, value, body, ..
+        } = mixed.value.node()
+        else {
+            panic!("the mixed command must be a let");
+        };
+        assert_eq!(
+            type_,
+            &Expr::const_(Name::from_components(["Nat"]), Vec::new())
+        );
+        assert!(matches!(
+            value.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(_)
+            }
+        ));
+        assert!(matches!(
+            body.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "ok"
+        ));
+
+        let swapped = parse_definition(b"def answer : Nat := let s := \"hi\"; 1")
+            .expect("a String let inside a Nat definition is in the seed grammar");
+        let Declaration::Defn(swapped) = elaborate_definition(swapped.syntax())
+            .expect("the let binder must be String, not the Nat result type")
+        else {
+            panic!("the swapped let must elaborate to a definition");
+        };
+        let ExprNode::LetE { type_, .. } = swapped.value.node() else {
+            panic!("the swapped command must be a let");
+        };
+        assert_eq!(
+            type_,
+            &Expr::const_(Name::from_components(["String"]), Vec::new())
+        );
 
         let raw = parse_definition(b"def raw : String := r##\"left \\\\ right\"##")
             .expect("the lexer-approved raw String literal parses");
