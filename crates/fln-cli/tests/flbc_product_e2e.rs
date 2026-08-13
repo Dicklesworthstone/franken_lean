@@ -1,10 +1,10 @@
 //! Real-process producer-to-consumer evidence for the bounded FLBC product seam.
 //!
-//! This is deliberately narrower than D18: it proves supported Nat and String
-//! sources reach the filesystem only after batch success and that their exact
-//! bytes are consumed by Golem. It does not claim a certified build, general
-//! Lean source support, closure-complete reproducibility, or thread-matrix
-//! determinism.
+//! This is deliberately narrower than D18: it proves supported Nat, checked
+//! `Nat.add`, and String sources reach the filesystem only after batch success
+//! and that their exact bytes are consumed by Golem. It does not claim a
+//! certified build, general Lean source support, closure-complete
+//! reproducibility, or thread-matrix determinism.
 
 #![forbid(unsafe_code)]
 
@@ -41,7 +41,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let collision = root.join("Collision.flbc");
     std::fs::write(
         &source,
-        b"def first (x y : Nat) : Nat := x\ndef answer : Nat := first 42 9\n",
+        b"def first : Nat := Nat.add 40 1\ndef answer : Nat := Nat.add first 1\n",
     )
     .expect("write supported dependent source batch");
     std::fs::write(
@@ -277,7 +277,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     let source = root.join("Answer.lean");
     std::fs::write(
         &source,
-        b"def first (x y : Nat) : Nat := x\ndef answer : Nat := first 42 9\n",
+        b"def first : Nat := Nat.add 40 1\ndef answer : Nat := Nat.add first 1\n",
     )
     .expect("write supported dependent source batch");
 

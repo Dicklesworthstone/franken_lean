@@ -2,7 +2,7 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded exact Nat/String definition or first-order application
+//! from a bounded exact Nat/String definition, `Nat.add`, or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -41,7 +41,9 @@ pub use fln_comp::fir::LoweringError;
 use fln_comp::fir::ValueType;
 use fln_comp::flbc::CallableResultOwnership;
 pub use fln_comp::flbc::{CodecError, CodecLimits};
-use fln_comp::ingress::{FunctionBinding, IngressResource, LambdaBinding, LambdaRecursion};
+use fln_comp::ingress::{
+    FunctionBinding, IngressResource, IntrinsicBinding, LambdaBinding, LambdaRecursion,
+};
 pub use fln_comp::ingress::{IngressError, IngressLimits};
 pub use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
@@ -1375,8 +1377,9 @@ impl std::error::Error for EngineBvDecideError {
 /// One immutable embeddable engine snapshot.
 ///
 /// The live source constructors seed only the opaque type names needed by their
-/// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String`. Neither is
-/// the real Prelude. Successful admission or execution returns a new `Engine`
+/// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String` and the
+/// checked `Nat.add : Nat -> Nat -> Nat` extern signature. Neither seed is the
+/// real Prelude. Successful admission or execution returns a new `Engine`
 /// snapshot containing the published declaration; the receiver is never
 /// mutated.
 #[derive(Debug, Clone)]
@@ -1420,11 +1423,12 @@ impl Engine {
     }
 
     /// Construct the bounded Nat/String source engine through the ordinary K1
-    /// and independent-checker council, retaining both checker projections.
+    /// and independent-checker council, retaining every checker projection.
     ///
-    /// The two opaque type names are only enough to check literals and exact
-    /// first-order signatures. This is not a Prelude substitute and grants no
-    /// constructors, eliminators, or native intrinsic authority.
+    /// The two opaque type names check literals and exact first-order
+    /// signatures. The third declaration is the exact checked `Nat.add`
+    /// signature recognized by the compiler's generated-row bridge. This is
+    /// not a Prelude substitute and grants no constructors or eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -2373,16 +2377,16 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let functions = executable_dependencies(&self.environment, &expression, limits.ingress)
+        let catalog = executable_dependencies(&self.environment, &expression, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
         let local_lambda = executable_lambda(&admission.declaration, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
         let lambdas = local_lambda.as_slice();
         let ingress = fln_comp::ingress::lower_closed_expr_with_lambdas(
             &expression,
+            &catalog.intrinsics,
             &[],
-            &[],
-            &functions,
+            &catalog.functions,
             lambdas,
             limits.ingress,
         )
@@ -2824,11 +2828,16 @@ fn review_with_independent_checker(
 /// caller-supplied [`FunctionBinding`] would be able to replace a checked
 /// constant's body or lie about its runtime type; neither is an acceptable
 /// embeddable-engine boundary.
+struct ExecutableCatalog {
+    intrinsics: Vec<IntrinsicBinding>,
+    functions: Vec<FunctionBinding>,
+}
+
 fn executable_dependencies(
     environment: &Environment,
     source: &Expr,
     limits: IngressLimits,
-) -> Result<Vec<FunctionBinding>, IngressError> {
+) -> Result<ExecutableCatalog, IngressError> {
     let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
     let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
     let mut pending = BTreeSet::new();
@@ -2837,10 +2846,25 @@ fn executable_dependencies(
     collect_executable_constants(source, &mut pending, &mut visited_nodes, limits)?;
 
     let maximum_functions = limits.fir.max_functions.saturating_sub(1);
+    let mut intrinsics = Vec::new();
     let mut functions = Vec::new();
     while let Some(name) = pending.pop_first() {
         if !resolved.insert(name.clone()) {
             continue;
+        }
+        if name == Name::from_components(["Nat", "add"])
+            && environment.find(&name).is_some_and(is_nat_add_seed)
+        {
+            if let Some(binding) = nat_add_intrinsic_binding() {
+                intrinsics
+                    .try_reserve(1)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::ProgramTables,
+                        requested: 1,
+                    })?;
+                intrinsics.push(binding);
+                continue;
+            }
         }
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
@@ -2882,7 +2906,62 @@ fn executable_dependencies(
             body: signature.body,
         });
     }
-    Ok(functions)
+    Ok(ExecutableCatalog {
+        intrinsics,
+        functions,
+    })
+}
+
+fn is_nat_add_seed(info: &ConstantInfo) -> bool {
+    let ConstantInfo::Axiom(actual) = info else {
+        return false;
+    };
+    let Declaration::Axiom(expected) = fln_elab::seed::nat_add_seed_declaration() else {
+        return false;
+    };
+    actual == &expected
+}
+
+fn nat_add_intrinsic_binding() -> Option<IntrinsicBinding> {
+    use fln_vm::extern_row::{
+        ArgumentOwnership as ContractArgumentOwnership, EffectClass as ContractEffectClass,
+        Ownership as ContractOwnership, ResultOwnership as ContractResultOwnership,
+    };
+
+    let row = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|row| row.name == "Nat.add" && row.levels == 0 && row.arity == 2)?;
+    if ContractEffectClass::parse(row.effect).ok()? != ContractEffectClass::Pure {
+        return None;
+    }
+    let ownership = ContractOwnership::parse(row.ownership).ok()?;
+    let arguments: [ContractArgumentOwnership; 2] =
+        ownership.argument_ownership(2).ok()?.try_into().ok()?;
+    let argument_ownership = arguments
+        .map(|argument| match argument {
+            ContractArgumentOwnership::Borrowed => fln_comp::flbc::ArgumentOwnership::Borrowed,
+            ContractArgumentOwnership::Owned => fln_comp::flbc::ArgumentOwnership::Owned,
+            ContractArgumentOwnership::Unique => fln_comp::flbc::ArgumentOwnership::Unique,
+            ContractArgumentOwnership::Scalar => fln_comp::flbc::ArgumentOwnership::Scalar,
+        })
+        .to_vec();
+    let result_ownership = match ownership.result_ownership().ok()? {
+        ContractResultOwnership::Owned => fln_comp::flbc::ResultOwnership::Owned,
+        ContractResultOwnership::Borrowed => fln_comp::flbc::ResultOwnership::Borrowed,
+        ContractResultOwnership::Scalar => fln_comp::flbc::ResultOwnership::Scalar,
+        ContractResultOwnership::RawObject => fln_comp::flbc::ResultOwnership::RawObject,
+    };
+
+    Some(IntrinsicBinding {
+        name: Name::from_components(["Nat", "add"]),
+        universe_arity: 0,
+        row: row.id.to_owned(),
+        arguments: vec![ValueType::Nat, ValueType::Nat],
+        argument_ownership,
+        result: ValueType::Nat,
+        result_ownership,
+        effect: fln_comp::fir::EffectClass::Pure,
+    })
 }
 
 /// Describe the definition currently being published when its full value is a
@@ -5962,10 +6041,10 @@ mod tests {
         ));
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
-        assert_eq!(engine.environment().len(), 2);
+            .expect("the bounded source seed answers completely");
+        assert_eq!(engine.environment().len(), 3);
         assert!(
             engine
                 .environment()
@@ -5975,6 +6054,11 @@ mod tests {
             engine
                 .environment()
                 .contains(&Name::from_components(["String"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["Nat", "add"]))
         );
 
         let completed = engine
@@ -6001,16 +6085,112 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 4);
+        assert_eq!(completed.engine.environment().len(), 5);
+    }
+
+    #[test]
+    fn checked_nat_add_source_reaches_the_existing_intrinsic_runtime() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let base_root = nat_only.logical_root(&options);
+        let missing = nat_only
+            .execute_source_definition(b"def answer := Nat.add 40 2", &options, test_limits())
+            .expect_err("the Nat-only seed must not invent the Nat.add constant");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(nat_only.logical_root(&options), base_root);
+        assert!(
+            !nat_only
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(b"def answer := Nat.add 40 2", &options, test_limits())
+            .expect("the checked Nat.add source reaches the compiler intrinsic catalog");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked Nat.add source must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::Scalar(42)))
+        );
+
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed FLBC artifact decodes canonically");
+        let nat_add_row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.name == "Nat.add")
+            .expect("the generated pin census contains Nat.add")
+            .id;
+        assert!(executable.functions().iter().any(|function| {
+            function.code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Intrinsic { row, .. } if row == nat_add_row
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn checked_definition_named_nat_add_is_not_replaced_by_the_seed_intrinsic() {
+        let options = KVMap::new();
+        let engine = seeded_engine();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def Nat.add (left right : Nat) : Nat := left",
+                    b"def answer := Nat.add 40 2",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("an ordinary checked definition named Nat.add remains an ordinary function");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary Nat.add definition batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::Scalar(40)))
+        );
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[1].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed ordinary-function FLBC decodes canonically");
+        let nat_add_row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.name == "Nat.add")
+            .expect("the generated pin census contains Nat.add")
+            .id;
+        assert!(executable.functions().iter().all(|function| {
+            function.code.iter().all(|instruction| {
+                !matches!(
+                    instruction,
+                    Instruction::Intrinsic { row, .. } if row == nat_add_row
+                )
+            })
+        }));
     }
 
     #[test]
     fn inferred_string_application_executes_on_the_source_door() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
+            .expect("the bounded source seed answers completely");
         let completed = engine
             .execute_source_definitions(
                 &[
@@ -6035,9 +6215,9 @@ mod tests {
     fn explicit_source_let_type_executes_and_a_mismatch_publishes_nothing() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
+            .expect("the bounded source seed answers completely");
         let base_root = engine.logical_root(&options);
         let broken_name = Name::from_components(["broken"]);
 
@@ -6085,9 +6265,9 @@ mod tests {
     fn inferred_function_alias_is_callable_on_the_source_door() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
+            .expect("the bounded source seed answers completely");
         let completed = engine
             .execute_source_definitions(
                 &[
@@ -6113,9 +6293,9 @@ mod tests {
     fn returning_a_function_from_a_parameter_is_eta_applied() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
+            .expect("the bounded source seed answers completely");
         let completed = engine
             .execute_source_definitions(
                 &[
@@ -6141,9 +6321,9 @@ mod tests {
     fn partial_application_of_a_checked_function_eta_lifts_used_binders() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
-            .expect("both source type names pass the dual-checker council")
+            .expect("the source seed passes the dual-checker council")
             .into_complete()
-            .expect("the bounded two-row source seed answers completely");
+            .expect("the bounded source seed answers completely");
         let completed = engine
             .execute_source_definitions(
                 &[

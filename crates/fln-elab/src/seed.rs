@@ -10,15 +10,17 @@
 //!
 //! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
 //! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
-//! `String : Sort 1`. They are enough to resolve literal types but not to
-//! compute, eliminate, or inspect either type. The real inductive blocks belong
-//! to inductive elaboration and Prelude ingestion.
+//! `String : Sort 1` and the exact `Nat.add : Nat -> Nat -> Nat` extern
+//! signature. The types are enough to resolve literals, while the checked
+//! `Nat.add` row lets the compiler reach Golem's already-implemented intrinsic;
+//! no constructor or eliminator is implied. The real inductive blocks belong to
+//! inductive elaboration and Prelude ingestion.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
 //! kernel rejection (FL-INV-07).
 
-use fln_core::expr::Expr;
+use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
@@ -111,10 +113,43 @@ pub fn string_seed_declaration() -> Declaration {
     })
 }
 
+/// Construct the exact `Nat.add : Nat -> Nat -> Nat` candidate recognized by
+/// the bounded compiler bridge.
+///
+/// This declaration is still only an axiom at the kernel layer. Execution is
+/// possible because the compiler separately requires this exact checked
+/// declaration before binding the generated `extern:Nat.add` census row.
+pub fn nat_add_seed_declaration() -> Declaration {
+    let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    Declaration::Axiom(AxiomVal {
+        base: ConstantVal {
+            name: Name::from_components(["Nat", "add"]),
+            level_params: Vec::new(),
+            type_: Expr::forall_e(
+                Name::from_components(["left"]),
+                nat.clone(),
+                Expr::forall_e(
+                    Name::from_components(["right"]),
+                    nat.clone(),
+                    nat,
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+        },
+        is_unsafe: false,
+    })
+}
+
 /// The exact declaration sequence required by the bounded Nat/String source
-/// frontend. Order is part of the deterministic seed contract.
-pub fn source_seed_declarations() -> [Declaration; 2] {
-    [nat_seed_declaration(), string_seed_declaration()]
+/// frontend. Order is part of the deterministic seed contract: both types must
+/// exist before the intrinsic signature can be admitted.
+pub fn source_seed_declarations() -> [Declaration; 3] {
+    [
+        nat_seed_declaration(),
+        string_seed_declaration(),
+        nat_add_seed_declaration(),
+    ]
 }
 
 /// Build the seed's minimal environment.
@@ -181,5 +216,13 @@ mod tests {
             bootstrap_nat_environment(Budget::DEFAULT).expect("the bounded Nat seed publishes");
         assert!(environment.contains(&Name::from_components(["Nat"])));
         assert_eq!(environment.len(), 1);
+    }
+
+    #[test]
+    fn source_seed_orders_both_types_before_the_exact_nat_add_signature() {
+        let declarations = source_seed_declarations();
+        assert_eq!(declarations[0], nat_seed_declaration());
+        assert_eq!(declarations[1], string_seed_declaration());
+        assert_eq!(declarations[2], nat_add_seed_declaration());
     }
 }

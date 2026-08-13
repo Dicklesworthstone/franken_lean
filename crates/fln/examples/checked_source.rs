@@ -58,8 +58,8 @@ fn run_embedder() -> Result<EmbedderSummary, Box<dyn Error>> {
     let engine = seeded_engine()?;
     let options = KVMap::new();
     let sources: [&[u8]; 2] = [
-        b"def first (x y : Nat) : Nat := x",
-        b"def answer : Nat := first 42 9",
+        b"def first : Nat := Nat.add 40 1",
+        b"def answer : Nat := Nat.add first 1",
     ];
     let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(KERNEL_STACK_BYTES));
     let completed = match engine.execute_source_definitions(&sources, &options, limits)? {
