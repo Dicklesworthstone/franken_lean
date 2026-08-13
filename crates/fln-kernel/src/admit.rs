@@ -2163,7 +2163,12 @@ impl<'a> Engine<'a> {
                     cidx: cv.cidx,
                     num_params: self.nparams as u32,
                     num_fields: cv.num_fields,
-                    is_unsafe: cv.is_unsafe,
+                    // The pin stamps `m_is_unsafe` from the *current* declaration
+                    // on every auxiliary constructor (inductive.cpp:472), because
+                    // they join that block. Copying the nested head's flag
+                    // (`List.cons` is safe) into an unsafe parent block makes
+                    // `check_constructors` reject a legal `unsafe inductive`.
+                    is_unsafe: self.is_unsafe,
                 });
             }
             st.aux_types.push(InductiveVal {

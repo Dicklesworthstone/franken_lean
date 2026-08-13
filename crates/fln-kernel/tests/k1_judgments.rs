@@ -6564,6 +6564,28 @@ fn kr608_nested_block_admits_with_byte_exact_translated_regeneration() {
 }
 
 #[test]
+fn kr608_unsafe_nested_block_stamps_block_safety_on_minted_constructors() {
+    // `unsafe inductive Foo | wrap : List Foo → Foo` must not die because
+    // the minted `_nested.List` constructors inherited `List.cons`'s safe
+    // flag while the auxiliary *type* inherited the unsafe block flag.
+    let (mut types, mut ctors, mut recursors) = mytree_block();
+    types[0].is_unsafe = true;
+    ctors[0].is_unsafe = true;
+    for recursor in &mut recursors {
+        recursor.is_unsafe = true;
+    }
+    let verdict = check(
+        &mylist_env(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "unsafe MyTree nesting a safe MyList must admit; got {verdict:?}"
+    );
+}
+
+#[test]
 fn kr608_positivity_is_enforced_through_the_translation() {
     // MUTANT (bead franken_lean-8ce: "skipped positivity on the translated
     // block"): nest `MyList (MyTree → MyTree)` — the occurrence is nested
