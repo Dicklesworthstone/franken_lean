@@ -35,10 +35,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let source = root.join("Answer.lean");
     let string_source = root.join("Message.lean");
     let string_metric_source = root.join("StringMetric.lean");
+    let bounded_nat_source = root.join("BoundedNat.lean");
     let bad_source = root.join("Open.lean");
     let product = root.join("Answer.flbc");
     let string_product = root.join("Message.flbc");
     let string_metric_product = root.join("StringMetric.flbc");
+    let bounded_nat_product = root.join("BoundedNat.flbc");
     let failed_product = root.join("Failed.flbc");
     let collision = root.join("Collision.flbc");
     std::fs::write(
@@ -58,6 +60,11 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
             .as_bytes(),
     )
     .expect("write supported String metric source");
+    std::fs::write(
+        &bounded_nat_source,
+        b"def answer := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\n",
+    )
+    .expect("write supported bounded Nat source");
     std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")
         .expect("write non-closed source");
 
@@ -218,6 +225,36 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(string_metric_consumed.stderr.is_empty());
     assert!(utf8(&string_metric_consumed.stdout).contains("\"returnValue\":9"));
+
+    let bounded_nat_produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &bounded_nat_product,
+        &bounded_nat_source,
+    ]);
+    assert!(
+        bounded_nat_produced.status.success(),
+        "bounded Nat producer stderr: {}",
+        utf8(&bounded_nat_produced.stderr)
+    );
+    assert!(bounded_nat_produced.stderr.is_empty());
+    let bounded_nat_stdout = utf8(&bounded_nat_produced.stdout);
+    assert!(bounded_nat_stdout.contains("\"definitions\":1"));
+    assert!(bounded_nat_stdout.contains("\"finalValue\":47"));
+    let bounded_nat_consumed = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &bounded_nat_product,
+    ]);
+    assert!(
+        bounded_nat_consumed.status.success(),
+        "bounded Nat consumer stderr: {}",
+        utf8(&bounded_nat_consumed.stderr)
+    );
+    assert!(bounded_nat_consumed.stderr.is_empty());
+    assert!(utf8(&bounded_nat_consumed.stdout).contains("\"returnValue\":47"));
 
     let mut corrupt_string = original_string.clone();
     corrupt_string[0] ^= 0xff;
