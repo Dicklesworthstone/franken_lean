@@ -288,13 +288,49 @@ fn malformed_forms_have_exact_typed_diagnostics_and_publish_no_syntax() {
         MacroExpansionBudget::generous(),
         None,
     );
-    assert!(matches!(
-        unexpected,
-        Outcome::Complete(Err(MacroExpansionError::UnexpectedSplice { .. }))
-    ));
-    if let Outcome::Complete(Err(error)) = unexpected {
-        assert_eq!(error.message(), "unexpected antiquotation splice");
-    }
+    let path = match unexpected {
+        Outcome::Complete(Err(error @ MacroExpansionError::UnexpectedSplice { .. })) => {
+            assert_eq!(error.message(), "unexpected antiquotation splice");
+            let MacroExpansionError::UnexpectedSplice { path } = error else {
+                unreachable!("matched above");
+            };
+            path
+        }
+        other => panic!("root splice refusal must keep its class, got {other:?}"),
+    };
+    assert_eq!(path, SyntaxPath::root());
+
+    let nested_unexpected = expand_quotation(
+        MacroExpansionInput {
+            coordinates: coordinates(Mode::Faithful, 1),
+            quotation: quotation(),
+            template: QuotationTemplate::Node {
+                definition_info: original(0, 8),
+                kind: Name::from_components(["Lean", "Parser", "Term"]),
+                args: vec![
+                    QuotationTemplate::Literal(Syntax::atom(original(1, 2), "head")),
+                    QuotationTemplate::Node {
+                        definition_info: original(3, 7),
+                        kind: Name::from_components(["Lean", "Parser", "Term"]),
+                        args: vec![QuotationTemplate::Splice {
+                            hole_info: original(4, 6),
+                            values: vec![QuotedSyntax::from_source(Syntax::atom(
+                                original(10, 11),
+                                "x",
+                            ))],
+                        }],
+                    },
+                ],
+            },
+        },
+        MacroExpansionBudget::generous(),
+        None,
+    );
+    let Outcome::Complete(Err(MacroExpansionError::UnexpectedSplice { path })) = nested_unexpected
+    else {
+        panic!("nested splice refusal must name the offending node, got {nested_unexpected:?}");
+    };
+    assert_eq!(path, SyntaxPath::root().child(1));
 
     let missing = expand_quotation(
         MacroExpansionInput {
