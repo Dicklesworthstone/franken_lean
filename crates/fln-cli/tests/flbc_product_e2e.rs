@@ -1,9 +1,10 @@
 //! Real-process producer-to-consumer evidence for the bounded FLBC product seam.
 //!
-//! This is deliberately narrower than D18: it proves one supported Nat source
-//! reaches the filesystem only after batch success and that the exact bytes are
-//! consumed by Golem. It does not claim a certified build, general Lean source
-//! support, closure-complete reproducibility, or thread-matrix determinism.
+//! This is deliberately narrower than D18: it proves supported Nat and String
+//! sources reach the filesystem only after batch success and that their exact
+//! bytes are consumed by Golem. It does not claim a certified build, general
+//! Lean source support, closure-complete reproducibility, or thread-matrix
+//! determinism.
 
 #![forbid(unsafe_code)]
 
@@ -32,8 +33,10 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     ));
     std::fs::create_dir(&root).expect("create fresh retained integration-test directory");
     let source = root.join("Answer.lean");
+    let string_source = root.join("Message.lean");
     let bad_source = root.join("Open.lean");
     let product = root.join("Answer.flbc");
+    let string_product = root.join("Message.flbc");
     let failed_product = root.join("Failed.flbc");
     let collision = root.join("Collision.flbc");
     std::fs::write(
@@ -41,6 +44,11 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
         b"def first (x y : Nat) : Nat := x\ndef answer : Nat := first 42 9\n",
     )
     .expect("write supported dependent source batch");
+    std::fs::write(
+        &string_source,
+        "def message : String := \"artifact\\nβ\"\n".as_bytes(),
+    )
+    .expect("write supported String source");
     std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")
         .expect("write non-closed source");
 
@@ -131,8 +139,82 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(consumed.stderr.is_empty());
     let consumer_stdout = utf8(&consumed.stdout);
-    assert!(consumer_stdout.contains("\"schema\":\"fln.flbc-run/2\""));
-    assert!(consumer_stdout.contains("\"scalarValue\":42"));
+    assert!(consumer_stdout.contains("\"schema\":\"fln.flbc-run/3\""));
+    assert!(consumer_stdout.contains("\"returnValue\":42"));
+
+    let string_produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &string_product,
+        &string_source,
+    ]);
+    assert!(
+        string_produced.status.success(),
+        "String producer stderr: {}",
+        utf8(&string_produced.stderr)
+    );
+    assert!(string_produced.stderr.is_empty());
+    let string_producer_stdout = utf8(&string_produced.stdout);
+    assert!(string_producer_stdout.contains("\"finalKind\":\"string\""));
+    assert!(string_producer_stdout.contains("\"finalValue\":\"artifact\\nβ\""));
+    assert!(string_producer_stdout.contains("\"emittedFlbc\":{"));
+    let original_string = std::fs::read(&string_product).expect("read emitted String FLBC product");
+    assert!(!original_string.is_empty());
+
+    let string_consumed = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &string_product,
+    ]);
+    assert!(
+        string_consumed.status.success(),
+        "String consumer stderr: {}",
+        utf8(&string_consumed.stderr)
+    );
+    assert!(string_consumed.stderr.is_empty());
+    let string_consumer_stdout = utf8(&string_consumed.stdout).to_owned();
+    assert!(string_consumer_stdout.contains("\"schema\":\"fln.flbc-run/3\""));
+    assert!(string_consumer_stdout.contains("\"returnKind\":\"string\""));
+    assert!(string_consumer_stdout.contains("\"returnValue\":\"artifact\\nβ\""));
+
+    let mut corrupt_string = original_string.clone();
+    corrupt_string[0] ^= 0xff;
+    fln::publish_file_atomic(&corrupt_string, &string_product)
+        .expect("publish planted String corruption");
+    let string_rejected = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &string_product,
+    ]);
+    assert!(!string_rejected.status.success());
+    assert!(string_rejected.stdout.is_empty());
+    let string_rejected_stderr = utf8(&string_rejected.stderr);
+    assert!(string_rejected_stderr.contains("\"schema\":\"fln.flbc-run/3\""));
+    assert!(string_rejected_stderr.contains("\"class\":\"codec\""));
+    assert!(string_rejected_stderr.contains("FLBC artifact magic mismatch"));
+
+    fln::publish_file_atomic(&original_string, &string_product)
+        .expect("restore exact String product bytes");
+    assert_eq!(
+        std::fs::read(&string_product).expect("read restored String product"),
+        original_string
+    );
+    let string_recovered = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &string_product,
+    ]);
+    assert!(
+        string_recovered.status.success(),
+        "String recovery stderr: {}",
+        utf8(&string_recovered.stderr)
+    );
+    assert!(string_recovered.stderr.is_empty());
+    assert_eq!(utf8(&string_recovered.stdout), string_consumer_stdout);
 
     let mut corrupt = original.clone();
     corrupt[0] ^= 0xff;
@@ -146,7 +228,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     assert!(!rejected.status.success());
     assert!(rejected.stdout.is_empty());
     let rejected_stderr = utf8(&rejected.stderr);
-    assert!(rejected_stderr.contains("\"schema\":\"fln.flbc-run/2\""));
+    assert!(rejected_stderr.contains("\"schema\":\"fln.flbc-run/3\""));
     assert!(rejected_stderr.contains("\"class\":\"codec\""));
     assert!(rejected_stderr.contains("FLBC artifact magic mismatch"));
 
@@ -167,7 +249,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
         utf8(&recovered.stderr)
     );
     assert!(recovered.stderr.is_empty());
-    assert!(utf8(&recovered.stdout).contains("\"scalarValue\":42"));
+    assert!(utf8(&recovered.stdout).contains("\"returnValue\":42"));
 }
 
 /// Real-process D18 increment for the live `fln-cli` product root.
@@ -269,8 +351,8 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     );
     assert!(bound.stderr.is_empty());
     let bound_stdout = utf8(&bound.stdout).to_owned();
-    assert!(bound_stdout.contains("\"schema\":\"fln.flbc-run/2\""));
-    assert!(bound_stdout.contains("\"scalarValue\":42"));
+    assert!(bound_stdout.contains("\"schema\":\"fln.flbc-run/3\""));
+    assert!(bound_stdout.contains("\"returnValue\":42"));
     assert!(bound_stdout.contains("\"sidecar\":{\"verified\":true"));
 
     let mode_at = sidecar_mode_offset(&sidecar);
@@ -289,7 +371,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     assert!(!contaminated.status.success());
     assert!(contaminated.stdout.is_empty());
     let contaminated_stderr = utf8(&contaminated.stderr);
-    assert!(contaminated_stderr.contains("\"schema\":\"fln.flbc-run/2\""));
+    assert!(contaminated_stderr.contains("\"schema\":\"fln.flbc-run/3\""));
     assert!(contaminated_stderr.contains("\"class\":\"sidecar\""));
     assert!(contaminated_stderr.contains("product coordinate mode"));
 
