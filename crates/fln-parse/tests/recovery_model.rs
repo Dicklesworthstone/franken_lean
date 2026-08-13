@@ -12,7 +12,7 @@ use fln_parse::recovery::{
     reparse_nat_definition_incremental,
 };
 use fln_parse::registry::Registry;
-use fln_parse::{NatDefinitionParseError, parse_nat_definition};
+use fln_parse::{NatDefinitionExpectation, NatDefinitionParseError, parse_nat_definition};
 use fln_syntax::run::LexBudget;
 use fln_syntax::source::{BytePos, ByteSpan, SourceError};
 
@@ -121,6 +121,45 @@ fn malformed_commands_are_marked_and_both_boundary_products_are_journaled() {
         entry.markers(),
         &[recovered.recovered()[0].marker().clone()]
     );
+}
+
+#[test]
+fn later_command_refusals_name_file_bytes_not_the_slice() {
+    // First command is well-formed. A slice-local diagnostic for the second
+    // command sits around byte 12 and would land inside `def good := 2`.
+    let source = b"def good := 2\ndef broken : String := 1";
+    let recovered = session(source, RecoveryMode::Enabled);
+    let speculative = recovered.speculative().expect("recovery was enabled");
+    assert_eq!(speculative.boundaries().len(), 2);
+    assert_eq!(
+        speculative.boundaries()[0].observation(),
+        &SpeculativeObservation::AcceptedCommandShape
+    );
+    let SpeculativeObservation::RejectedCommandShape(NatDefinitionParseError::OutsideSeedGrammar {
+        at,
+        expected: NatDefinitionExpectation::NaturalType,
+    }) = speculative.boundaries()[1].observation()
+    else {
+        panic!(
+            "the second command must be a type-ascription refusal, got {:?}",
+            speculative.boundaries()[1].observation()
+        );
+    };
+    assert_eq!(*at, BytePos(27));
+    assert!(source[at.0..].starts_with(b"String"));
+
+    let crlf = b"def good := 2\r\ndef broken : String := 1";
+    let recovered = session(crlf, RecoveryMode::Enabled);
+    let speculative = recovered.speculative().expect("recovery was enabled");
+    let SpeculativeObservation::RejectedCommandShape(NatDefinitionParseError::OutsideSeedGrammar {
+        at,
+        ..
+    }) = speculative.boundaries()[1].observation()
+    else {
+        panic!("CRLF later-command refusal must keep its parse class");
+    };
+    assert_eq!(*at, BytePos(28));
+    assert_eq!(crlf[at.0], b'S');
 }
 
 #[test]

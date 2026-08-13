@@ -377,6 +377,7 @@ enum TemplateTask {
     Visit {
         template: QuotationTemplate,
         expansion_path: ExpansionPath,
+        syntax_path: SyntaxPath,
     },
     FinishNode {
         definition_info: SourceInfo,
@@ -664,6 +665,7 @@ impl Expander<'_> {
         let mut tasks = vec![TemplateTask::Visit {
             template,
             expansion_path: root_path,
+            syntax_path: SyntaxPath::root(),
         }];
         let mut built = Vec::<Fragment>::new();
 
@@ -672,6 +674,7 @@ impl Expander<'_> {
                 TemplateTask::Visit {
                     template,
                     expansion_path,
+                    syntax_path,
                 } => {
                     self.observe_template()?;
                     let mut template = template;
@@ -722,7 +725,7 @@ impl Expander<'_> {
                                     .any(|arg| matches!(arg, QuotationTemplate::Splice { .. }))
                             {
                                 return Err(MacroExpansionError::UnexpectedSplice {
-                                    path: SyntaxPath::root(),
+                                    path: syntax_path,
                                 }
                                 .into());
                             }
@@ -733,12 +736,13 @@ impl Expander<'_> {
                                 child_count,
                                 expansion_path: expansion_path.clone(),
                             });
-                            tasks.extend(args.into_iter().rev().map(|template| {
-                                TemplateTask::Visit {
+                            tasks.extend(args.into_iter().enumerate().rev().map(
+                                |(index, template)| TemplateTask::Visit {
                                     template,
                                     expansion_path: expansion_path.clone(),
-                                }
-                            }));
+                                    syntax_path: syntax_path.child(index as u64),
+                                },
+                            ));
                         }
                         QuotationTemplate::GeneratedIdent {
                             definition_info,
@@ -781,6 +785,7 @@ impl Expander<'_> {
                             tasks.push(TemplateTask::Visit {
                                 template: *body,
                                 expansion_path: nested_path,
+                                syntax_path,
                             });
                         }
                     }

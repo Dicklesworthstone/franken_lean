@@ -133,6 +133,36 @@ impl NatDefinitionParseError {
             Self::Build(error) => Self::Build(error),
         }
     }
+
+    /// Rebase a refusal from a normalized command slice into the original file.
+    ///
+    /// Recovery parses each `def`…`def` slice as an independent buffer, so the
+    /// seed parser's positions are slice-local and LF-normalized. Adding the
+    /// original start as a raw offset is wrong once a later command still
+    /// contains collapsed CRLF: the local coordinate is a view offset, and the
+    /// original byte is [`SourceView::to_original`] of `start + local`.
+    pub fn rebase_from_normalized_slice(self, view: &SourceView, start: BytePos) -> Self {
+        let mapped = |at: BytePos| view.to_original(BytePos(start.0.saturating_add(at.0)));
+        match self {
+            Self::Source(SourceError::NotUtf8 { at }) => {
+                Self::Source(SourceError::NotUtf8 { at: mapped(at) })
+            }
+            Self::Lexical { diagnostics } => Self::Lexical {
+                diagnostics: diagnostics
+                    .into_iter()
+                    .map(|diagnostic| ParseDiagnostic {
+                        message: diagnostic.message,
+                        at: mapped(diagnostic.at),
+                    })
+                    .collect(),
+            },
+            Self::OutsideSeedGrammar { at, expected } => Self::OutsideSeedGrammar {
+                at: mapped(at),
+                expected,
+            },
+            Self::Build(error) => Self::Build(error),
+        }
+    }
 }
 
 impl From<BuildError> for NatDefinitionParseError {
@@ -747,6 +777,36 @@ mod nat_definition_tests {
             }
         ));
         assert!(source[29..].starts_with(b"String"));
+    }
+
+    #[test]
+    fn normalized_slice_rebase_accounts_for_crlf_inside_the_later_command() {
+        let source = b"def first := 1\r\ndef second :\r\n String := first";
+        let original = SourceText::from_utf8(source).expect("fixture is utf-8");
+        let view = SourceView::of(&original);
+        let start = BytePos(15);
+        assert_eq!(view.normalized().as_str().as_bytes()[start.0], b'd');
+        let error = parse_nat_definition(b"def second :\n String := first")
+            .expect_err("String is outside the bounded Nat grammar")
+            .rebase_from_normalized_slice(&view, start);
+        assert!(matches!(
+            error,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(31),
+                expected: NatDefinitionExpectation::NaturalType,
+            }
+        ));
+        assert_eq!(source[31], b'S');
+        let naive = parse_nat_definition(b"def second :\n String := first")
+            .expect_err("same refusal")
+            .with_original_offset(view.to_original(start));
+        let NatDefinitionParseError::OutsideSeedGrammar { at: naive_at, .. } = naive else {
+            panic!("the naive offset path must stay a type-ascription refusal");
+        };
+        assert_ne!(
+            naive_at.0, 31,
+            "raw original-start plus view-local must not be mistaken for to_original(start+local)"
+        );
     }
 
     #[test]

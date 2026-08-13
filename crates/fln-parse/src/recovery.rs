@@ -721,18 +721,21 @@ fn make_boundaries(
                 .chain(std::iter::once(BytePos(view.normalized().len_bytes()))),
         )
         .filter_map(|(start, stop)| {
-            ByteSpan::new(start, stop).map(|span| SpeculativeBoundary {
+            let span = ByteSpan::new(start, stop)?;
+            // A lexer-derived span of the same normalized text is always a
+            // valid substring. A miss is a SourceText invariant break, not
+            // invalid UTF-8; omitting the speculative slice is honest.
+            let candidate = view.normalized().span_str(span)?;
+            let observation = match parse_nat_definition(candidate.as_bytes()) {
+                Ok(_) => SpeculativeObservation::AcceptedCommandShape,
+                Err(error) => SpeculativeObservation::RejectedCommandShape(
+                    error.rebase_from_normalized_slice(view, start),
+                ),
+            };
+            Some(SpeculativeBoundary {
                 span,
                 epoch: registry.epoch_at_position(start),
-                observation: match view.normalized().span_str(span) {
-                    Some(candidate) => match parse_nat_definition(candidate.as_bytes()) {
-                        Ok(_) => SpeculativeObservation::AcceptedCommandShape,
-                        Err(error) => SpeculativeObservation::RejectedCommandShape(error),
-                    },
-                    None => SpeculativeObservation::RejectedCommandShape(
-                        NatDefinitionParseError::Source(SourceError::NotUtf8 { at: start }),
-                    ),
-                },
+                observation,
             })
         })
         .collect()
