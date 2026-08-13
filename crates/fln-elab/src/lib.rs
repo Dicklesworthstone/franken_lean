@@ -458,9 +458,9 @@ fn elaborate_definition_with_types(
             parameters.push((parameter.clone(), parameter_type.clone()));
         }
     }
-    let result_type = expect_null_args(&signature[1], "optional explicit result type")?;
-    let result_type = match result_type {
-        [] => Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+    let ascribed_result = expect_null_args(&signature[1], "optional explicit result type")?;
+    let ascribed_result = match ascribed_result {
+        [] => None,
         [result_type] => {
             let parts = expect_node(
                 result_type,
@@ -477,11 +477,11 @@ fn elaborate_definition_with_types(
                     expected: "Nat result type",
                 });
             };
-            scalar_type(result_type, allow_string).ok_or(
+            Some(scalar_type(result_type, allow_string).ok_or(
                 NatDefinitionElabError::UnexpectedSyntax {
                     expected: "supported scalar result type",
                 },
-            )?
+            )?)
         }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -489,6 +489,12 @@ fn elaborate_definition_with_types(
             });
         }
     };
+    // Lets still need an expected type for un-inferable apps/consts. Nat is
+    // the historical default; omitted declaration results are refined after
+    // the body elaborates.
+    let elaboration_result_type = ascribed_result
+        .clone()
+        .unwrap_or_else(|| Expr::const_(Name::from_components(["Nat"]), Vec::new()));
 
     let value = expect_node(
         &definition[3],
@@ -497,7 +503,12 @@ fn elaborate_definition_with_types(
         "Lean.Parser.Command.declValSimple",
     )?;
     expect_atom(&value[0], ":=", "definition assignment")?;
-    let mut expression = elaborate_term(&value[1], &parameters, &result_type, allow_string)?;
+    let mut expression = elaborate_term(
+        &value[1],
+        &parameters,
+        &elaboration_result_type,
+        allow_string,
+    )?;
 
     let termination = expect_node(
         &value[2],
@@ -512,7 +523,10 @@ fn elaborate_definition_with_types(
     expect_empty_null(&definition[4], "absent definition clauses")?;
 
     let name = declaration_name.clone();
-    let mut declaration_type = result_type.clone();
+    let mut declaration_type = ascribed_result.unwrap_or_else(|| {
+        infer_let_binder_type(&expression, &parameters)
+            .unwrap_or_else(|| Expr::const_(Name::from_components(["Nat"]), Vec::new()))
+    });
     for (parameter, parameter_type) in parameters.iter().rev() {
         declaration_type = Expr::forall_e(
             parameter.clone(),
@@ -644,9 +658,10 @@ fn elaborate_term(
     Ok(expression)
 }
 
-/// The type a `let` binder should carry. Literals and already-bound names
-/// have an exact scalar type. Applications and environment constants are
-/// left to the kernel: we fall back to the declaration result type there.
+/// The type a `let` binder — or an omitted declaration result — should carry.
+/// Literals and already-bound names have an exact scalar type. Applications
+/// and environment constants are left to the kernel: we fall back to the
+/// declaration result type there.
 fn infer_let_binder_type(value: &Expr, locals: &[(Name, Expr)]) -> Option<Expr> {
     match value.node() {
         ExprNode::Lit {
@@ -1112,5 +1127,80 @@ mod tests {
             decode_string("\"\\u0000\""),
             Ok(Literal::Str("\0".to_owned()))
         );
+    }
+
+    #[test]
+    fn omitted_result_type_is_inferred_from_the_elaborated_value() {
+        let string_ty = Expr::const_(Name::from_components(["String"]), Vec::new());
+        let nat_ty = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+
+        let parsed = parse_definition(b"def message := \"hello\"")
+            .expect("an un-ascribed String literal is in the scalar grammar");
+        let Declaration::Defn(definition) = elaborate_definition(parsed.syntax())
+            .expect("omitted String result must not be stamped Nat")
+        else {
+            panic!("the un-ascribed String command must elaborate to a definition");
+        };
+        assert_eq!(definition.base.type_, string_ty);
+        assert!(matches!(
+            definition.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "hello"
+        ));
+
+        let parsed = parse_definition(b"def message := let n := 1; \"ok\"")
+            .expect("an un-ascribed let-of-String is in the scalar grammar");
+        let Declaration::Defn(mixed) = elaborate_definition(parsed.syntax())
+            .expect("the omitted result follows the let body, not the Nat binder")
+        else {
+            panic!("the un-ascribed mixed let must elaborate to a definition");
+        };
+        assert_eq!(mixed.base.type_, string_ty);
+        let ExprNode::LetE {
+            type_, value, body, ..
+        } = mixed.value.node()
+        else {
+            panic!("the mixed command must be a let");
+        };
+        assert_eq!(type_, &nat_ty);
+        assert!(matches!(
+            value.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(_)
+            }
+        ));
+        assert!(matches!(
+            body.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "ok"
+        ));
+
+        let parsed = parse_definition(b"def copy (value : String) := value")
+            .expect("an un-ascribed String parameter identity is in the scalar grammar");
+        let Declaration::Defn(copy) = elaborate_definition(parsed.syntax())
+            .expect("the omitted result follows the bound String parameter")
+        else {
+            panic!("the un-ascribed String identity must elaborate to a definition");
+        };
+        assert_eq!(
+            copy.base.type_,
+            Expr::forall_e(
+                Name::from_components(["value"]),
+                string_ty.clone(),
+                string_ty,
+                BinderInfo::Default,
+            )
+        );
+
+        let parsed = parse_definition(b"def answer := 42")
+            .expect("an un-ascribed Nat literal stays in the scalar grammar");
+        let Declaration::Defn(answer) =
+            elaborate_definition(parsed.syntax()).expect("omitted Nat result remains Nat")
+        else {
+            panic!("the un-ascribed Nat command must elaborate to a definition");
+        };
+        assert_eq!(answer.base.type_, nat_ty);
     }
 }
