@@ -4,10 +4,10 @@
 //! dataflow scheduler (plan §10, §4.3).
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
-//! end-to-end production seam: one parsed bounded exact `Nat`/`String`
-//! definition, explicit first-order function, parenthesized application, or local let chain
-//! becomes a real [`Declaration::Defn`] and is handed to Crucible's sole check
-//! authority. The original Nat-only door remains strict.
+//! end-to-end production seam: one parsed bounded exact `Nat`/`String`/`Bool`
+//! definition, explicit first-order function, parenthesized application, or
+//! local let chain becomes a real [`Declaration::Defn`] and is handed to
+//! Crucible's sole check authority. The original Nat-only door remains strict.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
@@ -329,7 +329,9 @@ fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
 
 fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
     if name == &Name::from_components(["Nat"])
-        || (allow_string && name == &Name::from_components(["String"]))
+        || (allow_string
+            && (name == &Name::from_components(["String"])
+                || name == &Name::from_components(["Bool"])))
     {
         Some(Expr::const_(name.clone(), Vec::new()))
     } else {
@@ -799,7 +801,9 @@ fn acceptable_inferred(ty: &Expr, allow_string: bool) -> bool {
     match ty.node() {
         ExprNode::Const { name, levels } if levels.is_empty() => {
             name == &Name::from_components(["Nat"])
-                || (allow_string && name == &Name::from_components(["String"]))
+                || (allow_string
+                    && (name == &Name::from_components(["String"])
+                        || name == &Name::from_components(["Bool"])))
         }
         ExprNode::ForallE { body, .. } if !body.has_loose_bvars() => {
             acceptable_inferred(body, allow_string)
@@ -1022,7 +1026,7 @@ pub fn check_nat_definition_source(
     })
 }
 
-/// Parse, elaborate, and kernel-check one bounded Nat/String definition.
+/// Parse, elaborate, and kernel-check one bounded Nat/String/Bool definition.
 ///
 /// Like the Nat-only door, this returns Crucible's typed outcome without
 /// publishing anything into the supplied immutable environment.
