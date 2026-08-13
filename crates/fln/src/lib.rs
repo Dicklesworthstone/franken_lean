@@ -6029,13 +6029,16 @@ mod tests {
                 test_limits(),
             )
             .expect_err("K1 must check an explicit let type against its value");
-        assert!(matches!(
-            &mismatch,
-            EngineExecutionError::KernelRejected {
-                class: RejectClass::TypeMismatch,
-                ..
-            }
-        ), "unexpected explicit let mismatch: {mismatch:?}");
+        assert!(
+            matches!(
+                &mismatch,
+                EngineExecutionError::KernelRejected {
+                    class: RejectClass::TypeMismatch,
+                    ..
+                }
+            ),
+            "unexpected explicit let mismatch: {mismatch:?}"
+        );
         assert_eq!(engine.logical_root(&options), base_root);
         assert!(!engine.environment().contains(&broken_name));
 

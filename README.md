@@ -270,10 +270,11 @@ cargo run -p fln --example checked_source
 ```
 
 This is the currently implemented bounded `Nat`/`String` source facade: caller-
-supplied bytes, explicit budgets, immutable environment successors, K1 plus the
-independent checker, canonical FLBC, and Golem. The planned `Cx` builder,
-project/import elaboration, and receipt API from §17.2 do not exist yet; the
-example deliberately does not pretend otherwise.
+supplied bytes, exact scalar signatures and optionally ascribed local lets,
+explicit budgets, immutable environment successors, K1 plus the independent
+checker, canonical FLBC, and Golem. The planned `Cx` builder, project/import
+elaboration, and receipt API from §17.2 do not exist yet; the example deliberately
+does not pretend otherwise.
 
 ## Quick start
 
