@@ -2091,6 +2091,21 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
     match error {
         fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
         fln::EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),
+        fln::EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
+            ("resource", false, 3)
+        }
+        fln::EngineExecutionError::Codec(error) if error.is_resource_exhaustion() => {
+            ("resource", false, 3)
+        }
+        fln::EngineExecutionError::Lowering(error) => {
+            if error.is_resource_exhaustion() {
+                ("resource", false, 3)
+            } else if error.is_internal_fault() {
+                ("internal-fault", false, 4)
+            } else {
+                ("execution", true, 1)
+            }
+        }
         fln::EngineExecutionError::CouncilHalted { .. } => ("inconclusive", false, 3),
         fln::EngineExecutionError::CheckerBridge { .. }
         | fln::EngineExecutionError::UnexpectedPublication { .. } => ("internal-fault", false, 4),
@@ -3855,6 +3870,31 @@ mod tests {
         assert_eq!(
             execution_error_disposition(&exhausted),
             ("resource", false, 3)
+        );
+
+        // Compiler-stage budgets are FL-INV-07 too. Folding them into
+        // `execution` / exit 1 would promote exhaustion to a source verdict.
+        let lowering_budget = fln::EngineExecutionError::BatchCommand {
+            index: 0,
+            error: Box::new(fln::EngineExecutionError::Lowering(
+                fln::LoweringError::AllocationFailure {
+                    table: "functions",
+                    requested: usize::MAX,
+                },
+            )),
+        };
+        assert_eq!(
+            execution_error_disposition(&lowering_budget),
+            ("resource", false, 3)
+        );
+
+        let lowering_fault =
+            fln::EngineExecutionError::Lowering(fln::LoweringError::InternalInvariant {
+                reason: "register file shrank",
+            });
+        assert_eq!(
+            execution_error_disposition(&lowering_fault),
+            ("internal-fault", false, 4)
         );
     }
 

@@ -868,6 +868,18 @@ impl std::error::Error for IngressError {
     }
 }
 
+impl IngressError {
+    /// Whether this refusal is a budget or allocation failure, not a
+    /// source-shape refusal. Nested FIR validation is classified the same way.
+    pub fn is_resource_exhaustion(&self) -> bool {
+        match self {
+            Self::ResourceLimit { .. } | Self::AllocationFailure { .. } => true,
+            Self::FirValidation(error) => error.is_resource_exhaustion(),
+            _ => false,
+        }
+    }
+}
+
 impl From<fir::ValidationError> for IngressError {
     fn from(error: fir::ValidationError) -> Self {
         Self::FirValidation(error)
@@ -4469,6 +4481,23 @@ mod tests {
 
     fn nat(value: u64) -> Expr {
         Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+    }
+
+    #[test]
+    fn resource_exhaustion_includes_nested_fir_validation() {
+        let direct = IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: 0,
+            observed: 1,
+        };
+        let nested = IngressError::FirValidation(fir::ValidationError::AllocationFailure {
+            resource: fir::ValidationResource::Functions,
+            requested: 1,
+        });
+        let shape = IngressError::UnknownConstant { name_hash: 0 };
+        assert!(direct.is_resource_exhaustion());
+        assert!(nested.is_resource_exhaustion());
+        assert!(!shape.is_resource_exhaustion());
     }
 
     fn string(value: &str) -> Expr {
