@@ -171,6 +171,8 @@ fn fixture_register_result(
             Instruction::Intrinsic { dst, row, .. } if *dst == register => {
                 return match row.as_str() {
                     "extern:Nat.add"
+                    | "extern:Nat.sub"
+                    | "extern:Nat.mul"
                     | "extern:Array.size"
                     | "extern:ST.Prim.Ref.ptrEq"
                     | "extern:ST.Prim.Ref.set" => CallableResultOwnership::Scalar,
@@ -361,6 +363,86 @@ fn canonical_flbc_artifact_decodes_validates_and_executes_without_a_shadow_value
         decode_canonical(&trailing, CodecLimits::default()).is_err(),
         "a noncanonical artifact never reaches execute"
     );
+}
+
+#[test]
+fn generated_nat_mul_and_sub_rows_execute_with_nat_semantics() {
+    let _guard = lock();
+    let arithmetic = validated(vec![function(
+        0,
+        0,
+        5,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 9,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 5,
+            },
+            intrinsic(r(2), "extern:Nat.mul", vec![r(0), r(1)]),
+            Instruction::Nat {
+                dst: r(3),
+                value: 3,
+            },
+            intrinsic(r(4), "extern:Nat.sub", vec![r(2), r(3)]),
+            Instruction::Return { src: r(4) },
+        ],
+    )]);
+    let completed = returned(execute(&arithmetic, ExecutionLimits::default(), None));
+    assert_eq!(completed.value.unbox(), 42);
+
+    let saturating_subtraction = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 2,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 5,
+            },
+            intrinsic(r(2), "extern:Nat.sub", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let completed = returned(execute(
+        &saturating_subtraction,
+        ExecutionLimits::default(),
+        None,
+    ));
+    assert_eq!(completed.value.unbox(), 0);
+
+    let overflow = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 2,
+            },
+            intrinsic(r(2), "extern:Nat.mul", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&overflow, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::NatOverflow {
+                operation: "Nat.mul"
+            },
+            ..
+        })
+    ));
 }
 
 #[test]
