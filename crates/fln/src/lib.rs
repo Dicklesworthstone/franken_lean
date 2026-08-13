@@ -2834,14 +2834,28 @@ struct ExecutableCatalog {
     functions: Vec<FunctionBinding>,
 }
 
+struct ExecutableValueTypes {
+    nat: Expr,
+    string: Expr,
+    bool_: Expr,
+}
+
+impl ExecutableValueTypes {
+    fn bounded_source() -> Self {
+        Self {
+            nat: Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+            string: Expr::const_(Name::from_components(["String"]), Vec::new()),
+            bool_: Expr::const_(Name::from_components(["Bool"]), Vec::new()),
+        }
+    }
+}
+
 fn executable_dependencies(
     environment: &Environment,
     source: &Expr,
     limits: IngressLimits,
 ) -> Result<ExecutableCatalog, IngressError> {
-    let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-    let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
-    let bool_type = Expr::const_(Name::from_components(["Bool"]), Vec::new());
+    let value_types = ExecutableValueTypes::bounded_source();
     let mut pending = BTreeSet::new();
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
@@ -2867,15 +2881,8 @@ fn executable_dependencies(
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
         };
-        let Some(signature) = executable_signature(
-            definition,
-            &nat_type,
-            &string_type,
-            &bool_type,
-            &mut visited_nodes,
-            limits,
-            true,
-        )?
+        let Some(signature) =
+            executable_signature(definition, &value_types, &mut visited_nodes, limits, true)?
         else {
             continue;
         };
@@ -3019,19 +3026,10 @@ fn executable_lambda(
     let Declaration::Defn(definition) = declaration else {
         return Ok(None);
     };
-    let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-    let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
-    let bool_type = Expr::const_(Name::from_components(["Bool"]), Vec::new());
+    let value_types = ExecutableValueTypes::bounded_source();
     let mut visited_nodes = 0usize;
-    let Some(signature) = executable_signature(
-        definition,
-        &nat_type,
-        &string_type,
-        &bool_type,
-        &mut visited_nodes,
-        limits,
-        false,
-    )?
+    let Some(signature) =
+        executable_signature(definition, &value_types, &mut visited_nodes, limits, false)?
     else {
         return Ok(None);
     };
@@ -3088,9 +3086,7 @@ struct ExecutableSignature {
 /// removed, as required by [`FunctionBinding`].
 fn executable_signature(
     definition: &DefinitionVal,
-    nat_type: &Expr,
-    string_type: &Expr,
-    bool_type: &Expr,
+    value_types: &ExecutableValueTypes,
     visited_nodes: &mut usize,
     limits: IngressLimits,
     eta_expand: bool,
@@ -3112,9 +3108,7 @@ fn executable_signature(
                 body: result_type,
                 ..
             } => {
-                let Some((parameter, _)) =
-                    executable_value_type(binder_type, nat_type, string_type, bool_type)
-                else {
+                let Some((parameter, _)) = executable_value_type(binder_type, value_types) else {
                     break;
                 };
                 charge_catalog_node(visited_nodes, limits)?;
@@ -3136,9 +3130,7 @@ fn executable_signature(
                             body,
                             declared_type,
                             parameters,
-                            nat_type,
-                            string_type,
-                            bool_type,
+                            value_types,
                             visited_nodes,
                             limits,
                         );
@@ -3170,9 +3162,7 @@ fn executable_signature(
         }
     }
 
-    let Some((result, result_ownership)) =
-        executable_value_type(declared_type, nat_type, string_type, bool_type)
-    else {
+    let Some((result, result_ownership)) = executable_value_type(declared_type, value_types) else {
         return Ok(None);
     };
     Ok(Some(ExecutableSignature {
@@ -3190,9 +3180,7 @@ fn eta_expand_signature(
     function: &Expr,
     remaining_type: &Expr,
     mut parameters: Vec<ValueType>,
-    nat_type: &Expr,
-    string_type: &Expr,
-    bool_type: &Expr,
+    value_types: &ExecutableValueTypes,
     visited_nodes: &mut usize,
     limits: IngressLimits,
 ) -> Result<Option<ExecutableSignature>, IngressError> {
@@ -3211,9 +3199,7 @@ fn eta_expand_signature(
         if body.has_loose_bvars() {
             return Ok(None);
         }
-        let Some((parameter, _)) =
-            executable_value_type(binder_type, nat_type, string_type, bool_type)
-        else {
+        let Some((parameter, _)) = executable_value_type(binder_type, value_types) else {
             return Ok(None);
         };
         extra = extra.saturating_add(1);
@@ -3237,9 +3223,7 @@ fn eta_expand_signature(
     if extra == 0 {
         return Ok(None);
     }
-    let Some((result, result_ownership)) =
-        executable_value_type(remaining, nat_type, string_type, bool_type)
-    else {
+    let Some((result, result_ownership)) = executable_value_type(remaining, value_types) else {
         return Ok(None);
     };
 
@@ -3279,15 +3263,13 @@ fn eta_expand_signature(
 
 fn executable_value_type(
     source: &Expr,
-    nat_type: &Expr,
-    string_type: &Expr,
-    bool_type: &Expr,
+    value_types: &ExecutableValueTypes,
 ) -> Option<(ValueType, CallableResultOwnership)> {
-    if source == nat_type {
+    if source == &value_types.nat {
         Some((ValueType::Nat, CallableResultOwnership::Scalar))
-    } else if source == string_type {
+    } else if source == &value_types.string {
         Some((ValueType::String, CallableResultOwnership::Owned))
-    } else if source == bool_type {
+    } else if source == &value_types.bool_ {
         Some((ValueType::Bool, CallableResultOwnership::Scalar))
     } else {
         None
