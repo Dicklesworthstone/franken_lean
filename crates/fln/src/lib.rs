@@ -2,7 +2,7 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded exact Nat/String definition, `Nat.add`, or first-order application
+//! from a bounded exact Nat/String definition, checked Nat arithmetic, or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -1378,7 +1378,7 @@ impl std::error::Error for EngineBvDecideError {
 ///
 /// The live source constructors seed only the opaque type names needed by their
 /// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String` and the
-/// checked `Nat.add : Nat -> Nat -> Nat` extern signature. Neither seed is the
+/// checked `Nat.add`/`Nat.sub`/`Nat.mul` extern signatures. Neither seed is the
 /// real Prelude. Successful admission or execution returns a new `Engine`
 /// snapshot containing the published declaration; the receiver is never
 /// mutated.
@@ -1426,9 +1426,10 @@ impl Engine {
     /// and independent-checker council, retaining every checker projection.
     ///
     /// The two opaque type names check literals and exact first-order
-    /// signatures. The third declaration is the exact checked `Nat.add`
-    /// signature recognized by the compiler's generated-row bridge. This is
-    /// not a Prelude substitute and grants no constructors or eliminators.
+    /// signatures. The remaining declarations are the exact checked Nat
+    /// arithmetic signatures recognized by the compiler's generated-row
+    /// bridge. This is not a Prelude substitute and grants no constructors or
+    /// eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -2852,10 +2853,7 @@ fn executable_dependencies(
         if !resolved.insert(name.clone()) {
             continue;
         }
-        if name == Name::from_components(["Nat", "add"])
-            && environment.find(&name).is_some_and(is_nat_add_seed)
-            && let Some(binding) = nat_add_intrinsic_binding()
-        {
+        if let Some(binding) = source_nat_intrinsic_binding(environment, &name) {
             intrinsics
                 .try_reserve(1)
                 .map_err(|_| IngressError::AllocationFailure {
@@ -2911,25 +2909,41 @@ fn executable_dependencies(
     })
 }
 
-fn is_nat_add_seed(info: &ConstantInfo) -> bool {
+fn source_nat_intrinsic_binding(
+    environment: &Environment,
+    name: &Name,
+) -> Option<IntrinsicBinding> {
+    let info = environment.find(name)?;
     let ConstantInfo::Axiom(actual) = info else {
-        return false;
+        return None;
     };
-    let Declaration::Axiom(expected) = fln_elab::seed::nat_add_seed_declaration() else {
-        return false;
+    let Declaration::Axiom(expected) =
+        fln_elab::seed::source_intrinsic_seed_declaration(name)?
+    else {
+        return None;
     };
-    actual == &expected
+    if actual != &expected {
+        return None;
+    }
+    nat_binary_intrinsic_binding(name)
 }
 
-fn nat_add_intrinsic_binding() -> Option<IntrinsicBinding> {
+fn nat_binary_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
     use fln_vm::extern_row::{
         ArgumentOwnership as ContractArgumentOwnership, EffectClass as ContractEffectClass,
         Ownership as ContractOwnership, ResultOwnership as ContractResultOwnership,
     };
 
+    let row_name = name.to_display_string();
     let row = fln_vm::extern_table_generated::EXTERN_ROWS
         .iter()
-        .find(|row| row.name == "Nat.add" && row.levels == 0 && row.arity == 2)?;
+        .find(|row| row.name == row_name && row.levels == 0 && row.arity == 2)?;
+    let type_anchor = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|candidate| candidate.name == "Nat.add")?;
+    if row.type_hash != type_anchor.type_hash {
+        return None;
+    }
     if ContractEffectClass::parse(row.effect).ok()? != ContractEffectClass::Pure {
         return None;
     }
@@ -2952,7 +2966,7 @@ fn nat_add_intrinsic_binding() -> Option<IntrinsicBinding> {
     };
 
     Some(IntrinsicBinding {
-        name: Name::from_components(["Nat", "add"]),
+        name: name.clone(),
         universe_arity: 0,
         row: row.id.to_owned(),
         arguments: vec![ValueType::Nat, ValueType::Nat],
@@ -6140,6 +6154,50 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn checked_nat_mul_and_sub_source_reaches_golem() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def product := Nat.mul 9 5",
+                    b"def answer := Nat.sub product 3",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("checked Nat.mul and Nat.sub reach Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked Nat arithmetic must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::Scalar(42)))
+        );
+
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[1].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed FLBC artifact decodes canonically");
+        for expected in ["Nat.mul", "Nat.sub"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the arithmetic row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
     }
 
     #[test]
