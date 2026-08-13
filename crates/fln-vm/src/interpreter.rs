@@ -514,9 +514,13 @@ enum IntrinsicImplementation {
     NatDiv,
     NatGcd,
     NatLand,
+    NatLog2,
     NatLor,
     NatMod,
+    NatPow,
     NatPred,
+    NatShiftLeft,
+    NatShiftRight,
     NatXor,
     StringAppend,
     StringDecEq,
@@ -558,9 +562,13 @@ impl IntrinsicImplementation {
             "extern:Nat.div" => Self::NatDiv,
             "extern:Nat.gcd" => Self::NatGcd,
             "extern:Nat.land" => Self::NatLand,
+            "extern:Nat.log2" => Self::NatLog2,
             "extern:Nat.lor" => Self::NatLor,
             "extern:Nat.mod" => Self::NatMod,
+            "extern:Nat.pow" => Self::NatPow,
             "extern:Nat.pred" => Self::NatPred,
+            "extern:Nat.shiftLeft" => Self::NatShiftLeft,
+            "extern:Nat.shiftRight" => Self::NatShiftRight,
             "extern:Nat.xor" => Self::NatXor,
             "extern:String.append" => Self::StringAppend,
             "extern:String.decEq" => Self::StringDecEq,
@@ -2923,6 +2931,20 @@ fn invoke_intrinsic(
             let right = nat_value(&args[1], "Nat.land", 1)?;
             Ok(IntrinsicResult::owned(Obj::mk_nat(left & right)))
         }
+        IntrinsicImplementation::NatLog2 => {
+            expect_arity(row, args, 1)?;
+            let value = nat_value(&args[0], "Nat.log2", 0)?;
+            let result = if value < 2 {
+                0
+            } else {
+                usize::try_from(usize::BITS - 1 - value.leading_zeros()).map_err(|_| {
+                    VmRefusal::NatOverflow {
+                        operation: "Nat.log2",
+                    }
+                })?
+            };
+            Ok(IntrinsicResult::owned(Obj::mk_nat(result)))
+        }
         IntrinsicImplementation::NatLor => {
             expect_arity(row, args, 2)?;
             let left = nat_value(&args[0], "Nat.lor", 0)?;
@@ -2937,10 +2959,63 @@ fn invoke_intrinsic(
                 dividend.checked_rem(divisor).unwrap_or(dividend),
             )))
         }
+        IntrinsicImplementation::NatPow => {
+            expect_arity(row, args, 2)?;
+            let base = nat_value(&args[0], "Nat.pow", 0)?;
+            let exponent = nat_value(&args[1], "Nat.pow", 1)?;
+            let power = match (base, exponent) {
+                (_, 0) => 1,
+                (0, _) => 0,
+                (1, _) => 1,
+                _ => u32::try_from(exponent)
+                    .ok()
+                    .and_then(|exponent| base.checked_pow(exponent))
+                    .ok_or(VmRefusal::NatOverflow {
+                        operation: "Nat.pow",
+                    })?,
+            };
+            if power > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "Nat.pow",
+                });
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(power)))
+        }
         IntrinsicImplementation::NatPred => {
             expect_arity(row, args, 1)?;
             let value = nat_value(&args[0], "Nat.pred", 0)?;
             Ok(IntrinsicResult::owned(Obj::mk_nat(value.saturating_sub(1))))
+        }
+        IntrinsicImplementation::NatShiftLeft => {
+            expect_arity(row, args, 2)?;
+            let value = nat_value(&args[0], "Nat.shiftLeft", 0)?;
+            let amount = nat_value(&args[1], "Nat.shiftLeft", 1)?;
+            let shifted = if value == 0 {
+                0
+            } else {
+                u32::try_from(amount)
+                    .ok()
+                    .and_then(|amount| value.checked_shl(amount))
+                    .ok_or(VmRefusal::NatOverflow {
+                        operation: "Nat.shiftLeft",
+                    })?
+            };
+            if shifted > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "Nat.shiftLeft",
+                });
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(shifted)))
+        }
+        IntrinsicImplementation::NatShiftRight => {
+            expect_arity(row, args, 2)?;
+            let value = nat_value(&args[0], "Nat.shiftRight", 0)?;
+            let amount = nat_value(&args[1], "Nat.shiftRight", 1)?;
+            let shifted = u32::try_from(amount)
+                .ok()
+                .and_then(|amount| value.checked_shr(amount))
+                .unwrap_or(0);
+            Ok(IntrinsicResult::owned(Obj::mk_nat(shifted)))
         }
         IntrinsicImplementation::NatXor => {
             expect_arity(row, args, 2)?;
@@ -3225,9 +3300,13 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatDiv
         | IntrinsicImplementation::NatGcd
         | IntrinsicImplementation::NatLand
+        | IntrinsicImplementation::NatLog2
         | IntrinsicImplementation::NatLor
         | IntrinsicImplementation::NatMod
+        | IntrinsicImplementation::NatPow
         | IntrinsicImplementation::NatPred
+        | IntrinsicImplementation::NatShiftLeft
+        | IntrinsicImplementation::NatShiftRight
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
         | IntrinsicImplementation::StringDecEq
