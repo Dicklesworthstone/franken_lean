@@ -2932,11 +2932,13 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
 
     let row_name = name.to_display_string();
     let (argument_types, result, type_family_anchor) = match row_name.as_str() {
-        "Nat.add" | "Nat.sub" | "Nat.mul" => (
+        "Nat.add" | "Nat.sub" | "Nat.mul" | "Nat.div" | "Nat.gcd" | "Nat.land"
+        | "Nat.lor" | "Nat.mod" | "Nat.xor" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Nat,
             Some("Nat.add"),
         ),
+        "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
         "String.append" => (
             vec![ValueType::String, ValueType::String],
             ValueType::String,
