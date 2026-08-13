@@ -49,6 +49,7 @@
 use crate::pratt::Lookup;
 use crate::state::Production;
 use fln_core::name::Name;
+use fln_syntax::source::BytePos;
 use std::collections::BTreeMap;
 
 /// `Lean.identKind` — the auxiliary token identifiers are indexed under.
@@ -95,8 +96,10 @@ pub enum LeadingToken {
     Node(Name),
     /// Something else: no productions.
     Other,
-    /// The token could not be lexed.
-    Unlexable,
+    /// The token could not be lexed. The position is the peek site: a hardcoded
+    /// `BytePos(0)` would report an unlexable token in the middle of a file as
+    /// if it were at the start.
+    Unlexable { at: BytePos },
 }
 
 /// A map from token to the productions indexed under it — upstream `TokenMap`.
@@ -203,10 +206,10 @@ impl Category {
         unindexed_first: bool,
     ) -> Lookup<'a> {
         let indexed: Vec<&Production> = match token {
-            LeadingToken::Unlexable => {
+            LeadingToken::Unlexable { at } => {
                 return Lookup::TokenError(crate::state::ParseError::new(
                     "could not lex a token",
-                    fln_syntax::source::BytePos(0),
+                    *at,
                 ));
             }
             LeadingToken::Atom(symbol) => {
@@ -513,13 +516,16 @@ mod tests {
     #[test]
     fn an_unlexable_token_is_a_token_error_not_an_empty_lookup() {
         let category = category(LeadingIdentBehavior::Default);
-        assert!(
-            matches!(
-                category.leading_at(&LeadingToken::Unlexable),
-                Lookup::TokenError(_)
+        let at = BytePos(7);
+        match category.leading_at(&LeadingToken::Unlexable { at }) {
+            Lookup::TokenError(error) => assert_eq!(
+                error.at, at,
+                "an unlexable token must keep the peek position, not BytePos(0)"
             ),
-            "an unlexable token must be distinguishable from 'no applicable production'"
-        );
+            Lookup::Productions(_) => {
+                panic!("an unlexable token must be distinguishable from 'no applicable production'")
+            }
+        }
         assert!(matches!(
             category.leading_at(&LeadingToken::Other),
             Lookup::Productions(_)
