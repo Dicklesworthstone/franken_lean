@@ -5,7 +5,7 @@
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed bounded exact `Nat`/`String`
-//! definition, explicit first-order function, application, or local let chain
+//! definition, explicit first-order function, parenthesized application, or local let chain
 //! becomes a real [`Declaration::Defn`] and is handed to Crucible's sole check
 //! authority. The original Nat-only door remains strict.
 //! This is a subset of the final abstraction, not a substitute for unification,
@@ -639,6 +639,128 @@ fn elaborate_atom(
     })
 }
 
+fn parenthesized_inner(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinitionElabError> {
+    let Syntax::Node { kind, .. } = syntax else {
+        return Ok(None);
+    };
+    if kind != &parser_kind(&["Term", "paren"]) {
+        return Ok(None);
+    }
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Term", "paren"]),
+        3,
+        "Lean.Parser.Term.paren",
+    )?;
+    let opener = expect_node(
+        &parts[0],
+        &parser_kind(&["Term", "hygienicLParen"]),
+        2,
+        "Lean.Parser.Term.hygienicLParen",
+    )?;
+    expect_atom(&opener[0], "(", "parenthesized term opener")?;
+    let hygiene = expect_node(
+        &opener[1],
+        &Name::str(Name::anonymous(), "hygieneInfo"),
+        1,
+        "parenthesized term hygiene information",
+    )?;
+    let [Syntax::Ident { val, .. }] = hygiene else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "anonymous parenthesis hygiene identifier",
+        });
+    };
+    if !val.is_anonymous() {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "anonymous parenthesis hygiene identifier",
+        });
+    }
+    expect_atom(&parts[2], ")", "parenthesized term closer")?;
+    Ok(Some(&parts[1]))
+}
+
+fn elaborate_nonlet_term(
+    syntax: &Syntax,
+    locals: &[(Name, Expr)],
+    allow_string: bool,
+) -> Result<Expr, NatDefinitionElabError> {
+    enum Task<'a> {
+        Visit(&'a Syntax),
+        Apply(usize),
+    }
+
+    let mut tasks = vec![Task::Visit(syntax)];
+    let mut values = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(term) => {
+                if let Some(inner) = parenthesized_inner(term)? {
+                    tasks.push(Task::Visit(inner));
+                    continue;
+                }
+                let Syntax::Node { kind, .. } = term else {
+                    values.push(elaborate_atom(term, locals, allow_string)?);
+                    continue;
+                };
+                if kind != &parser_kind(&["Term", "app"]) {
+                    values.push(elaborate_atom(term, locals, allow_string)?);
+                    continue;
+                }
+                let parts = expect_node(
+                    term,
+                    &parser_kind(&["Term", "app"]),
+                    2,
+                    "Lean.Parser.Term.app",
+                )?;
+                let Syntax::Ident { val: function, .. } = &parts[0] else {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "application function identifier",
+                    });
+                };
+                if function.is_anonymous() {
+                    return Err(NatDefinitionElabError::AnonymousReferenceName);
+                }
+                let arguments = expect_null_args(&parts[1], "nonempty application argument array")?;
+                if arguments.is_empty() {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "nonempty application argument array",
+                    });
+                }
+                tasks.push(Task::Apply(arguments.len()));
+                for argument in arguments.iter().rev() {
+                    tasks.push(Task::Visit(argument));
+                }
+                tasks.push(Task::Visit(&parts[0]));
+            }
+            Task::Apply(argument_count) => {
+                let Some(start) = values.len().checked_sub(argument_count.saturating_add(1)) else {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "complete application operands",
+                    });
+                };
+                let operands = values.split_off(start);
+                let mut operands = operands.into_iter();
+                let mut expression =
+                    operands
+                        .next()
+                        .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                            expected: "application function",
+                        })?;
+                for argument in operands {
+                    expression = Expr::app(expression, argument);
+                }
+                values.push(expression);
+            }
+        }
+    }
+    let [expression] = values.as_slice() else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "one complete scalar term",
+        });
+    };
+    Ok(expression.clone())
+}
+
 fn elaborate_term(
     syntax: &Syntax,
     locals: &[(Name, Expr)],
@@ -646,49 +768,12 @@ fn elaborate_term(
     allow_string: bool,
     environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
-    let Syntax::Node { kind, args, .. } = syntax else {
-        return elaborate_atom(syntax, locals, allow_string);
-    };
-    if kind == &parser_kind(&["Term", "let"]) {
+    if let Syntax::Node { kind, args, .. } = syntax
+        && kind == &parser_kind(&["Term", "let"])
+    {
         return elaborate_let(args, locals, result_type, allow_string, environment);
     }
-    if kind != &parser_kind(&["Term", "app"]) {
-        return elaborate_atom(syntax, locals, allow_string);
-    }
-    if args.len() != 2 {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "Lean.Parser.Term.app",
-        });
-    }
-    let Syntax::Ident { val: function, .. } = &args[0] else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "application function identifier",
-        });
-    };
-    if function.is_anonymous() {
-        return Err(NatDefinitionElabError::AnonymousReferenceName);
-    }
-    let Syntax::Node {
-        kind: argument_kind,
-        args: arguments,
-        ..
-    } = &args[1]
-    else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "nonempty application argument array",
-        });
-    };
-    if argument_kind != &Name::str(Name::anonymous(), "null") || arguments.is_empty() {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "nonempty application argument array",
-        });
-    }
-
-    let mut expression = elaborate_nat_reference(function, locals)?;
-    for argument in arguments {
-        expression = Expr::app(expression, elaborate_atom(argument, locals, allow_string)?);
-    }
-    Ok(expression)
+    elaborate_nonlet_term(syntax, locals, allow_string)
 }
 
 fn nat_const() -> Expr {
@@ -1208,12 +1293,45 @@ mod tests {
                 expected: "Lean.Parser.Term.app"
             })
         ));
+        assert!(matches!(
+            elaborate_term(
+                &Syntax::node(parser_kind(&["Term", "paren"]), Vec::new()),
+                &[],
+                &Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+                false,
+                None,
+            ),
+            Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "Lean.Parser.Term.paren"
+            })
+        ));
         for malformed in ["", "_1", "1_", "0x", "0x1_", "0b2"] {
             assert_eq!(
                 decode_natural(malformed),
                 Err(NatDefinitionElabError::InvalidNaturalLiteral)
             );
         }
+    }
+
+    #[test]
+    fn deeply_parenthesized_term_elaborates_without_host_stack_recursion() {
+        const DEPTH: usize = 20_000;
+        let mut source = b"def answer := ".to_vec();
+        source.extend(std::iter::repeat_n(b'(', DEPTH));
+        source.extend_from_slice(b"42");
+        source.extend(std::iter::repeat_n(b')', DEPTH));
+        let parsed = parse_nat_definition(&source).expect("the bounded term parser is iterative");
+        let declaration = elaborate_nat_definition(parsed.syntax())
+            .expect("parenthesis elaboration uses an explicit work stack");
+        let Declaration::Defn(definition) = declaration else {
+            panic!("the nested source must elaborate to a definition");
+        };
+        assert!(matches!(
+            definition.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(value)
+            } if value == &fln_core::expr::NatLit::from_u64(42)
+        ));
     }
 
     #[test]

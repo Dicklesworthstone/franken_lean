@@ -41,12 +41,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let collision = root.join("Collision.flbc");
     std::fs::write(
         &source,
-        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub incremented 1\n",
+        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub (Nat.add incremented 0) 1\n",
     )
     .expect("write supported dependent source batch");
     std::fs::write(
         &string_source,
-        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := String.append prefix \"β\"; output\n"
+        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := String.append (copy prefix) \"β\"; output\n"
             .as_bytes(),
     )
     .expect("write supported String source");
@@ -277,7 +277,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     let source = root.join("Answer.lean");
     std::fs::write(
         &source,
-        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub incremented 1\n",
+        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub (Nat.add incremented 0) 1\n",
     )
     .expect("write supported dependent source batch");
 
