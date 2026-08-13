@@ -1206,6 +1206,21 @@ mod nat_definition_tests {
                                 [Syntax::Atom { val: colon, .. }, Syntax::Ident { val: ty, .. }]
                                 if colon == ":" && ty.to_display_string() == "String"))
         ));
+
+        assert!(matches!(
+            parse_definition(b"def bad := let value : Bool := 1; value"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::ScalarType,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def bad := let value : String := 1; value"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalType,
+                ..
+            })
+        ));
     }
 
     #[test]
