@@ -2137,9 +2137,9 @@ impl Engine {
     /// It accepts the compiler's substantially broader implemented closed-
     /// expression subset rather than the seed parser's literal-or-identifier
     /// Nat-term subset.
-    /// References to closed, universe-free first-order `Nat -> ... -> Nat`
-    /// definitions are compiled from the exact types and bodies already
-    /// published in the base environment. This is the first
+    /// References to closed, universe-free first-order definitions over exact
+    /// `Nat` and `String` parameter/result types are compiled from the types and
+    /// bodies already published in the base environment. This is the first
     /// environment-to-compiler catalog bridge; other runtime signatures remain
     /// explicit compiler refusals. Non-definition declarations are explicit
     /// refusals because they have no executable body.
@@ -2194,9 +2194,9 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
 
-        let functions = executable_nat_dependencies(&self.environment, &expression, limits.ingress)
+        let functions = executable_dependencies(&self.environment, &expression, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
-        let local_lambda = executable_nat_lambda(&admission.declaration, limits.ingress)
+        let local_lambda = executable_lambda(&admission.declaration, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
         let lambdas = local_lambda.as_slice();
         let ingress = fln_comp::ingress::lower_closed_expr_with_lambdas(
@@ -2640,16 +2640,18 @@ fn review_with_independent_checker(
 
 /// Derive the compiler catalog from declarations that already passed K1.
 ///
-/// This deliberately supports one exact family of erased signatures. A raw
+/// This deliberately supports one exact family of erased scalar/owned
+/// signatures. A raw
 /// caller-supplied [`FunctionBinding`] would be able to replace a checked
 /// constant's body or lie about its runtime type; neither is an acceptable
 /// embeddable-engine boundary.
-fn executable_nat_dependencies(
+fn executable_dependencies(
     environment: &Environment,
     source: &Expr,
     limits: IngressLimits,
 ) -> Result<Vec<FunctionBinding>, IngressError> {
     let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
     let mut pending = BTreeSet::new();
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
@@ -2664,8 +2666,13 @@ fn executable_nat_dependencies(
         let Some(ConstantInfo::Defn(definition)) = environment.find(&name) else {
             continue;
         };
-        let Some((arity, body)) =
-            executable_nat_signature(definition, &nat_type, &mut visited_nodes, limits)?
+        let Some(signature) = executable_signature(
+            definition,
+            &nat_type,
+            &string_type,
+            &mut visited_nodes,
+            limits,
+        )?
         else {
             continue;
         };
@@ -2683,25 +2690,25 @@ fn executable_nat_dependencies(
                 resource: IngressResource::ProgramTables,
                 requested: observed,
             })?;
-        let (parameters, parameter_ownership) = nat_runtime_parameters(arity)?;
-        collect_executable_constants(body, &mut pending, &mut visited_nodes, limits)?;
+        let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
+        collect_executable_constants(signature.body, &mut pending, &mut visited_nodes, limits)?;
         functions.push(FunctionBinding {
             name,
             universe_arity: 0,
-            parameters,
+            parameters: signature.parameters,
             parameter_ownership,
-            result: ValueType::Nat,
-            result_ownership: CallableResultOwnership::Scalar,
-            body: body.clone(),
+            result: signature.result,
+            result_ownership: signature.result_ownership,
+            body: signature.body.clone(),
         });
     }
     Ok(functions)
 }
 
 /// Describe the definition currently being published when its full value is a
-/// supported first-order Nat lambda. This lets the same compiler path execute
-/// the function value itself and expose the checked successor snapshot.
-fn executable_nat_lambda(
+/// supported first-order runtime lambda. This lets the same compiler path
+/// execute the function value itself and expose the checked successor snapshot.
+fn executable_lambda(
     declaration: &Declaration,
     limits: IngressLimits,
 ) -> Result<Option<LambdaBinding>, IngressError> {
@@ -2709,37 +2716,35 @@ fn executable_nat_lambda(
         return Ok(None);
     };
     let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+    let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
     let mut visited_nodes = 0usize;
-    let Some((arity, _)) =
-        executable_nat_signature(definition, &nat_type, &mut visited_nodes, limits)?
+    let Some(signature) = executable_signature(
+        definition,
+        &nat_type,
+        &string_type,
+        &mut visited_nodes,
+        limits,
+    )?
     else {
         return Ok(None);
     };
-    if arity == 0 {
+    if signature.parameters.is_empty() {
         return Ok(None);
     }
-    let (parameters, parameter_ownership) = nat_runtime_parameters(arity)?;
+    let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
     Ok(Some(LambdaBinding {
         lambda: definition.value.clone(),
-        parameters,
+        parameters: signature.parameters,
         parameter_ownership,
-        result: ValueType::Nat,
-        result_ownership: CallableResultOwnership::Scalar,
+        result: signature.result,
+        result_ownership: signature.result_ownership,
         recursion: LambdaRecursion::NonRecursive,
     }))
 }
 
-fn nat_runtime_parameters(
+fn borrowed_runtime_parameters(
     arity: usize,
-) -> Result<(Vec<ValueType>, Vec<fln_comp::flbc::ArgumentOwnership>), IngressError> {
-    let mut parameters = Vec::new();
-    parameters
-        .try_reserve_exact(arity)
-        .map_err(|_| IngressError::AllocationFailure {
-            resource: IngressResource::ProgramTables,
-            requested: arity,
-        })?;
-    parameters.resize(arity, ValueType::Nat);
+) -> Result<Vec<fln_comp::flbc::ArgumentOwnership>, IngressError> {
     let mut parameter_ownership = Vec::new();
     parameter_ownership
         .try_reserve_exact(arity)
@@ -2748,22 +2753,30 @@ fn nat_runtime_parameters(
             requested: arity,
         })?;
     parameter_ownership.resize(arity, fln_comp::flbc::ArgumentOwnership::Borrowed);
-    Ok((parameters, parameter_ownership))
+    Ok(parameter_ownership)
 }
 
-/// Bind one checked definition to the compiler's exact first-order Nat ABI.
+struct ExecutableSignature<'a> {
+    parameters: Vec<ValueType>,
+    result: ValueType,
+    result_ownership: CallableResultOwnership,
+    body: &'a Expr,
+}
+
+/// Bind one checked definition to the compiler's exact first-order runtime ABI.
 ///
 /// Pi binders and lambda binders must match structurally and in count. K1 has
 /// already proved the declaration well typed, but the runtime bridge accepts a
 /// deliberately narrower representation than definitional equality so it
 /// never invents an erasure rule. The returned body has its top-level lambdas
 /// removed, as required by [`FunctionBinding`].
-fn executable_nat_signature<'a>(
+fn executable_signature<'a>(
     definition: &'a DefinitionVal,
     nat_type: &Expr,
+    string_type: &Expr,
     visited_nodes: &mut usize,
     limits: IngressLimits,
-) -> Result<Option<(usize, &'a Expr)>, IngressError> {
+) -> Result<Option<ExecutableSignature<'a>>, IngressError> {
     use fln_core::expr::ExprNode;
 
     if !definition.base.level_params.is_empty() {
@@ -2772,7 +2785,7 @@ fn executable_nat_signature<'a>(
 
     let mut declared_type = &definition.base.type_;
     let mut body = &definition.value;
-    let mut arity = 0usize;
+    let mut parameters = Vec::new();
     loop {
         charge_catalog_node(visited_nodes, limits)?;
         match declared_type.node() {
@@ -2780,7 +2793,12 @@ fn executable_nat_signature<'a>(
                 binder_type,
                 body: result_type,
                 ..
-            } if binder_type == nat_type => {
+            } => {
+                let Some((parameter, _)) =
+                    executable_value_type(binder_type, nat_type, string_type)
+                else {
+                    break;
+                };
                 charge_catalog_node(visited_nodes, limits)?;
                 let ExprNode::Lam {
                     binder_type: value_binder_type,
@@ -2790,17 +2808,24 @@ fn executable_nat_signature<'a>(
                 else {
                     return Ok(None);
                 };
-                if value_binder_type != nat_type {
+                if value_binder_type != binder_type {
                     return Ok(None);
                 }
-                arity = arity.saturating_add(1);
-                if arity > limits.max_context_depth {
+                let observed = parameters.len().saturating_add(1);
+                if observed > limits.max_context_depth {
                     return Err(IngressError::ResourceLimit {
                         resource: IngressResource::ContextDepth,
                         limit: limits.max_context_depth,
-                        observed: arity,
+                        observed,
                     });
                 }
+                parameters
+                    .try_reserve(1)
+                    .map_err(|_| IngressError::AllocationFailure {
+                        resource: IngressResource::ProgramTables,
+                        requested: observed,
+                    })?;
+                parameters.push(parameter);
                 declared_type = result_type;
                 body = value_body;
             }
@@ -2808,7 +2833,31 @@ fn executable_nat_signature<'a>(
         }
     }
 
-    Ok((declared_type == nat_type).then_some((arity, body)))
+    let Some((result, result_ownership)) =
+        executable_value_type(declared_type, nat_type, string_type)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ExecutableSignature {
+        parameters,
+        result,
+        result_ownership,
+        body,
+    }))
+}
+
+fn executable_value_type(
+    source: &Expr,
+    nat_type: &Expr,
+    string_type: &Expr,
+) -> Option<(ValueType, CallableResultOwnership)> {
+    if source == nat_type {
+        Some((ValueType::Nat, CallableResultOwnership::Scalar))
+    } else if source == string_type {
+        Some((ValueType::String, CallableResultOwnership::Owned))
+    } else {
+        None
+    }
 }
 
 fn charge_catalog_node(
@@ -3591,6 +3640,20 @@ mod tests {
             .expect("the bounded Nat seed council answers completely")
     }
 
+    fn engine_with_string_type() -> Engine {
+        let seeded = seeded_engine();
+        seeded
+            .admit_declaration(
+                typed_axiom("String", Expr::sort(Level::one())),
+                &KVMap::new(),
+                EngineAdmissionLimits::new(test_budget()),
+            )
+            .expect("the String type stand-in reaches both council seats")
+            .into_complete()
+            .expect("the bounded String type admission answers completely")
+            .engine
+    }
+
     fn bv_identity_type() -> Expr {
         Expr::forall_e(
             Name::from_components(["p"]),
@@ -4241,13 +4304,21 @@ mod tests {
         Expr::const_(Name::str(Name::anonymous(), "Nat"), Vec::new())
     }
 
+    fn string_type() -> Expr {
+        Expr::const_(Name::str(Name::anonymous(), "String"), Vec::new())
+    }
+
     fn definition(name: &str, value: Expr) -> Declaration {
+        typed_definition(name, nat_type(), value)
+    }
+
+    fn typed_definition(name: &str, type_: Expr, value: Expr) -> Declaration {
         let name = Name::from_components([name]);
         Declaration::Defn(DefinitionVal {
             base: ConstantVal {
                 name: name.clone(),
                 level_params: Vec::new(),
-                type_: nat_type(),
+                type_,
             },
             value,
             hints: ReducibilityHints::Regular(1),
@@ -4333,6 +4404,14 @@ mod tests {
     }
 
     fn nat_identity_definition(name: &str) -> Declaration {
+        identity_definition(name, nat_type())
+    }
+
+    fn string_identity_definition(name: &str) -> Declaration {
+        identity_definition(name, string_type())
+    }
+
+    fn identity_definition(name: &str, parameter_type: Expr) -> Declaration {
         let name = Name::from_components([name]);
         Declaration::Defn(DefinitionVal {
             base: ConstantVal {
@@ -4340,15 +4419,15 @@ mod tests {
                 level_params: Vec::new(),
                 type_: Expr::forall_e(
                     Name::from_components(["value"]),
-                    nat_type(),
-                    nat_type(),
+                    parameter_type.clone(),
+                    parameter_type.clone(),
                     BinderInfo::Default,
                 ),
             },
             value: Expr::lam(
                 Name::from_components(["value"]),
-                nat_type(),
-                Expr::bvar(0).expect("one Nat parameter fits the term covenant"),
+                parameter_type,
+                Expr::bvar(0).expect("one first-order parameter fits the term covenant"),
                 BinderInfo::Default,
             ),
             hints: ReducibilityHints::Regular(1),
@@ -5481,6 +5560,103 @@ mod tests {
         assert_eq!(value_kind(&returned.value), ValueKind::Scalar);
         assert_eq!(returned.value.unbox(), 42);
         assert_eq!(applied.engine.environment().len(), 3);
+    }
+
+    #[test]
+    fn checked_string_functions_publish_execute_and_recover_after_a_bounded_refusal() {
+        let engine = engine_with_string_type();
+        let options = KVMap::new();
+        let identity = string_identity_definition("stringIdentity");
+        let identity_name = Name::from_components(["stringIdentity"]);
+        let base_root = engine.logical_root(&options);
+
+        let mut constrained = test_limits();
+        constrained.ingress.max_context_depth = 0;
+        let error = engine
+            .execute_definition(identity.clone(), &options, constrained)
+            .expect_err("the explicit zero-depth bound refuses one String parameter");
+        assert_eq!(
+            error,
+            EngineExecutionError::Ingress(IngressError::ResourceLimit {
+                resource: IngressResource::ContextDepth,
+                limit: 0,
+                observed: 1,
+            })
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(!engine.environment().contains(&identity_name));
+
+        let published = engine
+            .execute_definition(identity, &options, test_limits())
+            .expect("the checked String function is compiled as a local closure");
+        let Outcome::Complete(published) = published else {
+            panic!("the small checked String function must answer completely");
+        };
+        assert!(published.engine.environment().contains(&identity_name));
+
+        let applied = published
+            .engine
+            .execute_definition(
+                typed_definition(
+                    "message",
+                    string_type(),
+                    Expr::app(
+                        Expr::const_(identity_name, Vec::new()),
+                        Expr::lit(Literal::Str("facade-catalog".to_owned())),
+                    ),
+                ),
+                &options,
+                test_limits(),
+            )
+            .expect("the compiler derives the owned String ABI from the checked environment");
+        let Outcome::Complete(applied) = applied else {
+            panic!("the checked String function application must answer completely");
+        };
+        let VmExit::Returned(returned) = applied.exit else {
+            panic!("the checked String function application must return normally");
+        };
+        assert_eq!(value_kind(&returned.value), ValueKind::String);
+        let (size, _, _, bytes) = returned.value.string_view();
+        assert!(size > 0);
+        assert_eq!(bytes.get(size - 1), Some(&0));
+        assert_eq!(
+            std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
+            "facade-catalog"
+        );
+        assert_eq!(applied.engine.environment().len(), 4);
+    }
+
+    #[test]
+    fn checked_runtime_catalog_refuses_unmapped_types_without_publishing() {
+        let engine = engine_with_string_type();
+        let options = KVMap::new();
+        let token_type = Expr::const_(Name::from_components(["Token"]), Vec::new());
+        let admitted = engine
+            .admit_declaration(
+                typed_axiom("Token", Expr::sort(Level::one())),
+                &options,
+                EngineAdmissionLimits::new(test_budget()),
+            )
+            .expect("the opaque test type reaches both council seats")
+            .into_complete()
+            .expect("the bounded opaque type admission answers completely");
+        let base_root = admitted.engine.logical_root(&options);
+        let name = Name::from_components(["tokenIdentity"]);
+
+        let error = admitted
+            .engine
+            .execute_definition(
+                identity_definition("tokenIdentity", token_type),
+                &options,
+                test_limits(),
+            )
+            .expect_err("an unmapped source type has no invented runtime ABI");
+        assert!(matches!(
+            error,
+            EngineExecutionError::Ingress(IngressError::UnknownLambda { .. })
+        ));
+        assert_eq!(admitted.engine.logical_root(&options), base_root);
+        assert!(!admitted.engine.environment().contains(&name));
     }
 
     #[test]
