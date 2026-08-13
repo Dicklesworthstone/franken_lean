@@ -509,6 +509,13 @@ enum IntrinsicImplementation {
     NatAdd,
     NatSub,
     NatMul,
+    NatDiv,
+    NatGcd,
+    NatLand,
+    NatLor,
+    NatMod,
+    NatPred,
+    NatXor,
     StringAppend,
     StringLength,
     StringUtf8ByteSize,
@@ -543,6 +550,13 @@ impl IntrinsicImplementation {
             "extern:Nat.add" => Self::NatAdd,
             "extern:Nat.sub" => Self::NatSub,
             "extern:Nat.mul" => Self::NatMul,
+            "extern:Nat.div" => Self::NatDiv,
+            "extern:Nat.gcd" => Self::NatGcd,
+            "extern:Nat.land" => Self::NatLand,
+            "extern:Nat.lor" => Self::NatLor,
+            "extern:Nat.mod" => Self::NatMod,
+            "extern:Nat.pred" => Self::NatPred,
+            "extern:Nat.xor" => Self::NatXor,
             "extern:String.append" => Self::StringAppend,
             "extern:String.length" => Self::StringLength,
             "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
@@ -2853,6 +2867,58 @@ fn invoke_intrinsic(
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(product)))
         }
+        IntrinsicImplementation::NatDiv => {
+            expect_arity(row, args, 2)?;
+            let dividend = nat_value(&args[0], "Nat.div", 0)?;
+            let divisor = nat_value(&args[1], "Nat.div", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(if divisor == 0 {
+                0
+            } else {
+                dividend / divisor
+            })))
+        }
+        IntrinsicImplementation::NatGcd => {
+            expect_arity(row, args, 2)?;
+            let mut left = nat_value(&args[0], "Nat.gcd", 0)?;
+            let mut right = nat_value(&args[1], "Nat.gcd", 1)?;
+            while right != 0 {
+                (left, right) = (right, left % right);
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(left)))
+        }
+        IntrinsicImplementation::NatLand => {
+            expect_arity(row, args, 2)?;
+            let left = nat_value(&args[0], "Nat.land", 0)?;
+            let right = nat_value(&args[1], "Nat.land", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(left & right)))
+        }
+        IntrinsicImplementation::NatLor => {
+            expect_arity(row, args, 2)?;
+            let left = nat_value(&args[0], "Nat.lor", 0)?;
+            let right = nat_value(&args[1], "Nat.lor", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(left | right)))
+        }
+        IntrinsicImplementation::NatMod => {
+            expect_arity(row, args, 2)?;
+            let dividend = nat_value(&args[0], "Nat.mod", 0)?;
+            let divisor = nat_value(&args[1], "Nat.mod", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(if divisor == 0 {
+                dividend
+            } else {
+                dividend % divisor
+            })))
+        }
+        IntrinsicImplementation::NatPred => {
+            expect_arity(row, args, 1)?;
+            let value = nat_value(&args[0], "Nat.pred", 0)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(value.saturating_sub(1))))
+        }
+        IntrinsicImplementation::NatXor => {
+            expect_arity(row, args, 2)?;
+            let left = nat_value(&args[0], "Nat.xor", 0)?;
+            let right = nat_value(&args[1], "Nat.xor", 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(left ^ right)))
+        }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
             let mut lhs = string_value(&args[0], "String.append", 0)?;
@@ -3102,6 +3168,13 @@ fn managerless_task_application(
         IntrinsicImplementation::NatAdd
         | IntrinsicImplementation::NatSub
         | IntrinsicImplementation::NatMul
+        | IntrinsicImplementation::NatDiv
+        | IntrinsicImplementation::NatGcd
+        | IntrinsicImplementation::NatLand
+        | IntrinsicImplementation::NatLor
+        | IntrinsicImplementation::NatMod
+        | IntrinsicImplementation::NatPred
+        | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
         | IntrinsicImplementation::StringLength
         | IntrinsicImplementation::StringUtf8ByteSize
