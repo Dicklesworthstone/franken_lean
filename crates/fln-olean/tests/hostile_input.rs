@@ -296,6 +296,39 @@ fn a_truncation_with_a_huge_wanted_saturates_the_diagnostic() {
     }
 }
 
+#[test]
+fn a_string_whose_m_length_is_not_the_scalar_count_is_refused() {
+    let bytes = pilot();
+    {
+        let view = OleanView::parse(&bytes).expect("pilot parses");
+        view.walk(WalkBudget::default())
+            .expect("the unmutated pilot walks");
+    }
+    let objects = collect_objects(&bytes);
+    let string = objects
+        .iter()
+        .find(|obj| obj.tag == abi::TAG_STRING)
+        .expect("the pilot carries a string");
+    let stored = get_u64(&bytes, string.off + 24);
+    let mut hostile = bytes.clone();
+    put_u64(&mut hostile, string.off + 24, stored.wrapping_add(1));
+
+    let view = OleanView::parse(&hostile).expect("hostile parses structurally");
+    let error = view
+        .walk(WalkBudget::default())
+        .expect_err("a drifted m_length must refuse");
+    assert!(
+        matches!(
+            error,
+            RegionError::StringIntegrity {
+                reason: "m_length is not the UTF-8 scalar count",
+                ..
+            }
+        ),
+        "expected m_length integrity, got {error:?}"
+    );
+}
+
 // --- finding 5: the walk's scalar-array law is the shared engine's law --------
 
 #[test]
