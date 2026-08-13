@@ -3004,7 +3004,7 @@ fn executable_signature(
                     // Local-closure execution must not eta: it binds the
                     // source lambda spine, whose binder count would then
                     // disagree with the expanded signature.
-                    if eta_expand && !body.has_loose_bvars() {
+                    if eta_expand {
                         return eta_expand_signature(
                             body,
                             declared_type,
@@ -3111,7 +3111,18 @@ fn eta_expand_signature(
         return Ok(None);
     };
 
-    let mut eta = function.clone();
+    let extra_u32 = u32::try_from(extra).map_err(|_| IngressError::ResourceLimit {
+        resource: IngressResource::ContextDepth,
+        limit: limits.max_context_depth,
+        observed: extra,
+    })?;
+    let mut eta = function
+        .lift_loose(0, extra_u32)
+        .map_err(|_| IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: limits.max_context_depth,
+            observed: extra,
+        })?;
     for index in (0..extra).rev() {
         charge_catalog_node(visited_nodes, limits)?;
         let index = u32::try_from(index).map_err(|_| IngressError::ResourceLimit {
@@ -6123,6 +6134,34 @@ mod tests {
         assert_eq!(
             closed_vm_value(&completed.executions[2].exit),
             Ok(Some(ClosedVmValue::String("kept".to_owned())))
+        );
+    }
+
+    #[test]
+    fn partial_application_of_a_checked_function_eta_lifts_used_binders() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def first (x y : Nat) := x",
+                    b"def apply (n : Nat) := first n",
+                    b"def answer := apply 17 2",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("fun n => first n must compile as fun n y => first n y");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the partial-application batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 3);
+        assert_eq!(
+            closed_vm_value(&completed.executions[2].exit),
+            Ok(Some(ClosedVmValue::Scalar(17)))
         );
     }
 
