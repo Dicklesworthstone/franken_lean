@@ -2841,6 +2841,7 @@ fn executable_dependencies(
 ) -> Result<ExecutableCatalog, IngressError> {
     let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
     let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
+    let bool_type = Expr::const_(Name::from_components(["Bool"]), Vec::new());
     let mut pending = BTreeSet::new();
     let mut resolved = BTreeSet::new();
     let mut visited_nodes = 0usize;
@@ -2870,6 +2871,7 @@ fn executable_dependencies(
             definition,
             &nat_type,
             &string_type,
+            &bool_type,
             &mut visited_nodes,
             limits,
             true,
@@ -2939,6 +2941,11 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             Some("Nat.add"),
         ),
         "Nat.pred" => (vec![ValueType::Nat], ValueType::Nat, Some("Nat.pred")),
+        "Nat.beq" | "Nat.ble" => (
+            vec![ValueType::Nat, ValueType::Nat],
+            ValueType::Bool,
+            Some("Nat.beq"),
+        ),
         "String.append" => (
             vec![ValueType::String, ValueType::String],
             ValueType::String,
@@ -2948,6 +2955,11 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             vec![ValueType::String],
             ValueType::Nat,
             Some("String.length"),
+        ),
+        "String.decEq" => (
+            vec![ValueType::String, ValueType::String],
+            ValueType::Bool,
+            None,
         ),
         _ => return None,
     };
@@ -3009,11 +3021,13 @@ fn executable_lambda(
     };
     let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
     let string_type = Expr::const_(Name::from_components(["String"]), Vec::new());
+    let bool_type = Expr::const_(Name::from_components(["Bool"]), Vec::new());
     let mut visited_nodes = 0usize;
     let Some(signature) = executable_signature(
         definition,
         &nat_type,
         &string_type,
+        &bool_type,
         &mut visited_nodes,
         limits,
         false,
@@ -3076,6 +3090,7 @@ fn executable_signature(
     definition: &DefinitionVal,
     nat_type: &Expr,
     string_type: &Expr,
+    bool_type: &Expr,
     visited_nodes: &mut usize,
     limits: IngressLimits,
     eta_expand: bool,
@@ -3098,7 +3113,7 @@ fn executable_signature(
                 ..
             } => {
                 let Some((parameter, _)) =
-                    executable_value_type(binder_type, nat_type, string_type)
+                    executable_value_type(binder_type, nat_type, string_type, bool_type)
                 else {
                     break;
                 };
@@ -3123,6 +3138,7 @@ fn executable_signature(
                             parameters,
                             nat_type,
                             string_type,
+                            bool_type,
                             visited_nodes,
                             limits,
                         );
@@ -3155,7 +3171,7 @@ fn executable_signature(
     }
 
     let Some((result, result_ownership)) =
-        executable_value_type(declared_type, nat_type, string_type)
+        executable_value_type(declared_type, nat_type, string_type, bool_type)
     else {
         return Ok(None);
     };
@@ -3176,6 +3192,7 @@ fn eta_expand_signature(
     mut parameters: Vec<ValueType>,
     nat_type: &Expr,
     string_type: &Expr,
+    bool_type: &Expr,
     visited_nodes: &mut usize,
     limits: IngressLimits,
 ) -> Result<Option<ExecutableSignature>, IngressError> {
@@ -3194,7 +3211,9 @@ fn eta_expand_signature(
         if body.has_loose_bvars() {
             return Ok(None);
         }
-        let Some((parameter, _)) = executable_value_type(binder_type, nat_type, string_type) else {
+        let Some((parameter, _)) =
+            executable_value_type(binder_type, nat_type, string_type, bool_type)
+        else {
             return Ok(None);
         };
         extra = extra.saturating_add(1);
@@ -3218,7 +3237,8 @@ fn eta_expand_signature(
     if extra == 0 {
         return Ok(None);
     }
-    let Some((result, result_ownership)) = executable_value_type(remaining, nat_type, string_type)
+    let Some((result, result_ownership)) =
+        executable_value_type(remaining, nat_type, string_type, bool_type)
     else {
         return Ok(None);
     };
@@ -3261,11 +3281,14 @@ fn executable_value_type(
     source: &Expr,
     nat_type: &Expr,
     string_type: &Expr,
+    bool_type: &Expr,
 ) -> Option<(ValueType, CallableResultOwnership)> {
     if source == nat_type {
         Some((ValueType::Nat, CallableResultOwnership::Scalar))
     } else if source == string_type {
         Some((ValueType::String, CallableResultOwnership::Owned))
+    } else if source == bool_type {
+        Some((ValueType::Bool, CallableResultOwnership::Scalar))
     } else {
         None
     }
@@ -6077,7 +6100,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 15);
+        assert_eq!(engine.environment().len(), 19);
         assert!(
             engine
                 .environment()
@@ -6087,6 +6110,11 @@ mod tests {
             engine
                 .environment()
                 .contains(&Name::from_components(["String"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["Bool"]))
         );
         assert!(
             engine
@@ -6126,6 +6154,19 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["String", "utf8ByteSize"]))
         );
+        for operation in ["beq", "ble"] {
+            assert!(
+                engine
+                    .environment()
+                    .contains(&Name::from_components(["Nat", operation])),
+                "source seed must contain Nat.{operation}"
+            );
+        }
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["String", "decEq"]))
+        );
 
         let completed = engine
             .execute_source_definitions(
@@ -6151,7 +6192,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 17);
+        assert_eq!(completed.engine.environment().len(), 21);
     }
 
     #[test]
@@ -6486,6 +6527,127 @@ mod tests {
                     matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
                 })
             }));
+        }
+    }
+
+    #[test]
+    fn checked_bool_comparison_rows_reach_golem_as_scalars() {
+        let options = KVMap::new();
+        let unseeded = engine_with_string_type();
+        let base_root = unseeded.logical_root(&options);
+        let missing = unseeded
+            .execute_source_definition(b"def answer := Nat.beq 42 42", &options, test_limits())
+            .expect_err("the scalar types alone must not invent Nat.beq authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(unseeded.logical_root(&options), base_root);
+        assert!(
+            !unseeded
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the Bool source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded Bool source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def natEq : Bool := Nat.beq 42 42",
+                    b"def natLe : Bool := Nat.ble 41 42",
+                    "def answer : Bool := String.decEq \"βeta\" \"βeta\"".as_bytes(),
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("checked Bool comparisons reach Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked Bool comparison batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 3);
+        for execution in &completed.executions {
+            assert_eq!(
+                closed_vm_value(&execution.exit),
+                Ok(Some(ClosedVmValue::Scalar(1)))
+            );
+        }
+
+        for (execution, expected) in completed
+            .executions
+            .iter()
+            .zip(["Nat.beq", "Nat.ble", "String.decEq"])
+        {
+            let executable = fln_comp::flbc::decode_canonical(
+                &execution.flbc_artifact,
+                CodecLimits::default(),
+            )
+            .expect("the exact executed Bool comparison artifact decodes canonically");
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the comparison row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn checked_definitions_named_bool_comparisons_remain_ordinary() {
+        let options = KVMap::new();
+        let engine = engine_with_string_type();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def Nat.beq (left right : Nat) : Nat := left",
+                    b"def Nat.ble (left right : Nat) : Nat := right",
+                    b"def String.decEq (left right : String) : String := left",
+                    b"def numeric := Nat.beq (Nat.ble 1 2) 3",
+                    b"def answer := String.decEq \"ordinary\" \"ignored\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("ordinary checked comparison names remain ordinary functions");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary comparison batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[3].exit),
+            Ok(Some(ClosedVmValue::Scalar(2)))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.executions[4].exit),
+            Ok(Some(ClosedVmValue::String("ordinary".to_owned())))
+        );
+
+        for execution in [&completed.executions[3], &completed.executions[4]] {
+            let executable = fln_comp::flbc::decode_canonical(
+                &execution.flbc_artifact,
+                CodecLimits::default(),
+            )
+            .expect("the exact ordinary comparison artifact decodes canonically");
+            for forbidden in ["Nat.beq", "Nat.ble", "String.decEq"] {
+                let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                    .iter()
+                    .find(|row| row.name == forbidden)
+                    .expect("the generated pin census contains the comparison row")
+                    .id;
+                assert!(executable.functions().iter().all(|function| {
+                    function.code.iter().all(|instruction| {
+                        !matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                    })
+                }));
+            }
         }
     }
 
