@@ -1,7 +1,7 @@
 //! Real-process producer-to-consumer evidence for the bounded FLBC product seam.
 //!
 //! This is deliberately narrower than D18: it proves supported Nat, checked
-//! `Nat.add`, and String sources reach the filesystem only after batch success
+//! checked Nat arithmetic and String sources reach the filesystem only after batch success
 //! and that their exact bytes are consumed by Golem. It does not claim a
 //! certified build, general Lean source support, closure-complete
 //! reproducibility, or thread-matrix determinism.
@@ -41,7 +41,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let collision = root.join("Collision.flbc");
     std::fs::write(
         &source,
-        b"def first : Nat := Nat.add 40 1\ndef answer : Nat := Nat.add first 1\n",
+        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub incremented 1\n",
     )
     .expect("write supported dependent source batch");
     std::fs::write(
@@ -277,7 +277,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     let source = root.join("Answer.lean");
     std::fs::write(
         &source,
-        b"def first : Nat := Nat.add 40 1\ndef answer : Nat := Nat.add first 1\n",
+        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub incremented 1\n",
     )
     .expect("write supported dependent source batch");
 

@@ -243,8 +243,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         other => return Err(std::io::Error::other(format!("seed: {other:?}")).into()),
     };
     let sources: [&[u8]; 2] = [
-        b"def first : Nat := Nat.add 40 1",
-        b"def answer : Nat := Nat.add first 1",
+        b"def product : Nat := Nat.mul 6 7",
+        b"def incremented : Nat := Nat.add product 1",
+        b"def answer : Nat := Nat.sub incremented 1",
     ];
     let completed = match engine.execute_source_definitions(
         &sources,
@@ -271,7 +272,7 @@ cargo run -p fln --example checked_source
 
 This is the currently implemented bounded `Nat`/`String` source facade: caller-
 supplied bytes, exact scalar signatures, optionally ascribed local lets, the
-checked `Nat.add` intrinsic, explicit budgets, immutable environment successors,
+checked `Nat.add`/`Nat.sub`/`Nat.mul` intrinsics, explicit budgets, immutable environment successors,
 K1 plus the independent checker, canonical FLBC, and Golem. The planned `Cx`
 builder, project/import elaboration, and receipt API from §17.2 do not exist yet;
 the example deliberately does not pretend otherwise.
