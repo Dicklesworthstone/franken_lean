@@ -6,11 +6,12 @@
 //! [`parse_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
 //! signatures followed by a matching literal, identifier, saturated
-//! identifier-headed application, or non-recursive local let chain over those
-//! forms. [`parse_nat_definition`] retains the original Nat-only authority. Both
-//! use the same source view, lexer, attachment, and canonical `Syntax` shape as
-//! the general engine. Being outside these seed grammars is a typed refusal, not
-//! a claim that the source is invalid Lean.
+//! identifier-headed application, or non-recursive local let chain with optional
+//! exact scalar type ascriptions over those forms. [`parse_nat_definition`]
+//! retains the original Nat-only authority. Both use the same source view,
+//! lexer, attachment, and canonical `Syntax` shape as the general engine. Being
+//! outside these seed grammars is a typed refusal, not a claim that the source is
+//! invalid Lean.
 
 #![forbid(unsafe_code)]
 
@@ -197,6 +198,7 @@ struct ExplicitBinderTokens {
 struct LetBindingTokens {
     keyword: usize,
     name: usize,
+    explicit_type: Option<(usize, usize)>,
     assignment: usize,
     value: std::ops::Range<usize>,
     separator: usize,
@@ -334,7 +336,7 @@ fn validate_flat_term(
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <natural-literal-or-identifier>
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <identifier> <natural-literal-or-identifier>+
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? :=
-///   (let <identifier> := <flat-term>;)+ <flat-term>
+///   (let <identifier> (: Nat)? := <flat-term>;)+ <flat-term>
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -508,7 +510,29 @@ fn parse_definition_with_grammar(
                 expected: NatDefinitionExpectation::LocalIdentifier,
             });
         }
-        let assignment = name + 1;
+        let mut declaration_cursor = name + 1;
+        let explicit_type = if matches!(
+            tokens.get(declaration_cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":"
+        ) {
+            let colon = declaration_cursor;
+            declaration_cursor += 1;
+            if !matches!(
+                tokens.get(declaration_cursor).map(|token| &token.kind),
+                Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
+            ) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(&view, &tokens, declaration_cursor),
+                    expected: grammar.type_expectation(),
+                });
+            }
+            let type_name = declaration_cursor;
+            declaration_cursor += 1;
+            Some((colon, type_name))
+        } else {
+            None
+        };
+        let assignment = declaration_cursor;
         if !matches!(
             tokens.get(assignment).map(|token| &token.kind),
             Some(TokenKind::Symbol(symbol)) if symbol == ":="
@@ -534,6 +558,7 @@ fn parse_definition_with_grammar(
         let_bindings.push(LetBindingTokens {
             keyword,
             name,
+            explicit_type,
             assignment,
             value: value_start..separator,
             separator,
@@ -632,6 +657,13 @@ fn parse_definition_with_grammar(
     let mut value = flat_term(body_start..tokens.len())?;
     for binding in let_bindings.into_iter().rev() {
         let local_value = flat_term(binding.value)?;
+        let explicit_type = match binding.explicit_type {
+            Some((colon, type_name)) => null_node(vec![Syntax::node(
+                parser_kind(&["Term", "typeSpec"]),
+                vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
+            )]),
+            None => null_node(Vec::new()),
+        };
         let local_id = Syntax::node(
             parser_kind(&["Term", "letId"]),
             vec![leaves.leaf(binding.name)?],
@@ -641,7 +673,7 @@ fn parse_definition_with_grammar(
             vec![
                 local_id,
                 null_node(Vec::new()),
-                null_node(Vec::new()),
+                explicit_type,
                 leaves.leaf(binding.assignment)?,
                 local_value,
             ],
@@ -1116,6 +1148,63 @@ mod nat_definition_tests {
         assert!(matches!(
             &let_parts[4],
             Syntax::Ident { val, .. } if val.to_display_string() == "x"
+        ));
+    }
+
+    #[test]
+    fn command_slice_preserves_the_pinned_explicit_let_type_shape() {
+        let source = b"def message := let value : String := \"typed\"; value";
+        let parsed = parse_definition(source).expect("an exact String let type is in the grammar");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+        assert_eq!(parsed.reconstruct_original(), source);
+
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        let Syntax::Node {
+            args: let_parts, ..
+        } = &value[1]
+        else {
+            panic!("the source let must be a term node");
+        };
+        let Syntax::Node {
+            args: let_declarations,
+            ..
+        } = &let_parts[2]
+        else {
+            panic!("the let declaration must use its Reference wrapper");
+        };
+        let [
+            Syntax::Node {
+                args: local_declaration,
+                ..
+            },
+        ] = &let_declarations[..]
+        else {
+            panic!("the let must contain one identifier declaration");
+        };
+        assert!(matches!(
+            &local_declaration[2],
+            Syntax::Node { kind, args, .. }
+                if kind == &state::null_kind()
+                    && matches!(&args[..],
+                        [Syntax::Node { kind, args, .. }]
+                        if kind == &parser_kind(&["Term", "typeSpec"])
+                            && matches!(&args[..],
+                                [Syntax::Atom { val: colon, .. }, Syntax::Ident { val: ty, .. }]
+                                if colon == ":" && ty.to_display_string() == "String"))
         ));
     }
 
