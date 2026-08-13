@@ -66,7 +66,7 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/land/lor/xor and String.append/length/utf8ByteSize calls,\n",
+    "`run` executes supported Nat/String/Bool definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
     "from each path in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
     "and Golem. The final path must produce a closed Nat or String result to report. The\n",
