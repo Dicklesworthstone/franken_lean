@@ -678,31 +678,15 @@ fn root_hex(root: fln::ContentRoot) -> String {
     rendered
 }
 
-fn closed_cli_value(exit: &fln::VmExit) -> Result<Option<SourceFinalValue>, &'static str> {
-    let fln::VmExit::Returned(returned) = exit else {
-        return Err("non-returning VM exit reached a completed-value renderer");
-    };
-    if returned.value.is_scalar() {
-        return Ok(Some(SourceFinalValue::Nat(returned.value.unbox())));
-    }
-    if fln::vm_value_kind(&returned.value) != fln::VmValueKind::String {
-        return Ok(None);
-    }
-
-    let (size, _, _, bytes) = returned.value.string_view();
-    let Some(content_size) = size.checked_sub(1) else {
-        return Err("returned String did not contain its required trailing NUL");
-    };
-    if size > bytes.len() {
-        return Err("returned String size exceeded its runtime buffer");
-    }
-    if bytes.get(content_size) != Some(&0) {
-        return Err("returned String did not contain its required trailing NUL");
-    }
-    let content = &bytes[..content_size];
-    let value =
-        std::str::from_utf8(content).map_err(|_| "returned String payload was not UTF-8")?;
-    Ok(Some(SourceFinalValue::String(value.to_owned())))
+fn closed_cli_value(
+    exit: &fln::VmExit,
+) -> Result<Option<SourceFinalValue>, fln::ClosedVmValueError> {
+    fln::closed_vm_value(exit).map(|value| {
+        value.map(|value| match value {
+            fln::ClosedVmValue::Scalar(value) => SourceFinalValue::Nat(value),
+            fln::ClosedVmValue::String(value) => SourceFinalValue::String(value),
+        })
+    })
 }
 
 fn render_flbc_success(
@@ -713,8 +697,8 @@ fn render_flbc_success(
 ) -> MultiplexerOutput {
     let value = match closed_cli_value(returned) {
         Ok(value) => value,
-        Err(detail) => {
-            return flbc_failure("internal-fault", detail, false, None, json, 4);
+        Err(error) => {
+            return flbc_failure("internal-fault", &error.to_string(), false, None, json, 4);
         }
     };
     let fln::VmExit::Returned(returned) = returned else {
@@ -2381,7 +2365,9 @@ where
                 1,
             );
         }
-        Err(detail) => return source_failure("internal-fault", detail, false, json, 4),
+        Err(error) => {
+            return source_failure("internal-fault", &error.to_string(), false, json, 4);
+        }
     };
     let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
         let toolchain_image = match toolchain_image {
