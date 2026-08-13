@@ -2932,8 +2932,8 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
 
     let row_name = name.to_display_string();
     let (argument_types, result, type_family_anchor) = match row_name.as_str() {
-        "Nat.add" | "Nat.sub" | "Nat.mul" | "Nat.div" | "Nat.gcd" | "Nat.land"
-        | "Nat.lor" | "Nat.mod" | "Nat.xor" => (
+        "Nat.add" | "Nat.sub" | "Nat.mul" | "Nat.div" | "Nat.gcd" | "Nat.land" | "Nat.lor"
+        | "Nat.mod" | "Nat.xor" => (
             vec![ValueType::Nat, ValueType::Nat],
             ValueType::Nat,
             Some("Nat.add"),
@@ -6077,7 +6077,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 8);
+        assert_eq!(engine.environment().len(), 15);
         assert!(
             engine
                 .environment()
@@ -6103,6 +6103,14 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["Nat", "mul"]))
         );
+        for operation in ["div", "gcd", "land", "lor", "mod", "pred", "xor"] {
+            assert!(
+                engine
+                    .environment()
+                    .contains(&Name::from_components(["Nat", operation])),
+                "source seed must contain Nat.{operation}"
+            );
+        }
         assert!(
             engine
                 .environment()
@@ -6143,7 +6151,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 10);
+        assert_eq!(completed.engine.environment().len(), 17);
     }
 
     #[test]
@@ -6242,6 +6250,83 @@ mod tests {
                     matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
                 })
             }));
+        }
+    }
+
+    #[test]
+    fn checked_bounded_nat_rows_reach_golem_with_reference_zero_semantics() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let base_root = nat_only.logical_root(&options);
+        let missing = nat_only
+            .execute_source_definition(b"def answer := Nat.pred 9", &options, test_limits())
+            .expect_err("the Nat type alone must not invent Nat.pred authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(nat_only.logical_root(&options), base_root);
+        assert!(
+            !nat_only
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(
+                b"def answer := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))",
+                &options,
+                test_limits(),
+            )
+            .expect("checked bounded Nat rows reach Golem through nested applications");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked bounded Nat definition must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::Scalar(47)))
+        );
+
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed bounded Nat artifact decodes canonically");
+        for expected in [
+            "Nat.pred", "Nat.div", "Nat.mod", "Nat.gcd", "Nat.land", "Nat.lor", "Nat.xor",
+        ] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the bounded Nat row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
+
+        for (source, expected) in [
+            (b"def divZero := Nat.div 5 0".as_slice(), 0),
+            (b"def modZero := Nat.mod 5 0".as_slice(), 5),
+            (b"def gcdZero := Nat.gcd 0 5".as_slice(), 5),
+        ] {
+            let completed = engine
+                .execute_source_definition(source, &options, test_limits())
+                .expect("the checked zero case reaches Golem");
+            let Outcome::Complete(completed) = completed else {
+                panic!("the checked zero case must answer completely");
+            };
+            assert_eq!(
+                closed_vm_value(&completed.exit),
+                Ok(Some(ClosedVmValue::Scalar(expected)))
+            );
         }
     }
 
@@ -6519,6 +6604,54 @@ mod tests {
                 .iter()
                 .find(|row| row.name == forbidden)
                 .expect("the generated pin census contains the arithmetic row")
+                .id;
+            assert!(executable.functions().iter().all(|function| {
+                function.code.iter().all(|instruction| {
+                    !matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn checked_definitions_named_bounded_nat_rows_remain_ordinary() {
+        let options = KVMap::new();
+        let engine = seeded_engine();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def Nat.pred (value : Nat) : Nat := value",
+                    b"def Nat.div (left right : Nat) : Nat := left",
+                    b"def Nat.mod (left right : Nat) : Nat := left",
+                    b"def Nat.gcd (left right : Nat) : Nat := left",
+                    b"def Nat.land (left right : Nat) : Nat := left",
+                    b"def Nat.lor (left right : Nat) : Nat := left",
+                    b"def Nat.xor (left right : Nat) : Nat := left",
+                    b"def answer := Nat.xor (Nat.lor (Nat.land (Nat.gcd (Nat.mod (Nat.div (Nat.pred 1) 2) 3) 4) 5) 6) 7",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("ordinary checked bounded Nat names remain ordinary functions");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary bounded Nat batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[7].exit),
+            Ok(Some(ClosedVmValue::Scalar(1)))
+        );
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[7].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed ordinary bounded Nat artifact decodes canonically");
+        for forbidden in [
+            "Nat.pred", "Nat.div", "Nat.mod", "Nat.gcd", "Nat.land", "Nat.lor", "Nat.xor",
+        ] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == forbidden)
+                .expect("the generated pin census contains the bounded Nat row")
                 .id;
             assert!(executable.functions().iter().all(|function| {
                 function.code.iter().all(|instruction| {
