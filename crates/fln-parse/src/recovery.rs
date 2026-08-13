@@ -6,8 +6,9 @@
 //! with the command that decides acceptance. This module therefore keeps two
 //! products with deliberately different types:
 //!
-//! * [`AuthoritativeCommandStream`] contains the result of
-//!   [`crate::parse_nat_definition`]. Recovery mode never changes this value.
+//! * [`AuthoritativeCommandStream`] contains the result of the exact command
+//!   parser the session was opened with ([`crate::parse_nat_definition`] or
+//!   [`crate::parse_definition`]). Recovery mode never changes this value.
 //! * [`SpeculativeBoundaryMap`] and [`RecoveredSyntax`] are editor-only
 //!   observations. They can drive diagnostics and completion, but expose no
 //!   conversion to [`crate::ParsedNatDefinition`].
@@ -18,7 +19,12 @@
 //! cannot become a declaration by being mistaken for a successful parse.
 
 use crate::registry::{EpochSyntax, GrammarEpoch, Registry};
-use crate::{NatDefinitionParseError, ParsedNatDefinition, parse_nat_definition};
+use crate::{
+    NatDefinitionParseError, ParsedDefinition, ParsedNatDefinition, parse_definition,
+    parse_nat_definition,
+};
+
+type CommandParser = fn(&[u8]) -> Result<ParsedDefinition, NatDefinitionParseError>;
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome, ResourceUsage};
@@ -699,6 +705,7 @@ fn make_boundaries(
     view: &SourceView,
     registry: &Registry,
     spec: &RecoverySpec,
+    parse: CommandParser,
 ) -> Vec<SpeculativeBoundary> {
     let mut starts = run
         .events
@@ -726,7 +733,7 @@ fn make_boundaries(
             // valid substring. A miss is a SourceText invariant break, not
             // invalid UTF-8; omitting the speculative slice is honest.
             let candidate = view.normalized().span_str(span)?;
-            let observation = match parse_nat_definition(candidate.as_bytes()) {
+            let observation = match parse(candidate.as_bytes()) {
                 Ok(_) => SpeculativeObservation::AcceptedCommandShape,
                 Err(error) => SpeculativeObservation::RejectedCommandShape(
                     error.rebase_from_normalized_slice(view, start),
@@ -752,6 +759,7 @@ fn invalid_utf8_session(
     registry: &Registry,
     spec: &RecoverySpec,
     mode: RecoveryMode,
+    parse: CommandParser,
 ) -> RecoverySession {
     RecoverySession {
         generation,
@@ -761,7 +769,7 @@ fn invalid_utf8_session(
         source_view: None,
         lexical_run: None,
         authoritative: AuthoritativeCommandStream {
-            result: parse_nat_definition(source),
+            result: parse(source),
             boundaries: Vec::new(),
         },
         speculative: None,
@@ -770,13 +778,64 @@ fn invalid_utf8_session(
     }
 }
 
-/// Run the first command parser with an optional, non-authoritative recovery
+/// Recover a Nat-only command. The authoritative verdict is exactly
+/// [`crate::parse_nat_definition`]; String and mixed Scalar source stay outside
+/// that grammar.
+pub fn parse_nat_definition_recovering(
+    source: &[u8],
+    generation: u64,
+    registry: &Registry,
+    spec: &RecoverySpec,
+    mode: RecoveryMode,
+    budget: RecoveryBudget,
+    cancellation: Option<&dyn Fn(RecoveryCheckpoint) -> bool>,
+) -> Outcome<Result<RecoverySession, RecoveryError>> {
+    parse_command_recovering(
+        parse_nat_definition,
+        source,
+        generation,
+        registry,
+        spec,
+        mode,
+        budget,
+        cancellation,
+    )
+}
+
+/// Recover a bounded Nat/String command. The authoritative verdict is exactly
+/// [`crate::parse_definition`]. A String literal that the Nat-only door refuses
+/// is an accepted command here.
+pub fn parse_definition_recovering(
+    source: &[u8],
+    generation: u64,
+    registry: &Registry,
+    spec: &RecoverySpec,
+    mode: RecoveryMode,
+    budget: RecoveryBudget,
+    cancellation: Option<&dyn Fn(RecoveryCheckpoint) -> bool>,
+) -> Outcome<Result<RecoverySession, RecoveryError>> {
+    parse_command_recovering(
+        parse_definition,
+        source,
+        generation,
+        registry,
+        spec,
+        mode,
+        budget,
+        cancellation,
+    )
+}
+
+/// Run one exact command parser with an optional, non-authoritative recovery
 /// observation.
 ///
 /// Coordinates in the returned boundary products name the normalized
 /// [`SourceView`]. The exact parser's diagnostics remain mapped to the original
-/// bytes, preserving its existing public contract.
-pub fn parse_nat_definition_recovering(
+/// bytes, preserving its existing public contract. The extra argument is the
+/// exact parser; public wrappers keep the original seven-argument surface.
+#[allow(clippy::too_many_arguments)]
+fn parse_command_recovering(
+    parse: CommandParser,
     source: &[u8],
     generation: u64,
     registry: &Registry,
@@ -806,7 +865,7 @@ pub fn parse_nat_definition_recovering(
         Ok(original) => original,
         Err(SourceError::NotUtf8 { .. }) => {
             return Outcome::Complete(Ok(invalid_utf8_session(
-                source, generation, registry, spec, mode,
+                source, generation, registry, spec, mode, parse,
             )));
         }
     };
@@ -826,7 +885,7 @@ pub fn parse_nat_definition_recovering(
         processed += 1;
     }
 
-    let result = parse_nat_definition(source);
+    let result = parse(source);
     let exact_boundaries = if result.is_ok() {
         vec![CommandBoundary {
             span: whole_span(&view),
@@ -844,7 +903,7 @@ pub fn parse_nat_definition_recovering(
     let mut recovered = Vec::new();
     let mut journal = Vec::new();
     if mode == RecoveryMode::Enabled {
-        let boundaries = make_boundaries(&run, &view, registry, spec);
+        let boundaries = make_boundaries(&run, &view, registry, spec, parse);
         if boundaries.len() as u64 > budget.max_boundaries {
             return exhausted(
                 StructuralUnit::ProducedNodes,
@@ -1003,6 +1062,24 @@ pub fn reparse_nat_definition_incremental(
     new_source: &[u8],
     request: IncrementalRecoveryRequest<'_>,
 ) -> Outcome<Result<VerifiedIncrementalRecovery, RecoveryError>> {
+    reparse_command_incremental(parse_nat_definition, previous, new_source, request)
+}
+
+/// Incremental recovery using [`crate::parse_definition`] as the exact parser.
+pub fn reparse_definition_incremental(
+    previous: &RecoverySession,
+    new_source: &[u8],
+    request: IncrementalRecoveryRequest<'_>,
+) -> Outcome<Result<VerifiedIncrementalRecovery, RecoveryError>> {
+    reparse_command_incremental(parse_definition, previous, new_source, request)
+}
+
+fn reparse_command_incremental(
+    parse: CommandParser,
+    previous: &RecoverySession,
+    new_source: &[u8],
+    request: IncrementalRecoveryRequest<'_>,
+) -> Outcome<Result<VerifiedIncrementalRecovery, RecoveryError>> {
     let IncrementalRecoveryRequest {
         edit,
         registry,
@@ -1102,7 +1179,8 @@ pub fn reparse_nat_definition_incremental(
         }
     }
 
-    let mut full_session = match parse_nat_definition_recovering(
+    let mut full_session = match parse_command_recovering(
+        parse,
         new_source,
         edit.next_generation,
         registry,

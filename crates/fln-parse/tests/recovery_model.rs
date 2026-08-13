@@ -8,11 +8,13 @@ use fln_parse::recovery::{
     PublicationRefusal, RecoveryBudget, RecoveryCatalog, RecoveryCatalogError, RecoveryCheckpoint,
     RecoveryError, RecoveryMode, RecoverySession, RecoverySpec, RecoverySpecError,
     ResynchronizationToken, SpeculativeObservation, VerifiedIncrementalRecovery, command_category,
-    nat_definition_recovery_spec, parse_nat_definition_recovering, pinned_parser_categories,
-    reparse_nat_definition_incremental,
+    nat_definition_recovery_spec, parse_definition_recovering, parse_nat_definition_recovering,
+    pinned_parser_categories, reparse_definition_incremental, reparse_nat_definition_incremental,
 };
 use fln_parse::registry::Registry;
-use fln_parse::{NatDefinitionExpectation, NatDefinitionParseError, parse_nat_definition};
+use fln_parse::{
+    NatDefinitionExpectation, NatDefinitionParseError, parse_definition, parse_nat_definition,
+};
 use fln_syntax::run::LexBudget;
 use fln_syntax::source::{BytePos, ByteSpan, SourceError};
 
@@ -84,6 +86,113 @@ fn recovery_mode_cannot_change_the_authoritative_acceptance_result() {
             &parse_nat_definition(source)
         );
     }
+}
+
+#[test]
+fn scalar_recovery_accepts_string_commands_the_nat_door_refuses() {
+    let source = b"def message := \"hello\"";
+    let nat = session(source, RecoveryMode::Enabled);
+    assert!(
+        matches!(
+            nat.authoritative().result(),
+            Err(NatDefinitionParseError::OutsideSeedGrammar { .. })
+        ),
+        "the Nat recovery door must not silently widen to String"
+    );
+    assert!(matches!(
+        nat.speculative()
+            .expect("recovery was enabled")
+            .boundaries()[0]
+            .observation(),
+        SpeculativeObservation::RejectedCommandShape(_)
+    ));
+
+    let registry = Registry::new();
+    let spec = nat_definition_recovery_spec();
+    let disabled = completed(parse_definition_recovering(
+        source,
+        7,
+        &registry,
+        &spec,
+        RecoveryMode::Disabled,
+        RecoveryBudget::generous(),
+        None,
+    ))
+    .expect("the command recovery category matches");
+    let enabled = completed(parse_definition_recovering(
+        source,
+        7,
+        &registry,
+        &spec,
+        RecoveryMode::Enabled,
+        RecoveryBudget::generous(),
+        None,
+    ))
+    .expect("the command recovery category matches");
+    assert_eq!(
+        disabled.authoritative().result(),
+        enabled.authoritative().result()
+    );
+    assert_eq!(enabled.authoritative().result(), &parse_definition(source));
+    assert!(enabled.authoritative().accepted());
+    assert_eq!(
+        enabled
+            .speculative()
+            .expect("recovery was enabled")
+            .boundaries()[0]
+            .observation(),
+        &SpeculativeObservation::AcceptedCommandShape
+    );
+}
+
+#[test]
+fn scalar_incremental_recovery_matches_full_recovery_on_a_string_literal() {
+    let registry = Registry::new();
+    let spec = nat_definition_recovery_spec();
+    let old_source = b"def message := \"hello\"";
+    let new_source = b"def message := \"hi\"";
+    let previous = completed(parse_definition_recovering(
+        old_source,
+        20,
+        &registry,
+        &spec,
+        RecoveryMode::Enabled,
+        RecoveryBudget::generous(),
+        None,
+    ))
+    .expect("matching category");
+    let replaced = old_source
+        .windows(b"hello".len())
+        .position(|window| window == b"hello")
+        .expect("the old literal is present");
+    let edit = NormalizedRecoveryEdit {
+        base_generation: 20,
+        next_generation: 21,
+        base_registry_epoch: registry.epoch(),
+        replaced: ByteSpan::new(BytePos(replaced), BytePos(replaced + b"hello".len()))
+            .expect("ordered"),
+        inserted_len: b"hi".len(),
+    };
+
+    let incremental = incremental_completed(reparse_definition_incremental(
+        &previous,
+        new_source,
+        incremental_request(edit, &registry, &spec),
+    ))
+    .expect("exact edit");
+    let full = completed(parse_definition_recovering(
+        new_source,
+        21,
+        &registry,
+        &spec,
+        RecoveryMode::Enabled,
+        RecoveryBudget::generous(),
+        None,
+    ))
+    .expect("matching category");
+
+    assert_eq!(incremental.session(), &full);
+    assert!(full.authoritative().accepted());
 }
 
 #[test]
