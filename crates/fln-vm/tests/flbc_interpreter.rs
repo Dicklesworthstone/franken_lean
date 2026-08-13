@@ -173,6 +173,8 @@ fn fixture_register_result(
                     "extern:Nat.add"
                     | "extern:Nat.sub"
                     | "extern:Nat.mul"
+                    | "extern:String.length"
+                    | "extern:String.utf8ByteSize"
                     | "extern:Array.size"
                     | "extern:ST.Prim.Ref.ptrEq"
                     | "extern:ST.Prim.Ref.set" => CallableResultOwnership::Scalar,
@@ -443,6 +445,31 @@ fn generated_nat_mul_and_sub_rows_execute_with_nat_semantics() {
             ..
         })
     ));
+}
+
+#[test]
+fn generated_string_length_rows_distinguish_scalars_from_utf8_bytes() {
+    let _guard = lock();
+    for (row, expected) in [
+        ("extern:String.length", 4),
+        ("extern:String.utf8ByteSize", 5),
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            2,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "βeta".to_string(),
+                },
+                intrinsic(r(1), row, vec![r(0)]),
+                Instruction::Return { src: r(1) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.unbox(), expected, "{row}");
+    }
 }
 
 #[test]

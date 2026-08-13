@@ -510,6 +510,8 @@ enum IntrinsicImplementation {
     NatSub,
     NatMul,
     StringAppend,
+    StringLength,
+    StringUtf8ByteSize,
     ArraySize,
     ArrayGetInternal,
     ArrayGetBorrowed,
@@ -542,6 +544,8 @@ impl IntrinsicImplementation {
             "extern:Nat.sub" => Self::NatSub,
             "extern:Nat.mul" => Self::NatMul,
             "extern:String.append" => Self::StringAppend,
+            "extern:String.length" => Self::StringLength,
+            "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
             "extern:Array.size" => Self::ArraySize,
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
@@ -2855,6 +2859,26 @@ fn invoke_intrinsic(
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
         }
+        IntrinsicImplementation::StringLength => {
+            expect_arity(row, args, 1)?;
+            let length = string_value(&args[0], "String.length", 0)?.chars().count();
+            if length > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "String.length",
+                });
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(length)))
+        }
+        IntrinsicImplementation::StringUtf8ByteSize => {
+            expect_arity(row, args, 1)?;
+            let length = string_value(&args[0], "String.utf8ByteSize", 0)?.len();
+            if length > usize::MAX >> 1 {
+                return Err(VmRefusal::NatOverflow {
+                    operation: "String.utf8ByteSize",
+                });
+            }
+            Ok(IntrinsicResult::owned(Obj::mk_nat(length)))
+        }
         IntrinsicImplementation::ArraySize => {
             expect_arity(row, args, 1)?;
             let (size, _) = array_value(&args[0], "Array.size", 0)?;
@@ -3079,6 +3103,8 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatSub
         | IntrinsicImplementation::NatMul
         | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::StringLength
+        | IntrinsicImplementation::StringUtf8ByteSize
         | IntrinsicImplementation::ArraySize
         | IntrinsicImplementation::ArrayGetInternal
         | IntrinsicImplementation::ArrayGetBorrowed

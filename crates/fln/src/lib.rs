@@ -1427,9 +1427,9 @@ impl Engine {
     ///
     /// The two opaque type names check literals and exact first-order
     /// signatures. The remaining declarations are the exact checked Nat
-    /// arithmetic and String append signatures recognized by the compiler's
-    /// generated-row bridge. This is not a Prelude substitute and grants no
-    /// constructors or eliminators.
+    /// arithmetic, append, and String length signatures recognized by the
+    /// compiler's generated-row bridge. This is not a Prelude substitute and
+    /// grants no constructors or eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -2931,24 +2931,32 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
     };
 
     let row_name = name.to_display_string();
-    let (argument_types, result, nat_type_family) = match row_name.as_str() {
-        "Nat.add" | "Nat.sub" | "Nat.mul" => {
-            (vec![ValueType::Nat, ValueType::Nat], ValueType::Nat, true)
-        }
+    let (argument_types, result, type_family_anchor) = match row_name.as_str() {
+        "Nat.add" | "Nat.sub" | "Nat.mul" => (
+            vec![ValueType::Nat, ValueType::Nat],
+            ValueType::Nat,
+            Some("Nat.add"),
+        ),
         "String.append" => (
             vec![ValueType::String, ValueType::String],
             ValueType::String,
-            false,
+            None,
+        ),
+        "String.length" | "String.utf8ByteSize" => (
+            vec![ValueType::String],
+            ValueType::Nat,
+            Some("String.length"),
         ),
         _ => return None,
     };
+    let arity = u32::try_from(argument_types.len()).ok()?;
     let row = fln_vm::extern_table_generated::EXTERN_ROWS
         .iter()
-        .find(|row| row.name == row_name && row.levels == 0 && row.arity == 2)?;
-    if nat_type_family {
+        .find(|row| row.name == row_name && row.levels == 0 && row.arity == arity)?;
+    if let Some(anchor_name) = type_family_anchor {
         let type_anchor = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
-            .find(|candidate| candidate.name == "Nat.add")?;
+            .find(|candidate| candidate.name == anchor_name)?;
         if row.type_hash != type_anchor.type_hash {
             return None;
         }
@@ -2957,16 +2965,17 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
         return None;
     }
     let ownership = ContractOwnership::parse(row.ownership).ok()?;
-    let contract_arguments: [ContractArgumentOwnership; 2] =
-        ownership.argument_ownership(2).ok()?.try_into().ok()?;
-    let argument_ownership = contract_arguments
+    let argument_ownership = ownership
+        .argument_ownership(argument_types.len())
+        .ok()?
+        .into_iter()
         .map(|argument| match argument {
             ContractArgumentOwnership::Borrowed => fln_comp::flbc::ArgumentOwnership::Borrowed,
             ContractArgumentOwnership::Owned => fln_comp::flbc::ArgumentOwnership::Owned,
             ContractArgumentOwnership::Unique => fln_comp::flbc::ArgumentOwnership::Unique,
             ContractArgumentOwnership::Scalar => fln_comp::flbc::ArgumentOwnership::Scalar,
         })
-        .to_vec();
+        .collect();
     let result_ownership = match ownership.result_ownership().ok()? {
         ContractResultOwnership::Owned => fln_comp::flbc::ResultOwnership::Owned,
         ContractResultOwnership::Borrowed => fln_comp::flbc::ResultOwnership::Borrowed,
@@ -6066,7 +6075,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 6);
+        assert_eq!(engine.environment().len(), 8);
         assert!(
             engine
                 .environment()
@@ -6097,6 +6106,16 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["String", "append"]))
         );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["String", "length"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["String", "utf8ByteSize"]))
+        );
 
         let completed = engine
             .execute_source_definitions(
@@ -6122,7 +6141,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 8);
+        assert_eq!(completed.engine.environment().len(), 10);
     }
 
     #[test]
@@ -6320,6 +6339,109 @@ mod tests {
                 matches!(instruction, Instruction::Intrinsic { row, .. } if row == append_row)
             })
         }));
+    }
+
+    #[test]
+    fn checked_string_length_source_distinguishes_scalars_from_utf8_bytes() {
+        let options = KVMap::new();
+        let string_only = engine_with_string_type();
+        let base_root = string_only.logical_root(&options);
+        let missing = string_only
+            .execute_source_definition(
+                b"def answer := String.length \"not-seeded\"",
+                &options,
+                test_limits(),
+            )
+            .expect_err("the String type alone must not invent String.length authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(string_only.logical_root(&options), base_root);
+        assert!(
+            !string_only
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definition(
+                b"def answer := Nat.add (String.length \"\xce\xb2eta\") (String.utf8ByteSize \"\xce\xb2eta\")",
+                &options,
+                test_limits(),
+            )
+            .expect("checked String length metrics reach Golem through nested applications");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked String metric definition must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.exit),
+            Ok(Some(ClosedVmValue::Scalar(9)))
+        );
+        let executable =
+            fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                .expect("the exact executed String metric artifact decodes canonically");
+        for expected in ["String.length", "String.utf8ByteSize"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == expected)
+                .expect("the generated pin census contains the String metric row")
+                .id;
+            assert!(executable.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn checked_definitions_named_string_length_metrics_remain_ordinary() {
+        let options = KVMap::new();
+        let engine = engine_with_string_type();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def choose (left right : Nat) : Nat := left",
+                    b"def String.length (value : String) : Nat := 7",
+                    b"def String.utf8ByteSize (value : String) : Nat := 8",
+                    b"def answer := choose (String.length \"ordinary\") (String.utf8ByteSize \"ordinary\")",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("ordinary checked String metric names remain ordinary functions");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary String metric batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[3].exit),
+            Ok(Some(ClosedVmValue::Scalar(7)))
+        );
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[3].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed ordinary String metric artifact decodes canonically");
+        for forbidden in ["String.length", "String.utf8ByteSize"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == forbidden)
+                .expect("the generated pin census contains the String metric row")
+                .id;
+            assert!(executable.functions().iter().all(|function| {
+                function.code.iter().all(|instruction| {
+                    !matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
     }
 
     #[test]

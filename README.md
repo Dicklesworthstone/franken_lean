@@ -273,7 +273,8 @@ cargo run -p fln --example checked_source
 This is the currently implemented bounded `Nat`/`String` source facade: caller-
 supplied bytes, exact scalar signatures, parenthesized first-order applications,
 optionally ascribed local lets, the
-checked `Nat.add`/`Nat.sub`/`Nat.mul` and `String.append` intrinsics, explicit
+checked `Nat.add`/`Nat.sub`/`Nat.mul`, `String.append`, `String.length`, and
+`String.utf8ByteSize` intrinsics, explicit
 budgets, immutable environment successors, K1 plus the independent checker,
 canonical FLBC, and Golem. The planned `Cx`
 builder, project/import elaboration, and receipt API from §17.2 do not exist yet;
