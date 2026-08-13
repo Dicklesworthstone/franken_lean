@@ -1,7 +1,7 @@
 //! Real-process producer-to-consumer evidence for the bounded FLBC product seam.
 //!
-//! This is deliberately narrower than D18: it proves supported Nat, checked
-//! checked Nat arithmetic and String sources reach the filesystem only after batch success
+//! This is deliberately narrower than D18: it proves supported checked Nat
+//! arithmetic and String sources reach the filesystem only after batch success
 //! and that their exact bytes are consumed by Golem. It does not claim a
 //! certified build, general Lean source support, closure-complete
 //! reproducibility, or thread-matrix determinism.
@@ -83,7 +83,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     assert!(produced.stderr.is_empty());
     let producer_stdout = utf8(&produced.stdout);
     assert!(producer_stdout.contains("\"schema\":\"fln.source-run/5\""));
-    assert!(producer_stdout.contains("\"definitions\":2"));
+    assert!(producer_stdout.contains("\"definitions\":3"));
     assert!(producer_stdout.contains("\"finalValue\":42"));
     assert!(producer_stdout.contains("\"emittedFlbc\":{"));
     let original = std::fs::read(&product).expect("read emitted FLBC product");
