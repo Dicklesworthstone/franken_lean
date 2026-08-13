@@ -196,6 +196,87 @@ pub struct FlbcExecutionLimits {
     pub vm: VmExecutionLimits,
 }
 
+/// Owned projection of the simple closed values supported by the current
+/// bounded source facade.
+///
+/// A scalar is intentionally not labeled `Nat` here: canonical FLBC can carry
+/// other scalar conventions, while the source frontend is what proves its own
+/// result type. Heap values other than `String` are outside this projection and
+/// return `Ok(None)` from [`closed_vm_value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedVmValue {
+    Scalar(usize),
+    String(String),
+}
+
+/// A returned runtime value claimed to be a `String` but violated Marrow's
+/// public String representation, or a non-returning exit sent to the value
+/// projector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedVmValueError {
+    NonReturningExit,
+    StringMissingTrailingNul,
+    StringSizeExceedsBuffer { size: usize, buffer: usize },
+    StringPayloadIsNotUtf8,
+}
+
+impl fmt::Display for ClosedVmValueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonReturningExit => {
+                formatter.write_str("non-returning VM exit has no closed return value")
+            }
+            Self::StringMissingTrailingNul => {
+                formatter.write_str("returned String did not contain its required trailing NUL")
+            }
+            Self::StringSizeExceedsBuffer { size, buffer } => write!(
+                formatter,
+                "returned String size {size} exceeded its {buffer}-byte runtime buffer"
+            ),
+            Self::StringPayloadIsNotUtf8 => {
+                formatter.write_str("returned String payload was not UTF-8")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClosedVmValueError {}
+
+/// Copy one returned scalar or String out of Marrow's runtime representation.
+///
+/// This is the value-level companion to [`execute_flbc_artifact`]. It keeps
+/// embedders from depending on the ABI String header and trailing-NUL rules.
+/// Other valid runtime object kinds return `Ok(None)` and remain available via
+/// the original [`VmExit`] for callers with a richer domain decoder.
+pub fn closed_vm_value(exit: &VmExit) -> Result<Option<ClosedVmValue>, ClosedVmValueError> {
+    let VmExit::Returned(returned) = exit else {
+        return Err(ClosedVmValueError::NonReturningExit);
+    };
+    if returned.value.is_scalar() {
+        return Ok(Some(ClosedVmValue::Scalar(returned.value.unbox())));
+    }
+    if vm_value_kind(&returned.value) != VmValueKind::String {
+        return Ok(None);
+    }
+
+    let (size, _, _, bytes) = returned.value.string_view();
+    let Some(content_size) = size.checked_sub(1) else {
+        return Err(ClosedVmValueError::StringMissingTrailingNul);
+    };
+    if size > bytes.len() {
+        return Err(ClosedVmValueError::StringSizeExceedsBuffer {
+            size,
+            buffer: bytes.len(),
+        });
+    }
+    if bytes.get(content_size) != Some(&0) {
+        return Err(ClosedVmValueError::StringMissingTrailingNul);
+    }
+    let content = std::str::from_utf8(&bytes[..content_size])
+        .map_err(|_| ClosedVmValueError::StringPayloadIsNotUtf8)?;
+    Ok(Some(ClosedVmValue::String(content.to_owned())))
+}
+
 /// Validates and executes one canonical FLBC artifact through Golem.
 ///
 /// Malformed or over-budget bytes are refused before execution. A valid
@@ -3694,18 +3775,19 @@ impl From<EngineAdmissionError> for EngineExecutionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround, ConstantInfo,
-        ConstantVal, Declaration, DefinitionSafety, DefinitionVal, DiagnosticChannel,
-        DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat, DiagnosticFrontend,
-        DiagnosticOrderPolicy, DiagnosticPathPolicy, Engine, EngineAdmissionError,
-        EngineAdmissionLimits, EngineBvDecideError, EngineBvDecideInconclusive,
-        EngineBvDecideLimits, EngineBvDecideOutcome, EngineExecutionError, EngineExecutionLimits,
-        Environment, ExitClass, Expr, FlbcExecutionLimits, IngressError, IngressResource, KVMap,
-        Level, Literal, Name, NatDefinitionFrontendError, NatLit, OleanCheckError,
-        OleanCheckLimits, OleanDeclarationError, OleanDecodeError, OleanDecodeLimits,
-        OleanModuleImport, OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget,
-        OpaqueVal, Outcome, ProjectionRefusal, ProjectionRequest, ProjectionSnapshot,
-        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, decode_olean_artifact,
+        AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround,
+        ClosedVmValue, ClosedVmValueError, ConstantInfo, ConstantVal, Declaration,
+        DefinitionSafety, DefinitionVal, DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch,
+        DiagnosticFormat, DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, Engine,
+        EngineAdmissionError, EngineAdmissionLimits, EngineBvDecideError,
+        EngineBvDecideInconclusive, EngineBvDecideLimits, EngineBvDecideOutcome,
+        EngineExecutionError, EngineExecutionLimits, Environment, ExitClass, Expr,
+        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name,
+        NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
+        OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
+        OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
+        ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, ReducibilityHints, RejectClass,
+        TheoremVal, VmExecutionLimits, closed_vm_value, decode_olean_artifact,
         execute_flbc_artifact, execute_golem_with_options, project_lsp_diagnostics,
         rebuild_olean_artifact,
     };
@@ -3720,7 +3802,7 @@ mod tests {
     use fln_core::outcome::InconclusiveCause;
     use fln_env::constants::{QuotKind, QuotVal};
     use fln_verdict::{BoolExpr, BvDecideRequest};
-    use fln_vm::interpreter::{ValueKind, VmExit, value_kind};
+    use fln_vm::interpreter::{ExecutionUsage, ValueKind, VmExit, value_kind};
 
     fn test_budget() -> Budget {
         Budget::for_stack_bytes(2 * 1024 * 1024)
@@ -5690,6 +5772,7 @@ mod tests {
             panic!("the small checked String function must answer completely");
         };
         assert!(published.engine.environment().contains(&identity_name));
+        assert_eq!(closed_vm_value(&published.exit), Ok(None));
 
         let applied = published
             .engine
@@ -5709,6 +5792,10 @@ mod tests {
         let Outcome::Complete(applied) = applied else {
             panic!("the checked String function application must answer completely");
         };
+        assert_eq!(
+            closed_vm_value(&applied.exit),
+            Ok(Some(ClosedVmValue::String("facade-catalog".to_owned())))
+        );
         let VmExit::Returned(returned) = applied.exit else {
             panic!("the checked String function application must return normally");
         };
@@ -5721,6 +5808,19 @@ mod tests {
             "facade-catalog"
         );
         assert_eq!(applied.engine.environment().len(), 4);
+
+        let panicked = VmExit::Panicked {
+            message: "expected example panic".to_owned(),
+            usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+        };
+        assert_eq!(
+            closed_vm_value(&panicked),
+            Err(ClosedVmValueError::NonReturningExit)
+        );
     }
 
     #[test]
