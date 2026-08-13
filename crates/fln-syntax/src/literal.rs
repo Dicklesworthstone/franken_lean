@@ -32,8 +32,10 @@
 //!   parenthesizing the number". The position matters — it is what makes `1.foo` point at
 //!   the thing the user has to parenthesize.
 //! * **String gaps** (`stringGapFn`, `Basic.lean:633`): a `\` before a newline eats the
-//!   newline and following whitespace, but **at most one newline** — a second is
-//!   "unexpected additional newline in string gap".
+//!   newline and following pin-whitespace (space, tab, CR, LF — `Char.isWhitespace`
+//!   at `Init/Data/Char/Basic.lean:97`), but **at most one newline** — a second is
+//!   "unexpected additional newline in string gap". Rust's Unicode `is_whitespace`
+//!   is a larger set and would swallow NBSP / form-feed / line-separator as gap.
 //! * **An unterminated string is reported at its opening quote**, not at end of file, which
 //!   is the only position that helps.
 //!
@@ -524,6 +526,17 @@ fn hex_digits(s: &str, at: usize, count: usize) -> Result<usize, LiteralError> {
     Ok(at + count)
 }
 
+/// Pin `Char.isWhitespace` (`Init/Data/Char/Basic.lean:97-98`): space, tab, CR, LF.
+///
+/// Rust's `char::is_whitespace` is Unicode White_Space (NBSP, form feed, line
+/// separator, …). A string gap that used that set would eat characters the pin
+/// leaves as content. Exported so the elaborator decodes the same predicate the
+/// lexer scanned.
+#[inline]
+pub const fn is_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
 /// `stringGapFn` (`Basic.lean:633`): whitespace after the escaped newline, with **at most
 /// one** newline. The cap is upstream's, on the grounds that more than one is visually
 /// confusing — a readability rule enforced by the lexer, so ours has to enforce it too.
@@ -537,7 +550,7 @@ fn string_gap(s: &str, at: usize) -> Result<usize, LiteralError> {
             }
             seen_newline = true;
             at += 1;
-        } else if c.is_whitespace() {
+        } else if is_whitespace(c) {
             at += c.len_utf8();
         } else {
             break;
@@ -831,6 +844,34 @@ mod tests {
         );
         // A raw newline with no backslash is just content, not a gap and not an error.
         assert_eq!(lex("\"a\nb\""), "Str 5");
+    }
+
+    #[test]
+    fn a_string_gap_uses_pin_whitespace_not_unicode_white_space() {
+        assert_eq!(
+            string_gap(" \t\rx", 0).expect("ASCII pin whitespace is gap"),
+            3,
+            "space, tab, and CR are Char.isWhitespace"
+        );
+        assert_eq!(
+            string_gap("\u{00a0}x", 0).expect("NBSP is not a gap character"),
+            0,
+            "NBSP is content; Rust is_whitespace would have swallowed it"
+        );
+        assert_eq!(
+            string_gap("\u{000c}x", 0).expect("form feed is not a gap character"),
+            0,
+            "form feed is Unicode White_Space but not Char.isWhitespace"
+        );
+        assert_eq!(
+            string_gap("\u{2028}x", 0).expect("line separator is not a gap character"),
+            0
+        );
+        assert_eq!(
+            lex("\"a\\\n\u{00a0}b\""),
+            "Str 8",
+            "NBSP after a gap stays inside the same string token"
+        );
     }
 
     /// Char literals hold exactly one character.

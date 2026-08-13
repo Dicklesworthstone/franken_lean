@@ -308,12 +308,14 @@ fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
                 decoded.push(decode_hex_scalar(digits.as_bytes())?);
             }
             // Pin `quotedCharCoreFn` (`Basic.lean:668`): a string gap starts
-            // only on a newline after `\`. `stringGapFn` then eats other
-            // whitespace and refuses a second newline.
+            // only on a newline after `\`. `stringGapFn` then eats pin
+            // whitespace (`Char.isWhitespace`: space, tab, CR, LF) and
+            // refuses a second newline. Unicode White_Space (NBSP, form
+            // feed, …) is content, not gap.
             '\n' => loop {
                 match chars.clone().next() {
                     Some('\n') => return Err(NatDefinitionElabError::InvalidStringLiteral),
-                    Some(whitespace) if whitespace.is_whitespace() => {
+                    Some(whitespace) if fln_syntax::literal::is_whitespace(whitespace) => {
                         chars.next();
                     }
                     _ => break,
@@ -1354,6 +1356,20 @@ mod tests {
             } if value == "line\nheart ♥"
         ));
 
+        let nbsp = parse_definition("def message : String := \"left\\\n\u{00a0}right\"".as_bytes())
+            .expect("NBSP after a string gap remains in the scalar grammar");
+        let Declaration::Defn(nbsp) =
+            elaborate_definition(nbsp.syntax()).expect("NBSP after a gap elaborates as content")
+        else {
+            panic!("the NBSP command must elaborate to a definition");
+        };
+        assert!(matches!(
+            nbsp.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "left\u{00a0}right"
+        ));
+
         let mixed = parse_definition(b"def message : String := let n := 1; \"ok\"")
             .expect("a Nat let inside a String definition is in the seed grammar");
         let Declaration::Defn(mixed) = elaborate_definition(mixed.syntax())
@@ -1445,6 +1461,21 @@ mod tests {
         assert_eq!(
             decode_string("\"left\\\n  right\""),
             Ok(Literal::Str("leftright".to_owned()))
+        );
+        assert_eq!(
+            decode_string("\"left\\\n\t right\""),
+            Ok(Literal::Str("leftright".to_owned())),
+            "pin gap whitespace is space, tab, CR, LF"
+        );
+        assert_eq!(
+            decode_string("\"left\\\n\u{00a0}right\""),
+            Ok(Literal::Str("left\u{00a0}right".to_owned())),
+            "NBSP after a gap is content, not Char.isWhitespace"
+        );
+        assert_eq!(
+            decode_string("\"left\\\n\u{000c}right\""),
+            Ok(Literal::Str("left\u{000c}right".to_owned())),
+            "form feed after a gap is content"
         );
         for malformed in [
             "",
