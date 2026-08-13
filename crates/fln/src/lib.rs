@@ -6032,7 +6032,7 @@ mod tests {
         assert!(matches!(
             &mismatch,
             EngineExecutionError::KernelRejected {
-                class: RejectClass::DefinitionTypeMismatch,
+                class: RejectClass::TypeMismatch,
                 ..
             }
         ), "unexpected explicit let mismatch: {mismatch:?}");
