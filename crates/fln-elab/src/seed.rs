@@ -10,10 +10,10 @@
 //!
 //! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
 //! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
-//! `String : Sort 1` and the exact `Nat.add : Nat -> Nat -> Nat` extern
-//! signature. The types are enough to resolve literals, while the checked
-//! `Nat.add` row lets the compiler reach Golem's already-implemented intrinsic;
-//! no constructor or eliminator is implied. The real inductive blocks belong to
+//! `String : Sort 1` and exact `Nat.add`/`Nat.sub`/`Nat.mul` binary extern
+//! signatures. The types are enough to resolve literals, while those checked
+//! rows let the compiler reach Golem's matching intrinsic implementations; no
+//! constructor or eliminator is implied. The real inductive blocks belong to
 //! inductive elaboration and Prelude ingestion.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
@@ -113,17 +113,11 @@ pub fn string_seed_declaration() -> Declaration {
     })
 }
 
-/// Construct the exact `Nat.add : Nat -> Nat -> Nat` candidate recognized by
-/// the bounded compiler bridge.
-///
-/// This declaration is still only an axiom at the kernel layer. Execution is
-/// possible because the compiler separately requires this exact checked
-/// declaration before binding the generated `extern:Nat.add` census row.
-pub fn nat_add_seed_declaration() -> Declaration {
+fn nat_binary_seed_declaration(operation: &str) -> Declaration {
     let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
     Declaration::Axiom(AxiomVal {
         base: ConstantVal {
-            name: Name::from_components(["Nat", "add"]),
+            name: Name::from_components(["Nat", operation]),
             level_params: Vec::new(),
             type_: Expr::forall_e(
                 Name::from_components(["left"]),
@@ -141,14 +135,50 @@ pub fn nat_add_seed_declaration() -> Declaration {
     })
 }
 
+/// Construct the exact `Nat.add : Nat -> Nat -> Nat` candidate recognized by
+/// the bounded compiler bridge.
+pub fn nat_add_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("add")
+}
+
+/// Construct the exact `Nat.sub : Nat -> Nat -> Nat` candidate recognized by
+/// the bounded compiler bridge.
+pub fn nat_sub_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("sub")
+}
+
+/// Construct the exact `Nat.mul : Nat -> Nat -> Nat` candidate recognized by
+/// the bounded compiler bridge.
+pub fn nat_mul_seed_declaration() -> Declaration {
+    nat_binary_seed_declaration("mul")
+}
+
+/// Return the exact source-seed declaration for an executable intrinsic name.
+///
+/// This is an allowlist, not a shape-based constructor: another generated row
+/// with the same apparent type receives no source or runtime authority.
+pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
+    if name == &Name::from_components(["Nat", "add"]) {
+        Some(nat_add_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "sub"]) {
+        Some(nat_sub_seed_declaration())
+    } else if name == &Name::from_components(["Nat", "mul"]) {
+        Some(nat_mul_seed_declaration())
+    } else {
+        None
+    }
+}
+
 /// The exact declaration sequence required by the bounded Nat/String source
 /// frontend. Order is part of the deterministic seed contract: both types must
 /// exist before the intrinsic signature can be admitted.
-pub fn source_seed_declarations() -> [Declaration; 3] {
+pub fn source_seed_declarations() -> [Declaration; 5] {
     [
         nat_seed_declaration(),
         string_seed_declaration(),
         nat_add_seed_declaration(),
+        nat_sub_seed_declaration(),
+        nat_mul_seed_declaration(),
     ]
 }
 
@@ -219,10 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn source_seed_orders_both_types_before_the_exact_nat_add_signature() {
+    fn source_seed_orders_types_before_the_exact_arithmetic_signatures() {
         let declarations = source_seed_declarations();
         assert_eq!(declarations[0], nat_seed_declaration());
         assert_eq!(declarations[1], string_seed_declaration());
         assert_eq!(declarations[2], nat_add_seed_declaration());
+        assert_eq!(declarations[3], nat_sub_seed_declaration());
+        assert_eq!(declarations[4], nat_mul_seed_declaration());
+        assert!(
+            source_intrinsic_seed_declaration(&Name::from_components(["Nat", "div"])).is_none(),
+            "an unimplemented generated row is not source authority"
+        );
     }
 }
