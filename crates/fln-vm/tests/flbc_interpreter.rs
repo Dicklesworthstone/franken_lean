@@ -178,7 +178,11 @@ fn fixture_register_result(
                     | "extern:Nat.land"
                     | "extern:Nat.lor"
                     | "extern:Nat.mod"
+                    | "extern:Nat.pow"
                     | "extern:Nat.pred"
+                    | "extern:Nat.log2"
+                    | "extern:Nat.shiftLeft"
+                    | "extern:Nat.shiftRight"
                     | "extern:Nat.xor"
                     | "extern:Nat.beq"
                     | "extern:Nat.ble"
@@ -485,7 +489,14 @@ fn generated_string_length_rows_distinguish_scalars_from_utf8_bytes() {
 #[test]
 fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
     let _guard = lock();
-    for (row, input, expected) in [("extern:Nat.pred", 0, 0), ("extern:Nat.pred", 9, 8)] {
+    for (row, input, expected) in [
+        ("extern:Nat.pred", 0, 0),
+        ("extern:Nat.pred", 9, 8),
+        ("extern:Nat.log2", 0, 0),
+        ("extern:Nat.log2", 1, 0),
+        ("extern:Nat.log2", 7, 2),
+        ("extern:Nat.log2", 8, 3),
+    ] {
         let program = validated(vec![function(
             0,
             0,
@@ -513,6 +524,29 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
         ("extern:Nat.land", 0b1100, 0b1010, 0b1000),
         ("extern:Nat.lor", 0b1100, 0b1010, 0b1110),
         ("extern:Nat.xor", 0b1100, 0b1010, 0b0110),
+        ("extern:Nat.pow", 3, 4, 81),
+        ("extern:Nat.pow", 0, 0, 1),
+        (
+            "extern:Nat.pow",
+            0,
+            u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+            0,
+        ),
+        (
+            "extern:Nat.pow",
+            1,
+            u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+            1,
+        ),
+        ("extern:Nat.shiftLeft", 7, 3, 56),
+        (
+            "extern:Nat.shiftLeft",
+            0,
+            u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+            0,
+        ),
+        ("extern:Nat.shiftRight", 56, 3, 7),
+        ("extern:Nat.shiftRight", 56, u64::from(usize::BITS), 0),
     ] {
         let program = validated(vec![function(
             0,
@@ -533,6 +567,33 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
         )]);
         let completed = returned(execute(&program, ExecutionLimits::default(), None));
         assert_eq!(completed.value.unbox(), expected, "{row} {left} {right}");
+    }
+
+    for row in ["extern:Nat.pow", "extern:Nat.shiftLeft"] {
+        let program = validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: 2,
+                },
+                intrinsic(r(2), row, vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::NatOverflow { operation },
+                ..
+            }) if operation == row.trim_start_matches("extern:")
+        ));
     }
 }
 
