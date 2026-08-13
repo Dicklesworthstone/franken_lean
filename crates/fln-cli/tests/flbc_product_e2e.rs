@@ -46,7 +46,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported dependent source batch");
     std::fs::write(
         &string_source,
-        "def message : String := \"artifact\\nβ\"\n".as_bytes(),
+        "def message := \"artifact\\nβ\"\n".as_bytes(),
     )
     .expect("write supported String source");
     std::fs::write(&bad_source, b"def open (x : Nat) : Nat := x\n")

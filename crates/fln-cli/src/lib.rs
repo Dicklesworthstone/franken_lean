@@ -3562,7 +3562,7 @@ mod tests {
     fn source_run_executes_checked_string_batches_and_publishes_the_executed_product() {
         let output = execute_source_bytes(
             vec![
-                b"def copy (value : String) : String := value".to_vec(),
+                b"def copy (value : String) := value".to_vec(),
                 b"def message : String := copy \"cli\\nconnected\"".to_vec(),
             ],
             true,
