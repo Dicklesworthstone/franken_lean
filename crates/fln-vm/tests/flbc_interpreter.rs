@@ -173,6 +173,13 @@ fn fixture_register_result(
                     "extern:Nat.add"
                     | "extern:Nat.sub"
                     | "extern:Nat.mul"
+                    | "extern:Nat.div"
+                    | "extern:Nat.gcd"
+                    | "extern:Nat.land"
+                    | "extern:Nat.lor"
+                    | "extern:Nat.mod"
+                    | "extern:Nat.pred"
+                    | "extern:Nat.xor"
                     | "extern:String.length"
                     | "extern:String.utf8ByteSize"
                     | "extern:Array.size"
@@ -469,6 +476,60 @@ fn generated_string_length_rows_distinguish_scalars_from_utf8_bytes() {
         )]);
         let completed = returned(execute(&program, ExecutionLimits::default(), None));
         assert_eq!(completed.value.unbox(), expected, "{row}");
+    }
+}
+
+#[test]
+fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
+    let _guard = lock();
+    for (row, input, expected) in [("extern:Nat.pred", 0, 0), ("extern:Nat.pred", 9, 8)] {
+        let program = validated(vec![function(
+            0,
+            0,
+            2,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: input,
+                },
+                intrinsic(r(1), row, vec![r(0)]),
+                Instruction::Return { src: r(1) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.unbox(), expected, "{row} {input}");
+    }
+
+    for (row, left, right, expected) in [
+        ("extern:Nat.div", 20, 6, 3),
+        ("extern:Nat.div", 5, 0, 0),
+        ("extern:Nat.mod", 20, 6, 2),
+        ("extern:Nat.mod", 5, 0, 5),
+        ("extern:Nat.gcd", 48, 18, 6),
+        ("extern:Nat.gcd", 0, 5, 5),
+        ("extern:Nat.land", 0b1100, 0b1010, 0b1000),
+        ("extern:Nat.lor", 0b1100, 0b1010, 0b1110),
+        ("extern:Nat.xor", 0b1100, 0b1010, 0b0110),
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: left,
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: right,
+                },
+                intrinsic(r(2), row, vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.unbox(), expected, "{row} {left} {right}");
     }
 }
 
