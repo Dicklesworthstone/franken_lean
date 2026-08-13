@@ -1426,10 +1426,10 @@ impl Engine {
     /// and independent-checker council, retaining every checker projection.
     ///
     /// The two opaque type names check literals and exact first-order
-    /// signatures. The remaining declarations are the exact checked Nat
-    /// arithmetic, append, and String length signatures recognized by the
-    /// compiler's generated-row bridge. This is not a Prelude substitute and
-    /// grants no constructors or eliminators.
+    /// signatures. The remaining declarations are an exact allowlist of
+    /// checked Nat scalar operations plus append and String length signatures
+    /// recognized by the compiler's generated-row bridge. This is not a
+    /// Prelude substitute and grants no constructors or eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
