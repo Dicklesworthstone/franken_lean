@@ -984,6 +984,76 @@ impl Expr {
         self.loose_bvar_range() > 0
     }
 
+    /// Increase every loose bvar `>= cutoff` by `amount`. Binders raise the cutoff.
+    ///
+    /// Used to eta-expand a remaining Π over a body that already mentions
+    /// peeled parameters (`fun n => first n` becomes `fun n y => first n y`).
+    pub fn lift_loose(&self, cutoff: u32, amount: u32) -> Result<Expr, TooManyBoundVars> {
+        if amount == 0 || self.loose_bvar_range() <= cutoff {
+            return Ok(self.clone());
+        }
+        Ok(match self.node() {
+            ExprNode::BVar { idx } if *idx >= cutoff => {
+                let lifted = idx
+                    .checked_add(amount)
+                    .ok_or(TooManyBoundVars { range: u32::MAX })?;
+                Expr::bvar(lifted)?
+            }
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Lit { .. } => self.clone(),
+            ExprNode::App { f, a } => {
+                Expr::app(f.lift_loose(cutoff, amount)?, a.lift_loose(cutoff, amount)?)
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::lam(
+                binder_name.clone(),
+                binder_type.lift_loose(cutoff, amount)?,
+                body.lift_loose(cutoff.saturating_add(1), amount)?,
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::forall_e(
+                binder_name.clone(),
+                binder_type.lift_loose(cutoff, amount)?,
+                body.lift_loose(cutoff.saturating_add(1), amount)?,
+                *binder_info,
+            ),
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => Expr::let_e(
+                decl_name.clone(),
+                type_.lift_loose(cutoff, amount)?,
+                value.lift_loose(cutoff, amount)?,
+                body.lift_loose(cutoff.saturating_add(1), amount)?,
+                *non_dep,
+            ),
+            ExprNode::MData { data, expr } => {
+                Expr::mdata(data.clone(), expr.lift_loose(cutoff, amount)?)
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => Expr::proj(struct_name.clone(), *idx, expr.lift_loose(cutoff, amount)?),
+        })
+    }
+
     /// The structural node (metaprograms pattern-match on the inventory).
     pub fn node(&self) -> &ExprNode {
         self.node_arc()
@@ -1085,6 +1155,10 @@ mod tests {
         let b = Expr::bvar(3).expect("packs");
         assert_eq!(b.hash(), u64::from(mix_hash(7, 3) as u32));
         assert_eq!(b.loose_bvar_range(), 4);
+        let lifted = b.lift_loose(0, 2).expect("lift packs");
+        assert!(matches!(lifted.node(), ExprNode::BVar { idx } if *idx == 5));
+        let below = b.lift_loose(4, 2).expect("cutoff leaves idx 3");
+        assert!(matches!(below.node(), ExprNode::BVar { idx } if *idx == 3));
         assert_eq!(b.approx_depth(), 0);
         assert!(!b.has_fvar() && !b.has_expr_mvar());
 

@@ -558,9 +558,7 @@ fn elaborate_definition_with_types(
             .filter(|ty| acceptable_inferred(ty, allow_string))
             .unwrap_or_else(nat_const)
     });
-    if !expression.has_loose_bvars() {
-        expression = eta_expand_nondependent(expression, &declaration_type)?;
-    }
+    expression = eta_expand_nondependent(expression, &declaration_type)?;
     for (parameter, parameter_type) in parameters.iter().rev() {
         declaration_type = Expr::forall_e(
             parameter.clone(),
@@ -814,7 +812,10 @@ fn eta_expand_nondependent(value: Expr, inferred: &Expr) -> Result<Expr, NatDefi
     }
 
     let extra = binders.len();
-    let mut eta = value;
+    let extra_u32 = u32::try_from(extra).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
+    let mut eta = value
+        .lift_loose(0, extra_u32)
+        .map_err(|_| NatDefinitionElabError::TooManyParameters)?;
     for index in (0..extra).rev() {
         let index = u32::try_from(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
         let argument = Expr::bvar(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
