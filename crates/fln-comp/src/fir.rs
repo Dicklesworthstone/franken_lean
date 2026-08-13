@@ -1918,6 +1918,17 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+impl ValidationError {
+    /// Whether this refusal is a budget or allocation failure, not a
+    /// program-shape refusal.
+    pub fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceLimit { .. } | Self::AllocationFailure { .. }
+        )
+    }
+}
+
 /// Validate all FIR tables and every function CFG before lowering.
 pub fn validate(
     program: Program,
@@ -3312,6 +3323,24 @@ impl std::error::Error for LoweringError {
     }
 }
 
+impl LoweringError {
+    /// Whether this refusal is a budget or allocation failure, including
+    /// ownership-insertion resource refusals.
+    pub fn is_resource_exhaustion(&self) -> bool {
+        match self {
+            Self::AllocationFailure { .. } => true,
+            Self::OwnershipInsertion(error) => error.is_resource_exhaustion(),
+            _ => false,
+        }
+    }
+
+    /// Whether this refusal is an internal accounting fault, never a source
+    /// verdict.
+    pub fn is_internal_fault(&self) -> bool {
+        matches!(self, Self::InternalInvariant { .. })
+    }
+}
+
 /// Deterministically lower validated target-neutral FIR to independently
 /// validated FLBC. Failure publishes no FLBC wrapper and never falls back
 /// across stages.
@@ -3856,6 +3885,45 @@ mod tests {
 
     fn f(raw: u32) -> FunctionId {
         FunctionId::new(raw)
+    }
+
+    #[test]
+    fn resource_exhaustion_classifiers_do_not_promote_shape_refusals() {
+        assert!(
+            ValidationError::ResourceLimit {
+                resource: ValidationResource::Functions,
+                limit: 0,
+                observed: 1,
+            }
+            .is_resource_exhaustion()
+        );
+        assert!(!ValidationError::EmptyProgram.is_resource_exhaustion());
+        assert!(
+            LoweringError::AllocationFailure {
+                table: "functions",
+                requested: 1,
+            }
+            .is_resource_exhaustion()
+        );
+        assert!(
+            LoweringError::InternalInvariant {
+                reason: "register file shrank",
+            }
+            .is_internal_fault()
+        );
+        assert!(
+            !LoweringError::InternalInvariant {
+                reason: "register file shrank",
+            }
+            .is_resource_exhaustion()
+        );
+        assert!(
+            LoweringError::OwnershipInsertion(crate::flbc::OwnershipError::AllocationFailure {
+                resource: crate::flbc::OwnershipResource::Functions,
+                requested: 1,
+            })
+            .is_resource_exhaustion()
+        );
     }
 
     fn b(raw: u32) -> BlockId {

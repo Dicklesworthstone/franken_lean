@@ -224,6 +224,17 @@ impl fmt::Display for CodecError {
 
 impl std::error::Error for CodecError {}
 
+impl CodecError {
+    /// Whether this refusal is a budget or allocation failure, not a
+    /// malformed-artifact refusal.
+    pub fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceLimit { .. } | Self::AllocationFailure { .. }
+        )
+    }
+}
+
 /// A function-table index.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FunctionId(u32);
@@ -1168,6 +1179,17 @@ impl std::error::Error for OwnershipError {
             Self::CandidateValidation(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl OwnershipError {
+    /// Whether this refusal is a budget or allocation failure, not a
+    /// witness-shape refusal.
+    pub fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceLimit { .. } | Self::AllocationFailure { .. }
+        )
     }
 }
 
@@ -6390,6 +6412,27 @@ mod codec_tests {
 
     fn r(raw: u16) -> Register {
         Register::new(raw)
+    }
+
+    #[test]
+    fn codec_and_ownership_resource_exhaustion_is_not_a_shape_refusal() {
+        assert!(
+            CodecError::ResourceLimit {
+                resource: CodecResource::ArtifactBytes,
+                limit: 0,
+                observed: 1,
+            }
+            .is_resource_exhaustion()
+        );
+        assert!(!CodecError::BadMagic.is_resource_exhaustion());
+        assert!(
+            OwnershipError::AllocationFailure {
+                resource: OwnershipResource::Functions,
+                requested: 1,
+            }
+            .is_resource_exhaustion()
+        );
+        assert!(!OwnershipError::ProgramIdentityChanged.is_resource_exhaustion());
     }
 
     fn f(raw: u32) -> FunctionId {
