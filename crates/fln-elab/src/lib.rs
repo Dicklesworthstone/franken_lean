@@ -345,19 +345,39 @@ fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
 /// function, determines whether the function and arguments make the declaration
 /// admissible.
 pub fn elaborate_nat_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
-    elaborate_definition_with_types(syntax, false)
+    elaborate_definition_with_types(syntax, false, None)
+}
+
+/// Same as [`elaborate_nat_definition`], but omitted results may follow
+/// already-checked constants in `environment`.
+pub fn elaborate_nat_definition_in(
+    syntax: &Syntax,
+    environment: &Environment,
+) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_definition_with_types(syntax, false, Some(environment))
 }
 
 /// Elaborate the canonical bounded definition tree over exact `Nat` and
 /// `String` types. K1 remains responsible for checking every reference,
 /// application, literal type, and declared result before publication.
 pub fn elaborate_definition(syntax: &Syntax) -> Result<Declaration, NatDefinitionElabError> {
-    elaborate_definition_with_types(syntax, true)
+    elaborate_definition_with_types(syntax, true, None)
+}
+
+/// Same as [`elaborate_definition`], consulting `environment` so an omitted
+/// result on `def message := copy "hello"` becomes `String` when `copy` is
+/// already a checked `String → String`.
+pub fn elaborate_definition_in(
+    syntax: &Syntax,
+    environment: &Environment,
+) -> Result<Declaration, NatDefinitionElabError> {
+    elaborate_definition_with_types(syntax, true, Some(environment))
 }
 
 fn elaborate_definition_with_types(
     syntax: &Syntax,
     allow_string: bool,
+    environment: Option<&Environment>,
 ) -> Result<Declaration, NatDefinitionElabError> {
     let declaration = expect_node(
         syntax,
@@ -508,6 +528,7 @@ fn elaborate_definition_with_types(
         &parameters,
         &elaboration_result_type,
         allow_string,
+        environment,
     )?;
 
     let termination = expect_node(
@@ -524,8 +545,9 @@ fn elaborate_definition_with_types(
 
     let name = declaration_name.clone();
     let mut declaration_type = ascribed_result.unwrap_or_else(|| {
-        infer_let_binder_type(&expression, &parameters)
-            .unwrap_or_else(|| Expr::const_(Name::from_components(["Nat"]), Vec::new()))
+        infer_expr_type(&expression, &parameters, environment)
+            .and_then(|ty| scalar_result_type(ty, allow_string))
+            .unwrap_or_else(nat_const)
     });
     for (parameter, parameter_type) in parameters.iter().rev() {
         declaration_type = Expr::forall_e(
@@ -612,12 +634,13 @@ fn elaborate_term(
     locals: &[(Name, Expr)],
     result_type: &Expr,
     allow_string: bool,
+    environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
     let Syntax::Node { kind, args, .. } = syntax else {
         return elaborate_atom(syntax, locals, allow_string);
     };
     if kind == &parser_kind(&["Term", "let"]) {
-        return elaborate_let(args, locals, result_type, allow_string);
+        return elaborate_let(args, locals, result_type, allow_string, environment);
     }
     if kind != &parser_kind(&["Term", "app"]) {
         return elaborate_atom(syntax, locals, allow_string);
@@ -658,18 +681,65 @@ fn elaborate_term(
     Ok(expression)
 }
 
+fn nat_const() -> Expr {
+    Expr::const_(Name::from_components(["Nat"]), Vec::new())
+}
+
+fn string_const() -> Expr {
+    Expr::const_(Name::from_components(["String"]), Vec::new())
+}
+
+fn environment_constant_type(name: &Name, environment: Option<&Environment>) -> Option<Expr> {
+    let info = environment?.find(name)?;
+    let val = info.constant_val();
+    if !val.level_params.is_empty() {
+        return None;
+    }
+    Some(val.type_.clone())
+}
+
+fn acceptable_inferred(ty: &Expr, allow_string: bool) -> bool {
+    match ty.node() {
+        ExprNode::Const { name, levels } if levels.is_empty() => {
+            name == &Name::from_components(["Nat"])
+                || (allow_string && name == &Name::from_components(["String"]))
+        }
+        ExprNode::ForallE { body, .. } if !body.has_loose_bvars() => {
+            acceptable_inferred(body, allow_string)
+        }
+        _ => false,
+    }
+}
+
+fn scalar_result_type(ty: Expr, allow_string: bool) -> Option<Expr> {
+    match ty.node() {
+        ExprNode::Const { name, levels }
+            if levels.is_empty()
+                && (name == &Name::from_components(["Nat"])
+                    || (allow_string && name == &Name::from_components(["String"]))) =>
+        {
+            Some(ty)
+        }
+        _ => None,
+    }
+}
+
 /// The type a `let` binder — or an omitted declaration result — should carry.
-/// Literals and already-bound names have an exact scalar type. Applications
-/// and environment constants are left to the kernel: we fall back to the
-/// declaration result type there.
-fn infer_let_binder_type(value: &Expr, locals: &[(Name, Expr)]) -> Option<Expr> {
+/// Literals and already-bound names have an exact scalar type. Environment
+/// constants and saturated first-order applications consult the snapshot when
+/// one is provided; dependent remaining types stay with the declaration result.
+fn infer_expr_type(
+    value: &Expr,
+    locals: &[(Name, Expr)],
+    environment: Option<&Environment>,
+) -> Option<Expr> {
     match value.node() {
         ExprNode::Lit {
             literal: Literal::Nat(_),
-        } => Some(Expr::const_(Name::from_components(["Nat"]), Vec::new())),
+        } => Some(nat_const()),
         ExprNode::Lit {
             literal: Literal::Str(_),
-        } => Some(Expr::const_(Name::from_components(["String"]), Vec::new())),
+        } => Some(string_const()),
         ExprNode::BVar { idx } => locals
             .iter()
             .rev()
@@ -678,7 +748,40 @@ fn infer_let_binder_type(value: &Expr, locals: &[(Name, Expr)]) -> Option<Expr> 
         ExprNode::LetE { type_, body, .. } => {
             let mut extended = locals.to_vec();
             extended.push((Name::anonymous(), type_.clone()));
-            infer_let_binder_type(body, &extended)
+            infer_expr_type(body, &extended, environment)
+        }
+        ExprNode::Const { name, levels } if levels.is_empty() => {
+            environment_constant_type(name, environment)
+        }
+        ExprNode::App { .. } => {
+            let mut arity = 0_usize;
+            let mut head = value;
+            while let ExprNode::App { f, .. } = head.node() {
+                arity = arity.checked_add(1)?;
+                head = f;
+            }
+            let mut ty = match head.node() {
+                ExprNode::Const { name, levels } if levels.is_empty() => {
+                    environment_constant_type(name, environment)?
+                }
+                ExprNode::BVar { idx } => locals
+                    .iter()
+                    .rev()
+                    .nth(usize::try_from(*idx).ok()?)?
+                    .1
+                    .clone(),
+                _ => return None,
+            };
+            for _ in 0..arity {
+                let ExprNode::ForallE { body, .. } = ty.node() else {
+                    return None;
+                };
+                if body.has_loose_bvars() {
+                    return None;
+                }
+                ty = body.clone();
+            }
+            Some(ty)
         }
         _ => None,
     }
@@ -689,6 +792,7 @@ fn elaborate_let(
     locals: &[(Name, Expr)],
     result_type: &Expr,
     allow_string: bool,
+    environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
     let [keyword, config, declaration, separator, body] = parts else {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
@@ -735,13 +839,21 @@ fn elaborate_let(
     expect_empty_null(&declaration[1], "empty let binder array")?;
     expect_empty_null(&declaration[2], "absent explicit let type")?;
     expect_atom(&declaration[3], ":=", "let assignment")?;
-    let value = elaborate_term(&declaration[4], locals, result_type, allow_string)?;
+    let value = elaborate_term(
+        &declaration[4],
+        locals,
+        result_type,
+        allow_string,
+        environment,
+    )?;
     expect_atom(separator, ";", "let body separator")?;
 
-    let binder_type = infer_let_binder_type(&value, locals).unwrap_or_else(|| result_type.clone());
+    let binder_type = infer_expr_type(&value, locals, environment)
+        .filter(|ty| acceptable_inferred(ty, allow_string))
+        .unwrap_or_else(|| result_type.clone());
     let mut body_locals = locals.to_vec();
     body_locals.push((local_name.clone(), binder_type.clone()));
-    let body = elaborate_term(body, &body_locals, result_type, allow_string)?;
+    let body = elaborate_term(body, &body_locals, result_type, allow_string, environment)?;
     Ok(Expr::let_e(
         local_name.clone(),
         binder_type,
@@ -767,7 +879,7 @@ pub fn check_nat_definition_source(
     budget: Budget,
 ) -> Result<NatDefinitionCheck, NatDefinitionFrontendError> {
     let parsed = parse_nat_definition(source)?;
-    let declaration = elaborate_nat_definition(parsed.syntax())?;
+    let declaration = elaborate_nat_definition_in(parsed.syntax(), environment)?;
     let outcome = check(environment, &declaration, budget);
     Ok(NatDefinitionCheck {
         parsed,
@@ -786,7 +898,7 @@ pub fn check_definition_source(
     budget: Budget,
 ) -> Result<DefinitionCheck, DefinitionFrontendError> {
     let parsed = parse_definition(source)?;
-    let declaration = elaborate_definition(parsed.syntax())?;
+    let declaration = elaborate_definition_in(parsed.syntax(), environment)?;
     let outcome = check(environment, &declaration, budget);
     Ok(DefinitionCheck {
         parsed,
@@ -1009,6 +1121,7 @@ mod tests {
                 &[],
                 &Expr::const_(Name::from_components(["Nat"]), Vec::new()),
                 false,
+                None,
             ),
             Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "Lean.Parser.Term.app"
@@ -1202,5 +1315,83 @@ mod tests {
             panic!("the un-ascribed Nat command must elaborate to a definition");
         };
         assert_eq!(answer.base.type_, nat_ty);
+    }
+
+    #[test]
+    fn omitted_result_type_follows_environment_constants_and_applications() {
+        use fln_env::constants::{AxiomVal, ConstantInfo};
+
+        let string_ty = Expr::const_(Name::from_components(["String"]), Vec::new());
+        let copy_ty = Expr::forall_e(
+            Name::from_components(["value"]),
+            string_ty.clone(),
+            string_ty.clone(),
+            BinderInfo::Default,
+        );
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: Name::from_components(["greet"]),
+                    level_params: Vec::new(),
+                    type_: string_ty.clone(),
+                },
+                is_unsafe: false,
+            }))
+            .expect("the greet axiom is a unique test fixture")
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: Name::from_components(["copy"]),
+                    level_params: Vec::new(),
+                    type_: copy_ty,
+                },
+                value: Expr::lit(Literal::Str("unused".to_owned())),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![Name::from_components(["copy"])],
+            }))
+            .expect("the copy fixture is a unique test name");
+
+        let parsed = parse_definition(b"def message := greet")
+            .expect("an un-ascribed constant reference is in the scalar grammar");
+        let Declaration::Defn(greet) = elaborate_definition_in(parsed.syntax(), &env)
+            .expect("omitted result follows a String constant in the snapshot")
+        else {
+            panic!("the greet command must elaborate to a definition");
+        };
+        assert_eq!(greet.base.type_, string_ty);
+
+        let parsed = parse_definition(b"def message := copy \"hello\"")
+            .expect("an un-ascribed String application is in the scalar grammar");
+        let Declaration::Defn(applied) = elaborate_definition_in(parsed.syntax(), &env)
+            .expect("omitted result follows a saturated String function")
+        else {
+            panic!("the applied command must elaborate to a definition");
+        };
+        assert_eq!(applied.base.type_, string_ty);
+
+        let parsed = parse_definition(b"def message := let x := copy \"hi\"; x")
+            .expect("an un-ascribed let of an application is in the scalar grammar");
+        let Declaration::Defn(bound) = elaborate_definition_in(parsed.syntax(), &env)
+            .expect("the let binder and omitted result both follow the application")
+        else {
+            panic!("the bound command must elaborate to a definition");
+        };
+        assert_eq!(bound.base.type_, string_ty);
+        let ExprNode::LetE { type_, .. } = bound.value.node() else {
+            panic!("the bound command must be a let");
+        };
+        assert_eq!(type_, &string_ty);
+
+        let parsed = parse_definition(b"def message := copy \"hello\"")
+            .expect("the env-less door still parses the same tree");
+        let Declaration::Defn(without_env) = elaborate_definition(parsed.syntax())
+            .expect("the env-less API remains the Nat default for applications")
+        else {
+            panic!("the env-less command must elaborate to a definition");
+        };
+        assert_eq!(
+            without_env.base.type_,
+            Expr::const_(Name::from_components(["Nat"]), Vec::new())
+        );
     }
 }
