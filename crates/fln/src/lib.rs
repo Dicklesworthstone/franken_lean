@@ -5859,7 +5859,7 @@ mod tests {
         let completed = engine
             .execute_source_definitions(
                 &[
-                    b"def copy (value : String) : String := value",
+                    b"def copy (value : String) := value",
                     b"def message : String := copy \"source\\nconnected\"",
                 ],
                 &options,
