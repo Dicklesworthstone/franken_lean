@@ -2917,8 +2917,7 @@ fn source_nat_intrinsic_binding(
     let ConstantInfo::Axiom(actual) = info else {
         return None;
     };
-    let Declaration::Axiom(expected) =
-        fln_elab::seed::source_intrinsic_seed_declaration(name)?
+    let Declaration::Axiom(expected) = fln_elab::seed::source_intrinsic_seed_declaration(name)?
     else {
         return None;
     };
@@ -6057,7 +6056,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 3);
+        assert_eq!(engine.environment().len(), 5);
         assert!(
             engine
                 .environment()
@@ -6072,6 +6071,16 @@ mod tests {
             engine
                 .environment()
                 .contains(&Name::from_components(["Nat", "add"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["Nat", "sub"]))
+        );
+        assert!(
+            engine
+                .environment()
+                .contains(&Name::from_components(["Nat", "mul"]))
         );
 
         let completed = engine
@@ -6098,7 +6107,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 5);
+        assert_eq!(completed.engine.environment().len(), 7);
     }
 
     #[test]
@@ -6239,6 +6248,48 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn checked_definitions_named_nat_mul_and_sub_are_not_replaced_by_seed_intrinsics() {
+        let options = KVMap::new();
+        let engine = seeded_engine();
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def Nat.mul (left right : Nat) : Nat := left",
+                    b"def product := Nat.mul 40 2",
+                    b"def Nat.sub (left right : Nat) : Nat := right",
+                    b"def answer := Nat.sub product 3",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("ordinary checked arithmetic names remain ordinary functions");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary arithmetic definition batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[3].exit),
+            Ok(Some(ClosedVmValue::Scalar(3)))
+        );
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[3].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the exact executed ordinary-function FLBC decodes canonically");
+        for forbidden in ["Nat.mul", "Nat.sub"] {
+            let row = fln_vm::extern_table_generated::EXTERN_ROWS
+                .iter()
+                .find(|row| row.name == forbidden)
+                .expect("the generated pin census contains the arithmetic row")
+                .id;
+            assert!(executable.functions().iter().all(|function| {
+                function.code.iter().all(|instruction| {
+                    !matches!(instruction, Instruction::Intrinsic { row: actual, .. } if actual == row)
+                })
+            }));
+        }
     }
 
     #[test]
