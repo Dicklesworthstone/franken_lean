@@ -957,11 +957,45 @@ pub fn check_definition_source(
 mod tests {
     use super::*;
     use fln_core::expr::{ExprNode, NatLit};
+    use fln_core::level::Level;
+    use fln_env::constants::AxiomVal;
+    use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+    use fln_env::pmap::CollisionBudget;
+    use fln_kernel::capability::{Published, admit};
+    use fln_kernel::council::{Council, CouncilOutcome, convene};
     use fln_kernel::verdict::RejectClass;
     use seed::bootstrap_nat_environment;
 
     fn nat_environment() -> Environment {
         bootstrap_nat_environment(Budget::DEFAULT).expect("the small Nat fixture must publish")
+    }
+
+    fn publish_test_axiom(environment: &Environment, name: &str, type_: Expr) -> Environment {
+        let declaration = Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: Name::from_components([name]),
+                level_params: Vec::new(),
+                type_,
+            },
+            is_unsafe: false,
+        });
+        let Outcome::Complete(admitted) = admit(environment, declaration, Budget::DEFAULT) else {
+            panic!("the bounded test axiom must reach a kernel verdict");
+        };
+        let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+        else {
+            panic!("the kernel-accepted test axiom must pass the empty council");
+        };
+        let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(publication))) =
+            checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            )
+        else {
+            panic!("the checked test axiom must publish exactly once");
+        };
+        publication.environment
     }
 
     #[test]
@@ -1390,8 +1424,6 @@ mod tests {
 
     #[test]
     fn omitted_result_type_follows_environment_constants_and_applications() {
-        use fln_env::constants::{AxiomVal, ConstantInfo};
-
         let string_ty = Expr::const_(Name::from_components(["String"]), Vec::new());
         let copy_ty = Expr::forall_e(
             Name::from_components(["value"]),
@@ -1399,28 +1431,9 @@ mod tests {
             string_ty.clone(),
             BinderInfo::Default,
         );
-        let env = Environment::new()
-            .add_decl(ConstantInfo::Axiom(AxiomVal {
-                base: ConstantVal {
-                    name: Name::from_components(["greet"]),
-                    level_params: Vec::new(),
-                    type_: string_ty.clone(),
-                },
-                is_unsafe: false,
-            }))
-            .expect("the greet axiom is a unique test fixture")
-            .add_decl(ConstantInfo::Defn(DefinitionVal {
-                base: ConstantVal {
-                    name: Name::from_components(["copy"]),
-                    level_params: Vec::new(),
-                    type_: copy_ty.clone(),
-                },
-                value: Expr::lit(Literal::Str("unused".to_owned())),
-                hints: ReducibilityHints::Regular(1),
-                safety: DefinitionSafety::Safe,
-                all: vec![Name::from_components(["copy"])],
-            }))
-            .expect("the copy fixture is a unique test name");
+        let env = publish_test_axiom(&nat_environment(), "String", Expr::sort(Level::one()));
+        let env = publish_test_axiom(&env, "greet", string_ty.clone());
+        let env = publish_test_axiom(&env, "copy", copy_ty.clone());
 
         let parsed = parse_definition(b"def message := greet")
             .expect("an un-ascribed constant reference is in the scalar grammar");
