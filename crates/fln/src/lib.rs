@@ -2994,22 +2994,22 @@ fn executable_signature(
                     ..
                 } = body.node()
                 else {
-                    // A function alias or partial application is a closed
-                    // function value, not a lambda spine. Only eta-expand when
-                    // no binders were already peeled: a remaining Π after a
-                    // real lambda is a function-returning function, which this
-                    // catalog does not compile.
-                    if parameters.is_empty() {
-                        return eta_expand_signature(
-                            body,
-                            declared_type,
-                            nat_type,
-                            string_type,
-                            visited_nodes,
-                            limits,
-                        );
+                    // Remaining Π after zero or more real lambdas is still a
+                    // first-order function (`fun ignored => copy`). Eta is
+                    // sound only when the current body is closed; a body that
+                    // already mentions peeled binders would need lifting.
+                    if body.has_loose_bvars() {
+                        return Ok(None);
                     }
-                    return Ok(None);
+                    return eta_expand_signature(
+                        body,
+                        declared_type,
+                        parameters,
+                        nat_type,
+                        string_type,
+                        visited_nodes,
+                        limits,
+                    );
                 };
                 if value_binder_type != binder_type {
                     return Ok(None);
@@ -3049,11 +3049,13 @@ fn executable_signature(
     }))
 }
 
-/// Compile `alias := copy` as `fun x => copy x` when the checked type is a
-/// first-order scalar telescope and the value is already that function.
+/// Compile `fun ignored => copy` as `fun ignored x => copy x` when the
+/// remaining type is a first-order scalar telescope and `function` is already
+/// that closed function value.
 fn eta_expand_signature(
     function: &Expr,
     remaining_type: &Expr,
+    mut parameters: Vec<ValueType>,
     nat_type: &Expr,
     string_type: &Expr,
     visited_nodes: &mut usize,
@@ -3062,7 +3064,7 @@ fn eta_expand_signature(
     use fln_core::expr::ExprNode;
 
     let mut remaining = remaining_type;
-    let mut parameters = Vec::new();
+    let mut extra = 0_usize;
     loop {
         charge_catalog_node(visited_nodes, limits)?;
         let ExprNode::ForallE {
@@ -3077,6 +3079,7 @@ fn eta_expand_signature(
         let Some((parameter, _)) = executable_value_type(binder_type, nat_type, string_type) else {
             return Ok(None);
         };
+        extra = extra.saturating_add(1);
         let observed = parameters.len().saturating_add(1);
         if observed > limits.max_context_depth {
             return Err(IngressError::ResourceLimit {
@@ -3094,7 +3097,7 @@ fn eta_expand_signature(
         parameters.push(parameter);
         remaining = body;
     }
-    if parameters.is_empty() {
+    if extra == 0 {
         return Ok(None);
     }
     let Some((result, result_ownership)) = executable_value_type(remaining, nat_type, string_type)
@@ -3102,7 +3105,6 @@ fn eta_expand_signature(
         return Ok(None);
     };
 
-    let extra = parameters.len();
     let mut eta = function.clone();
     for index in (0..extra).rev() {
         charge_catalog_node(visited_nodes, limits)?;
@@ -6087,6 +6089,34 @@ mod tests {
         assert_eq!(
             closed_vm_value(&completed.executions[2].exit),
             Ok(Some(ClosedVmValue::String("via-alias".to_owned())))
+        );
+    }
+
+    #[test]
+    fn returning_a_function_from_a_parameter_is_eta_applied() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("both source type names pass the dual-checker council")
+            .into_complete()
+            .expect("the bounded two-row source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def copy (value : String) := value",
+                    b"def wrap (ignored : String) := copy",
+                    b"def message := wrap \"ignored\" \"kept\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("fun ignored => copy must compile as fun ignored value => copy value");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the function-returning wrapper batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 3);
+        assert_eq!(
+            closed_vm_value(&completed.executions[2].exit),
+            Ok(Some(ClosedVmValue::String("kept".to_owned())))
         );
     }
 
