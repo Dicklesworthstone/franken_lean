@@ -2246,14 +2246,10 @@ where
             return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
         }
         Err(error) => {
-            let (class, authority, exit_code) = match &error {
-                fln::EngineAdmissionError::CouncilHalted { .. } => ("inconclusive", false, 3),
-                fln::EngineAdmissionError::CheckerBridge { .. }
-                | fln::EngineAdmissionError::UnexpectedPublication { .. } => {
-                    ("internal-fault", false, 4)
-                }
-                _ => ("seed", true, 1),
-            };
+            // Seed admission is ordinary declaration admission. A second
+            // catch-all here used to promote AllocationFailure to an
+            // authoritative `seed` rejection (FL-INV-07).
+            let (class, authority, exit_code) = admission_error_disposition(&error);
             return source_failure(class, &error.to_string(), authority, json, exit_code);
         }
     };
@@ -4018,6 +4014,17 @@ mod tests {
         assert_eq!(
             execution_error_disposition(&lowering_fault),
             ("internal-fault", false, 4)
+        );
+
+        // with_source_seed is ordinary admission. The old seed catch-all
+        // rendered this as `seed` / exit 1.
+        let seed_exhausted = fln::EngineAdmissionError::AllocationFailure {
+            resource: "seed declaration table",
+            requested: usize::MAX,
+        };
+        assert_eq!(
+            admission_error_disposition(&seed_exhausted),
+            ("resource", false, 3)
         );
     }
 
