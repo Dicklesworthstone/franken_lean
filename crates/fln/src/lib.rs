@@ -2870,7 +2870,7 @@ fn executable_dependencies(
                 requested: observed,
             })?;
         let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
-        collect_executable_constants(signature.body, &mut pending, &mut visited_nodes, limits)?;
+        collect_executable_constants(&signature.body, &mut pending, &mut visited_nodes, limits)?;
         functions.push(FunctionBinding {
             name,
             universe_arity: 0,
@@ -2878,7 +2878,7 @@ fn executable_dependencies(
             parameter_ownership,
             result: signature.result,
             result_ownership: signature.result_ownership,
-            body: signature.body.clone(),
+            body: signature.body,
         });
     }
     Ok(functions)
@@ -2910,6 +2910,15 @@ fn executable_lambda(
     if signature.parameters.is_empty() {
         return Ok(None);
     }
+    // Catalog eta can give a Const/App alias a first-order signature. Only a
+    // real lambda spine is a publishable local closure; executing `copy` as a
+    // zero-argument program is an arity error.
+    if !matches!(
+        definition.value.node(),
+        fln_core::expr::ExprNode::Lam { .. }
+    ) {
+        return Ok(None);
+    }
     let parameter_ownership = borrowed_runtime_parameters(signature.parameters.len())?;
     Ok(Some(LambdaBinding {
         lambda: definition.value.clone(),
@@ -2935,11 +2944,11 @@ fn borrowed_runtime_parameters(
     Ok(parameter_ownership)
 }
 
-struct ExecutableSignature<'a> {
+struct ExecutableSignature {
     parameters: Vec<ValueType>,
     result: ValueType,
     result_ownership: CallableResultOwnership,
-    body: &'a Expr,
+    body: Expr,
 }
 
 /// Bind one checked definition to the compiler's exact first-order runtime ABI.
@@ -2949,13 +2958,13 @@ struct ExecutableSignature<'a> {
 /// deliberately narrower representation than definitional equality so it
 /// never invents an erasure rule. The returned body has its top-level lambdas
 /// removed, as required by [`FunctionBinding`].
-fn executable_signature<'a>(
-    definition: &'a DefinitionVal,
+fn executable_signature(
+    definition: &DefinitionVal,
     nat_type: &Expr,
     string_type: &Expr,
     visited_nodes: &mut usize,
     limits: IngressLimits,
-) -> Result<Option<ExecutableSignature<'a>>, IngressError> {
+) -> Result<Option<ExecutableSignature>, IngressError> {
     use fln_core::expr::ExprNode;
 
     if !definition.base.level_params.is_empty() {
@@ -2985,6 +2994,21 @@ fn executable_signature<'a>(
                     ..
                 } = body.node()
                 else {
+                    // A function alias or partial application is a closed
+                    // function value, not a lambda spine. Only eta-expand when
+                    // no binders were already peeled: a remaining Π after a
+                    // real lambda is a function-returning function, which this
+                    // catalog does not compile.
+                    if parameters.is_empty() {
+                        return eta_expand_signature(
+                            body,
+                            declared_type,
+                            nat_type,
+                            string_type,
+                            visited_nodes,
+                            limits,
+                        );
+                    }
                     return Ok(None);
                 };
                 if value_binder_type != binder_type {
@@ -3021,7 +3045,84 @@ fn executable_signature<'a>(
         parameters,
         result,
         result_ownership,
-        body,
+        body: body.clone(),
+    }))
+}
+
+/// Compile `alias := copy` as `fun x => copy x` when the checked type is a
+/// first-order scalar telescope and the value is already that function.
+fn eta_expand_signature(
+    function: &Expr,
+    remaining_type: &Expr,
+    nat_type: &Expr,
+    string_type: &Expr,
+    visited_nodes: &mut usize,
+    limits: IngressLimits,
+) -> Result<Option<ExecutableSignature>, IngressError> {
+    use fln_core::expr::ExprNode;
+
+    let mut remaining = remaining_type;
+    let mut parameters = Vec::new();
+    loop {
+        charge_catalog_node(visited_nodes, limits)?;
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = remaining.node()
+        else {
+            break;
+        };
+        if body.has_loose_bvars() {
+            return Ok(None);
+        }
+        let Some((parameter, _)) = executable_value_type(binder_type, nat_type, string_type) else {
+            return Ok(None);
+        };
+        let observed = parameters.len().saturating_add(1);
+        if observed > limits.max_context_depth {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ContextDepth,
+                limit: limits.max_context_depth,
+                observed,
+            });
+        }
+        parameters
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: observed,
+            })?;
+        parameters.push(parameter);
+        remaining = body;
+    }
+    if parameters.is_empty() {
+        return Ok(None);
+    }
+    let Some((result, result_ownership)) = executable_value_type(remaining, nat_type, string_type)
+    else {
+        return Ok(None);
+    };
+
+    let extra = parameters.len();
+    let mut eta = function.clone();
+    for index in (0..extra).rev() {
+        charge_catalog_node(visited_nodes, limits)?;
+        let index = u32::try_from(index).map_err(|_| IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: limits.max_context_depth,
+            observed: extra,
+        })?;
+        let argument = Expr::bvar(index).map_err(|_| IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: limits.max_context_depth,
+            observed: extra,
+        })?;
+        eta = Expr::app(eta, argument);
+    }
+    Ok(Some(ExecutableSignature {
+        parameters,
+        result,
+        result_ownership,
+        body: eta,
     }))
 }
 

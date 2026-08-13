@@ -335,6 +335,40 @@ fn scalar_type(name: &Name, allow_string: bool) -> Option<Expr> {
     }
 }
 
+fn optional_scalar_type(
+    syntax: &Syntax,
+    allow_string: bool,
+    optional_expected: &'static str,
+    scalar_expected: &'static str,
+) -> Result<Option<Expr>, NatDefinitionElabError> {
+    let optional = expect_null_args(syntax, optional_expected)?;
+    match optional {
+        [] => Ok(None),
+        [type_spec] => {
+            let parts = expect_node(
+                type_spec,
+                &parser_kind(&["Term", "typeSpec"]),
+                2,
+                "Lean.Parser.Term.typeSpec",
+            )?;
+            expect_atom(&parts[0], ":", "explicit type ascription")?;
+            let Syntax::Ident { val: type_name, .. } = &parts[1] else {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: scalar_expected,
+                });
+            };
+            Ok(Some(scalar_type(type_name, allow_string).ok_or(
+                NatDefinitionElabError::UnexpectedSyntax {
+                    expected: scalar_expected,
+                },
+            )?))
+        }
+        _ => Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: optional_expected,
+        }),
+    }
+}
+
 /// Elaborate the exact canonical tree produced by
 /// [`fln_parse::parse_nat_definition`].
 ///
@@ -478,37 +512,12 @@ fn elaborate_definition_with_types(
             parameters.push((parameter.clone(), parameter_type.clone()));
         }
     }
-    let ascribed_result = expect_null_args(&signature[1], "optional explicit result type")?;
-    let ascribed_result = match ascribed_result {
-        [] => None,
-        [result_type] => {
-            let parts = expect_node(
-                result_type,
-                &parser_kind(&["Term", "typeSpec"]),
-                2,
-                "Lean.Parser.Term.typeSpec",
-            )?;
-            expect_atom(&parts[0], ":", "explicit result type ascription")?;
-            let Syntax::Ident {
-                val: result_type, ..
-            } = &parts[1]
-            else {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "Nat result type",
-                });
-            };
-            Some(scalar_type(result_type, allow_string).ok_or(
-                NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "supported scalar result type",
-                },
-            )?)
-        }
-        _ => {
-            return Err(NatDefinitionElabError::UnexpectedSyntax {
-                expected: "optional explicit result type",
-            });
-        }
-    };
+    let ascribed_result = optional_scalar_type(
+        &signature[1],
+        allow_string,
+        "optional explicit result type",
+        "supported scalar result type",
+    )?;
     // Lets still need an expected type for un-inferable apps/consts. Nat is
     // the historical default; omitted declaration results are refined after
     // the body elaborates.
@@ -546,9 +555,12 @@ fn elaborate_definition_with_types(
     let name = declaration_name.clone();
     let mut declaration_type = ascribed_result.unwrap_or_else(|| {
         infer_expr_type(&expression, &parameters, environment)
-            .and_then(|ty| scalar_result_type(ty, allow_string))
+            .filter(|ty| acceptable_inferred(ty, allow_string))
             .unwrap_or_else(nat_const)
     });
+    if parameters.is_empty() {
+        expression = eta_expand_nondependent(expression, &declaration_type)?;
+    }
     for (parameter, parameter_type) in parameters.iter().rev() {
         declaration_type = Expr::forall_e(
             parameter.clone(),
@@ -711,19 +723,6 @@ fn acceptable_inferred(ty: &Expr, allow_string: bool) -> bool {
     }
 }
 
-fn scalar_result_type(ty: Expr, allow_string: bool) -> Option<Expr> {
-    match ty.node() {
-        ExprNode::Const { name, levels }
-            if levels.is_empty()
-                && (name == &Name::from_components(["Nat"])
-                    || (allow_string && name == &Name::from_components(["String"]))) =>
-        {
-            Some(ty)
-        }
-        _ => None,
-    }
-}
-
 /// The type a `let` binder — or an omitted declaration result — should carry.
 /// Literals and already-bound names have an exact scalar type. Environment
 /// constants and saturated first-order applications consult the snapshot when
@@ -787,6 +786,46 @@ fn infer_expr_type(
     }
 }
 
+/// Turn `alias := copy` into `fun x => copy x` when the inferred type is a
+/// non-dependent first-order telescope. The source door has no expected-type
+/// input, so this is the only way a function alias becomes a real lambda the
+/// compiler catalog already knows how to publish and apply.
+fn eta_expand_nondependent(value: Expr, inferred: &Expr) -> Result<Expr, NatDefinitionElabError> {
+    if matches!(value.node(), ExprNode::Lam { .. }) {
+        return Ok(value);
+    }
+    let mut binders = Vec::new();
+    let mut remaining = inferred;
+    while let ExprNode::ForallE {
+        binder_name,
+        binder_type,
+        body,
+        binder_info,
+    } = remaining.node()
+    {
+        if body.has_loose_bvars() {
+            return Ok(value);
+        }
+        binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+        remaining = body;
+    }
+    if binders.is_empty() {
+        return Ok(value);
+    }
+
+    let extra = binders.len();
+    let mut eta = value;
+    for index in (0..extra).rev() {
+        let index = u32::try_from(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
+        let argument = Expr::bvar(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
+        eta = Expr::app(eta, argument);
+    }
+    for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+        eta = Expr::lam(binder_name, binder_type, eta, binder_info);
+    }
+    Ok(eta)
+}
+
 fn elaborate_let(
     parts: &[Syntax],
     locals: &[(Name, Expr)],
@@ -837,7 +876,12 @@ fn elaborate_let(
         return Err(NatDefinitionElabError::AnonymousReferenceName);
     }
     expect_empty_null(&declaration[1], "empty let binder array")?;
-    expect_empty_null(&declaration[2], "absent explicit let type")?;
+    let ascribed_type = optional_scalar_type(
+        &declaration[2],
+        allow_string,
+        "optional explicit let type",
+        "supported scalar let type",
+    )?;
     expect_atom(&declaration[3], ":=", "let assignment")?;
     let value = elaborate_term(
         &declaration[4],
@@ -848,9 +892,11 @@ fn elaborate_let(
     )?;
     expect_atom(separator, ";", "let body separator")?;
 
-    let binder_type = infer_expr_type(&value, locals, environment)
-        .filter(|ty| acceptable_inferred(ty, allow_string))
-        .unwrap_or_else(|| result_type.clone());
+    let binder_type = ascribed_type.unwrap_or_else(|| {
+        infer_expr_type(&value, locals, environment)
+            .filter(|ty| acceptable_inferred(ty, allow_string))
+            .unwrap_or_else(|| result_type.clone())
+    });
     let mut body_locals = locals.to_vec();
     body_locals.push((local_name.clone(), binder_type.clone()));
     let body = elaborate_term(body, &body_locals, result_type, allow_string, environment)?;
@@ -1200,6 +1246,31 @@ mod tests {
             &Expr::const_(Name::from_components(["String"]), Vec::new())
         );
 
+        let typed = parse_definition(b"def typed := let value : String := \"explicit\"; value")
+            .expect("an exact explicit String let type is in the scalar grammar");
+        let Declaration::Defn(typed) = elaborate_definition(typed.syntax())
+            .expect("the explicit let type elaborates into the core let")
+        else {
+            panic!("the typed let command must elaborate to a definition");
+        };
+        assert_eq!(
+            typed.base.type_,
+            Expr::const_(Name::from_components(["String"]), Vec::new())
+        );
+        let ExprNode::LetE { type_, value, .. } = typed.value.node() else {
+            panic!("the typed command must be a let");
+        };
+        assert_eq!(
+            type_,
+            &Expr::const_(Name::from_components(["String"]), Vec::new())
+        );
+        assert!(matches!(
+            value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "explicit"
+        ));
+
         let raw = parse_definition(b"def raw : String := r##\"left \\\\ right\"##")
             .expect("the lexer-approved raw String literal parses");
         let Declaration::Defn(raw) =
@@ -1342,7 +1413,7 @@ mod tests {
                 base: ConstantVal {
                     name: Name::from_components(["copy"]),
                     level_params: Vec::new(),
-                    type_: copy_ty,
+                    type_: copy_ty.clone(),
                 },
                 value: Expr::lit(Literal::Str("unused".to_owned())),
                 hints: ReducibilityHints::Regular(1),
@@ -1368,6 +1439,23 @@ mod tests {
             panic!("the applied command must elaborate to a definition");
         };
         assert_eq!(applied.base.type_, string_ty);
+
+        let parsed = parse_definition(b"def alias := copy")
+            .expect("an un-ascribed function alias is in the scalar grammar");
+        let Declaration::Defn(alias) = elaborate_definition_in(parsed.syntax(), &env)
+            .expect("omitted result keeps a closed String function type")
+        else {
+            panic!("the alias command must elaborate to a definition");
+        };
+        assert_eq!(alias.base.type_, copy_ty);
+        let ExprNode::Lam {
+            binder_type, body, ..
+        } = alias.value.node()
+        else {
+            panic!("a function alias must eta-expand to a lambda");
+        };
+        assert_eq!(binder_type, &string_ty);
+        assert!(matches!(body.node(), ExprNode::App { .. }));
 
         let parsed = parse_definition(b"def message := let x := copy \"hi\"; x")
             .expect("an un-ascribed let of an application is in the scalar grammar");
