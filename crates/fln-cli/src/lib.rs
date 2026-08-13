@@ -39,7 +39,7 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
-const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/2";
+const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/5";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
@@ -68,7 +68,7 @@ const USAGE: &str = concat!(
     "\n",
     "`run` executes supported Nat/String definitions from each path, in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
-    "and Golem. The final path must produce the closed Nat result to report. The\n",
+    "and Golem. The final path must produce a closed Nat or String result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
     "--emit-flbc, the final definition's exact executed artifact is published\n",
     "only after the whole batch succeeds; any existing PATH is refused, never\n",
@@ -678,12 +678,45 @@ fn root_hex(root: fln::ContentRoot) -> String {
     rendered
 }
 
+fn closed_cli_value(exit: &fln::VmExit) -> Result<Option<SourceFinalValue>, &'static str> {
+    let fln::VmExit::Returned(returned) = exit else {
+        return Err("non-returning VM exit reached a completed-value renderer");
+    };
+    if returned.value.is_scalar() {
+        return Ok(Some(SourceFinalValue::Nat(returned.value.unbox())));
+    }
+    if fln::vm_value_kind(&returned.value) != fln::VmValueKind::String {
+        return Ok(None);
+    }
+
+    let (size, _, _, bytes) = returned.value.string_view();
+    let Some(content_size) = size.checked_sub(1) else {
+        return Err("returned String did not contain its required trailing NUL");
+    };
+    if size > bytes.len() {
+        return Err("returned String size exceeded its runtime buffer");
+    }
+    if bytes.get(content_size) != Some(&0) {
+        return Err("returned String did not contain its required trailing NUL");
+    }
+    let content = &bytes[..content_size];
+    let value = std::str::from_utf8(content)
+        .map_err(|_| "returned String payload was not UTF-8")?;
+    Ok(Some(SourceFinalValue::String(value.to_owned())))
+}
+
 fn render_flbc_success(
     bytes: usize,
     returned: &fln::VmExit,
     sidecar: Option<&fln::FlbcProductSidecarV1>,
     json: bool,
 ) -> MultiplexerOutput {
+    let value = match closed_cli_value(returned) {
+        Ok(value) => value,
+        Err(detail) => {
+            return flbc_failure("internal-fault", detail, false, None, json, 4);
+        }
+    };
     let fln::VmExit::Returned(returned) = returned else {
         return flbc_failure(
             "internal-fault",
@@ -695,15 +728,15 @@ fn render_flbc_success(
         );
     };
     let kind = vm_value_kind_name(fln::vm_value_kind(&returned.value));
-    let scalar = returned.value.is_scalar().then(|| returned.value.unbox());
     let usage = (
         returned.usage.steps,
         returned.usage.system_polls,
         returned.usage.peak_stack_depth,
     );
     let stdout = if json {
-        let value = scalar
-            .map(|value| value.to_string())
+        let value = value
+            .as_ref()
+            .map(SourceFinalValue::json)
             .unwrap_or_else(|| "null".to_owned());
         let sidecar = sidecar.map_or_else(
             || "null".to_owned(),
@@ -722,7 +755,7 @@ fn render_flbc_success(
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
-                "\"artifactBytes\":{},\"returnKind\":{},\"scalarValue\":{},",
+                "\"artifactBytes\":{},\"returnKind\":{},\"returnValue\":{},",
                 "\"sidecar\":{},",
                 "\"execution\":{{\"steps\":{},\"systemPolls\":{},",
                 "\"peakStackDepth\":{}}}}}\n"
@@ -737,9 +770,10 @@ fn render_flbc_success(
             usage.2,
         )
     } else {
-        let value = scalar
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "not a scalar".to_owned());
+        let value = value
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "not a closed scalar or String".to_owned());
         let sidecar = sidecar.map_or_else(String::new, |sidecar| {
             format!(
                 concat!(
@@ -756,7 +790,7 @@ fn render_flbc_success(
                 "canonical FLBC execution: complete\n",
                 "artifact bytes: {}\n",
                 "return kind: {}\n",
-                "scalar value: {}\n",
+                "return value: {}\n",
                 "{}",
                 "execution: {} steps, {} system polls, peak stack {}\n"
             ),
@@ -2336,65 +2370,19 @@ where
             4,
         );
     };
-    let final_value = if returned.value.is_scalar() {
-        SourceFinalValue::Nat(returned.value.unbox())
-    } else if fln::vm_value_kind(&returned.value) == fln::VmValueKind::String {
-        let (size, _, _, bytes) = returned.value.string_view();
-        let Some(content_size) = size.checked_sub(1) else {
+    let final_value = match closed_cli_value(&final_execution.exit) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
             return source_failure(
-                "internal-fault",
-                "returned String did not contain its required trailing NUL",
-                false,
+                "execution",
+                "final definition did not produce a closed Nat or String value",
+                true,
                 json,
-                4,
-            );
-        };
-        if bytes.get(content_size) != Some(&0) {
-            return source_failure(
-                "internal-fault",
-                "returned String did not contain its required trailing NUL",
-                false,
-                json,
-                4,
+                1,
             );
         }
-        let Some(content) = bytes.get(..content_size) else {
-            return source_failure(
-                "internal-fault",
-                "returned String size exceeded its runtime buffer",
-                false,
-                json,
-                4,
-            );
-        };
-        let Ok(value) = std::str::from_utf8(content) else {
-            return source_failure(
-                "internal-fault",
-                "returned String payload was not UTF-8",
-                false,
-                json,
-                4,
-            );
-        };
-        SourceFinalValue::String(value.to_owned())
-    } else {
-        return source_failure(
-            "execution",
-            "final definition did not produce a closed Nat or String value",
-            true,
-            json,
-            1,
-        );
+        Err(detail) => return source_failure("internal-fault", detail, false, json, 4),
     };
-    if !returned.value.is_scalar() && (emit_flbc.is_some() || emit_sidecar.is_some()) {
-        return source_failure(
-            "execution",
-            "FLBC source-product publication currently requires a closed Nat scalar",
-            true,
-            json,
-            1,
-        );
-    }
     let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
         let toolchain_image = match toolchain_image {
             Some(image) => image,
@@ -3185,17 +3173,17 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"authority\":true"));
         assert!(robot.stdout.contains("\"returnKind\":\"scalar\""));
-        assert!(robot.stdout.contains("\"scalarValue\":73"));
+        assert!(robot.stdout.contains("\"returnValue\":73"));
 
         let human = execute_flbc_bytes(&artifact, artifact.len(), false);
         assert_eq!(human.exit_code, 0, "{}", human.stderr);
         assert!(human.stdout.contains("canonical FLBC execution: complete"));
-        assert!(human.stdout.contains("scalar value: 73"));
+        assert!(human.stdout.contains("return value: 73"));
 
         let non_scalar = execute_flbc_bytes(STRING_FLBC, STRING_FLBC.len(), true);
         assert_eq!(non_scalar.exit_code, 0, "{}", non_scalar.stderr);
         assert!(non_scalar.stdout.contains("\"returnKind\":\"string\""));
-        assert!(non_scalar.stdout.contains("\"scalarValue\":null"));
+        assert!(non_scalar.stdout.contains("\"returnValue\":\"hi\""));
 
         let mut malformed = artifact.clone();
         malformed[0] ^= u8::MAX;
@@ -3585,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn source_run_executes_checked_string_batches_without_widening_product_publication() {
+    fn source_run_executes_checked_string_batches_and_publishes_the_executed_product() {
         let output = execute_source_bytes(
             vec![
                 b"def copy (value : String) : String := value".to_vec(),
@@ -3602,26 +3590,53 @@ mod tests {
         assert!(output.stdout.contains("\"finalValue\":\"cli\\nconnected\""));
         assert!(output.stdout.contains("\"authority\":true"));
 
-        let mut publications = 0;
-        let refused = execute_source_bytes_with_publisher(
-            vec![b"def message : String := \"not a product yet\"".to_vec()],
+        let target = PathBuf::from("string.flbc");
+        let mut publications = Vec::new();
+        let published = execute_source_bytes_with_publisher(
+            vec![b"def message : String := \"published\\nstring\"".to_vec()],
             Some(PathBuf::from("string.flbc")),
             None,
             None,
             true,
+            |bytes, path| {
+                publications.push((path.to_path_buf(), bytes.to_vec()));
+                Ok::<(), std::io::Error>(())
+            },
+        );
+        assert_eq!(published.exit_code, 0, "{}", published.stderr);
+        assert!(published.stderr.is_empty());
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].0, target);
+        let replay = execute_flbc_bytes(&publications[0].1, publications[0].1.len(), true);
+        assert_eq!(replay.exit_code, 0, "{}", replay.stderr);
+        assert!(replay.stderr.is_empty());
+        assert!(replay.stdout.contains("\"returnKind\":\"string\""));
+        assert!(
+            replay
+                .stdout
+                .contains("\"returnValue\":\"published\\nstring\"")
+        );
+
+        let mut failed_publications = 0;
+        let refused = execute_source_bytes_with_publisher(
+            vec![b"def open (value : String) : String := value".to_vec()],
+            Some(PathBuf::from("open.flbc")),
+            None,
+            None,
+            true,
             |_bytes, _path| {
-                publications += 1;
+                failed_publications += 1;
                 Ok::<(), std::io::Error>(())
             },
         );
         assert_eq!(refused.exit_code, 1);
-        assert_eq!(publications, 0);
+        assert_eq!(failed_publications, 0);
         assert!(refused.stdout.is_empty());
         assert!(refused.stderr.contains("\"class\":\"execution\""));
         assert!(
             refused
                 .stderr
-                .contains("publication currently requires a closed Nat scalar")
+                .contains("did not produce a closed Nat or String value")
         );
     }
 
