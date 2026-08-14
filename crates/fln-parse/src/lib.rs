@@ -327,6 +327,29 @@ fn bounded_term_leaf(
     }
 }
 
+/// The let-body separator is the first `;` at parenthesis depth 0.
+/// Scanning for the first `;` anywhere splits `let x := (1; 2); x` at the
+/// inner semicolon, leaving `(1` as the value — fail-closed with the wrong
+/// cut. Nested `let` in parens is outside the seed term grammar either way;
+/// the depth walk makes the refusal land on the leftover token, not an
+/// unclosed `(`.
+fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for index in from..tokens.len() {
+        match tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(symbol)) if symbol == "(" => depth += 1,
+            Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
+                depth = depth.saturating_sub(1);
+            }
+            Some(TokenKind::Symbol(symbol)) if symbol == ";" && depth == 0 => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn finish_bounded_term(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -670,12 +693,7 @@ fn parse_definition_with_grammar(
             });
         }
         let value_start = assignment + 1;
-        let Some(separator) = (value_start..tokens.len()).find(|index| {
-            matches!(
-                tokens.get(*index).map(|token| &token.kind),
-                Some(TokenKind::Symbol(symbol)) if symbol == ";"
-            )
-        }) else {
+        let Some(separator) = find_let_separator(&tokens, value_start) else {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(&view, &tokens, tokens.len()),
                 expected: NatDefinitionExpectation::LetSeparator,
@@ -1536,6 +1554,20 @@ mod nat_definition_tests {
                 ..
             })
         ));
+        // Inner `;` is not the let separator. Splitting there left `(1` as
+        // the value and reported an unclosed paren. The refusal is now the
+        // leftover `;` inside the grouped term.
+        assert!(matches!(
+            parse_nat_definition(b"def answer := let x := (1; 2); x"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalValue,
+                ..
+            })
+        ));
+        assert!(
+            parse_nat_definition(b"def answer := let x := (1); x").is_ok(),
+            "a grouped atom is still a legal let value"
+        );
     }
 
     #[test]
