@@ -31,6 +31,7 @@ use crate::extern_row::{
     ResultOwnership as ContractResultOwnership,
 };
 use crate::extern_table_generated::{EXTERN_ROW_CONTRACT_ROOT, EXTERN_ROWS};
+use fln_bignum::nat::{BigNat, BigNatView, MAX_LIMBS};
 use fln_comp::flbc::{
     ArgumentOwnership, CallableResultOwnership, CodecLimits, FunctionId, Instruction, Register,
     ResultOwnership, ValidatedProgram, encode_canonical,
@@ -56,6 +57,13 @@ use std::fmt;
 pub struct ExecutionLimits {
     pub max_steps: u64,
     pub max_stack_depth: u64,
+    /// Maximum normalized mpz-limb storage charged to one Nat arithmetic result.
+    ///
+    /// This is a Golem-owned memory ceiling, not Lean heartbeat fuel. The
+    /// Growth paths charge their operation-specific allocation bound before
+    /// allocating; exhaustion is an outcome-level [`Inconclusive`], never an
+    /// authoritative VM refusal.
+    pub max_nat_magnitude_bytes: u64,
 }
 
 impl Default for ExecutionLimits {
@@ -63,6 +71,7 @@ impl Default for ExecutionLimits {
         Self {
             max_steps: 1_000_000,
             max_stack_depth: 1_000,
+            max_nat_magnitude_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -1092,6 +1101,17 @@ struct IntrinsicResult {
     value: Obj,
 }
 
+enum IntrinsicFailure {
+    Refused(VmRefusal),
+    NatMagnitudeLimit { allowed: u64, observed: u64 },
+}
+
+impl From<VmRefusal> for IntrinsicFailure {
+    fn from(refusal: VmRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 impl IntrinsicResult {
     fn owned(value: Obj) -> Self {
         Self {
@@ -1734,7 +1754,12 @@ fn run(
                         }
                     }
                 } else {
-                    match invoke_intrinsic(plan.implementation, plan.row, &values) {
+                    match invoke_intrinsic(
+                        plan.implementation,
+                        plan.row,
+                        &values,
+                        limits.max_nat_magnitude_bytes,
+                    ) {
                         Ok(result) => {
                             let value =
                                 match finish_intrinsic_result(plan.row, result_ownership, result) {
@@ -1749,11 +1774,14 @@ fn run(
                             set_register(current_frame_mut(&mut stack)?, dst, value)?;
                             advance(current_frame_mut(&mut stack)?)?;
                         }
-                        Err(refusal) => {
+                        Err(IntrinsicFailure::Refused(refusal)) => {
                             return Ok(VmExit::Refused {
                                 refusal,
                                 usage: usage(steps, peak_stack_depth),
                             });
+                        }
+                        Err(IntrinsicFailure::NatMagnitudeLimit { allowed, observed }) => {
+                            return Err(nat_magnitude_exhausted(allowed, observed, &location));
                         }
                     }
                 }
@@ -2543,6 +2571,19 @@ fn stack_exhausted(allowed: u64, observed: u64, location: &str) -> Stop {
     )
 }
 
+fn nat_magnitude_exhausted(allowed: u64, observed: u64, location: &str) -> Stop {
+    Stop::Inconclusive(
+        Inconclusive::resource(ResourceUsage {
+            reason: ResourceReason::Memory {
+                limit_bytes: allowed,
+            },
+            allowed,
+            observed,
+        })
+        .with_progress(location),
+    )
+}
+
 fn advance(frame: &mut Frame) -> Result<(), Stop> {
     frame.pc = frame.pc.checked_add(1).ok_or_else(|| {
         Stop::InternalFault(InternalFault::new(
@@ -2853,27 +2894,37 @@ fn invoke_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
     args: &[Obj],
-) -> Result<IntrinsicResult, VmRefusal> {
+    max_nat_magnitude_bytes: u64,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    let max_nat_magnitude_bytes = max_nat_magnitude_bytes.min(
+        u64::try_from(MAX_LIMBS)
+            .expect("the bignum limb ceiling fits u64")
+            .saturating_mul(8),
+    );
     match implementation {
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
-            let lhs = nat_value(&args[0], "Nat.add", 0)?;
-            let rhs = nat_value(&args[1], "Nat.add", 1)?;
-            let sum = lhs.checked_add(rhs).ok_or(VmRefusal::NatOverflow {
-                operation: "Nat.add",
-            })?;
-            if sum > usize::MAX >> 1 {
-                return Err(VmRefusal::NatOverflow {
-                    operation: "Nat.add",
-                });
-            }
-            Ok(IntrinsicResult::owned(Obj::mk_nat(sum)))
+            let sum = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.add",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    let result_bits = if left.is_zero() && right.is_zero() {
+                        0
+                    } else {
+                        u128::from(left.bit_length().max(right.bit_length())) + 1
+                    };
+                    ensure_nat_bits(max_nat_magnitude_bytes, result_bits)?;
+                    Ok(left.add(right))
+                },
+            )??;
+            finish_nat_result(sum, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatBeq => {
             expect_arity(row, args, 2)?;
-            let left = nat_value(&args[0], "Nat.beq", 0)?;
-            let right = nat_value(&args[1], "Nat.beq", 1)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_nat(if left == right {
+            let equal =
+                with_nat_views(&args[0], &args[1], "Nat.beq", |left, right| left.beq(right))?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(if equal {
                 1
             } else {
                 0
@@ -2881,9 +2932,9 @@ fn invoke_intrinsic(
         }
         IntrinsicImplementation::NatBle => {
             expect_arity(row, args, 2)?;
-            let left = nat_value(&args[0], "Nat.ble", 0)?;
-            let right = nat_value(&args[1], "Nat.ble", 1)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_nat(if left <= right {
+            let less_or_equal =
+                with_nat_views(&args[0], &args[1], "Nat.ble", |left, right| left.ble(right))?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(if less_or_equal {
                 1
             } else {
                 0
@@ -2891,147 +2942,213 @@ fn invoke_intrinsic(
         }
         IntrinsicImplementation::NatSub => {
             expect_arity(row, args, 2)?;
-            let lhs = nat_value(&args[0], "Nat.sub", 0)?;
-            let rhs = nat_value(&args[1], "Nat.sub", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(lhs.saturating_sub(rhs))))
+            let difference = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.sub",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(max_nat_magnitude_bytes, u128::from(left.bit_length()))?;
+                    Ok(left.sub(right))
+                },
+            )??;
+            finish_nat_result(difference, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatMul => {
             expect_arity(row, args, 2)?;
-            let lhs = nat_value(&args[0], "Nat.mul", 0)?;
-            let rhs = nat_value(&args[1], "Nat.mul", 1)?;
-            let product = lhs.checked_mul(rhs).ok_or(VmRefusal::NatOverflow {
-                operation: "Nat.mul",
-            })?;
-            if product > usize::MAX >> 1 {
-                return Err(VmRefusal::NatOverflow {
-                    operation: "Nat.mul",
-                });
-            }
-            Ok(IntrinsicResult::owned(Obj::mk_nat(product)))
+            let product = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.mul",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    let result_bits = if left.is_zero() || right.is_zero() {
+                        0
+                    } else {
+                        u128::from(left.bit_length()) + u128::from(right.bit_length())
+                    };
+                    ensure_nat_bits(max_nat_magnitude_bytes, result_bits)?;
+                    Ok(left.mul(right))
+                },
+            )??;
+            finish_nat_result(product, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatDiv => {
             expect_arity(row, args, 2)?;
-            let dividend = nat_value(&args[0], "Nat.div", 0)?;
-            let divisor = nat_value(&args[1], "Nat.div", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(
-                dividend.checked_div(divisor).unwrap_or(0),
-            )))
+            let quotient = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.div",
+                |dividend, divisor| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(max_nat_magnitude_bytes, u128::from(dividend.bit_length()))?;
+                    Ok(dividend.div(divisor))
+                },
+            )??;
+            finish_nat_result(quotient, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatGcd => {
             expect_arity(row, args, 2)?;
-            let mut left = nat_value(&args[0], "Nat.gcd", 0)?;
-            let mut right = nat_value(&args[1], "Nat.gcd", 1)?;
-            while right != 0 {
-                (left, right) = (right, left % right);
-            }
-            Ok(IntrinsicResult::owned(Obj::mk_nat(left)))
+            let gcd = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.gcd",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(left.bit_length().max(right.bit_length())),
+                    )?;
+                    Ok(left.gcd(right))
+                },
+            )??;
+            finish_nat_result(gcd, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatLand => {
             expect_arity(row, args, 2)?;
-            let left = nat_value(&args[0], "Nat.land", 0)?;
-            let right = nat_value(&args[1], "Nat.land", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(left & right)))
+            let result = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.land",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(left.bit_length().min(right.bit_length())),
+                    )?;
+                    Ok(left.land(right))
+                },
+            )??;
+            finish_nat_result(result, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatLog2 => {
             expect_arity(row, args, 1)?;
-            let value = nat_value(&args[0], "Nat.log2", 0)?;
-            let result = if value < 2 {
-                0
-            } else {
-                usize::try_from(usize::BITS - 1 - value.leading_zeros()).map_err(|_| {
-                    VmRefusal::NatOverflow {
-                        operation: "Nat.log2",
-                    }
-                })?
-            };
-            Ok(IntrinsicResult::owned(Obj::mk_nat(result)))
+            let result = with_nat_view(&args[0], "Nat.log2", 0, |value| {
+                BigNat::from_u64(value.bit_length().saturating_sub(1))
+            })?;
+            finish_nat_result(result, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatLor => {
             expect_arity(row, args, 2)?;
-            let left = nat_value(&args[0], "Nat.lor", 0)?;
-            let right = nat_value(&args[1], "Nat.lor", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(left | right)))
+            let result = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.lor",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(left.bit_length().max(right.bit_length())),
+                    )?;
+                    Ok(left.lor(right))
+                },
+            )??;
+            finish_nat_result(result, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatMod => {
             expect_arity(row, args, 2)?;
-            let dividend = nat_value(&args[0], "Nat.mod", 0)?;
-            let divisor = nat_value(&args[1], "Nat.mod", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(
-                dividend.checked_rem(divisor).unwrap_or(dividend),
-            )))
+            let remainder = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.mod",
+                |dividend, divisor| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(max_nat_magnitude_bytes, u128::from(dividend.bit_length()))?;
+                    Ok(dividend.rem(divisor))
+                },
+            )??;
+            finish_nat_result(remainder, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatPow => {
             expect_arity(row, args, 2)?;
-            let base = nat_value(&args[0], "Nat.pow", 0)?;
-            let exponent = nat_value(&args[1], "Nat.pow", 1)?;
-            let power = match (base, exponent) {
-                (_, 0) => 1,
-                (0, _) => 0,
-                (1, _) => 1,
-                _ => u32::try_from(exponent)
-                    .ok()
-                    .and_then(|exponent| base.checked_pow(exponent))
-                    .ok_or(VmRefusal::NatOverflow {
-                        operation: "Nat.pow",
-                    })?,
-            };
-            if power > usize::MAX >> 1 {
-                return Err(VmRefusal::NatOverflow {
-                    operation: "Nat.pow",
-                });
-            }
-            Ok(IntrinsicResult::owned(Obj::mk_nat(power)))
+            let power = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.pow",
+                |base, exponent| -> Result<_, IntrinsicFailure> {
+                    if exponent.is_zero() {
+                        return Ok(BigNat::from_u64(1));
+                    }
+                    match base.to_u64() {
+                        Some(0) => return Ok(BigNat::zero()),
+                        Some(1) => return Ok(BigNat::from_u64(1)),
+                        _ => {}
+                    }
+                    let base_bits = u128::from(base.bit_length());
+                    let exponent_u64 = exponent.to_u64();
+                    let observed = exponent_u64.map_or(u64::MAX, |exponent| {
+                        nat_magnitude_bytes(base_bits.saturating_mul(u128::from(exponent)))
+                    });
+                    let exponent = exponent_u64
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            nat_magnitude_limit(
+                                max_nat_magnitude_bytes.min(nat_magnitude_bytes(
+                                    base_bits.saturating_mul(u128::from(u32::MAX)),
+                                )),
+                                observed,
+                            )
+                        })?;
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        base_bits.saturating_mul(u128::from(exponent)),
+                    )?;
+                    base.checked_pow(exponent)
+                        .ok_or_else(|| nat_magnitude_limit(max_nat_magnitude_bytes, observed))
+                },
+            )??;
+            finish_nat_result(power, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatPred => {
             expect_arity(row, args, 1)?;
-            let value = nat_value(&args[0], "Nat.pred", 0)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(value.saturating_sub(1))))
+            let predecessor = with_nat_view(&args[0], "Nat.pred", 0, |value| {
+                value.sub(BigNatView::from_limbs_le(&[1]))
+            })?;
+            finish_nat_result(predecessor, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatShiftLeft => {
             expect_arity(row, args, 2)?;
-            let value = nat_value(&args[0], "Nat.shiftLeft", 0)?;
-            let amount = nat_value(&args[1], "Nat.shiftLeft", 1)?;
-            // Pin `Nat.shiftLeft` is `n * 2^k`. Rust `checked_shl` only
-            // refuses a count ≥ bit width, so `2 <<< 63` wraps to 0 on
-            // 64-bit instead of leaving the scalar range. Zero stays 0
-            // for any k (`0 <<< k = 0`); any other value that cannot
-            // fit in the Lean small-Nat ceiling is overflow.
-            let shifted = if value == 0 {
-                0
-            } else {
-                let amount = u32::try_from(amount).map_err(|_| VmRefusal::NatOverflow {
-                    operation: "Nat.shiftLeft",
-                })?;
-                if amount >= usize::BITS {
-                    return Err(VmRefusal::NatOverflow {
-                        operation: "Nat.shiftLeft",
-                    });
-                }
-                let maximum = usize::MAX >> 1;
-                if amount > 0 && value > (maximum >> amount) {
-                    return Err(VmRefusal::NatOverflow {
-                        operation: "Nat.shiftLeft",
-                    });
-                }
-                value << amount
-            };
-            Ok(IntrinsicResult::owned(Obj::mk_nat(shifted)))
+            let shifted = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.shiftLeft",
+                |value, amount| -> Result<_, IntrinsicFailure> {
+                    if value.is_zero() {
+                        return Ok(BigNat::zero());
+                    }
+                    let Some(amount) = amount.to_u64() else {
+                        return Err(nat_magnitude_limit(max_nat_magnitude_bytes, u64::MAX));
+                    };
+                    let result_bits =
+                        u128::from(value.bit_length()).saturating_add(u128::from(amount));
+                    ensure_nat_bits(max_nat_magnitude_bytes, result_bits)?;
+                    value.checked_shl(amount).ok_or_else(|| {
+                        nat_magnitude_limit(
+                            max_nat_magnitude_bytes,
+                            nat_magnitude_bytes(result_bits),
+                        )
+                    })
+                },
+            )??;
+            finish_nat_result(shifted, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatShiftRight => {
             expect_arity(row, args, 2)?;
-            let value = nat_value(&args[0], "Nat.shiftRight", 0)?;
-            let amount = nat_value(&args[1], "Nat.shiftRight", 1)?;
-            let shifted = u32::try_from(amount)
-                .ok()
-                .and_then(|amount| value.checked_shr(amount))
-                .unwrap_or(0);
-            Ok(IntrinsicResult::owned(Obj::mk_nat(shifted)))
+            let shifted = with_nat_views(&args[0], &args[1], "Nat.shiftRight", |value, amount| {
+                amount
+                    .to_u64()
+                    .map_or_else(BigNat::zero, |amount| value.shr(amount))
+            })?;
+            finish_nat_result(shifted, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::NatXor => {
             expect_arity(row, args, 2)?;
-            let left = nat_value(&args[0], "Nat.xor", 0)?;
-            let right = nat_value(&args[1], "Nat.xor", 1)?;
-            Ok(IntrinsicResult::owned(Obj::mk_nat(left ^ right)))
+            let result = with_nat_views(
+                &args[0],
+                &args[1],
+                "Nat.xor",
+                |left, right| -> Result<_, IntrinsicFailure> {
+                    ensure_nat_bits(
+                        max_nat_magnitude_bytes,
+                        u128::from(left.bit_length().max(right.bit_length())),
+                    )?;
+                    Ok(left.lxor(right))
+                },
+            )??;
+            finish_nat_result(result, max_nat_magnitude_bytes)
         }
         IntrinsicImplementation::StringAppend => {
             expect_arity(row, args, 2)?;
@@ -3056,19 +3173,20 @@ fn invoke_intrinsic(
             // but would silently disagree with the Reference on a string whose
             // header and payload had drifted.
             if value_kind(&args[0]) != ValueKind::String {
-                return Err(type_mismatch("String.length", 0, "String", &args[0]));
+                return Err(type_mismatch("String.length", 0, "String", &args[0]).into());
             }
             let (size, _, length, bytes) = args[0].string_view();
             if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
-                return Err(VmRefusal::InvalidStringObject);
+                return Err(VmRefusal::InvalidStringObject.into());
             }
             if std::str::from_utf8(&bytes[..size - 1]).is_err() {
-                return Err(VmRefusal::InvalidStringObject);
+                return Err(VmRefusal::InvalidStringObject.into());
             }
             if length > usize::MAX >> 1 {
                 return Err(VmRefusal::NatOverflow {
                     operation: "String.length",
-                });
+                }
+                .into());
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(length)))
         }
@@ -3078,7 +3196,8 @@ fn invoke_intrinsic(
             if length > usize::MAX >> 1 {
                 return Err(VmRefusal::NatOverflow {
                     operation: "String.utf8ByteSize",
-                });
+                }
+                .into());
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(length)))
         }
@@ -3088,7 +3207,8 @@ fn invoke_intrinsic(
             if size > usize::MAX >> 1 {
                 return Err(VmRefusal::NatOverflow {
                     operation: "Array.size",
-                });
+                }
+                .into());
             }
             Ok(IntrinsicResult::raw_object(Obj::mk_nat(size)))
         }
@@ -3097,7 +3217,7 @@ fn invoke_intrinsic(
             let (size, _) = array_value(&args[0], "Array.getInternal", 0)?;
             let index = nat_value(&args[1], "Array.getInternal", 1)?;
             if index >= size {
-                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size });
+                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
             }
             Ok(IntrinsicResult::owned(args[0].array_child(index)))
         }
@@ -3106,7 +3226,7 @@ fn invoke_intrinsic(
             let (size, _) = array_value(&args[0], "Array.ugetBorrowed", 0)?;
             let index = nat_value(&args[1], "Array.ugetBorrowed", 1)?;
             if index >= size {
-                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size });
+                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
             }
             Ok(IntrinsicResult::borrowed_promoted(
                 args[0].array_child(index),
@@ -3126,7 +3246,7 @@ fn invoke_intrinsic(
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.cancel", 0, "Task", ValueKind::Task)?;
             if args[0].finished_task_value().is_none() {
-                return Err(VmRefusal::UnsupportedTaskState);
+                return Err(VmRefusal::UnsupportedTaskState.into());
             }
             Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
         }
@@ -3195,7 +3315,7 @@ fn invoke_intrinsic(
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "Thunk.mk", 0, "Golem closure", ValueKind::Closure)?;
             if args[0].closure_shell_parts().is_none() {
-                return Err(VmRefusal::UnsupportedNativeClosure);
+                return Err(VmRefusal::UnsupportedNativeClosure.into());
             }
             Ok(IntrinsicResult::owned(Obj::mk_thunk_closure(
                 args[0].clone_ref(),
@@ -3213,7 +3333,7 @@ fn invoke_intrinsic(
             args[0]
                 .finished_task_value()
                 .map(IntrinsicResult::owned)
-                .ok_or(VmRefusal::UnsupportedTaskState)
+                .ok_or_else(|| VmRefusal::UnsupportedTaskState.into())
         }
         IntrinsicImplementation::ThunkGet
         | IntrinsicImplementation::TaskSpawn
@@ -3221,7 +3341,8 @@ fn invoke_intrinsic(
         | IntrinsicImplementation::TaskBind
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -3426,6 +3547,83 @@ fn expect_value_kind(
     Ok(())
 }
 
+fn with_nat_view<R>(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+    use_view: impl FnOnce(BigNatView<'_>) -> R,
+) -> Result<R, VmRefusal> {
+    if value.is_scalar() {
+        let limb = [value.unbox() as u64];
+        return Ok(use_view(BigNatView::from_limbs_le(&limb)));
+    }
+    if value_kind(value) != ValueKind::Mpz {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    }
+    let (_, size, limbs) = value.mpz_view();
+    if size < 0 {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    }
+    Ok(use_view(BigNatView::from_limbs_le(limbs)))
+}
+
+fn with_nat_views<R>(
+    left: &Obj,
+    right: &Obj,
+    operation: &'static str,
+    use_views: impl FnOnce(BigNatView<'_>, BigNatView<'_>) -> R,
+) -> Result<R, VmRefusal> {
+    with_nat_view(left, operation, 0, |left| {
+        with_nat_view(right, operation, 1, |right| use_views(left, right))
+    })?
+}
+
+fn nat_magnitude_bytes(bits: u128) -> u64 {
+    if bits <= u128::from(usize::BITS - 1) {
+        return 0;
+    }
+    let limbs = bits.saturating_add(63) / 64;
+    u64::try_from(limbs.saturating_mul(8)).unwrap_or(u64::MAX)
+}
+
+fn ensure_nat_bits(allowed: u64, result_bits: u128) -> Result<(), IntrinsicFailure> {
+    let observed = nat_magnitude_bytes(result_bits);
+    if observed > allowed {
+        return Err(nat_magnitude_limit(allowed, observed));
+    }
+    Ok(())
+}
+
+fn nat_magnitude_limit(allowed: u64, observed: u64) -> IntrinsicFailure {
+    IntrinsicFailure::NatMagnitudeLimit {
+        allowed,
+        observed: observed.max(allowed.saturating_add(1)),
+    }
+}
+
+fn finish_nat_result(
+    value: BigNat,
+    max_nat_magnitude_bytes: u64,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    let observed = match value.to_u64() {
+        Some(value) if value <= (usize::MAX >> 1) as u64 => 0,
+        _ => u64::try_from(value.limbs_le().len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8),
+    };
+    if observed > max_nat_magnitude_bytes {
+        return Err(nat_magnitude_limit(max_nat_magnitude_bytes, observed));
+    }
+    Ok(IntrinsicResult::owned(nat_from_big_nat(&value)))
+}
+
+fn nat_from_big_nat(value: &BigNat) -> Obj {
+    match value.to_u64() {
+        Some(value) if value <= (usize::MAX >> 1) as u64 => Obj::mk_nat(value as usize),
+        _ => Obj::mk_mpz(value.limbs_le(), false),
+    }
+}
+
 fn nat_value(value: &Obj, operation: &'static str, argument: usize) -> Result<usize, VmRefusal> {
     if !value.is_scalar() {
         return Err(type_mismatch(operation, argument, "Nat scalar", value));
@@ -3508,6 +3706,17 @@ fn type_mismatch(
         expected,
         actual: value_kind(value),
     }
+}
+
+/// Copy a nonnegative Marrow `Nat` value to canonical decimal text.
+///
+/// Tagged small values and positive mpz objects share this projection. Other
+/// ABI kinds, including negative mpz values used for `Int`, return `None`.
+pub fn nat_decimal(value: &Obj) -> Option<String> {
+    with_nat_view(value, "Nat decimal projection", 0, |value| {
+        value.to_owned().to_decimal()
+    })
+    .ok()
 }
 
 /// Derive the runtime category without exposing an address or host shadow.

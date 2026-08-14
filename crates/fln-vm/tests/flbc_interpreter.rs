@@ -67,9 +67,7 @@ const fn cache_context(
 
 const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnership {
     match ty {
-        fir::ValueType::Unit | fir::ValueType::Bool => {
-            CallableResultOwnership::Scalar
-        }
+        fir::ValueType::Unit | fir::ValueType::Bool => CallableResultOwnership::Scalar,
         fir::ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         fir::ValueType::String
         | fir::ValueType::Constructor
@@ -348,6 +346,17 @@ fn string_contents(value: &Obj) -> String {
         .to_string()
 }
 
+fn nat_limbs(value: &Obj) -> Vec<u64> {
+    if value.is_scalar() {
+        let value = value.unbox() as u64;
+        return if value == 0 { Vec::new() } else { vec![value] };
+    }
+    assert_eq!(value_kind(value), ValueKind::Mpz);
+    let (_, size, limbs) = value.mpz_view();
+    assert!(size >= 0, "a Nat mpz cannot carry a negative sign");
+    limbs.to_vec()
+}
+
 #[test]
 fn canonical_flbc_artifact_decodes_validates_and_executes_without_a_shadow_value_domain() {
     let _guard = lock();
@@ -434,7 +443,7 @@ fn generated_nat_mul_and_sub_rows_execute_with_nat_semantics() {
     ));
     assert_eq!(completed.value.unbox(), 0);
 
-    let overflow = validated(vec![function(
+    let wide_product = validated(vec![function(
         0,
         0,
         3,
@@ -451,15 +460,13 @@ fn generated_nat_mul_and_sub_rows_execute_with_nat_semantics() {
             Instruction::Return { src: r(2) },
         ],
     )]);
-    assert!(matches!(
-        execute(&overflow, ExecutionLimits::default(), None),
-        Outcome::Complete(VmExit::Refused {
-            refusal: VmRefusal::NatOverflow {
-                operation: "Nat.mul"
-            },
-            ..
-        })
-    ));
+    let completed = returned(execute(&wide_product, ExecutionLimits::default(), None));
+    assert_eq!(value_kind(&completed.value), ValueKind::Mpz);
+    assert_eq!(
+        nat_limbs(&completed.value),
+        vec![(usize::MAX >> 1) as u64 * 2],
+        "multiplication crosses the tagged-Nat ceiling without changing value"
+    );
 }
 
 #[test]
@@ -488,7 +495,7 @@ fn generated_string_length_rows_distinguish_scalars_from_utf8_bytes() {
 }
 
 #[test]
-fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
+fn generated_nat_rows_execute_reference_zero_and_bitwise_semantics() {
     let _guard = lock();
     for (row, input, expected) in [
         ("extern:Nat.pred", 0, 0),
@@ -579,6 +586,7 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
     }
 
     for row in ["extern:Nat.pow", "extern:Nat.shiftLeft"] {
+        let input = (usize::MAX >> 1) as u64;
         let program = validated(vec![function(
             0,
             0,
@@ -586,7 +594,7 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
             vec![
                 Instruction::Nat {
                     dst: r(0),
-                    value: u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
+                    value: input,
                 },
                 Instruction::Nat {
                     dst: r(1),
@@ -596,13 +604,18 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
                 Instruction::Return { src: r(2) },
             ],
         )]);
-        assert!(matches!(
-            execute(&program, ExecutionLimits::default(), None),
-            Outcome::Complete(VmExit::Refused {
-                refusal: VmRefusal::NatOverflow { operation },
-                ..
-            }) if operation == row.trim_start_matches("extern:")
-        ));
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        let expected = if row == "extern:Nat.pow" {
+            u128::from(input) * u128::from(input)
+        } else {
+            u128::from(input) << 2
+        };
+        let mut expected_limbs = vec![expected as u64, (expected >> 64) as u64];
+        while expected_limbs.last() == Some(&0) {
+            expected_limbs.pop();
+        }
+        assert_eq!(value_kind(&completed.value), ValueKind::Mpz, "{row}");
+        assert_eq!(nat_limbs(&completed.value), expected_limbs, "{row}");
     }
 
     for (value, amount) in [
@@ -624,19 +637,214 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
                 Instruction::Return { src: r(2) },
             ],
         )]);
-        assert!(
-            matches!(
-                execute(&program, ExecutionLimits::default(), None),
-                Outcome::Complete(VmExit::Refused {
-                    refusal: VmRefusal::NatOverflow {
-                        operation: "Nat.shiftLeft"
-                    },
-                    ..
-                })
-            ),
-            "Nat.shiftLeft {value} {amount} must not wrap into the small-Nat range"
-        );
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        let expected = u128::from(value) << amount;
+        let mut expected_limbs = vec![expected as u64, (expected >> 64) as u64];
+        while expected_limbs.last() == Some(&0) {
+            expected_limbs.pop();
+        }
+        assert_eq!(nat_limbs(&completed.value), expected_limbs);
     }
+
+    let growth = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 64,
+            },
+            intrinsic(r(2), "extern:Nat.shiftLeft", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    shadow::enable();
+    let stopped = execute(
+        &growth,
+        ExecutionLimits {
+            max_nat_magnitude_bytes: 8,
+            ..ExecutionLimits::default()
+        },
+        None,
+    );
+    assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+    assert!(matches!(
+        stopped,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                inconclusive.cause,
+                InconclusiveCause::ResourceExhausted { ref usage }
+                    if usage.allowed == 8
+                        && usage.observed == 16
+                        && usage.reason == ResourceReason::Memory { limit_bytes: 8 }
+            ) && inconclusive.progress.is_some()
+    ));
+    let completed = returned(execute(&growth, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&completed.value), vec![0, 1]);
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "Nat magnitude stop and recovery retain no mpz");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
+fn generated_nat_rows_consume_mpz_operands_without_narrowing() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        20,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 80,
+            },
+            intrinsic(r(2), "extern:Nat.shiftLeft", vec![r(0), r(1)]),
+            Instruction::Nat {
+                dst: r(3),
+                value: 3,
+            },
+            Instruction::Nat {
+                dst: r(4),
+                value: 2,
+            },
+            intrinsic(r(5), "extern:Nat.add", vec![r(2), r(3)]),
+            intrinsic(r(6), "extern:Nat.sub", vec![r(5), r(3)]),
+            intrinsic(r(7), "extern:Nat.div", vec![r(5), r(4)]),
+            intrinsic(r(8), "extern:Nat.mod", vec![r(5), r(4)]),
+            intrinsic(r(9), "extern:Nat.gcd", vec![r(5), r(2)]),
+            intrinsic(r(10), "extern:Nat.land", vec![r(5), r(2)]),
+            intrinsic(r(11), "extern:Nat.lor", vec![r(5), r(2)]),
+            intrinsic(r(12), "extern:Nat.xor", vec![r(5), r(2)]),
+            intrinsic(r(13), "extern:Nat.pred", vec![r(5)]),
+            intrinsic(r(14), "extern:Nat.log2", vec![r(5)]),
+            intrinsic(r(15), "extern:Nat.shiftRight", vec![r(5), r(1)]),
+            intrinsic(r(16), "extern:Nat.beq", vec![r(10), r(2)]),
+            intrinsic(r(17), "extern:Nat.ble", vec![r(2), r(5)]),
+            Instruction::Array {
+                dst: r(18),
+                items: (5..=17).map(r).collect(),
+            },
+            Instruction::Return { src: r(18) },
+        ],
+    )]);
+
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    let results = (0..13)
+        .map(|index| nat_limbs(&completed.value.array_child(index)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![
+            vec![3, 1 << 16],
+            vec![0, 1 << 16],
+            vec![1, 1 << 15],
+            vec![1],
+            vec![1],
+            vec![0, 1 << 16],
+            vec![3, 1 << 16],
+            vec![3],
+            vec![2, 1 << 16],
+            vec![80],
+            vec![1],
+            vec![1],
+            vec![1],
+        ]
+    );
+}
+
+#[test]
+fn callable_nat_result_accepts_scalar_or_mpz_but_scalar_contract_refuses_mpz() {
+    let _guard = lock();
+    let wide_body = vec![
+        Instruction::Nat {
+            dst: r(0),
+            value: 1,
+        },
+        Instruction::Nat {
+            dst: r(1),
+            value: 64,
+        },
+        intrinsic(r(2), "extern:Nat.shiftLeft", vec![r(0), r(1)]),
+        Instruction::Return { src: r(2) },
+    ];
+    let through_call = validated(vec![
+        function(
+            0,
+            0,
+            1,
+            vec![
+                Instruction::Call {
+                    dst: r(0),
+                    function: fid(1),
+                    args: Vec::new(),
+                    argument_ownership: Vec::new(),
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
+                },
+                Instruction::Return { src: r(0) },
+            ],
+        ),
+        function_with_callable_result(
+            1,
+            Vec::new(),
+            CallableResultOwnership::OwnedOrScalar,
+            3,
+            wide_body.clone(),
+        ),
+    ]);
+    let completed = returned(execute(&through_call, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&completed.value), vec![0, 1]);
+
+    let scalar_union = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::OwnedOrScalar,
+        1,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 7,
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    assert_eq!(
+        returned(execute(&scalar_union, ExecutionLimits::default(), None))
+            .value
+            .unbox(),
+        7
+    );
+
+    let falsely_scalar = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Scalar,
+        3,
+        wide_body,
+    )]);
+    assert!(matches!(
+        execute(&falsely_scalar, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::CallableResultKind {
+                function,
+                expected: CallableResultOwnership::Scalar,
+                actual: ValueKind::Mpz,
+            },
+            ..
+        }) if function == fid(0)
+    ));
 }
 
 #[test]
@@ -930,6 +1138,7 @@ fn owned_direct_call_reuses_its_consumed_destination_and_tears_down_on_stack_sto
         ExecutionLimits {
             max_steps: 10,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -1233,6 +1442,7 @@ fn owned_closure_captures_cross_fir_and_same_destination_runtime_stops() {
         ExecutionLimits {
             max_steps: 20,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -1498,6 +1708,7 @@ fn owned_apply_arguments_cross_fir_partial_exact_overapplication_and_refuse_drif
         ExecutionLimits {
             max_steps: 100,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -2556,6 +2767,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
         ExecutionLimits {
             max_steps: 15,
             max_stack_depth: 8,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -3096,6 +3308,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
         ExecutionLimits {
             max_steps: 14,
             max_stack_depth: 8,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -4294,6 +4507,7 @@ fn self_recursive_core_closures_return_acyclic_environments_and_stop_typed() {
         ExecutionLimits {
             max_steps: 100,
             max_stack_depth: 3,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -4518,6 +4732,7 @@ fn mutual_recursive_core_closures_return_peers_and_stop_typed_without_cycles() {
         ExecutionLimits {
             max_steps: 100,
             max_stack_depth: 3,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -5045,7 +5260,7 @@ fn closures_capture_abi_values_and_exact_application_uses_the_same_objects() {
                     closure: r(1),
                     args: vec![r(2)],
                     argument_ownership: vec![ArgumentOwnership::Borrowed],
-                    result_ownership: CallableResultOwnership::Scalar,
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
                 },
                 Instruction::Return { src: r(3) },
             ],
@@ -5161,7 +5376,7 @@ fn repeated_and_over_application_preserve_argument_order() {
                     closure: r(3),
                     args: vec![r(4)],
                     argument_ownership: vec![ArgumentOwnership::Borrowed],
-                    result_ownership: CallableResultOwnership::Scalar,
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
                 },
                 Instruction::Return { src: r(5) },
             ],
@@ -5209,7 +5424,7 @@ fn repeated_and_over_application_preserve_argument_order() {
                         ArgumentOwnership::Borrowed,
                         ArgumentOwnership::Borrowed,
                     ],
-                    result_ownership: CallableResultOwnership::Scalar,
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
                 },
                 Instruction::Return { src: r(3) },
             ],
@@ -5609,6 +5824,7 @@ fn closure_stops_and_dynamic_refusals_are_typed_and_rc_clean() {
         ExecutionLimits {
             max_steps: 20,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -6116,6 +6332,7 @@ fn delayed_thunk_stops_and_panics_do_not_publish_or_leak() {
         ExecutionLimits {
             max_steps: 20,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -6813,6 +7030,7 @@ fn managerless_task_stops_and_panics_do_not_publish_or_leak() {
         ExecutionLimits {
             max_steps: 3,
             max_stack_depth: 8,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -6832,6 +7050,7 @@ fn managerless_task_stops_and_panics_do_not_publish_or_leak() {
         ExecutionLimits {
             max_steps: 20,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -7289,6 +7508,7 @@ fn check_system_observes_the_command_heartbeat_delta_at_its_explicit_opcode() {
         ExecutionLimits {
             max_steps: 2,
             max_stack_depth: 4,
+            ..ExecutionLimits::default()
         },
         one_option_unit,
         Some(&cancelled),
@@ -8002,6 +8222,7 @@ fn step_stack_and_cancellation_stops_are_non_authoritative() {
         ExecutionLimits {
             max_steps: 3,
             max_stack_depth: 4,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -8056,6 +8277,7 @@ fn step_stack_and_cancellation_stops_are_non_authoritative() {
         ExecutionLimits {
             max_steps: 100,
             max_stack_depth: 2,
+            ..ExecutionLimits::default()
         },
         None,
     );
@@ -8119,7 +8341,7 @@ fn user_panic_and_dynamic_intrinsic_refusals_remain_completed_answers() {
             refusal: VmRefusal::TypeMismatch {
                 operation: "Nat.add",
                 argument: 0,
-                expected: "Nat scalar",
+                expected: "Nat",
                 actual: ValueKind::String,
             },
             ..
@@ -8171,6 +8393,7 @@ fn a_budget_stop_releases_every_live_register_and_the_next_run_recovers() {
             ExecutionLimits {
                 max_steps: 2,
                 max_stack_depth: 4,
+                ..ExecutionLimits::default()
             },
             None,
         );
@@ -8230,7 +8453,7 @@ fn apply_inline_cache_matches_uncached_execution_and_survives_a_stack_stop() {
                     closure: r(1),
                     args: vec![r(2)],
                     argument_ownership: vec![ArgumentOwnership::Borrowed],
-                    result_ownership: CallableResultOwnership::Scalar,
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
                 },
                 Instruction::Return { src: r(3) },
             ],
@@ -8272,6 +8495,7 @@ fn apply_inline_cache_matches_uncached_execution_and_survives_a_stack_stop() {
         ExecutionLimits {
             max_steps: 20,
             max_stack_depth: 1,
+            ..ExecutionLimits::default()
         },
         None,
         context,

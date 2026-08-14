@@ -684,7 +684,8 @@ fn closed_cli_value(
 ) -> Result<Option<SourceFinalValue>, fln::ClosedVmValueError> {
     fln::closed_vm_value(exit).map(|value| {
         value.map(|value| match value {
-            fln::ClosedVmValue::Scalar(value) => SourceFinalValue::Nat(value),
+            fln::ClosedVmValue::Scalar(value) => SourceFinalValue::Nat(value.to_string()),
+            fln::ClosedVmValue::NonnegativeMpz(value) => SourceFinalValue::Nat(value),
             fln::ClosedVmValue::String(value) => SourceFinalValue::String(value),
         })
     })
@@ -1952,7 +1953,7 @@ struct SourceSuccess<'a> {
 }
 
 enum SourceFinalValue {
-    Nat(usize),
+    Nat(String),
     String(String),
 }
 
@@ -1966,7 +1967,7 @@ impl SourceFinalValue {
 
     fn json(&self) -> String {
         match self {
-            Self::Nat(value) => value.to_string(),
+            Self::Nat(value) => value.clone(),
             Self::String(value) => json_string(value),
         }
     }
@@ -3033,7 +3034,7 @@ mod tests {
 
     const PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
-    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x07\0\x0b\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
+    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x07\0\x0c\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
         let invoked_from = std::env::current_dir().expect("the test has an invocation directory");
