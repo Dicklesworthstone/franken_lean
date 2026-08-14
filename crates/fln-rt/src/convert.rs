@@ -238,6 +238,31 @@ fn nat_u64(obj: &Obj, family: &'static str) -> Result<u64, ConvertError> {
     }
 }
 
+/// Lean `Int`: a tagged scalar whose payload is a sign-extended `i32`
+/// (olean `decode_int` on 64-bit: `(ptr >> 1) as u32 as i32`), or a
+/// nonnegative/negative mpz whose live magnitude fits `i64`.
+fn int_i64(obj: &Obj, family: &'static str) -> Result<i64, ConvertError> {
+    if obj.is_scalar() {
+        return Ok(i64::from(obj.unbox() as u32 as i32));
+    }
+    if obj.obj_tag() != usize::from(abi::TAG_MPZ) {
+        return Err(malformed(family, "expected an Int (scalar or mpz)"));
+    }
+    let (_, size, limbs) = obj.mpz_view();
+    let negative = size < 0;
+    match limbs {
+        [] => Ok(0),
+        [limb] if negative && *limb == 1u64 << 63 => Ok(i64::MIN),
+        [limb] if negative => {
+            let magnitude =
+                i64::try_from(*limb).map_err(|_| malformed(family, "Int exceeds i64"))?;
+            Ok(-magnitude)
+        }
+        [limb] => i64::try_from(*limb).map_err(|_| malformed(family, "Int exceeds i64")),
+        _ => Err(malformed(family, "Int exceeds i64")),
+    }
+}
+
 /// First scalar `u8` after the leading Data word. Lean packs `BinderInfo`
 /// and `letE.nonDep` there; small-object alignment zero-pads the rest of
 /// the word, so a `u64` read is the safe API and the low byte is the value.
@@ -645,10 +670,10 @@ impl Conversion {
                 let n = nat_u64(&ctor_field(obj, 0, "data-value")?, "data-value")?;
                 Ok(DataValue::OfNat(n))
             }
-            TAG_DV_INT => Err(ConvertError::UnsupportedConstructor {
-                family: "data-value",
-                tag: TAG_DV_INT,
-            }),
+            TAG_DV_INT => {
+                let value = int_i64(&ctor_field(obj, 0, "data-value")?, "data-value")?;
+                Ok(DataValue::OfInt(value))
+            }
             TAG_DV_SYNTAX => Err(ConvertError::UnsupportedConstructor {
                 family: "data-value",
                 tag: TAG_DV_SYNTAX,
@@ -928,10 +953,7 @@ fn inject_data_value(value: &DataValue) -> Result<Obj, ConvertError> {
         DataValue::OfBool(flag) => Ok(Obj::mk_ctor(TAG_DV_BOOL, Vec::new(), &[u8::from(*flag)])),
         DataValue::OfName(name) => Ok(Obj::mk_ctor(TAG_DV_NAME, vec![inject_name(name)], &[])),
         DataValue::OfNat(n) => Ok(Obj::mk_ctor(TAG_DV_NAT, vec![inject_nat(*n)], &[])),
-        DataValue::OfInt(_) => Err(ConvertError::UnsupportedConstructor {
-            family: "data-value",
-            tag: TAG_DV_INT,
-        }),
+        DataValue::OfInt(value) => Ok(Obj::mk_ctor(TAG_DV_INT, vec![Obj::mk_int(*value)], &[])),
         DataValue::OfSyntax(_) => Err(ConvertError::UnsupportedConstructor {
             family: "data-value",
             tag: TAG_DV_SYNTAX,
