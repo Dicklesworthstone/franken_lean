@@ -777,12 +777,26 @@ fn elaborate_term(
     allow_string: bool,
     environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
-    if let Syntax::Node { kind, args, .. } = syntax
+    // Sequential seed lets are a right-nested `Term.let` spine the parser
+    // builds with a heap fold. Recursing one frame per binder would stack-
+    // fault a legal source file (FL-INV-07).
+    let mut current = syntax;
+    let mut locals = locals.to_vec();
+    let mut bindings = Vec::new();
+    while let Syntax::Node { kind, args, .. } = current
         && kind == &parser_kind(&["Term", "let"])
     {
-        return elaborate_let(args, locals, result_type, allow_string, environment);
+        let (name, binder_type, value, body) =
+            peel_let(args, &locals, result_type, allow_string, environment)?;
+        locals.push((name.clone(), binder_type.clone()));
+        bindings.push((name, binder_type, value));
+        current = body;
     }
-    elaborate_nonlet_term(syntax, locals, allow_string)
+    let mut expression = elaborate_nonlet_term(current, &locals, allow_string)?;
+    for (name, binder_type, value) in bindings.into_iter().rev() {
+        expression = Expr::let_e(name, binder_type, value, expression, false);
+    }
+    Ok(expression)
 }
 
 fn nat_const() -> Expr {
@@ -803,15 +817,19 @@ fn environment_constant_type(name: &Name, environment: Option<&Environment>) -> 
 }
 
 fn acceptable_inferred(ty: &Expr, allow_string: bool) -> bool {
-    match ty.node() {
+    let mut current = ty;
+    while let ExprNode::ForallE { body, .. } = current.node() {
+        if body.has_loose_bvars() {
+            return false;
+        }
+        current = body;
+    }
+    match current.node() {
         ExprNode::Const { name, levels } if levels.is_empty() => {
             name == &Name::from_components(["Nat"])
                 || (allow_string
                     && (name == &Name::from_components(["String"])
                         || name == &Name::from_components(["Bool"])))
-        }
-        ExprNode::ForallE { body, .. } if !body.has_loose_bvars() => {
-            acceptable_inferred(body, allow_string)
         }
         _ => false,
     }
@@ -826,7 +844,23 @@ fn infer_expr_type(
     locals: &[(Name, Expr)],
     environment: Option<&Environment>,
 ) -> Option<Expr> {
-    match value.node() {
+    let mut extra = Vec::new();
+    let mut current = value;
+    while let ExprNode::LetE { type_, body, .. } = current.node() {
+        extra.push(type_.clone());
+        current = body;
+    }
+    let mut owned = None;
+    let locals: &[(Name, Expr)] = if extra.is_empty() {
+        locals
+    } else {
+        let extended = owned.insert(locals.to_vec());
+        for type_ in extra {
+            extended.push((Name::anonymous(), type_));
+        }
+        extended
+    };
+    match current.node() {
         ExprNode::Lit {
             literal: Literal::Nat(_),
         } => Some(nat_const()),
@@ -838,17 +872,12 @@ fn infer_expr_type(
             .rev()
             .nth(usize::try_from(*idx).ok()?)
             .map(|(_, ty)| ty.clone()),
-        ExprNode::LetE { type_, body, .. } => {
-            let mut extended = locals.to_vec();
-            extended.push((Name::anonymous(), type_.clone()));
-            infer_expr_type(body, &extended, environment)
-        }
         ExprNode::Const { name, levels } if levels.is_empty() => {
             environment_constant_type(name, environment)
         }
         ExprNode::App { .. } => {
             let mut arity = 0_usize;
-            let mut head = value;
+            let mut head = current;
             while let ExprNode::App { f, .. } = head.node() {
                 arity = arity.checked_add(1)?;
                 head = f;
@@ -923,13 +952,13 @@ fn eta_expand_nondependent(value: Expr, inferred: &Expr) -> Result<Expr, NatDefi
     Ok(eta)
 }
 
-fn elaborate_let(
-    parts: &[Syntax],
+fn peel_let<'a>(
+    parts: &'a [Syntax],
     locals: &[(Name, Expr)],
     result_type: &Expr,
     allow_string: bool,
     environment: Option<&Environment>,
-) -> Result<Expr, NatDefinitionElabError> {
+) -> Result<(Name, Expr, Expr, &'a Syntax), NatDefinitionElabError> {
     let [keyword, config, declaration, separator, body] = parts else {
         return Err(NatDefinitionElabError::UnexpectedSyntax {
             expected: "Lean.Parser.Term.let",
@@ -994,16 +1023,7 @@ fn elaborate_let(
             .filter(|ty| acceptable_inferred(ty, allow_string))
             .unwrap_or_else(|| result_type.clone())
     });
-    let mut body_locals = locals.to_vec();
-    body_locals.push((local_name.clone(), binder_type.clone()));
-    let body = elaborate_term(body, &body_locals, result_type, allow_string, environment)?;
-    Ok(Expr::let_e(
-        local_name.clone(),
-        binder_type,
-        value,
-        body,
-        false,
-    ))
+    Ok((local_name.clone(), binder_type, value, body))
 }
 
 /// Parse, elaborate, and kernel-check one bounded Nat-valued definition.
@@ -1676,6 +1696,41 @@ mod tests {
         assert_eq!(
             without_env.base.type_,
             Expr::const_(Name::from_components(["Nat"]), Vec::new())
+        );
+    }
+
+    #[test]
+    fn sequential_lets_elaborate_without_stack_recursion() {
+        // Sequential seed lets are a right-nested `Term.let` spine the parser
+        // builds with a heap fold. Recursing one elaborator frame per binder
+        // would stack-fault a legal source file (FL-INV-07).
+        let mut source = String::from("def answer := ");
+        for index in 0..400 {
+            source.push_str(&format!("let x{index} := 1; "));
+        }
+        source.push_str("x399");
+        let parsed = parse_definition(source.as_bytes())
+            .expect("400 sequential lets are in the seed grammar");
+        let Declaration::Defn(definition) =
+            elaborate_definition(parsed.syntax()).expect("a deep let spine must not stack-fault")
+        else {
+            panic!("the deep let command must elaborate to a definition");
+        };
+        assert_eq!(
+            definition.base.type_,
+            Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+            "omitted result follows the last binder through the let spine"
+        );
+        let mut current = &definition.value;
+        for _ in 0..400 {
+            let ExprNode::LetE { body, .. } = current.node() else {
+                panic!("expected a let spine of length 400");
+            };
+            current = body;
+        }
+        assert!(
+            matches!(current.node(), ExprNode::BVar { idx } if *idx == 0),
+            "the last name is the innermost binder"
         );
     }
 }
