@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 use fln_unsafe_abi::handle::Obj;
@@ -81,6 +82,57 @@ fn project_then_inject_mirrors_the_structure_exactly() {
     let back_nat = back_lit.ctor_child(0).ctor_child(0);
     assert!(back_nat.is_scalar());
     assert_eq!(back_nat.unbox(), 42, "the payload is byte-exact");
+}
+
+#[test]
+fn a_multibyte_string_literal_projects_every_scalar() {
+    let mut heap = NativeHeap::new();
+    // "héllo" is 5 scalars and 6 UTF-8 bytes. Slicing the buffer with
+    // m_length drops the last character.
+    let text = Obj::mk_string("héllo");
+    let lit = Obj::mk_ctor(9, vec![Obj::mk_ctor(1, vec![text], &[])], &[]);
+    let mut conversion = Conversion::new();
+    let handle = conversion
+        .project_expr(&mut heap, &lit)
+        .expect("a well-formed multi-byte string must project");
+    let expr = heap.get(handle).expect("the handle resolves");
+    assert!(
+        matches!(
+            expr.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "héllo"
+        ),
+        "projection must keep every UTF-8 scalar, not m_length bytes"
+    );
+}
+
+#[test]
+fn injected_nat_literals_use_the_small_nat_ceiling_not_usize_max() {
+    let mut heap = NativeHeap::new();
+
+    let zero = heap.alloc(Expr::lit(Literal::Nat(NatLit::from_u64(0))));
+    let back_zero = inject_expr(&heap, zero).expect("zero injects");
+    let zero_payload = back_zero.ctor_child(0).ctor_child(0);
+    assert!(
+        zero_payload.is_scalar(),
+        "Nat 0 is a tagged scalar, not mpz"
+    );
+    assert_eq!(zero_payload.unbox(), 0);
+
+    let just_over = heap.alloc(Expr::lit(Literal::Nat(NatLit::from_u64(
+        (usize::MAX >> 1) as u64 + 1,
+    ))));
+    let back_wide =
+        inject_expr(&heap, just_over).expect("a Nat just above the tagged ceiling must not panic");
+    let wide_payload = back_wide.ctor_child(0).ctor_child(0);
+    assert!(
+        !wide_payload.is_scalar(),
+        "2^63 is a nonnegative mpz, not mk_nat"
+    );
+    let (_, size, limbs) = wide_payload.mpz_view();
+    assert!(size > 0);
+    assert_eq!(limbs, &[(usize::MAX >> 1) as u64 + 1]);
 }
 
 #[test]
