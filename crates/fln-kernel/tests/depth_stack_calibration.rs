@@ -36,35 +36,32 @@ use fln_env::constants::{
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
-use fln_kernel::{Declaration, check, check_def_eq};
+use fln_kernel::{Declaration, check};
 
 // ---------------------------------------------------------------------------
 // Probe shapes
 // ---------------------------------------------------------------------------
 
 /// The residual recursive descents that thread `depth`. Consecutive
-/// application, lambda, Pi, let, and recursor-major spines have explicit
-/// worklists now, so they are covered by shallow-depth regressions rather than
-/// pretending to remain native-stack calibration shapes. Each shape here is
-/// built so that reaching depth `d` costs `O(d)` work, not `O(d^2)`.
+/// application, lambda, Pi, let, recursor-major, and matching binder-defeq
+/// spines have explicit worklists now, so they are covered by shallow-depth
+/// regressions rather than pretending to remain native-stack calibration
+/// shapes. Each shape here is built so that reaching depth `d` costs `O(d)`
+/// work, not `O(d^2)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
     /// `infer_core` down a right-nested argument tree (KR-106): flattening the
     /// left-associated application spine does not flatten an application
     /// nested inside its argument.
     AppInfer,
-    /// `is_def_eq` → `quick_def_eq_rules` → `is_def_eq` binder congruence
-    /// (KR-302). Two kernel frames per unit of depth.
-    DefEqBinder,
 }
 
 impl Shape {
-    const ALL: [Shape; 2] = [Shape::AppInfer, Shape::DefEqBinder];
+    const ALL: [Shape; 1] = [Shape::AppInfer];
 
     fn as_str(self) -> &'static str {
         match self {
             Shape::AppInfer => "app_infer",
-            Shape::DefEqBinder => "defeq_binder",
         }
     }
 
@@ -79,10 +76,6 @@ fn n(s: &str) -> Name {
 
 fn sort1() -> Expr {
     Expr::sort(Level::one())
-}
-
-fn prop() -> Expr {
-    Expr::sort(Level::zero())
 }
 
 fn axiom_decl(name: &str, type_: Expr) -> Declaration {
@@ -119,26 +112,15 @@ fn add(env: &Environment, decl: &Declaration) -> Environment {
     env.add_decl(info).expect("probe environment extends")
 }
 
-/// `fun (x : Sort 1) => ... => leaf`, `levels` binders deep.
-fn lam_nest(levels: u32, leaf: Expr) -> Expr {
-    let mut e = leaf;
-    for _ in 0..levels {
-        e = Expr::lam(n("x"), sort1(), e, BinderInfo::Default);
-    }
-    e
-}
-
 /// What a probe run submits to the kernel's public authority.
 enum Probe {
     Decl(Environment, Declaration),
-    DefEq(Environment, Expr, Expr),
 }
 
 impl Probe {
     fn run(&self, budget: Budget) -> Outcome<Verdict> {
         match self {
             Probe::Decl(env, decl) => check(env, decl, budget),
-            Probe::DefEq(env, lhs, rhs) => check_def_eq(env, &[], lhs, rhs, budget),
         }
     }
 }
@@ -166,16 +148,6 @@ fn build_probe(shape: Shape, levels: u32) -> Probe {
                 e = Expr::app(f.clone(), e);
             }
             Probe::Decl(env, defn_decl("Probe", t, e))
-        }
-        Shape::DefEqBinder => {
-            // Two lambda telescopes of equal shape that differ only at the
-            // leaf: KR-302 binder congruence must descend all the way before
-            // it can decide, and it decides `false` at the bottom.
-            Probe::DefEq(
-                Environment::new(),
-                lam_nest(levels, prop()),
-                lam_nest(levels, sort1()),
-            )
         }
     }
 }
@@ -532,11 +504,12 @@ impl Shape {
     /// first.
     ///
     /// Re-measured after the explicit telescope/worklist conversion:
-    /// `DefEqBinder` is the residual worst case at 4,688.1 bytes/depth versus
-    /// 4,430.6 for `AppInfer`. The former forall/lambda shapes no longer belong
-    /// in a native-stack witness at all; retaining either would make "survived
-    /// without reaching the ceiling" look like a calibration failure.
-    const WITNESS: Shape = Shape::DefEqBinder;
+    /// matching binder-defeq (KR-302) is now a heap loop like the former
+    /// forall/lambda infer spines, so it no longer belongs in a native-stack
+    /// witness. Retaining it would make "survived without reaching the
+    /// ceiling" look like a calibration failure. `AppInfer` is the residual
+    /// worst case (right-nested argument trees still recurse).
+    const WITNESS: Shape = Shape::AppInfer;
 }
 
 // ---------------------------------------------------------------------------
@@ -680,11 +653,10 @@ fn observe_shape(
 ///   whatever the other three do.
 /// * BELOW the claim is a property of ALL shapes AT ONCE. A single cheap
 ///   descent is not evidence the constant is overstated — the constant is not
-///   describing that shape. `defeq_binder` measures 4,507 bytes/depth against
-///   the shipped 5,935, which is 24% below it *by design*; quantifying the low
-///   bound per shape would have put a permanent tripwire 9 points away from a
-///   value that is correct, and the first person to see it fire would have
-///   widened the band rather than read it.
+///   describing that shape. A cheaper residual descent sitting below the
+///   shipped maximum is expected; quantifying the low bound per shape would
+///   put a permanent tripwire next to a value that is correct, and the first
+///   person to see it fire would have widened the band rather than read it.
 fn calibration_refusals(
     claimed_bytes_per_depth: usize,
     claimed_entry_reserve: usize,

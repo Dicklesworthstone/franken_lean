@@ -3082,42 +3082,13 @@ impl<'a> TypeChecker<'a> {
         if let (ExprNode::Sort { level: lt }, ExprNode::Sort { level: ls }) = (t.node(), s.node()) {
             return Ok(Some(lt.is_equiv(ls)));
         }
-        // KR-302 binder congruence.
+        // KR-302 binder congruence. Matching Π/λ telescopes are a heap loop
+        // (`is_def_eq_binding`); one recursive frame per binder used to abort
+        // on a legal 400-deep spine (FL-INV-07).
         match (t.node(), s.node()) {
-            (
-                ExprNode::Lam {
-                    binder_type: t1,
-                    body: b1,
-                    ..
-                },
-                ExprNode::Lam {
-                    binder_type: t2,
-                    body: b2,
-                    ..
-                },
-            )
-            | (
-                ExprNode::ForallE {
-                    binder_type: t1,
-                    body: b1,
-                    ..
-                },
-                ExprNode::ForallE {
-                    binder_type: t2,
-                    body: b2,
-                    ..
-                },
-            ) => {
-                let (t1, b1, t2, b2) = (t1.clone(), b1.clone(), t2.clone(), b2.clone());
-                if !self.is_def_eq(&t1, &t2, depth + 1)? {
-                    return Ok(Some(false));
-                }
-                let id = self.fresh_fvar(t1, None);
-                let ob1 = self.open_binder(&b1, &id, depth + 1)?;
-                let ob2 = self.open_binder(&b2, &id, depth + 1)?;
-                let result = self.is_def_eq(&ob1, &ob2, depth + 1);
-                self.drop_local();
-                Ok(Some(result?))
+            (ExprNode::Lam { .. }, ExprNode::Lam { .. })
+            | (ExprNode::ForallE { .. }, ExprNode::ForallE { .. }) => {
+                Ok(Some(self.is_def_eq_binding(t, s, depth)?))
             }
             _ => Ok(None),
         }
@@ -3298,6 +3269,103 @@ impl<'a> TypeChecker<'a> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Pin `is_def_eq_binding` (type_checker.cpp:690). Matching Π/λ telescopes
+    /// are a loop, not a recursive type-checker call chain. Convert can now
+    /// inject a 400-deep binder spine; walking one frame per binder would
+    /// abort (FL-INV-07). Peel while both sides keep the same binder kind,
+    /// charge one `step` per extra layer so `Budget::depth` still binds,
+    /// compare instantiated domains, then defeq the remaining bodies under
+    /// the accumulated locals. A failing domain is decisive, same as the
+    /// pin's early `return false`.
+    fn is_def_eq_binding(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        let saved_locals = self.locals.len();
+        let result = (|| {
+            let kind_is_lam = matches!(t.node(), ExprNode::Lam { .. });
+            let mut left = t.clone();
+            let mut right = s.clone();
+            let mut subst: Vec<Expr> = Vec::new();
+            let mut opened: u32 = 0;
+            let mut layer = depth;
+
+            loop {
+                let (t_dom, t_body, s_dom, s_body) = match (left.node(), right.node()) {
+                    (
+                        ExprNode::Lam {
+                            binder_type: t1,
+                            body: b1,
+                            ..
+                        },
+                        ExprNode::Lam {
+                            binder_type: t2,
+                            body: b2,
+                            ..
+                        },
+                    ) if kind_is_lam => (t1.clone(), b1.clone(), t2.clone(), b2.clone()),
+                    (
+                        ExprNode::ForallE {
+                            binder_type: t1,
+                            body: b1,
+                            ..
+                        },
+                        ExprNode::ForallE {
+                            binder_type: t2,
+                            body: b2,
+                            ..
+                        },
+                    ) if !kind_is_lam => (t1.clone(), b1.clone(), t2.clone(), b2.clone()),
+                    _ => break,
+                };
+
+                if opened > 0 {
+                    layer = depth
+                        .checked_add(opened)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                    self.step(layer)?;
+                }
+
+                let child_depth = layer
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+
+                // Pin skips the domain comparison when the uninstantiated
+                // domains are already the same object. After the same
+                // `instantiate_rev` they remain equal, so the skip is only
+                // an optimization. We still instantiate the right domain
+                // for the local's type.
+                let instantiated_s = if t_dom != s_dom {
+                    let var_t = self.instantiate_rev(&t_dom, &subst, 0, child_depth)?;
+                    let var_s = self.instantiate_rev(&s_dom, &subst, 0, child_depth)?;
+                    if !self.is_def_eq(&var_t, &var_s, child_depth)? {
+                        return Ok(false);
+                    }
+                    var_s
+                } else {
+                    self.instantiate_rev(&s_dom, &subst, 0, child_depth)?
+                };
+
+                // Pin only allocates a local when a body mentions a loose
+                // bvar; otherwise it pushes `g_dont_care`. Always allocating
+                // an fvar is equivalent: a closed body ignores the substitute.
+                let id = self.fresh_fvar(instantiated_s, None);
+                subst.push(Expr::fvar(id));
+                opened = opened
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                left = t_body;
+                right = s_body;
+            }
+
+            let child_depth = layer
+                .checked_add(1)
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+            let opened_left = self.instantiate_rev(&left, &subst, 0, child_depth)?;
+            let opened_right = self.instantiate_rev(&right, &subst, 0, child_depth)?;
+            self.is_def_eq(&opened_left, &opened_right, child_depth)
+        })();
+        self.truncate_locals(saved_locals);
+        result
     }
 
     /// Is `name` a one-constructor, index-free, non-recursive structure?
@@ -5823,6 +5891,94 @@ mod tests {
             !tc.def_eq_public(&left, &other, 0)
                 .expect("a 400-app mismatch must not stack-fault"),
             "Sort 0 and Sort 1 heads stay apart"
+        );
+    }
+
+    #[test]
+    fn defeq_binder_congruence_walks_a_deep_telescope_without_stack_fault() {
+        // Convert can inject a 400-deep Π/λ spine; KR-302 used to open one
+        // binder per recursive `is_def_eq` and abort (FL-INV-07).
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let domain = Expr::sort(Level::one());
+        let name = Name::str(Name::anonymous(), "x");
+        let mut left_lam = Expr::sort(Level::zero());
+        let mut right_lam = Expr::sort(Level::zero());
+        let mut left_pi = Expr::sort(Level::zero());
+        let mut right_pi = Expr::sort(Level::zero());
+        for _ in 0..400 {
+            left_lam = Expr::lam(name.clone(), domain.clone(), left_lam, BinderInfo::Default);
+            right_lam = Expr::lam(name.clone(), domain.clone(), right_lam, BinderInfo::Default);
+            left_pi = Expr::forall_e(name.clone(), domain.clone(), left_pi, BinderInfo::Default);
+            right_pi = Expr::forall_e(name.clone(), domain.clone(), right_pi, BinderInfo::Default);
+        }
+        assert!(
+            tc.def_eq_public(&left_lam, &right_lam, 0)
+                .expect("a 400-λ congruence must not stack-fault"),
+            "identical deep lambda telescopes are defeq"
+        );
+        assert!(
+            tc.def_eq_public(&left_pi, &right_pi, 0)
+                .expect("a 400-Π congruence must not stack-fault"),
+            "identical deep forall telescopes are defeq"
+        );
+
+        let mut other_lam = Expr::sort(Level::one());
+        let mut other_pi = Expr::sort(Level::one());
+        for _ in 0..400 {
+            other_lam = Expr::lam(name.clone(), domain.clone(), other_lam, BinderInfo::Default);
+            other_pi = Expr::forall_e(name.clone(), domain.clone(), other_pi, BinderInfo::Default);
+        }
+        assert!(
+            !tc.def_eq_public(&left_lam, &other_lam, 0)
+                .expect("a 400-λ mismatch must not stack-fault"),
+            "Sort 0 and Sort 1 bodies stay apart"
+        );
+        assert!(
+            !tc.def_eq_public(&left_pi, &other_pi, 0)
+                .expect("a 400-Π mismatch must not stack-fault"),
+            "Sort 0 and Sort 1 codomains stay apart"
+        );
+
+        // Innermost domain disagrees; the peel must still compare it.
+        let mut left_dom = Expr::lam(
+            name.clone(),
+            Expr::sort(Level::zero()),
+            Expr::sort(Level::zero()),
+            BinderInfo::Default,
+        );
+        let mut right_dom = Expr::lam(
+            name.clone(),
+            Expr::sort(Level::one()),
+            Expr::sort(Level::zero()),
+            BinderInfo::Default,
+        );
+        for _ in 0..399 {
+            left_dom = Expr::lam(name.clone(), domain.clone(), left_dom, BinderInfo::Default);
+            right_dom = Expr::lam(name.clone(), domain.clone(), right_dom, BinderInfo::Default);
+        }
+        assert!(
+            !tc.def_eq_public(&left_dom, &right_dom, 0)
+                .expect("a deep domain mismatch must not stack-fault"),
+            "a binder whose innermost domain differs is not defeq"
+        );
+
+        // Bodies that mention the last binder still open under one fvar.
+        let mut left_bvar = Expr::bvar(0).expect("bvar 0 packs");
+        let mut right_bvar = Expr::bvar(0).expect("bvar 0 packs");
+        for _ in 0..400 {
+            left_bvar = Expr::lam(name.clone(), domain.clone(), left_bvar, BinderInfo::Default);
+            right_bvar = Expr::lam(
+                name.clone(),
+                domain.clone(),
+                right_bvar,
+                BinderInfo::Default,
+            );
+        }
+        assert!(
+            tc.def_eq_public(&left_bvar, &right_bvar, 0)
+                .expect("a 400-λ identity telescope must not stack-fault"),
+            "identical deep identities are defeq"
         );
     }
 
