@@ -3239,13 +3239,44 @@ impl<'a> TypeChecker<'a> {
         if tn_full != tn || sn_full != sn {
             return self.is_def_eq_core(&tn_full, &sn_full, depth + 1);
         }
-        // KR-311 application congruence.
-        if let (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) =
-            (tn.node(), sn.node())
-        {
-            let (f1, a1, f2, a2) = (f1.clone(), a1.clone(), f2.clone(), a2.clone());
-            if self.is_def_eq(&f1, &f2, depth + 1)? && self.is_def_eq(&a1, &a2, depth + 1)? {
-                return Ok(true);
+        // KR-311 application congruence. The pin is one app per recursive
+        // call (fn then arg). A 400-deep spine is now a legal WHNF residue;
+        // walking it on the call stack would abort (FL-INV-07). Peel both
+        // spines, charge one `step` per extra layer so Budget::depth still
+        // binds, then compare head and arguments left-to-right. Failure
+        // falls through to eta, same as a false conjunct at the pin.
+        if matches!(
+            (tn.node(), sn.node()),
+            (ExprNode::App { .. }, ExprNode::App { .. })
+        ) {
+            let (head1, args1) = app_spine(&tn);
+            let (head2, args2) = app_spine(&sn);
+            if args1.len() == args2.len() {
+                let mut layer = depth;
+                let mut ok = true;
+                for extra in 1..args1.len() {
+                    layer = depth
+                        .checked_add(extra as u32)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                    self.step(layer)?;
+                }
+                let child_depth = layer
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                if !self.is_def_eq(&head1, &head2, child_depth)? {
+                    ok = false;
+                }
+                if ok {
+                    for (a1, a2) in args1.iter().zip(&args2) {
+                        if !self.is_def_eq(a1, a2, child_depth)? {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    return Ok(true);
+                }
             }
         }
         // KR-312 function eta, both directions.
@@ -5764,6 +5795,34 @@ mod tests {
         assert!(
             result == one,
             "zeta of unused lets around a literal is the literal"
+        );
+    }
+
+    #[test]
+    fn defeq_app_congruence_walks_a_deep_spine_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let arg = Expr::sort(Level::zero());
+        let mut left = Expr::sort(Level::zero());
+        let mut right = Expr::sort(Level::zero());
+        for _ in 0..400 {
+            left = Expr::app(left, arg.clone());
+            right = Expr::app(right, arg.clone());
+        }
+        assert!(
+            tc.def_eq_public(&left, &right, 0)
+                .expect("a 400-app congruence must not stack-fault"),
+            "identical deep app spines are defeq"
+        );
+
+        let mut other = Expr::sort(Level::one());
+        for _ in 0..400 {
+            other = Expr::app(other, arg.clone());
+        }
+        assert!(
+            !tc.def_eq_public(&left, &other, 0)
+                .expect("a 400-app mismatch must not stack-fault"),
+            "Sort 0 and Sort 1 heads stay apart"
         );
     }
 
