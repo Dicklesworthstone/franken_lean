@@ -2749,7 +2749,9 @@ fn finish_callable_result(
     let matches = match expected {
         CallableResultOwnership::Owned => !value.is_scalar(),
         CallableResultOwnership::Scalar => value.is_scalar(),
-        CallableResultOwnership::OwnedOrScalar => true,
+        // Schema v12: a Nat is a tagged scalar or a nonnegative mpz.
+        // A String/Array/ctor is not a Nat just because the union exists.
+        CallableResultOwnership::OwnedOrScalar => is_nat_abi(&value),
     };
     if !matches {
         return Err(VmRefusal::CallableResultKind {
@@ -2759,6 +2761,19 @@ fn finish_callable_result(
         });
     }
     Ok(value)
+}
+
+/// Lean `Nat` at the ABI: small values are tagged scalars; large values are
+/// nonnegative mpz objects. Negative mpz is `Int`, not `Nat`.
+fn is_nat_abi(value: &Obj) -> bool {
+    if value.is_scalar() {
+        return true;
+    }
+    if value_kind(value) != ValueKind::Mpz {
+        return false;
+    }
+    let (_, size, _) = value.mpz_view();
+    size >= 0
 }
 
 fn transfer_intrinsic_arguments(
