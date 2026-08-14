@@ -2990,21 +2990,30 @@ fn invoke_intrinsic(
             expect_arity(row, args, 2)?;
             let value = nat_value(&args[0], "Nat.shiftLeft", 0)?;
             let amount = nat_value(&args[1], "Nat.shiftLeft", 1)?;
+            // Pin `Nat.shiftLeft` is `n * 2^k`. Rust `checked_shl` only
+            // refuses a count ≥ bit width, so `2 <<< 63` wraps to 0 on
+            // 64-bit instead of leaving the scalar range. Zero stays 0
+            // for any k (`0 <<< k = 0`); any other value that cannot
+            // fit in the Lean small-Nat ceiling is overflow.
             let shifted = if value == 0 {
                 0
             } else {
-                u32::try_from(amount)
-                    .ok()
-                    .and_then(|amount| value.checked_shl(amount))
-                    .ok_or(VmRefusal::NatOverflow {
-                        operation: "Nat.shiftLeft",
-                    })?
-            };
-            if shifted > usize::MAX >> 1 {
-                return Err(VmRefusal::NatOverflow {
+                let amount = u32::try_from(amount).map_err(|_| VmRefusal::NatOverflow {
                     operation: "Nat.shiftLeft",
-                });
-            }
+                })?;
+                if amount >= usize::BITS {
+                    return Err(VmRefusal::NatOverflow {
+                        operation: "Nat.shiftLeft",
+                    });
+                }
+                let maximum = usize::MAX >> 1;
+                if amount > 0 && value > (maximum >> amount) {
+                    return Err(VmRefusal::NatOverflow {
+                        operation: "Nat.shiftLeft",
+                    });
+                }
+                value << amount
+            };
             Ok(IntrinsicResult::owned(Obj::mk_nat(shifted)))
         }
         IntrinsicImplementation::NatShiftRight => {
