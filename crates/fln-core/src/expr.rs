@@ -1239,6 +1239,170 @@ impl Expr {
             .ok_or(TooManyBoundVars { range: u32::MAX })
     }
 
+    /// Replace free variable `id` by `bvar k`. Binders raise `k`.
+    /// Iterative: admit re-binds telescopes, and a 400-deep nest of the
+    /// target fvar is legal (FL-INV-07).
+    pub fn abstract_fvar(&self, id: &FVarId, k: u32) -> Result<Expr, TooManyBoundVars> {
+        if !self.has_fvar() {
+            return Ok(self.clone());
+        }
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![(self.clone(), k, false)];
+        while let Some((current, cut, exit)) = stack.pop() {
+            if !current.has_fvar() {
+                done.insert((current.allocation_identity(), cut), current);
+                continue;
+            }
+            let key = (current.allocation_identity(), cut);
+            if done.contains_key(&key) {
+                continue;
+            }
+            if !exit {
+                stack.push((current.clone(), cut, true));
+                match current.node() {
+                    ExprNode::App { f, a } => {
+                        stack.push((a.clone(), cut, false));
+                        stack.push((f.clone(), cut, false));
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((binder_type.clone(), cut, false));
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((value.clone(), cut, false));
+                        stack.push((type_.clone(), cut, false));
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push((expr.clone(), cut, false));
+                    }
+                    ExprNode::BVar { .. }
+                    | ExprNode::FVar { .. }
+                    | ExprNode::MVar { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::Lit { .. } => {}
+                }
+                continue;
+            }
+            let abstracted = match current.node() {
+                ExprNode::FVar { id: found } if found == id => Expr::bvar(cut)?,
+                ExprNode::BVar { .. }
+                | ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => current.clone(),
+                ExprNode::App { f, a } => {
+                    Expr::app(lifted_child(&done, f, cut)?, lifted_child(&done, a, cut)?)
+                }
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    lifted_child(&done, type_, cut)?,
+                    lifted_child(&done, value, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => {
+                    Expr::mdata(data.clone(), lifted_child(&done, expr, cut)?)
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => Expr::proj(struct_name.clone(), *idx, lifted_child(&done, expr, cut)?),
+            };
+            done.insert(key, abstracted);
+        }
+        done.get(&(self.allocation_identity(), k))
+            .cloned()
+            .ok_or(TooManyBoundVars { range: u32::MAX })
+    }
+
+    /// Does loose `bvar idx` occur in this term? Range-pruned, iterative.
+    pub fn has_loose_bvar(&self, idx: u32) -> bool {
+        if self.loose_bvar_range() <= idx {
+            return false;
+        }
+        let mut stack = vec![(self, idx)];
+        while let Some((current, i)) = stack.pop() {
+            if current.loose_bvar_range() <= i {
+                continue;
+            }
+            match current.node() {
+                ExprNode::BVar { idx: found } => {
+                    if *found == i {
+                        return true;
+                    }
+                }
+                ExprNode::App { f, a } => {
+                    stack.push((a, i));
+                    stack.push((f, i));
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push((body, i.saturating_add(1)));
+                    stack.push((binder_type, i));
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push((body, i.saturating_add(1)));
+                    stack.push((value, i));
+                    stack.push((type_, i));
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    stack.push((expr, i));
+                }
+                ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => {}
+            }
+        }
+        false
+    }
+
     /// The structural node (metaprograms pattern-match on the inventory).
     pub fn node(&self) -> &ExprNode {
         self.node_arc()
@@ -1421,6 +1585,57 @@ mod tests {
             .subst_loose(0, std::slice::from_ref(&subst))
             .expect("a 400-deep nest substitutes without a stack fault");
         assert_eq!(out.loose_bvar_range(), 4, "every loose #0 becomes #3");
+    }
+
+    #[test]
+    fn abstract_fvar_replaces_the_target_and_raises_under_a_binder() {
+        let id = FVarId(name("x"));
+        let other = FVarId(name("y"));
+        let app = Expr::app(Expr::fvar(id.clone()), Expr::fvar(other.clone()));
+        let out = app.abstract_fvar(&id, 0).expect("abstract packs");
+        let ExprNode::App { f, a } = out.node() else {
+            panic!("expected an app");
+        };
+        assert!(matches!(f.node(), ExprNode::BVar { idx } if *idx == 0));
+        assert!(matches!(a.node(), ExprNode::FVar { id: found } if found == &other));
+
+        let lam = Expr::lam(
+            name("z"),
+            Expr::sort(Level::zero()),
+            Expr::fvar(id.clone()),
+            BinderInfo::Default,
+        );
+        let raised = lam.abstract_fvar(&id, 0).expect("binder abstract packs");
+        let ExprNode::Lam { body, .. } = raised.node() else {
+            panic!("expected a lam");
+        };
+        assert!(
+            matches!(body.node(), ExprNode::BVar { idx } if *idx == 1),
+            "the abstracted fvar must become #1 under the lambda"
+        );
+    }
+
+    #[test]
+    fn abstract_fvar_and_has_loose_bvar_walk_a_deep_app_nest() {
+        let id = FVarId(name("x"));
+        let mut expr = Expr::fvar(id.clone());
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::fvar(id.clone()));
+        }
+        let out = expr
+            .abstract_fvar(&id, 0)
+            .expect("a 400-deep fvar nest abstracts without a stack fault");
+        assert_eq!(out.loose_bvar_range(), 1);
+        assert!(out.has_loose_bvar(0));
+        assert!(!out.has_loose_bvar(1));
+
+        let mut loose = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            loose = Expr::app(loose, Expr::bvar(2).expect("packs"));
+        }
+        assert!(loose.has_loose_bvar(0));
+        assert!(loose.has_loose_bvar(2));
+        assert!(!loose.has_loose_bvar(1));
     }
 
     #[test]

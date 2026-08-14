@@ -80,73 +80,11 @@ fn depth_guard(depth: u32) -> KResult<()> {
 }
 
 /// Replace `fvar id` by `bvar k` (k bumped under binders) — the inverse of
-/// instantiation, used to re-bind engine telescopes.
-fn abstract_fvar(e: &Expr, id: &FVarId, k: u32, depth: u32) -> KResult<Expr> {
-    depth_guard(depth)?;
-    if !e.has_fvar() {
-        return Ok(e.clone());
-    }
-    Ok(match e.node() {
-        ExprNode::FVar { id: found } => {
-            if found == id {
-                Expr::bvar(k).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
-            } else {
-                e.clone()
-            }
-        }
-        ExprNode::App { f, a } => Expr::app(
-            abstract_fvar(f, id, k, depth + 1)?,
-            abstract_fvar(a, id, k, depth + 1)?,
-        ),
-        ExprNode::Lam {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::lam(
-            binder_name.clone(),
-            abstract_fvar(binder_type, id, k, depth + 1)?,
-            abstract_fvar(body, id, k + 1, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::forall_e(
-            binder_name.clone(),
-            abstract_fvar(binder_type, id, k, depth + 1)?,
-            abstract_fvar(body, id, k + 1, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::LetE {
-            decl_name,
-            type_,
-            value,
-            body,
-            non_dep,
-        } => Expr::let_e(
-            decl_name.clone(),
-            abstract_fvar(type_, id, k, depth + 1)?,
-            abstract_fvar(value, id, k, depth + 1)?,
-            abstract_fvar(body, id, k + 1, depth + 1)?,
-            *non_dep,
-        ),
-        ExprNode::MData { data, expr } => {
-            Expr::mdata(data.clone(), abstract_fvar(expr, id, k, depth + 1)?)
-        }
-        ExprNode::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => Expr::proj(
-            struct_name.clone(),
-            *idx,
-            abstract_fvar(expr, id, k, depth + 1)?,
-        ),
-        _ => e.clone(),
-    })
+/// instantiation, used to re-bind engine telescopes. The walk lives on
+/// [`Expr::abstract_fvar`] so a deep nest cannot stack-fault.
+fn abstract_fvar(e: &Expr, id: &FVarId, k: u32, _depth: u32) -> KResult<Expr> {
+    e.abstract_fvar(id, k)
+        .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))
 }
 
 /// `Π locals, body` — right fold with abstraction (pin `local_ctx::mk_pi`).
@@ -195,91 +133,58 @@ fn subst_loose_bvars(e: &Expr, k: u32, substs: &[Expr], _depth: u32) -> KResult<
     })
 }
 
-/// Does `bvar idx` occur loose in `e`? Range-pruned.
-fn has_loose_bvar(e: &Expr, idx: u32, depth: u32) -> KResult<bool> {
-    depth_guard(depth)?;
-    if e.loose_bvar_range() <= idx {
-        return Ok(false);
-    }
-    Ok(match e.node() {
-        ExprNode::BVar { idx: found } => *found == idx,
-        ExprNode::App { f, a } => {
-            has_loose_bvar(f, idx, depth + 1)? || has_loose_bvar(a, idx, depth + 1)?
-        }
-        ExprNode::Lam {
-            binder_type, body, ..
-        }
-        | ExprNode::ForallE {
-            binder_type, body, ..
-        } => {
-            has_loose_bvar(binder_type, idx, depth + 1)?
-                || has_loose_bvar(body, idx + 1, depth + 1)?
-        }
-        ExprNode::LetE {
-            type_, value, body, ..
-        } => {
-            has_loose_bvar(type_, idx, depth + 1)?
-                || has_loose_bvar(value, idx, depth + 1)?
-                || has_loose_bvar(body, idx + 1, depth + 1)?
-        }
-        ExprNode::MData { expr, .. } => has_loose_bvar(expr, idx, depth + 1)?,
-        ExprNode::Proj { expr, .. } => has_loose_bvar(expr, idx, depth + 1)?,
-        _ => false,
-    })
-}
-
 /// `has_loose_bvars_in_domain` (pin expr.cpp:370): does `bvar vidx` occur in a
 /// (transitively relevant) Π domain of `b`?
-fn has_loose_bvars_in_domain(b: &Expr, vidx: u32, strict: bool, depth: u32) -> KResult<bool> {
-    depth_guard(depth)?;
-    if let ExprNode::ForallE {
-        binder_type,
-        body,
-        binder_info,
-        ..
-    } = b.node()
-    {
-        if has_loose_bvar(binder_type, vidx, depth + 1)?
-            && (*binder_info == BinderInfo::Default
-                || has_loose_bvars_in_domain(body, 0, strict, depth + 1)?)
+fn has_loose_bvars_in_domain(b: &Expr, vidx: u32, strict: bool) -> bool {
+    let mut current = b;
+    let mut index = vidx;
+    loop {
+        let ExprNode::ForallE {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = current.node()
+        else {
+            return !strict && current.has_loose_bvar(index);
+        };
+        if binder_type.has_loose_bvar(index)
+            && (*binder_info == BinderInfo::Default || has_loose_bvars_in_domain(body, 0, strict))
         {
-            return Ok(true);
+            return true;
         }
-        has_loose_bvars_in_domain(body, vidx + 1, strict, depth + 1)
-    } else if !strict {
-        has_loose_bvar(b, vidx, depth)
-    } else {
-        Ok(false)
+        current = body;
+        index = index.saturating_add(1);
     }
 }
 
 /// `infer_implicit` (pin expr.cpp:480, strict): mark leading Π binders
 /// implicit when a later domain (transitively) needs them.
-fn infer_implicit_strict(t: &Expr, depth: u32) -> KResult<Expr> {
-    depth_guard(depth)?;
-    let ExprNode::ForallE {
+fn infer_implicit_strict(t: &Expr, _depth: u32) -> KResult<Expr> {
+    let mut spine = Vec::new();
+    let mut current = t;
+    while let ExprNode::ForallE {
         binder_name,
         binder_type,
         body,
         binder_info,
-    } = t.node()
-    else {
-        return Ok(t.clone());
-    };
-    let new_body = infer_implicit_strict(body, depth + 1)?;
-    let info = if *binder_info != BinderInfo::Default {
-        *binder_info
-    } else if has_loose_bvars_in_domain(&new_body, 0, true, depth + 1)? {
-        BinderInfo::Implicit
-    } else {
-        BinderInfo::Default
-    };
-    Ok(Expr::forall_e(
-        binder_name.clone(),
-        binder_type.clone(),
-        new_body,
-        info,
-    ))
+    } = current.node()
+    {
+        spine.push((binder_name.clone(), binder_type.clone(), *binder_info));
+        current = body;
+    }
+    let mut acc = current.clone();
+    for (binder_name, binder_type, binder_info) in spine.into_iter().rev() {
+        let info = if binder_info != BinderInfo::Default {
+            binder_info
+        } else if has_loose_bvars_in_domain(&acc, 0, true) {
+            BinderInfo::Implicit
+        } else {
+            BinderInfo::Default
+        };
+        acc = Expr::forall_e(binder_name, binder_type, acc, info);
+    }
+    Ok(acc)
 }
 
 /// `mk_rec_name` (inductive.cpp:22).
