@@ -6966,7 +6966,7 @@ fn managerless_task_rows_refuse_bad_kinds_scalars_and_bind_results_without_leaks
             refusal: VmRefusal::TypeMismatch {
                 operation: "Task.spawn",
                 argument: 1,
-                expected: "Nat scalar",
+                expected: "Nat",
                 actual: ValueKind::String,
             },
             ..
