@@ -295,6 +295,63 @@ fn data_and_u8(data: u64, extra: u8) -> Vec<u8> {
     bytes
 }
 
+/// Lean-true object-slot count for an Expr constructor. `None` is an
+/// unknown tag. A constructor whose `other` differs is the older
+/// convert-subset packing (inline bvar index, …) and has no Data word.
+fn expr_lean_slots(tag: u8) -> Option<u8> {
+    Some(match tag {
+        TAG_EXPR_BVAR | TAG_EXPR_FVAR | TAG_EXPR_MVAR | TAG_EXPR_SORT | TAG_EXPR_LIT => 1,
+        TAG_EXPR_CONST | TAG_EXPR_APP | TAG_EXPR_MDATA => 2,
+        TAG_EXPR_LAM | TAG_EXPR_FORALL | TAG_EXPR_PROJ => 3,
+        TAG_EXPR_LET => 4,
+        _ => return None,
+    })
+}
+
+fn level_lean_slots(tag: u8) -> Option<u8> {
+    Some(match tag {
+        TAG_LEVEL_SUCC | TAG_LEVEL_PARAM | TAG_LEVEL_MVAR => 1,
+        TAG_LEVEL_MAX | TAG_LEVEL_IMAX => 2,
+        _ => return None,
+    })
+}
+
+/// First scalar u64 after the Lean-true children, when that word is present.
+/// Missing bytes stay `None` so children-only objects still project.
+fn stored_data_word(obj: &Obj, slots: Option<u8>, family: &'static str) -> Option<u64> {
+    let slots = slots?;
+    if obj.is_scalar() || obj.header().other != slots {
+        return None;
+    }
+    ctor_u64(obj, usize::from(slots) * 8, family).ok()
+}
+
+fn check_expr_data(obj: &Obj, expr: &Expr) -> Result<(), ConvertError> {
+    let Some(stored) = stored_data_word(obj, expr_lean_slots(obj.obj_tag() as u8), "expr") else {
+        return Ok(());
+    };
+    if stored != expr.data().0 {
+        return Err(malformed(
+            "expr",
+            "stored Expr.Data does not match the children",
+        ));
+    }
+    Ok(())
+}
+
+fn check_level_data(obj: &Obj, level: &Level) -> Result<(), ConvertError> {
+    let Some(stored) = stored_data_word(obj, level_lean_slots(obj.obj_tag() as u8), "level") else {
+        return Ok(());
+    };
+    if stored != level.data().0 {
+        return Err(malformed(
+            "level",
+            "stored Level.Data does not match the children",
+        ));
+    }
+    Ok(())
+}
+
 /// A conversion scope: the accounting for one lazy boundary crossing.
 /// Creating one is free; dropping it without projecting allocates nothing.
 /// The dedup itself lives in the destination heap's interning, so the
@@ -357,7 +414,7 @@ impl Conversion {
             ));
         }
         let tag = obj.obj_tag() as u8;
-        match tag {
+        let expr = match tag {
             TAG_EXPR_BVAR => {
                 // Lean `bvar` is one Nat child. Convert's own inject stores
                 // an inline u64 with `other == 0`. Both packings are live.
@@ -450,7 +507,9 @@ impl Conversion {
                 family: "expr",
                 tag: other,
             }),
-        }
+        }?;
+        check_expr_data(obj, &expr)?;
+        Ok(expr)
     }
 
     fn project_expr_child(&mut self, obj: &Obj, i: usize) -> Result<Expr, ConvertError> {
@@ -500,7 +559,7 @@ impl Conversion {
         if obj.is_scalar() {
             return Err(malformed("level", "a tagged scalar is not a level object"));
         }
-        match obj.obj_tag() as u8 {
+        let level = match obj.obj_tag() as u8 {
             TAG_LEVEL_ZERO => Ok(Level::zero()),
             TAG_LEVEL_SUCC => {
                 let inner = self.level(&ctor_field(obj, 0, "level")?)?;
@@ -530,7 +589,9 @@ impl Conversion {
                 family: "level",
                 tag: other,
             }),
-        }
+        }?;
+        check_level_data(obj, &level)?;
+        Ok(level)
     }
 
     fn literal(&mut self, obj: &Obj) -> Result<Literal, ConvertError> {
