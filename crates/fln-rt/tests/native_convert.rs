@@ -23,6 +23,16 @@ use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, injec
 use fln_rt::native_heap::NativeHeap;
 use fln_unsafe_abi::handle::Obj;
 
+fn name_component_count(name: &Name) -> usize {
+    let mut cursor = name.clone();
+    let mut count = 0;
+    while !cursor.is_anonymous() {
+        count += 1;
+        cursor = cursor.parent();
+    }
+    count
+}
+
 fn mk_name(parts: &[&str]) -> Obj {
     let mut out = Obj::mk_ctor(0, Vec::new(), &[]);
     for part in parts {
@@ -817,18 +827,22 @@ fn a_syntax_tree_payload_stays_an_unsupported_constructor() {
 }
 
 #[test]
-fn a_name_chain_deeper_than_the_walk_ceiling_is_overflow_not_a_stack_fault() {
-    // FL-INV-07: a hostile Compat Name.pre chain must not blow the host stack.
+fn project_walks_a_hand_built_long_name_chain() {
+    // Older convert-subset packing: children only, no hash word. Must still
+    // walk iteratively — a 400-component Name is legal.
     let mut chain = Obj::mk_nat(0);
     for _ in 0..400 {
-        chain = Obj::mk_ctor(1, vec![chain, Obj::mk_string("a")], &[0u8; 8]);
+        chain = Obj::mk_ctor(1, vec![chain, Obj::mk_string("a")], &[]);
     }
-    let expr = Obj::mk_ctor(4, vec![chain, Obj::mk_nat(0)], &[0u8; 8]);
+    let expr = Obj::mk_ctor(4, vec![chain, Obj::mk_nat(0)], &[]);
     let mut heap = NativeHeap::new();
-    match Conversion::new().project_expr(&mut heap, &expr) {
-        Err(ConvertError::NativeOverflow { family }) => assert_eq!(family, "name"),
-        other => panic!("a 400-deep Name chain must overflow typed, got {other:?}"),
-    }
+    let back = Conversion::new()
+        .project_expr(&mut heap, &expr)
+        .expect("a 400-component Compat Name is legal");
+    let ExprNode::Const { name, .. } = heap.get(back).expect("handle").node() else {
+        panic!("expected a const");
+    };
+    assert_eq!(name_component_count(name), 400);
 }
 
 #[test]
@@ -840,6 +854,25 @@ fn inject_walks_a_long_name_chain_without_a_stack_fault() {
     let mut heap = NativeHeap::new();
     let handle = heap.alloc(Expr::const_(name, Vec::new()));
     inject_expr(&heap, handle).expect("inject_name is iterative on the parent chain");
+}
+
+#[test]
+fn project_walks_a_long_name_chain_without_a_stack_fault() {
+    let mut name = Name::anonymous();
+    for _ in 0..400 {
+        name = Name::str(name, "a");
+    }
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::const_(name.clone(), Vec::new()));
+    let injected = inject_expr(&heap, handle).expect("inject_name is iterative");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("project_name is iterative on the parent chain");
+    let ExprNode::Const { name: restored, .. } = heap.get(back).expect("handle").node() else {
+        panic!("expected a const");
+    };
+    assert_eq!(restored.hash(), name.hash());
+    assert_eq!(name_component_count(restored), 400);
 }
 
 #[test]
