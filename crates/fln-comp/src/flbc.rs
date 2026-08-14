@@ -26,15 +26,16 @@ use std::fmt;
 /// explicit artifact instruction carrying its diagnostic module name; version
 /// 11 also admits a validated register operand for computed module names;
 /// version 12 adds the ABI-exact callable result class used by `Nat`, whose
-/// runtime representation may be either a tagged scalar or an owned mpz.
-pub const FLBC_SCHEMA_VERSION: u16 = 12;
+/// runtime representation may be either a tagged scalar or an owned mpz;
+/// version 13 carries canonical arbitrary-precision Nat literal limbs.
+pub const FLBC_SCHEMA_VERSION: u16 = 13;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 7;
+pub const FLBC_WIRE_VERSION: u16 = 8;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -73,6 +74,7 @@ const OP_PANIC: u8 = 14;
 const OP_CTOR_FIELD: u8 = 15;
 const OP_CHECK_SYSTEM: u8 = 16;
 const OP_CHECK_SYSTEM_VALUE: u8 = 17;
+const OP_NAT_BIG: u8 = 18;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -440,6 +442,11 @@ pub enum Instruction {
         dst: Register,
         value: u64,
     },
+    /// A canonical non-scalar Nat encoded as little-endian 64-bit limbs.
+    NatBig {
+        dst: Register,
+        limbs_le: Vec<u64>,
+    },
     String {
         dst: Register,
         value: String,
@@ -537,6 +544,7 @@ impl Instruction {
     fn read_registers(&self) -> Vec<Register> {
         match self {
             Self::Nat { .. }
+            | Self::NatBig { .. }
             | Self::String { .. }
             | Self::Jump { .. }
             | Self::CheckSystem { .. } => Vec::new(),
@@ -566,6 +574,7 @@ impl Instruction {
     fn written_register(&self) -> Option<Register> {
         match self {
             Self::Nat { dst, .. }
+            | Self::NatBig { dst, .. }
             | Self::String { dst, .. }
             | Self::Copy { dst, .. }
             | Self::Move { dst, .. }
@@ -1411,6 +1420,19 @@ pub enum ValidationError {
         pc: Pc,
         value: u64,
     },
+    EmptyBigNatConstant {
+        function: FunctionId,
+        pc: Pc,
+    },
+    BigNatConstantHasHighZeroLimb {
+        function: FunctionId,
+        pc: Pc,
+    },
+    BigNatConstantFitsScalar {
+        function: FunctionId,
+        pc: Pc,
+        value: u64,
+    },
     CtorTagOutOfRange {
         function: FunctionId,
         pc: Pc,
@@ -1826,6 +1848,28 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 pc.get()
             ),
+            Self::EmptyBigNatConstant { function, pc } => write!(
+                f,
+                "function {} pc {} has an empty arbitrary-precision Nat constant",
+                function.get(),
+                pc.get()
+            ),
+            Self::BigNatConstantHasHighZeroLimb { function, pc } => write!(
+                f,
+                "function {} pc {} arbitrary-precision Nat constant has a high zero limb",
+                function.get(),
+                pc.get()
+            ),
+            Self::BigNatConstantFitsScalar {
+                function,
+                pc,
+                value,
+            } => write!(
+                f,
+                "function {} pc {} arbitrary-precision Nat constant {value} has a noncanonical scalar spelling",
+                function.get(),
+                pc.get()
+            ),
             Self::CtorTagOutOfRange { function, pc, tag } => write!(
                 f,
                 "function {} pc {} constructor tag {tag} exceeds the ABI contract",
@@ -2067,6 +2111,11 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.register(*dst)?;
             encoder.u64(*value)
         }
+        Instruction::NatBig { dst, limbs_le } => {
+            encoder.u8(OP_NAT_BIG)?;
+            encoder.register(*dst)?;
+            encoder.u64_limbs("arbitrary-precision Nat literal", limbs_le)
+        }
         Instruction::String { dst, value } => {
             encoder.u8(OP_STRING)?;
             encoder.register(*dst)?;
@@ -2211,6 +2260,10 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
         OP_NAT => Ok(Instruction::Nat {
             dst: decoder.register()?,
             value: decoder.u64()?,
+        }),
+        OP_NAT_BIG => Ok(Instruction::NatBig {
+            dst: decoder.register()?,
+            limbs_le: decoder.u64_limbs("arbitrary-precision Nat literal")?,
         }),
         OP_STRING => Ok(Instruction::String {
             dst: decoder.register()?,
@@ -2457,6 +2510,21 @@ impl Encoder {
         self.bytes(field, value.as_bytes())
     }
 
+    fn u64_limbs(&mut self, field: &'static str, limbs: &[u64]) -> Result<(), CodecError> {
+        let byte_count = limbs.len().saturating_mul(8);
+        self.literal_bytes = checked_total(
+            CodecResource::LiteralBytes,
+            self.literal_bytes,
+            byte_count,
+            self.limits.max_literal_bytes,
+        )?;
+        self.len(field, limbs.len())?;
+        for limb in limbs {
+            self.u64(*limb)?;
+        }
+        Ok(())
+    }
+
     fn charge_instructions(&mut self, count: usize) -> Result<(), CodecError> {
         self.instructions = checked_total(
             CodecResource::Instructions,
@@ -2672,6 +2740,29 @@ impl<'a> Decoder<'a> {
         Ok(owned)
     }
 
+    fn u64_limbs(&mut self, field: &'static str) -> Result<Vec<u64>, CodecError> {
+        let count = self.len(field)?;
+        let byte_count = count.saturating_mul(8);
+        self.literal_bytes = checked_total(
+            CodecResource::LiteralBytes,
+            self.literal_bytes,
+            byte_count,
+            self.limits.max_literal_bytes,
+        )?;
+        self.require_items(count, 8)?;
+        let mut limbs = Vec::new();
+        limbs
+            .try_reserve_exact(count)
+            .map_err(|_| CodecError::AllocationFailure {
+                resource: CodecResource::LiteralBytes,
+                requested: byte_count,
+            })?;
+        for _ in 0..count {
+            limbs.push(self.u64()?);
+        }
+        Ok(limbs)
+    }
+
     fn charge_instructions(&mut self, count: usize) -> Result<(), CodecError> {
         self.instructions = checked_total(
             CodecResource::Instructions,
@@ -2814,6 +2905,27 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                         function: function.id,
                         pc,
                         value: *value,
+                    });
+                }
+            }
+            Instruction::NatBig { limbs_le, .. } => {
+                let Some(high) = limbs_le.last() else {
+                    return Err(ValidationError::EmptyBigNatConstant {
+                        function: function.id,
+                        pc,
+                    });
+                };
+                if *high == 0 {
+                    return Err(ValidationError::BigNatConstantHasHighZeroLimb {
+                        function: function.id,
+                        pc,
+                    });
+                }
+                if limbs_le.len() == 1 && limbs_le[0] <= (usize::MAX >> 1) as u64 {
+                    return Err(ValidationError::BigNatConstantFitsScalar {
+                        function: function.id,
+                        pc,
+                        value: limbs_le[0],
                     });
                 }
             }
@@ -3334,6 +3446,7 @@ fn ownership_reads<E>(
 ) -> Result<(), E> {
     match instruction {
         Instruction::Nat { .. }
+        | Instruction::NatBig { .. }
         | Instruction::String { .. }
         | Instruction::Jump { .. }
         | Instruction::CheckSystem { .. } => {}
@@ -3525,6 +3638,7 @@ fn scalar_callable_result_count(instruction: &Instruction) -> usize {
 fn ownership_operand_count(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::Nat { .. }
+        | Instruction::NatBig { .. }
         | Instruction::String { .. }
         | Instruction::Jump { .. }
         | Instruction::CheckSystem { .. } => 0,
@@ -3587,6 +3701,7 @@ fn ownership_cfg_edge_count(instruction: &Instruction) -> usize {
 
 fn ownership_payload_bytes(instruction: &Instruction) -> usize {
     match instruction {
+        Instruction::NatBig { limbs_le, .. } => limbs_le.len().saturating_mul(8),
         Instruction::String { value, .. } => value.len(),
         Instruction::Ctor { scalar_bytes, .. } => scalar_bytes.len(),
         Instruction::Intrinsic { row, .. } => row.len(),
@@ -3733,11 +3848,27 @@ fn ownership_clone_string(source: &str) -> Result<String, OwnershipError> {
     Ok(copy)
 }
 
+fn ownership_clone_u64s(source: &[u64]) -> Result<Vec<u64>, OwnershipError> {
+    let requested = source.len().saturating_mul(8);
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(source.len())
+        .map_err(|_| OwnershipError::AllocationFailure {
+            resource: OwnershipResource::PayloadBytes,
+            requested,
+        })?;
+    copy.extend_from_slice(source);
+    Ok(copy)
+}
+
 fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction, OwnershipError> {
     Ok(match instruction {
         Instruction::Nat { dst, value } => Instruction::Nat {
             dst: *dst,
             value: *value,
+        },
+        Instruction::NatBig { dst, limbs_le } => Instruction::NatBig {
+            dst: *dst,
+            limbs_le: ownership_clone_u64s(limbs_le)?,
         },
         Instruction::String { dst, value } => Instruction::String {
             dst: *dst,
@@ -6524,12 +6655,17 @@ mod codec_tests {
                 function(
                     0,
                     0,
-                    10,
+                    11,
                     vec![
                         Instruction::Nat {
                             dst: r(0),
                             value: 0,
                         },
+                        Instruction::NatBig {
+                            dst: r(10),
+                            limbs_le: vec![0, 1],
+                        },
+                        Instruction::Drop { src: r(10) },
                         Instruction::String {
                             dst: r(1),
                             value: "value".to_string(),
@@ -6589,10 +6725,10 @@ mod codec_tests {
                         },
                         Instruction::JumpIfZero {
                             cond: r(0),
-                            zero: pc(13),
-                            nonzero: pc(13),
+                            zero: pc(15),
+                            nonzero: pc(15),
                         },
-                        Instruction::Jump { target: pc(14) },
+                        Instruction::Jump { target: pc(16) },
                         Instruction::CheckSystem {
                             module_name: "Every.Opcode".to_string(),
                         },
@@ -11104,8 +11240,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                7, 0, // wire version
-                12, 0, // schema version
+                8, 0, // wire version
+                13, 0, // schema version
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
@@ -11120,6 +11256,80 @@ mod codec_tests {
                 13, // Return
                 0, 0, // source
             ]
+        );
+    }
+
+    #[test]
+    fn arbitrary_precision_nat_constants_are_canonical_bounded_and_round_trip() {
+        let program = |limbs_le: Vec<u64>| {
+            Program::new(
+                f(0),
+                vec![function(
+                    0,
+                    0,
+                    1,
+                    vec![
+                        Instruction::NatBig {
+                            dst: r(0),
+                            limbs_le,
+                        },
+                        Instruction::Return { src: r(0) },
+                    ],
+                )],
+            )
+        };
+
+        let validated = validate(program(vec![0, 1])).expect("2^64 has one canonical limb vector");
+        let bytes = encode_canonical(&validated, CodecLimits::default())
+            .expect("canonical arbitrary-precision Nat encodes");
+        assert_eq!(
+            decode_canonical(&bytes, CodecLimits::default())
+                .expect("canonical arbitrary-precision Nat decodes"),
+            validated
+        );
+
+        let literal_limit = CodecLimits {
+            max_literal_bytes: 15,
+            ..CodecLimits::default()
+        };
+        assert_eq!(
+            encode_canonical(&validated, literal_limit),
+            Err(CodecError::ResourceLimit {
+                resource: CodecResource::LiteralBytes,
+                limit: 15,
+                observed: 16,
+            })
+        );
+        assert_eq!(
+            decode_canonical(&bytes, literal_limit),
+            Err(CodecError::ResourceLimit {
+                resource: CodecResource::LiteralBytes,
+                limit: 15,
+                observed: 16,
+            })
+        );
+
+        assert_eq!(
+            validate(program(Vec::new())),
+            Err(ValidationError::EmptyBigNatConstant {
+                function: f(0),
+                pc: pc(0),
+            })
+        );
+        assert_eq!(
+            validate(program(vec![1, 0])),
+            Err(ValidationError::BigNatConstantHasHighZeroLimb {
+                function: f(0),
+                pc: pc(0),
+            })
+        );
+        assert_eq!(
+            validate(program(vec![7])),
+            Err(ValidationError::BigNatConstantFitsScalar {
+                function: f(0),
+                pc: pc(0),
+                value: 7,
+            })
         );
     }
 

@@ -1434,6 +1434,25 @@ fn run(
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_nat(value))?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
+            Instruction::NatBig { dst, limbs_le } => {
+                let observed = u64::try_from(limbs_le.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(8);
+                let allowed = limits.max_nat_magnitude_bytes.min(
+                    u64::try_from(MAX_LIMBS)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(8),
+                );
+                if observed > allowed {
+                    return Err(nat_magnitude_exhausted(allowed, observed, &location));
+                }
+                set_register(
+                    current_frame_mut(&mut stack)?,
+                    dst,
+                    Obj::mk_mpz(&limbs_le, false),
+                )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
             Instruction::String { dst, value } => {
                 set_register(current_frame_mut(&mut stack)?, dst, Obj::mk_string(&value))?;
                 advance(current_frame_mut(&mut stack)?)?;

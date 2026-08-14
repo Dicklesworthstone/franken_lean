@@ -379,13 +379,6 @@ pub enum IngressError {
         expected: fir::ValueType,
         actual: fir::ValueType,
     },
-    NatLiteralTooWide {
-        limbs: usize,
-    },
-    NatLiteralOutOfAbiRange {
-        value: u64,
-        maximum: u64,
-    },
     IdentifierWidth {
         table: &'static str,
         observed: usize,
@@ -832,14 +825,6 @@ impl fmt::Display for IngressError {
             } => write!(
                 formatter,
                 "lambda catalog binding {binding} declares result {expected:?}, observed {actual:?}"
-            ),
-            Self::NatLiteralTooWide { limbs } => write!(
-                formatter,
-                "Nat literal has {limbs} limbs; large-Nat boxing is not implemented"
-            ),
-            Self::NatLiteralOutOfAbiRange { value, maximum } => write!(
-                formatter,
-                "Nat literal {value} exceeds the ABI scalar maximum {maximum}"
             ),
             Self::IdentifierWidth { table, observed } => {
                 write!(formatter, "{table} index {observed} does not fit u32")
@@ -1342,6 +1327,18 @@ fn clone_bytes(values: &[u8]) -> Result<Vec<u8>, IngressError> {
     Ok(clone)
 }
 
+fn clone_u64s(values: &[u64]) -> Result<Vec<u64>, IngressError> {
+    let mut clone = Vec::new();
+    clone
+        .try_reserve_exact(values.len())
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::LiteralBytes,
+            requested: values.len().saturating_mul(8),
+        })?;
+    clone.extend_from_slice(values);
+    Ok(clone)
+}
+
 fn emit_binding(
     bindings: &mut Vec<fir::Binding>,
     parameter_count: usize,
@@ -1412,21 +1409,33 @@ fn emit_literal(
 ) -> Result<CompiledValue, IngressError> {
     match literal {
         Literal::Nat(value) => {
-            let scalar = value.to_u64().ok_or(IngressError::NatLiteralTooWide {
-                limbs: value.limbs_le().len(),
-            })?;
             let maximum = (usize::MAX >> 1) as u64;
-            if scalar > maximum {
-                return Err(IngressError::NatLiteralOutOfAbiRange {
-                    value: scalar,
-                    maximum,
-                });
-            }
+            let operation = match value.to_u64() {
+                Some(scalar) if scalar <= maximum => fir::Operation::Nat(scalar),
+                _ => {
+                    let limbs = value.limbs_le();
+                    let bytes = limbs.len().saturating_mul(8);
+                    let observed = literal_bytes.checked_add(bytes).unwrap_or(usize::MAX);
+                    charge(
+                        IngressResource::LiteralBytes,
+                        observed,
+                        limits.max_literal_bytes,
+                    )?;
+                    charge_fir(
+                        fir::ValidationResource::LiteralBytes,
+                        observed,
+                        limits.fir.max_literal_bytes,
+                    )?;
+                    let limbs = clone_u64s(limbs)?;
+                    *literal_bytes = observed;
+                    fir::Operation::NatBig(limbs)
+                }
+            };
             emit_binding(
                 bindings,
                 parameter_count,
                 fir::ValueType::Nat,
-                fir::Operation::Nat(scalar),
+                operation,
                 limits,
             )
         }
@@ -4825,7 +4834,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
@@ -4858,7 +4867,7 @@ mod tests {
     }
 
     #[test]
-    fn open_unresolved_unsupported_and_large_literals_never_publish() {
+    fn open_unresolved_and_unsupported_terms_never_publish_but_large_nats_enter_fir() {
         assert_eq!(
             lower_closed_expr(
                 &Expr::fvar(FVarId(Name::anonymous())),
@@ -4893,24 +4902,25 @@ mod tests {
                 actual: fir::ValueType::Nat,
             })
         );
-        assert_eq!(
-            lower_closed_expr(
-                &Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
-                IngressLimits::default()
-            ),
-            Err(IngressError::NatLiteralTooWide { limbs: 2 })
-        );
+        let two_to_64 = lower_closed_expr(
+            &Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+            IngressLimits::default(),
+        )
+        .expect("a canonical two-limb Nat enters FIR");
+        assert!(matches!(
+            &two_to_64.fir().functions()[0].blocks[0].bindings[0].operation,
+            fir::Operation::NatBig(limbs) if limbs == &[0, 1]
+        ));
         let maximum = (usize::MAX >> 1) as u64;
-        assert_eq!(
-            lower_closed_expr(
-                &Expr::lit(Literal::Nat(NatLit::from_u64(maximum + 1))),
-                IngressLimits::default()
-            ),
-            Err(IngressError::NatLiteralOutOfAbiRange {
-                value: maximum + 1,
-                maximum,
-            })
-        );
+        let one_limb_mpz = lower_closed_expr(
+            &Expr::lit(Literal::Nat(NatLit::from_u64(maximum + 1))),
+            IngressLimits::default(),
+        )
+        .expect("a Nat just beyond the tagged scalar range enters FIR");
+        assert!(matches!(
+            &one_limb_mpz.fir().functions()[0].blocks[0].bindings[0].operation,
+            fir::Operation::NatBig(limbs) if limbs == &[maximum + 1]
+        ));
     }
 
     #[test]
@@ -4953,7 +4963,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "function f0 params=[] ownership=[] result=unit result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:unit = check_system 10:4c616b652e4275696c64\n",
@@ -5169,7 +5179,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
@@ -5227,7 +5237,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "constructor c1 tag=3 fields=[] scalar_bytes=0:\n",
                 "function f0 params=[] ownership=[] result=ctor result_ownership=owned\n",
@@ -5522,7 +5532,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "constructor c0 tag=7 fields=[nat,string] scalar_bytes=2:abcd\n",
                 "projection p0 constructor=c0 field=0\n",
                 "projection p1 constructor=c0 field=1\n",
@@ -5776,7 +5786,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
@@ -6363,7 +6373,7 @@ mod tests {
         assert_eq!(
             ingress.fir().canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "closure_type s0 params=[string] ownership=[borrowed] result=string result_ownership=owned\n",
                 "intrinsic i0 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
                 "function f0 params=[] ownership=[] result=string result_ownership=owned\n",
@@ -8010,6 +8020,21 @@ mod tests {
                 resource: IngressResource::LiteralBytes,
                 limit: 3,
                 observed: 4,
+            })
+        ));
+        let wide_nat_literal = IngressLimits {
+            max_literal_bytes: 15,
+            ..IngressLimits::default()
+        };
+        assert!(matches!(
+            lower_closed_expr(
+                &Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+                wide_nat_literal,
+            ),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::LiteralBytes,
+                limit: 15,
+                observed: 16,
             })
         ));
         let constructor_literal = IngressLimits {
