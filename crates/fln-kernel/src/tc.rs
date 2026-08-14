@@ -3702,34 +3702,86 @@ impl<'a> TypeChecker<'a> {
         Ok(Some(self.is_def_eq(&expanded, s, depth + 1)?))
     }
 
-    /// KR-312 (function half): `t` a lambda, `s` not — eta-expand `s` through its
-    /// Π-type and retry.
+    /// KR-312 (function half): `t` a lambda, `s` not — eta-expand `s` through
+    /// its Π-type and retry. The pin is one expansion per recursive
+    /// `is_def_eq` (`type_checker.cpp:778`). A 400-deep λ against a
+    /// non-lambda is now a legal pair; composing one expansion with
+    /// binder-congruence would abort (FL-INV-07). Flatten that composition:
+    /// peel `t`'s λ spine against successive WHNF Πs of `s`, compare
+    /// instantiated domains, apply `s` to the opened locals, then defeq the
+    /// remainders. A failing domain is decisive, same as the pin.
     fn try_eta(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
         if !matches!(t.node(), ExprNode::Lam { .. }) || matches!(s.node(), ExprNode::Lam { .. }) {
             return Ok(false);
         }
-        let s_type = match self.infer_only(s, depth) {
-            Ok(ty) => ty,
-            Err(Stop::Reject(..)) => return Ok(false),
-            Err(stop) => return Err(stop),
-        };
-        let s_type = self.whnf(&s_type, depth)?;
-        let ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            binder_info,
-            ..
-        } = s_type.node()
-        else {
-            return Ok(false);
-        };
-        let expanded = Expr::lam(
-            binder_name.clone(),
-            binder_type.clone(),
-            Expr::app(s.clone(), Expr::bvar(0).unwrap_or_else(|_| s.clone())),
-            *binder_info,
-        );
-        self.is_def_eq(t, &expanded, depth)
+        let saved_locals = self.locals.len();
+        let result = (|| {
+            let mut remaining_t = t.clone();
+            let mut remaining_s = s.clone();
+            let mut subst: Vec<Expr> = Vec::new();
+            let mut opened: u32 = 0;
+            let mut layer = depth;
+
+            while let ExprNode::Lam {
+                binder_type: t_dom,
+                body: t_body,
+                ..
+            } = remaining_t.node()
+            {
+                let (t_dom, t_body) = (t_dom.clone(), t_body.clone());
+
+                if opened > 0 {
+                    layer = depth
+                        .checked_add(opened)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                    self.step(layer)?;
+                }
+                let child_depth = layer
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+
+                let s_type = match self.infer_only(&remaining_s, layer) {
+                    Ok(ty) => ty,
+                    Err(Stop::Reject(..)) => return Ok(false),
+                    Err(stop) => return Err(stop),
+                };
+                let s_type = self.whnf(&s_type, layer)?;
+                let ExprNode::ForallE {
+                    binder_type: s_dom, ..
+                } = s_type.node()
+                else {
+                    break;
+                };
+                let s_dom = s_dom.clone();
+
+                let instantiated_t = self.instantiate_rev(&t_dom, &subst, 0, child_depth)?;
+                if instantiated_t != s_dom
+                    && !self.is_def_eq(&instantiated_t, &s_dom, child_depth)?
+                {
+                    return Ok(false);
+                }
+
+                let id = self.fresh_fvar(s_dom, None);
+                let fv = Expr::fvar(id);
+                subst.push(fv.clone());
+                remaining_s = Expr::app(remaining_s, fv);
+                remaining_t = t_body;
+                opened = opened
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+            }
+
+            if opened == 0 {
+                return Ok(false);
+            }
+            let child_depth = layer
+                .checked_add(1)
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+            let opened_t = self.instantiate_rev(&remaining_t, &subst, 0, child_depth)?;
+            self.is_def_eq(&opened_t, &remaining_s, child_depth)
+        })();
+        self.truncate_locals(saved_locals);
+        result
     }
 
     // ---- typing (KR-100..112) ----------------------------------------------------------
@@ -5973,6 +6025,128 @@ mod tests {
             tc.def_eq_public(&left_bvar, &right_bvar, 0)
                 .expect("a 400-λ identity telescope must not stack-fault"),
             "identical deep identities are defeq"
+        );
+    }
+
+    #[test]
+    fn defeq_function_eta_walks_a_deep_telescope_without_stack_fault() {
+        // KR-312 used to expand one λ per recursive is_def_eq. Convert can
+        // inject a 400-deep λ against a non-lambda; that composition aborted
+        // (FL-INV-07).
+        use fln_env::constants::{AxiomVal, ConstantVal};
+
+        let name = Name::str(Name::anonymous(), "x");
+        let domain = Expr::sort(Level::one());
+        let f_name = Name::str(Name::anonymous(), "f");
+        let mut f_type = domain.clone();
+        for _ in 0..400 {
+            f_type = Expr::forall_e(name.clone(), domain.clone(), f_type, BinderInfo::Default);
+        }
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: f_name.clone(),
+                    level_params: Vec::new(),
+                    type_: f_type,
+                },
+                is_unsafe: false,
+            }),
+        );
+        let f = Expr::const_(f_name, Vec::new());
+        let mut expanded = f.clone();
+        for i in (0..400).rev() {
+            expanded = Expr::app(expanded, Expr::bvar(i).expect("bvar packs"));
+        }
+        for _ in 0..400 {
+            expanded = Expr::lam(name.clone(), domain.clone(), expanded, BinderInfo::Default);
+        }
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            tc.def_eq_public(&expanded, &f, 0)
+                .expect("a 400-λ eta must not stack-fault"),
+            "(fun x1 … x400 => f x1 … x400) ≟ f"
+        );
+
+        // Domain mismatch stays decisive: Sort 0 vs Sort 1 on the first binder.
+        let g_name = Name::str(Name::anonymous(), "g");
+        let g_type = Expr::forall_e(
+            name.clone(),
+            domain.clone(),
+            domain.clone(),
+            BinderInfo::Default,
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: g_name.clone(),
+                    level_params: Vec::new(),
+                    type_: g_type,
+                },
+                is_unsafe: false,
+            }),
+        );
+        let g = Expr::const_(g_name, Vec::new());
+        let wrong = Expr::lam(
+            name.clone(),
+            Expr::sort(Level::zero()),
+            Expr::app(g.clone(), Expr::bvar(0).expect("bvar packs")),
+            BinderInfo::Default,
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            !tc.def_eq_public(&wrong, &g, 0)
+                .expect("eta domain mismatch must not stack-fault"),
+            "eta must still compare the λ domain against the Π domain"
+        );
+
+        // Dependent two-layer: (fun (A : Sort 1) (a : A) => h A a) ≟ h
+        // with h : (A : Sort 1) → A → A.
+        let h_name = Name::str(Name::anonymous(), "h");
+        let a_name = Name::str(Name::anonymous(), "A");
+        let h_type = Expr::forall_e(
+            a_name.clone(),
+            domain.clone(),
+            Expr::forall_e(
+                name.clone(),
+                Expr::bvar(0).expect("bvar packs"),
+                Expr::bvar(1).expect("bvar packs"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: h_name.clone(),
+                    level_params: Vec::new(),
+                    type_: h_type,
+                },
+                is_unsafe: false,
+            }),
+        );
+        let h = Expr::const_(h_name, Vec::new());
+        let dep = Expr::lam(
+            a_name,
+            domain,
+            Expr::lam(
+                name,
+                Expr::bvar(0).expect("bvar packs"),
+                Expr::app(
+                    Expr::app(h.clone(), Expr::bvar(1).expect("bvar packs")),
+                    Expr::bvar(0).expect("bvar packs"),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            tc.def_eq_public(&dep, &h, 0)
+                .expect("dependent two-layer eta must not stack-fault"),
+            "(fun (A : Sort 1) (a : A) => h A a) ≟ h"
         );
     }
 
