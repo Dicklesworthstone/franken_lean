@@ -1737,12 +1737,6 @@ impl<'a> TypeChecker<'a> {
             .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
-    /// Instantiate a binder body with an fvar (the standard descent move).
-    fn open_binder(&mut self, body: &Expr, id: &FVarId, depth: u32) -> KResult<Expr> {
-        let fv = Expr::fvar(id.clone());
-        self.instantiate(body, 0, &fv, depth)
-    }
-
     /// Pin `instantiate_rev(e, values)`: simultaneously consume an outer
     /// binder telescope. Values are stored outermost-to-innermost, so bvar 0
     /// receives the last value. The same primitive opens binders with fvars
@@ -2272,13 +2266,13 @@ impl<'a> TypeChecker<'a> {
         let mut current = e.clone();
         let mut depth = depth;
         let result = loop {
-            if !cheap_proj && current != *e {
-                if let Some(cached) =
+            if !cheap_proj
+                && current != *e
+                && let Some(cached) =
                     self.whnf_core_cache
                         .get(&current, &self.locals, &self.local_positions)
-                {
-                    break cached;
-                }
+            {
+                break cached;
             }
             match current.node() {
                 ExprNode::MData { expr, .. } => {
