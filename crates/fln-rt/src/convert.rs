@@ -47,7 +47,7 @@
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
-use fln_core::options::{DataValue, KVMap};
+use fln_core::options::{DataValue, KVMap, SyntaxHandle};
 use fln_unsafe_abi::handle::Obj;
 
 use crate::abi;
@@ -674,10 +674,26 @@ impl Conversion {
                 let value = int_i64(&ctor_field(obj, 0, "data-value")?, "data-value")?;
                 Ok(DataValue::OfInt(value))
             }
-            TAG_DV_SYNTAX => Err(ConvertError::UnsupportedConstructor {
-                family: "data-value",
-                tag: TAG_DV_SYNTAX,
-            }),
+            TAG_DV_SYNTAX => {
+                // Olean stores a scalar-or-offset handle when the payload is
+                // not a live Syntax tree. A constructor child is a real
+                // Syntax object; this membrane has no arena, so that stays
+                // a typed subset refusal rather than a fabricated handle.
+                let payload = ctor_field(obj, 0, "data-value")?;
+                if payload.is_scalar()
+                    || (!payload.is_scalar() && payload.obj_tag() == usize::from(abi::TAG_MPZ))
+                {
+                    Ok(DataValue::OfSyntax(SyntaxHandle(nat_u64(
+                        &payload,
+                        "data-value",
+                    )?)))
+                } else {
+                    Err(ConvertError::UnsupportedConstructor {
+                        family: "data-value",
+                        tag: TAG_DV_SYNTAX,
+                    })
+                }
+            }
             other => Err(ConvertError::UnsupportedConstructor {
                 family: "data-value",
                 tag: other,
@@ -954,9 +970,8 @@ fn inject_data_value(value: &DataValue) -> Result<Obj, ConvertError> {
         DataValue::OfName(name) => Ok(Obj::mk_ctor(TAG_DV_NAME, vec![inject_name(name)], &[])),
         DataValue::OfNat(n) => Ok(Obj::mk_ctor(TAG_DV_NAT, vec![inject_nat(*n)], &[])),
         DataValue::OfInt(value) => Ok(Obj::mk_ctor(TAG_DV_INT, vec![Obj::mk_int(*value)], &[])),
-        DataValue::OfSyntax(_) => Err(ConvertError::UnsupportedConstructor {
-            family: "data-value",
-            tag: TAG_DV_SYNTAX,
-        }),
+        DataValue::OfSyntax(SyntaxHandle(handle)) => {
+            Ok(Obj::mk_ctor(TAG_DV_SYNTAX, vec![inject_nat(*handle)], &[]))
+        }
     }
 }
