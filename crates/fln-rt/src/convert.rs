@@ -573,7 +573,10 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
 
 fn inject_name(name: &Name) -> Obj {
     if name.is_anonymous() {
-        return Obj::mk_ctor(TAG_NAME_ANONYMOUS, Vec::new(), &[]);
+        // Lean boxes a 0-field ctor as `lean_box(0)`. Olean write uses
+        // the same encoding; a heap ctor tag 0 is convert-private and
+        // would not survive a Lean-true Name walk.
+        return Obj::mk_nat(0);
     }
     let pre = inject_name(&name.parent());
     match name.leaf_view() {
@@ -589,7 +592,7 @@ fn inject_name(name: &Name) -> Obj {
 
 fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
     match level.view() {
-        fln_core::level::LevelView::Zero => Ok(Obj::mk_ctor(TAG_LEVEL_ZERO, Vec::new(), &[])),
+        fln_core::level::LevelView::Zero => Ok(Obj::mk_nat(0)),
         fln_core::level::LevelView::Succ(inner) => Ok(Obj::mk_ctor(
             TAG_LEVEL_SUCC,
             vec![inject_level(inner)?],
@@ -636,7 +639,7 @@ fn inject_literal(literal: &Literal) -> Obj {
 }
 
 fn inject_level_list(levels: &[Level]) -> Result<Obj, ConvertError> {
-    let mut out = Obj::mk_ctor(TAG_LIST_NIL, Vec::new(), &[]);
+    let mut out = Obj::mk_nat(0);
     for level in levels.iter().rev() {
         out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level(level)?, out], &[]);
     }

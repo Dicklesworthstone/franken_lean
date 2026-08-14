@@ -413,6 +413,28 @@ fn lean_box0_nullary_constructors_project_as_anonymous_zero_and_nil() {
 }
 
 #[test]
+fn inject_emits_lean_box0_for_anonymous_zero_and_nil() {
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::const_(Name::anonymous(), Vec::new()));
+    let back = inject_expr(&heap, handle).expect("anonymous const injects");
+    assert!(
+        back.ctor_child(0).is_scalar() && back.ctor_child(0).unbox() == 0,
+        "injected Name.anonymous is lean_box(0)"
+    );
+    assert!(
+        back.ctor_child(1).is_scalar() && back.ctor_child(1).unbox() == 0,
+        "injected List.nil is lean_box(0)"
+    );
+
+    let sort = heap.alloc(Expr::sort(Level::zero()));
+    let back_sort = inject_expr(&heap, sort).expect("sort 0 injects");
+    assert!(
+        back_sort.ctor_child(0).is_scalar() && back_sort.ctor_child(0).unbox() == 0,
+        "injected Level.zero is lean_box(0)"
+    );
+}
+
+#[test]
 fn a_bvar_with_no_scalar_bytes_is_malformed_not_a_panic() {
     let mut heap = NativeHeap::new();
     let bvar = Obj::mk_ctor(0, Vec::new(), &[]);
