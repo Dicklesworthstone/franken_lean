@@ -452,6 +452,15 @@ fn inject_emits_lean_box0_for_anonymous_zero_and_nil() {
         back_sort.ctor_child(0).is_scalar() && back_sort.ctor_child(0).unbox() == 0,
         "injected Level.zero is lean_box(0)"
     );
+
+    let succ = Level::zero().succ().expect("succ packs");
+    let sort_succ = heap.alloc(Expr::sort(succ.clone()));
+    let back_succ = inject_expr(&heap, sort_succ).expect("sort succ injects");
+    assert_eq!(
+        back_succ.ctor_child(0).ctor_scalar_u64(8),
+        succ.data().0,
+        "injected Level.succ carries Level.Data after its child"
+    );
 }
 
 #[test]
@@ -531,6 +540,12 @@ fn inject_emits_a_nat_child_for_bvar() {
     assert_eq!(back.header().other, 1, "Lean bvar has one Nat child");
     assert!(back.ctor_child(0).is_scalar());
     assert_eq!(back.ctor_child(0).unbox(), 4);
+    let native = Expr::bvar(4).expect("bvar 4 packs");
+    assert_eq!(
+        back.ctor_scalar_u64(8),
+        native.data().0,
+        "injected bvar carries Expr.Data after the Nat child"
+    );
 }
 
 #[test]
