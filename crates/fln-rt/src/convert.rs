@@ -105,6 +105,14 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
+/// Recursion ceiling for name / expr / level projection. Matches the
+/// kernel walk so a cyclic Compat graph becomes a typed overflow, not a
+/// host stack fault (FL-INV-07).
+const MAX_WALK_DEPTH: u32 = 2_048;
+/// Node visits in one conversion scope, covering iterative lists as well
+/// as the recursive families.
+const MAX_WALK_NODES: usize = 1_000_000;
+
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -380,6 +388,8 @@ fn check_level_data(obj: &Obj, level: &Level) -> Result<(), ConvertError> {
 pub struct Conversion {
     projected: usize,
     dedup_hits: usize,
+    depth: u32,
+    nodes: usize,
 }
 
 impl Conversion {
@@ -405,6 +415,41 @@ impl Conversion {
         (self.projected, self.dedup_hits)
     }
 
+    fn enter(&mut self, family: &'static str) -> Result<(), ConvertError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_WALK_NODES {
+            return Err(malformed(family, "conversion walk exceeded the node bound"));
+        }
+        if self.depth >= MAX_WALK_DEPTH {
+            return Err(ConvertError::NativeOverflow { family });
+        }
+        Ok(())
+    }
+
+    fn expr(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
+        self.enter("expr")?;
+        self.depth += 1;
+        let result = self.project_expr_node(obj);
+        self.depth -= 1;
+        result
+    }
+
+    fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
+        self.enter("name")?;
+        self.depth += 1;
+        let result = self.project_name(obj);
+        self.depth -= 1;
+        result
+    }
+
+    fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
+        self.enter("level")?;
+        self.depth += 1;
+        let result = self.project_level(obj);
+        self.depth -= 1;
+        result
+    }
+
     /// Project a Compat Expr graph into the NativeHeap, deduplicated by the
     /// terms' own computed hashes (upstream's hash-consing discipline).
     pub fn project_expr(
@@ -425,7 +470,7 @@ impl Conversion {
         Ok(handle)
     }
 
-    fn expr(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
+    fn project_expr_node(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
         if obj.is_scalar() {
             return Err(malformed(
                 "expr",
@@ -536,7 +581,7 @@ impl Conversion {
         self.expr(&child)
     }
 
-    fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
+    fn project_name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
         if lean_box0(obj) {
             return Ok(Name::anonymous());
         }
@@ -573,7 +618,7 @@ impl Conversion {
         Ok(name)
     }
 
-    fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
+    fn project_level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
         if lean_box0(obj) {
             return Ok(Level::zero());
         }
@@ -666,6 +711,7 @@ impl Conversion {
         let mut out = Vec::new();
         let mut cursor = obj.clone_ref();
         loop {
+            self.enter("level-list")?;
             if lean_box0(&cursor) {
                 return Ok(out);
             }
@@ -694,6 +740,7 @@ impl Conversion {
         let mut entries = Vec::new();
         let mut cursor = obj.clone_ref();
         loop {
+            self.enter("kvmap")?;
             if lean_box0(&cursor) {
                 return Ok(KVMap::from_entries(entries));
             }
