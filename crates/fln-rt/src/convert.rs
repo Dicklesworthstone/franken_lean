@@ -707,35 +707,43 @@ pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj,
 }
 
 fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
-    let data = expr.data().0.to_le_bytes();
+    let data_bytes = expr.data().0.to_le_bytes();
     match expr.node() {
         ExprNode::BVar { idx } => Ok(Obj::mk_ctor(
             TAG_EXPR_BVAR,
             vec![inject_nat(u64::from(*idx))],
-            &data,
+            &data_bytes,
         )),
-        ExprNode::FVar { id } => Ok(Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &data)),
+        ExprNode::FVar { id } => Ok(Obj::mk_ctor(
+            TAG_EXPR_FVAR,
+            vec![inject_name(&id.0)],
+            &data_bytes,
+        )),
         ExprNode::Sort { level } => Ok(Obj::mk_ctor(
             TAG_EXPR_SORT,
             vec![inject_level(level)?],
-            &data,
+            &data_bytes,
         )),
         ExprNode::Const { name, levels } => Ok(Obj::mk_ctor(
             TAG_EXPR_CONST,
             vec![inject_name(name), inject_level_list(levels)?],
-            &data,
+            &data_bytes,
         )),
         ExprNode::App { f, a } => Ok(Obj::mk_ctor(
             TAG_EXPR_APP,
             vec![inject_expr_value(f)?, inject_expr_value(a)?],
-            &data,
+            &data_bytes,
         )),
         ExprNode::Lit { literal } => Ok(Obj::mk_ctor(
             TAG_EXPR_LIT,
             vec![inject_literal(literal)],
-            &data,
+            &data_bytes,
         )),
-        ExprNode::MVar { id } => Ok(Obj::mk_ctor(TAG_EXPR_MVAR, vec![inject_name(&id.0)], &data)),
+        ExprNode::MVar { id } => Ok(Obj::mk_ctor(
+            TAG_EXPR_MVAR,
+            vec![inject_name(&id.0)],
+            &data_bytes,
+        )),
         ExprNode::Lam {
             binder_name,
             binder_type,
@@ -783,7 +791,7 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
         ExprNode::MData { data, expr: inner } => Ok(Obj::mk_ctor(
             TAG_EXPR_MDATA,
             vec![inject_kvmap(data)?, inject_expr_value(inner)?],
-            &data,
+            &data_bytes,
         )),
         ExprNode::Proj {
             struct_name,
@@ -796,7 +804,7 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
                 inject_nat(*idx),
                 inject_expr_value(inner)?,
             ],
-            &data,
+            &data_bytes,
         )),
     }
 }

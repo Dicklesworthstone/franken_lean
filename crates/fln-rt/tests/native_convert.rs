@@ -599,7 +599,8 @@ fn inject_and_project_round_trip_lam_forall_let_mvar_proj_and_mdata() {
         Expr::bvar(0).expect("bvar 0 packs"),
         BinderInfo::Implicit,
     );
-    let injected = inject_expr(&heap, heap.alloc(lam.clone())).expect("lam inject");
+    let handle = heap.alloc(lam.clone());
+    let injected = inject_expr(&heap, handle).expect("lam inject");
     assert_eq!(injected.header().other, 3, "Lean lam has three children");
     assert_eq!(
         injected.ctor_scalar_u64(24),
@@ -650,7 +651,8 @@ fn a_lam_missing_its_binder_info_word_is_malformed_not_a_panic() {
 fn inject_and_project_round_trip_a_level_metavariable() {
     let mut heap = NativeHeap::new();
     let sort = Expr::sort(Level::mvar(LMVarId(Name::from_components(["u"]))));
-    let injected = inject_expr(&heap, heap.alloc(sort.clone())).expect("level mvar injects");
+    let handle = heap.alloc(sort.clone());
+    let injected = inject_expr(&heap, handle).expect("level mvar injects");
     assert_eq!(
         injected.ctor_child(0).obj_tag(),
         5,
