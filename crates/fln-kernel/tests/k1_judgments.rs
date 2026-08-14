@@ -3899,6 +3899,23 @@ fn fl_inv_07_oversized_shift_results_are_typed_exhaustion() {
         check_def_eq(&env, &[], &shr_all, &lit(0), Budget::DEFAULT).is_accepted(),
         "shifting right past every bit is zero"
     );
+
+    // A generous step budget can pay `count/64 + 1` for a 2^40-bit shift
+    // and still be unable to represent the result (`MAX_LIMBS` is 2^28).
+    // That must stay typed exhaustion — `BigNat::shl` panics past the
+    // ceiling, and FL-INV-07 forbids turning a user term into an abort.
+    let generous =
+        Budget::stated_for_measurement(1u64 << 35, Budget::DEFAULT_DEPTH, Budget::MIN_STACK_BYTES);
+    let over_limb_ceiling = nat_op_app("shiftLeft", lit(1), lit(1u64 << 40));
+    let verdict = check_def_eq(&env, &[], &over_limb_ceiling, &lit(0), generous);
+    let usage = exhausted_usage(&verdict);
+    assert_eq!(usage.allowed, generous.steps);
+    assert!(usage.observed > usage.allowed);
+    assert_eq!(
+        usage.reason,
+        ResourceReason::ExecutionSteps,
+        "an unrepresentable shift under a paid step budget is still a run outcome"
+    );
 }
 
 /// The KR-314 world at this pin, miniaturized honestly. At the pin, `String`
