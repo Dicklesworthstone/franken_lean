@@ -1978,17 +1978,21 @@ fn run(
             } => {
                 let frame = current_frame(&stack)?;
                 let condition = register(frame, cond)?;
-                if !condition.is_scalar() {
-                    return Ok(VmExit::Refused {
-                        refusal: type_mismatch("jump_if_zero", 0, "Nat scalar", condition),
-                        usage: usage(steps, peak_stack_depth),
-                    });
-                }
-                let target = if condition.unbox() == 0 {
-                    zero
-                } else {
-                    nonzero
-                };
+                // FIR BranchZero types the condition as Nat | Bool. Bool is
+                // always a 0/1 scalar; a Nat may be a nonnegative mpz after
+                // the wide-Nat landing. A well-typed 2^64 is nonzero, not
+                // "not a Nat".
+                let is_zero =
+                    match with_nat_view(condition, "jump_if_zero", 0, |view| view.is_zero()) {
+                        Ok(is_zero) => is_zero,
+                        Err(refusal) => {
+                            return Ok(VmExit::Refused {
+                                refusal,
+                                usage: usage(steps, peak_stack_depth),
+                            });
+                        }
+                    };
+                let target = if is_zero { zero } else { nonzero };
                 current_frame_mut(&mut stack)?.pc =
                     usize::try_from(target.get()).map_err(|_| {
                         Stop::InternalFault(InternalFault::new(

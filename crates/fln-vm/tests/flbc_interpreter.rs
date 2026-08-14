@@ -8099,6 +8099,121 @@ fn an_mpz_array_index_is_out_of_bounds_not_a_type_mismatch() {
 }
 
 #[test]
+fn jump_if_zero_on_an_mpz_nat_takes_the_nonzero_arm() {
+    let _guard = lock();
+    // FIR BranchZero types the condition as Nat | Bool. After wide Nats,
+    // `1 << 64` is a well-typed nonzero Nat. Treating it as "not a scalar"
+    // would make the branch a type error instead of the nonzero arm.
+    let wide = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 64,
+            },
+            intrinsic(r(2), "extern:Nat.shiftLeft", vec![r(0), r(1)]),
+            Instruction::JumpIfZero {
+                cond: r(2),
+                zero: pc(4),
+                nonzero: pc(6),
+            },
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            Instruction::Jump { target: pc(7) },
+            Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    shadow::enable();
+    assert_eq!(
+        returned(execute(&wide, ExecutionLimits::default(), None))
+            .value
+            .unbox(),
+        1
+    );
+
+    let zero = validated(vec![function(
+        0,
+        0,
+        1,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            Instruction::JumpIfZero {
+                cond: r(0),
+                zero: pc(2),
+                nonzero: pc(4),
+            },
+            Instruction::Nat {
+                dst: r(0),
+                value: 11,
+            },
+            Instruction::Jump { target: pc(5) },
+            Instruction::Nat {
+                dst: r(0),
+                value: 99,
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    assert_eq!(
+        returned(execute(&zero, ExecutionLimits::default(), None))
+            .value
+            .unbox(),
+        11
+    );
+
+    let not_a_nat = validated(vec![function(
+        0,
+        0,
+        1,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "cond".to_string(),
+            },
+            Instruction::JumpIfZero {
+                cond: r(0),
+                zero: pc(2),
+                nonzero: pc(2),
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&not_a_nat, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "jump_if_zero",
+                argument: 0,
+                expected: "Nat",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "mpz branch and typed refusal retain no objects");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
 fn validator_refuses_version_bounds_flow_and_fallthrough_before_execution() {
     let _guard = lock();
 
