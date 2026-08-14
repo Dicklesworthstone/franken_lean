@@ -4466,31 +4466,74 @@ pub(crate) fn constant_is_unsafe(info: &ConstantInfo) -> bool {
 }
 
 /// Level-parameter substitution (pure, structural).
+///
+/// Iterative post-order: a 24-bit-legal succ / max / imax spine of parameters
+/// is a legal universe, and a recursive walk of one blows a 2 MiB host stack
+/// (FL-INV-07). Subtrees without a parameter are shared unchanged.
 fn substitute_level(level: &Level, params: &[Name], levels: &[Level]) -> Level {
     use fln_core::level::LevelView;
-    match level.view() {
-        LevelView::Zero => Level::zero(),
-        LevelView::Param(name) => params
-            .iter()
-            .position(|p| p == name)
-            .and_then(|i| levels.get(i))
-            .cloned()
-            .unwrap_or_else(|| level.clone()),
-        LevelView::Succ(inner) => substitute_level(inner, params, levels)
-            .succ()
-            .unwrap_or_else(|_| level.clone()),
-        LevelView::Max(a, b) => Level::try_smart_max(
-            substitute_level(a, params, levels),
-            substitute_level(b, params, levels),
-        )
-        .unwrap_or_else(|_| level.clone()),
-        LevelView::IMax(a, b) => Level::try_kernel_imax(
-            substitute_level(a, params, levels),
-            substitute_level(b, params, levels),
-        )
-        .unwrap_or_else(|_| level.clone()),
-        LevelView::MVar(_) => level.clone(),
+    if !level.has_param() {
+        return level.clone();
     }
+    let mut done: HashMap<Level, Level> = HashMap::new();
+    let mut stack = vec![(level.clone(), false)];
+    while let Some((current, exit)) = stack.pop() {
+        if done.contains_key(&current) {
+            continue;
+        }
+        if !current.has_param() {
+            done.insert(current.clone(), current);
+            continue;
+        }
+        if !exit {
+            stack.push((current.clone(), true));
+            match current.view() {
+                LevelView::Succ(inner) => {
+                    if inner.has_param() && !done.contains_key(inner) {
+                        stack.push((inner.clone(), false));
+                    }
+                }
+                LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                    if b.has_param() && !done.contains_key(b) {
+                        stack.push((b.clone(), false));
+                    }
+                    if a.has_param() && !done.contains_key(a) {
+                        stack.push((a.clone(), false));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let substituted = match current.view() {
+            LevelView::Zero => Level::zero(),
+            LevelView::Param(name) => params
+                .iter()
+                .position(|p| p == name)
+                .and_then(|i| levels.get(i))
+                .cloned()
+                .unwrap_or_else(|| current.clone()),
+            LevelView::Succ(inner) => done
+                .get(inner)
+                .cloned()
+                .unwrap_or_else(|| inner.clone())
+                .succ()
+                .unwrap_or_else(|_| current.clone()),
+            LevelView::Max(a, b) => Level::try_smart_max(
+                done.get(a).cloned().unwrap_or_else(|| a.clone()),
+                done.get(b).cloned().unwrap_or_else(|| b.clone()),
+            )
+            .unwrap_or_else(|_| current.clone()),
+            LevelView::IMax(a, b) => Level::try_kernel_imax(
+                done.get(a).cloned().unwrap_or_else(|| a.clone()),
+                done.get(b).cloned().unwrap_or_else(|| b.clone()),
+            )
+            .unwrap_or_else(|_| current.clone()),
+            LevelView::MVar(_) => current.clone(),
+        };
+        done.insert(current, substituted);
+    }
+    done.get(level).cloned().unwrap_or_else(|| level.clone())
 }
 
 fn collect_undeclared_param(level: &Level, declared: &[Name], found: &mut Option<Name>) {
@@ -4498,18 +4541,25 @@ fn collect_undeclared_param(level: &Level, declared: &[Name], found: &mut Option
     if found.is_some() || !level.has_param() {
         return;
     }
-    match level.view() {
-        LevelView::Param(name) => {
-            if !declared.contains(name) {
-                *found = Some(name.clone());
+    let mut stack = vec![level.clone()];
+    while let Some(current) = stack.pop() {
+        if found.is_some() || !current.has_param() {
+            continue;
+        }
+        match current.view() {
+            LevelView::Param(name) => {
+                if !declared.contains(name) {
+                    *found = Some(name.clone());
+                    return;
+                }
             }
+            LevelView::Succ(inner) => stack.push(inner.clone()),
+            LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                stack.push(b.clone());
+                stack.push(a.clone());
+            }
+            _ => {}
         }
-        LevelView::Succ(inner) => collect_undeclared_param(inner, declared, found),
-        LevelView::Max(a, b) | LevelView::IMax(a, b) => {
-            collect_undeclared_param(a, declared, found);
-            collect_undeclared_param(b, declared, found);
-        }
-        _ => {}
     }
 }
 
@@ -4772,6 +4822,53 @@ mod tests {
         assert!(
             substitute_level(&one_imax_w, &[], &[]) == Level::param(w),
             "kernel imax 1 u must be structurally u"
+        );
+    }
+
+    #[test]
+    fn deep_level_param_spines_do_not_stack_fault() {
+        // `check_level` and `instantiate_lparams` used to recurse one frame
+        // per succ / max nesting. A legal 24-bit spine is far past a 2 MiB
+        // host stack (FL-INV-07). 10_000 is enough to kill the old walk and
+        // small enough to build in a unit test.
+        let u = Name::str(Name::anonymous(), "u");
+        let mut level = Level::param(u.clone());
+        for _ in 0..10_000 {
+            level = level.succ().expect("10k succs pack under the 24-bit cap");
+        }
+
+        let mut expected = Level::zero();
+        for _ in 0..10_000 {
+            expected = expected.succ().expect("zero tower packs");
+        }
+        assert_eq!(
+            substitute_level(&level, std::slice::from_ref(&u), &[Level::zero()]),
+            expected,
+            "substituting 0 for u on a deep succ spine must rebuild the offset"
+        );
+
+        let mut found = None;
+        collect_undeclared_param(&level, &[], &mut found);
+        assert_eq!(
+            found,
+            Some(u.clone()),
+            "an undeclared param at the bottom of a deep succ spine must still be found"
+        );
+        let mut found = None;
+        collect_undeclared_param(&level, std::slice::from_ref(&u), &mut found);
+        assert!(
+            found.is_none(),
+            "a declared param at the bottom of a deep succ spine must not be reported"
+        );
+
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, std::slice::from_ref(&u), Budget::DEFAULT);
+        let inferred = tc
+            .infer(&Expr::sort(level), 0)
+            .expect("inferring Sort of a deep succ spine must not stack-fault");
+        assert!(
+            matches!(inferred.node(), ExprNode::Sort { .. }),
+            "Sort (u+10000) : Sort (u+10001)"
         );
     }
 
