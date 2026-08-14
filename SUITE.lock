@@ -27,7 +27,7 @@ target x86_64-unknown-linux-gnu
 
 # ---- the FrankenSuite (D1 closed universe), pinned at exact commits --------------------
 suite asupersync       commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
-suite frankensqlite    commit=fd569bb49a38361848ca88bf17a7b01b53308a45 path=/dp/frankensqlite
+suite frankensqlite    commit=38a9ecab220d8a37a41bb4c9860c94beaeff9185 path=/dp/frankensqlite
 suite franken_networkx commit=9d710b1c33e99412c94de7fa4de2f7ce4954110f path=/dp/franken_networkx
 suite frankensearch    commit=51209c4628b8f798c315adb07459d1473021dba4 path=/dp/frankensearch
 suite frankentui       commit=af2df3e6bdd06abafe03a0ef1e4960114918b26b path=/dp/frankentui
@@ -41,7 +41,7 @@ suite frankentorch     commit=e4c6bdd5ec629ae70b40da9314da345ade012ca7 path=/dp/
 
 # ---- allowed suite packages, mapped to their pinned repos ------------------------------
 crate asupersync       repo=asupersync
-crate frankensqlite    repo=frankensqlite
+crate fsqlite          repo=frankensqlite
 crate franken_networkx repo=franken_networkx
 crate frankensearch    repo=frankensearch
 crate frankentui       repo=frankentui
