@@ -3895,12 +3895,18 @@ impl<'a> TypeChecker<'a> {
             let s_sort = self.whnf(&s_sort, depth)?;
             matches!(s_sort.node(), ExprNode::Sort { level } if level.is_equiv(&Level::zero()))
         };
-        // Walk the constructor telescope: instantiate params, then peel idx fields.
+        // Pin `infer_proj` (`type_checker.cpp:241-265`): WHNF the remaining
+        // constructor telescope before every Π peel (a parameter or field type
+        // may be an abbreviation), instantiate only the inductive parameters,
+        // and drop an earlier field without a leak check when later field types
+        // do not mention it. Instantiating an unused non-Prop field of a Prop
+        // structure is what fabricated the leak the pin never sees.
         let ctor_params = ctor.base.level_params.clone();
         let levels = levels.clone();
         let mut telescope =
             self.instantiate_lparams(&ctor.base.type_.clone(), &ctor_params, &levels, depth)?;
-        for arg in args.iter().take(ctor.num_params as usize) {
+        for arg in args.iter().take(ind.num_params as usize) {
+            telescope = self.whnf(&telescope, depth)?;
             let ExprNode::ForallE { body, .. } = telescope.node() else {
                 return reject(RejectClass::InvalidProjection, "constructor arity mismatch");
             };
@@ -3908,6 +3914,7 @@ impl<'a> TypeChecker<'a> {
             telescope = self.instantiate(&body, 0, arg, depth)?;
         }
         for i in 0..idx {
+            telescope = self.whnf(&telescope, depth)?;
             let ExprNode::ForallE {
                 binder_type, body, ..
             } = telescope.node()
@@ -3917,16 +3924,21 @@ impl<'a> TypeChecker<'a> {
                     "projection index out of range",
                 );
             };
-            if is_prop_type && !self.is_prop(&binder_type.clone(), depth)? {
-                return reject(
-                    RejectClass::InvalidProjection,
-                    "projection would leak data out of Prop",
-                );
+            let (binder_type, body) = (binder_type.clone(), body.clone());
+            if body.has_loose_bvars() {
+                if is_prop_type && !self.is_prop(&binder_type, depth)? {
+                    return reject(
+                        RejectClass::InvalidProjection,
+                        "projection would leak data out of Prop",
+                    );
+                }
+                let earlier = Expr::proj(struct_name.clone(), i, scrutinee.clone());
+                telescope = self.instantiate(&body, 0, &earlier, depth)?;
+            } else {
+                telescope = body;
             }
-            let body = body.clone();
-            let earlier = Expr::proj(struct_name.clone(), i, scrutinee.clone());
-            telescope = self.instantiate(&body, 0, &earlier, depth)?;
         }
+        telescope = self.whnf(&telescope, depth)?;
         let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
             return reject(
                 RejectClass::InvalidProjection,

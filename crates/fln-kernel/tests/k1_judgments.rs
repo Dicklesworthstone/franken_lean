@@ -728,6 +728,102 @@ fn kr901_projection_cannot_leak_data_out_of_prop() {
 }
 
 #[test]
+fn kr901_unused_earlier_data_field_does_not_block_a_later_prop_projection() {
+    // Pin `infer_proj` (`type_checker.cpp:252`): an earlier non-Prop field is
+    // leak-checked only when a later field type mentions it. `Ppair` is Prop,
+    // `pmk : D → Q → Ppair`, and `Q` does not depend on `D`. Projecting the
+    // second field must succeed; projecting the first must still refuse.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let env = admit(&env, &axiom("Q", prop()));
+    let d = Expr::const_(n("D"), vec![]);
+    let q = Expr::const_(n("Q"), vec![]);
+    let env = add_structure(&env, "Ppair", "pmk", prop(), &[d.clone(), q.clone()]);
+    let env = admit(&env, &axiom("hp", Expr::const_(n("Ppair"), vec![])));
+    let hp = Expr::const_(n("hp"), vec![]);
+
+    let later = check(
+        &env,
+        &defn("getQ", q.clone(), Expr::proj(n("Ppair"), 1, hp.clone())),
+        Budget::DEFAULT,
+    );
+    assert!(
+        later.is_accepted(),
+        "a later Prop field whose type ignores the earlier datum must still project: {later:?}"
+    );
+
+    let leak = check(
+        &env,
+        &defn("leakD", d, Expr::proj(n("Ppair"), 0, hp)),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&leak),
+        Some(RejectClass::InvalidProjection),
+        "projecting the unused datum itself is still a leak: {leak:?}"
+    );
+}
+
+#[test]
+fn kr112_projection_whnfs_an_abbreviated_constructor_telescope() {
+    // Pin `infer_proj` (`type_checker.cpp:244/250/260`) WHNFs the remaining
+    // constructor type before every Π peel. `mk : Rest` with `Rest := D → S`
+    // is a legal constructor type; refusing it as a non-Π is a false reject.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = Expr::const_(n("D"), vec![]);
+    let env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: n("S"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![n("S")],
+            ctors: vec![n("mk")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let rest_ty = Expr::forall_e(
+        n("_f"),
+        d.clone(),
+        Expr::const_(n("S"), vec![]),
+        BinderInfo::Default,
+    );
+    let env = admit(&env, &defn("Rest", sort1(), rest_ty));
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: n("mk"),
+                level_params: vec![],
+                type_: Expr::const_(n("Rest"), vec![]),
+            },
+            induct: n("S"),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }),
+    );
+    let env = admit(&env, &axiom("s", Expr::const_(n("S"), vec![])));
+    let s = Expr::const_(n("s"), vec![]);
+    let verdict = check(
+        &env,
+        &defn("px", d, Expr::proj(n("S"), 0, s)),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "proj S 0 s : D through an abbreviated constructor type — {verdict:?}"
+    );
+}
+
+#[test]
 fn kr310_same_constant_defeq_iff_levels_are_equivalent() {
     // F.{u} : Sort u — a universe-polymorphic axiom.
     let poly = Declaration::Axiom(AxiomVal {
