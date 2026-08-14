@@ -6827,6 +6827,7 @@ fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
         ("Init".to_string(), reference_lib.to_path_buf()),
         ("Std".to_string(), reference_lib.to_path_buf()),
         ("Lean".to_string(), reference_lib.to_path_buf()),
+        ("Lake".to_string(), reference_lib.to_path_buf()),
         ("Batteries".to_string(), pkg("batteries")),
         ("Aesop".to_string(), pkg("aesop")),
         ("Qq".to_string(), pkg("Qq")),
@@ -6838,6 +6839,22 @@ fn chosen_set_roots(reference_lib: &Path) -> Vec<(String, PathBuf)> {
         // it (it backs the cache tool itself), so it has no root here.
         ("Mathlib".to_string(), corpus.join(".lake/build/lib/lean")),
     ]
+}
+
+#[test]
+fn chosen_set_routes_every_reference_top_level() {
+    let reference_lib = PathBuf::from("/pinned-reference/lib/lean");
+    let roots = chosen_set_roots(&reference_lib);
+
+    for prefix in ["Init", "Std", "Lean", "Lake"] {
+        assert_eq!(
+            roots
+                .iter()
+                .find_map(|(candidate, root)| (candidate == prefix).then_some(root)),
+            Some(&reference_lib),
+            "the selected-module harness must route {prefix} through the pinned Reference library"
+        );
+    }
 }
 
 fn chosen_module_file(roots: &[(String, PathBuf)], name: &str) -> Option<PathBuf> {
