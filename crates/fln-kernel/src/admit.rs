@@ -135,27 +135,80 @@ fn subst_loose_bvars(e: &Expr, k: u32, substs: &[Expr], _depth: u32) -> KResult<
 
 /// `has_loose_bvars_in_domain` (pin expr.cpp:370): does `bvar vidx` occur in a
 /// (transitively relevant) Π domain of `b`?
+///
+/// The pin recurses when an implicit domain mentions `vidx` (then searches
+/// the body from 0). A 400-deep implicit telescope of that shape is legal
+/// recursor input and must not stack-fault (FL-INV-07).
 fn has_loose_bvars_in_domain(b: &Expr, vidx: u32, strict: bool) -> bool {
-    let mut current = b;
-    let mut index = vidx;
-    loop {
-        let ExprNode::ForallE {
-            binder_type,
-            body,
-            binder_info,
-            ..
-        } = current.node()
-        else {
-            return !strict && current.has_loose_bvar(index);
-        };
-        if binder_type.has_loose_bvar(index)
-            && (*binder_info == BinderInfo::Default || has_loose_bvars_in_domain(body, 0, strict))
-        {
-            return true;
+    let mut stack = vec![(b, vidx)];
+    while let Some((start, start_index)) = stack.pop() {
+        let mut current = start;
+        let mut index = start_index;
+        loop {
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = current.node()
+            else {
+                if !strict && current.has_loose_bvar(index) {
+                    return true;
+                }
+                break;
+            };
+            if binder_type.has_loose_bvar(index) {
+                if *binder_info == BinderInfo::Default {
+                    return true;
+                }
+                stack.push((body, index.saturating_add(1)));
+                current = body;
+                index = 0;
+                continue;
+            }
+            current = body;
+            index = index.saturating_add(1);
         }
-        current = body;
-        index = index.saturating_add(1);
     }
+    false
+}
+
+/// Does `e` mention any of `names` as a `Const` head? Iterative: constructor
+/// types and recursor motives can nest past a 2 MiB host stack (FL-INV-07).
+fn expr_mentions_any(e: &Expr, names: &[Name]) -> bool {
+    let mut stack = vec![e];
+    while let Some(current) = stack.pop() {
+        match current.node() {
+            ExprNode::Const { name, .. } => {
+                if names.contains(name) {
+                    return true;
+                }
+            }
+            ExprNode::App { f, a } => {
+                stack.push(a);
+                stack.push(f);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(body);
+                stack.push(binder_type);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body);
+                stack.push(value);
+                stack.push(type_);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `infer_implicit` (pin expr.cpp:480, strict): mark leading Π binders
@@ -607,25 +660,7 @@ impl<'a> Engine<'a> {
     }
 
     fn mentions_block(&self, e: &Expr) -> bool {
-        let names = self.block_names();
-        fn walk(e: &Expr, names: &[Name]) -> bool {
-            match e.node() {
-                ExprNode::Const { name, .. } => names.contains(name),
-                ExprNode::App { f, a } => walk(f, names) || walk(a, names),
-                ExprNode::Lam {
-                    binder_type, body, ..
-                }
-                | ExprNode::ForallE {
-                    binder_type, body, ..
-                } => walk(binder_type, names) || walk(body, names),
-                ExprNode::LetE {
-                    type_, value, body, ..
-                } => walk(type_, names) || walk(value, names) || walk(body, names),
-                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => walk(expr, names),
-                _ => false,
-            }
-        }
-        walk(e, &names)
+        expr_mentions_any(e, &self.block_names())
     }
 
     /// KR-607: recursive iff some constructor field domain mentions the block.
@@ -2892,5 +2927,74 @@ pub(crate) fn scratch_admit(
             "scratch publication of `{}` faulted: {fault:?}",
             name.to_display_string()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        Name::str(Name::anonymous(), s)
+    }
+
+    #[test]
+    fn mentions_block_walks_a_deep_app_nest() {
+        let target = n("T");
+        let other = n("U");
+        let mut hit = Expr::const_(target.clone(), Vec::new());
+        let mut miss = Expr::const_(other, Vec::new());
+        let leaf = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            hit = Expr::app(hit, leaf.clone());
+            miss = Expr::app(miss, leaf.clone());
+        }
+        assert!(
+            expr_mentions_any(&hit, std::slice::from_ref(&target)),
+            "a Const T under 400 apps must still be found"
+        );
+        assert!(
+            !expr_mentions_any(&miss, std::slice::from_ref(&target)),
+            "a Const U under 400 apps must not count as T"
+        );
+    }
+
+    #[test]
+    fn implicit_domain_scan_walks_a_deep_implicit_telescope() {
+        // Every implicit domain is bvar 0, so the pin's transitivity arm
+        // would recurse one frame per binder. Strict mode still returns
+        // false — no explicit domain ever mentions the index — but the
+        // walk must finish.
+        let mut telescope = Expr::const_(n("Nat"), Vec::new());
+        for _ in 0..400 {
+            telescope = Expr::forall_e(
+                n("x"),
+                Expr::bvar(0).expect("packs"),
+                telescope,
+                BinderInfo::Implicit,
+            );
+        }
+        assert!(
+            !has_loose_bvars_in_domain(&telescope, 0, true),
+            "strict mode ignores implicit-only mentions"
+        );
+        let explicit = Expr::forall_e(
+            n("α"),
+            Expr::sort(Level::one()),
+            telescope,
+            BinderInfo::Default,
+        );
+        infer_implicit_strict(&explicit, 0).expect("a deep implicit body must not stack-fault");
+
+        let mentioned = Expr::forall_e(
+            n("x"),
+            Expr::bvar(0).expect("packs"),
+            Expr::const_(n("Nat"), Vec::new()),
+            BinderInfo::Default,
+        );
+        assert!(
+            has_loose_bvars_in_domain(&mentioned, 0, true),
+            "an explicit domain mentioning bvar 0 is a hit"
+        );
     }
 }
