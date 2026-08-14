@@ -1059,7 +1059,9 @@ pub struct G02Evidence {
 /// Init.Prelude 2198/2198 accepted (0 rejected, 6 typed artifact-incomplete
 /// per FL-INV-07), the Std leg Std.Data.HashMap.Basic 92/92 over a
 /// 165-module closure, and the defeq-heavy mathlib leg Mathlib.Order.Basic
-/// 376/376 over a 1286-module closure — 2,666 accepted declarations with
+/// 427/427 over a 1286-module closure — 2,717 accepted declarations with
+/// module-part decoding enabled (the tracked G0-1 fixture's 376 count is its
+/// exported public-region census, not this replay's active module-data census),
 /// zero rejected, and the pinned leanchecker independently accepting every
 /// chosen module as ReferenceKernelOracle (the review amendment's authority
 /// class: it embeds the Reference C++ kernel, never a foreign-independent

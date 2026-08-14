@@ -10,8 +10,9 @@ artifact-incomplete, 0 rejected — `scripts/e2e/kernel_replay.sh`, census
 receipted). S = the Std leg of the chosen set (Std.Data.HashMap.Basic: 92/92 accepted
 over a 165-module closure, `chosen_set_replays_and_witnesses`, receipt
 `crates/fln-conformance/evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl`).
-M = the mathlib leg (Mathlib.Order.Basic: 376/376 accepted over a
-1286-module closure). C3 =
+M = the mathlib leg (Mathlib.Order.Basic: 427/427 active module-data
+declarations accepted over a 1286-module closure; the G0-1 fixture's 376 count
+is its exported public-region census). C3 =
 the C3 fixture pair plus the pinned-leanchecker Reference-kernel re-execution
 (`scripts/tribunal/leanchecker_witness.sh`, ReferenceKernelOracle, not an
 independent implementation). C0 = the
@@ -131,8 +132,8 @@ declarations are counted separately per FL-INV-07.
 
 ## What this table binds
 
-1. **2,666 accepted declarations across three real modules** (2198 Init.Prelude
-   + 92 Std + 376 mathlib, each with ReferenceKernelOracle agreement), with
+1. **2,717 accepted declarations across three real modules** (2198 Init.Prelude
+   + 92 Std + 427 mathlib, each with ReferenceKernelOracle agreement), with
    every rejection either converted by named follow-ups or triaged to a
    pre-classified family. No verdict here is implicit: each is
    `fln_kernel::check` over real Reference declarations. Leanchecker re-runs the

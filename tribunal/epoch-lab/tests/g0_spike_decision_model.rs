@@ -1498,7 +1498,7 @@ fn g02_evidence() -> G02Evidence {
     }
     let expected = [
         ("Std.Data.HashMap.Basic".to_string(), 92_u64),
-        ("Mathlib.Order.Basic".to_string(), 376_u64),
+        ("Mathlib.Order.Basic".to_string(), 427_u64),
     ];
     legs.sort();
     let mut expected_sorted = expected.to_vec();
@@ -1597,7 +1597,7 @@ fn the_g02_receipt_holds_content_not_merely_presence() {
     assert!(receipt.contains(r#""closure_modules":165"#));
     assert!(receipt.contains(r#""closure_modules":1286"#));
     assert!(receipt.contains(r#""accepted":92"#));
-    assert!(receipt.contains(r#""accepted":376"#));
+    assert!(receipt.contains(r#""accepted":427"#));
     assert!(lines.iter().all(|l| l.contains(r#""rejected":{}"#)));
     assert!(!receipt.contains(r#""witness_accepted":false"#));
     assert!(receipt.contains(r#""witness":"ReferenceKernelOracle:leanchecker""#));
