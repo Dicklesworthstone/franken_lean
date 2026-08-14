@@ -1509,7 +1509,13 @@ impl<'a> TypeChecker<'a> {
                 binder_info,
             } => {
                 let t2 = self.instantiate(binder_type, k, subst, depth + 1)?;
-                let b2 = self.instantiate(body, k + 1, subst, depth + 1)?;
+                // Pin `instantiate` (`kernel/instantiate.cpp:29`): the
+                // substitute is lifted by the binders crossed, so its loose
+                // bvars skip the new binder instead of being captured by it.
+                let lifted = subst
+                    .lift_loose(0, 1)
+                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
                 Expr::lam(binder_name.clone(), t2, b2, *binder_info)
             }
             ExprNode::ForallE {
@@ -1519,7 +1525,10 @@ impl<'a> TypeChecker<'a> {
                 binder_info,
             } => {
                 let t2 = self.instantiate(binder_type, k, subst, depth + 1)?;
-                let b2 = self.instantiate(body, k + 1, subst, depth + 1)?;
+                let lifted = subst
+                    .lift_loose(0, 1)
+                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
                 Expr::forall_e(binder_name.clone(), t2, b2, *binder_info)
             }
             ExprNode::LetE {
@@ -1531,7 +1540,10 @@ impl<'a> TypeChecker<'a> {
             } => {
                 let t2 = self.instantiate(type_, k, subst, depth + 1)?;
                 let v2 = self.instantiate(value, k, subst, depth + 1)?;
-                let b2 = self.instantiate(body, k + 1, subst, depth + 1)?;
+                let lifted = subst
+                    .lift_loose(0, 1)
+                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
                 Expr::let_e(decl_name.clone(), t2, v2, b2, *non_dep)
             }
             ExprNode::MData { data, expr } => {
@@ -1608,7 +1620,11 @@ impl<'a> TypeChecker<'a> {
             ExprNode::BVar { idx } if *idx >= bound => {
                 let relative = *idx - bound;
                 if relative < count {
-                    fvars[(count - 1 - relative) as usize].clone()
+                    // Pin `instantiate_rev` (`kernel/instantiate.cpp:110`):
+                    // lift the chosen substitute by the binders crossed.
+                    fvars[(count - 1 - relative) as usize]
+                        .lift_loose(0, bound)
+                        .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
                 } else {
                     Expr::bvar(idx - count).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
                 }
@@ -4594,6 +4610,98 @@ mod tests {
                 .expect("instantiates")
                 == inner_bound,
             "bvars below the consumed binder are untouched"
+        );
+    }
+
+    /// Pin `instantiate` lifts the substitute by the binders crossed
+    /// (`kernel/instantiate.cpp:29`). Without the lift, `(fun x y => x) #0`
+    /// and `(fun x y => y) #0` both become `fun y => y`, so defeq would
+    /// identify the first projection with the second.
+    #[test]
+    fn instantiate_lifts_an_open_substitute_under_binders() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let bv = |i: u32| Expr::bvar(i).expect("packs");
+        let sort = Expr::sort(Level::zero());
+        let name = |s: &str| Name::str(Name::anonymous(), s);
+        let inner = Expr::lam(
+            name("y"),
+            sort.clone(),
+            bv(1),
+            fln_core::expr::BinderInfo::Default,
+        );
+        let expected = Expr::lam(
+            name("y"),
+            sort.clone(),
+            bv(1),
+            fln_core::expr::BinderInfo::Default,
+        );
+        assert!(
+            tc.instantiate(&inner, 0, &bv(0), 0).expect("instantiates") == expected,
+            "replacing #1 under a lambda with #0 must yield #1, not capture #0"
+        );
+
+        let fst = Expr::app(
+            Expr::lam(
+                name("x"),
+                sort.clone(),
+                Expr::lam(
+                    name("y"),
+                    sort.clone(),
+                    bv(1),
+                    fln_core::expr::BinderInfo::Default,
+                ),
+                fln_core::expr::BinderInfo::Default,
+            ),
+            bv(0),
+        );
+        let snd = Expr::app(
+            Expr::lam(
+                name("x"),
+                sort.clone(),
+                Expr::lam(
+                    name("y"),
+                    sort.clone(),
+                    bv(0),
+                    fln_core::expr::BinderInfo::Default,
+                ),
+                fln_core::expr::BinderInfo::Default,
+            ),
+            bv(0),
+        );
+        let fst_whnf = tc.whnf_public(&fst, 0).expect("beta fst");
+        let snd_whnf = tc.whnf_public(&snd, 0).expect("beta snd");
+        assert!(
+            fst_whnf != snd_whnf,
+            "beta of (fun x y => x) #0 must not collapse to (fun x y => y) #0"
+        );
+        assert!(
+            fst_whnf
+                == Expr::lam(
+                    name("y"),
+                    sort.clone(),
+                    bv(1),
+                    fln_core::expr::BinderInfo::Default,
+                ),
+            "beta must lift the argument so the first projection stays #1"
+        );
+
+        let let_open = Expr::let_e(
+            name("x"),
+            sort.clone(),
+            bv(0),
+            Expr::lam(
+                name("y"),
+                sort.clone(),
+                bv(1),
+                fln_core::expr::BinderInfo::Default,
+            ),
+            false,
+        );
+        assert!(
+            tc.whnf_public(&let_open, 0).expect("zeta")
+                == Expr::lam(name("y"), sort, bv(1), fln_core::expr::BinderInfo::Default,),
+            "zeta must lift the let value under the body's lambda"
         );
     }
 
