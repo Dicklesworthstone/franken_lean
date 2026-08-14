@@ -1480,96 +1480,261 @@ impl<'a> TypeChecker<'a> {
         subst: &Expr,
         depth: u32,
     ) -> KResult<Expr> {
-        self.step(depth)?;
-        if let Some(cached) = self.instantiate_cache.get(e, k, subst) {
-            return Ok(cached);
+        // Post-order heap walk. Recursing one frame per node would abort a
+        // legal deep open term before `step` could turn it into Inconclusive
+        // if the host stack is smaller than Budget::depth (FL-INV-07).
+        enum Op {
+            Enter {
+                e: Expr,
+                k: u32,
+                subst: Expr,
+                depth: u32,
+            },
+            Finish {
+                e: Expr,
+                k: u32,
+                subst: Expr,
+                lifted: Option<Expr>,
+            },
         }
-        if e.loose_bvar_range() <= k {
-            return Ok(e.clone());
-        }
-        let result = match e.node() {
-            ExprNode::BVar { idx } => {
-                if *idx == k {
-                    subst.clone()
-                } else if *idx > k {
-                    Expr::bvar(idx - 1).unwrap_or_else(|_| e.clone())
-                } else {
-                    e.clone()
+        let lookup = |done: &HashMap<(usize, u32, usize), Expr>,
+                      child: &Expr,
+                      k: u32,
+                      subst: &Expr|
+         -> KResult<Expr> {
+            done.get(&(child.allocation_identity(), k, subst.allocation_identity()))
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: HashMap<(usize, u32, usize), Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            k,
+            subst: subst.clone(),
+            depth,
+        }];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e, k, subst, depth } => {
+                    self.step(depth)?;
+                    let key = (e.allocation_identity(), k, subst.allocation_identity());
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(cached) = self.instantiate_cache.get(&e, k, &subst) {
+                        done.insert(key, cached);
+                        continue;
+                    }
+                    if e.loose_bvar_range() <= k {
+                        done.insert(key, e.clone());
+                        continue;
+                    }
+                    match e.node() {
+                        ExprNode::BVar { idx } => {
+                            let result = if *idx == k {
+                                subst.clone()
+                            } else if *idx > k {
+                                Expr::bvar(idx - 1).unwrap_or_else(|_| e.clone())
+                            } else {
+                                e.clone()
+                            };
+                            if result != e {
+                                self.instantiate_cache.insert(
+                                    e.clone(),
+                                    k,
+                                    subst.clone(),
+                                    result.clone(),
+                                );
+                            }
+                            done.insert(key, result);
+                        }
+                        ExprNode::App { f, a } => {
+                            let (f, a) = (f.clone(), a.clone());
+                            stack.push(Op::Finish {
+                                e,
+                                k,
+                                subst: subst.clone(),
+                                lifted: None,
+                            });
+                            stack.push(Op::Enter {
+                                e: a,
+                                k,
+                                subst: subst.clone(),
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: f,
+                                k,
+                                subst,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::Lam { .. } | ExprNode::ForallE { .. } | ExprNode::LetE { .. } => {
+                            let lifted = subst
+                                .lift_loose(0, 1)
+                                .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let next_k = k
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let (ty, body, value) = match e.node() {
+                                ExprNode::Lam {
+                                    binder_type, body, ..
+                                }
+                                | ExprNode::ForallE {
+                                    binder_type, body, ..
+                                } => (Some(binder_type.clone()), body.clone(), None),
+                                ExprNode::LetE {
+                                    type_, value, body, ..
+                                } => (Some(type_.clone()), body.clone(), Some(value.clone())),
+                                _ => unreachable!("matched binder above"),
+                            };
+                            stack.push(Op::Finish {
+                                e,
+                                k,
+                                subst: subst.clone(),
+                                lifted: Some(lifted.clone()),
+                            });
+                            stack.push(Op::Enter {
+                                e: body,
+                                k: next_k,
+                                subst: lifted,
+                                depth: depth + 1,
+                            });
+                            if let Some(value) = value {
+                                stack.push(Op::Enter {
+                                    e: value,
+                                    k,
+                                    subst: subst.clone(),
+                                    depth: depth + 1,
+                                });
+                            }
+                            if let Some(ty) = ty {
+                                stack.push(Op::Enter {
+                                    e: ty,
+                                    k,
+                                    subst,
+                                    depth: depth + 1,
+                                });
+                            }
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let inner = expr.clone();
+                            stack.push(Op::Finish {
+                                e,
+                                k,
+                                subst: subst.clone(),
+                                lifted: None,
+                            });
+                            stack.push(Op::Enter {
+                                e: inner,
+                                k,
+                                subst,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::FVar { .. }
+                        | ExprNode::MVar { .. }
+                        | ExprNode::Sort { .. }
+                        | ExprNode::Const { .. }
+                        | ExprNode::Lit { .. } => {
+                            done.insert(key, e);
+                        }
+                    }
+                }
+                Op::Finish {
+                    e,
+                    k,
+                    subst,
+                    lifted,
+                } => {
+                    let key = (e.allocation_identity(), k, subst.allocation_identity());
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let result = match e.node() {
+                        ExprNode::App { f, a } => {
+                            Expr::app(lookup(&done, f, k, &subst)?, lookup(&done, a, k, &subst)?)
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let lifted = lifted
+                                .as_ref()
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let next_k = k
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::lam(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, k, &subst)?,
+                                lookup(&done, body, next_k, lifted)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let lifted = lifted
+                                .as_ref()
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let next_k = k
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::forall_e(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, k, &subst)?,
+                                lookup(&done, body, next_k, lifted)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            let lifted = lifted
+                                .as_ref()
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let next_k = k
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::let_e(
+                                decl_name.clone(),
+                                lookup(&done, type_, k, &subst)?,
+                                lookup(&done, value, k, &subst)?,
+                                lookup(&done, body, next_k, lifted)?,
+                                *non_dep,
+                            )
+                        }
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr, k, &subst)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, k, &subst)?),
+                        _ => e.clone(),
+                    };
+                    if result != e {
+                        self.instantiate_cache
+                            .insert(e.clone(), k, subst.clone(), result.clone());
+                    }
+                    done.insert(key, result);
                 }
             }
-            ExprNode::App { f, a } => {
-                let f2 = self.instantiate(f, k, subst, depth + 1)?;
-                let a2 = self.instantiate(a, k, subst, depth + 1)?;
-                Expr::app(f2, a2)
-            }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.instantiate(binder_type, k, subst, depth + 1)?;
-                // Pin `instantiate` (`kernel/instantiate.cpp:29`): the
-                // substitute is lifted by the binders crossed, so its loose
-                // bvars skip the new binder instead of being captured by it.
-                let lifted = subst
-                    .lift_loose(0, 1)
-                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
-                Expr::lam(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.instantiate(binder_type, k, subst, depth + 1)?;
-                let lifted = subst
-                    .lift_loose(0, 1)
-                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
-                Expr::forall_e(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                let t2 = self.instantiate(type_, k, subst, depth + 1)?;
-                let v2 = self.instantiate(value, k, subst, depth + 1)?;
-                let lifted = subst
-                    .lift_loose(0, 1)
-                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-                let b2 = self.instantiate(body, k + 1, &lifted, depth + 1)?;
-                Expr::let_e(decl_name.clone(), t2, v2, b2, *non_dep)
-            }
-            ExprNode::MData { data, expr } => {
-                let inner = self.instantiate(expr, k, subst, depth + 1)?;
-                Expr::mdata(data.clone(), inner)
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => {
-                let inner = self.instantiate(expr, k, subst, depth + 1)?;
-                Expr::proj(struct_name.clone(), *idx, inner)
-            }
-            // Range-0 kinds are unreachable here thanks to the pruning guard.
-            ExprNode::FVar { .. }
-            | ExprNode::MVar { .. }
-            | ExprNode::Sort { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::Lit { .. } => e.clone(),
-        };
-        if result != *e {
-            self.instantiate_cache
-                .insert(e.clone(), k, subst.clone(), result.clone());
         }
-        Ok(result)
+        done.get(&(e.allocation_identity(), k, subst.allocation_identity()))
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
     /// Instantiate a binder body with an fvar (the standard descent move).
@@ -4850,6 +5015,35 @@ mod tests {
             tc.whnf_public(&let_open, 0).expect("zeta")
                 == Expr::lam(name("y"), sort, bv(1), fln_core::expr::BinderInfo::Default,),
             "zeta must lift the let value under the body's lambda"
+        );
+    }
+
+    #[test]
+    fn instantiate_walks_a_deep_app_nest_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let subst = Expr::sort(Level::zero());
+        let mut expr = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::bvar(1).expect("packs"));
+        }
+        let result = tc
+            .instantiate(&expr, 0, &subst, 0)
+            .expect("a 400-app open nest must not stack-fault");
+        let mut current = &result;
+        let mut apps = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            assert!(
+                matches!(a.node(), ExprNode::BVar { idx } if *idx == 0),
+                "loose #1 must shift down to #0"
+            );
+            current = f;
+            apps += 1;
+        }
+        assert!(apps == 400, "the app spine length is preserved");
+        assert!(
+            current == &subst,
+            "the head #0 is replaced by the substitute"
         );
     }
 
