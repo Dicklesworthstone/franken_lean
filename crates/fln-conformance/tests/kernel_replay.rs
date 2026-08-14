@@ -1519,8 +1519,17 @@ fn inventory_present_oleans(root: &Path) -> Result<CorpusInventory, String> {
     inventory_oleans(root, None)
 }
 
-fn inventory_mathlib_oleans(root: &Path) -> Result<CorpusInventory, String> {
-    inventory_oleans(root, Some("Mathlib"))
+fn module_names_below(root: &Path, module_prefix: Option<&str>) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    collect_present_oleans(root, &mut paths)?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            module_name_from_path(root, &path)
+                .map(|relative| qualify_module_name(module_prefix, relative))
+        })
+        .collect()
 }
 
 #[test]
@@ -3815,10 +3824,15 @@ fn whole_mathlib_corpus_resurrection_preflight() {
     }
 }
 
-/// Decode every built Mathlib module before attempting replay. This deliberately
-/// keeps the first full-corpus increment to the region-reader boundary: it
-/// establishes a pin-keyed, namespace-correct inventory and canonical order,
-/// but makes no kernel-admission claim yet.
+/// Decode the entire built Mathlib import closure before attempting replay. The
+/// old sweep decoded only paths below `Mathlib/`: its order silently ignored
+/// every `Init`, `Std`, `Lean`, and package import because those modules were
+/// absent from the inventory. This walk seeds all built `Mathlib.*` modules into
+/// the same multi-root closure builder used by the executable selected probes,
+/// and refuses unless that transitive closure is actually closed.
+///
+/// This still makes no kernel-admission claim. It closes the artifact/context
+/// input seam needed by that later lane rather than relabelling decode as replay.
 ///
 /// Run explicitly after the preflight is ready:
 /// `cargo test --locked -p fln-conformance --test kernel_replay \
@@ -3827,35 +3841,69 @@ fn whole_mathlib_corpus_resurrection_preflight() {
 #[ignore = "cost: decode the full pinned Mathlib corpus; on-demand resurrection sweep for franken_lean-t6r7"]
 fn whole_mathlib_corpus_resurrection_sweep() {
     let library = preflight_mathlib_corpus().expect("the exact built Mathlib corpus is ready");
-    let inventory = inventory_mathlib_oleans(&library).expect("decode every Mathlib olean");
+    let mathlib_modules =
+        module_names_below(&library, Some("Mathlib")).expect("enumerate every Mathlib module");
     assert!(
-        inventory.modules.len() >= 8_000,
+        mathlib_modules.len() >= 8_000,
         "whole-Mathlib resurrection found only {} modules; a truncated corpus is not a smaller green sweep",
-        inventory.modules.len(),
+        mathlib_modules.len(),
+    );
+    let reference_lib =
+        reference_lib().expect("pinned Reference stdlib required for the Mathlib closure");
+    let roots = chosen_set_roots(&reference_lib);
+    for (_, root) in &roots {
+        assert!(
+            root.is_dir(),
+            "whole-Mathlib closure root missing: {}",
+            root.display()
+        );
+    }
+    let inventory = closure_inventory_from_seeds(&roots, &mathlib_modules)
+        .expect("decode the closed whole-Mathlib import graph");
+    assert!(
+        inventory.missing_imports.is_empty(),
+        "whole-Mathlib closure has unresolved imports: {:?}",
+        inventory
+            .missing_imports
+            .iter()
+            .take(20)
+            .collect::<Vec<_>>()
     );
     assert!(
-        inventory.decoded != 0,
+        mathlib_modules
+            .iter()
+            .all(|name| inventory.modules.contains_key(name)),
+        "the closure inventory omitted at least one Mathlib seed"
+    );
+    let mathlib_decoded = mathlib_modules
+        .iter()
+        .map(|name| inventory.modules[name].decoded)
+        .sum::<u64>();
+    assert!(
+        mathlib_decoded != 0,
         "whole-Mathlib resurrection decoded zero declarations"
     );
     assert!(
-        inventory
-            .modules
-            .keys()
+        mathlib_modules
+            .iter()
             .all(|name| name.starts_with("Mathlib.")),
-        "the Mathlib inventory must qualify module names before comparing olean imports"
+        "the Mathlib seeds must be namespace-qualified before resolving their imports"
     );
     let order = corpus_module_order(&inventory).expect("derive canonical Mathlib module order");
     assert_eq!(
         order.len(),
         inventory.modules.len(),
-        "canonical order must cover every decoded Mathlib module"
+        "canonical order must cover the complete decoded import closure"
     );
     println!(
-        "{{\"schema\":\"fln-t6r7-mathlib-resurrection/1\",\"status\":\"observed\",\"corpus_commit\":{},\"modules\":{},\"decoded\":{},\"oracle_skipped\":{},\"fixture_hash\":{}}}",
+        "{{\"schema\":\"fln-t6r7-mathlib-resurrection/2\",\"status\":\"observed\",\"corpus_commit\":{},\"mathlib_modules\":{},\"closure_modules\":{},\"mathlib_decoded\":{},\"closure_decoded\":{},\"closure_oracle_skipped\":{},\"missing_imports\":{},\"fixture_hash\":{}}}",
         json_string(&suite_lock_corpus_commit()),
+        mathlib_modules.len(),
         inventory.modules.len(),
+        mathlib_decoded,
         inventory.decoded,
         inventory.oracle_skipped,
+        inventory.missing_imports.len(),
         json_string(&inventory.fixture_hash),
     );
 }
@@ -6864,16 +6912,52 @@ fn chosen_module_file(roots: &[(String, PathBuf)], name: &str) -> Option<PathBuf
     candidate.is_file().then_some(candidate)
 }
 
-/// BFS inventory from the chosen module through decoded import rows, folded
+fn canonical_closure_seed_queue(seeds: &[String]) -> Vec<String> {
+    seeds
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+#[test]
+fn multi_root_closure_preserves_every_distinct_seed() {
+    let seeds = vec![
+        "Mathlib.Zeta".to_string(),
+        "Mathlib.Alpha".to_string(),
+        "Mathlib.Zeta".to_string(),
+        "Mathlib.Middle".to_string(),
+    ];
+    let mut queue = canonical_closure_seed_queue(&seeds);
+    let mut popped = Vec::new();
+    while let Some(seed) = queue.pop() {
+        popped.push(seed);
+    }
+    assert_eq!(
+        popped,
+        ["Mathlib.Alpha", "Mathlib.Middle", "Mathlib.Zeta"],
+        "a multi-root closure must neither drop a distinct seed nor replay duplicates"
+    );
+}
+
+/// BFS inventory from one or more chosen modules through decoded import rows, folded
 /// with the same scheme as `inventory_present_oleans` so the two fixture
 /// hashes mean the same thing over their different populations.
-fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<CorpusInventory, String> {
+fn closure_inventory_from_seeds(
+    roots: &[(String, PathBuf)],
+    seeds: &[String],
+) -> Result<CorpusInventory, String> {
+    if seeds.is_empty() {
+        return Err("closure inventory needs at least one seed module".to_string());
+    }
     let mut modules = BTreeMap::new();
     let mut decoded = 0_u64;
     let mut oracle_skipped = 0_u64;
     let mut aggregate = Vec::new();
     aggregate.extend_from_slice(b"fln.kernel-reference-corpus.inventory/1\0");
-    let mut queue = vec![chosen.to_string()];
+    let mut queue = canonical_closure_seed_queue(seeds);
     while let Some(name) = queue.pop() {
         if modules.contains_key(&name) {
             continue;
@@ -6931,6 +7015,10 @@ fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<Corpus
         missing_imports,
         fixture_hash: hash(Domain::Fixture, &aggregate).to_hex(),
     })
+}
+
+fn closure_inventory(roots: &[(String, PathBuf)], chosen: &str) -> Result<CorpusInventory, String> {
+    closure_inventory_from_seeds(roots, &[chosen.to_string()])
 }
 
 /// One chosen-set leg: the verdict census of one replayed module over its
@@ -7337,42 +7425,28 @@ fn chosen_set_replays_and_witnesses() {
     // MUST be acceptance — the Reference accepted these modules when it wrote
     // them. This is a second execution of that implementation, not an
     // independent witness.
-    let lean_path = roots
+    let search_roots = roots
         .iter()
-        .map(|(_, root)| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-    let checker = reference_lib
-        .parent()
-        .and_then(Path::parent)
-        .map(|bin| bin.join("bin/leanchecker"))
-        .expect("leanchecker beside lean in the pinned toolchain");
-    assert!(
-        checker.is_file(),
-        "leanchecker missing at {}",
-        checker.display()
-    );
+        .map(|(_, root)| root.as_path())
+        .collect::<Vec<_>>();
     let mut witness_rows = Vec::new();
     for report in &reports {
-        let out = std::process::Command::new(&checker)
-            .arg(&report.module)
-            .env("LEAN_PATH", &lean_path)
-            .output()
-            .expect("spawn leanchecker");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let accepted = out.status.success()
-            && !stderr.to_lowercase().contains("uncaught exception")
-            && !stdout.to_lowercase().contains("uncaught exception");
+        let verdict = run_leanchecker_with_search_roots(
+            &reference_lib,
+            &search_roots,
+            std::slice::from_ref(&report.module),
+        )
+        .unwrap_or_else(|error| panic!("{}: sealed leanchecker failed: {error}", report.module));
+        let accepted = matches!(verdict, ReferenceCorpusVerdict::Accepted { .. });
         eprintln!(
-            "chosen_set witness module={} verdict={} rc={:?}",
+            "chosen_set witness module={} verdict={} detail={:?}",
             report.module,
-            if accepted { "accepted" } else { "rejected" },
-            out.status.code(),
+            if accepted { "accepted" } else { "not_accepted" },
+            verdict,
         );
         assert!(
             accepted,
-            "Reference kernel oracle rejected {}: {stderr}",
+            "Reference kernel oracle did not accept {}",
             report.module
         );
         witness_rows.push((report.module.clone(), accepted));
