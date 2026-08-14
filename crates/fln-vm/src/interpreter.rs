@@ -3215,19 +3215,13 @@ fn invoke_intrinsic(
         IntrinsicImplementation::ArrayGetInternal => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.getInternal", 0)?;
-            let index = nat_value(&args[1], "Array.getInternal", 1)?;
-            if index >= size {
-                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
-            }
+            let index = array_index(&args[1], "Array.getInternal", size)?;
             Ok(IntrinsicResult::owned(args[0].array_child(index)))
         }
         IntrinsicImplementation::ArrayGetBorrowed => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.ugetBorrowed", 0)?;
-            let index = nat_value(&args[1], "Array.ugetBorrowed", 1)?;
-            if index >= size {
-                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
-            }
+            let index = array_index(&args[1], "Array.ugetBorrowed", size)?;
             Ok(IntrinsicResult::borrowed_promoted(
                 args[0].array_child(index),
             ))
@@ -3380,7 +3374,11 @@ fn managerless_task_application(
         IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
             expect_golem_task_closure(&closure, "Task.spawn", 0)?;
-            nat_value(&priority, "Task.spawn", 1)?;
+            // Priority is a Nat; the managerless path ignores the number.
+            // An mpz priority is still a Nat — refusing it as a type
+            // mismatch would treat 2^64 as ill-typed rather than a valid
+            // (and here unused) priority.
+            with_nat_view(&priority, "Task.spawn", 1, |_| ())?;
             Ok(ManagerlessTaskApplication {
                 row,
                 closure,
@@ -3393,7 +3391,7 @@ fn managerless_task_application(
             let [closure, task, priority, sync] = exact_owned_args(row, args)?;
             expect_golem_task_closure(&closure, "Task.map", 0)?;
             expect_value_kind(&task, "Task.map", 1, "finished Task", ValueKind::Task)?;
-            nat_value(&priority, "Task.map", 2)?;
+            with_nat_view(&priority, "Task.map", 2, |_| ())?;
             bool_value(&sync, "Task.map", 3)?;
             let argument = task
                 .finished_task_value()
@@ -3410,7 +3408,7 @@ fn managerless_task_application(
             let [task, closure, priority, sync] = exact_owned_args(row, args)?;
             expect_value_kind(&task, "Task.bind", 0, "finished Task", ValueKind::Task)?;
             expect_golem_task_closure(&closure, "Task.bind", 1)?;
-            nat_value(&priority, "Task.bind", 2)?;
+            with_nat_view(&priority, "Task.bind", 2, |_| ())?;
             bool_value(&sync, "Task.bind", 3)?;
             let argument = task
                 .finished_task_value()
@@ -3629,6 +3627,31 @@ fn nat_value(value: &Obj, operation: &'static str, argument: usize) -> Result<us
         return Err(type_mismatch(operation, argument, "Nat scalar", value));
     }
     Ok(value.unbox())
+}
+
+/// A Marrow `Nat` used as a host index. `None` means a well-typed Nat larger
+/// than `usize::MAX` — out of range for every in-memory array, not a type error.
+fn nat_as_usize(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<Option<usize>, VmRefusal> {
+    with_nat_view(value, operation, argument, |view| {
+        view.to_u64().and_then(|word| usize::try_from(word).ok())
+    })
+}
+
+fn array_index(value: &Obj, operation: &'static str, size: usize) -> Result<usize, VmRefusal> {
+    let Some(index) = nat_as_usize(value, operation, 1)? else {
+        return Err(VmRefusal::ArrayIndexOutOfBounds {
+            index: usize::MAX,
+            size,
+        });
+    };
+    if index >= size {
+        return Err(VmRefusal::ArrayIndexOutOfBounds { index, size });
+    }
+    Ok(index)
 }
 
 fn nat_low_u64(value: &Obj, operation: &'static str, argument: usize) -> Result<u64, VmRefusal> {

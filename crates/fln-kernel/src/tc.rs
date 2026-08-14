@@ -2091,7 +2091,15 @@ impl<'a> TypeChecker<'a> {
                             .try_into()
                             .unwrap_or(u64::MAX);
                         self.charge_bulk(result_limbs)?;
-                        va.pow(u32::try_from(exp).unwrap_or(u32::MAX))
+                        // `BigNat::pow` panics past MAX_LIMBS. A generous
+                        // step budget can pay the charge and still be unable
+                        // to represent the result; that is exhaustion, not
+                        // an invariant failure (FL-INV-07).
+                        va.checked_pow(u32::try_from(exp).unwrap_or(u32::MAX))
+                            .ok_or_else(|| {
+                                self.used.steps_used = self.budget.steps.saturating_add(1);
+                                Stop::Exhausted(ExhaustionReason::Steps)
+                            })?
                     }
                     _ => return Ok(None),
                 }
@@ -2114,8 +2122,20 @@ impl<'a> TypeChecker<'a> {
                     self.used.steps_used = self.budget.steps.saturating_add(1);
                     return Err(Stop::Exhausted(ExhaustionReason::Steps));
                 };
-                self.charge_bulk(count / 64 + 1)?;
-                va.shl(count)
+                // Include the left operand's limbs: `count/64 + 1` alone
+                // under-charges a wide value and can pay a shift whose
+                // result still exceeds the bignum limb ceiling.
+                self.charge_bulk(count / 64 + 1 + limbs_a)?;
+                // `BigNat::shl` panics past MAX_LIMBS. Charge can succeed
+                // on a generous budget while the result is still
+                // unrepresentable; that is typed exhaustion, never abort.
+                match va.checked_shl(count) {
+                    Some(shifted) => shifted,
+                    None => {
+                        self.used.steps_used = self.budget.steps.saturating_add(1);
+                        return Err(Stop::Exhausted(ExhaustionReason::Steps));
+                    }
+                }
             }
             "shiftRight" => match vb.to_u64() {
                 Some(count) => va.shr(count),

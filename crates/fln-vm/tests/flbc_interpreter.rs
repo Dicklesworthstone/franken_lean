@@ -7970,6 +7970,58 @@ fn generated_intrinsic_results_promote_borrowed_bind_raw_and_refuse_drift() {
 }
 
 #[test]
+fn an_mpz_array_index_is_out_of_bounds_not_a_type_mismatch() {
+    let _guard = lock();
+    // `1 << 64` is a well-typed Nat that no longer fits a scalar. Indexing
+    // with it must be a bounds refusal — treating the mpz as "not a Nat"
+    // would make `arr[2^64]` a type error, and taking only the low limb
+    // would silently access index 0.
+    let program = validated(vec![function(
+        0,
+        0,
+        5,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "only".to_string(),
+            },
+            Instruction::Array {
+                dst: r(1),
+                items: vec![r(0)],
+            },
+            Instruction::Nat {
+                dst: r(2),
+                value: 1,
+            },
+            Instruction::Nat {
+                dst: r(3),
+                value: 64,
+            },
+            intrinsic(r(4), "extern:Nat.shiftLeft", vec![r(2), r(3)]),
+            intrinsic(r(2), "extern:Array.getInternal", vec![r(1), r(4)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    shadow::enable();
+    assert!(matches!(
+        execute(&program, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::ArrayIndexOutOfBounds {
+                index: usize::MAX,
+                size: 1,
+            },
+            ..
+        })
+    ));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "an mpz index refusal retains no array or mpz");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
+}
+
+#[test]
 fn validator_refuses_version_bounds_flow_and_fallthrough_before_execution() {
     let _guard = lock();
 
