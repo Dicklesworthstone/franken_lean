@@ -107,9 +107,10 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
-/// Recursion ceiling for name / expr / level projection. The kernel walk
-/// is 2048, but these frames are large enough that a debug host stack
-/// dies first; 256 stays typed (FL-INV-07) with room under a 2 MiB stack.
+/// Recursion ceiling for name / expr projection. Level projection is
+/// iterative (Level.depth is 24-bit). The kernel walk is 2048, but these
+/// frames are large enough that a debug host stack dies first; 256 stays
+/// typed (FL-INV-07) with room under a 2 MiB stack.
 const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
@@ -445,11 +446,7 @@ impl Conversion {
     }
 
     fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
-        self.enter("level")?;
-        self.depth += 1;
-        let result = self.project_level(obj);
-        self.depth -= 1;
-        result
+        self.project_level(obj)
     }
 
     /// Project a Compat Expr graph into the NativeHeap, deduplicated by the
@@ -620,46 +617,124 @@ impl Conversion {
         Ok(name)
     }
 
-    fn project_level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
-        if lean_box0(obj) {
-            return Ok(Level::zero());
+    fn project_level(&mut self, root: &Obj) -> Result<Level, ConvertError> {
+        // Iterative post-order, keyed by identity_token: Level.depth is
+        // 24-bit, so a succ tower can legally exceed the 256-frame host
+        // stack that still bounds the recursive expr/name projectors.
+        // A child already on the stack is a cycle in the Compat graph.
+        let mut done: HashMap<usize, Level> = HashMap::new();
+        let mut stack = vec![root.clone_ref()];
+        while let Some(current) = stack.last().map(Obj::clone_ref) {
+            let key = current.identity_token();
+            if lean_box0(&current) {
+                self.enter("level")?;
+                done.insert(key, Level::zero());
+                stack.pop();
+                continue;
+            }
+            if done.contains_key(&key) {
+                stack.pop();
+                continue;
+            }
+            if current.is_scalar() {
+                return Err(malformed("level", "a tagged scalar is not a level object"));
+            }
+            let tag = current.obj_tag() as u8;
+            let child_slots: &[usize] = match tag {
+                TAG_LEVEL_ZERO => &[],
+                TAG_LEVEL_SUCC => &[0],
+                TAG_LEVEL_MAX | TAG_LEVEL_IMAX => &[0, 1],
+                TAG_LEVEL_PARAM | TAG_LEVEL_MVAR => &[],
+                other => {
+                    return Err(ConvertError::UnsupportedConstructor {
+                        family: "level",
+                        tag: other,
+                    });
+                }
+            };
+            let mut pending = false;
+            // Only ancestors are a cycle. A sibling already pushed this
+            // visit (max of a shared child) is the same work item twice.
+            let ancestors = stack.len();
+            for &i in child_slots {
+                let child = ctor_field(&current, i, "level")?;
+                let child_key = child.identity_token();
+                if lean_box0(&child) {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = done.entry(child_key) {
+                        self.enter("level")?;
+                        slot.insert(Level::zero());
+                    }
+                    continue;
+                }
+                if done.contains_key(&child_key) {
+                    continue;
+                }
+                if stack[..ancestors]
+                    .iter()
+                    .any(|frame| frame.identity_token() == child_key)
+                {
+                    return Err(malformed("level", "level graph is cyclic"));
+                }
+                stack.push(child);
+                pending = true;
+            }
+            if pending {
+                continue;
+            }
+            self.enter("level")?;
+            let current = stack.pop().expect("the parent is still on the stack");
+            let projected = match tag {
+                TAG_LEVEL_ZERO => Level::zero(),
+                TAG_LEVEL_SUCC => {
+                    let child = ctor_field(&current, 0, "level")?;
+                    let inner = done.get(&child.identity_token()).ok_or_else(|| {
+                        malformed("level", "succ child was not projected before its parent")
+                    })?;
+                    inner
+                        .clone()
+                        .succ()
+                        .map_err(|_| ConvertError::NativeOverflow { family: "level" })?
+                }
+                TAG_LEVEL_MAX => {
+                    let a = ctor_field(&current, 0, "level")?;
+                    let b = ctor_field(&current, 1, "level")?;
+                    let left = done.get(&a.identity_token()).ok_or_else(|| {
+                        malformed("level", "max left was not projected before its parent")
+                    })?;
+                    let right = done.get(&b.identity_token()).ok_or_else(|| {
+                        malformed("level", "max right was not projected before its parent")
+                    })?;
+                    Level::max(left.clone(), right.clone())
+                        .map_err(|_| ConvertError::NativeOverflow { family: "level" })?
+                }
+                TAG_LEVEL_IMAX => {
+                    let a = ctor_field(&current, 0, "level")?;
+                    let b = ctor_field(&current, 1, "level")?;
+                    let left = done.get(&a.identity_token()).ok_or_else(|| {
+                        malformed("level", "imax left was not projected before its parent")
+                    })?;
+                    let right = done.get(&b.identity_token()).ok_or_else(|| {
+                        malformed("level", "imax right was not projected before its parent")
+                    })?;
+                    Level::imax(left.clone(), right.clone())
+                        .map_err(|_| ConvertError::NativeOverflow { family: "level" })?
+                }
+                TAG_LEVEL_PARAM => {
+                    let name = self.name(&ctor_field(&current, 0, "level")?)?;
+                    Level::param(name)
+                }
+                TAG_LEVEL_MVAR => {
+                    let name = self.name(&ctor_field(&current, 0, "level")?)?;
+                    Level::mvar(LMVarId(name))
+                }
+                _ => unreachable!("tag classified above"),
+            };
+            check_level_data(&current, &projected)?;
+            done.insert(key, projected);
         }
-        if obj.is_scalar() {
-            return Err(malformed("level", "a tagged scalar is not a level object"));
-        }
-        let level = match obj.obj_tag() as u8 {
-            TAG_LEVEL_ZERO => Ok(Level::zero()),
-            TAG_LEVEL_SUCC => {
-                let inner = self.level(&ctor_field(obj, 0, "level")?)?;
-                inner
-                    .succ()
-                    .map_err(|_| ConvertError::NativeOverflow { family: "level" })
-            }
-            TAG_LEVEL_MAX => {
-                let a = self.level(&ctor_field(obj, 0, "level")?)?;
-                let b = self.level(&ctor_field(obj, 1, "level")?)?;
-                Level::max(a, b).map_err(|_| ConvertError::NativeOverflow { family: "level" })
-            }
-            TAG_LEVEL_IMAX => {
-                let a = self.level(&ctor_field(obj, 0, "level")?)?;
-                let b = self.level(&ctor_field(obj, 1, "level")?)?;
-                Level::imax(a, b).map_err(|_| ConvertError::NativeOverflow { family: "level" })
-            }
-            TAG_LEVEL_PARAM => {
-                let name = self.name(&ctor_field(obj, 0, "level")?)?;
-                Ok(Level::param(name))
-            }
-            TAG_LEVEL_MVAR => {
-                let name = self.name(&ctor_field(obj, 0, "level")?)?;
-                Ok(Level::mvar(LMVarId(name)))
-            }
-            other => Err(ConvertError::UnsupportedConstructor {
-                family: "level",
-                tag: other,
-            }),
-        }?;
-        check_level_data(obj, &level)?;
-        Ok(level)
+        done.get(&root.identity_token())
+            .cloned()
+            .ok_or_else(|| malformed("level", "level was not projected"))
     }
 
     fn literal(&mut self, obj: &Obj) -> Result<Literal, ConvertError> {

@@ -854,6 +854,55 @@ fn inject_walks_a_long_succ_tower_without_a_stack_fault() {
 }
 
 #[test]
+fn project_walks_a_long_succ_tower_without_a_stack_fault() {
+    let mut level = Level::zero();
+    for _ in 0..400 {
+        level = level.succ().expect("400 < 2^24");
+    }
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::sort(level.clone()));
+    let injected = inject_expr(&heap, handle).expect("inject_level is iterative on succ");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("project_level is iterative on succ");
+    let ExprNode::Sort { level: restored } = heap.get(back).expect("handle").node() else {
+        panic!("expected a sort");
+    };
+    assert_eq!(restored.depth(), 400, "a legal 400-deep succ must project");
+    assert_eq!(restored.hash(), level.hash());
+}
+
+#[test]
+fn project_walks_a_hand_built_long_succ_tower() {
+    // Older convert-subset packing: no Data word. Must still walk iteratively.
+    let mut heap = NativeHeap::new();
+    let sort = Obj::mk_ctor(3, vec![mk_level_succ(400)], &[]);
+    let back = Conversion::new()
+        .project_expr(&mut heap, &sort)
+        .expect("a 400-deep Compat succ tower is a legal Level");
+    let ExprNode::Sort { level } = heap.get(back).expect("handle").node() else {
+        panic!("expected a sort");
+    };
+    assert_eq!(level.depth(), 400);
+}
+
+#[test]
+fn project_reuses_a_shared_level_child() {
+    let succ = Level::zero().succ().expect("packs");
+    let diamond = Level::max(succ.clone(), succ).expect("packs");
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::sort(diamond.clone()));
+    let injected = inject_expr(&heap, handle).expect("a shared succ injects once");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("a max of a shared succ must not look like a cycle");
+    let ExprNode::Sort { level: restored } = heap.get(back).expect("handle").node() else {
+        panic!("expected a sort");
+    };
+    assert_eq!(restored.hash(), diamond.hash());
+}
+
+#[test]
 fn inject_refuses_an_expr_deeper_than_the_walk_ceiling() {
     let mut expr = Expr::bvar(0).expect("packs");
     for _ in 0..400 {
