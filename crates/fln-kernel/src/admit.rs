@@ -1658,144 +1658,296 @@ impl<'a> Engine<'a> {
     /// The pin's `replace_all_nested`/`replace_if_nested` over a closed field
     /// region: `inner` counts binders below the parameter telescope, so a
     /// parameter `j` reads `bvar (inner + nparams - 1 - j)`.
+    ///
+    /// Post-order heap walk. A 400-deep field region is legal once convert
+    /// injects it; one frame per App/binder would abort (FL-INV-07). The
+    /// nested-occurrence mint still happens when the Const spine is first
+    /// seen, before trailing arguments are rewritten, matching the pin.
     fn nested_replace(
         &mut self,
         e: &Expr,
         inner: u32,
-        depth: u32,
+        _depth: u32,
         st: &mut NestedState,
     ) -> KResult<Expr> {
-        depth_guard(depth)?;
-        // Decompose an application spine.
-        let mut args: Vec<Expr> = Vec::new();
-        let mut head = e.clone();
-        while let ExprNode::App { f, a } = head.node() {
-            args.push(a.clone());
-            let next = f.clone();
-            head = next;
+        const MAX_NODES: usize = 1_000_000;
+        enum Op {
+            Enter {
+                e: Expr,
+                inner: u32,
+            },
+            FinishNested {
+                e: Expr,
+                inner: u32,
+                aux_name: Name,
+                np: usize,
+            },
+            FinishApp {
+                e: Expr,
+                inner: u32,
+            },
+            FinishBinder {
+                e: Expr,
+                inner: u32,
+            },
         }
-        args.reverse();
-        if let ExprNode::Const { name, levels } = head.node()
-            && !args.is_empty()
-            && !st.is_aux_name(name)
-            && !self.block.types.iter().any(|t| &t.base.name == name)
-        {
-            let head_row = self.base_env.find(name).cloned();
-            if let Some(ConstantInfo::Induct(iv)) = head_row {
-                let np = iv.num_params as usize;
-                let mut mentions = false;
-                for a in args.iter().take(np) {
-                    if self.mentions_block_type(a, st)? {
-                        mentions = true;
-                        break;
+        let lookup =
+            |done: &HashMap<(usize, u32), Expr>, child: &Expr, inner: u32| -> KResult<Expr> {
+                done.get(&(child.allocation_identity(), inner))
+                    .cloned()
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+            };
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            inner,
+        }];
+        let mut nodes = 0usize;
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e: current, inner } => {
+                    nodes = nodes
+                        .checked_add(1)
+                        .filter(|&n| n <= MAX_NODES)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Steps))?;
+                    let key = (current.allocation_identity(), inner);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let (head, args) = peel_app(&current);
+                    if let Some((aux_name, np)) = self.nested_occurrence(&head, &args, inner, st)? {
+                        if args.len() == np {
+                            done.insert(key, self.nested_aux_app(&aux_name, inner, &[])?);
+                            continue;
+                        }
+                        stack.push(Op::FinishNested {
+                            e: current,
+                            inner,
+                            aux_name,
+                            np,
+                        });
+                        for trailing in args.into_iter().skip(np).rev() {
+                            stack.push(Op::Enter { e: trailing, inner });
+                        }
+                        continue;
+                    }
+                    if !args.is_empty() {
+                        stack.push(Op::FinishApp { e: current, inner });
+                        for a in args.into_iter().rev() {
+                            stack.push(Op::Enter { e: a, inner });
+                        }
+                        stack.push(Op::Enter { e: head, inner });
+                        continue;
+                    }
+                    match current.node() {
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            let body_inner = inner
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            stack.push(Op::FinishBinder { e: current, inner });
+                            stack.push(Op::Enter {
+                                e: body,
+                                inner: body_inner,
+                            });
+                            stack.push(Op::Enter { e: ty, inner });
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            let body_inner = inner
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            stack.push(Op::FinishBinder { e: current, inner });
+                            stack.push(Op::Enter {
+                                e: body,
+                                inner: body_inner,
+                            });
+                            stack.push(Op::Enter { e: value, inner });
+                            stack.push(Op::Enter { e: ty, inner });
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let expr = expr.clone();
+                            stack.push(Op::FinishBinder { e: current, inner });
+                            stack.push(Op::Enter { e: expr, inner });
+                        }
+                        _ => {
+                            done.insert(key, current);
+                        }
                     }
                 }
-                if mentions {
-                    if args.len() < np {
-                        return reject(
-                            RejectClass::BlockMismatch,
-                            format!(
-                                "nested occurrence of `{}` is under-applied",
-                                name.to_display_string()
-                            ),
-                        );
+                Op::FinishNested {
+                    e: current,
+                    inner,
+                    aux_name,
+                    np,
+                } => {
+                    let key = (current.allocation_identity(), inner);
+                    if done.contains_key(&key) {
+                        continue;
                     }
-                    // Canonicalize the parametric prefix (pin replace_params;
-                    // loose non-parameter variables are the pin's hard error).
-                    let mut canonical: Vec<Expr> = Vec::with_capacity(np);
-                    for arg in args.iter().take(np) {
-                        canonical.push(self.lower_to_param_canonical(arg, inner, 0)?);
+                    let (_, args) = peel_app(&current);
+                    let mut trailing = Vec::new();
+                    for a in args.iter().skip(np) {
+                        trailing.push(lookup(&done, a, inner)?);
                     }
-                    let key = fold_app(
-                        Expr::const_(name.clone(), levels.clone()),
-                        canonical.iter().cloned(),
-                    );
-                    let aux_name = match st.lookup_aux(&key) {
-                        Some(found) => found,
-                        None => self.nested_mint(&iv, levels.clone(), &canonical, &key, st)?,
+                    done.insert(key, self.nested_aux_app(&aux_name, inner, &trailing)?);
+                }
+                Op::FinishApp { e: current, inner } => {
+                    let key = (current.allocation_identity(), inner);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let (head, args) = peel_app(&current);
+                    let mut rebuilt = lookup(&done, &head, inner)?;
+                    for a in &args {
+                        rebuilt = Expr::app(rebuilt, lookup(&done, a, inner)?);
+                    }
+                    done.insert(key, rebuilt);
+                }
+                Op::FinishBinder { e: current, inner } => {
+                    let key = (current.allocation_identity(), inner);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let body_inner = inner
+                        .checked_add(1)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                    let result = match current.node() {
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::lam(
+                            binder_name.clone(),
+                            lookup(&done, binder_type, inner)?,
+                            lookup(&done, body, body_inner)?,
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::forall_e(
+                            binder_name.clone(),
+                            lookup(&done, binder_type, inner)?,
+                            lookup(&done, body, body_inner)?,
+                            *binder_info,
+                        ),
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            lookup(&done, type_, inner)?,
+                            lookup(&done, value, inner)?,
+                            lookup(&done, body, body_inner)?,
+                            *non_dep,
+                        ),
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr, inner)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, inner)?),
+                        _ => current.clone(),
                     };
-                    // `auxI params trailing…` at this site.
-                    let mut replacement = Expr::const_(aux_name, self.levels.clone());
-                    for j in 0..self.nparams {
-                        replacement = Expr::app(
-                            replacement,
-                            Expr::bvar(inner + (self.nparams - 1 - j) as u32).map_err(|_| {
-                                Stop::Reject(
-                                    RejectClass::BlockMismatch,
-                                    "nested translation parameter reference out of range".into(),
-                                )
-                            })?,
-                        );
-                    }
-                    for trailing in &args[np..] {
-                        replacement = Expr::app(
-                            replacement,
-                            self.nested_replace(trailing, inner, depth + 1, st)?,
-                        );
-                    }
-                    return Ok(replacement);
+                    done.insert(key, result);
                 }
             }
         }
-        // Not a nested application: rebuild structurally.
-        if !args.is_empty() {
-            let mut rebuilt = self.nested_replace(&head, inner, depth + 1, st)?;
-            for a in &args {
-                rebuilt = Expr::app(rebuilt, self.nested_replace(a, inner, depth + 1, st)?);
-            }
-            return Ok(rebuilt);
+        done.get(&(e.allocation_identity(), inner))
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+    }
+
+    /// Pin `replace_if_nested`: if this Const spine is a nested occurrence,
+    /// mint/lookup the auxiliary and return `(aux_name, nparams)`.
+    fn nested_occurrence(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+        inner: u32,
+        st: &mut NestedState,
+    ) -> KResult<Option<(Name, usize)>> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if args.is_empty()
+            || st.is_aux_name(name)
+            || self.block.types.iter().any(|t| &t.base.name == name)
+        {
+            return Ok(None);
         }
-        Ok(match e.node() {
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                self.nested_replace(binder_type, inner, depth + 1, st)?,
-                self.nested_replace(body, inner + 1, depth + 1, st)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                self.nested_replace(binder_type, inner, depth + 1, st)?,
-                self.nested_replace(body, inner + 1, depth + 1, st)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                self.nested_replace(type_, inner, depth + 1, st)?,
-                self.nested_replace(value, inner, depth + 1, st)?,
-                self.nested_replace(body, inner + 1, depth + 1, st)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => Expr::mdata(
-                data.clone(),
-                self.nested_replace(expr, inner, depth + 1, st)?,
-            ),
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.nested_replace(expr, inner, depth + 1, st)?,
-            ),
-            _ => e.clone(),
-        })
+        let Some(ConstantInfo::Induct(iv)) = self.base_env.find(name).cloned() else {
+            return Ok(None);
+        };
+        let np = iv.num_params as usize;
+        let mut mentions = false;
+        for a in args.iter().take(np) {
+            if self.mentions_block_type(a, st)? {
+                mentions = true;
+                break;
+            }
+        }
+        if !mentions {
+            return Ok(None);
+        }
+        if args.len() < np {
+            return reject(
+                RejectClass::BlockMismatch,
+                format!(
+                    "nested occurrence of `{}` is under-applied",
+                    name.to_display_string()
+                ),
+            );
+        }
+        let mut canonical: Vec<Expr> = Vec::with_capacity(np);
+        for arg in args.iter().take(np) {
+            canonical.push(self.lower_to_param_canonical(arg, inner, 0)?);
+        }
+        let key = fold_app(
+            Expr::const_(name.clone(), levels.clone()),
+            canonical.iter().cloned(),
+        );
+        let aux_name = match st.lookup_aux(&key) {
+            Some(found) => found,
+            None => self.nested_mint(&iv, levels.clone(), &canonical, &key, st)?,
+        };
+        Ok(Some((aux_name, np)))
+    }
+
+    /// `auxI params trailing…` at this site (pin after `replace_if_nested`).
+    fn nested_aux_app(&self, aux_name: &Name, inner: u32, trailing: &[Expr]) -> KResult<Expr> {
+        let mut replacement = Expr::const_(aux_name.clone(), self.levels.clone());
+        for j in 0..self.nparams {
+            let idx = inner
+                .checked_add((self.nparams - 1 - j) as u32)
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+            replacement = Expr::app(
+                replacement,
+                Expr::bvar(idx).map_err(|_| {
+                    Stop::Reject(
+                        RejectClass::BlockMismatch,
+                        "nested translation parameter reference out of range".into(),
+                    )
+                })?,
+            );
+        }
+        Ok(fold_app(replacement, trailing.iter().cloned()))
     }
 
     /// Does the expression mention a type of the (translated) block?
@@ -2020,129 +2172,234 @@ impl<'a> Engine<'a> {
     /// renamed auxiliary recursors, auxiliary type applications mapped back
     /// to the original instantiated occurrence, auxiliary constructor
     /// applications mapped back to the original constructor.
+    ///
+    /// Post-order heap walk. Generated recursor types are now legally deep
+    /// once convert injects them; one frame per App/binder would abort
+    /// (FL-INV-07). The rewrite is context-free, so the memo is keyed by
+    /// allocation identity alone.
     fn restore_expr(
         &self,
         e: &Expr,
         st: &NestedState,
         rec_rename: &[(Name, Name)],
-        depth: u32,
+        _depth: u32,
     ) -> KResult<Expr> {
-        depth_guard(depth)?;
-        let mut args: Vec<Expr> = Vec::new();
-        let mut head = e.clone();
-        while let ExprNode::App { f, a } = head.node() {
-            args.push(a.clone());
-            let next = f.clone();
-            head = next;
+        const MAX_NODES: usize = 1_000_000;
+        enum Op {
+            Enter(Expr),
+            Finish(Expr),
         }
-        args.reverse();
-        if let ExprNode::Const { name, levels } = head.node() {
-            let mut restored_args = Vec::with_capacity(args.len());
-            for a in &args {
-                restored_args.push(self.restore_expr(a, st, rec_rename, depth + 1)?);
-            }
-            if let Some((_, renamed)) = rec_rename.iter().find(|(g, _)| g == name) {
-                return Ok(fold_app(
-                    Expr::const_(renamed.clone(), levels.clone()),
-                    restored_args.into_iter(),
-                ));
-            }
-            if let Some(aux) = st.auxes.iter().find(|a| &a.aux_name == name) {
-                // `auxJ params… trailing…` → the original occurrence with the
-                // canonical template instantiated at THIS site's parameters.
-                if restored_args.len() < self.nparams {
-                    return reject(
-                        RejectClass::BlockMismatch,
-                        "auxiliary type application is under-applied in a generated recursor",
-                    );
+        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+            done.get(&child.allocation_identity())
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter(e.clone())];
+        let mut nodes = 0usize;
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter(current) => {
+                    nodes = nodes
+                        .checked_add(1)
+                        .filter(|&n| n <= MAX_NODES)
+                        .ok_or(Stop::Exhausted(ExhaustionReason::Steps))?;
+                    if done.contains_key(&current.allocation_identity()) {
+                        continue;
+                    }
+                    let (head, args) = peel_app(&current);
+                    if let ExprNode::Const { name, levels } = head.node() {
+                        if args.is_empty() {
+                            done.insert(
+                                current.allocation_identity(),
+                                self.restore_const_app(name, levels, Vec::new(), st, rec_rename)?,
+                            );
+                            continue;
+                        }
+                        stack.push(Op::Finish(current));
+                        for a in args.into_iter().rev() {
+                            stack.push(Op::Enter(a));
+                        }
+                        continue;
+                    }
+                    if !args.is_empty() {
+                        stack.push(Op::Finish(current));
+                        for a in args.into_iter().rev() {
+                            stack.push(Op::Enter(a));
+                        }
+                        stack.push(Op::Enter(head));
+                        continue;
+                    }
+                    match current.node() {
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            stack.push(Op::Finish(current));
+                            stack.push(Op::Enter(body));
+                            stack.push(Op::Enter(ty));
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            stack.push(Op::Finish(current));
+                            stack.push(Op::Enter(body));
+                            stack.push(Op::Enter(value));
+                            stack.push(Op::Enter(ty));
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let expr = expr.clone();
+                            stack.push(Op::Finish(current));
+                            stack.push(Op::Enter(expr));
+                        }
+                        _ => {
+                            done.insert(current.allocation_identity(), current);
+                        }
+                    }
                 }
-                let site_params = &restored_args[..self.nparams];
-                let body = subst_loose_bvars(&aux.orig_app, 0, site_params, depth + 1)?;
-                return Ok(fold_app(
-                    body,
-                    restored_args[self.nparams..].iter().cloned(),
-                ));
-            }
-            if let Some((aux, orig_ctor)) = st.find_aux_ctor(name) {
-                if restored_args.len() < self.nparams {
-                    return reject(
-                        RejectClass::BlockMismatch,
-                        "auxiliary constructor application is under-applied in a generated recursor",
-                    );
+                Op::Finish(current) => {
+                    if done.contains_key(&current.allocation_identity()) {
+                        continue;
+                    }
+                    let (head, args) = peel_app(&current);
+                    let result = if let ExprNode::Const { name, levels } = head.node() {
+                        let mut restored_args = Vec::with_capacity(args.len());
+                        for a in &args {
+                            restored_args.push(lookup(&done, a)?);
+                        }
+                        self.restore_const_app(name, levels, restored_args, st, rec_rename)?
+                    } else if !args.is_empty() {
+                        let mut out = lookup(&done, &head)?;
+                        for a in &args {
+                            out = Expr::app(out, lookup(&done, a)?);
+                        }
+                        out
+                    } else {
+                        match current.node() {
+                            ExprNode::Lam {
+                                binder_name,
+                                binder_type,
+                                body,
+                                binder_info,
+                            } => Expr::lam(
+                                binder_name.clone(),
+                                lookup(&done, binder_type)?,
+                                lookup(&done, body)?,
+                                *binder_info,
+                            ),
+                            ExprNode::ForallE {
+                                binder_name,
+                                binder_type,
+                                body,
+                                binder_info,
+                            } => Expr::forall_e(
+                                binder_name.clone(),
+                                lookup(&done, binder_type)?,
+                                lookup(&done, body)?,
+                                *binder_info,
+                            ),
+                            ExprNode::LetE {
+                                decl_name,
+                                type_,
+                                value,
+                                body,
+                                non_dep,
+                            } => Expr::let_e(
+                                decl_name.clone(),
+                                lookup(&done, type_)?,
+                                lookup(&done, value)?,
+                                lookup(&done, body)?,
+                                *non_dep,
+                            ),
+                            ExprNode::MData { data, expr } => {
+                                Expr::mdata(data.clone(), lookup(&done, expr)?)
+                            }
+                            ExprNode::Proj {
+                                struct_name,
+                                idx,
+                                expr,
+                            } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
+                            _ => current.clone(),
+                        }
+                    };
+                    done.insert(current.allocation_identity(), result);
                 }
-                let template = fold_app(
-                    Expr::const_(orig_ctor.clone(), aux.site_levels.clone()),
-                    aux.inst_args.iter().cloned(),
-                );
-                let site_params = &restored_args[..self.nparams];
-                let body = subst_loose_bvars(&template, 0, site_params, depth + 1)?;
-                return Ok(fold_app(
-                    body,
-                    restored_args[self.nparams..].iter().cloned(),
-                ));
             }
-            return Ok(fold_app(head.clone(), restored_args.into_iter()));
         }
-        if !args.is_empty() {
-            let restored_head = self.restore_expr(&head, st, rec_rename, depth + 1)?;
-            let mut out = restored_head;
-            for a in &args {
-                out = Expr::app(out, self.restore_expr(a, st, rec_rename, depth + 1)?);
-            }
-            return Ok(out);
-        }
-        Ok(match e.node() {
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                self.restore_expr(binder_type, st, rec_rename, depth + 1)?,
-                self.restore_expr(body, st, rec_rename, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                self.restore_expr(binder_type, st, rec_rename, depth + 1)?,
-                self.restore_expr(body, st, rec_rename, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                self.restore_expr(type_, st, rec_rename, depth + 1)?,
-                self.restore_expr(value, st, rec_rename, depth + 1)?,
-                self.restore_expr(body, st, rec_rename, depth + 1)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => Expr::mdata(
-                data.clone(),
-                self.restore_expr(expr, st, rec_rename, depth + 1)?,
-            ),
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.restore_expr(expr, st, rec_rename, depth + 1)?,
-            ),
-            _ => e.clone(),
-        })
+        done.get(&e.allocation_identity())
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
+
+    /// Apply the pin's three Const-head restore rules to an already-restored
+    /// argument spine.
+    fn restore_const_app(
+        &self,
+        name: &Name,
+        levels: &[Level],
+        restored_args: Vec<Expr>,
+        st: &NestedState,
+        rec_rename: &[(Name, Name)],
+    ) -> KResult<Expr> {
+        if let Some((_, renamed)) = rec_rename.iter().find(|(g, _)| g == name) {
+            return Ok(fold_app(
+                Expr::const_(renamed.clone(), levels.to_vec()),
+                restored_args.into_iter(),
+            ));
+        }
+        if let Some(aux) = st.auxes.iter().find(|a| &a.aux_name == name) {
+            if restored_args.len() < self.nparams {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    "auxiliary type application is under-applied in a generated recursor",
+                );
+            }
+            let site_params = &restored_args[..self.nparams];
+            let body = subst_loose_bvars(&aux.orig_app, 0, site_params, 0)?;
+            return Ok(fold_app(
+                body,
+                restored_args[self.nparams..].iter().cloned(),
+            ));
+        }
+        if let Some((aux, orig_ctor)) = st.find_aux_ctor(name) {
+            if restored_args.len() < self.nparams {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    "auxiliary constructor application is under-applied in a generated recursor",
+                );
+            }
+            let template = fold_app(
+                Expr::const_(orig_ctor.clone(), aux.site_levels.clone()),
+                aux.inst_args.iter().cloned(),
+            );
+            let site_params = &restored_args[..self.nparams];
+            let body = subst_loose_bvars(&template, 0, site_params, 0)?;
+            return Ok(fold_app(
+                body,
+                restored_args[self.nparams..].iter().cloned(),
+            ));
+        }
+        Ok(fold_app(
+            Expr::const_(name.clone(), levels.to_vec()),
+            restored_args.into_iter(),
+        ))
+    }
+}
+
+/// Split an application spine into `(head, args-left-to-right)`.
+fn peel_app(e: &Expr) -> (Expr, Vec<Expr>) {
+    let mut args: Vec<Expr> = Vec::new();
+    let mut head = e.clone();
+    while let ExprNode::App { f, a } = head.node() {
+        args.push(a.clone());
+        head = f.clone();
+    }
+    args.reverse();
+    (head, args)
 }
 
 /// Left fold of applications.
@@ -3027,6 +3284,7 @@ pub(crate) fn scratch_admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fln_env::constants::ConstantVal;
 
     fn n(s: &str) -> Name {
         Name::str(Name::anonymous(), s)
@@ -3117,6 +3375,87 @@ mod tests {
         assert!(
             lowered == lams,
             "bvar 400 under 400 binders is the same block parameter"
+        );
+    }
+
+    fn dummy_block() -> InductiveBlock {
+        InductiveBlock {
+            types: vec![InductiveVal {
+                base: ConstantVal {
+                    name: n("T"),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                num_params: 0,
+                num_indices: 0,
+                all: vec![n("T")],
+                ctors: Vec::new(),
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            }],
+            ctors: Vec::new(),
+            recursors: Vec::new(),
+        }
+    }
+
+    fn deep_app_and_pi() -> (Expr, Expr) {
+        let leaf = Expr::sort(Level::zero());
+        let mut app = Expr::const_(n("Nat"), Vec::new());
+        for _ in 0..400 {
+            app = Expr::app(app, leaf.clone());
+        }
+        let mut pi = leaf;
+        for _ in 0..400 {
+            pi = Expr::forall_e(n("x"), Expr::sort(Level::zero()), pi, BinderInfo::Default);
+        }
+        (app, pi)
+    }
+
+    #[test]
+    fn restore_expr_walks_a_deep_nest_without_stack_fault() {
+        let block = dummy_block();
+        let engine = Engine::new(&Environment::new(), &block, Budget::DEFAULT)
+            .expect("dummy block admits an engine");
+        let st = NestedState::default();
+        let (app, pi) = deep_app_and_pi();
+        let restored_app = engine
+            .restore_expr(&app, &st, &[], 0)
+            .expect("a 400-app restore must not stack-fault");
+        assert!(
+            restored_app == app,
+            "a non-auxiliary Const spine restores to itself"
+        );
+        let restored_pi = engine
+            .restore_expr(&pi, &st, &[], 0)
+            .expect("a 400-Π restore must not stack-fault");
+        assert!(
+            restored_pi == pi,
+            "a binder nest with no aux Consts is unchanged"
+        );
+    }
+
+    #[test]
+    fn nested_replace_walks_a_deep_nest_without_stack_fault() {
+        let block = dummy_block();
+        let mut engine = Engine::new(&Environment::new(), &block, Budget::DEFAULT)
+            .expect("dummy block admits an engine");
+        let mut st = NestedState::default();
+        let (app, pi) = deep_app_and_pi();
+        let replaced_app = engine
+            .nested_replace(&app, 0, 0, &mut st)
+            .expect("a 400-app nested_replace must not stack-fault");
+        assert!(
+            replaced_app == app,
+            "a Const that is not a nested inductive is rebuilt unchanged"
+        );
+        let replaced_pi = engine
+            .nested_replace(&pi, 0, 0, &mut st)
+            .expect("a 400-Π nested_replace must not stack-fault");
+        assert!(
+            replaced_pi == pi,
+            "a binder nest with no nested occurrence is unchanged"
         );
     }
 }
