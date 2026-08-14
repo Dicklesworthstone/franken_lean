@@ -21,6 +21,7 @@
 //! * `Nat` hash = the value mod 2^64 (src/Init/Data/Hashable.lean:15-16); `List` hash
 //!   = left fold of `mixHash` from seed 7 (Hashable.lean:37-38).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::debug_walk::FlatDebug;
@@ -988,70 +989,123 @@ impl Expr {
     ///
     /// Used to eta-expand a remaining Π over a body that already mentions
     /// peeled parameters (`fun n => first n` becomes `fun n y => first n y`).
+    /// Iterative: a 400-deep open nest is a legal term, and the recursive
+    /// form blew the host stack the same way convert's pre-bound walks did.
     pub fn lift_loose(&self, cutoff: u32, amount: u32) -> Result<Expr, TooManyBoundVars> {
         if amount == 0 || self.loose_bvar_range() <= cutoff {
             return Ok(self.clone());
         }
-        Ok(match self.node() {
-            ExprNode::BVar { idx } if *idx >= cutoff => {
-                let lifted = idx
-                    .checked_add(amount)
-                    .ok_or(TooManyBoundVars { range: u32::MAX })?;
-                Expr::bvar(lifted)?
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![(self.clone(), cutoff, false)];
+        while let Some((current, cut, exit)) = stack.pop() {
+            if amount == 0 || current.loose_bvar_range() <= cut {
+                done.insert((current.allocation_identity(), cut), current);
+                continue;
             }
-            ExprNode::BVar { .. }
-            | ExprNode::FVar { .. }
-            | ExprNode::MVar { .. }
-            | ExprNode::Sort { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::Lit { .. } => self.clone(),
-            ExprNode::App { f, a } => {
-                Expr::app(f.lift_loose(cutoff, amount)?, a.lift_loose(cutoff, amount)?)
+            let key = (current.allocation_identity(), cut);
+            if done.contains_key(&key) {
+                continue;
             }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                binder_type.lift_loose(cutoff, amount)?,
-                body.lift_loose(cutoff.saturating_add(1), amount)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                binder_type.lift_loose(cutoff, amount)?,
-                body.lift_loose(cutoff.saturating_add(1), amount)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                type_.lift_loose(cutoff, amount)?,
-                value.lift_loose(cutoff, amount)?,
-                body.lift_loose(cutoff.saturating_add(1), amount)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => {
-                Expr::mdata(data.clone(), expr.lift_loose(cutoff, amount)?)
+            if !exit {
+                stack.push((current.clone(), cut, true));
+                match current.node() {
+                    ExprNode::App { f, a } => {
+                        stack.push((a.clone(), cut, false));
+                        stack.push((f.clone(), cut, false));
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((binder_type.clone(), cut, false));
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((value.clone(), cut, false));
+                        stack.push((type_.clone(), cut, false));
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push((expr.clone(), cut, false));
+                    }
+                    ExprNode::BVar { .. }
+                    | ExprNode::FVar { .. }
+                    | ExprNode::MVar { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::Lit { .. } => {}
+                }
+                continue;
             }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(struct_name.clone(), *idx, expr.lift_loose(cutoff, amount)?),
-        })
+            let lifted = match current.node() {
+                ExprNode::BVar { idx } if *idx >= cut => {
+                    let lifted = idx
+                        .checked_add(amount)
+                        .ok_or(TooManyBoundVars { range: u32::MAX })?;
+                    Expr::bvar(lifted)?
+                }
+                ExprNode::BVar { .. }
+                | ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => current.clone(),
+                ExprNode::App { f, a } => {
+                    Expr::app(lifted_child(&done, f, cut)?, lifted_child(&done, a, cut)?)
+                }
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    lifted_child(&done, type_, cut)?,
+                    lifted_child(&done, value, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => {
+                    Expr::mdata(data.clone(), lifted_child(&done, expr, cut)?)
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => Expr::proj(struct_name.clone(), *idx, lifted_child(&done, expr, cut)?),
+            };
+            done.insert(key, lifted);
+        }
+        done.get(&(self.allocation_identity(), cutoff))
+            .cloned()
+            .ok_or(TooManyBoundVars { range: u32::MAX })
     }
 
     /// The structural node (metaprograms pattern-match on the inventory).
@@ -1072,6 +1126,16 @@ impl Expr {
     pub fn allocation_identity(&self) -> usize {
         Arc::as_ptr(self.node_arc()) as usize
     }
+}
+
+fn lifted_child(
+    done: &HashMap<(usize, u32), Expr>,
+    child: &Expr,
+    cut: u32,
+) -> Result<Expr, TooManyBoundVars> {
+    done.get(&(child.allocation_identity(), cut))
+        .cloned()
+        .ok_or(TooManyBoundVars { range: u32::MAX })
 }
 
 impl Drop for Expr {
@@ -1159,6 +1223,30 @@ mod tests {
         assert!(matches!(lifted.node(), ExprNode::BVar { idx } if *idx == 5));
         let below = b.lift_loose(4, 2).expect("cutoff leaves idx 3");
         assert!(matches!(below.node(), ExprNode::BVar { idx } if *idx == 3));
+    }
+
+    #[test]
+    fn lift_loose_walks_a_deep_app_nest() {
+        let mut expr = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::bvar(0).expect("packs"));
+        }
+        let lifted = expr
+            .lift_loose(0, 1)
+            .expect("a 400-deep open nest lifts without a stack fault");
+        assert_eq!(
+            lifted.loose_bvar_range(),
+            expr.loose_bvar_range() + 1,
+            "every loose #0 becomes #1"
+        );
+        let diamond = Expr::app(expr.clone(), expr.clone());
+        let lifted_diamond = diamond.lift_loose(0, 1).expect("a shared child lifts once");
+        assert_eq!(lifted_diamond.loose_bvar_range(), 2);
+    }
+
+    #[test]
+    fn leaf_data_keeps_fvar_and_mvar_flags() {
+        let b = Expr::bvar(3).expect("packs");
         assert_eq!(b.approx_depth(), 0);
         assert!(!b.has_fvar() && !b.has_expr_mvar());
 
