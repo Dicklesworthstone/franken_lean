@@ -44,7 +44,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
@@ -107,10 +107,11 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
-/// Recursion ceiling for name / expr projection. Level projection is
-/// iterative (Level.depth is 24-bit). The kernel walk is 2048, but these
-/// frames are large enough that a debug host stack dies first; 256 stays
-/// typed (FL-INV-07) with room under a 2 MiB stack.
+/// Recursion ceiling for expr projection. Name and Level projection are
+/// iterative (a 400-component Name is legal; Level.depth is 24-bit). The
+/// kernel walk is 2048, but expr frames are large enough that a debug host
+/// stack dies first; 256 stays typed (FL-INV-07) with room under a 2 MiB
+/// stack.
 const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
@@ -438,11 +439,7 @@ impl Conversion {
     }
 
     fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
-        self.enter("name")?;
-        self.depth += 1;
-        let result = self.project_name(obj);
-        self.depth -= 1;
-        result
+        self.project_name(obj)
     }
 
     fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
@@ -580,40 +577,62 @@ impl Conversion {
         self.expr(&child)
     }
 
-    fn project_name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
-        if lean_box0(obj) {
-            return Ok(Name::anonymous());
-        }
-        if obj.is_scalar() {
-            return Err(malformed("name", "a tagged scalar is not a name object"));
-        }
-        let name = match obj.obj_tag() as u8 {
-            TAG_NAME_ANONYMOUS => Ok(Name::anonymous()),
-            TAG_NAME_STR => {
-                let pre = self.name(&ctor_field(obj, 0, "name")?)?;
-                let text = self.string(&ctor_field(obj, 1, "name")?)?;
-                Ok(Name::str(pre, text))
+    fn project_name(&mut self, root: &Obj) -> Result<Name, ConvertError> {
+        // Iterative on the parent chain: a 400-component Name is a legal
+        // native value, and the recursive form overflowed at the host-stack
+        // ceiling that still bounds expr (FL-INV-07).
+        let mut chain = Vec::new();
+        let mut cursor = root.clone_ref();
+        let mut seen = HashSet::new();
+        loop {
+            self.enter("name")?;
+            if lean_box0(&cursor) {
+                break;
             }
-            TAG_NAME_NUM => {
-                let header = obj.header();
-                let pre = self.name(&ctor_field(obj, 0, "name")?)?;
-                let component = if header.other >= 2 {
-                    // Lean: (pre : Name) (i : Nat) plus a cached hash scalar.
-                    nat_u64(&ctor_field(obj, 1, "name")?, "name")?
-                } else {
-                    // Convert subset: one child plus an inline u64. Offset 0
-                    // is the parent pointer; `ctor_scalar_u64` measures from
-                    // obj_cptr and requires `offset >= other * 8`.
-                    ctor_u64(obj, 8, "name")?
-                };
-                Ok(Name::num(pre, component))
+            if cursor.is_scalar() {
+                return Err(malformed("name", "a tagged scalar is not a name object"));
             }
-            other => Err(ConvertError::UnsupportedConstructor {
-                family: "name",
-                tag: other,
-            }),
-        }?;
-        check_name_hash(obj, &name)?;
+            if !seen.insert(cursor.identity_token()) {
+                return Err(malformed("name", "name graph is cyclic"));
+            }
+            match cursor.obj_tag() as u8 {
+                TAG_NAME_ANONYMOUS => break,
+                TAG_NAME_STR | TAG_NAME_NUM => {
+                    chain.push(cursor.clone_ref());
+                    cursor = ctor_field(&cursor, 0, "name")?;
+                }
+                other => {
+                    return Err(ConvertError::UnsupportedConstructor {
+                        family: "name",
+                        tag: other,
+                    });
+                }
+            }
+        }
+        let mut name = Name::anonymous();
+        for obj in chain.into_iter().rev() {
+            name = match obj.obj_tag() as u8 {
+                TAG_NAME_STR => {
+                    let text = self.string(&ctor_field(&obj, 1, "name")?)?;
+                    Name::str(name, text)
+                }
+                TAG_NAME_NUM => {
+                    let header = obj.header();
+                    let component = if header.other >= 2 {
+                        // Lean: (pre : Name) (i : Nat) plus a cached hash scalar.
+                        nat_u64(&ctor_field(&obj, 1, "name")?, "name")?
+                    } else {
+                        // Convert subset: one child plus an inline u64. Offset 0
+                        // is the parent pointer; `ctor_scalar_u64` measures from
+                        // obj_cptr and requires `offset >= other * 8`.
+                        ctor_u64(&obj, 8, "name")?
+                    };
+                    Name::num(name, component)
+                }
+                _ => unreachable!("only str/num were chained"),
+            };
+            check_name_hash(&obj, &name)?;
+        }
         Ok(name)
     }
 
