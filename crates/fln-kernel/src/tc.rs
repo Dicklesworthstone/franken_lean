@@ -2265,93 +2265,130 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(cached);
         }
-        let result = match e.node() {
-            ExprNode::MData { expr, .. } => self.whnf_core_mode(expr, depth + 1, cheap_proj)?,
-            ExprNode::FVar { id } => match self.find_local(id).and_then(|d| d.value.clone()) {
-                // KR-203: a let-bound fvar unfolds to its value.
-                Some(value) => self.whnf_core_mode(&value, depth + 1, cheap_proj)?,
-                None => e.clone(),
-            },
-            ExprNode::LetE { value, body, .. } => {
-                // KR-203 zeta.
-                let value = value.clone();
-                let body = body.clone();
-                let reduced = self.instantiate(&body, 0, &value, depth + 1)?;
-                self.whnf_core_mode(&reduced, depth + 1, cheap_proj)?
-            }
-            ExprNode::App { .. } => {
-                // Collect the spine, whnf the head, then KR-202 batched beta.
-                let (head0, args) = app_spine(e);
-                let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
-                if matches!(head.node(), ExprNode::Lam { .. }) {
-                    let mut body = head;
-                    let mut consumed = 0usize;
-                    while consumed < args.len() {
-                        self.step(depth)?;
-                        let ExprNode::Lam {
-                            body: next_body, ..
-                        } = body.node()
-                        else {
-                            break;
-                        };
-                        body = next_body.clone();
-                        consumed += 1;
-                    }
-                    let mut current =
-                        self.instantiate_rev(&body, &args[..consumed], 0, depth + 1)?;
-                    for arg in &args[consumed..] {
-                        current = Expr::app(current, arg.clone());
-                    }
-                    self.whnf_core_mode(&current, depth + 1, cheap_proj)?
-                } else if head == head0 {
-                    // KR-205: the head is stable — try quotient computation, then
-                    // inductive iota, on the original application.
-                    match self.reduce_recursor(e, depth + 1)? {
-                        Some(reduced) => self.whnf_core_mode(&reduced, depth + 1, cheap_proj)?,
-                        None => e.clone(),
-                    }
-                } else {
-                    // The head changed (let-fvar zeta, mdata strip): rebuild and
-                    // continue, as the pin re-enters whnf_core on the update.
-                    let mut rebuilt = head;
-                    for arg in args {
-                        rebuilt = Expr::app(rebuilt, arg);
-                    }
-                    self.whnf_core_mode(&rebuilt, depth + 1, cheap_proj)?
-                }
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => {
-                // KR-204: projection of a constructor application.
-                let struct_name = struct_name.clone();
-                let idx = *idx;
-                let scrutinee = if cheap_proj {
-                    self.whnf_core_mode(expr, depth + 1, true)?
-                } else {
-                    self.whnf(&expr.clone(), depth + 1)?
-                };
-                // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a
-                // String-literal scrutinee expands to its constructor spine
-                // (whnf'd so `String.ofList` unfolds to the real constructor)
-                // before field extraction.
-                let scrutinee = if let ExprNode::Lit {
-                    literal: Literal::Str(value),
-                } = scrutinee.node()
+        // Peel mdata / zeta / let-bound fvars on the heap. The seed elaborator
+        // can now emit a 400-deep let spine; recursing one frame per zeta
+        // would abort the check that found it (FL-INV-07). App/proj tail
+        // reductions continue the same loop.
+        let mut current = e.clone();
+        let mut depth = depth;
+        let result = loop {
+            if !cheap_proj && current != *e {
+                if let Some(cached) =
+                    self.whnf_core_cache
+                        .get(&current, &self.locals, &self.local_positions)
                 {
-                    let expanded = string_lit_to_constructor(value);
-                    self.whnf(&expanded, depth + 1)?
-                } else {
-                    scrutinee
-                };
-                match self.reduce_proj(&struct_name, idx, &scrutinee) {
-                    Some(field) => self.whnf_core_mode(&field, depth + 1, cheap_proj)?,
-                    None => Expr::proj(struct_name, idx, scrutinee),
+                    break cached;
                 }
             }
-            _ => e.clone(),
+            match current.node() {
+                ExprNode::MData { expr, .. } => {
+                    current = expr.clone();
+                    depth += 1;
+                    self.step(depth)?;
+                }
+                ExprNode::FVar { id } => match self.find_local(id).and_then(|d| d.value.clone()) {
+                    // KR-203: a let-bound fvar unfolds to its value.
+                    Some(value) => {
+                        current = value;
+                        depth += 1;
+                        self.step(depth)?;
+                    }
+                    None => break current.clone(),
+                },
+                ExprNode::LetE { value, body, .. } => {
+                    // KR-203 zeta.
+                    let value = value.clone();
+                    let body = body.clone();
+                    current = self.instantiate(&body, 0, &value, depth + 1)?;
+                    depth += 1;
+                    self.step(depth)?;
+                }
+                ExprNode::App { .. } => {
+                    // Collect the spine, whnf the head, then KR-202 batched beta.
+                    let (head0, args) = app_spine(&current);
+                    let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
+                    if matches!(head.node(), ExprNode::Lam { .. }) {
+                        let mut body = head;
+                        let mut consumed = 0usize;
+                        while consumed < args.len() {
+                            self.step(depth)?;
+                            let ExprNode::Lam {
+                                body: next_body, ..
+                            } = body.node()
+                            else {
+                                break;
+                            };
+                            body = next_body.clone();
+                            consumed += 1;
+                        }
+                        let mut reduced =
+                            self.instantiate_rev(&body, &args[..consumed], 0, depth + 1)?;
+                        for arg in &args[consumed..] {
+                            reduced = Expr::app(reduced, arg.clone());
+                        }
+                        current = reduced;
+                        depth += 1;
+                        self.step(depth)?;
+                    } else if head == head0 {
+                        // KR-205: the head is stable — try quotient computation, then
+                        // inductive iota, on the original application.
+                        match self.reduce_recursor(&current, depth + 1)? {
+                            Some(reduced) => {
+                                current = reduced;
+                                depth += 1;
+                                self.step(depth)?;
+                            }
+                            None => break current.clone(),
+                        }
+                    } else {
+                        // The head changed (let-fvar zeta, mdata strip): rebuild and
+                        // continue, as the pin re-enters whnf_core on the update.
+                        let mut rebuilt = head;
+                        for arg in args {
+                            rebuilt = Expr::app(rebuilt, arg);
+                        }
+                        current = rebuilt;
+                        depth += 1;
+                        self.step(depth)?;
+                    }
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    // KR-204: projection of a constructor application.
+                    let struct_name = struct_name.clone();
+                    let idx = *idx;
+                    let scrutinee = if cheap_proj {
+                        self.whnf_core_mode(expr, depth + 1, true)?
+                    } else {
+                        self.whnf(&expr.clone(), depth + 1)?
+                    };
+                    // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a
+                    // String-literal scrutinee expands to its constructor spine
+                    // (whnf'd so `String.ofList` unfolds to the real constructor)
+                    // before field extraction.
+                    let scrutinee = if let ExprNode::Lit {
+                        literal: Literal::Str(value),
+                    } = scrutinee.node()
+                    {
+                        let expanded = string_lit_to_constructor(value);
+                        self.whnf(&expanded, depth + 1)?
+                    } else {
+                        scrutinee
+                    };
+                    match self.reduce_proj(&struct_name, idx, &scrutinee) {
+                        Some(field) => {
+                            current = field;
+                            depth += 1;
+                            self.step(depth)?;
+                        }
+                        None => break Expr::proj(struct_name, idx, scrutinee),
+                    }
+                }
+                _ => break current.clone(),
+            }
         };
         // The explicit recursor continuation may retry an outer application
         // after normalizing a newly exposed nested major. A completed stuck
@@ -5701,6 +5738,33 @@ mod tests {
         }
         assert!(apps == 400, "the app spine length is preserved");
         assert!(current == &subst, "the head fvar is replaced");
+    }
+
+    #[test]
+    fn whnf_zetas_a_deep_let_spine_without_stack_fault() {
+        // The seed elaborator folds sequential lets on the heap; WHNF used to
+        // zeta one LetE per recursive frame and abort the check (FL-INV-07).
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let one = Expr::lit(Literal::Nat(NatLit::from_u64(1)));
+        let nat = Expr::const_(Name::str(Name::anonymous(), "Nat"), Vec::new());
+        let mut expr = one.clone();
+        for _ in 0..400 {
+            expr = Expr::let_e(
+                Name::str(Name::anonymous(), "x"),
+                nat.clone(),
+                one.clone(),
+                expr,
+                false,
+            );
+        }
+        let result = tc
+            .whnf_public(&expr, 0)
+            .expect("a 400-let spine must not stack-fault");
+        assert!(
+            result == one,
+            "zeta of unused lets around a literal is the literal"
+        );
     }
 
     #[test]
