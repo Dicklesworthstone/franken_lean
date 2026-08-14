@@ -4176,9 +4176,10 @@ const fn default_callable_result_ownership(
     result: fir::ValueType,
 ) -> crate::flbc::CallableResultOwnership {
     match result {
-        fir::ValueType::Unit | fir::ValueType::Bool | fir::ValueType::Nat => {
+        fir::ValueType::Unit | fir::ValueType::Bool => {
             crate::flbc::CallableResultOwnership::Scalar
         }
+        fir::ValueType::Nat => crate::flbc::CallableResultOwnership::OwnedOrScalar,
         fir::ValueType::String
         | fir::ValueType::Constructor
         | fir::ValueType::Array
@@ -4827,7 +4828,7 @@ mod tests {
             ingress.fir().canonical_text(),
             concat!(
                 "fir/14 entry=f0\n",
-                "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
+                "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
                 "  v1:nat = nat 2\n",
@@ -5173,7 +5174,7 @@ mod tests {
                 "fir/14 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
                 "intrinsic i1 row=20:65787465726e3a537472696e672e617070656e64 args=[string,string] ownership=[owned,borrowed] result=string result_ownership=owned effect=pure\n",
-                "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
+                "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 20\n",
                 "  v1:nat = nat 21\n",
@@ -5779,17 +5780,17 @@ mod tests {
             concat!(
                 "fir/14 entry=f0\n",
                 "intrinsic i0 row=14:65787465726e3a4e61742e616464 args=[nat,nat] ownership=[borrowed,borrowed] result=nat result_ownership=owned effect=pure\n",
-                "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
+                "function f0 params=[] ownership=[] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 40\n",
                 "  v1:nat = call f2 [v0]\n",
                 "  return v1\n",
-                "function f1 params=[nat] ownership=[borrowed] result=nat result_ownership=scalar\n",
+                "function f1 params=[nat] ownership=[borrowed] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v1:nat = nat 1\n",
                 "  v2:nat = intrinsic i0 [v0,v1]\n",
                 "  return v2\n",
-                "function f2 params=[nat] ownership=[borrowed] result=nat result_ownership=scalar\n",
+                "function f2 params=[nat] ownership=[borrowed] result=nat result_ownership=owned-or-scalar\n",
                 " block b0\n",
                 "  v1:nat = call f1 [v0]\n",
                 "  v2:nat = call f1 [v1]\n",

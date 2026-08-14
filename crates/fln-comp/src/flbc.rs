@@ -24,8 +24,10 @@ use std::fmt;
 /// Owned-or-Scalar result contract of every callable function and invocation;
 /// version 10 makes each native `Lean.Core.checkSystem` observation point an
 /// explicit artifact instruction carrying its diagnostic module name; version
-/// 11 also admits a validated register operand for computed module names.
-pub const FLBC_SCHEMA_VERSION: u16 = 11;
+/// 11 also admits a validated register operand for computed module names;
+/// version 12 adds the ABI-exact callable result class used by `Nat`, whose
+/// runtime representation may be either a tagged scalar or an owned mpz.
+pub const FLBC_SCHEMA_VERSION: u16 = 12;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
@@ -388,12 +390,15 @@ impl ResultOwnership {
 ///
 /// A completed function always transfers one register-owned [`fln_rt::obj::Obj`]
 /// to its continuation. `Owned` requires a heap object; `Scalar` requires a
-/// tagged immediate. Borrowed and unique callable results are deliberately not
+/// tagged immediate; `OwnedOrScalar` admits the ABI representation used by
+/// values such as `Nat`, where small values are immediate and large values are
+/// owned mpz objects. Borrowed and unique callable results are deliberately not
 /// representable in this bounded schema.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CallableResultOwnership {
     Owned,
     Scalar,
+    OwnedOrScalar,
 }
 
 impl CallableResultOwnership {
@@ -401,6 +406,7 @@ impl CallableResultOwnership {
         match self {
             Self::Owned => "owned",
             Self::Scalar => "scalar",
+            Self::OwnedOrScalar => "owned-or-scalar",
         }
     }
 
@@ -408,6 +414,7 @@ impl CallableResultOwnership {
         match self {
             Self::Owned => 0,
             Self::Scalar => 1,
+            Self::OwnedOrScalar => 2,
         }
     }
 
@@ -415,6 +422,7 @@ impl CallableResultOwnership {
         match tag {
             0 => Ok(Self::Owned),
             1 => Ok(Self::Scalar),
+            2 => Ok(Self::OwnedOrScalar),
             _ => Err(CodecError::InvalidCallableResultOwnership { tag, offset }),
         }
     }
@@ -3490,10 +3498,12 @@ fn owned_callable_result_count(instruction: &Instruction) -> usize {
     usize::from(matches!(
         instruction,
         Instruction::Call {
-            result_ownership: CallableResultOwnership::Owned,
+            result_ownership:
+                CallableResultOwnership::Owned | CallableResultOwnership::OwnedOrScalar,
             ..
         } | Instruction::Apply {
-            result_ownership: CallableResultOwnership::Owned,
+            result_ownership:
+                CallableResultOwnership::Owned | CallableResultOwnership::OwnedOrScalar,
             ..
         }
     ))
@@ -10963,7 +10973,7 @@ mod codec_tests {
         let mut entry = function(
             0,
             0,
-            2,
+            3,
             vec![
                 Instruction::Call {
                     dst: r(0),
@@ -10978,6 +10988,13 @@ mod codec_tests {
                     args: Vec::new(),
                     argument_ownership: Vec::new(),
                     result_ownership: CallableResultOwnership::Owned,
+                },
+                Instruction::Call {
+                    dst: r(2),
+                    function: f(3),
+                    args: Vec::new(),
+                    argument_ownership: Vec::new(),
+                    result_ownership: CallableResultOwnership::OwnedOrScalar,
                 },
                 Instruction::Return { src: r(1) },
             ],
@@ -11008,8 +11025,21 @@ mod codec_tests {
             ],
         );
         owned.result_ownership = CallableResultOwnership::Owned;
-        let program = Program::new(f(0), vec![entry, scalar, owned]);
-        let source = validate(program.clone()).expect("both callable result classes validate");
+        let mut owned_or_scalar = function(
+            3,
+            0,
+            1,
+            vec![
+                Instruction::Nat {
+                    dst: r(0),
+                    value: 9,
+                },
+                Instruction::Return { src: r(0) },
+            ],
+        );
+        owned_or_scalar.result_ownership = CallableResultOwnership::OwnedOrScalar;
+        let program = Program::new(f(0), vec![entry, scalar, owned, owned_or_scalar]);
+        let source = validate(program.clone()).expect("all callable result classes validate");
         let bytes =
             encode_canonical(&source, CodecLimits::default()).expect("result classes encode");
         let decoded =
@@ -11018,7 +11048,7 @@ mod codec_tests {
 
         let inserted = insert_ownership(&source, OwnershipLimits::default())
             .expect("ownership witness binds both callable result classes");
-        assert_eq!(inserted.witness().functions()[0].owned_callable_results, 1);
+        assert_eq!(inserted.witness().functions()[0].owned_callable_results, 2);
         assert_eq!(inserted.witness().functions()[0].scalar_callable_results, 1);
         let mut forged_rows = inserted.witness().functions().to_vec();
         forged_rows[0].owned_callable_results = 0;
@@ -11033,7 +11063,7 @@ mod codec_tests {
             Err(OwnershipError::WitnessCount {
                 function,
                 count: OwnershipWitnessCount::OwnedCallableResults,
-                expected: 1,
+                expected: 2,
                 actual: 0,
             }) if function == f(0)
         ));
@@ -11059,10 +11089,10 @@ mod codec_tests {
 
         let mut invalid_tag =
             encode_canonical(&minimal_program(), CodecLimits::default()).expect("minimal bytes");
-        invalid_tag[32] = 2;
+        invalid_tag[32] = 3;
         assert_eq!(
             decode_canonical(&invalid_tag, CodecLimits::default()),
-            Err(CodecError::InvalidCallableResultOwnership { tag: 2, offset: 32 })
+            Err(CodecError::InvalidCallableResultOwnership { tag: 3, offset: 32 })
         );
     }
 
@@ -11075,7 +11105,7 @@ mod codec_tests {
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
                 7, 0, // wire version
-                11, 0, // schema version
+                12, 0, // schema version
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
