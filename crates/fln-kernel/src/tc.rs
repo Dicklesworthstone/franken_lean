@@ -4020,15 +4020,46 @@ pub(crate) fn first_divergence_public(t: &Expr, s: &Expr) -> Option<String> {
 /// the d4x arc's level-aware messages are the precedent).
 fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
     fn level_shape(l: &Level) -> String {
+        level_shape_fuel(l, 32)
+    }
+    fn level_shape_fuel(l: &Level, fuel: usize) -> String {
         use fln_core::level::LevelView;
-        match l.view() {
+        // Peel succ towers in a loop: `check_level` now admits 24-bit-legal
+        // spines, and a recursive `succ(succ(…))` render of one would abort
+        // the rejection that found them (FL-INV-07).
+        let mut current = l;
+        let mut offset = 0usize;
+        while let LevelView::Succ(inner) = current.view() {
+            offset = offset.saturating_add(1);
+            current = inner;
+        }
+        if fuel == 0 {
+            return if offset == 0 {
+                "..".to_string()
+            } else {
+                format!("succ^{offset}(..)")
+            };
+        }
+        let mut rendered = match current.view() {
             LevelView::Zero => "0".to_string(),
             LevelView::Param(p) => format!("param:{}", p.to_display_string()),
-            LevelView::Succ(inner) => format!("succ({})", level_shape(inner)),
-            LevelView::Max(a, b) => format!("max({},{})", level_shape(a), level_shape(b)),
-            LevelView::IMax(a, b) => format!("imax({},{})", level_shape(a), level_shape(b)),
             LevelView::MVar(_) => "mvar".to_string(),
+            LevelView::Max(a, b) => format!(
+                "max({},{})",
+                level_shape_fuel(a, fuel - 1),
+                level_shape_fuel(b, fuel - 1)
+            ),
+            LevelView::IMax(a, b) => format!(
+                "imax({},{})",
+                level_shape_fuel(a, fuel - 1),
+                level_shape_fuel(b, fuel - 1)
+            ),
+            LevelView::Succ(_) => unreachable!("succ towers are peeled above"),
+        };
+        for _ in 0..offset {
+            rendered = format!("succ({rendered})");
         }
+        rendered
     }
     fn levels_diff(path: &str, l1: &[Level], l2: &[Level]) -> Option<String> {
         if l1.len() != l2.len() {
@@ -4869,6 +4900,24 @@ mod tests {
         assert!(
             matches!(inferred.node(), ExprNode::Sort { .. }),
             "Sort (u+10000) : Sort (u+10001)"
+        );
+    }
+
+    #[test]
+    fn first_divergence_renders_a_deep_succ_spine_without_stack_fault() {
+        let u = Name::str(Name::anonymous(), "u");
+        let v = Name::str(Name::anonymous(), "v");
+        let mut left = Level::param(u);
+        let mut right = Level::param(v);
+        for _ in 0..10_000 {
+            left = left.succ().expect("10k succs pack");
+            right = right.succ().expect("10k succs pack");
+        }
+        let report = first_divergence(&Expr::sort(left), &Expr::sort(right))
+            .expect("distinct param spines must diverge");
+        assert!(
+            report.contains("param:u") && report.contains("param:v"),
+            "the diagnostic must still name both parameters: {report}"
         );
     }
 
