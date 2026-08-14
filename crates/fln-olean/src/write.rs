@@ -1575,12 +1575,51 @@ mod tests {
             Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
             Expr::lit(Literal::Str("writer".to_owned())),
             Expr::mdata(metadata, body.clone()),
+            Expr::mdata(
+                KVMap::from_entries(vec![
+                    (name("dup"), DataValue::OfNat(1)),
+                    (name("other"), DataValue::OfBool(false)),
+                    (name("dup"), DataValue::OfNat(2)),
+                ]),
+                body.clone(),
+            ),
             Expr::proj(name("Demo.Pair"), u64::MAX, body),
         ];
 
         for case in cases {
             roundtrip(&case);
         }
+    }
+
+    #[test]
+    fn mdata_duplicate_keys_survive_decode_as_the_entry_list() {
+        // Pin `KVMap.mk`: duplicate keys are representable. `insert` would
+        // replace the first `dup` and the stored Expr.Data word would then
+        // fail the decoder's cross-check — or, with the check off, silently
+        // shrink the map. The codec must keep both rows.
+        let metadata = KVMap::from_entries(vec![
+            (name("dup"), DataValue::OfNat(1)),
+            (name("other"), DataValue::OfString("keep".to_owned())),
+            (name("dup"), DataValue::OfNat(2)),
+        ]);
+        let expression = Expr::mdata(metadata, Expr::bvar(0).expect("body"));
+        roundtrip(&expression);
+        let encoded =
+            encode_expr_region(&expression, header(), WriteBudget::default()).expect("encode");
+        let view = OleanView::parse(&encoded.bytes).expect("header");
+        let decoded = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_expr(encoded.root)
+            .expect("decode");
+        assert!(
+            matches!(decoded.node(), ExprNode::MData { data, .. } if data.entries()
+                == [
+                    (name("dup"), DataValue::OfNat(1)),
+                    (name("other"), DataValue::OfString("keep".to_owned())),
+                    (name("dup"), DataValue::OfNat(2)),
+                ]
+                && data.find(&name("dup")) == Some(&DataValue::OfNat(1))
+                && data.len() == 3)
+        );
     }
 
     #[test]

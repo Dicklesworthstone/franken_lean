@@ -561,7 +561,11 @@ impl<'a> DeclDecoder<'a> {
 
     fn decode_kvmap(&mut self, ptr: u64) -> DResult<KVMap> {
         // KVMap is a single-field structure: erased to its entry list.
-        let mut map = KVMap::new();
+        // Duplicate keys are legal on the pin (`KVMap.mk` / `from_entries`)
+        // and ride inside `Expr.mdata`. `insert` would replace the first
+        // match, drop the shadowed entry, and then disagree with the
+        // stored Expr.Data word — a codec collapse, not a lookup.
+        let mut entries = Vec::new();
         for pair in self.list_ptrs(ptr)? {
             let off = self.view.deref(pair)?;
             let (tag, other, _) = self.view.obj_header(off)?;
@@ -573,9 +577,9 @@ impl<'a> DeclDecoder<'a> {
             }
             let key = self.decode_name(self.view.read_u64(off + 8)?)?;
             let value = self.decode_data_value(self.view.read_u64(off + 16)?)?;
-            map.insert(key, value);
+            entries.push((key, value));
         }
-        Ok(map)
+        Ok(KVMap::from_entries(entries))
     }
 
     // ---- Expr --------------------------------------------------------------------------
