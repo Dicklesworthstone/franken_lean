@@ -239,7 +239,12 @@ fn decode_hex_scalar(bytes: &[u8]) -> Result<char, NatDefinitionElabError> {
             .and_then(|value| value.checked_add(u32::try_from(digit).ok()?))
             .ok_or(NatDefinitionElabError::InvalidStringLiteral)?;
     }
-    char::from_u32(value).ok_or(NatDefinitionElabError::InvalidStringLiteral)
+    // Pin `decodeQuotedChar` (`Init/Meta/Defs.lean:1096-1105`) feeds the
+    // digits to `Char.ofNat`. Invalid scalars (the UTF-16 surrogates a
+    // four-digit `\u` can name) become `'\0'`, not a decode failure
+    // (`Prelude.lean:2867-2870`). `char::from_u32` is the Rust refusal;
+    // using it here rejected `"\uD800"` while the pin accepted a NUL.
+    Ok(char::from_u32(value).unwrap_or('\0'))
 }
 
 fn decode_string(spelling: &str) -> Result<Literal, NatDefinitionElabError> {
@@ -1488,7 +1493,6 @@ mod tests {
             "r#\"extra closer\"##",
             "\"a\\ b\"",
             "\"left\\\n\n  right\"",
-            "\"\\uD800\"",
         ] {
             assert_eq!(
                 decode_string(malformed),
@@ -1499,6 +1503,31 @@ mod tests {
             decode_string("\"\\u0000\""),
             Ok(Literal::Str("\0".to_owned()))
         );
+        // Pin `Char.ofNat`: a four-digit `\u` that names a surrogate is
+        // `'\0'`, not a refused literal. The lexer already accepted the
+        // hex digits; decode must not invent a refusal the pin does not.
+        assert_eq!(
+            decode_string("\"\\uD800\""),
+            Ok(Literal::Str("\0".to_owned()))
+        );
+        assert_eq!(
+            decode_string("\"\\uDFFF\""),
+            Ok(Literal::Str("\0".to_owned()))
+        );
+
+        let parsed = parse_definition(br#"def s : String := "\uD800""#)
+            .expect("the lexer accepts a four-digit surrogate escape");
+        let Declaration::Defn(definition) = elaborate_definition(parsed.syntax())
+            .expect("Char.ofNat maps the surrogate to NUL, so the definition elaborates")
+        else {
+            panic!("the surrogate escape must elaborate to a definition");
+        };
+        assert!(matches!(
+            definition.value.node(),
+            ExprNode::Lit {
+                literal: Literal::Str(value)
+            } if value == "\0"
+        ));
     }
 
     #[test]
