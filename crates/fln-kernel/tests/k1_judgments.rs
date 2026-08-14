@@ -4996,6 +4996,54 @@ fn kr606_negative_occurrences_are_rejected() {
 }
 
 #[test]
+fn kr606_positivity_walks_a_deep_pi_telescope_without_stack_fault() {
+    // Convert can inject a 400-deep Π field; KR-606 used to open one binder
+    // per recursive frame and abort (FL-INV-07). The innermost domain is
+    // the block itself, so the walk must still reject as non-positive.
+    let deep = || Expr::const_(n("Deep"), vec![]);
+    let mut field = Expr::forall_e(n("y"), deep(), deep(), BinderInfo::Default);
+    for _ in 0..400 {
+        field = Expr::forall_e(n("x"), prop(), field, BinderInfo::Default);
+    }
+    let ind = InductiveVal {
+        // Prop so KR-604 (field universe ≤ datatype) does not fire first:
+        // wrapping `Π x : Prop, _` raises the field sort above Sort 0.
+        base: cval(n("Deep"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("Deep")],
+        ctors: vec![nn("Deep", "mk")],
+        num_nested: 0,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: true,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("Deep", "mk"),
+            vec![],
+            Expr::forall_e(n("f"), field, deep(), BinderInfo::Default),
+        ),
+        induct: n("Deep"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(vec![ind], vec![mk], vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("non positive"),
+        "a non-positive occurrence under 400 Πs must still be the KR-606 judgment, got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
 fn kr604_oversized_constructor_fields_are_rejected() {
     // MANDATED MUTANT (AGENTS testing policy: "inverted universe condition"):
     // a `Type`-level datatype with a `Type 1` field violates KR-604. The

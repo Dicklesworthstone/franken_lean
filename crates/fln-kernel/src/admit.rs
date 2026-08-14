@@ -22,6 +22,8 @@
 //! explicit depth converted to typed exhaustion, and all typing/reduction work
 //! runs through budget-metered [`TypeChecker`] instances.
 
+use std::collections::HashMap;
+
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId};
 use fln_core::level::Level;
 use fln_core::name::{LeafView, Name};
@@ -747,7 +749,12 @@ impl<'a> Engine<'a> {
         Ok(self.valid_ind_app_index(&t))
     }
 
-    /// KR-606 strict positivity.
+    /// KR-606 strict positivity. The pin peels one Π per recursive call
+    /// (`inductive.cpp:393`). A 400-deep field telescope that mentions the
+    /// block at the end is legal input once convert injects it; walking one
+    /// frame per binder would abort (FL-INV-07). Same WHNF / domain /
+    /// open-body steps, on a loop. `depth_guard` still binds a hostile
+    /// telescope to typed exhaustion.
     fn check_positivity(
         &mut self,
         t: &Expr,
@@ -755,40 +762,44 @@ impl<'a> Engine<'a> {
         arg_idx: usize,
         depth: u32,
     ) -> KResult<()> {
-        depth_guard(depth)?;
-        let t = self.with_tc(|tc| tc.whnf_public(t, 0))?;
-        if !self.mentions_block(&t) {
-            return Ok(()); // non-recursive argument
-        }
-        if matches!(t.node(), ExprNode::ForallE { .. }) {
-            let ExprNode::ForallE { binder_type, .. } = t.node() else {
-                unreachable!("matched above");
-            };
-            if self.mentions_block(binder_type) {
-                return reject(
-                    RejectClass::BlockMismatch,
-                    format!(
-                        "arg #{} of `{}` has a non positive occurrence of the datatypes being declared",
-                        arg_idx + 1,
-                        ctor.to_display_string()
-                    ),
-                );
+        let mut current = t.clone();
+        let mut depth = depth;
+        loop {
+            depth_guard(depth)?;
+            current = self.with_tc(|tc| tc.whnf_public(&current, 0))?;
+            if !self.mentions_block(&current) {
+                return Ok(());
             }
-            let local = self.mk_local_for(&t)?;
-            let body = self.open_pi(&t, &local)?;
-            return self.check_positivity(&body, ctor, arg_idx, depth + 1);
+            if let ExprNode::ForallE { binder_type, .. } = current.node() {
+                if self.mentions_block(binder_type) {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        format!(
+                            "arg #{} of `{}` has a non positive occurrence of the datatypes being declared",
+                            arg_idx + 1,
+                            ctor.to_display_string()
+                        ),
+                    );
+                }
+                let local = self.mk_local_for(&current)?;
+                current = self.open_pi(&current, &local)?;
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                continue;
+            }
+            if self.valid_ind_app_index(&current).is_some() {
+                return Ok(());
+            }
+            return reject(
+                RejectClass::BlockMismatch,
+                format!(
+                    "arg #{} of `{}` contains a non valid occurrence of the datatypes being declared",
+                    arg_idx + 1,
+                    ctor.to_display_string()
+                ),
+            );
         }
-        if self.valid_ind_app_index(&t).is_some() {
-            return Ok(()); // recursive argument
-        }
-        reject(
-            RejectClass::BlockMismatch,
-            format!(
-                "arg #{} of `{}` contains a non valid occurrence of the datatypes being declared",
-                arg_idx + 1,
-                ctor.to_display_string()
-            ),
-        )
     }
 
     /// KR-603/604/605/606 + decoded-row cross-checks, for every constructor.
@@ -2159,102 +2170,185 @@ struct NestedAux {
 
 /// Lower one nested-head parameter while keeping binders introduced inside the
 /// parameter distinct from loose locals surrounding the occurrence.
+///
+/// Post-order heap walk. A 400-deep app or binder nest is a legal nested
+/// parameter once convert injects it; recursing one frame per node would
+/// abort (FL-INV-07). `depth` is retained for callers; the walk is bounded
+/// by a node cap rather than native-stack frames.
 pub(crate) fn lower_param_expr(
     e: &Expr,
     nparams: usize,
     site_inner: u32,
     bound_inside_arg: u32,
-    depth: u32,
+    _depth: u32,
 ) -> KResult<Expr> {
-    depth_guard(depth)?;
     if e.loose_bvar_range() == 0 {
         return Ok(e.clone());
     }
-    Ok(match e.node() {
-        ExprNode::BVar { idx } if *idx < bound_inside_arg => e.clone(),
-        ExprNode::BVar { idx } => {
-            let loose = idx - bound_inside_arg;
-            if loose < site_inner {
-                return reject(
-                    RejectClass::BlockMismatch,
-                    "nested inductive datatype parameters cannot contain local variables",
-                );
+    const MAX_NODES: usize = 1_000_000;
+    enum Op {
+        Enter { e: Expr, bound: u32 },
+        Finish { e: Expr, bound: u32 },
+    }
+    let lookup = |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+        done.get(&(child.allocation_identity(), bound))
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+    };
+    let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+    let mut stack = vec![Op::Enter {
+        e: e.clone(),
+        bound: bound_inside_arg,
+    }];
+    let mut nodes = 0usize;
+    while let Some(op) = stack.pop() {
+        match op {
+            Op::Enter { e, bound } => {
+                nodes = nodes
+                    .checked_add(1)
+                    .filter(|&n| n <= MAX_NODES)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Steps))?;
+                let key = (e.allocation_identity(), bound);
+                if done.contains_key(&key) {
+                    continue;
+                }
+                if e.loose_bvar_range() == 0 {
+                    done.insert(key, e);
+                    continue;
+                }
+                match e.node() {
+                    ExprNode::BVar { idx } if *idx < bound => {
+                        done.insert(key, e);
+                    }
+                    ExprNode::BVar { idx } => {
+                        let loose = idx - bound;
+                        if loose < site_inner {
+                            return reject(
+                                RejectClass::BlockMismatch,
+                                "nested inductive datatype parameters cannot contain local variables",
+                            );
+                        }
+                        let lowered = loose - site_inner;
+                        if lowered as usize >= nparams {
+                            return reject(
+                                RejectClass::BlockMismatch,
+                                "nested occurrence parameter reference escapes the telescope",
+                            );
+                        }
+                        done.insert(
+                            key,
+                            Expr::bvar(bound + lowered).unwrap_or_else(|_| e.clone()),
+                        );
+                    }
+                    ExprNode::App { f, a } => {
+                        let (f, a) = (f.clone(), a.clone());
+                        stack.push(Op::Finish { e, bound });
+                        stack.push(Op::Enter { e: a, bound });
+                        stack.push(Op::Enter { e: f, bound });
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        let (ty, body) = (binder_type.clone(), body.clone());
+                        let inner = bound
+                            .checked_add(1)
+                            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                        stack.push(Op::Finish { e, bound });
+                        stack.push(Op::Enter {
+                            e: body,
+                            bound: inner,
+                        });
+                        stack.push(Op::Enter { e: ty, bound });
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                        let inner = bound
+                            .checked_add(1)
+                            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                        stack.push(Op::Finish { e, bound });
+                        stack.push(Op::Enter {
+                            e: body,
+                            bound: inner,
+                        });
+                        stack.push(Op::Enter { e: value, bound });
+                        stack.push(Op::Enter { e: ty, bound });
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        let expr = expr.clone();
+                        stack.push(Op::Finish { e, bound });
+                        stack.push(Op::Enter { e: expr, bound });
+                    }
+                    _ => {
+                        done.insert(key, e);
+                    }
+                }
             }
-            let lowered = loose - site_inner;
-            if lowered as usize >= nparams {
-                return reject(
-                    RejectClass::BlockMismatch,
-                    "nested occurrence parameter reference escapes the telescope",
-                );
+            Op::Finish { e, bound } => {
+                let key = (e.allocation_identity(), bound);
+                if done.contains_key(&key) {
+                    continue;
+                }
+                let result = match e.node() {
+                    ExprNode::App { f, a } => {
+                        Expr::app(lookup(&done, f, bound)?, lookup(&done, a, bound)?)
+                    }
+                    ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::lam(
+                        binder_name.clone(),
+                        lookup(&done, binder_type, bound)?,
+                        lookup(&done, body, bound + 1)?,
+                        *binder_info,
+                    ),
+                    ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::forall_e(
+                        binder_name.clone(),
+                        lookup(&done, binder_type, bound)?,
+                        lookup(&done, body, bound + 1)?,
+                        *binder_info,
+                    ),
+                    ExprNode::LetE {
+                        decl_name,
+                        type_,
+                        value,
+                        body,
+                        non_dep,
+                    } => Expr::let_e(
+                        decl_name.clone(),
+                        lookup(&done, type_, bound)?,
+                        lookup(&done, value, bound)?,
+                        lookup(&done, body, bound + 1)?,
+                        *non_dep,
+                    ),
+                    ExprNode::MData { data, expr } => {
+                        Expr::mdata(data.clone(), lookup(&done, expr, bound)?)
+                    }
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
+                    _ => e.clone(),
+                };
+                done.insert(key, result);
             }
-            Expr::bvar(bound_inside_arg + lowered).unwrap_or_else(|_| e.clone())
         }
-        ExprNode::App { f, a } => Expr::app(
-            lower_param_expr(f, nparams, site_inner, bound_inside_arg, depth + 1)?,
-            lower_param_expr(a, nparams, site_inner, bound_inside_arg, depth + 1)?,
-        ),
-        ExprNode::Lam {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::lam(
-            binder_name.clone(),
-            lower_param_expr(
-                binder_type,
-                nparams,
-                site_inner,
-                bound_inside_arg,
-                depth + 1,
-            )?,
-            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::forall_e(
-            binder_name.clone(),
-            lower_param_expr(
-                binder_type,
-                nparams,
-                site_inner,
-                bound_inside_arg,
-                depth + 1,
-            )?,
-            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::LetE {
-            decl_name,
-            type_,
-            value,
-            body,
-            non_dep,
-        } => Expr::let_e(
-            decl_name.clone(),
-            lower_param_expr(type_, nparams, site_inner, bound_inside_arg, depth + 1)?,
-            lower_param_expr(value, nparams, site_inner, bound_inside_arg, depth + 1)?,
-            lower_param_expr(body, nparams, site_inner, bound_inside_arg + 1, depth + 1)?,
-            *non_dep,
-        ),
-        ExprNode::MData { data, expr } => Expr::mdata(
-            data.clone(),
-            lower_param_expr(expr, nparams, site_inner, bound_inside_arg, depth + 1)?,
-        ),
-        ExprNode::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => Expr::proj(
-            struct_name.clone(),
-            *idx,
-            lower_param_expr(expr, nparams, site_inner, bound_inside_arg, depth + 1)?,
-        ),
-        _ => e.clone(),
-    })
+    }
+    done.get(&(e.allocation_identity(), bound_inside_arg))
+        .cloned()
+        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
 }
 
 /// The forward translation's accumulating state.
@@ -2995,6 +3089,34 @@ mod tests {
         assert!(
             has_loose_bvars_in_domain(&mentioned, 0, true),
             "an explicit domain mentioning bvar 0 is a hit"
+        );
+    }
+
+    #[test]
+    fn lower_param_expr_walks_a_deep_nest_without_stack_fault() {
+        // Convert can inject a 400-deep nested-parameter term; the old walk
+        // recursed one frame per App/Lam (FL-INV-07).
+        let leaf = Expr::bvar(0).expect("packs");
+        let mut app = leaf.clone();
+        for _ in 0..400 {
+            app = Expr::app(app, leaf.clone());
+        }
+        let lowered =
+            lower_param_expr(&app, 1, 0, 0, 0).expect("a 400-app nest must not stack-fault");
+        assert!(
+            lowered == app,
+            "bvar 0 with nparams=1 and no surrounding locals is unchanged"
+        );
+
+        let mut lams = Expr::bvar(400).expect("packs");
+        for _ in 0..400 {
+            lams = Expr::lam(n("x"), Expr::sort(Level::zero()), lams, BinderInfo::Default);
+        }
+        let lowered =
+            lower_param_expr(&lams, 1, 0, 0, 0).expect("a 400-λ nest must not stack-fault");
+        assert!(
+            lowered == lams,
+            "bvar 400 under 400 binders is the same block parameter"
         );
     }
 }
