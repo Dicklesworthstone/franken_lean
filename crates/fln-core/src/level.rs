@@ -17,6 +17,7 @@
 //! `LMVarId` is a `Name` wrapper whose derived hash is `mixHash 0 name.hash`
 //! (deriving-handler semantics, src/Lean/Elab/Deriving/Hashable.lean).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::debug_walk::FlatDebug;
@@ -607,23 +608,70 @@ impl Level {
         Level::imax(u1, u2).expect("children already packed")
     }
 
-    /// `getMaxArgsAux` (Level.lean:318-321): flatten nested `max`, normalizing each
-    /// non-max leaf once. Left child first.
-    fn collect_max_args(level: &Level, already_normalized: bool, out: &mut Vec<Level>) {
-        let mut stack = vec![(level.clone(), already_normalized)];
-        while let Some((current, already)) = stack.pop() {
+    /// Flatten nested `max` without normalizing. Left child first.
+    fn raw_max_leaves(level: &Level) -> Vec<Level> {
+        let mut out = Vec::new();
+        let mut stack = vec![level.clone()];
+        while let Some(current) = stack.pop() {
             match current.node() {
                 Node::Max(a, b) => {
-                    stack.push((b.clone(), already));
-                    stack.push((a.clone(), already));
-                }
-                _ if !already => {
-                    let normalized = current.normalize();
-                    stack.push((normalized, true));
+                    stack.push(b.clone());
+                    stack.push(a.clone());
                 }
                 _ => out.push(current),
             }
         }
+        out
+    }
+
+    fn lookup_norm(done: &HashMap<Level, Level>, level: &Level) -> Level {
+        if level.is_already_normalized_cheap() {
+            level.clone()
+        } else {
+            done.get(level)
+                .cloned()
+                .expect("normalize scheduled this child")
+        }
+    }
+
+    /// Pin `getMaxArgsAux`: flatten `max`, substitute each leaf's normalized
+    /// form, then flatten any `max` that normalization produced (`already =
+    /// true` — no second normalize).
+    fn append_normed_max_args(done: &HashMap<Level, Level>, level: &Level, out: &mut Vec<Level>) {
+        for leaf in Level::raw_max_leaves(level) {
+            let mut rest = vec![Level::lookup_norm(done, &leaf)];
+            while let Some(normalized) = rest.pop() {
+                match normalized.node() {
+                    Node::Max(a, b) => {
+                        rest.push(b.clone());
+                        rest.push(a.clone());
+                    }
+                    _ => out.push(normalized),
+                }
+            }
+        }
+    }
+
+    fn finish_max_normalize(lvls: &mut [Level], k: u32) -> Level {
+        lvls.sort_by(|a, b| {
+            if a.norm_lt(b) {
+                std::cmp::Ordering::Less
+            } else if b.norm_lt(a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        let first_non_explicit = Level::skip_explicit(lvls);
+        let i = if Level::is_explicit_subsumed(lvls, first_non_explicit) {
+            first_non_explicit
+        } else {
+            first_non_explicit.saturating_sub(1)
+        };
+        let lvl1 = &lvls[i];
+        let prev = lvl1.get_level_offset().clone();
+        let prev_k = lvl1.get_offset();
+        Level::mk_max_aux(lvls, k, i + 1, prev, prev_k, Level::zero())
     }
 
     /// `accMax` (Level.lean:323-325).
@@ -732,52 +780,77 @@ impl Level {
         if self.is_already_normalized_cheap() {
             return self.clone();
         }
-        let k = self.get_offset();
-        let u = self.get_level_offset();
-        match u.node() {
-            Node::Max(l1, l2) => {
-                let mut lvls: Vec<Level> = Vec::new();
-                Level::collect_max_args(l1, false, &mut lvls);
-                Level::collect_max_args(l2, false, &mut lvls);
-                // `Array.qsort normLt` — order by the normalization total order.
-                // A stable sort with a strict-weak `normLt` yields the same sequence.
-                lvls.sort_by(|a, b| {
-                    if a.norm_lt(b) {
-                        std::cmp::Ordering::Less
-                    } else if b.norm_lt(a) {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Equal
+        // Post-order heap walk: IMax used to recurse one frame per nesting,
+        // and collect_max_args re-entered normalize on every IMax leaf.
+        // A 24-bit-legal spine blows a 2 MiB host stack (FL-INV-07).
+        let mut done: HashMap<Level, Level> = HashMap::new();
+        let mut stack = vec![(self.clone(), false)];
+        while let Some((current, exit)) = stack.pop() {
+            if done.contains_key(&current) {
+                continue;
+            }
+            if current.is_already_normalized_cheap() {
+                done.insert(current.clone(), current);
+                continue;
+            }
+            let base = current.get_level_offset().clone();
+            if !exit {
+                stack.push((current, true));
+                match base.node() {
+                    Node::Max(l1, l2) => {
+                        for leaf in Level::raw_max_leaves(l1)
+                            .into_iter()
+                            .chain(Level::raw_max_leaves(l2))
+                        {
+                            if !leaf.is_already_normalized_cheap() && !done.contains_key(&leaf) {
+                                stack.push((leaf, false));
+                            }
+                        }
                     }
-                });
-                let first_non_explicit = Level::skip_explicit(&lvls);
-                let i = if Level::is_explicit_subsumed(&lvls, first_non_explicit) {
-                    first_non_explicit
-                } else {
-                    first_non_explicit.saturating_sub(1)
-                };
-                let lvl1 = &lvls[i];
-                let prev = lvl1.get_level_offset().clone();
-                let prev_k = lvl1.get_offset();
-                Level::mk_max_aux(&lvls, k, i + 1, prev, prev_k, Level::zero())
-            }
-            Node::IMax(l1, l2) => {
-                if l2.is_never_zero() {
-                    let as_max = Level::max(l1.clone(), l2.clone()).expect("children packed");
-                    as_max
-                        .normalize()
-                        .add_offset(k)
-                        .expect("normalization cannot deepen")
-                } else {
-                    let n1 = l1.normalize();
-                    let n2 = l2.normalize();
-                    Level::mk_imax_aux(n1, n2)
-                        .add_offset(k)
-                        .expect("normalization cannot deepen")
+                    Node::IMax(l1, l2) => {
+                        if l2.is_never_zero() {
+                            let as_max =
+                                Level::max(l1.clone(), l2.clone()).expect("children packed");
+                            stack.push((as_max, false));
+                        } else {
+                            stack.push((l2.clone(), false));
+                            stack.push((l1.clone(), false));
+                        }
+                    }
+                    _ => {}
                 }
+                continue;
             }
-            _ => unreachable!("cheap-normalized levels are handled above"),
+            let k = current.get_offset();
+            let normalized = match base.node() {
+                Node::Max(l1, l2) => {
+                    let mut lvls = Vec::new();
+                    Level::append_normed_max_args(&done, l1, &mut lvls);
+                    Level::append_normed_max_args(&done, l2, &mut lvls);
+                    Level::finish_max_normalize(&mut lvls, k)
+                }
+                Node::IMax(l1, l2) => {
+                    if l2.is_never_zero() {
+                        let as_max = Level::max(l1.clone(), l2.clone()).expect("children packed");
+                        Level::lookup_norm(&done, &as_max)
+                            .add_offset(k)
+                            .expect("normalization cannot deepen")
+                    } else {
+                        Level::mk_imax_aux(
+                            Level::lookup_norm(&done, l1),
+                            Level::lookup_norm(&done, l2),
+                        )
+                        .add_offset(k)
+                        .expect("normalization cannot deepen")
+                    }
+                }
+                _ => unreachable!("cheap-normalized levels are handled above"),
+            };
+            done.insert(current, normalized);
         }
+        done.get(self)
+            .cloned()
+            .expect("the root was scheduled for normalize")
     }
 
     /// `Level.isEquiv` (Level.lean:403-408).
@@ -1996,8 +2069,6 @@ mod tests {
                 assert!(deep.is_geq(&other));
                 assert!(deep.norm_lt(&succ_chain(DEPTH + 1)));
 
-                // max-only: normalize flattens Max iteratively. An alternating
-                // imax spine still recurses inside normalize (separate hole).
                 // Distinct params so go cannot exit on identity.
                 let mut left_spine = Level::zero();
                 let mut right_spine = Level::zero();
@@ -2010,6 +2081,21 @@ mod tests {
                     "geq of a deep max spine with itself"
                 );
                 let _ = left_spine.is_geq(&right_spine);
+
+                let mut imax_spine = Level::zero();
+                for _ in 0..DEPTH {
+                    imax_spine = Level::imax(imax_spine, p("a")).expect("shallow width");
+                }
+                let first = imax_spine.normalize();
+                let second = imax_spine.normalize();
+                assert_eq!(
+                    first, second,
+                    "a deep imax spine normalizes deterministically"
+                );
+                assert!(
+                    imax_spine.is_geq(&imax_spine),
+                    "geq of a deep imax spine with itself"
+                );
             })
             .expect("spawn bounded-stack Level predicate worker")
             .join();
