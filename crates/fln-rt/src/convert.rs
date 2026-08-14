@@ -377,14 +377,28 @@ impl Conversion {
                 "a tagged scalar is not a string object",
             ));
         }
-        let (_, _, len, bytes) = obj.string_view();
-        if len > bytes.len() {
+        // `string_view` is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
+        // `m_length` is the UTF-8 scalar count, the same field
+        // `lean_string_length` boxes. Slicing the buffer with it treats
+        // "héllo" (5 scalars, 6 payload bytes) as a 5-byte string and
+        // silently drops the last character — or splits a multi-byte
+        // scalar and fails UTF-8. The payload is `m_size - 1` bytes.
+        let (size, _, length, bytes) = obj.string_view();
+        if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
             return Err(malformed(
                 "string",
-                "the length field exceeds the byte span",
+                "missing NUL terminator or size past the buffer",
             ));
         }
-        String::from_utf8(bytes[..len].to_vec()).map_err(|_| malformed("string", "invalid UTF-8"))
+        let content = std::str::from_utf8(&bytes[..size - 1])
+            .map_err(|_| malformed("string", "invalid UTF-8"))?;
+        if content.chars().count() != length {
+            return Err(malformed(
+                "string",
+                "m_length is not the UTF-8 scalar count",
+            ));
+        }
+        Ok(content.to_owned())
     }
 }
 
@@ -470,11 +484,16 @@ fn inject_level(level: &Level) -> Obj {
 fn inject_literal(literal: &Literal) -> Obj {
     match literal {
         Literal::Nat(nat) => {
-            let limbs = nat.limbs_le();
-            let payload = if limbs.len() == 1 && limbs[0] <= usize::MAX as u64 {
-                Obj::mk_nat(limbs[0] as usize)
-            } else {
-                Obj::mk_mpz(limbs, false)
+            // Tagged small Nats are `n << 1 | 1`, so the ceiling is
+            // `usize::MAX >> 1`, not `usize::MAX`. A single limb of 2^63
+            // is a well-formed NatLit; `mk_nat` asserts below that
+            // ceiling and would panic — which this membrane forbids.
+            // Zero is the empty limb vector and must stay a scalar, not
+            // an mpz object.
+            let maximum = (usize::MAX >> 1) as u64;
+            let payload = match nat.to_u64() {
+                Some(scalar) if scalar <= maximum => Obj::mk_nat(scalar as usize),
+                _ => Obj::mk_mpz(nat.limbs_le(), false),
             };
             Obj::mk_ctor(TAG_LIT_NAT, vec![payload], &[])
         }
