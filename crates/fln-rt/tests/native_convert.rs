@@ -18,7 +18,7 @@
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
-use fln_core::options::{DataValue, KVMap};
+use fln_core::options::{DataValue, KVMap, SyntaxHandle};
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 use fln_unsafe_abi::handle::Obj;
@@ -710,6 +710,57 @@ fn an_int_payload_that_is_not_mpz_is_malformed_not_a_panic() {
             );
         }
         other => panic!("a string posing as an Int must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
+fn inject_and_project_round_trip_mdata_syntax_handles() {
+    let mut heap = NativeHeap::new();
+    let body = Expr::bvar(0).expect("bvar 0 packs");
+    let metadata = KVMap::from_entries(vec![
+        (
+            Name::from_components(["small"]),
+            DataValue::OfSyntax(SyntaxHandle(42)),
+        ),
+        (
+            Name::from_components(["wide"]),
+            DataValue::OfSyntax(SyntaxHandle(u64::MAX)),
+        ),
+    ]);
+    let native = Expr::mdata(metadata, body);
+    let handle = heap.alloc(native.clone());
+    let injected = inject_expr(&heap, handle).expect("ofSyntax handle injects");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("ofSyntax handle projects");
+    let ExprNode::MData { data: restored, .. } = heap.get(back).expect("handle").node() else {
+        panic!("expected mdata");
+    };
+    let ExprNode::MData { data: original, .. } = native.node() else {
+        panic!("the fixture is mdata");
+    };
+    assert_eq!(
+        restored.entries(),
+        original.entries(),
+        "a scalar or mpz SyntaxHandle must survive the membrane"
+    );
+}
+
+#[test]
+fn a_syntax_tree_payload_stays_an_unsupported_constructor() {
+    let mut heap = NativeHeap::new();
+    let syntax = Obj::mk_ctor(0, vec![Obj::mk_string("ident")], &[]);
+    let value = Obj::mk_ctor(5, vec![syntax], &[]);
+    let pair = Obj::mk_ctor(0, vec![mk_name(&["k"]), value], &[]);
+    let list = Obj::mk_ctor(1, vec![pair, Obj::mk_nat(0)], &[]);
+    let body = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let mdata = Obj::mk_ctor(10, vec![list, body], &[]);
+    match Conversion::new().project_expr(&mut heap, &mdata) {
+        Err(ConvertError::UnsupportedConstructor { family, tag }) => {
+            assert_eq!(family, "data-value");
+            assert_eq!(tag, 5, "ofSyntax is DataValue ctor tag 5");
+        }
+        other => panic!("a Syntax tree payload must stay unsupported, got {other:?}"),
     }
 }
 
