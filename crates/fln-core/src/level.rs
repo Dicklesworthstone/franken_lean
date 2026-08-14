@@ -398,12 +398,10 @@ impl Level {
     // ---- structure ---------------------------------------------------------------------
 
     /// `Level.isExplicit`: a numeral `succ^k zero` (Level.lean:233-236).
+    /// Flags are OR'd down the tower, so a param/mvar anywhere is visible
+    /// here; `get_level_offset` peels succs iteratively.
     pub fn is_explicit(&self) -> bool {
-        match self.node() {
-            Node::Zero => true,
-            Node::Succ(u) => !u.has_mvar() && !u.has_param() && u.is_explicit(),
-            _ => false,
-        }
+        !self.has_mvar() && !self.has_param() && self.get_level_offset().is_zero()
     }
 
     /// `Level.getOffset`: the count of outer `succ`s.
@@ -446,34 +444,55 @@ impl Level {
 
     /// `Level.isNeverZero` (Level.lean:210-217).
     pub fn is_never_zero(&self) -> bool {
-        match self.node() {
-            Node::Zero | Node::Param(_) | Node::MVar(_) => false,
-            Node::Succ(_) => true,
-            Node::Max(u, v) => u.is_never_zero() || v.is_never_zero(),
-            Node::IMax(_, v) => v.is_never_zero(),
+        let mut stack = vec![self];
+        while let Some(current) = stack.pop() {
+            match current.node() {
+                Node::Succ(_) => return true,
+                Node::Max(u, v) => {
+                    stack.push(v);
+                    stack.push(u);
+                }
+                Node::IMax(_, v) => stack.push(v),
+                Node::Zero | Node::Param(_) | Node::MVar(_) => {}
+            }
         }
+        false
     }
 
     /// `Level.isAlwaysZero` (Level.lean:199-208).
     pub fn is_always_zero(&self) -> bool {
-        match self.node() {
-            Node::Zero => true,
-            Node::Param(_) | Node::MVar(_) | Node::Succ(_) => false,
-            Node::Max(u, v) => u.is_always_zero() && v.is_always_zero(),
-            Node::IMax(_, v) => v.is_always_zero(),
+        let mut stack = vec![self];
+        while let Some(current) = stack.pop() {
+            match current.node() {
+                Node::Zero => {}
+                Node::Max(u, v) => {
+                    stack.push(v);
+                    stack.push(u);
+                }
+                Node::IMax(_, v) => stack.push(v),
+                Node::Param(_) | Node::MVar(_) | Node::Succ(_) => return false,
+            }
         }
+        true
     }
 
     /// `Level.occurs u v` — does `self` occur (as a subterm) in `inside`?
     pub fn occurs_in(&self, inside: &Level) -> bool {
-        if self == inside {
-            return true;
+        let mut stack = vec![inside];
+        while let Some(current) = stack.pop() {
+            if self == current {
+                return true;
+            }
+            match current.node() {
+                Node::Succ(u) => stack.push(u),
+                Node::Max(u, v) | Node::IMax(u, v) => {
+                    stack.push(v);
+                    stack.push(u);
+                }
+                Node::Zero | Node::Param(_) | Node::MVar(_) => {}
+            }
         }
-        match inside.node() {
-            Node::Succ(u) => self.occurs_in(u),
-            Node::Max(u, v) | Node::IMax(u, v) => self.occurs_in(u) || self.occurs_in(v),
-            _ => false,
-        }
+        false
     }
 
     /// `Level.dec` (Level.lean:411-419). Note the pin maps BOTH `max` and `imax`
@@ -505,12 +524,21 @@ impl Level {
     }
 
     /// `normLtAux` (Level.lean:274-293).
-    fn norm_lt_aux(l1: &Level, k1: u32, l2: &Level, k2: u32) -> bool {
-        if let Node::Succ(u1) = l1.node() {
-            return Level::norm_lt_aux(u1, k1 + 1, l2, k2);
-        }
-        if let Node::Succ(u2) = l2.node() {
-            return Level::norm_lt_aux(l1, k1, u2, k2 + 1);
+    fn norm_lt_aux(mut l1: &Level, mut k1: u32, mut l2: &Level, mut k2: u32) -> bool {
+        // Peel succ towers on the heap. A 24-bit-legal tower would blow the
+        // host stack if this stayed recursive (FL-INV-07).
+        loop {
+            if let Node::Succ(u1) = l1.node() {
+                l1 = u1;
+                k1 += 1;
+                continue;
+            }
+            if let Node::Succ(u2) = l2.node() {
+                l2 = u2;
+                k2 += 1;
+                continue;
+            }
+            break;
         }
         match (l1.node(), l2.node()) {
             (Node::Max(a1, b1), Node::Max(a2, b2)) | (Node::IMax(a1, b1), Node::IMax(a2, b2)) => {
@@ -554,11 +582,10 @@ impl Level {
 
     /// `isAlreadyNormalizedCheap` (Level.lean:303-308).
     fn is_already_normalized_cheap(&self) -> bool {
-        match self.node() {
-            Node::Zero | Node::Param(_) | Node::MVar(_) => true,
-            Node::Succ(u) => u.is_already_normalized_cheap(),
-            _ => false,
-        }
+        matches!(
+            self.get_level_offset().node(),
+            Node::Zero | Node::Param(_) | Node::MVar(_)
+        )
     }
 
     /// `mkIMaxAux` (Level.lean:311-315).
@@ -583,16 +610,19 @@ impl Level {
     /// `getMaxArgsAux` (Level.lean:318-321): flatten nested `max`, normalizing each
     /// non-max leaf once. Left child first.
     fn collect_max_args(level: &Level, already_normalized: bool, out: &mut Vec<Level>) {
-        match level.node() {
-            Node::Max(a, b) => {
-                Level::collect_max_args(a, already_normalized, out);
-                Level::collect_max_args(b, already_normalized, out);
+        let mut stack = vec![(level.clone(), already_normalized)];
+        while let Some((current, already)) = stack.pop() {
+            match current.node() {
+                Node::Max(a, b) => {
+                    stack.push((b.clone(), already));
+                    stack.push((a.clone(), already));
+                }
+                _ if !already => {
+                    let normalized = current.normalize();
+                    stack.push((normalized, true));
+                }
+                _ => out.push(current),
             }
-            _ if !already_normalized => {
-                let normalized = level.normalize();
-                Level::collect_max_args(&normalized, true, out);
-            }
-            _ => out.push(level.clone()),
         }
     }
 
@@ -759,12 +789,19 @@ impl Level {
     /// parameter assignment can make this level zero. Conservatively `false`
     /// for params and mvars.
     pub fn is_not_zero(&self) -> bool {
-        match self.view() {
-            LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => false,
-            LevelView::Succ(_) => true,
-            LevelView::Max(a, b) => a.is_not_zero() || b.is_not_zero(),
-            LevelView::IMax(_, b) => b.is_not_zero(),
+        let mut stack = vec![self];
+        while let Some(current) = stack.pop() {
+            match current.view() {
+                LevelView::Succ(_) => return true,
+                LevelView::Max(a, b) => {
+                    stack.push(b);
+                    stack.push(a);
+                }
+                LevelView::IMax(_, b) => stack.push(b),
+                LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => {}
+            }
         }
+        false
     }
 
     /// `is_geq` (vendor: src/kernel/level.cpp:508-531): a sound approximation
@@ -807,7 +844,17 @@ impl Level {
                 (_, LevelView::Max(v1, v2)) => go(u, v1) && go(u, v2),
                 (LevelView::Max(u1, u2), _) => go(u1, v) || go(u2, v) || k(u, v),
                 (LevelView::IMax(_, u2), _) => go(u2, v),
-                (LevelView::Succ(u1), LevelView::Succ(v1)) => go(u1, v1),
+                (LevelView::Succ(_), LevelView::Succ(_)) => {
+                    let mut left = u;
+                    let mut right = v;
+                    while let (LevelView::Succ(u1), LevelView::Succ(v1)) =
+                        (left.view(), right.view())
+                    {
+                        left = u1;
+                        right = v1;
+                    }
+                    go(left, right)
+                }
                 _ => k(u, v),
             }
         }
@@ -1865,6 +1912,49 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "deep Level equality exhausted the bounded worker stack"
+        );
+    }
+
+    /// The remaining Level predicates used to recurse down `succ` towers.
+    /// Convert now injects a 400-deep tower; 24-bit depth is 16M. A 1 MiB
+    /// worker is far below one frame per succ.
+    #[test]
+    fn deep_level_predicates_are_stack_bounded() {
+        const DEPTH: usize = 100_000;
+
+        fn succ_chain(depth: usize) -> Level {
+            let mut level = Level::zero();
+            for _ in 0..depth {
+                level = level.succ().expect("depth is inside the 24-bit packing");
+            }
+            level
+        }
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deep = succ_chain(DEPTH);
+                let other = succ_chain(DEPTH);
+                assert!(deep.is_explicit(), "succ^k 0 is a numeral");
+                assert!(deep.is_never_zero());
+                assert!(!deep.is_always_zero());
+                assert!(deep.is_not_zero());
+                assert!(Level::zero().occurs_in(&deep));
+                assert!(!p("a").occurs_in(&deep));
+                let normalized = deep.normalize();
+                assert_eq!(
+                    normalized, deep,
+                    "a succ tower over zero is already cheap-normalized"
+                );
+                assert!(deep.is_equiv(&other));
+                assert!(deep.is_geq(&other));
+                assert!(deep.norm_lt(&succ_chain(DEPTH + 1)));
+            })
+            .expect("spawn bounded-stack Level predicate worker")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "deep Level predicates exhausted the bounded worker stack"
         );
     }
     /// Byte-for-byte `Debug` vectors captured from the recursive implementation
