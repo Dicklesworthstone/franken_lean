@@ -15,7 +15,8 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
+use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
 use fln_rt::native_heap::NativeHeap;
@@ -328,6 +329,62 @@ fn a_negative_mpz_nat_literal_is_refused_as_negative() {
             );
         }
         other => panic!("a negative mpz Nat must be refused as negative, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_bvar_index_wider_than_u32_is_overflow_not_a_wrapped_index() {
+    let mut heap = NativeHeap::new();
+    let wide = u64::from(u32::MAX) + 5;
+    let bvar = Obj::mk_ctor(0, Vec::new(), &wide.to_le_bytes());
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &bvar) {
+        Err(ConvertError::NativeOverflow { family }) => assert_eq!(family, "expr"),
+        other => panic!("a u64 index above u32::MAX must not wrap into a live bvar, got {other:?}"),
+    }
+}
+
+#[test]
+fn injecting_an_out_of_subset_constructor_is_refused_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let ty = Expr::sort(Level::zero());
+    let body = Expr::bvar(0).expect("bvar 0 packs");
+    let lam = Expr::lam(Name::from_components(["x"]), ty, body, BinderInfo::Default);
+    let handle = heap.alloc(lam);
+    match inject_expr(&heap, handle) {
+        Err(ConvertError::UnsupportedConstructor { family, tag }) => {
+            assert_eq!(family, "expr");
+            assert_eq!(tag, 6, "lam is Expr ctor tag 6");
+        }
+        other => panic!(
+            "injecting a lam must be a typed refusal, got {}",
+            match other {
+                Ok(_) => "Ok(obj)".to_string(),
+                Err(error) => format!("Err({error})"),
+            }
+        ),
+    }
+}
+
+#[test]
+fn injecting_a_level_metavariable_is_refused_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let sort = Expr::sort(Level::mvar(fln_core::level::LMVarId(
+        Name::from_components(["u"]),
+    )));
+    let handle = heap.alloc(sort);
+    match inject_expr(&heap, handle) {
+        Err(ConvertError::UnsupportedConstructor { family, tag }) => {
+            assert_eq!(family, "level");
+            assert_eq!(tag, 5, "Level.mvar is ctor tag 5");
+        }
+        other => panic!(
+            "injecting a level mvar must be a typed refusal, got {}",
+            match other {
+                Ok(_) => "Ok(obj)".to_string(),
+                Err(error) => format!("Err({error})"),
+            }
+        ),
     }
 }
 

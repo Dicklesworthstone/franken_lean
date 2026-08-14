@@ -132,13 +132,20 @@ const TAG_LEVEL_SUCC: u8 = 1;
 const TAG_LEVEL_MAX: u8 = 2;
 const TAG_LEVEL_IMAX: u8 = 3;
 const TAG_LEVEL_PARAM: u8 = 4;
+const TAG_LEVEL_MVAR: u8 = 5;
 
 const TAG_EXPR_BVAR: u8 = 0;
 const TAG_EXPR_FVAR: u8 = 1;
+const TAG_EXPR_MVAR: u8 = 2;
 const TAG_EXPR_SORT: u8 = 3;
 const TAG_EXPR_CONST: u8 = 4;
 const TAG_EXPR_APP: u8 = 5;
+const TAG_EXPR_LAM: u8 = 6;
+const TAG_EXPR_FORALL: u8 = 7;
+const TAG_EXPR_LET: u8 = 8;
 const TAG_EXPR_LIT: u8 = 9;
+const TAG_EXPR_MDATA: u8 = 10;
+const TAG_EXPR_PROJ: u8 = 11;
 
 const TAG_LIT_NAT: u8 = 0;
 const TAG_LIT_STR: u8 = 1;
@@ -217,7 +224,14 @@ impl Conversion {
         let tag = obj.obj_tag() as u8;
         match tag {
             TAG_EXPR_BVAR => {
-                let index = obj.ctor_scalar_u64(0) as u32;
+                // The convert subset stores the index as an inline u64.
+                // Truncating with `as u32` turns `2^32 + 5` into `bvar(5)` —
+                // a fabricated term. `NativeOverflow` is the family the
+                // range covenant already uses when the index is merely too
+                // wide for `Expr::bvar`.
+                let index = obj.ctor_scalar_u64(0);
+                let index = u32::try_from(index)
+                    .map_err(|_| ConvertError::NativeOverflow { family: "expr" })?;
                 Expr::bvar(index).map_err(|_| ConvertError::NativeOverflow { family: "expr" })
             }
             TAG_EXPR_FVAR => {
@@ -416,38 +430,63 @@ pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj,
     let expr = heap
         .get(handle)
         .map_err(|_| malformed("expr", "the native handle does not resolve"))?;
-    Ok(inject_expr_value(expr))
+    inject_expr_value(expr)
 }
 
-fn inject_expr_value(expr: &Expr) -> Obj {
+fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
     match expr.node() {
-        ExprNode::BVar { idx } => {
-            Obj::mk_ctor(TAG_EXPR_BVAR, Vec::new(), &(*idx as u64).to_le_bytes())
+        ExprNode::BVar { idx } => Ok(Obj::mk_ctor(
+            TAG_EXPR_BVAR,
+            Vec::new(),
+            &(*idx as u64).to_le_bytes(),
+        )),
+        ExprNode::FVar { id } => Ok(Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &[])),
+        ExprNode::Sort { level } => {
+            Ok(Obj::mk_ctor(TAG_EXPR_SORT, vec![inject_level(level)?], &[]))
         }
-        ExprNode::FVar { id } => Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &[]),
-        ExprNode::Sort { level } => Obj::mk_ctor(TAG_EXPR_SORT, vec![inject_level(level)], &[]),
-        ExprNode::Const { name, levels } => Obj::mk_ctor(
+        ExprNode::Const { name, levels } => Ok(Obj::mk_ctor(
             TAG_EXPR_CONST,
-            vec![inject_name(name), inject_level_list(levels)],
+            vec![inject_name(name), inject_level_list(levels)?],
             &[],
-        ),
-        ExprNode::App { f, a } => Obj::mk_ctor(
+        )),
+        ExprNode::App { f, a } => Ok(Obj::mk_ctor(
             TAG_EXPR_APP,
-            vec![inject_expr_value(f), inject_expr_value(a)],
+            vec![inject_expr_value(f)?, inject_expr_value(a)?],
             &[],
-        ),
-        ExprNode::Lit { literal } => Obj::mk_ctor(TAG_EXPR_LIT, vec![inject_literal(literal)], &[]),
-        other => {
-            // Outside the converted subset: the injection boundary is the
-            // same as the projection boundary. A well-formed converter
-            // pipeline never lands here (projection refuses these tags), so
-            // the honest encoding is the subset's own refusal shape.
-            unreachable!(
-                "inject_expr: constructor outside the converted subset ({other:?}) — \
-                 the subset boundary is declared on projection, and this path is unreachable \
-                 from any projected term"
-            )
-        }
+        )),
+        ExprNode::Lit { literal } => Ok(Obj::mk_ctor(
+            TAG_EXPR_LIT,
+            vec![inject_literal(literal)],
+            &[],
+        )),
+        // The NativeHeap holds the full Expr inventory. Injection is a
+        // public Result API that claims never to panic, so an out-of-subset
+        // constructor is the same typed refusal projection already uses —
+        // not `unreachable!` on a well-typed native term.
+        ExprNode::MVar { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_MVAR,
+        }),
+        ExprNode::Lam { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_LAM,
+        }),
+        ExprNode::ForallE { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_FORALL,
+        }),
+        ExprNode::LetE { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_LET,
+        }),
+        ExprNode::MData { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_MDATA,
+        }),
+        ExprNode::Proj { .. } => Err(ConvertError::UnsupportedConstructor {
+            family: "expr",
+            tag: TAG_EXPR_PROJ,
+        }),
     }
 }
 
@@ -467,25 +506,31 @@ fn inject_name(name: &Name) -> Obj {
     }
 }
 
-fn inject_level(level: &Level) -> Obj {
+fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
     match level.view() {
-        fln_core::level::LevelView::Zero => Obj::mk_ctor(TAG_LEVEL_ZERO, Vec::new(), &[]),
-        fln_core::level::LevelView::Succ(inner) => {
-            Obj::mk_ctor(TAG_LEVEL_SUCC, vec![inject_level(inner)], &[])
-        }
-        fln_core::level::LevelView::Max(a, b) => {
-            Obj::mk_ctor(TAG_LEVEL_MAX, vec![inject_level(a), inject_level(b)], &[])
-        }
-        fln_core::level::LevelView::IMax(a, b) => {
-            Obj::mk_ctor(TAG_LEVEL_IMAX, vec![inject_level(a), inject_level(b)], &[])
-        }
+        fln_core::level::LevelView::Zero => Ok(Obj::mk_ctor(TAG_LEVEL_ZERO, Vec::new(), &[])),
+        fln_core::level::LevelView::Succ(inner) => Ok(Obj::mk_ctor(
+            TAG_LEVEL_SUCC,
+            vec![inject_level(inner)?],
+            &[],
+        )),
+        fln_core::level::LevelView::Max(a, b) => Ok(Obj::mk_ctor(
+            TAG_LEVEL_MAX,
+            vec![inject_level(a)?, inject_level(b)?],
+            &[],
+        )),
+        fln_core::level::LevelView::IMax(a, b) => Ok(Obj::mk_ctor(
+            TAG_LEVEL_IMAX,
+            vec![inject_level(a)?, inject_level(b)?],
+            &[],
+        )),
         fln_core::level::LevelView::Param(name) => {
-            Obj::mk_ctor(TAG_LEVEL_PARAM, vec![inject_name(name)], &[])
+            Ok(Obj::mk_ctor(TAG_LEVEL_PARAM, vec![inject_name(name)], &[]))
         }
-        fln_core::level::LevelView::MVar(_) => unreachable!(
-            "inject_level: metavariables are elaboration state, not terms — \
-             the subset boundary is declared on projection"
-        ),
+        fln_core::level::LevelView::MVar(_) => Err(ConvertError::UnsupportedConstructor {
+            family: "level",
+            tag: TAG_LEVEL_MVAR,
+        }),
     }
 }
 
@@ -509,10 +554,10 @@ fn inject_literal(literal: &Literal) -> Obj {
     }
 }
 
-fn inject_level_list(levels: &[Level]) -> Obj {
+fn inject_level_list(levels: &[Level]) -> Result<Obj, ConvertError> {
     let mut out = Obj::mk_ctor(TAG_LIST_NIL, Vec::new(), &[]);
     for level in levels.iter().rev() {
-        out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level(level), out], &[]);
+        out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level(level)?, out], &[]);
     }
-    out
+    Ok(out)
 }
