@@ -181,77 +181,14 @@ fn mk_lam_locals(locals: &[Local], body: Expr) -> KResult<Expr> {
 
 /// Lift every loose bvar of `e` by `amount` (the substitutes of
 /// [`subst_loose_bvars`] cross binders on the way in). Range-pruned.
-fn lift_loose_bvars(e: &Expr, cutoff: u32, amount: u32, depth: u32) -> KResult<Expr> {
-    depth_guard(depth)?;
-    if amount == 0 || e.loose_bvar_range() <= cutoff {
-        return Ok(e.clone());
-    }
-    Ok(match e.node() {
-        ExprNode::BVar { idx } => {
-            if *idx >= cutoff {
-                Expr::bvar(idx + amount).map_err(|_| {
-                    Stop::Reject(
-                        RejectClass::BlockMismatch,
-                        "nested translation lifted a bound variable out of range".into(),
-                    )
-                })?
-            } else {
-                e.clone()
-            }
-        }
-        ExprNode::App { f, a } => Expr::app(
-            lift_loose_bvars(f, cutoff, amount, depth + 1)?,
-            lift_loose_bvars(a, cutoff, amount, depth + 1)?,
-        ),
-        ExprNode::Lam {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::lam(
-            binder_name.clone(),
-            lift_loose_bvars(binder_type, cutoff, amount, depth + 1)?,
-            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::forall_e(
-            binder_name.clone(),
-            lift_loose_bvars(binder_type, cutoff, amount, depth + 1)?,
-            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::LetE {
-            decl_name,
-            type_,
-            value,
-            body,
-            non_dep,
-        } => Expr::let_e(
-            decl_name.clone(),
-            lift_loose_bvars(type_, cutoff, amount, depth + 1)?,
-            lift_loose_bvars(value, cutoff, amount, depth + 1)?,
-            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
-            *non_dep,
-        ),
-        ExprNode::MData { data, expr } => Expr::mdata(
-            data.clone(),
-            lift_loose_bvars(expr, cutoff, amount, depth + 1)?,
-        ),
-        ExprNode::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => Expr::proj(
-            struct_name.clone(),
-            *idx,
-            lift_loose_bvars(expr, cutoff, amount, depth + 1)?,
-        ),
-        _ => e.clone(),
+/// The walk itself lives on [`Expr::lift_loose`] so a deep open nest
+/// cannot stack-fault; wrapping `idx + amount` is gone with it.
+fn lift_loose_bvars(e: &Expr, cutoff: u32, amount: u32, _depth: u32) -> KResult<Expr> {
+    e.lift_loose(cutoff, amount).map_err(|_| {
+        Stop::Reject(
+            RejectClass::BlockMismatch,
+            "nested translation lifted a bound variable out of range".into(),
+        )
     })
 }
 
