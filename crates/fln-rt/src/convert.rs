@@ -107,11 +107,11 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
-/// Recursion ceiling for expr projection. Name and Level projection are
-/// iterative (a 400-component Name is legal; Level.depth is 24-bit). The
-/// kernel walk is 2048, but expr frames are large enough that a debug host
-/// stack dies first; 256 stays typed (FL-INV-07) with room under a 2 MiB
-/// stack.
+/// Recursion ceiling for expr injection. Name, Level, and expr projection
+/// are iterative (a 400-component Name and a 400-deep app nest are legal;
+/// Level.depth is 24-bit). The kernel walk is 2048, but inject frames are
+/// large enough that a debug host stack dies first; 256 stays typed
+/// (FL-INV-07) with room under a 2 MiB stack.
 const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
@@ -338,6 +338,13 @@ fn stored_data_word(obj: &Obj, slots: Option<u8>, family: &'static str) -> Optio
     ctor_u64(obj, usize::from(slots) * 8, family).ok()
 }
 
+fn expr_from_done(done: &HashMap<usize, Expr>, obj: &Obj, i: usize) -> Result<Expr, ConvertError> {
+    let child = ctor_field(obj, i, "expr")?;
+    done.get(&child.identity_token())
+        .cloned()
+        .ok_or_else(|| malformed("expr", "child was not projected before its parent"))
+}
+
 fn check_expr_data(obj: &Obj, expr: &Expr) -> Result<(), ConvertError> {
     let Some(stored) = stored_data_word(obj, expr_lean_slots(obj.obj_tag() as u8), "expr") else {
         return Ok(());
@@ -431,11 +438,7 @@ impl Conversion {
     }
 
     fn expr(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
-        self.enter("expr")?;
-        self.depth += 1;
-        let result = self.project_expr_node(obj);
-        self.depth -= 1;
-        result
+        self.project_expr_graph(obj)
     }
 
     fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
@@ -466,15 +469,84 @@ impl Conversion {
         Ok(handle)
     }
 
-    fn project_expr_node(&mut self, obj: &Obj) -> Result<Expr, ConvertError> {
-        if obj.is_scalar() {
-            return Err(malformed(
-                "expr",
-                "a bare tagged scalar is not an expression object",
-            ));
+    fn project_expr_graph(&mut self, root: &Obj) -> Result<Expr, ConvertError> {
+        // Iterative post-order: a 400-deep app nest is a legal native
+        // value, and the recursive form overflowed at the host-stack
+        // ceiling that still bounds inject (FL-INV-07).
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut stack = vec![root.clone_ref()];
+        while let Some(current) = stack.last().map(Obj::clone_ref) {
+            if current.is_scalar() {
+                return Err(malformed(
+                    "expr",
+                    "a bare tagged scalar is not an expression object",
+                ));
+            }
+            let key = current.identity_token();
+            if done.contains_key(&key) {
+                stack.pop();
+                continue;
+            }
+            let tag = current.obj_tag() as u8;
+            let child_slots: &[usize] = match tag {
+                TAG_EXPR_APP => &[0, 1],
+                TAG_EXPR_LAM | TAG_EXPR_FORALL => &[1, 2],
+                TAG_EXPR_LET => &[1, 2, 3],
+                TAG_EXPR_MDATA => &[1],
+                TAG_EXPR_PROJ => &[2],
+                TAG_EXPR_BVAR | TAG_EXPR_FVAR | TAG_EXPR_MVAR | TAG_EXPR_SORT | TAG_EXPR_CONST
+                | TAG_EXPR_LIT => &[],
+                other => {
+                    return Err(ConvertError::UnsupportedConstructor {
+                        family: "expr",
+                        tag: other,
+                    });
+                }
+            };
+            let mut pending = false;
+            let ancestors = stack.len();
+            for &i in child_slots {
+                let child = ctor_field(&current, i, "expr")?;
+                if child.is_scalar() {
+                    return Err(malformed(
+                        "expr",
+                        "a bare tagged scalar is not an expression object",
+                    ));
+                }
+                let child_key = child.identity_token();
+                if done.contains_key(&child_key) {
+                    continue;
+                }
+                if stack[..ancestors]
+                    .iter()
+                    .any(|frame| frame.identity_token() == child_key)
+                {
+                    return Err(malformed("expr", "expr graph is cyclic"));
+                }
+                stack.push(child);
+                pending = true;
+            }
+            if pending {
+                continue;
+            }
+            self.enter("expr")?;
+            let current = stack.pop().expect("the parent is still on the stack");
+            let projected = self.project_expr_node(&current, &done)?;
+            check_expr_data(&current, &projected)?;
+            done.insert(key, projected);
         }
+        done.get(&root.identity_token())
+            .cloned()
+            .ok_or_else(|| malformed("expr", "expr was not projected"))
+    }
+
+    fn project_expr_node(
+        &mut self,
+        obj: &Obj,
+        done: &HashMap<usize, Expr>,
+    ) -> Result<Expr, ConvertError> {
         let tag = obj.obj_tag() as u8;
-        let expr = match tag {
+        match tag {
             TAG_EXPR_BVAR => {
                 // Lean `bvar` is one Nat child. Convert's own inject stores
                 // an inline u64 with `other == 0`. Both packings are live.
@@ -508,43 +580,35 @@ impl Conversion {
                 let levels = self.level_list(&ctor_field(obj, 1, "expr")?)?;
                 Ok(Expr::const_(name, levels))
             }
-            TAG_EXPR_APP => {
-                let f = self.project_expr_child(obj, 0)?;
-                let a = self.project_expr_child(obj, 1)?;
-                Ok(Expr::app(f, a))
-            }
+            TAG_EXPR_APP => Ok(Expr::app(
+                expr_from_done(done, obj, 0)?,
+                expr_from_done(done, obj, 1)?,
+            )),
             TAG_EXPR_LAM => {
                 let binder_name = self.name(&ctor_field(obj, 0, "expr")?)?;
-                let binder_type = self.project_expr_child(obj, 1)?;
-                let body = self.project_expr_child(obj, 2)?;
                 Ok(Expr::lam(
                     binder_name,
-                    binder_type,
-                    body,
+                    expr_from_done(done, obj, 1)?,
+                    expr_from_done(done, obj, 2)?,
                     binder_info_of(obj)?,
                 ))
             }
             TAG_EXPR_FORALL => {
                 let binder_name = self.name(&ctor_field(obj, 0, "expr")?)?;
-                let binder_type = self.project_expr_child(obj, 1)?;
-                let body = self.project_expr_child(obj, 2)?;
                 Ok(Expr::forall_e(
                     binder_name,
-                    binder_type,
-                    body,
+                    expr_from_done(done, obj, 1)?,
+                    expr_from_done(done, obj, 2)?,
                     binder_info_of(obj)?,
                 ))
             }
             TAG_EXPR_LET => {
                 let decl_name = self.name(&ctor_field(obj, 0, "expr")?)?;
-                let type_ = self.project_expr_child(obj, 1)?;
-                let value = self.project_expr_child(obj, 2)?;
-                let body = self.project_expr_child(obj, 3)?;
                 Ok(Expr::let_e(
                     decl_name,
-                    type_,
-                    value,
-                    body,
+                    expr_from_done(done, obj, 1)?,
+                    expr_from_done(done, obj, 2)?,
+                    expr_from_done(done, obj, 3)?,
                     bool_after_data(obj, "expr")?,
                 ))
             }
@@ -554,33 +618,24 @@ impl Conversion {
             }
             TAG_EXPR_MDATA => {
                 let data = self.kvmap(&ctor_field(obj, 0, "expr")?)?;
-                let expr = self.project_expr_child(obj, 1)?;
-                Ok(Expr::mdata(data, expr))
+                Ok(Expr::mdata(data, expr_from_done(done, obj, 1)?))
             }
             TAG_EXPR_PROJ => {
                 let struct_name = self.name(&ctor_field(obj, 0, "expr")?)?;
                 let idx = nat_u64(&ctor_field(obj, 1, "expr")?, "expr")?;
-                let expr = self.project_expr_child(obj, 2)?;
-                Ok(Expr::proj(struct_name, idx, expr))
+                Ok(Expr::proj(struct_name, idx, expr_from_done(done, obj, 2)?))
             }
             other => Err(ConvertError::UnsupportedConstructor {
                 family: "expr",
                 tag: other,
             }),
-        }?;
-        check_expr_data(obj, &expr)?;
-        Ok(expr)
-    }
-
-    fn project_expr_child(&mut self, obj: &Obj, i: usize) -> Result<Expr, ConvertError> {
-        let child = ctor_field(obj, i, "expr")?;
-        self.expr(&child)
+        }
     }
 
     fn project_name(&mut self, root: &Obj) -> Result<Name, ConvertError> {
         // Iterative on the parent chain: a 400-component Name is a legal
         // native value, and the recursive form overflowed at the host-stack
-        // ceiling that still bounds expr (FL-INV-07).
+        // ceiling that still bounds inject (FL-INV-07).
         let mut chain = Vec::new();
         let mut cursor = root.clone_ref();
         let mut seen = HashSet::new();

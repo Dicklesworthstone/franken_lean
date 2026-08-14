@@ -936,6 +936,33 @@ fn project_reuses_a_shared_level_child() {
 }
 
 #[test]
+fn project_walks_a_hand_built_long_app_nest() {
+    let mk_bvar = || Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let mut nest = mk_bvar();
+    for _ in 0..400 {
+        nest = Obj::mk_ctor(5, vec![nest, mk_bvar()], &[]);
+    }
+    let mut heap = NativeHeap::new();
+    Conversion::new()
+        .project_expr(&mut heap, &nest)
+        .expect("a 400-deep app nest is a legal Expr");
+}
+
+#[test]
+fn project_reuses_a_shared_expr_child() {
+    let bvar = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let diamond = Obj::mk_ctor(5, vec![bvar.clone_ref(), bvar], &[]);
+    let mut heap = NativeHeap::new();
+    let back = Conversion::new()
+        .project_expr(&mut heap, &diamond)
+        .expect("an app of a shared bvar must not look like a cycle");
+    let ExprNode::App { f, a } = heap.get(back).expect("handle").node() else {
+        panic!("expected an app");
+    };
+    assert_eq!(f.hash(), a.hash());
+}
+
+#[test]
 fn inject_refuses_an_expr_deeper_than_the_walk_ceiling() {
     let mut expr = Expr::bvar(0).expect("packs");
     for _ in 0..400 {
