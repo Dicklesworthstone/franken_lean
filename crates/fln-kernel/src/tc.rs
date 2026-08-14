@@ -2018,75 +2018,197 @@ impl<'a> TypeChecker<'a> {
         levels: &[Level],
         depth: u32,
     ) -> KResult<Expr> {
-        self.step(depth)?;
-        if !e.has_level_param() {
-            return Ok(e.clone());
+        // Post-order heap walk. Recursing one frame per node would abort a
+        // legal deep type with universe parameters before `step` could turn
+        // it into Inconclusive if the host stack is smaller than
+        // Budget::depth (FL-INV-07).
+        enum Op {
+            Enter { e: Expr, depth: u32 },
+            Finish { e: Expr },
         }
-        if let Some(cached) = self.instantiate_lparams_cache.get(e, params, levels) {
-            return Ok(cached);
-        }
-        let subst_level = |l: &Level| -> Level { substitute_level(l, params, levels) };
-        let result = match e.node() {
-            ExprNode::Sort { level } => Expr::sort(subst_level(level)),
-            ExprNode::Const { name, levels: ls } => {
-                Expr::const_(name.clone(), ls.iter().map(subst_level).collect())
-            }
-            ExprNode::App { f, a } => {
-                let f2 = self.instantiate_lparams(f, params, levels, depth + 1)?;
-                let a2 = self.instantiate_lparams(a, params, levels, depth + 1)?;
-                Expr::app(f2, a2)
-            }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.instantiate_lparams(binder_type, params, levels, depth + 1)?;
-                let b2 = self.instantiate_lparams(body, params, levels, depth + 1)?;
-                Expr::lam(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.instantiate_lparams(binder_type, params, levels, depth + 1)?;
-                let b2 = self.instantiate_lparams(body, params, levels, depth + 1)?;
-                Expr::forall_e(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                let t2 = self.instantiate_lparams(type_, params, levels, depth + 1)?;
-                let v2 = self.instantiate_lparams(value, params, levels, depth + 1)?;
-                let b2 = self.instantiate_lparams(body, params, levels, depth + 1)?;
-                Expr::let_e(decl_name.clone(), t2, v2, b2, *non_dep)
-            }
-            ExprNode::MData { data, expr } => {
-                let inner = self.instantiate_lparams(expr, params, levels, depth + 1)?;
-                Expr::mdata(data.clone(), inner)
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => {
-                let inner = self.instantiate_lparams(expr, params, levels, depth + 1)?;
-                Expr::proj(struct_name.clone(), *idx, inner)
-            }
-            _ => e.clone(),
+        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+            done.get(&child.allocation_identity())
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
         };
-        if result != *e {
-            self.instantiate_lparams_cache
-                .insert(e.clone(), params, levels, result.clone());
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            depth,
+        }];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e, depth } => {
+                    self.step(depth)?;
+                    let key = e.allocation_identity();
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    if !e.has_level_param() {
+                        done.insert(key, e);
+                        continue;
+                    }
+                    if let Some(cached) = self.instantiate_lparams_cache.get(&e, params, levels) {
+                        done.insert(key, cached);
+                        continue;
+                    }
+                    match e.node() {
+                        ExprNode::Sort { level } => {
+                            let result = Expr::sort(substitute_level(level, params, levels));
+                            if result != e {
+                                self.instantiate_lparams_cache.insert(
+                                    e.clone(),
+                                    params,
+                                    levels,
+                                    result.clone(),
+                                );
+                            }
+                            done.insert(key, result);
+                        }
+                        ExprNode::Const { name, levels: ls } => {
+                            let result = Expr::const_(
+                                name.clone(),
+                                ls.iter()
+                                    .map(|level| substitute_level(level, params, levels))
+                                    .collect(),
+                            );
+                            if result != e {
+                                self.instantiate_lparams_cache.insert(
+                                    e.clone(),
+                                    params,
+                                    levels,
+                                    result.clone(),
+                                );
+                            }
+                            done.insert(key, result);
+                        }
+                        ExprNode::App { f, a } => {
+                            let (f, a) = (f.clone(), a.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: a,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: f,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: body,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: body,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: value,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let inner = expr.clone();
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: inner,
+                                depth: depth + 1,
+                            });
+                        }
+                        _ => {
+                            done.insert(key, e);
+                        }
+                    }
+                }
+                Op::Finish { e } => {
+                    let key = e.allocation_identity();
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let result = match e.node() {
+                        ExprNode::App { f, a } => Expr::app(lookup(&done, f)?, lookup(&done, a)?),
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::lam(
+                            binder_name.clone(),
+                            lookup(&done, binder_type)?,
+                            lookup(&done, body)?,
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::forall_e(
+                            binder_name.clone(),
+                            lookup(&done, binder_type)?,
+                            lookup(&done, body)?,
+                            *binder_info,
+                        ),
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            lookup(&done, type_)?,
+                            lookup(&done, value)?,
+                            lookup(&done, body)?,
+                            *non_dep,
+                        ),
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
+                        _ => e.clone(),
+                    };
+                    if result != e {
+                        self.instantiate_lparams_cache.insert(
+                            e.clone(),
+                            params,
+                            levels,
+                            result.clone(),
+                        );
+                    }
+                    done.insert(key, result);
+                }
+            }
         }
-        Ok(result)
+        done.get(&e.allocation_identity())
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
     // ---- whnf (KR-200..204) ------------------------------------------------------------
@@ -5271,6 +5393,36 @@ mod tests {
         assert!(
             substitute_level(&one_imax_w, &[], &[]) == Level::param(w),
             "kernel imax 1 u must be structurally u"
+        );
+    }
+
+    #[test]
+    fn instantiate_lparams_walks_a_deep_app_nest_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let u = Name::str(Name::anonymous(), "u");
+        let sort_u = Expr::sort(Level::param(u.clone()));
+        let mut expr = sort_u;
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::bvar(0).expect("packs"));
+        }
+        let result = tc
+            .instantiate_lparams(&expr, std::slice::from_ref(&u), &[Level::zero()], 0)
+            .expect("a 400-app universe nest must not stack-fault");
+        let mut current = &result;
+        let mut apps = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            assert!(
+                matches!(a.node(), ExprNode::BVar { idx } if *idx == 0),
+                "bvar arguments have no level params and stay shared"
+            );
+            current = f;
+            apps += 1;
+        }
+        assert!(apps == 400, "the app spine length is preserved");
+        assert!(
+            matches!(current.node(), ExprNode::Sort { level } if *level == Level::zero()),
+            "Sort u becomes Sort 0"
         );
     }
 
