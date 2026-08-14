@@ -44,9 +44,10 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
-use fln_core::level::Level;
+use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
+use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
+use fln_core::options::{DataValue, KVMap};
 use fln_unsafe_abi::handle::Obj;
 
 use crate::abi;
@@ -154,6 +155,13 @@ const TAG_LIT_STR: u8 = 1;
 const TAG_LIST_NIL: u8 = 0;
 const TAG_LIST_CONS: u8 = 1;
 
+const TAG_DV_STRING: u8 = 0;
+const TAG_DV_BOOL: u8 = 1;
+const TAG_DV_NAME: u8 = 2;
+const TAG_DV_NAT: u8 = 3;
+const TAG_DV_INT: u8 = 4;
+const TAG_DV_SYNTAX: u8 = 5;
+
 fn malformed(family: &'static str, reason: impl Into<String>) -> ConvertError {
     ConvertError::MalformedCompat {
         family,
@@ -228,6 +236,38 @@ fn nat_u64(obj: &Obj, family: &'static str) -> Result<u64, ConvertError> {
         [limb] => Ok(*limb),
         _ => Err(malformed(family, "Nat exceeds u64")),
     }
+}
+
+/// First scalar `u8` after the leading Data word. Lean packs `BinderInfo`
+/// and `letE.nonDep` there; small-object alignment zero-pads the rest of
+/// the word, so a `u64` read is the safe API and the low byte is the value.
+fn ctor_u8_after_data(obj: &Obj, family: &'static str) -> Result<u8, ConvertError> {
+    let byte_off = usize::from(obj.header().other) * 8 + 8;
+    Ok(ctor_u64(obj, byte_off, family)? as u8)
+}
+
+fn binder_info_of(obj: &Obj) -> Result<BinderInfo, ConvertError> {
+    match ctor_u8_after_data(obj, "expr")? {
+        0 => Ok(BinderInfo::Default),
+        1 => Ok(BinderInfo::Implicit),
+        2 => Ok(BinderInfo::StrictImplicit),
+        3 => Ok(BinderInfo::InstImplicit),
+        _ => Err(malformed("expr", "BinderInfo byte is not 0..=3")),
+    }
+}
+
+fn bool_after_data(obj: &Obj, family: &'static str) -> Result<bool, ConvertError> {
+    match ctor_u8_after_data(obj, family)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(malformed(family, "noncanonical Bool")),
+    }
+}
+
+fn data_and_u8(data: u64, extra: u8) -> Vec<u8> {
+    let mut bytes = data.to_le_bytes().to_vec();
+    bytes.push(extra);
+    bytes
 }
 
 /// A conversion scope: the accounting for one lazy boundary crossing.
@@ -313,6 +353,10 @@ impl Conversion {
                 let name = self.name(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::fvar(fln_core::expr::FVarId(name)))
             }
+            TAG_EXPR_MVAR => {
+                let name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                Ok(Expr::mvar(MVarId(name)))
+            }
             TAG_EXPR_SORT => {
                 let level = self.level(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::sort(level))
@@ -327,9 +371,55 @@ impl Conversion {
                 let a = self.project_expr_child(obj, 1)?;
                 Ok(Expr::app(f, a))
             }
+            TAG_EXPR_LAM => {
+                let binder_name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                let binder_type = self.project_expr_child(obj, 1)?;
+                let body = self.project_expr_child(obj, 2)?;
+                Ok(Expr::lam(
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info_of(obj)?,
+                ))
+            }
+            TAG_EXPR_FORALL => {
+                let binder_name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                let binder_type = self.project_expr_child(obj, 1)?;
+                let body = self.project_expr_child(obj, 2)?;
+                Ok(Expr::forall_e(
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info_of(obj)?,
+                ))
+            }
+            TAG_EXPR_LET => {
+                let decl_name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                let type_ = self.project_expr_child(obj, 1)?;
+                let value = self.project_expr_child(obj, 2)?;
+                let body = self.project_expr_child(obj, 3)?;
+                Ok(Expr::let_e(
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    bool_after_data(obj, "expr")?,
+                ))
+            }
             TAG_EXPR_LIT => {
                 let literal = self.literal(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::lit(literal))
+            }
+            TAG_EXPR_MDATA => {
+                let data = self.kvmap(&ctor_field(obj, 0, "expr")?)?;
+                let expr = self.project_expr_child(obj, 1)?;
+                Ok(Expr::mdata(data, expr))
+            }
+            TAG_EXPR_PROJ => {
+                let struct_name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                let idx = nat_u64(&ctor_field(obj, 1, "expr")?, "expr")?;
+                let expr = self.project_expr_child(obj, 2)?;
+                Ok(Expr::proj(struct_name, idx, expr))
             }
             other => Err(ConvertError::UnsupportedConstructor {
                 family: "expr",
@@ -406,6 +496,10 @@ impl Conversion {
             TAG_LEVEL_PARAM => {
                 let name = self.name(&ctor_field(obj, 0, "level")?)?;
                 Ok(Level::param(name))
+            }
+            TAG_LEVEL_MVAR => {
+                let name = self.name(&ctor_field(obj, 0, "level")?)?;
+                Ok(Level::mvar(LMVarId(name)))
             }
             other => Err(ConvertError::UnsupportedConstructor {
                 family: "level",
@@ -487,6 +581,85 @@ impl Conversion {
         }
     }
 
+    fn kvmap(&mut self, obj: &Obj) -> Result<KVMap, ConvertError> {
+        // KVMap is a structure erased to its entry list. Duplicate keys are
+        // legal and preserved (the pin's `from_entries` / `KVMap.mk`).
+        let mut entries = Vec::new();
+        let mut cursor = obj.clone_ref();
+        loop {
+            if lean_box0(&cursor) {
+                return Ok(KVMap::from_entries(entries));
+            }
+            if cursor.is_scalar() {
+                return Err(malformed("kvmap", "the list ends in a scalar"));
+            }
+            match cursor.obj_tag() as u8 {
+                TAG_LIST_NIL => return Ok(KVMap::from_entries(entries)),
+                TAG_LIST_CONS => {
+                    let pair = ctor_field(&cursor, 0, "kvmap")?;
+                    if pair.is_scalar() || pair.obj_tag() as u8 != 0 || pair.header().other != 2 {
+                        return Err(malformed("kvmap", "expected a Name × DataValue pair"));
+                    }
+                    let key = self.name(&ctor_field(&pair, 0, "kvmap")?)?;
+                    let value = self.data_value(&ctor_field(&pair, 1, "kvmap")?)?;
+                    entries.push((key, value));
+                    cursor = ctor_field(&cursor, 1, "kvmap")?;
+                }
+                other => {
+                    return Err(ConvertError::UnsupportedConstructor {
+                        family: "kvmap",
+                        tag: other,
+                    });
+                }
+            }
+        }
+    }
+
+    fn data_value(&mut self, obj: &Obj) -> Result<DataValue, ConvertError> {
+        if obj.is_scalar() {
+            return Err(malformed(
+                "data-value",
+                "a tagged scalar is not a DataValue object",
+            ));
+        }
+        match obj.obj_tag() as u8 {
+            TAG_DV_STRING => {
+                let text = self.string(&ctor_field(obj, 0, "data-value")?)?;
+                Ok(DataValue::OfString(text))
+            }
+            TAG_DV_BOOL => {
+                if obj.header().other != 0 {
+                    return Err(malformed("data-value", "ofBool has no object fields"));
+                }
+                match ctor_u64(obj, 0, "data-value")? as u8 {
+                    0 => Ok(DataValue::OfBool(false)),
+                    1 => Ok(DataValue::OfBool(true)),
+                    _ => Err(malformed("data-value", "noncanonical Bool")),
+                }
+            }
+            TAG_DV_NAME => {
+                let name = self.name(&ctor_field(obj, 0, "data-value")?)?;
+                Ok(DataValue::OfName(name))
+            }
+            TAG_DV_NAT => {
+                let n = nat_u64(&ctor_field(obj, 0, "data-value")?, "data-value")?;
+                Ok(DataValue::OfNat(n))
+            }
+            TAG_DV_INT => Err(ConvertError::UnsupportedConstructor {
+                family: "data-value",
+                tag: TAG_DV_INT,
+            }),
+            TAG_DV_SYNTAX => Err(ConvertError::UnsupportedConstructor {
+                family: "data-value",
+                tag: TAG_DV_SYNTAX,
+            }),
+            other => Err(ConvertError::UnsupportedConstructor {
+                family: "data-value",
+                tag: other,
+            }),
+        }
+    }
+
     fn string(&mut self, obj: &Obj) -> Result<String, ConvertError> {
         if obj.is_scalar() {
             return Err(malformed(
@@ -562,34 +735,69 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
             vec![inject_literal(literal)],
             &data,
         )),
-        // The NativeHeap holds the full Expr inventory. Injection is a
-        // public Result API that claims never to panic, so an out-of-subset
-        // constructor is the same typed refusal projection already uses —
-        // not `unreachable!` on a well-typed native term.
-        ExprNode::MVar { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_MVAR,
-        }),
-        ExprNode::Lam { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_LAM,
-        }),
-        ExprNode::ForallE { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_FORALL,
-        }),
-        ExprNode::LetE { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_LET,
-        }),
-        ExprNode::MData { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_MDATA,
-        }),
-        ExprNode::Proj { .. } => Err(ConvertError::UnsupportedConstructor {
-            family: "expr",
-            tag: TAG_EXPR_PROJ,
-        }),
+        ExprNode::MVar { id } => Ok(Obj::mk_ctor(TAG_EXPR_MVAR, vec![inject_name(&id.0)], &data)),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Ok(Obj::mk_ctor(
+            TAG_EXPR_LAM,
+            vec![
+                inject_name(binder_name),
+                inject_expr_value(binder_type)?,
+                inject_expr_value(body)?,
+            ],
+            &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
+        )),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Ok(Obj::mk_ctor(
+            TAG_EXPR_FORALL,
+            vec![
+                inject_name(binder_name),
+                inject_expr_value(binder_type)?,
+                inject_expr_value(body)?,
+            ],
+            &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
+        )),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Ok(Obj::mk_ctor(
+            TAG_EXPR_LET,
+            vec![
+                inject_name(decl_name),
+                inject_expr_value(type_)?,
+                inject_expr_value(value)?,
+                inject_expr_value(body)?,
+            ],
+            &data_and_u8(expr.data().0, u8::from(*non_dep)),
+        )),
+        ExprNode::MData { data, expr: inner } => Ok(Obj::mk_ctor(
+            TAG_EXPR_MDATA,
+            vec![inject_kvmap(data)?, inject_expr_value(inner)?],
+            &data,
+        )),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr: inner,
+        } => Ok(Obj::mk_ctor(
+            TAG_EXPR_PROJ,
+            vec![
+                inject_name(struct_name),
+                inject_nat(*idx),
+                inject_expr_value(inner)?,
+            ],
+            &data,
+        )),
     }
 }
 
@@ -651,10 +859,11 @@ fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
             vec![inject_name(name)],
             &data,
         )),
-        fln_core::level::LevelView::MVar(_) => Err(ConvertError::UnsupportedConstructor {
-            family: "level",
-            tag: TAG_LEVEL_MVAR,
-        }),
+        fln_core::level::LevelView::MVar(id) => Ok(Obj::mk_ctor(
+            TAG_LEVEL_MVAR,
+            vec![inject_name(&id.0)],
+            &data,
+        )),
     }
 }
 
@@ -692,4 +901,32 @@ fn inject_level_list(levels: &[Level]) -> Result<Obj, ConvertError> {
         out = Obj::mk_ctor(TAG_LIST_CONS, vec![inject_level(level)?, out], &[]);
     }
     Ok(out)
+}
+
+fn inject_kvmap(map: &KVMap) -> Result<Obj, ConvertError> {
+    let mut out = Obj::mk_nat(0);
+    for (key, value) in map.entries().iter().rev() {
+        let pair = Obj::mk_ctor(0, vec![inject_name(key), inject_data_value(value)?], &[]);
+        out = Obj::mk_ctor(TAG_LIST_CONS, vec![pair, out], &[]);
+    }
+    Ok(out)
+}
+
+fn inject_data_value(value: &DataValue) -> Result<Obj, ConvertError> {
+    match value {
+        DataValue::OfString(text) => {
+            Ok(Obj::mk_ctor(TAG_DV_STRING, vec![Obj::mk_string(text)], &[]))
+        }
+        DataValue::OfBool(flag) => Ok(Obj::mk_ctor(TAG_DV_BOOL, Vec::new(), &[u8::from(*flag)])),
+        DataValue::OfName(name) => Ok(Obj::mk_ctor(TAG_DV_NAME, vec![inject_name(name)], &[])),
+        DataValue::OfNat(n) => Ok(Obj::mk_ctor(TAG_DV_NAT, vec![inject_nat(*n)], &[])),
+        DataValue::OfInt(_) => Err(ConvertError::UnsupportedConstructor {
+            family: "data-value",
+            tag: TAG_DV_INT,
+        }),
+        DataValue::OfSyntax(_) => Err(ConvertError::UnsupportedConstructor {
+            family: "data-value",
+            tag: TAG_DV_SYNTAX,
+        }),
+    }
 }

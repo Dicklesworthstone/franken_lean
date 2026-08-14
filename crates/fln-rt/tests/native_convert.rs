@@ -15,9 +15,10 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
-use fln_core::level::Level;
+use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
+use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
+use fln_core::options::{DataValue, KVMap};
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 use fln_unsafe_abi::handle::Obj;
@@ -255,23 +256,15 @@ fn a_shared_subgraph_projects_once_across_separate_conversions() {
 #[test]
 fn an_out_of_subset_constructor_is_refused_with_family_and_tag() {
     let mut heap = NativeHeap::new();
-    // lam (tag 6) is outside the converted subset.
-    let lam = Obj::mk_ctor(
-        6,
-        vec![
-            mk_name(&["x"]),
-            Obj::mk_ctor(3, vec![Obj::mk_ctor(0, Vec::new(), &[])], &[]),
-            Obj::mk_ctor(0, Vec::new(), &[]),
-        ],
-        &[],
-    );
+    // Expr tags 0..=11 are the Lean inventory. Tag 12 is not a constructor.
+    let unknown = Obj::mk_ctor(12, Vec::new(), &[]);
     let mut conversion = Conversion::new();
-    match conversion.project_expr(&mut heap, &lam) {
+    match conversion.project_expr(&mut heap, &unknown) {
         Err(ConvertError::UnsupportedConstructor { family, tag }) => {
             assert_eq!(family, "expr");
-            assert_eq!(tag, 6);
+            assert_eq!(tag, 12);
         }
-        other => panic!("a lam must be refused typed, got {other:?}"),
+        other => panic!("an unknown Expr tag must be refused typed, got {other:?}"),
     }
 }
 
@@ -548,48 +541,125 @@ fn inject_emits_a_nat_child_for_bvar() {
     );
 }
 
+fn data_then(extra: u8) -> Vec<u8> {
+    let mut bytes = 0u64.to_le_bytes().to_vec();
+    bytes.push(extra);
+    bytes
+}
+
 #[test]
-fn injecting_an_out_of_subset_constructor_is_refused_not_a_panic() {
+fn inject_and_project_round_trip_lam_forall_let_mvar_proj_and_mdata() {
     let mut heap = NativeHeap::new();
     let ty = Expr::sort(Level::zero());
     let body = Expr::bvar(0).expect("bvar 0 packs");
-    let lam = Expr::lam(Name::from_components(["x"]), ty, body, BinderInfo::Default);
-    let handle = heap.alloc(lam);
-    match inject_expr(&heap, handle) {
-        Err(ConvertError::UnsupportedConstructor { family, tag }) => {
+    let lam = Expr::lam(
+        Name::from_components(["x"]),
+        ty.clone(),
+        body.clone(),
+        BinderInfo::Implicit,
+    );
+    let forall = Expr::forall_e(
+        Name::from_components(["y"]),
+        ty.clone(),
+        body.clone(),
+        BinderInfo::InstImplicit,
+    );
+    let let_e = Expr::let_e(
+        Name::from_components(["z"]),
+        ty.clone(),
+        Expr::lit(Literal::Nat(NatLit::from_u64(1))),
+        body.clone(),
+        true,
+    );
+    let mvar = Expr::mvar(MVarId(Name::from_components(["m"])));
+    let proj = Expr::proj(Name::from_components(["Pair"]), 1, body.clone());
+    let metadata = KVMap::from_entries(vec![(
+        Name::from_components(["note"]),
+        DataValue::OfString("hi".to_string()),
+    )]);
+    let mdata = Expr::mdata(metadata, body);
+
+    for native in [lam, forall, let_e, mvar, proj, mdata] {
+        let handle = heap.alloc(native.clone());
+        let injected = inject_expr(&heap, handle).expect("binder/mdata/proj inject");
+        let back = Conversion::new()
+            .project_expr(&mut heap, &injected)
+            .expect("binder/mdata/proj project");
+        let restored = heap.get(back).expect("handle");
+        assert_eq!(
+            restored.hash(),
+            native.hash(),
+            "injected Lean-true packing must project to the same term"
+        );
+    }
+
+    let lam = Expr::lam(
+        Name::from_components(["x"]),
+        ty,
+        Expr::bvar(0).expect("bvar 0 packs"),
+        BinderInfo::Implicit,
+    );
+    let injected = inject_expr(&heap, heap.alloc(lam.clone())).expect("lam inject");
+    assert_eq!(injected.header().other, 3, "Lean lam has three children");
+    assert_eq!(
+        injected.ctor_scalar_u64(24),
+        lam.data().0,
+        "injected lam carries Expr.Data after the children"
+    );
+    assert_eq!(
+        injected.ctor_scalar_u64(32) as u8,
+        BinderInfo::Implicit.to_u64() as u8,
+        "injected lam carries BinderInfo after Expr.Data"
+    );
+}
+
+#[test]
+fn a_lean_true_lam_projects_its_binder_info() {
+    let mut heap = NativeHeap::new();
+    let ty = Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &[]);
+    let body = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let lam = Obj::mk_ctor(6, vec![mk_name(&["x"]), ty, body], &data_then(2));
+    let handle = Conversion::new()
+        .project_expr(&mut heap, &lam)
+        .expect("a Lean-true lam must project");
+    let ExprNode::Lam { binder_info, .. } = heap.get(handle).expect("handle").node() else {
+        panic!("expected a lam");
+    };
+    assert_eq!(*binder_info, BinderInfo::StrictImplicit);
+}
+
+#[test]
+fn a_lam_missing_its_binder_info_word_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let ty = Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &[]);
+    let body = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let lam = Obj::mk_ctor(6, vec![mk_name(&["x"]), ty, body], &[]);
+    match Conversion::new().project_expr(&mut heap, &lam) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
             assert_eq!(family, "expr");
-            assert_eq!(tag, 6, "lam is Expr ctor tag 6");
+            assert!(
+                reason.contains("scalar"),
+                "a lam without BinderInfo must name the missing scalar, got {reason}"
+            );
         }
-        other => panic!(
-            "injecting a lam must be a typed refusal, got {}",
-            match other {
-                Ok(_) => "Ok(obj)".to_string(),
-                Err(error) => format!("Err({error})"),
-            }
-        ),
+        other => panic!("a lam without BinderInfo must be malformed, got {other:?}"),
     }
 }
 
 #[test]
-fn injecting_a_level_metavariable_is_refused_not_a_panic() {
+fn inject_and_project_round_trip_a_level_metavariable() {
     let mut heap = NativeHeap::new();
-    let sort = Expr::sort(Level::mvar(fln_core::level::LMVarId(
-        Name::from_components(["u"]),
-    )));
-    let handle = heap.alloc(sort);
-    match inject_expr(&heap, handle) {
-        Err(ConvertError::UnsupportedConstructor { family, tag }) => {
-            assert_eq!(family, "level");
-            assert_eq!(tag, 5, "Level.mvar is ctor tag 5");
-        }
-        other => panic!(
-            "injecting a level mvar must be a typed refusal, got {}",
-            match other {
-                Ok(_) => "Ok(obj)".to_string(),
-                Err(error) => format!("Err({error})"),
-            }
-        ),
-    }
+    let sort = Expr::sort(Level::mvar(LMVarId(Name::from_components(["u"]))));
+    let injected = inject_expr(&heap, heap.alloc(sort.clone())).expect("level mvar injects");
+    assert_eq!(
+        injected.ctor_child(0).obj_tag(),
+        5,
+        "injected Level.mvar is ctor tag 5"
+    );
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("level mvar projects");
+    assert_eq!(heap.get(back).expect("handle").hash(), sort.hash());
 }
 
 // ---------------------------------------------------------------------------
