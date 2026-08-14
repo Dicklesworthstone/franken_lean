@@ -3498,12 +3498,12 @@ fn owned_callable_result_count(instruction: &Instruction) -> usize {
     usize::from(matches!(
         instruction,
         Instruction::Call {
-            result_ownership:
-                CallableResultOwnership::Owned | CallableResultOwnership::OwnedOrScalar,
+            result_ownership: CallableResultOwnership::Owned
+                | CallableResultOwnership::OwnedOrScalar,
             ..
         } | Instruction::Apply {
-            result_ownership:
-                CallableResultOwnership::Owned | CallableResultOwnership::OwnedOrScalar,
+            result_ownership: CallableResultOwnership::Owned
+                | CallableResultOwnership::OwnedOrScalar,
             ..
         }
     ))

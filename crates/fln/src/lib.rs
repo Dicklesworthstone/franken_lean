@@ -126,7 +126,7 @@ pub use fln_verdict::{
 };
 use fln_vm::interpreter::CommandExecutionContext;
 pub use fln_vm::interpreter::{
-    ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit,
+    ExecutionLimits as VmExecutionLimits, ValueKind as VmValueKind, VmExit, nat_decimal,
     value_kind as vm_value_kind,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -199,15 +199,19 @@ pub struct FlbcExecutionLimits {
 }
 
 /// Owned projection of the simple closed values supported by the current
-/// bounded source facade.
+/// source facade.
 ///
 /// A scalar is intentionally not labeled `Nat` here: canonical FLBC can carry
 /// other scalar conventions, while the source frontend is what proves its own
-/// result type. Heap values other than `String` are outside this projection and
+/// result type. A nonnegative mpz is projected to exact decimal text without
+/// assuming whether its source type was `Nat` or `Int`, so an
+/// arbitrary-precision source `Nat` is not narrowed through `usize`. Heap
+/// values other than positive mpz and `String` are outside this projection and
 /// return `Ok(None)` from [`closed_vm_value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClosedVmValue {
     Scalar(usize),
+    NonnegativeMpz(String),
     String(String),
 }
 
@@ -244,7 +248,8 @@ impl fmt::Display for ClosedVmValueError {
 
 impl std::error::Error for ClosedVmValueError {}
 
-/// Copy one returned scalar or String out of Marrow's runtime representation.
+/// Copy one returned scalar, nonnegative mpz, or String out of Marrow's runtime
+/// representation.
 ///
 /// This is the value-level companion to [`execute_flbc_artifact`]. It keeps
 /// embedders from depending on the ABI String header and trailing-NUL rules.
@@ -256,6 +261,9 @@ pub fn closed_vm_value(exit: &VmExit) -> Result<Option<ClosedVmValue>, ClosedVmV
     };
     if returned.value.is_scalar() {
         return Ok(Some(ClosedVmValue::Scalar(returned.value.unbox())));
+    }
+    if vm_value_kind(&returned.value) == VmValueKind::Mpz {
+        return Ok(nat_decimal(&returned.value).map(ClosedVmValue::NonnegativeMpz));
     }
     if vm_value_kind(&returned.value) != VmValueKind::String {
         return Ok(None);
@@ -1427,9 +1435,10 @@ impl Engine {
     ///
     /// The three opaque type names check literals, Bool comparison results, and
     /// exact first-order signatures. The remaining declarations are an exact
-    /// allowlist of checked Nat scalar operations plus String operations
-    /// recognized by the compiler's generated-row bridge. This is not a
-    /// Prelude substitute and grants no constructors or eliminators.
+    /// allowlist of checked Nat operations with scalar-or-mpz results plus
+    /// String operations recognized by the compiler's generated-row bridge.
+    /// This is not a Prelude substitute and grants no constructors or
+    /// eliminators.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -3266,7 +3275,7 @@ fn executable_value_type(
     value_types: &ExecutableValueTypes,
 ) -> Option<(ValueType, CallableResultOwnership)> {
     if source == &value_types.nat {
-        Some((ValueType::Nat, CallableResultOwnership::Scalar))
+        Some((ValueType::Nat, CallableResultOwnership::OwnedOrScalar))
     } else if source == &value_types.string {
         Some((ValueType::String, CallableResultOwnership::Owned))
     } else if source == &value_types.bool_ {
@@ -4037,7 +4046,7 @@ mod tests {
     use fln_core::diag::ResourceReason;
     use fln_core::mode::{Mode, ReproducibilityProfile};
     use fln_core::options::DataValue;
-    use fln_core::outcome::InconclusiveCause;
+    use fln_core::outcome::{Authority, InconclusiveCause};
     use fln_env::constants::{QuotKind, QuotVal};
     use fln_verdict::{BoolExpr, BvDecideRequest};
     use fln_vm::interpreter::{ExecutionUsage, ValueKind, VmExit, value_kind};
@@ -6421,6 +6430,77 @@ mod tests {
                 })
             }));
         }
+    }
+
+    #[test]
+    fn checked_nat_mpz_results_cross_source_dependencies_and_stay_resource_typed() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the source seed answers completely");
+
+        let mut limited = test_limits();
+        limited.vm.max_nat_magnitude_bytes = 8;
+        let stopped = engine
+            .execute_source_definition(b"def tooWide := Nat.pow 2 64", &options, limited)
+            .expect("the checked source reaches Golem before its magnitude stop");
+        assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+        assert!(matches!(
+            stopped,
+            Outcome::Inconclusive(ref inconclusive)
+                if matches!(
+                    inconclusive.cause,
+                    InconclusiveCause::ResourceExhausted { ref usage }
+                        if usage.allowed == 8
+                            && usage.observed == 16
+                            && usage.reason == ResourceReason::Memory { limit_bytes: 8 }
+                )
+        ));
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["tooWide"]))
+        );
+
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def huge := Nat.pow 2 80",
+                    b"def answer := Nat.add huge 194",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("a checked mpz Nat crosses the dependent source call");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the arbitrary-precision Nat source batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 2);
+        assert_eq!(
+            closed_vm_value(&completed.executions[0].exit),
+            Ok(Some(ClosedVmValue::NonnegativeMpz(
+                "1208925819614629174706176".to_owned()
+            )))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::NonnegativeMpz(
+                "1208925819614629174706370".to_owned()
+            )))
+        );
+
+        let executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[1].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the dependent mpz artifact decodes canonically");
+        assert!(executable.functions().iter().any(|function| {
+            function.result_ownership == CallableResultOwnership::OwnedOrScalar
+                && function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row, .. } if row == "extern:Nat.add")
+                })
+        }));
     }
 
     #[test]

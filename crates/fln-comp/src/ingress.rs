@@ -4176,9 +4176,7 @@ const fn default_callable_result_ownership(
     result: fir::ValueType,
 ) -> crate::flbc::CallableResultOwnership {
     match result {
-        fir::ValueType::Unit | fir::ValueType::Bool => {
-            crate::flbc::CallableResultOwnership::Scalar
-        }
+        fir::ValueType::Unit | fir::ValueType::Bool => crate::flbc::CallableResultOwnership::Scalar,
         fir::ValueType::Nat => crate::flbc::CallableResultOwnership::OwnedOrScalar,
         fir::ValueType::String
         | fir::ValueType::Constructor

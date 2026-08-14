@@ -224,6 +224,7 @@ dependencies = [
 name = "fln-vm"
 version = "0.0.0"
 dependencies = [
+ "fln-bignum",
  "fln-comp",
  "fln-core",
  "fln-hash",
