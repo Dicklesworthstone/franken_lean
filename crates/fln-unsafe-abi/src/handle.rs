@@ -415,6 +415,33 @@ impl Obj {
         }
     }
 
+    /// Fallible mpz view `(alloc, size, limbs)`.
+    ///
+    /// Returns `None` when the handle is not an mpz or the header is
+    /// inconsistent (negative alloc, live limb count past alloc, null
+    /// buffer with a positive live count). Product paths that accept
+    /// untrusted objects must use this; [`mpz_view`] still asserts.
+    pub fn try_mpz_view(&self) -> Option<(i32, i32, &[u64])> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_MPZ) {
+            return None;
+        }
+        // SAFETY: tag is TAG_MPZ, so the object is a LeanMpzObject.
+        unsafe {
+            let (alloc, size, pointer, live) = object::mpz_fields(self.0);
+            if alloc < 0 || live > alloc as usize {
+                return None;
+            }
+            let limbs = if live == 0 {
+                &[]
+            } else if pointer.is_null() {
+                return None;
+            } else {
+                core::slice::from_raw_parts(pointer, live)
+            };
+            Some((alloc, size, limbs))
+        }
+    }
+
     /// Mpz salient borrowed view `(alloc, size, limbs)`.
     ///
     /// The returned slice aliases the object's immutable ABI limb buffer and
@@ -422,21 +449,26 @@ impl Obj {
     /// copy, radix conversion, or ownership transfer occurs.
     pub fn mpz_view(&self) -> (i32, i32, &[u64]) {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_MPZ));
-        // SAFETY: invariant + tag assertion.
+        self.try_mpz_view().expect("mpz header is consistent")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_negative_mpz_alloc(&self) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_MPZ));
+        // SAFETY: tag is TAG_MPZ; test-only header vandalism.
         unsafe {
-            let (alloc, size, pointer, live) = object::mpz_fields(self.0);
-            assert!(alloc >= 0, "mpz allocation count is negative");
-            assert!(
-                live <= alloc as usize,
-                "mpz live limb count exceeds its allocation"
-            );
-            let limbs = if live == 0 {
-                &[]
-            } else {
-                assert!(!pointer.is_null(), "nonempty mpz has a null limb buffer");
-                core::slice::from_raw_parts(pointer, live)
-            };
-            (alloc, size, limbs)
+            let mpz = self.0.cast::<crate::layout::LeanMpzObject>();
+            (*mpz).m_alloc = -1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_mpz_alloc(&self, alloc: i32) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_MPZ));
+        // SAFETY: tag is TAG_MPZ; restores the planted header so Drop frees.
+        unsafe {
+            let mpz = self.0.cast::<crate::layout::LeanMpzObject>();
+            (*mpz).m_alloc = alloc;
         }
     }
 

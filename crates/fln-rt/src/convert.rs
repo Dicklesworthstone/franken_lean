@@ -239,7 +239,9 @@ fn nat_u64(obj: &Obj, family: &'static str) -> Result<u64, ConvertError> {
     if obj.obj_tag() != usize::from(abi::TAG_MPZ) {
         return Err(malformed(family, "expected a Nat (scalar or mpz)"));
     }
-    let (_, size, limbs) = obj.mpz_view();
+    let Some((_, size, limbs)) = obj.try_mpz_view() else {
+        return Err(malformed(family, "mpz header is inconsistent"));
+    };
     if size < 0 {
         return Err(malformed(family, "a natural number is negative"));
     }
@@ -260,7 +262,9 @@ fn int_i64(obj: &Obj, family: &'static str) -> Result<i64, ConvertError> {
     if obj.obj_tag() != usize::from(abi::TAG_MPZ) {
         return Err(malformed(family, "expected an Int (scalar or mpz)"));
     }
-    let (_, size, limbs) = obj.mpz_view();
+    let Some((_, size, limbs)) = obj.try_mpz_view() else {
+        return Err(malformed(family, "mpz header is inconsistent"));
+    };
     let negative = size < 0;
     match limbs {
         [] => Ok(0),
@@ -831,10 +835,11 @@ impl Conversion {
                         "a non-scalar Nat payload must be an mpz object",
                     ))
                 } else {
-                    let (_alloc, size, limbs) = payload.mpz_view();
-                    // `mpz_view` is `(alloc, size, limbs)`. `alloc` is always
-                    // non-negative; the sign lives in `size`. Checking the
-                    // first field never sees a negative Nat.
+                    let Some((_alloc, size, limbs)) = payload.try_mpz_view() else {
+                        return Err(malformed("literal", "mpz header is inconsistent"));
+                    };
+                    // `try_mpz_view` is `(alloc, size, limbs)`. `alloc` is
+                    // always non-negative; the sign lives in `size`.
                     if size < 0 {
                         return Err(malformed("literal", "a natural literal is negative"));
                     }

@@ -68,6 +68,7 @@ row FLN-BX-0041 | crates/fln-unsafe-abi/src/handle.rs | fn string_view | (&self)
 row FLN-BX-0042 | crates/fln-unsafe-abi/src/handle.rs | fn array_view | (&self) -> (usize, usize) | array suites | value copies
 row FLN-BX-0043 | crates/fln-unsafe-abi/src/handle.rs | fn array_child | (&self, usize) -> Obj | array suites | inc-before-escape; returns owned handle
 row FLN-BX-0044 | crates/fln-unsafe-abi/src/handle.rs | fn mpz_view | (&self) -> (i32, i32, &[u64]) | mpz zero-copy identity + roundtrip | immutable slice lifetime is bound to the owning Obj; no raw pointer or owned authority escapes
+row FLN-BX-0082 | crates/fln-unsafe-abi/src/handle.rs | fn try_mpz_view | (&self) -> Option<(i32, i32, &[u64])> | try_mpz_view_refuses_hostile_headers | same borrowed limb slice as mpz_view, or None; no raw pointer, owned authority, or kernel type escapes
 row FLN-BX-0045 | crates/fln-unsafe-abi/src/handle.rs | fn closure_view | (&self) -> (u16, u16) | closure suites | value copies
 row FLN-BX-0046 | crates/fln-unsafe-abi/src/handle.rs | fn clone_ref | (&self) -> Obj | rc_clone_and_drop_balance | adds the reference it hands out
 row FLN-BX-0047 | crates/fln-unsafe-abi/src/handle.rs | fn make_persistent | (&self) | persistent suites; C4 rc.persistent facts | narrows RC behavior to immortal

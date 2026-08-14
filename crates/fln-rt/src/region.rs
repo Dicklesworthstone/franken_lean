@@ -1016,9 +1016,17 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     out.extend_from_slice(&(length as u64).to_le_bytes());
                     out.extend_from_slice(&data);
                 } else if h.tag == abi::TAG_MPZ {
-                    let (_, mp_size, limbs) = o.mpz_view();
+                    let Some((_, mp_size, limbs)) = o.try_mpz_view() else {
+                        return Err(RegionFault::MpzIntegrity {
+                            offset: offset as usize,
+                        });
+                    };
                     emit_header(&mut out, MPZ_FIXED + 8 * limbs.len(), h.tag, 0);
-                    out.extend_from_slice(&i32::try_from(limbs.len()).expect("i32").to_le_bytes());
+                    let alloc =
+                        i32::try_from(limbs.len()).map_err(|_| RegionFault::MpzIntegrity {
+                            offset: offset as usize,
+                        })?;
+                    out.extend_from_slice(&alloc.to_le_bytes());
                     out.extend_from_slice(&mp_size.to_le_bytes());
                     let limb_addr = base.wrapping_add(offset + MPZ_FIXED as u64);
                     out.extend_from_slice(&limb_addr.to_le_bytes());

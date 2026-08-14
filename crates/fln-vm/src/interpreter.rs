@@ -2776,8 +2776,7 @@ fn is_nat_abi(value: &Obj) -> bool {
     if value_kind(value) != ValueKind::Mpz {
         return false;
     }
-    let (_, size, _) = value.mpz_view();
-    size >= 0
+    matches!(value.try_mpz_view(), Some((_, size, _)) if size >= 0)
 }
 
 fn transfer_intrinsic_arguments(
@@ -3596,7 +3595,9 @@ fn with_nat_view<R>(
     if value_kind(value) != ValueKind::Mpz {
         return Err(type_mismatch(operation, argument, "Nat", value));
     }
-    let (_, size, limbs) = value.mpz_view();
+    let Some((_, size, limbs)) = value.try_mpz_view() else {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    };
     if size < 0 {
         return Err(type_mismatch(operation, argument, "Nat", value));
     }
@@ -3699,7 +3700,9 @@ fn nat_low_u64(value: &Obj, operation: &'static str, argument: usize) -> Result<
     if value_kind(value) != ValueKind::Mpz {
         return Err(type_mismatch(operation, argument, "Nat", value));
     }
-    let (_, size, limbs) = value.mpz_view();
+    let Some((_, size, limbs)) = value.try_mpz_view() else {
+        return Err(type_mismatch(operation, argument, "Nat", value));
+    };
     if size < 0 {
         return Err(type_mismatch(operation, argument, "Nat", value));
     }

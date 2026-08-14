@@ -598,6 +598,30 @@ fn mpz_view_is_zero_copy_normalized_and_excludes_negative_zero() {
 }
 
 #[test]
+fn try_mpz_view_refuses_hostile_headers() {
+    let _g = lock();
+    let well = Obj::mk_mpz(&[7], false);
+    let (alloc, size, limbs) = well.try_mpz_view().expect("a well-formed mpz is viewable");
+    assert_eq!((alloc, size, limbs), (1, 1, &[7][..]));
+
+    assert!(
+        Obj::mk_nat(3).try_mpz_view().is_none(),
+        "a scalar is not an mpz"
+    );
+    assert!(
+        Obj::mk_string("n").try_mpz_view().is_none(),
+        "a string is not an mpz"
+    );
+
+    well.plant_negative_mpz_alloc();
+    assert!(
+        well.try_mpz_view().is_none(),
+        "a negative alloc count is not a view"
+    );
+    well.restore_mpz_alloc(1);
+}
+
+#[test]
 fn external_finalizer_runs_exactly_once() {
     let _g = lock();
     let before = EXTERNAL_FINALIZED.load(Ordering::SeqCst);
