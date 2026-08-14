@@ -600,7 +600,14 @@ fn inject_name(name: &Name) -> Obj {
     let pre = inject_name(&name.parent());
     match name.leaf_view() {
         fln_core::name::LeafView::Str(text) => {
-            Obj::mk_ctor(TAG_NAME_STR, vec![pre, Obj::mk_string(text)], &[])
+            // Lean Name.str is (pre : Name) (s : String) plus the cached
+            // hash. Olean write already emits that scalar; without it a
+            // Lean-true walk at +24 panics or reads foreign bytes.
+            Obj::mk_ctor(
+                TAG_NAME_STR,
+                vec![pre, Obj::mk_string(text)],
+                &name.hash().to_le_bytes(),
+            )
         }
         fln_core::name::LeafView::Num(component) => {
             // Lean Name.num is (pre : Name) (i : Nat) plus the cached hash.

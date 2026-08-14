@@ -166,8 +166,18 @@ fn const_names_and_levels_round_trip() {
     let back_name = back.ctor_child(0);
     assert_eq!(back_name.obj_tag(), 1, "a str name node");
     let back_leaf = back_name.ctor_child(1);
-    let (_, _, len, bytes) = back_leaf.string_view();
-    assert_eq!(&bytes[..len], b"bar", "the leaf name is byte-exact");
+    let (size, _, _, bytes) = back_leaf.string_view();
+    assert_eq!(
+        &bytes[..size - 1],
+        b"bar",
+        "the leaf name is the UTF-8 payload"
+    );
+    let expected = Name::from_components(["Foo", "bar"]).hash();
+    assert_eq!(
+        back_name.ctor_scalar_u64(16),
+        expected,
+        "injected Name.str carries the cached hash, as olean write does"
+    );
 }
 
 #[test]
