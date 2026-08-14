@@ -67,9 +67,10 @@ const fn cache_context(
 
 const fn callable_result_ownership(ty: fir::ValueType) -> CallableResultOwnership {
     match ty {
-        fir::ValueType::Unit | fir::ValueType::Bool | fir::ValueType::Nat => {
+        fir::ValueType::Unit | fir::ValueType::Bool => {
             CallableResultOwnership::Scalar
         }
+        fir::ValueType::Nat => CallableResultOwnership::OwnedOrScalar,
         fir::ValueType::String
         | fir::ValueType::Constructor
         | fir::ValueType::Array
@@ -184,12 +185,12 @@ fn fixture_register_result(
                     | "extern:Nat.shiftLeft"
                     | "extern:Nat.shiftRight"
                     | "extern:Nat.xor"
-                    | "extern:Nat.beq"
-                    | "extern:Nat.ble"
-                    | "extern:String.decEq"
                     | "extern:String.length"
                     | "extern:String.utf8ByteSize"
-                    | "extern:Array.size"
+                    | "extern:Array.size" => CallableResultOwnership::OwnedOrScalar,
+                    "extern:Nat.beq"
+                    | "extern:Nat.ble"
+                    | "extern:String.decEq"
                     | "extern:ST.Prim.Ref.ptrEq"
                     | "extern:ST.Prim.Ref.set" => CallableResultOwnership::Scalar,
                     _ => CallableResultOwnership::Owned,

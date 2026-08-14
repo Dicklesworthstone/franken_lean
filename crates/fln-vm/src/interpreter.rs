@@ -2689,6 +2689,7 @@ fn finish_callable_result(
     let matches = match expected {
         CallableResultOwnership::Owned => !value.is_scalar(),
         CallableResultOwnership::Scalar => value.is_scalar(),
+        CallableResultOwnership::OwnedOrScalar => true,
     };
     if !matches {
         return Err(VmRefusal::CallableResultKind {

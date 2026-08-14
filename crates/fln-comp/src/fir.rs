@@ -243,9 +243,14 @@ impl ValueType {
 
     const fn admits_callable_result(self, ownership: flbc::CallableResultOwnership) -> bool {
         match self {
-            Self::Unit | Self::Bool | Self::Nat => {
+            Self::Unit | Self::Bool => {
                 matches!(ownership, flbc::CallableResultOwnership::Scalar)
             }
+            Self::Nat => matches!(
+                ownership,
+                flbc::CallableResultOwnership::Scalar
+                    | flbc::CallableResultOwnership::OwnedOrScalar
+            ),
             Self::Abi => true,
             Self::String
             | Self::Constructor
