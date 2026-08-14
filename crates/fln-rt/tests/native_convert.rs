@@ -664,6 +664,55 @@ fn inject_and_project_round_trip_a_level_metavariable() {
     assert_eq!(heap.get(back).expect("handle").hash(), sort.hash());
 }
 
+#[test]
+fn inject_and_project_round_trip_mdata_int_entries() {
+    let mut heap = NativeHeap::new();
+    let body = Expr::bvar(0).expect("bvar 0 packs");
+    let metadata = KVMap::from_entries(vec![
+        (Name::from_components(["neg"]), DataValue::OfInt(-42)),
+        (Name::from_components(["min"]), DataValue::OfInt(i64::MIN)),
+        (Name::from_components(["max"]), DataValue::OfInt(i64::MAX)),
+        (Name::from_components(["zero"]), DataValue::OfInt(0)),
+    ]);
+    let native = Expr::mdata(metadata, body);
+    let handle = heap.alloc(native.clone());
+    let injected = inject_expr(&heap, handle).expect("ofInt injects");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("ofInt projects");
+    let ExprNode::MData { data: restored, .. } = heap.get(back).expect("handle").node() else {
+        panic!("expected mdata");
+    };
+    let ExprNode::MData { data: original, .. } = native.node() else {
+        panic!("the fixture is mdata");
+    };
+    assert_eq!(
+        restored.entries(),
+        original.entries(),
+        "Lean Int scalars and i64-min mpz must survive the membrane"
+    );
+}
+
+#[test]
+fn an_int_payload_that_is_not_mpz_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let value = Obj::mk_ctor(4, vec![Obj::mk_string("not-an-int")], &[]);
+    let pair = Obj::mk_ctor(0, vec![mk_name(&["k"]), value], &[]);
+    let list = Obj::mk_ctor(1, vec![pair, Obj::mk_nat(0)], &[]);
+    let body = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let mdata = Obj::mk_ctor(10, vec![list, body], &[]);
+    match Conversion::new().project_expr(&mut heap, &mdata) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "data-value");
+            assert!(
+                reason.contains("Int"),
+                "a string posing as an Int payload must name Int, got {reason}"
+            );
+        }
+        other => panic!("a string posing as an Int must be malformed, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The declarations and the membrane tripwire
 // ---------------------------------------------------------------------------
