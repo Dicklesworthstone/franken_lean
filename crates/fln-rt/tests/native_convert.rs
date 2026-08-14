@@ -963,18 +963,18 @@ fn project_reuses_a_shared_expr_child() {
 }
 
 #[test]
-fn inject_refuses_an_expr_deeper_than_the_walk_ceiling() {
+fn inject_walks_a_long_app_nest_without_a_stack_fault() {
     let mut expr = Expr::bvar(0).expect("packs");
     for _ in 0..400 {
         expr = Expr::app(expr, Expr::bvar(0).expect("packs"));
     }
     let mut heap = NativeHeap::new();
-    let handle = heap.alloc(expr);
-    match inject_expr(&heap, handle) {
-        Err(ConvertError::NativeOverflow { family }) => assert_eq!(family, "expr"),
-        Err(other) => panic!("a 400-deep app nest must overflow typed, got {other}"),
-        Ok(_) => panic!("a 400-deep app nest must overflow typed, not inject"),
-    }
+    let handle = heap.alloc(expr.clone());
+    let injected = inject_expr(&heap, handle).expect("inject_expr is iterative on app");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
+        .expect("project_expr is iterative on app");
+    assert_eq!(heap.get(back).expect("handle").hash(), expr.hash());
 }
 
 // ---------------------------------------------------------------------------
