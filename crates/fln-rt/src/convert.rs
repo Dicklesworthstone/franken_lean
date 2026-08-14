@@ -537,8 +537,8 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
     match expr.node() {
         ExprNode::BVar { idx } => Ok(Obj::mk_ctor(
             TAG_EXPR_BVAR,
-            Vec::new(),
-            &(*idx as u64).to_le_bytes(),
+            vec![inject_nat(u64::from(*idx))],
+            &[],
         )),
         ExprNode::FVar { id } => Ok(Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &[])),
         ExprNode::Sort { level } => {
@@ -603,7 +603,15 @@ fn inject_name(name: &Name) -> Obj {
             Obj::mk_ctor(TAG_NAME_STR, vec![pre, Obj::mk_string(text)], &[])
         }
         fln_core::name::LeafView::Num(component) => {
-            Obj::mk_ctor(TAG_NAME_NUM, vec![pre], &component.to_le_bytes())
+            // Lean Name.num is (pre : Name) (i : Nat) plus the cached hash.
+            // An inline u64 after one child is convert-private and would not
+            // survive a Lean-true Name walk (olean write already uses two
+            // object slots).
+            Obj::mk_ctor(
+                TAG_NAME_NUM,
+                vec![pre, inject_nat(component)],
+                &name.hash().to_le_bytes(),
+            )
         }
         fln_core::name::LeafView::Anonymous => unreachable!("parent is anonymous but leaf is not"),
     }
@@ -637,6 +645,15 @@ fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
     }
 }
 
+fn inject_nat(value: u64) -> Obj {
+    let maximum = (usize::MAX >> 1) as u64;
+    if value <= maximum {
+        Obj::mk_nat(value as usize)
+    } else {
+        Obj::mk_mpz(&[value], false)
+    }
+}
+
 fn inject_literal(literal: &Literal) -> Obj {
     match literal {
         Literal::Nat(nat) => {
@@ -646,10 +663,9 @@ fn inject_literal(literal: &Literal) -> Obj {
             // ceiling and would panic — which this membrane forbids.
             // Zero is the empty limb vector and must stay a scalar, not
             // an mpz object.
-            let maximum = (usize::MAX >> 1) as u64;
             let payload = match nat.to_u64() {
-                Some(scalar) if scalar <= maximum => Obj::mk_nat(scalar as usize),
-                _ => Obj::mk_mpz(nat.limbs_le(), false),
+                Some(scalar) => inject_nat(scalar),
+                None => Obj::mk_mpz(nat.limbs_le(), false),
             };
             Obj::mk_ctor(TAG_LIT_NAT, vec![payload], &[])
         }

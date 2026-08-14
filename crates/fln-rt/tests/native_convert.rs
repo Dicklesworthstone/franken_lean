@@ -309,6 +309,16 @@ fn a_numeric_name_component_is_the_stored_u64_not_the_parent_pointer() {
         panic!("expected a const");
     };
     assert_eq!(name.to_display_string(), "foo.7");
+    assert_eq!(
+        injected.ctor_child(0).header().other,
+        2,
+        "injected Name.num is Lean's two object children, not an inline u64"
+    );
+    assert!(
+        injected.ctor_child(0).ctor_child(1).is_scalar(),
+        "the Name.num component is a boxed Nat"
+    );
+    assert_eq!(injected.ctor_child(0).ctor_child(1).unbox(), 7);
 }
 
 #[test]
@@ -501,6 +511,16 @@ fn a_lean_true_bvar_nat_child_projects() {
         panic!("expected a bvar");
     };
     assert_eq!(*idx, 3);
+}
+
+#[test]
+fn inject_emits_a_nat_child_for_bvar() {
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::bvar(4).expect("bvar 4 packs"));
+    let back = inject_expr(&heap, handle).expect("bvar injects");
+    assert_eq!(back.header().other, 1, "Lean bvar has one Nat child");
+    assert!(back.ctor_child(0).is_scalar());
+    assert_eq!(back.ctor_child(0).unbox(), 4);
 }
 
 #[test]
