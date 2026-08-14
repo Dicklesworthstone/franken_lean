@@ -49,6 +49,7 @@ use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_unsafe_abi::handle::Obj;
 
+use crate::abi;
 use crate::native_heap::{NativeHandle, NativeHeap};
 
 /// The converter's declaration, as data (see the module docs).
@@ -340,6 +341,13 @@ impl Conversion {
                 let payload = obj.ctor_child(0);
                 if payload.is_scalar() {
                     Ok(Literal::Nat(NatLit::from_u64(payload.unbox() as u64)))
+                } else if payload.obj_tag() != usize::from(abi::TAG_MPZ) {
+                    // `mpz_view` asserts the mpz tag. A string or ctor
+                    // payload is a malformed Nat, not an invariant failure.
+                    Err(malformed(
+                        "literal",
+                        "a non-scalar Nat payload must be an mpz object",
+                    ))
                 } else {
                     let (_alloc, size, limbs) = payload.mpz_view();
                     // `mpz_view` is `(alloc, size, limbs)`. `alloc` is always
@@ -398,6 +406,11 @@ impl Conversion {
                 "string",
                 "a tagged scalar is not a string object",
             ));
+        }
+        if obj.obj_tag() != usize::from(abi::TAG_STRING) {
+            // `string_view` asserts the string tag. Name.str's second
+            // child being a ctor is a malformed name, not a panic.
+            return Err(malformed("string", "expected a string object"));
         }
         // `string_view` is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
         // `m_length` is the UTF-8 scalar count, the same field
