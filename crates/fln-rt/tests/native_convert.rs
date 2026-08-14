@@ -831,6 +831,32 @@ fn a_name_chain_deeper_than_the_walk_ceiling_is_overflow_not_a_stack_fault() {
     }
 }
 
+#[test]
+fn inject_walks_a_long_name_chain_without_a_stack_fault() {
+    let mut name = Name::anonymous();
+    for _ in 0..400 {
+        name = Name::str(name, "a");
+    }
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::const_(name, Vec::new()));
+    inject_expr(&heap, handle).expect("inject_name is iterative on the parent chain");
+}
+
+#[test]
+fn inject_refuses_an_expr_deeper_than_the_walk_ceiling() {
+    let mut expr = Expr::bvar(0).expect("packs");
+    for _ in 0..400 {
+        expr = Expr::app(expr, Expr::bvar(0).expect("packs"));
+    }
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(expr);
+    match inject_expr(&heap, handle) {
+        Err(ConvertError::NativeOverflow { family }) => assert_eq!(family, "expr"),
+        Err(other) => panic!("a 400-deep app nest must overflow typed, got {other}"),
+        Ok(_) => panic!("a 400-deep app nest must overflow typed, not inject"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The declarations and the membrane tripwire
 // ---------------------------------------------------------------------------
