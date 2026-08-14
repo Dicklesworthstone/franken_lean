@@ -1108,6 +1108,137 @@ impl Expr {
             .ok_or(TooManyBoundVars { range: u32::MAX })
     }
 
+    /// Substitute the outermost `substs.len()` loose bvars: `bvar (k + j)`
+    /// becomes `substs[n - 1 - j]` lifted by `k`. Binders raise `k`.
+    ///
+    /// Iterative: admit's restore step instantiates open templates, and a
+    /// 400-deep nest is legal. The recursive form was depth-guarded at 2048
+    /// — a host-stack bound, not a Lean covenant (FL-INV-07).
+    pub fn subst_loose(&self, k: u32, substs: &[Expr]) -> Result<Expr, TooManyBoundVars> {
+        let n = u32::try_from(substs.len()).map_err(|_| TooManyBoundVars { range: u32::MAX })?;
+        if n == 0 || self.loose_bvar_range() <= k {
+            return Ok(self.clone());
+        }
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![(self.clone(), k, false)];
+        while let Some((current, cut, exit)) = stack.pop() {
+            if current.loose_bvar_range() <= cut {
+                done.insert((current.allocation_identity(), cut), current);
+                continue;
+            }
+            let key = (current.allocation_identity(), cut);
+            if done.contains_key(&key) {
+                continue;
+            }
+            if !exit {
+                stack.push((current.clone(), cut, true));
+                match current.node() {
+                    ExprNode::App { f, a } => {
+                        stack.push((a.clone(), cut, false));
+                        stack.push((f.clone(), cut, false));
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((binder_type.clone(), cut, false));
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push((body.clone(), cut.saturating_add(1), false));
+                        stack.push((value.clone(), cut, false));
+                        stack.push((type_.clone(), cut, false));
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        stack.push((expr.clone(), cut, false));
+                    }
+                    ExprNode::BVar { .. }
+                    | ExprNode::FVar { .. }
+                    | ExprNode::MVar { .. }
+                    | ExprNode::Sort { .. }
+                    | ExprNode::Const { .. }
+                    | ExprNode::Lit { .. } => {}
+                }
+                continue;
+            }
+            let substed = match current.node() {
+                ExprNode::BVar { idx } if *idx < cut => current.clone(),
+                ExprNode::BVar { idx } => {
+                    let offset = *idx - cut;
+                    if offset < n {
+                        let j = usize::try_from(offset)
+                            .map_err(|_| TooManyBoundVars { range: u32::MAX })?;
+                        substs[substs.len() - 1 - j].lift_loose(0, cut)?
+                    } else {
+                        let lowered = idx
+                            .checked_sub(n)
+                            .ok_or(TooManyBoundVars { range: u32::MAX })?;
+                        Expr::bvar(lowered)?
+                    }
+                }
+                ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => current.clone(),
+                ExprNode::App { f, a } => {
+                    Expr::app(lifted_child(&done, f, cut)?, lifted_child(&done, a, cut)?)
+                }
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    lifted_child(&done, binder_type, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    lifted_child(&done, type_, cut)?,
+                    lifted_child(&done, value, cut)?,
+                    lifted_child(&done, body, cut.saturating_add(1))?,
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => {
+                    Expr::mdata(data.clone(), lifted_child(&done, expr, cut)?)
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => Expr::proj(struct_name.clone(), *idx, lifted_child(&done, expr, cut)?),
+            };
+            done.insert(key, substed);
+        }
+        done.get(&(self.allocation_identity(), k))
+            .cloned()
+            .ok_or(TooManyBoundVars { range: u32::MAX })
+    }
+
     /// The structural node (metaprograms pattern-match on the inventory).
     pub fn node(&self) -> &ExprNode {
         self.node_arc()
@@ -1242,6 +1373,54 @@ mod tests {
         let diamond = Expr::app(expr.clone(), expr.clone());
         let lifted_diamond = diamond.lift_loose(0, 1).expect("a shared child lifts once");
         assert_eq!(lifted_diamond.loose_bvar_range(), 2);
+    }
+
+    #[test]
+    fn subst_loose_replaces_the_outer_window_and_shifts_the_rest() {
+        let body = Expr::app(Expr::bvar(0).expect("packs"), Expr::bvar(1).expect("packs"));
+        let subst = Expr::bvar(7).expect("packs");
+        let out = body
+            .subst_loose(0, std::slice::from_ref(&subst))
+            .expect("one subst packs");
+        let ExprNode::App { f, a } = out.node() else {
+            panic!("expected an app");
+        };
+        assert!(matches!(f.node(), ExprNode::BVar { idx } if *idx == 7));
+        assert!(matches!(a.node(), ExprNode::BVar { idx } if *idx == 0));
+    }
+
+    #[test]
+    fn subst_loose_lifts_an_open_substitute_under_a_binder() {
+        let body = Expr::lam(
+            name("x"),
+            Expr::sort(Level::zero()),
+            Expr::bvar(1).expect("loose #0 under one binder"),
+            BinderInfo::Default,
+        );
+        let subst = Expr::bvar(0).expect("packs");
+        let out = body
+            .subst_loose(0, std::slice::from_ref(&subst))
+            .expect("binder subst packs");
+        let ExprNode::Lam { body: inner, .. } = out.node() else {
+            panic!("expected a lam");
+        };
+        assert!(
+            matches!(inner.node(), ExprNode::BVar { idx } if *idx == 1),
+            "the substitute #0 must lift to #1 under the lambda"
+        );
+    }
+
+    #[test]
+    fn subst_loose_walks_a_deep_app_nest() {
+        let mut expr = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::bvar(0).expect("packs"));
+        }
+        let subst = Expr::bvar(3).expect("packs");
+        let out = expr
+            .subst_loose(0, std::slice::from_ref(&subst))
+            .expect("a 400-deep nest substitutes without a stack fault");
+        assert_eq!(out.loose_bvar_range(), 4, "every loose #0 becomes #3");
     }
 
     #[test]
