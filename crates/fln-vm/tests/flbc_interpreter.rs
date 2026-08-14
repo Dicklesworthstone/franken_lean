@@ -541,6 +541,14 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
         ("extern:Nat.shiftLeft", 7, 3, 56),
         (
             "extern:Nat.shiftLeft",
+            1,
+            u64::from(usize::BITS.saturating_sub(2)),
+            1usize
+                .checked_shl(usize::BITS.saturating_sub(2))
+                .expect("1 << (BITS-2) fits the small Nat ceiling"),
+        ),
+        (
+            "extern:Nat.shiftLeft",
             0,
             u64::try_from(usize::MAX >> 1).expect("small Nat ceiling fits u64"),
             0,
@@ -594,6 +602,39 @@ fn generated_bounded_nat_rows_execute_reference_zero_and_bitwise_semantics() {
                 ..
             }) if operation == row.trim_start_matches("extern:")
         ));
+    }
+
+    for (value, amount) in [
+        (2_u64, u64::from(usize::BITS.saturating_sub(1))),
+        (1_u64, u64::from(usize::BITS.saturating_sub(1))),
+        (2_u64, u64::from(usize::BITS)),
+    ] {
+        let program = validated(vec![function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Nat { dst: r(0), value },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: amount,
+                },
+                intrinsic(r(2), "extern:Nat.shiftLeft", vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        assert!(
+            matches!(
+                execute(&program, ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::NatOverflow {
+                        operation: "Nat.shiftLeft"
+                    },
+                    ..
+                })
+            ),
+            "Nat.shiftLeft {value} {amount} must not wrap into the small-Nat range"
+        );
     }
 }
 
