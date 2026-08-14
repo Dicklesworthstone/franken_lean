@@ -843,6 +843,17 @@ fn inject_walks_a_long_name_chain_without_a_stack_fault() {
 }
 
 #[test]
+fn inject_walks_a_long_succ_tower_without_a_stack_fault() {
+    let mut level = Level::zero();
+    for _ in 0..400 {
+        level = level.succ().expect("400 < 2^24");
+    }
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::sort(level));
+    inject_expr(&heap, handle).expect("inject_level is iterative on succ");
+}
+
+#[test]
 fn inject_refuses_an_expr_deeper_than_the_walk_ceiling() {
     let mut expr = Expr::bvar(0).expect("packs");
     for _ in 0..400 {
