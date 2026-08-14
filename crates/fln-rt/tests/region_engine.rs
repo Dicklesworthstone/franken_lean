@@ -158,6 +158,58 @@ fn corruption_fault_matrix() {
 }
 
 #[test]
+fn a_string_whose_m_length_drifted_from_the_payload_is_refused() {
+    let _g = lock();
+    let bytes = compact(&Obj::mk_string("m-length-probe"), BASE_A).expect("compact");
+    assert!(
+        fln_rt::region::audit(&bytes, BASE_A).is_ok(),
+        "a freshly compacted string must audit clean"
+    );
+
+    let needle = b"m-length-probe";
+    let payload = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("compacted payload contains the string bytes");
+    let length_field = payload
+        .checked_sub(8)
+        .expect("m_length sits immediately before the payload");
+    let mut drifted = bytes.clone();
+    drifted[length_field..length_field + 8].copy_from_slice(&99u64.to_le_bytes());
+
+    assert!(
+        matches!(
+            fln_rt::region::audit(&drifted, BASE_A),
+            Err(RegionFault::StringIntegrity {
+                reason: "m_length is not the UTF-8 scalar count",
+                ..
+            })
+        ),
+        "audit must refuse a drifted m_length"
+    );
+    assert!(
+        matches!(
+            relocate(&mut drifted.clone(), BASE_A, BASE_B),
+            Err(RegionFault::StringIntegrity {
+                reason: "m_length is not the UTF-8 scalar count",
+                ..
+            })
+        ),
+        "relocate shares walk_step with audit"
+    );
+    assert!(
+        matches!(
+            materialize(&drifted, BASE_A),
+            Err(RegionFault::StringIntegrity {
+                reason: "m_length is not the UTF-8 scalar count",
+                ..
+            })
+        ),
+        "materialize must not heal a drifted m_length by recounting"
+    );
+}
+
+#[test]
 fn envelope_laws() {
     let _g = lock();
     // Short garbage is length-gated before the magic check.

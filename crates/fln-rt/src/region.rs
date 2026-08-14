@@ -535,6 +535,23 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
                 reason: "missing NUL terminator",
             });
         }
+        // Pin `lean_string_object`: `m_length` is the UTF-8 scalar count,
+        // the same field `lean_string_length` boxes. Audit/relocate used
+        // to check size and NUL only; a drifted `m_length` then passed
+        // here and was boxed as a Nat by String.length.
+        let payload = &buf[offset + STRING_FIXED..offset + STRING_FIXED + bytes - 1];
+        let content = std::str::from_utf8(payload).map_err(|_| RegionFault::StringIntegrity {
+            offset,
+            reason: "invalid UTF-8",
+        })?;
+        let stored_length = read_u64(buf, offset + 24);
+        let scalars = u64::try_from(content.chars().count()).unwrap_or(u64::MAX);
+        if stored_length != scalars {
+            return Err(RegionFault::StringIntegrity {
+                offset,
+                reason: "m_length is not the UTF-8 scalar count",
+            });
+        }
         size
     } else if h.tag == abi::TAG_CLOSURE {
         return Err(RegionFault::ClosureUnsupported { offset });
