@@ -267,7 +267,11 @@ impl Conversion {
             }
             TAG_NAME_NUM => {
                 let pre = self.name(&obj.ctor_child(0))?;
-                let component = obj.ctor_scalar_u64(0);
+                // One object child, then the u64 component. Offset 0 is the
+                // parent pointer; `ctor_scalar_u64` measures from obj_cptr
+                // and requires `offset >= other * 8`, so 0 panics (and would
+                // otherwise read the heap address as the component).
+                let component = obj.ctor_scalar_u64(8);
                 Ok(Name::num(pre, component))
             }
             other => Err(ConvertError::UnsupportedConstructor {
@@ -323,16 +327,20 @@ impl Conversion {
                 if payload.is_scalar() {
                     Ok(Literal::Nat(NatLit::from_u64(payload.unbox() as u64)))
                 } else {
-                    let (sign, size, limbs) = payload.mpz_view();
-                    if sign < 0 {
+                    let (_alloc, size, limbs) = payload.mpz_view();
+                    // `mpz_view` is `(alloc, size, limbs)`. `alloc` is always
+                    // non-negative; the sign lives in `size`. Checking the
+                    // first field never sees a negative Nat.
+                    if size < 0 {
                         return Err(malformed("literal", "a natural literal is negative"));
                     }
-                    if size as usize > limbs.len() {
+                    let live = usize::try_from(size).map_err(|_| {
+                        malformed("literal", "mpz size field exceeds the limb span")
+                    })?;
+                    if live > limbs.len() {
                         return Err(malformed("literal", "mpz size field exceeds the limb span"));
                     }
-                    Ok(Literal::Nat(NatLit::from_limbs_le(
-                        limbs[..size as usize].to_vec(),
-                    )))
+                    Ok(Literal::Nat(NatLit::from_limbs_le(limbs[..live].to_vec())))
                 }
             }
             TAG_LIT_STR => {

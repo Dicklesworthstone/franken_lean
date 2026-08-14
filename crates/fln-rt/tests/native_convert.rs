@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 use fln_core::expr::{Expr, ExprNode, Literal, NatLit};
+use fln_core::name::Name;
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 use fln_unsafe_abi::handle::Obj;
@@ -273,6 +274,60 @@ fn a_malformed_shape_is_refused_with_its_reason() {
             assert_eq!(family, "expr");
         }
         other => panic!("a bare scalar is malformed as an expr, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_numeric_name_component_is_the_stored_u64_not_the_parent_pointer() {
+    let mut heap = NativeHeap::new();
+    let name = Obj::mk_ctor(2, vec![mk_name(&["foo"])], &7u64.to_le_bytes());
+    let levels = Obj::mk_ctor(0, Vec::new(), &[]);
+    let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
+    let mut conversion = Conversion::new();
+    let handle = conversion
+        .project_expr(&mut heap, &konst)
+        .expect("Name.num must project without panicking");
+    let expr = heap.get(handle).expect("the handle resolves");
+    let ExprNode::Const { name, .. } = expr.node() else {
+        panic!("expected a const");
+    };
+    assert_eq!(
+        name.to_display_string(),
+        "foo.7",
+        "the component is the scalar after the parent pointer, not byte 0"
+    );
+
+    let native = Name::num(Name::from_components(["foo"]), 7);
+    let injected_handle = heap.alloc(Expr::const_(native, Vec::new()));
+    let injected = inject_expr(&heap, injected_handle).expect("injecting Name.num");
+    let mut conversion = Conversion::new();
+    let back = conversion
+        .project_expr(&mut heap, &injected)
+        .expect("round-trip Name.num");
+    let ExprNode::Const { name, .. } = heap.get(back).expect("handle").node() else {
+        panic!("expected a const");
+    };
+    assert_eq!(name.to_display_string(), "foo.7");
+}
+
+#[test]
+fn a_negative_mpz_nat_literal_is_refused_as_negative() {
+    let mut heap = NativeHeap::new();
+    let lit = Obj::mk_ctor(
+        9,
+        vec![Obj::mk_ctor(0, vec![Obj::mk_mpz(&[1], true)], &[])],
+        &[],
+    );
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &lit) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "literal");
+            assert!(
+                reason.contains("negative"),
+                "the sign lives in _mp_size, not _mp_alloc; got {reason}"
+            );
+        }
+        other => panic!("a negative mpz Nat must be refused as negative, got {other:?}"),
     }
 }
 
