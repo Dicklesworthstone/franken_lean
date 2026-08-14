@@ -1804,10 +1804,11 @@ impl<'a> TypeChecker<'a> {
         self.whnf_core_mode(e, depth, false)
     }
 
-    /// The pin's defeq pre-pass uses `cheap_proj = true`: reduce a projection
-    /// scrutinee without delta so `a.i =?= b.i` can compare `a` and `b` before
-    /// either side opens an expensive definition. Cheap results are not mixed
-    /// into the full-WHNF cache.
+    /// The pin's defeq projection pre-pass uses `cheap_proj = true`: reduce a
+    /// projection scrutinee without delta so `a.i =?= b.i` can compare `a` and
+    /// `b` before either side opens an expensive definition. Cheap results are
+    /// not mixed into the full-WHNF cache, so this mode is reserved for the
+    /// matching-projection case rather than every defeq pair.
     fn whnf_core_for_defeq(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
         self.whnf_core_mode(e, depth, true)
     }
@@ -2676,8 +2677,23 @@ impl<'a> TypeChecker<'a> {
         // KR-305: normalize both sides without delta, then RE-RUN the head
         // rules on the reduced pair (beta/zeta/iota can expose Sort or binder
         // heads whose levels are equivalent but not structurally equal).
-        let tn = self.whnf_core_for_defeq(t, depth + 1)?;
-        let sn = self.whnf_core_for_defeq(s, depth + 1)?;
+        let cheap_projection_pair = matches!(
+            (t.node(), s.node()),
+            (
+                ExprNode::Proj { idx: left, .. },
+                ExprNode::Proj { idx: right, .. },
+            ) if left == right
+        );
+        let tn = if cheap_projection_pair {
+            self.whnf_core_for_defeq(t, depth + 1)?
+        } else {
+            self.whnf_core(t, depth + 1)?
+        };
+        let sn = if cheap_projection_pair {
+            self.whnf_core_for_defeq(s, depth + 1)?
+        } else {
+            self.whnf_core(s, depth + 1)?
+        };
         if (tn != *t || sn != *s)
             && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
         {
@@ -5290,6 +5306,34 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= budget.depth,
             "the projection pre-pass must not traverse the expensive definition body"
+        );
+    }
+
+    #[test]
+    fn defeq_preserves_full_whnf_cache_for_non_projection_pairs() {
+        let env = Environment::new();
+        let sort_zero = Expr::sort(Level::zero());
+        let beta_sort_zero = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            ),
+            sort_zero.clone(),
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(1_000, 32));
+
+        assert!(
+            tc.def_eq_public(&beta_sort_zero, &sort_zero, 0)
+                .expect("the non-projection beta pair completes"),
+            "beta reduction must establish the ordinary defeq pair"
+        );
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&beta_sort_zero, &tc.locals, &tc.local_positions),
+            Some(sort_zero),
+            "ordinary defeq normalization must retain its full-WHNF result"
         );
     }
 
