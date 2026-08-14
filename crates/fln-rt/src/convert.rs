@@ -877,6 +877,13 @@ pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj,
 }
 
 fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
+    inject_expr_value_at(expr, 0)
+}
+
+fn inject_expr_value_at(expr: &Expr, depth: u32) -> Result<Obj, ConvertError> {
+    if depth >= MAX_WALK_DEPTH {
+        return Err(ConvertError::NativeOverflow { family: "expr" });
+    }
     let data_bytes = expr.data().0.to_le_bytes();
     match expr.node() {
         ExprNode::BVar { idx } => Ok(Obj::mk_ctor(
@@ -891,7 +898,7 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
         )),
         ExprNode::Sort { level } => Ok(Obj::mk_ctor(
             TAG_EXPR_SORT,
-            vec![inject_level(level)?],
+            vec![inject_level_at(level, depth + 1)?],
             &data_bytes,
         )),
         ExprNode::Const { name, levels } => Ok(Obj::mk_ctor(
@@ -901,7 +908,10 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
         )),
         ExprNode::App { f, a } => Ok(Obj::mk_ctor(
             TAG_EXPR_APP,
-            vec![inject_expr_value(f)?, inject_expr_value(a)?],
+            vec![
+                inject_expr_value_at(f, depth + 1)?,
+                inject_expr_value_at(a, depth + 1)?,
+            ],
             &data_bytes,
         )),
         ExprNode::Lit { literal } => Ok(Obj::mk_ctor(
@@ -923,8 +933,8 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
             TAG_EXPR_LAM,
             vec![
                 inject_name(binder_name),
-                inject_expr_value(binder_type)?,
-                inject_expr_value(body)?,
+                inject_expr_value_at(binder_type, depth + 1)?,
+                inject_expr_value_at(body, depth + 1)?,
             ],
             &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
         )),
@@ -937,8 +947,8 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
             TAG_EXPR_FORALL,
             vec![
                 inject_name(binder_name),
-                inject_expr_value(binder_type)?,
-                inject_expr_value(body)?,
+                inject_expr_value_at(binder_type, depth + 1)?,
+                inject_expr_value_at(body, depth + 1)?,
             ],
             &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
         )),
@@ -952,15 +962,15 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
             TAG_EXPR_LET,
             vec![
                 inject_name(decl_name),
-                inject_expr_value(type_)?,
-                inject_expr_value(value)?,
-                inject_expr_value(body)?,
+                inject_expr_value_at(type_, depth + 1)?,
+                inject_expr_value_at(value, depth + 1)?,
+                inject_expr_value_at(body, depth + 1)?,
             ],
             &data_and_u8(expr.data().0, u8::from(*non_dep)),
         )),
         ExprNode::MData { data, expr: inner } => Ok(Obj::mk_ctor(
             TAG_EXPR_MDATA,
-            vec![inject_kvmap(data)?, inject_expr_value(inner)?],
+            vec![inject_kvmap(data)?, inject_expr_value_at(inner, depth + 1)?],
             &data_bytes,
         )),
         ExprNode::Proj {
@@ -972,7 +982,7 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
             vec![
                 inject_name(struct_name),
                 inject_nat(*idx),
-                inject_expr_value(inner)?,
+                inject_expr_value_at(inner, depth + 1)?,
             ],
             &data_bytes,
         )),
@@ -980,56 +990,72 @@ fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
 }
 
 fn inject_name(name: &Name) -> Obj {
+    // Iterative on the parent chain: a 400-component Name is a legal
+    // native value, and the recursive form blew the host stack the same
+    // way the pre-bound projector did (FL-INV-07).
     if name.is_anonymous() {
         // Lean boxes a 0-field ctor as `lean_box(0)`. Olean write uses
         // the same encoding; a heap ctor tag 0 is convert-private and
         // would not survive a Lean-true Name walk.
         return Obj::mk_nat(0);
     }
-    let pre = inject_name(&name.parent());
-    match name.leaf_view() {
-        fln_core::name::LeafView::Str(text) => {
-            // Lean Name.str is (pre : Name) (s : String) plus the cached
-            // hash. Olean write already emits that scalar; without it a
-            // Lean-true walk at +24 panics or reads foreign bytes.
-            Obj::mk_ctor(
-                TAG_NAME_STR,
-                vec![pre, Obj::mk_string(text)],
-                &name.hash().to_le_bytes(),
-            )
-        }
-        fln_core::name::LeafView::Num(component) => {
-            // Lean Name.num is (pre : Name) (i : Nat) plus the cached hash.
-            // An inline u64 after one child is convert-private and would not
-            // survive a Lean-true Name walk (olean write already uses two
-            // object slots).
-            Obj::mk_ctor(
-                TAG_NAME_NUM,
-                vec![pre, inject_nat(component)],
-                &name.hash().to_le_bytes(),
-            )
-        }
-        fln_core::name::LeafView::Anonymous => unreachable!("parent is anonymous but leaf is not"),
+    let mut chain = Vec::new();
+    let mut cursor = name.clone();
+    while !cursor.is_anonymous() {
+        chain.push(cursor.clone());
+        cursor = cursor.parent();
     }
+    let mut current = Obj::mk_nat(0);
+    for component in chain.into_iter().rev() {
+        current = match component.leaf_view() {
+            fln_core::name::LeafView::Str(text) => Obj::mk_ctor(
+                TAG_NAME_STR,
+                vec![current, Obj::mk_string(text)],
+                &component.hash().to_le_bytes(),
+            ),
+            fln_core::name::LeafView::Num(component_num) => Obj::mk_ctor(
+                TAG_NAME_NUM,
+                vec![current, inject_nat(component_num)],
+                &component.hash().to_le_bytes(),
+            ),
+            fln_core::name::LeafView::Anonymous => {
+                unreachable!("parent is anonymous but leaf is not")
+            }
+        };
+    }
+    current
 }
 
 fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
+    inject_level_at(level, 0)
+}
+
+fn inject_level_at(level: &Level, depth: u32) -> Result<Obj, ConvertError> {
+    if depth >= MAX_WALK_DEPTH {
+        return Err(ConvertError::NativeOverflow { family: "level" });
+    }
     let data = level.data().0.to_le_bytes();
     match level.view() {
         fln_core::level::LevelView::Zero => Ok(Obj::mk_nat(0)),
         fln_core::level::LevelView::Succ(inner) => Ok(Obj::mk_ctor(
             TAG_LEVEL_SUCC,
-            vec![inject_level(inner)?],
+            vec![inject_level_at(inner, depth + 1)?],
             &data,
         )),
         fln_core::level::LevelView::Max(a, b) => Ok(Obj::mk_ctor(
             TAG_LEVEL_MAX,
-            vec![inject_level(a)?, inject_level(b)?],
+            vec![
+                inject_level_at(a, depth + 1)?,
+                inject_level_at(b, depth + 1)?,
+            ],
             &data,
         )),
         fln_core::level::LevelView::IMax(a, b) => Ok(Obj::mk_ctor(
             TAG_LEVEL_IMAX,
-            vec![inject_level(a)?, inject_level(b)?],
+            vec![
+                inject_level_at(a, depth + 1)?,
+                inject_level_at(b, depth + 1)?,
+            ],
             &data,
         )),
         fln_core::level::LevelView::Param(name) => Ok(Obj::mk_ctor(
