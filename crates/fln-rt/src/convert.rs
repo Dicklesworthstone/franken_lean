@@ -210,6 +210,26 @@ fn ctor_u64(obj: &Obj, byte_off: usize, family: &'static str) -> Result<u64, Con
     Ok(obj.ctor_scalar_u64(byte_off))
 }
 
+/// A Lean `Nat` object: tagged scalar or nonnegative mpz. Wider than `u64`
+/// cannot enter `Name::num` or a `u32` bvar index.
+fn nat_u64(obj: &Obj, family: &'static str) -> Result<u64, ConvertError> {
+    if obj.is_scalar() {
+        return Ok(obj.unbox() as u64);
+    }
+    if obj.obj_tag() != usize::from(abi::TAG_MPZ) {
+        return Err(malformed(family, "expected a Nat (scalar or mpz)"));
+    }
+    let (_, size, limbs) = obj.mpz_view();
+    if size < 0 {
+        return Err(malformed(family, "a natural number is negative"));
+    }
+    match limbs {
+        [] => Ok(0),
+        [limb] => Ok(*limb),
+        _ => Err(malformed(family, "Nat exceeds u64")),
+    }
+}
+
 /// A conversion scope: the accounting for one lazy boundary crossing.
 /// Creating one is free; dropping it without projecting allocates nothing.
 /// The dedup itself lives in the destination heap's interning, so the
@@ -274,12 +294,17 @@ impl Conversion {
         let tag = obj.obj_tag() as u8;
         match tag {
             TAG_EXPR_BVAR => {
-                // The convert subset stores the index as an inline u64.
+                // Lean `bvar` is one Nat child. Convert's own inject stores
+                // an inline u64 with `other == 0`. Both packings are live.
                 // Truncating with `as u32` turns `2^32 + 5` into `bvar(5)` —
                 // a fabricated term. `NativeOverflow` is the family the
                 // range covenant already uses when the index is merely too
                 // wide for `Expr::bvar`.
-                let index = ctor_u64(obj, 0, "expr")?;
+                let index = if obj.header().other >= 1 {
+                    nat_u64(&ctor_field(obj, 0, "expr")?, "expr")?
+                } else {
+                    ctor_u64(obj, 0, "expr")?
+                };
                 let index = u32::try_from(index)
                     .map_err(|_| ConvertError::NativeOverflow { family: "expr" })?;
                 Expr::bvar(index).map_err(|_| ConvertError::NativeOverflow { family: "expr" })
@@ -334,22 +359,16 @@ impl Conversion {
             }
             TAG_NAME_NUM => {
                 let header = obj.header();
-                if header.other >= 2 {
-                    // Lean's Name.num is (pre : Name) (i : Nat) plus a hash
-                    // scalar. Convert's subset is one child plus an inline
-                    // u64. Reading Lean-true packing through ctor_scalar_u64(8)
-                    // panics (floor is other*8 == 16).
-                    return Err(malformed(
-                        "name",
-                        "Name.num with two object children is the Lean ABI, not the convert subset",
-                    ));
-                }
                 let pre = self.name(&ctor_field(obj, 0, "name")?)?;
-                // One object child, then the u64 component. Offset 0 is the
-                // parent pointer; `ctor_scalar_u64` measures from obj_cptr
-                // and requires `offset >= other * 8`, so 0 panics (and would
-                // otherwise read the heap address as the component).
-                let component = ctor_u64(obj, 8, "name")?;
+                let component = if header.other >= 2 {
+                    // Lean: (pre : Name) (i : Nat) plus a cached hash scalar.
+                    nat_u64(&ctor_field(obj, 1, "name")?, "name")?
+                } else {
+                    // Convert subset: one child plus an inline u64. Offset 0
+                    // is the parent pointer; `ctor_scalar_u64` measures from
+                    // obj_cptr and requires `offset >= other * 8`.
+                    ctor_u64(obj, 8, "name")?
+                };
                 Ok(Name::num(pre, component))
             }
             other => Err(ConvertError::UnsupportedConstructor {

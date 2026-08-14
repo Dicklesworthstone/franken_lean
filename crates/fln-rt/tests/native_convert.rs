@@ -470,7 +470,7 @@ fn a_short_constructor_is_malformed_not_a_panic() {
 }
 
 #[test]
-fn a_lean_true_two_child_name_num_is_malformed_not_a_panic() {
+fn a_lean_true_two_child_name_num_projects_the_nat_child() {
     let mut heap = NativeHeap::new();
     let name = Obj::mk_ctor(
         2,
@@ -480,16 +480,27 @@ fn a_lean_true_two_child_name_num_is_malformed_not_a_panic() {
     let levels = Obj::mk_ctor(0, Vec::new(), &[]);
     let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
     let mut conversion = Conversion::new();
-    match conversion.project_expr(&mut heap, &konst) {
-        Err(ConvertError::MalformedCompat { family, reason }) => {
-            assert_eq!(family, "name");
-            assert!(
-                reason.contains("two object children"),
-                "Lean-true Name.num must be refused as the other packing, got {reason}"
-            );
-        }
-        other => panic!("Lean-true Name.num must not panic, got {other:?}"),
-    }
+    let handle = conversion
+        .project_expr(&mut heap, &konst)
+        .expect("Lean Name.num is two object children, not an inline u64");
+    let ExprNode::Const { name, .. } = heap.get(handle).expect("handle").node() else {
+        panic!("expected a const");
+    };
+    assert_eq!(name.to_display_string(), "foo.7");
+}
+
+#[test]
+fn a_lean_true_bvar_nat_child_projects() {
+    let mut heap = NativeHeap::new();
+    let bvar = Obj::mk_ctor(0, vec![Obj::mk_nat(3)], &[]);
+    let mut conversion = Conversion::new();
+    let handle = conversion
+        .project_expr(&mut heap, &bvar)
+        .expect("Lean bvar is a Nat child, not only an inline u64");
+    let ExprNode::BVar { idx } = heap.get(handle).expect("handle").node() else {
+        panic!("expected a bvar");
+    };
+    assert_eq!(*idx, 3);
 }
 
 #[test]
