@@ -192,6 +192,24 @@ fn ctor_field(obj: &Obj, i: usize, family: &'static str) -> Result<Obj, ConvertE
     Ok(obj.ctor_child(i))
 }
 
+/// `ctor_scalar_u64` asserts the offset is inside the scalar area. A missing
+/// bvar index or Name.num component is a malformed graph, not an abort.
+fn ctor_u64(obj: &Obj, byte_off: usize, family: &'static str) -> Result<u64, ConvertError> {
+    if obj.is_scalar() {
+        return Err(malformed(family, "a tagged scalar has no scalar area"));
+    }
+    let header = obj.header();
+    if header.tag > abi::TAG_MAX_CTOR_TAG {
+        return Err(malformed(family, "not a constructor object"));
+    }
+    let floor = usize::from(header.other) * 8;
+    let extent = usize::from(header.cs_sz).saturating_sub(8);
+    if byte_off < floor || byte_off + 8 > extent {
+        return Err(malformed(family, "constructor scalar is missing"));
+    }
+    Ok(obj.ctor_scalar_u64(byte_off))
+}
+
 /// A conversion scope: the accounting for one lazy boundary crossing.
 /// Creating one is free; dropping it without projecting allocates nothing.
 /// The dedup itself lives in the destination heap's interning, so the
@@ -261,7 +279,7 @@ impl Conversion {
                 // a fabricated term. `NativeOverflow` is the family the
                 // range covenant already uses when the index is merely too
                 // wide for `Expr::bvar`.
-                let index = obj.ctor_scalar_u64(0);
+                let index = ctor_u64(obj, 0, "expr")?;
                 let index = u32::try_from(index)
                     .map_err(|_| ConvertError::NativeOverflow { family: "expr" })?;
                 Expr::bvar(index).map_err(|_| ConvertError::NativeOverflow { family: "expr" })
@@ -331,12 +349,7 @@ impl Conversion {
                 // parent pointer; `ctor_scalar_u64` measures from obj_cptr
                 // and requires `offset >= other * 8`, so 0 panics (and would
                 // otherwise read the heap address as the component).
-                let floor = usize::from(header.other) * 8;
-                let extent = usize::from(header.cs_sz).saturating_sub(8);
-                if 8 < floor || 8 + 8 > extent {
-                    return Err(malformed("name", "Name.num scalar is missing"));
-                }
-                let component = obj.ctor_scalar_u64(8);
+                let component = ctor_u64(obj, 8, "name")?;
                 Ok(Name::num(pre, component))
             }
             other => Err(ConvertError::UnsupportedConstructor {

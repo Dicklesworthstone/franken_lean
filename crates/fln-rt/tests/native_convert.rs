@@ -413,6 +413,23 @@ fn lean_box0_nullary_constructors_project_as_anonymous_zero_and_nil() {
 }
 
 #[test]
+fn a_bvar_with_no_scalar_bytes_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let bvar = Obj::mk_ctor(0, Vec::new(), &[]);
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &bvar) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "expr");
+            assert!(
+                reason.contains("scalar"),
+                "a bvar without an index word must name the missing scalar, got {reason}"
+            );
+        }
+        other => panic!("a 0-byte bvar must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_short_constructor_is_malformed_not_a_panic() {
     let mut heap = NativeHeap::new();
     // Expr.app needs two children; zero fields used to assert in ctor_child.
