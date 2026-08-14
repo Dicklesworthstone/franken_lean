@@ -4076,24 +4076,36 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
         }
         None
     }
-    fn go(t: &Expr, s: &Expr, path: String) -> Option<String> {
-        if t == s {
+    // Infer already walks app / let / binder spines on the heap. A mismatch
+    // diagnostic that recursed one frame per node would abort the rejection
+    // that found them (FL-INV-07). Descend the first differing child in place;
+    // siblings that the recursive form only visited after `None` are tried
+    // only when the earlier child is equal.
+    let mut current_t = t;
+    let mut current_s = s;
+    let mut path = String::from("root");
+    loop {
+        if current_t == current_s {
             return None;
         }
-        match (t.node(), s.node()) {
+        match (current_t.node(), current_s.node()) {
             (ExprNode::BVar { idx: i1 }, ExprNode::BVar { idx: i2 }) => {
-                Some(format!("{path}: #{i1} vs #{i2}"))
+                return Some(format!("{path}: #{i1} vs #{i2}"));
             }
-            (ExprNode::FVar { id: id1 }, ExprNode::FVar { id: id2 }) => Some(format!(
-                "{path}: fvar {} vs {}",
-                id1.0.to_display_string(),
-                id2.0.to_display_string()
-            )),
-            (ExprNode::Sort { level: l1 }, ExprNode::Sort { level: l2 }) => Some(format!(
-                "{path}: Sort {} vs {}",
-                level_shape(l1),
-                level_shape(l2)
-            )),
+            (ExprNode::FVar { id: id1 }, ExprNode::FVar { id: id2 }) => {
+                return Some(format!(
+                    "{path}: fvar {} vs {}",
+                    id1.0.to_display_string(),
+                    id2.0.to_display_string()
+                ));
+            }
+            (ExprNode::Sort { level: l1 }, ExprNode::Sort { level: l2 }) => {
+                return Some(format!(
+                    "{path}: Sort {} vs {}",
+                    level_shape(l1),
+                    level_shape(l2)
+                ));
+            }
             (
                 ExprNode::Const {
                     name: n1,
@@ -4104,7 +4116,7 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                     levels: l2,
                 },
             ) => {
-                if n1 != n2 {
+                return if n1 != n2 {
                     Some(format!(
                         "{path}: const {} vs {}",
                         n1.to_display_string(),
@@ -4113,10 +4125,18 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                 } else {
                     levels_diff(&path, l1, l2)
                         .or_else(|| Some(format!("{path}: consts differ undetectably")))
-                }
+                };
             }
             (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) => {
-                go(f1, f2, format!("{path}.fn")).or_else(|| go(a1, a2, format!("{path}.arg")))
+                if f1 != f2 {
+                    current_t = f1;
+                    current_s = f2;
+                    path.push_str(".fn");
+                    continue;
+                }
+                current_t = a1;
+                current_s = a2;
+                path.push_str(".arg");
             }
             (
                 ExprNode::Lam {
@@ -4156,8 +4176,15 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                         n2.to_display_string()
                     ));
                 }
-                go(t1, t2, format!("{path}.binder_type"))
-                    .or_else(|| go(b1, b2, format!("{path}.body")))
+                if t1 != t2 {
+                    current_t = t1;
+                    current_s = t2;
+                    path.push_str(".binder_type");
+                    continue;
+                }
+                current_t = b1;
+                current_s = b2;
+                path.push_str(".body");
             }
             (
                 ExprNode::LetE {
@@ -4172,17 +4199,43 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                     body: b2,
                     ..
                 },
-            ) => go(t1, t2, format!("{path}.let_type"))
-                .or_else(|| go(v1, v2, format!("{path}.let_value")))
-                .or_else(|| go(b1, b2, format!("{path}.let_body"))),
-            (ExprNode::MData { expr: e1, .. }, ExprNode::MData { expr: e2, .. }) => {
-                go(e1, e2, format!("{path}.mdata"))
-                    .or_else(|| Some(format!("{path}: metadata payloads differ")))
+            ) => {
+                if t1 != t2 {
+                    current_t = t1;
+                    current_s = t2;
+                    path.push_str(".let_type");
+                    continue;
+                }
+                if v1 != v2 {
+                    current_t = v1;
+                    current_s = v2;
+                    path.push_str(".let_value");
+                    continue;
+                }
+                current_t = b1;
+                current_s = b2;
+                path.push_str(".let_body");
             }
-            (ExprNode::MData { expr, .. }, _) => go(expr, s, path.clone())
-                .or_else(|| Some(format!("{path}: metadata wrapper on the left only"))),
-            (_, ExprNode::MData { expr, .. }) => go(t, expr, path.clone())
-                .or_else(|| Some(format!("{path}: metadata wrapper on the right only"))),
+            (ExprNode::MData { expr: e1, .. }, ExprNode::MData { expr: e2, .. }) => {
+                if e1 == e2 {
+                    return Some(format!("{path}: metadata payloads differ"));
+                }
+                current_t = e1;
+                current_s = e2;
+                path.push_str(".mdata");
+            }
+            (ExprNode::MData { expr, .. }, _) => {
+                if expr == current_s {
+                    return Some(format!("{path}: metadata wrapper on the left only"));
+                }
+                current_t = expr;
+            }
+            (_, ExprNode::MData { expr, .. }) => {
+                if current_t == expr {
+                    return Some(format!("{path}: metadata wrapper on the right only"));
+                }
+                current_s = expr;
+            }
             (
                 ExprNode::Proj {
                     struct_name: n1,
@@ -4196,34 +4249,36 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                 },
             ) => {
                 if n1 != n2 || i1 != i2 {
-                    Some(format!(
+                    return Some(format!(
                         "{path}: proj {}.{} vs {}.{}",
                         n1.to_display_string(),
                         i1,
                         n2.to_display_string(),
                         i2
-                    ))
-                } else {
-                    go(e1, e2, format!("{path}.proj_expr"))
+                    ));
                 }
+                current_t = e1;
+                current_s = e2;
+                path.push_str(".proj_expr");
             }
             (ExprNode::Lit { literal: l1 }, ExprNode::Lit { literal: l2 }) => {
-                (l1 != l2).then(|| {
+                return (l1 != l2).then(|| {
                     format!(
                         "{path}: literal {} vs {}",
-                        brief_expr(t, 1),
-                        brief_expr(s, 1)
+                        brief_expr(current_t, 1),
+                        brief_expr(current_s, 1)
                     )
-                })
+                });
             }
-            (t_node, s_node) => Some(format!(
-                "{path}: node kind {} vs {}",
-                node_kind_name(t_node),
-                node_kind_name(s_node)
-            )),
+            (t_node, s_node) => {
+                return Some(format!(
+                    "{path}: node kind {} vs {}",
+                    node_kind_name(t_node),
+                    node_kind_name(s_node)
+                ));
+            }
         }
     }
-    go(t, s, "root".to_string())
 }
 
 fn node_kind_name(node: &ExprNode) -> &'static str {
@@ -4918,6 +4973,48 @@ mod tests {
         assert!(
             report.contains("param:u") && report.contains("param:v"),
             "the diagnostic must still name both parameters: {report}"
+        );
+    }
+
+    #[test]
+    fn first_divergence_walks_deep_app_and_let_spines_without_stack_fault() {
+        let zero = Expr::bvar(0).expect("packs");
+        let one = Expr::bvar(1).expect("packs");
+        let mut left = zero.clone();
+        let mut right = one.clone();
+        for _ in 0..400 {
+            left = Expr::app(left, zero.clone());
+            right = Expr::app(right, zero.clone());
+        }
+        let report = first_divergence(&left, &right).expect("deep app heads differ");
+        assert!(
+            report.contains("#0 vs #1") && report.contains(".fn"),
+            "the difference is at the head of the fn spine: {report}"
+        );
+
+        let name = Name::str(Name::anonymous(), "x");
+        let ty = Expr::sort(Level::zero());
+        let val = Expr::sort(Level::zero());
+        let mut left = zero;
+        let mut right = one;
+        for _ in 0..400 {
+            left = Expr::let_e(name.clone(), ty.clone(), val.clone(), left, false);
+            right = Expr::let_e(name.clone(), ty.clone(), val.clone(), right, false);
+        }
+        let report = first_divergence(&left, &right).expect("deep let bodies differ");
+        assert!(
+            report.contains("#0 vs #1") && report.contains(".let_body"),
+            "the difference is at the end of the let spine: {report}"
+        );
+
+        let same = Expr::app(Expr::bvar(0).expect("packs"), Expr::bvar(1).expect("packs"));
+        assert_eq!(first_divergence(&same, &same), None);
+        let arg_left = Expr::app(Expr::bvar(0).expect("packs"), Expr::bvar(0).expect("packs"));
+        let arg_right = Expr::app(Expr::bvar(0).expect("packs"), Expr::bvar(1).expect("packs"));
+        let report = first_divergence(&arg_left, &arg_right).expect("args differ");
+        assert!(
+            report.contains(".arg") && report.contains("#0 vs #1"),
+            "equal heads must fall through to the argument: {report}"
         );
     }
 
