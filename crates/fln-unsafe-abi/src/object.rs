@@ -456,6 +456,10 @@ pub(crate) unsafe fn string_fields(o: *mut LeanObject) -> (usize, usize, usize, 
         let size = (&raw const (*s).m_size).read();
         let cap = (&raw const (*s).m_capacity).read();
         let len = (&raw const (*s).m_length).read();
+        // Refuse a lying `m_size` before forming the slice. C ABI callers
+        // still abort here (the pin also trusts the header); product
+        // paths go through `Obj::try_string_view` instead.
+        assert!(size > 0 && size <= cap, "string header is consistent");
         let data = (&raw const (*s).m_data).cast::<u8>();
         let copy = core::slice::from_raw_parts(data, size).to_vec();
         (size, cap, len, copy)

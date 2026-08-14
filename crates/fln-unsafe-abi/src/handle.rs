@@ -387,11 +387,77 @@ impl Obj {
         unsafe { object::ctor_get_scalar::<u64>(self.0, byte_off) }
     }
 
+    /// Fallible string view `(size, capacity, length, bytes-with-NUL)`.
+    ///
+    /// Returns `None` when the handle is not a string or the header is
+    /// inconsistent (`m_size == 0`, `m_size` past `m_capacity`, missing
+    /// NUL). Product paths that accept untrusted objects must use this;
+    /// [`string_view`] still asserts. Inflating both `m_size` and
+    /// `m_capacity` past the minted allocation remains outside this check
+    /// (same residual as [`try_mpz_view`]): the test plants `m_size` only,
+    /// so Drop still frees with the real `m_capacity`.
+    pub fn try_string_view(&self) -> Option<(usize, usize, usize, Vec<u8>)> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_STRING) {
+            return None;
+        }
+        // SAFETY: tag is TAG_STRING, so the object is a LeanStringObject.
+        // `m_size <= m_capacity` is the inline-buffer law: the minted
+        // data area is `m_capacity` bytes. Copying `m_size` after that
+        // check cannot run past the header's own capacity claim.
+        unsafe {
+            let s = self.0.cast::<crate::layout::LeanStringObject>();
+            let size = (&raw const (*s).m_size).read();
+            let cap = (&raw const (*s).m_capacity).read();
+            let len = (&raw const (*s).m_length).read();
+            if size == 0 || size > cap {
+                return None;
+            }
+            let data = (&raw const (*s).m_data).cast::<u8>();
+            let copy = core::slice::from_raw_parts(data, size).to_vec();
+            if copy[size - 1] != 0 {
+                return None;
+            }
+            Some((size, cap, len, copy))
+        }
+    }
+
     /// String salient facts `(size, capacity, length, bytes-with-NUL)`.
     pub fn string_view(&self) -> (usize, usize, usize, Vec<u8>) {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_STRING));
-        // SAFETY: invariant + tag assertion.
-        unsafe { object::string_fields(self.0) }
+        self.try_string_view().expect("string header is consistent")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_string_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_STRING));
+        // SAFETY: tag is TAG_STRING; test-only header vandalism.
+        unsafe {
+            let s = self.0.cast::<crate::layout::LeanStringObject>();
+            (*s).m_size = size;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_string_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_STRING));
+        // SAFETY: tag is TAG_STRING; restores the planted header so Drop frees.
+        unsafe {
+            let s = self.0.cast::<crate::layout::LeanStringObject>();
+            (*s).m_size = size;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_string_terminator(&self, byte: u8) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_STRING));
+        // SAFETY: tag is TAG_STRING; writes the last claimed data byte.
+        unsafe {
+            let s = self.0.cast::<crate::layout::LeanStringObject>();
+            let size = (*s).m_size;
+            assert!(size > 0);
+            let data = (&raw mut (*s).m_data).cast::<u8>();
+            data.add(size - 1).write(byte);
+        }
     }
 
     /// Array `(size, capacity)`.

@@ -3212,10 +3212,9 @@ fn invoke_intrinsic(
             if value_kind(&args[0]) != ValueKind::String {
                 return Err(type_mismatch("String.length", 0, "String", &args[0]).into());
             }
-            let (size, _, length, bytes) = args[0].string_view();
-            if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
+            let Some((size, _, length, bytes)) = args[0].try_string_view() else {
                 return Err(VmRefusal::InvalidStringObject.into());
-            }
+            };
             if std::str::from_utf8(&bytes[..size - 1]).is_err() {
                 return Err(VmRefusal::InvalidStringObject.into());
             }
@@ -3749,10 +3748,9 @@ fn string_value(
     if value_kind(value) != ValueKind::String {
         return Err(type_mismatch(operation, argument, "String", value));
     }
-    let (size, _, _, bytes) = value.string_view();
-    if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
+    let Some((size, _, _, bytes)) = value.try_string_view() else {
         return Err(VmRefusal::InvalidStringObject);
-    }
+    };
     std::str::from_utf8(&bytes[..size - 1])
         .map(str::to_string)
         .map_err(|_| VmRefusal::InvalidStringObject)

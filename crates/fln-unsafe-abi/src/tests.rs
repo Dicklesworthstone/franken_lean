@@ -622,6 +622,48 @@ fn try_mpz_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn try_string_view_refuses_hostile_headers() {
+    let _g = lock();
+    let well = Obj::mk_string("hi");
+    let (size, cap, len, bytes) = well
+        .try_string_view()
+        .expect("a well-formed string is viewable");
+    assert_eq!((size, cap, len), (3, 3, 2));
+    assert_eq!(&bytes[..size - 1], b"hi");
+    assert_eq!(bytes[size - 1], 0);
+
+    assert!(
+        Obj::mk_nat(3).try_string_view().is_none(),
+        "a scalar is not a string"
+    );
+    assert!(
+        Obj::mk_mpz(&[7], false).try_string_view().is_none(),
+        "an mpz is not a string"
+    );
+
+    well.plant_string_size(0);
+    assert!(
+        well.try_string_view().is_none(),
+        "a zero m_size is not a view"
+    );
+    well.restore_string_size(3);
+
+    well.plant_string_size(4);
+    assert!(
+        well.try_string_view().is_none(),
+        "m_size past m_capacity is not a view"
+    );
+    well.restore_string_size(3);
+
+    well.plant_string_terminator(b'x');
+    assert!(
+        well.try_string_view().is_none(),
+        "a missing NUL terminator is not a view"
+    );
+    well.plant_string_terminator(0);
+}
+
+#[test]
 fn external_finalizer_runs_exactly_once() {
     let _g = lock();
     let before = EXTERNAL_FINALIZED.load(Ordering::SeqCst);

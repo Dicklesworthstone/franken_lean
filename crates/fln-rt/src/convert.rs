@@ -994,23 +994,22 @@ impl Conversion {
             ));
         }
         if obj.obj_tag() != usize::from(abi::TAG_STRING) {
-            // `string_view` asserts the string tag. Name.str's second
+            // `try_string_view` refuses a non-string. Name.str's second
             // child being a ctor is a malformed name, not a panic.
             return Err(malformed("string", "expected a string object"));
         }
-        // `string_view` is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
+        // `try_string_view` is `(m_size, m_capacity, m_length, bytes-with-NUL)`.
         // `m_length` is the UTF-8 scalar count, the same field
         // `lean_string_length` boxes. Slicing the buffer with it treats
         // "héllo" (5 scalars, 6 payload bytes) as a 5-byte string and
         // silently drops the last character — or splits a multi-byte
         // scalar and fails UTF-8. The payload is `m_size - 1` bytes.
-        let (size, _, length, bytes) = obj.string_view();
-        if size == 0 || size > bytes.len() || bytes[size - 1] != 0 {
-            return Err(malformed(
-                "string",
-                "missing NUL terminator or size past the buffer",
-            ));
-        }
+        // Header laws (`m_size == 0`, `m_size > m_capacity`, missing NUL)
+        // are refused before the copy; the checks below are the payload
+        // laws that still need the bytes in hand.
+        let Some((size, _, length, bytes)) = obj.try_string_view() else {
+            return Err(malformed("string", "hostile or inconsistent string header"));
+        };
         let content = std::str::from_utf8(&bytes[..size - 1])
             .map_err(|_| malformed("string", "invalid UTF-8"))?;
         if content.chars().count() != length {

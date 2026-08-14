@@ -1009,7 +1009,12 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                         out.extend_from_slice(&w.to_le_bytes());
                     }
                 } else if h.tag == abi::TAG_STRING {
-                    let (size, _, length, data) = o.string_view();
+                    let Some((size, _, length, data)) = o.try_string_view() else {
+                        return Err(RegionFault::StringIntegrity {
+                            offset: offset as usize,
+                            reason: "hostile or inconsistent string header",
+                        });
+                    };
                     emit_header(&mut out, STRING_FIXED + size, h.tag, 0);
                     out.extend_from_slice(&(size as u64).to_le_bytes());
                     out.extend_from_slice(&(size as u64).to_le_bytes());

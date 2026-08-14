@@ -65,6 +65,7 @@ row FLN-BX-0038 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_retag | (&self, 
 row FLN-BX-0039 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_set_u64 | (&self, usize, u64) | ctor_retag_and_scalar_write | scalar-area write, offset law asserted
 row FLN-BX-0040 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_u64 | (&self, usize) -> u64 | ctor scalar suites; C4 scalar facts | value copy
 row FLN-BX-0041 | crates/fln-unsafe-abi/src/handle.rs | fn string_view | (&self) -> (usize, usize, usize, Vec<u8>) | string_facts_utf8 | data copies
+row FLN-BX-0083 | crates/fln-unsafe-abi/src/handle.rs | fn try_string_view | (&self) -> Option<(usize, usize, usize, Vec<u8>)> | try_string_view_refuses_hostile_headers | owned byte copies, or None; no raw pointer, owned authority, or kernel type escapes
 row FLN-BX-0042 | crates/fln-unsafe-abi/src/handle.rs | fn array_view | (&self) -> (usize, usize) | array suites | value copies
 row FLN-BX-0043 | crates/fln-unsafe-abi/src/handle.rs | fn array_child | (&self, usize) -> Obj | array suites | inc-before-escape; returns owned handle
 row FLN-BX-0044 | crates/fln-unsafe-abi/src/handle.rs | fn mpz_view | (&self) -> (i32, i32, &[u64]) | mpz zero-copy identity + roundtrip | immutable slice lifetime is bound to the owning Obj; no raw pointer or owned authority escapes
