@@ -385,6 +385,75 @@ fn a_name_str_whose_text_is_not_a_string_is_malformed_not_a_panic() {
 }
 
 #[test]
+fn lean_box0_nullary_constructors_project_as_anonymous_zero_and_nil() {
+    let mut heap = NativeHeap::new();
+    // Lean Name.anonymous / Level.zero / List.nil are lean_box(0).
+    let name = Obj::mk_nat(0);
+    let levels = Obj::mk_nat(0);
+    let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
+    let mut conversion = Conversion::new();
+    let handle = conversion
+        .project_expr(&mut heap, &konst)
+        .expect("Lean-true nullary names and lists must project");
+    let ExprNode::Const { name, levels } = heap.get(handle).expect("handle").node() else {
+        panic!("expected a const");
+    };
+    assert!(name.is_anonymous(), "box(0) is Name.anonymous");
+    assert!(levels.is_empty(), "box(0) is List.nil");
+
+    let sort = Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &[]);
+    let mut conversion = Conversion::new();
+    let handle = conversion
+        .project_expr(&mut heap, &sort)
+        .expect("Lean-true Level.zero must project");
+    let ExprNode::Sort { level } = heap.get(handle).expect("handle").node() else {
+        panic!("expected a sort");
+    };
+    assert!(level.is_zero(), "box(0) is Level.zero");
+}
+
+#[test]
+fn a_short_constructor_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    // Expr.app needs two children; zero fields used to assert in ctor_child.
+    let app = Obj::mk_ctor(5, Vec::new(), &[]);
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &app) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "expr");
+            assert!(
+                reason.contains("fields"),
+                "a short ctor must name the missing field, got {reason}"
+            );
+        }
+        other => panic!("a 0-field app must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_lean_true_two_child_name_num_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let name = Obj::mk_ctor(
+        2,
+        vec![mk_name(&["foo"]), Obj::mk_nat(7)],
+        &0u64.to_le_bytes(),
+    );
+    let levels = Obj::mk_ctor(0, Vec::new(), &[]);
+    let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &konst) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "name");
+            assert!(
+                reason.contains("two object children"),
+                "Lean-true Name.num must be refused as the other packing, got {reason}"
+            );
+        }
+        other => panic!("Lean-true Name.num must not panic, got {other:?}"),
+    }
+}
+
+#[test]
 fn injecting_an_out_of_subset_constructor_is_refused_not_a_panic() {
     let mut heap = NativeHeap::new();
     let ty = Expr::sort(Level::zero());

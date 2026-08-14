@@ -161,6 +161,37 @@ fn malformed(family: &'static str, reason: impl Into<String>) -> ConvertError {
     }
 }
 
+/// Lean boxes a nullary constructor as `lean_box(ctorIdx)`. `Name.anonymous`,
+/// `Level.zero`, and `List.nil` are all ctor 0, so they share the small-Nat
+/// 0 bit pattern. Convert's own inject still uses a 0-field heap ctor;
+/// projection must accept both, or a Lean-true graph is refused as malformed.
+fn lean_box0(obj: &Obj) -> bool {
+    obj.is_scalar() && obj.unbox() == 0
+}
+
+/// `ctor_child` asserts arity. Convert's public project path promised a
+/// typed `ConvertError` and never a panic, so a short constructor is a
+/// malformed graph, not an invariant failure.
+fn ctor_field(obj: &Obj, i: usize, family: &'static str) -> Result<Obj, ConvertError> {
+    if obj.is_scalar() {
+        return Err(malformed(
+            family,
+            "a tagged scalar has no constructor fields",
+        ));
+    }
+    let header = obj.header();
+    if header.tag > abi::TAG_MAX_CTOR_TAG {
+        return Err(malformed(family, "not a constructor object"));
+    }
+    if i >= usize::from(header.other) {
+        return Err(malformed(
+            family,
+            format!("constructor has {} fields, needed field {i}", header.other),
+        ));
+    }
+    Ok(obj.ctor_child(i))
+}
+
 /// A conversion scope: the accounting for one lazy boundary crossing.
 /// Creating one is free; dropping it without projecting allocates nothing.
 /// The dedup itself lives in the destination heap's interning, so the
@@ -236,16 +267,16 @@ impl Conversion {
                 Expr::bvar(index).map_err(|_| ConvertError::NativeOverflow { family: "expr" })
             }
             TAG_EXPR_FVAR => {
-                let name = self.name(&obj.ctor_child(0))?;
+                let name = self.name(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::fvar(fln_core::expr::FVarId(name)))
             }
             TAG_EXPR_SORT => {
-                let level = self.level(&obj.ctor_child(0))?;
+                let level = self.level(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::sort(level))
             }
             TAG_EXPR_CONST => {
-                let name = self.name(&obj.ctor_child(0))?;
-                let levels = self.level_list(&obj.ctor_child(1))?;
+                let name = self.name(&ctor_field(obj, 0, "expr")?)?;
+                let levels = self.level_list(&ctor_field(obj, 1, "expr")?)?;
                 Ok(Expr::const_(name, levels))
             }
             TAG_EXPR_APP => {
@@ -254,7 +285,7 @@ impl Conversion {
                 Ok(Expr::app(f, a))
             }
             TAG_EXPR_LIT => {
-                let literal = self.literal(&obj.ctor_child(0))?;
+                let literal = self.literal(&ctor_field(obj, 0, "expr")?)?;
                 Ok(Expr::lit(literal))
             }
             other => Err(ConvertError::UnsupportedConstructor {
@@ -265,27 +296,46 @@ impl Conversion {
     }
 
     fn project_expr_child(&mut self, obj: &Obj, i: usize) -> Result<Expr, ConvertError> {
-        let child = obj.ctor_child(i);
+        let child = ctor_field(obj, i, "expr")?;
         self.expr(&child)
     }
 
     fn name(&mut self, obj: &Obj) -> Result<Name, ConvertError> {
+        if lean_box0(obj) {
+            return Ok(Name::anonymous());
+        }
         if obj.is_scalar() {
             return Err(malformed("name", "a tagged scalar is not a name object"));
         }
         match obj.obj_tag() as u8 {
             TAG_NAME_ANONYMOUS => Ok(Name::anonymous()),
             TAG_NAME_STR => {
-                let pre = self.name(&obj.ctor_child(0))?;
-                let text = self.string(&obj.ctor_child(1))?;
+                let pre = self.name(&ctor_field(obj, 0, "name")?)?;
+                let text = self.string(&ctor_field(obj, 1, "name")?)?;
                 Ok(Name::str(pre, text))
             }
             TAG_NAME_NUM => {
-                let pre = self.name(&obj.ctor_child(0))?;
+                let header = obj.header();
+                if header.other >= 2 {
+                    // Lean's Name.num is (pre : Name) (i : Nat) plus a hash
+                    // scalar. Convert's subset is one child plus an inline
+                    // u64. Reading Lean-true packing through ctor_scalar_u64(8)
+                    // panics (floor is other*8 == 16).
+                    return Err(malformed(
+                        "name",
+                        "Name.num with two object children is the Lean ABI, not the convert subset",
+                    ));
+                }
+                let pre = self.name(&ctor_field(obj, 0, "name")?)?;
                 // One object child, then the u64 component. Offset 0 is the
                 // parent pointer; `ctor_scalar_u64` measures from obj_cptr
                 // and requires `offset >= other * 8`, so 0 panics (and would
                 // otherwise read the heap address as the component).
+                let floor = usize::from(header.other) * 8;
+                let extent = usize::from(header.cs_sz).saturating_sub(8);
+                if 8 < floor || 8 + 8 > extent {
+                    return Err(malformed("name", "Name.num scalar is missing"));
+                }
                 let component = obj.ctor_scalar_u64(8);
                 Ok(Name::num(pre, component))
             }
@@ -297,29 +347,32 @@ impl Conversion {
     }
 
     fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
+        if lean_box0(obj) {
+            return Ok(Level::zero());
+        }
         if obj.is_scalar() {
             return Err(malformed("level", "a tagged scalar is not a level object"));
         }
         match obj.obj_tag() as u8 {
             TAG_LEVEL_ZERO => Ok(Level::zero()),
             TAG_LEVEL_SUCC => {
-                let inner = self.level(&obj.ctor_child(0))?;
+                let inner = self.level(&ctor_field(obj, 0, "level")?)?;
                 inner
                     .succ()
                     .map_err(|_| ConvertError::NativeOverflow { family: "level" })
             }
             TAG_LEVEL_MAX => {
-                let a = self.level(&obj.ctor_child(0))?;
-                let b = self.level(&obj.ctor_child(1))?;
+                let a = self.level(&ctor_field(obj, 0, "level")?)?;
+                let b = self.level(&ctor_field(obj, 1, "level")?)?;
                 Level::max(a, b).map_err(|_| ConvertError::NativeOverflow { family: "level" })
             }
             TAG_LEVEL_IMAX => {
-                let a = self.level(&obj.ctor_child(0))?;
-                let b = self.level(&obj.ctor_child(1))?;
+                let a = self.level(&ctor_field(obj, 0, "level")?)?;
+                let b = self.level(&ctor_field(obj, 1, "level")?)?;
                 Level::imax(a, b).map_err(|_| ConvertError::NativeOverflow { family: "level" })
             }
             TAG_LEVEL_PARAM => {
-                let name = self.name(&obj.ctor_child(0))?;
+                let name = self.name(&ctor_field(obj, 0, "level")?)?;
                 Ok(Level::param(name))
             }
             other => Err(ConvertError::UnsupportedConstructor {
@@ -338,7 +391,7 @@ impl Conversion {
         }
         match obj.obj_tag() as u8 {
             TAG_LIT_NAT => {
-                let payload = obj.ctor_child(0);
+                let payload = ctor_field(obj, 0, "literal")?;
                 if payload.is_scalar() {
                     Ok(Literal::Nat(NatLit::from_u64(payload.unbox() as u64)))
                 } else if payload.obj_tag() != usize::from(abi::TAG_MPZ) {
@@ -366,7 +419,7 @@ impl Conversion {
                 }
             }
             TAG_LIT_STR => {
-                let text = self.string(&obj.ctor_child(0))?;
+                let text = self.string(&ctor_field(obj, 0, "literal")?)?;
                 Ok(Literal::Str(text))
             }
             other => Err(ConvertError::UnsupportedConstructor {
@@ -380,15 +433,17 @@ impl Conversion {
         let mut out = Vec::new();
         let mut cursor = obj.clone_ref();
         loop {
+            if lean_box0(&cursor) {
+                return Ok(out);
+            }
             if cursor.is_scalar() {
                 return Err(malformed("level-list", "the list ends in a scalar"));
             }
             match cursor.obj_tag() as u8 {
                 TAG_LIST_NIL => return Ok(out),
                 TAG_LIST_CONS => {
-                    out.push(self.level(&cursor.ctor_child(0))?);
-                    let tail = cursor.ctor_child(1);
-                    cursor = tail;
+                    out.push(self.level(&ctor_field(&cursor, 0, "level-list")?)?);
+                    cursor = ctor_field(&cursor, 1, "level-list")?;
                 }
                 other => {
                     return Err(ConvertError::UnsupportedConstructor {
