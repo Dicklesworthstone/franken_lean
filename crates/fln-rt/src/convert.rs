@@ -44,6 +44,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
@@ -898,7 +900,7 @@ fn inject_expr_value_at(expr: &Expr, depth: u32) -> Result<Obj, ConvertError> {
         )),
         ExprNode::Sort { level } => Ok(Obj::mk_ctor(
             TAG_EXPR_SORT,
-            vec![inject_level_at(level, depth + 1)?],
+            vec![inject_level(level)?],
             &data_bytes,
         )),
         ExprNode::Const { name, levels } => Ok(Obj::mk_ctor(
@@ -1027,48 +1029,76 @@ fn inject_name(name: &Name) -> Obj {
 }
 
 fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
-    inject_level_at(level, 0)
-}
-
-fn inject_level_at(level: &Level, depth: u32) -> Result<Obj, ConvertError> {
-    if depth >= MAX_WALK_DEPTH {
-        return Err(ConvertError::NativeOverflow { family: "level" });
+    // Iterative post-order: Level.depth is 24-bit, so a succ tower can
+    // legally exceed the 256-frame host-stack ceiling that still bounds
+    // the recursive expr projector.
+    let mut done: HashMap<Level, Obj> = HashMap::new();
+    let mut stack = vec![(level.clone(), false)];
+    while let Some((current, exit)) = stack.pop() {
+        if done.contains_key(&current) {
+            continue;
+        }
+        if !exit {
+            stack.push((current.clone(), true));
+            match current.view() {
+                fln_core::level::LevelView::Zero
+                | fln_core::level::LevelView::Param(_)
+                | fln_core::level::LevelView::MVar(_) => {}
+                fln_core::level::LevelView::Succ(child) => stack.push((child.clone(), false)),
+                fln_core::level::LevelView::Max(a, b) | fln_core::level::LevelView::IMax(a, b) => {
+                    stack.push((b.clone(), false));
+                    stack.push((a.clone(), false));
+                }
+            }
+            continue;
+        }
+        let data = current.data().0.to_le_bytes();
+        let object = match current.view() {
+            fln_core::level::LevelView::Zero => Obj::mk_nat(0),
+            fln_core::level::LevelView::Succ(child) => {
+                let inner = done.get(child).ok_or_else(|| {
+                    malformed("level", "succ child was not encoded before its parent")
+                })?;
+                Obj::mk_ctor(TAG_LEVEL_SUCC, vec![inner.clone_ref()], &data)
+            }
+            fln_core::level::LevelView::Max(a, b) => {
+                let left = done
+                    .get(a)
+                    .ok_or_else(|| malformed("level", "max left was not encoded"))?;
+                let right = done
+                    .get(b)
+                    .ok_or_else(|| malformed("level", "max right was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_LEVEL_MAX,
+                    vec![left.clone_ref(), right.clone_ref()],
+                    &data,
+                )
+            }
+            fln_core::level::LevelView::IMax(a, b) => {
+                let left = done
+                    .get(a)
+                    .ok_or_else(|| malformed("level", "imax left was not encoded"))?;
+                let right = done
+                    .get(b)
+                    .ok_or_else(|| malformed("level", "imax right was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_LEVEL_IMAX,
+                    vec![left.clone_ref(), right.clone_ref()],
+                    &data,
+                )
+            }
+            fln_core::level::LevelView::Param(name) => {
+                Obj::mk_ctor(TAG_LEVEL_PARAM, vec![inject_name(name)], &data)
+            }
+            fln_core::level::LevelView::MVar(id) => {
+                Obj::mk_ctor(TAG_LEVEL_MVAR, vec![inject_name(&id.0)], &data)
+            }
+        };
+        done.insert(current, object);
     }
-    let data = level.data().0.to_le_bytes();
-    match level.view() {
-        fln_core::level::LevelView::Zero => Ok(Obj::mk_nat(0)),
-        fln_core::level::LevelView::Succ(inner) => Ok(Obj::mk_ctor(
-            TAG_LEVEL_SUCC,
-            vec![inject_level_at(inner, depth + 1)?],
-            &data,
-        )),
-        fln_core::level::LevelView::Max(a, b) => Ok(Obj::mk_ctor(
-            TAG_LEVEL_MAX,
-            vec![
-                inject_level_at(a, depth + 1)?,
-                inject_level_at(b, depth + 1)?,
-            ],
-            &data,
-        )),
-        fln_core::level::LevelView::IMax(a, b) => Ok(Obj::mk_ctor(
-            TAG_LEVEL_IMAX,
-            vec![
-                inject_level_at(a, depth + 1)?,
-                inject_level_at(b, depth + 1)?,
-            ],
-            &data,
-        )),
-        fln_core::level::LevelView::Param(name) => Ok(Obj::mk_ctor(
-            TAG_LEVEL_PARAM,
-            vec![inject_name(name)],
-            &data,
-        )),
-        fln_core::level::LevelView::MVar(id) => Ok(Obj::mk_ctor(
-            TAG_LEVEL_MVAR,
-            vec![inject_name(&id.0)],
-            &data,
-        )),
-    }
+    done.get(level)
+        .map(Obj::clone_ref)
+        .ok_or_else(|| malformed("level", "level was not encoded"))
 }
 
 fn inject_nat(value: u64) -> Obj {
