@@ -107,11 +107,11 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
-/// Recursion ceiling for expr injection. Name, Level, and expr projection
-/// are iterative (a 400-component Name and a 400-deep app nest are legal;
-/// Level.depth is 24-bit). The kernel walk is 2048, but inject frames are
-/// large enough that a debug host stack dies first; 256 stays typed
-/// (FL-INV-07) with room under a 2 MiB stack.
+/// Recursion ceiling kept by `enter` if a walk family grows a frame again.
+/// Name, Level, and Expr projection and injection are iterative (a
+/// 400-component Name and a 400-deep app nest are legal; Level.depth is
+/// 24-bit). The kernel walk is 2048; 256 stayed typed (FL-INV-07) when
+/// those families still recursed under a 2 MiB debug stack.
 const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
@@ -1028,116 +1028,185 @@ pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj,
 }
 
 fn inject_expr_value(expr: &Expr) -> Result<Obj, ConvertError> {
-    inject_expr_value_at(expr, 0)
-}
-
-fn inject_expr_value_at(expr: &Expr, depth: u32) -> Result<Obj, ConvertError> {
-    if depth >= MAX_WALK_DEPTH {
-        return Err(ConvertError::NativeOverflow { family: "expr" });
+    // Iterative post-order: a 400-deep app nest is a legal native value,
+    // and the recursive form overflowed at the host-stack ceiling that
+    // used to bound every convert walk (FL-INV-07). Native Exprs are
+    // acyclic, so the memo is sharing, not cycle detection.
+    let mut done: HashMap<Expr, Obj> = HashMap::new();
+    let mut stack = vec![(expr.clone(), false)];
+    while let Some((current, exit)) = stack.pop() {
+        if done.contains_key(&current) {
+            continue;
+        }
+        if !exit {
+            stack.push((current.clone(), true));
+            match current.node() {
+                ExprNode::App { f, a } => {
+                    stack.push((a.clone(), false));
+                    stack.push((f.clone(), false));
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push((body.clone(), false));
+                    stack.push((binder_type.clone(), false));
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push((body.clone(), false));
+                    stack.push((value.clone(), false));
+                    stack.push((type_.clone(), false));
+                }
+                ExprNode::MData { expr: inner, .. } | ExprNode::Proj { expr: inner, .. } => {
+                    stack.push((inner.clone(), false));
+                }
+                ExprNode::BVar { .. }
+                | ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => {}
+            }
+            continue;
+        }
+        let data_bytes = current.data().0.to_le_bytes();
+        let object = match current.node() {
+            ExprNode::BVar { idx } => Obj::mk_ctor(
+                TAG_EXPR_BVAR,
+                vec![inject_nat(u64::from(*idx))],
+                &data_bytes,
+            ),
+            ExprNode::FVar { id } => {
+                Obj::mk_ctor(TAG_EXPR_FVAR, vec![inject_name(&id.0)], &data_bytes)
+            }
+            ExprNode::Sort { level } => {
+                Obj::mk_ctor(TAG_EXPR_SORT, vec![inject_level(level)?], &data_bytes)
+            }
+            ExprNode::Const { name, levels } => Obj::mk_ctor(
+                TAG_EXPR_CONST,
+                vec![inject_name(name), inject_level_list(levels)?],
+                &data_bytes,
+            ),
+            ExprNode::App { f, a } => {
+                let left = done
+                    .get(f)
+                    .ok_or_else(|| malformed("expr", "app function was not encoded"))?;
+                let right = done
+                    .get(a)
+                    .ok_or_else(|| malformed("expr", "app argument was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_APP,
+                    vec![left.clone_ref(), right.clone_ref()],
+                    &data_bytes,
+                )
+            }
+            ExprNode::Lit { literal } => {
+                Obj::mk_ctor(TAG_EXPR_LIT, vec![inject_literal(literal)], &data_bytes)
+            }
+            ExprNode::MVar { id } => {
+                Obj::mk_ctor(TAG_EXPR_MVAR, vec![inject_name(&id.0)], &data_bytes)
+            }
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                let ty = done
+                    .get(binder_type)
+                    .ok_or_else(|| malformed("expr", "lam binder type was not encoded"))?;
+                let inner = done
+                    .get(body)
+                    .ok_or_else(|| malformed("expr", "lam body was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_LAM,
+                    vec![inject_name(binder_name), ty.clone_ref(), inner.clone_ref()],
+                    &data_and_u8(current.data().0, binder_info.to_u64() as u8),
+                )
+            }
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => {
+                let ty = done
+                    .get(binder_type)
+                    .ok_or_else(|| malformed("expr", "forall binder type was not encoded"))?;
+                let inner = done
+                    .get(body)
+                    .ok_or_else(|| malformed("expr", "forall body was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_FORALL,
+                    vec![inject_name(binder_name), ty.clone_ref(), inner.clone_ref()],
+                    &data_and_u8(current.data().0, binder_info.to_u64() as u8),
+                )
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                let ty = done
+                    .get(type_)
+                    .ok_or_else(|| malformed("expr", "let type was not encoded"))?;
+                let val = done
+                    .get(value)
+                    .ok_or_else(|| malformed("expr", "let value was not encoded"))?;
+                let inner = done
+                    .get(body)
+                    .ok_or_else(|| malformed("expr", "let body was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_LET,
+                    vec![
+                        inject_name(decl_name),
+                        ty.clone_ref(),
+                        val.clone_ref(),
+                        inner.clone_ref(),
+                    ],
+                    &data_and_u8(current.data().0, u8::from(*non_dep)),
+                )
+            }
+            ExprNode::MData { data, expr: inner } => {
+                let child = done
+                    .get(inner)
+                    .ok_or_else(|| malformed("expr", "mdata child was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_MDATA,
+                    vec![inject_kvmap(data)?, child.clone_ref()],
+                    &data_bytes,
+                )
+            }
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr: inner,
+            } => {
+                let child = done
+                    .get(inner)
+                    .ok_or_else(|| malformed("expr", "proj child was not encoded"))?;
+                Obj::mk_ctor(
+                    TAG_EXPR_PROJ,
+                    vec![
+                        inject_name(struct_name),
+                        inject_nat(*idx),
+                        child.clone_ref(),
+                    ],
+                    &data_bytes,
+                )
+            }
+        };
+        done.insert(current, object);
     }
-    let data_bytes = expr.data().0.to_le_bytes();
-    match expr.node() {
-        ExprNode::BVar { idx } => Ok(Obj::mk_ctor(
-            TAG_EXPR_BVAR,
-            vec![inject_nat(u64::from(*idx))],
-            &data_bytes,
-        )),
-        ExprNode::FVar { id } => Ok(Obj::mk_ctor(
-            TAG_EXPR_FVAR,
-            vec![inject_name(&id.0)],
-            &data_bytes,
-        )),
-        ExprNode::Sort { level } => Ok(Obj::mk_ctor(
-            TAG_EXPR_SORT,
-            vec![inject_level(level)?],
-            &data_bytes,
-        )),
-        ExprNode::Const { name, levels } => Ok(Obj::mk_ctor(
-            TAG_EXPR_CONST,
-            vec![inject_name(name), inject_level_list(levels)?],
-            &data_bytes,
-        )),
-        ExprNode::App { f, a } => Ok(Obj::mk_ctor(
-            TAG_EXPR_APP,
-            vec![
-                inject_expr_value_at(f, depth + 1)?,
-                inject_expr_value_at(a, depth + 1)?,
-            ],
-            &data_bytes,
-        )),
-        ExprNode::Lit { literal } => Ok(Obj::mk_ctor(
-            TAG_EXPR_LIT,
-            vec![inject_literal(literal)],
-            &data_bytes,
-        )),
-        ExprNode::MVar { id } => Ok(Obj::mk_ctor(
-            TAG_EXPR_MVAR,
-            vec![inject_name(&id.0)],
-            &data_bytes,
-        )),
-        ExprNode::Lam {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Ok(Obj::mk_ctor(
-            TAG_EXPR_LAM,
-            vec![
-                inject_name(binder_name),
-                inject_expr_value_at(binder_type, depth + 1)?,
-                inject_expr_value_at(body, depth + 1)?,
-            ],
-            &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
-        )),
-        ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Ok(Obj::mk_ctor(
-            TAG_EXPR_FORALL,
-            vec![
-                inject_name(binder_name),
-                inject_expr_value_at(binder_type, depth + 1)?,
-                inject_expr_value_at(body, depth + 1)?,
-            ],
-            &data_and_u8(expr.data().0, binder_info.to_u64() as u8),
-        )),
-        ExprNode::LetE {
-            decl_name,
-            type_,
-            value,
-            body,
-            non_dep,
-        } => Ok(Obj::mk_ctor(
-            TAG_EXPR_LET,
-            vec![
-                inject_name(decl_name),
-                inject_expr_value_at(type_, depth + 1)?,
-                inject_expr_value_at(value, depth + 1)?,
-                inject_expr_value_at(body, depth + 1)?,
-            ],
-            &data_and_u8(expr.data().0, u8::from(*non_dep)),
-        )),
-        ExprNode::MData { data, expr: inner } => Ok(Obj::mk_ctor(
-            TAG_EXPR_MDATA,
-            vec![inject_kvmap(data)?, inject_expr_value_at(inner, depth + 1)?],
-            &data_bytes,
-        )),
-        ExprNode::Proj {
-            struct_name,
-            idx,
-            expr: inner,
-        } => Ok(Obj::mk_ctor(
-            TAG_EXPR_PROJ,
-            vec![
-                inject_name(struct_name),
-                inject_nat(*idx),
-                inject_expr_value_at(inner, depth + 1)?,
-            ],
-            &data_bytes,
-        )),
-    }
+    done.get(expr)
+        .map(Obj::clone_ref)
+        .ok_or_else(|| malformed("expr", "expr was not encoded"))
 }
 
 fn inject_name(name: &Name) -> Obj {
@@ -1179,8 +1248,8 @@ fn inject_name(name: &Name) -> Obj {
 
 fn inject_level(level: &Level) -> Result<Obj, ConvertError> {
     // Iterative post-order: Level.depth is 24-bit, so a succ tower can
-    // legally exceed the 256-frame host-stack ceiling that still bounds
-    // the recursive expr projector.
+    // legally exceed the 256-frame host-stack ceiling that used to bound
+    // every convert walk.
     let mut done: HashMap<Level, Obj> = HashMap::new();
     let mut stack = vec![(level.clone(), false)];
     while let Some((current, exit)) = stack.pop() {
