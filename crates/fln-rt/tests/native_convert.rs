@@ -345,6 +345,46 @@ fn a_bvar_index_wider_than_u32_is_overflow_not_a_wrapped_index() {
 }
 
 #[test]
+fn a_nat_literal_whose_payload_is_not_mpz_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let lit = Obj::mk_ctor(
+        9,
+        vec![Obj::mk_ctor(0, vec![Obj::mk_string("not-a-nat")], &[])],
+        &[],
+    );
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &lit) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "literal");
+            assert!(
+                reason.contains("mpz"),
+                "a non-mpz boxed Nat payload must name mpz, got {reason}"
+            );
+        }
+        other => panic!("a string posing as a Nat payload must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_name_str_whose_text_is_not_a_string_is_malformed_not_a_panic() {
+    let mut heap = NativeHeap::new();
+    let name = Obj::mk_ctor(1, vec![mk_name(&[]), Obj::mk_ctor(0, Vec::new(), &[])], &[]);
+    let levels = Obj::mk_ctor(0, Vec::new(), &[]);
+    let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
+    let mut conversion = Conversion::new();
+    match conversion.project_expr(&mut heap, &konst) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "string");
+            assert!(
+                reason.contains("string"),
+                "Name.str's second child must be a string object, got {reason}"
+            );
+        }
+        other => panic!("a ctor posing as a Name.str text must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
 fn injecting_an_out_of_subset_constructor_is_refused_not_a_panic() {
     let mut heap = NativeHeap::new();
     let ty = Expr::sort(Level::zero());
