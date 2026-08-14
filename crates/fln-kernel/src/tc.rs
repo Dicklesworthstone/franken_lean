@@ -2948,26 +2948,30 @@ impl<'a> TypeChecker<'a> {
             }
             let ht = self.definition_height(&t);
             let hs = self.definition_height(&s);
+            // Cheap projection reduction belongs to the matching-projection
+            // pre-pass. A delta-unfolded body uses ordinary cached WHNF: making
+            // every retry cheap discards reusable non-projection normal forms
+            // and can turn a small proof into repeated full-tree walks.
             match (ht, hs) {
                 (None, None) => return Ok(LazyDelta::Stuck(t, s)),
                 (Some(_), None) => match self.unfold_definition(&t, depth)? {
-                    Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
+                    Some(next) => t = self.whnf_core(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (None, Some(_)) => match self.unfold_definition(&s, depth)? {
-                    Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
+                    Some(next) => s = self.whnf_core(&next, depth)?,
                     None => return Ok(LazyDelta::Stuck(t, s)),
                 },
                 (Some(a), Some(b)) => {
                     if a >= b {
                         match self.unfold_definition(&t, depth)? {
-                            Some(next) => t = self.whnf_core_for_defeq(&next, depth)?,
+                            Some(next) => t = self.whnf_core(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
                     if b >= a {
                         match self.unfold_definition(&s, depth)? {
-                            Some(next) => s = self.whnf_core_for_defeq(&next, depth)?,
+                            Some(next) => s = self.whnf_core(&next, depth)?,
                             None => return Ok(LazyDelta::Stuck(t, s)),
                         }
                     }
@@ -5230,6 +5234,52 @@ mod tests {
             !tc.def_eq_public(&left, &right, 0)
                 .expect("ordinary unfolding still decides the unequal pair"),
             "the failure memo is an optimization, never a cached rejection"
+        );
+    }
+
+    #[test]
+    fn lazy_delta_retains_non_projection_unfold_results() {
+        use fln_env::constants::{ConstantVal, DefinitionVal};
+
+        let sort_zero = Expr::sort(Level::zero());
+        let beta_sort_zero = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                Expr::sort(Level::one()),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            ),
+            sort_zero.clone(),
+        );
+        let name = Name::str(Name::anonymous(), "lazyDeltaCacheSource");
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                value: beta_sort_zero.clone(),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![name.clone()],
+            }),
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(1_000, 32));
+
+        let outcome = tc
+            .lazy_delta(Expr::const_(name, Vec::new()), sort_zero.clone(), 0)
+            .expect("the regular definition unfolds and reaches the comparison term");
+        assert!(
+            matches!(outcome, LazyDelta::Stuck(ref left, ref right) if left == &sort_zero && right == &sort_zero),
+            "delta unfolding must normalize the definition body to its comparison term"
+        );
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&beta_sort_zero, &tc.locals, &tc.local_positions),
+            Some(sort_zero),
+            "lazy-delta unfolding must retain the ordinary WHNF result"
         );
     }
 
