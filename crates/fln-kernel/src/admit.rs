@@ -179,93 +179,19 @@ fn mk_lam_locals(locals: &[Local], body: Expr) -> KResult<Expr> {
     Ok(acc)
 }
 
-/// Lift every loose bvar of `e` by `amount` (the substitutes of
-/// [`subst_loose_bvars`] cross binders on the way in). Range-pruned.
-/// The walk itself lives on [`Expr::lift_loose`] so a deep open nest
-/// cannot stack-fault; wrapping `idx + amount` is gone with it.
-fn lift_loose_bvars(e: &Expr, cutoff: u32, amount: u32, _depth: u32) -> KResult<Expr> {
-    e.lift_loose(cutoff, amount).map_err(|_| {
-        Stop::Reject(
-            RejectClass::BlockMismatch,
-            "nested translation lifted a bound variable out of range".into(),
-        )
-    })
-}
-
 /// Simultaneous substitution of the outermost `substs.len()` loose bvars:
 /// `bvar (k + j)` becomes `substs[substs.len()-1-j]` lifted by `k` — the
 /// restore step instantiates the translation's param-canonical templates at
 /// occurrence sites whose arguments are themselves open terms, which the
 /// closed-substitute [`TypeChecker::instantiate`] deliberately cannot do.
-fn subst_loose_bvars(e: &Expr, k: u32, substs: &[Expr], depth: u32) -> KResult<Expr> {
-    depth_guard(depth)?;
-    let n = substs.len() as u32;
-    if n == 0 || e.loose_bvar_range() <= k {
-        return Ok(e.clone());
-    }
-    Ok(match e.node() {
-        ExprNode::BVar { idx } => {
-            if *idx >= k && *idx < k + n {
-                let j = (idx - k) as usize;
-                lift_loose_bvars(&substs[substs.len() - 1 - j], 0, k, depth + 1)?
-            } else if *idx >= k + n {
-                Expr::bvar(idx - n).unwrap_or_else(|_| e.clone())
-            } else {
-                e.clone()
-            }
-        }
-        ExprNode::App { f, a } => Expr::app(
-            subst_loose_bvars(f, k, substs, depth + 1)?,
-            subst_loose_bvars(a, k, substs, depth + 1)?,
-        ),
-        ExprNode::Lam {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::lam(
-            binder_name.clone(),
-            subst_loose_bvars(binder_type, k, substs, depth + 1)?,
-            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::ForallE {
-            binder_name,
-            binder_type,
-            body,
-            binder_info,
-        } => Expr::forall_e(
-            binder_name.clone(),
-            subst_loose_bvars(binder_type, k, substs, depth + 1)?,
-            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
-            *binder_info,
-        ),
-        ExprNode::LetE {
-            decl_name,
-            type_,
-            value,
-            body,
-            non_dep,
-        } => Expr::let_e(
-            decl_name.clone(),
-            subst_loose_bvars(type_, k, substs, depth + 1)?,
-            subst_loose_bvars(value, k, substs, depth + 1)?,
-            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
-            *non_dep,
-        ),
-        ExprNode::MData { data, expr } => {
-            Expr::mdata(data.clone(), subst_loose_bvars(expr, k, substs, depth + 1)?)
-        }
-        ExprNode::Proj {
-            struct_name,
-            idx,
-            expr,
-        } => Expr::proj(
-            struct_name.clone(),
-            *idx,
-            subst_loose_bvars(expr, k, substs, depth + 1)?,
-        ),
-        _ => e.clone(),
+/// The walk lives on [`Expr::subst_loose`] so a deep open nest cannot
+/// stack-fault; wrapping `k + n` / `idx - n` is gone with it.
+fn subst_loose_bvars(e: &Expr, k: u32, substs: &[Expr], _depth: u32) -> KResult<Expr> {
+    e.subst_loose(k, substs).map_err(|_| {
+        Stop::Reject(
+            RejectClass::BlockMismatch,
+            "nested translation substituted a bound variable out of range".into(),
+        )
     })
 }
 
