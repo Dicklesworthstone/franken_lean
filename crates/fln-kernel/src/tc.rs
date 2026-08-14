@@ -1768,103 +1768,243 @@ impl<'a> TypeChecker<'a> {
         cache: &mut InstantiateRevCache,
         context: Option<u32>,
     ) -> KResult<Expr> {
-        self.step(depth)?;
-        let cached = match context {
-            Some(context) => self.instantiate_rev_context_cache.get(context, e, bound),
-            None => cache.get(e, bound),
-        };
-        if let Some(cached) = cached {
-            return Ok(cached);
+        // Post-order heap walk. Batched beta and telescope opening feed this
+        // the same deep spines `instantiate` just stopped recursing on
+        // (FL-INV-07). Persistent cache still stores every computed node so a
+        // repeated call pays only the entry `step`.
+        enum Op {
+            Enter { e: Expr, bound: u32, depth: u32 },
+            Finish { e: Expr, bound: u32 },
         }
-        if e.loose_bvar_range() <= bound || fvars.is_empty() {
-            return Ok(e.clone());
-        }
+        let lookup =
+            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+                done.get(&(child.allocation_identity(), bound))
+                    .cloned()
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+            };
         let count =
             u32::try_from(fvars.len()).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
-        let result = match e.node() {
-            ExprNode::BVar { idx } if *idx >= bound => {
-                let relative = *idx - bound;
-                if relative < count {
-                    // Pin `instantiate_rev` (`kernel/instantiate.cpp:110`):
-                    // lift the chosen substitute by the binders crossed.
-                    fvars[(count - 1 - relative) as usize]
-                        .lift_loose(0, bound)
-                        .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
-                } else {
-                    Expr::bvar(idx - count).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            bound,
+            depth,
+        }];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e, bound, depth } => {
+                    self.step(depth)?;
+                    let key = (e.allocation_identity(), bound);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let cached = match context {
+                        Some(context) => self.instantiate_rev_context_cache.get(context, &e, bound),
+                        None => cache.get(&e, bound),
+                    };
+                    if let Some(cached) = cached {
+                        done.insert(key, cached);
+                        continue;
+                    }
+                    if e.loose_bvar_range() <= bound || fvars.is_empty() {
+                        done.insert(key, e);
+                        continue;
+                    }
+                    match e.node() {
+                        ExprNode::BVar { idx } if *idx >= bound => {
+                            let relative = *idx - bound;
+                            let result = if relative < count {
+                                fvars[(count - 1 - relative) as usize]
+                                    .lift_loose(0, bound)
+                                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+                            } else {
+                                Expr::bvar(idx - count)
+                                    .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+                            };
+                            match context {
+                                Some(context) => self.instantiate_rev_context_cache.insert(
+                                    context,
+                                    e.clone(),
+                                    bound,
+                                    result.clone(),
+                                ),
+                                None => cache.insert(e.clone(), bound, result.clone()),
+                            }
+                            done.insert(key, result);
+                        }
+                        ExprNode::BVar { .. }
+                        | ExprNode::FVar { .. }
+                        | ExprNode::MVar { .. }
+                        | ExprNode::Sort { .. }
+                        | ExprNode::Const { .. }
+                        | ExprNode::Lit { .. } => {
+                            match context {
+                                Some(context) => self.instantiate_rev_context_cache.insert(
+                                    context,
+                                    e.clone(),
+                                    bound,
+                                    e.clone(),
+                                ),
+                                None => cache.insert(e.clone(), bound, e.clone()),
+                            }
+                            done.insert(key, e);
+                        }
+                        ExprNode::App { f, a } => {
+                            let (f, a) = (f.clone(), a.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: a,
+                                bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: f,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: body,
+                                bound: next_bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: body,
+                                bound: next_bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: value,
+                                bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let inner = expr.clone();
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: inner,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                    }
+                }
+                Op::Finish { e, bound } => {
+                    let key = (e.allocation_identity(), bound);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let result = match e.node() {
+                        ExprNode::App { f, a } => {
+                            Expr::app(lookup(&done, f, bound)?, lookup(&done, a, bound)?)
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::lam(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::forall_e(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::let_e(
+                                decl_name.clone(),
+                                lookup(&done, type_, bound)?,
+                                lookup(&done, value, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *non_dep,
+                            )
+                        }
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr, bound)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
+                        _ => e.clone(),
+                    };
+                    match context {
+                        Some(context) => self.instantiate_rev_context_cache.insert(
+                            context,
+                            e.clone(),
+                            bound,
+                            result.clone(),
+                        ),
+                        None => cache.insert(e.clone(), bound, result.clone()),
+                    }
+                    done.insert(key, result);
                 }
             }
-            ExprNode::BVar { .. } => e.clone(),
-            ExprNode::App { f, a } => Expr::app(
-                self.instantiate_rev_cached(f, fvars, bound, depth + 1, cache, context)?,
-                self.instantiate_rev_cached(a, fvars, bound, depth + 1, cache, context)?,
-            ),
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache, context)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                self.instantiate_rev_cached(binder_type, fvars, bound, depth + 1, cache, context)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                self.instantiate_rev_cached(type_, fvars, bound, depth + 1, cache, context)?,
-                self.instantiate_rev_cached(value, fvars, bound, depth + 1, cache, context)?,
-                self.instantiate_rev_cached(body, fvars, bound + 1, depth + 1, cache, context)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => Expr::mdata(
-                data.clone(),
-                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache, context)?,
-            ),
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.instantiate_rev_cached(expr, fvars, bound, depth + 1, cache, context)?,
-            ),
-            ExprNode::FVar { .. }
-            | ExprNode::MVar { .. }
-            | ExprNode::Sort { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::Lit { .. } => e.clone(),
-        };
-        match context {
-            Some(context) => {
-                self.instantiate_rev_context_cache.insert(
-                    context,
-                    e.clone(),
-                    bound,
-                    result.clone(),
-                );
-            }
-            None => cache.insert(e.clone(), bound, result.clone()),
         }
-        Ok(result)
+        done.get(&(e.allocation_identity(), bound))
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
     /// Substitute declared level parameters by concrete levels throughout a type
@@ -5077,6 +5217,35 @@ mod tests {
         assert!(
             tc.consumption().steps_used - steps_after_first == 1,
             "a repeated batched substitution must pay only its entry hook"
+        );
+    }
+
+    #[test]
+    fn instantiate_rev_walks_a_deep_app_nest_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let subst = Expr::sort(Level::zero());
+        let mut expr = Expr::bvar(0).expect("packs");
+        for _ in 0..400 {
+            expr = Expr::app(expr, Expr::bvar(1).expect("packs"));
+        }
+        let result = tc
+            .instantiate_rev(&expr, std::slice::from_ref(&subst), 0, 0)
+            .expect("a 400-app batched nest must not stack-fault");
+        let mut current = &result;
+        let mut apps = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            assert!(
+                matches!(a.node(), ExprNode::BVar { idx } if *idx == 0),
+                "loose #1 must shift down by the consumed count"
+            );
+            current = f;
+            apps += 1;
+        }
+        assert!(apps == 400, "the app spine length is preserved");
+        assert!(
+            current == &subst,
+            "bvar 0 receives the last (only) substitute"
         );
     }
 
