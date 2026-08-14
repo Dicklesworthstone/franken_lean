@@ -494,11 +494,7 @@ fn a_short_constructor_is_malformed_not_a_panic() {
 #[test]
 fn a_lean_true_two_child_name_num_projects_the_nat_child() {
     let mut heap = NativeHeap::new();
-    let name = Obj::mk_ctor(
-        2,
-        vec![mk_name(&["foo"]), Obj::mk_nat(7)],
-        &0u64.to_le_bytes(),
-    );
+    let name = Obj::mk_ctor(2, vec![mk_name(&["foo"]), Obj::mk_nat(7)], &[]);
     let levels = Obj::mk_ctor(0, Vec::new(), &[]);
     let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
     let mut conversion = Conversion::new();
@@ -509,6 +505,28 @@ fn a_lean_true_two_child_name_num_projects_the_nat_child() {
         panic!("expected a const");
     };
     assert_eq!(name.to_display_string(), "foo.7");
+}
+
+#[test]
+fn a_stored_name_hash_that_disagrees_with_the_children_is_malformed() {
+    let mut heap = NativeHeap::new();
+    let name = Obj::mk_ctor(
+        2,
+        vec![mk_name(&["foo"]), Obj::mk_nat(7)],
+        &0xDEAD_BEEF_u64.to_le_bytes(),
+    );
+    let levels = Obj::mk_ctor(0, Vec::new(), &[]);
+    let konst = Obj::mk_ctor(4, vec![name, levels], &[]);
+    match Conversion::new().project_expr(&mut heap, &konst) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "name");
+            assert!(
+                reason.contains("Name.hash"),
+                "a hostile hash word must name Name.hash, got {reason}"
+            );
+        }
+        other => panic!("mismatched Name.hash must be malformed, got {other:?}"),
+    }
 }
 
 #[test]

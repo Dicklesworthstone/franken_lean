@@ -339,6 +339,25 @@ fn check_expr_data(obj: &Obj, expr: &Expr) -> Result<(), ConvertError> {
     Ok(())
 }
 
+fn check_name_hash(obj: &Obj, name: &Name) -> Result<(), ConvertError> {
+    // Lean Name.str / Name.num are two object children plus the cached hash.
+    // The older one-child Name.num packing stores the component at offset 8,
+    // not a hash; children-only Name.str objects have no hash word.
+    if obj.is_scalar() || obj.header().other != 2 {
+        return Ok(());
+    }
+    let Ok(stored) = ctor_u64(obj, 16, "name") else {
+        return Ok(());
+    };
+    if stored != name.hash() {
+        return Err(malformed(
+            "name",
+            "stored Name.hash does not match the children",
+        ));
+    }
+    Ok(())
+}
+
 fn check_level_data(obj: &Obj, level: &Level) -> Result<(), ConvertError> {
     let Some(stored) = stored_data_word(obj, level_lean_slots(obj.obj_tag() as u8), "level") else {
         return Ok(());
@@ -524,7 +543,7 @@ impl Conversion {
         if obj.is_scalar() {
             return Err(malformed("name", "a tagged scalar is not a name object"));
         }
-        match obj.obj_tag() as u8 {
+        let name = match obj.obj_tag() as u8 {
             TAG_NAME_ANONYMOUS => Ok(Name::anonymous()),
             TAG_NAME_STR => {
                 let pre = self.name(&ctor_field(obj, 0, "name")?)?;
@@ -549,7 +568,9 @@ impl Conversion {
                 family: "name",
                 tag: other,
             }),
-        }
+        }?;
+        check_name_hash(obj, &name)?;
+        Ok(name)
     }
 
     fn level(&mut self, obj: &Obj) -> Result<Level, ConvertError> {
