@@ -895,6 +895,33 @@ fn callable_nat_result_accepts_scalar_or_mpz_but_scalar_contract_refuses_mpz() {
             ..
         }) if function == fid(0)
     ));
+
+    // The union is Nat's ABI, not "any object". A String must not ride
+    // home as a Nat just because OwnedOrScalar exists.
+    let string_as_nat = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::OwnedOrScalar,
+        1,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "not-a-nat".to_string(),
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&string_as_nat, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::CallableResultKind {
+                function,
+                expected: CallableResultOwnership::OwnedOrScalar,
+                actual: ValueKind::String,
+            },
+            ..
+        }) if function == fid(0)
+    ));
 }
 
 #[test]
