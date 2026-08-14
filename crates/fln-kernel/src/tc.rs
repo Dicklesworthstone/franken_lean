@@ -4133,138 +4133,358 @@ impl<'a> TypeChecker<'a> {
         bound: u32,
         depth: u32,
     ) -> KResult<Expr> {
-        self.step(depth)?;
-        if !e.has_fvar() || active == 0 {
-            return Ok(e.clone());
+        // Post-order heap walk. Closing a deep lambda telescope used to
+        // recurse one frame per node; `step` cannot save a host stack smaller
+        // than Budget::depth (FL-INV-07).
+        enum Op {
+            Enter { e: Expr, bound: u32, depth: u32 },
+            Finish { e: Expr, bound: u32 },
         }
-        Ok(match e.node() {
-            ExprNode::FVar { id } => match ordinals.get(id).copied() {
-                Some(ordinal) if ordinal < active => {
-                    let index = bound
-                        .checked_add(active - 1 - ordinal)
-                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
-                    Expr::bvar(index).map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+        let lookup =
+            |done: &HashMap<(usize, u32), Expr>, child: &Expr, bound: u32| -> KResult<Expr> {
+                done.get(&(child.allocation_identity(), bound))
+                    .cloned()
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+            };
+        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            bound,
+            depth,
+        }];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e, bound, depth } => {
+                    self.step(depth)?;
+                    let key = (e.allocation_identity(), bound);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    if !e.has_fvar() || active == 0 {
+                        done.insert(key, e);
+                        continue;
+                    }
+                    match e.node() {
+                        ExprNode::FVar { id } => {
+                            let result = match ordinals.get(id).copied() {
+                                Some(ordinal) if ordinal < active => {
+                                    let index = bound
+                                        .checked_add(active - 1 - ordinal)
+                                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                                    Expr::bvar(index)
+                                        .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?
+                                }
+                                _ => e.clone(),
+                            };
+                            done.insert(key, result);
+                        }
+                        ExprNode::App { f, a } => {
+                            let (f, a) = (f.clone(), a.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: a,
+                                bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: f,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: body,
+                                bound: next_bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: body,
+                                bound: next_bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: value,
+                                bound,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let inner = expr.clone();
+                            stack.push(Op::Finish { e, bound });
+                            stack.push(Op::Enter {
+                                e: inner,
+                                bound,
+                                depth: depth + 1,
+                            });
+                        }
+                        _ => {
+                            done.insert(key, e);
+                        }
+                    }
                 }
-                _ => e.clone(),
-            },
-            ExprNode::App { f, a } => Expr::app(
-                self.abstract_fvar_set(f, ordinals, active, bound, depth + 1)?,
-                self.abstract_fvar_set(a, ordinals, active, bound, depth + 1)?,
-            ),
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::lam(
-                binder_name.clone(),
-                self.abstract_fvar_set(binder_type, ordinals, active, bound, depth + 1)?,
-                self.abstract_fvar_set(body, ordinals, active, bound + 1, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => Expr::forall_e(
-                binder_name.clone(),
-                self.abstract_fvar_set(binder_type, ordinals, active, bound, depth + 1)?,
-                self.abstract_fvar_set(body, ordinals, active, bound + 1, depth + 1)?,
-                *binder_info,
-            ),
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => Expr::let_e(
-                decl_name.clone(),
-                self.abstract_fvar_set(type_, ordinals, active, bound, depth + 1)?,
-                self.abstract_fvar_set(value, ordinals, active, bound, depth + 1)?,
-                self.abstract_fvar_set(body, ordinals, active, bound + 1, depth + 1)?,
-                *non_dep,
-            ),
-            ExprNode::MData { data, expr } => Expr::mdata(
-                data.clone(),
-                self.abstract_fvar_set(expr, ordinals, active, bound, depth + 1)?,
-            ),
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.abstract_fvar_set(expr, ordinals, active, bound, depth + 1)?,
-            ),
-            ExprNode::BVar { .. }
-            | ExprNode::MVar { .. }
-            | ExprNode::Sort { .. }
-            | ExprNode::Const { .. }
-            | ExprNode::Lit { .. } => e.clone(),
-        })
+                Op::Finish { e, bound } => {
+                    let key = (e.allocation_identity(), bound);
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let result = match e.node() {
+                        ExprNode::App { f, a } => {
+                            Expr::app(lookup(&done, f, bound)?, lookup(&done, a, bound)?)
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::lam(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::forall_e(
+                                binder_name.clone(),
+                                lookup(&done, binder_type, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *binder_info,
+                            )
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            let next_bound = bound
+                                .checked_add(1)
+                                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                            Expr::let_e(
+                                decl_name.clone(),
+                                lookup(&done, type_, bound)?,
+                                lookup(&done, value, bound)?,
+                                lookup(&done, body, next_bound)?,
+                                *non_dep,
+                            )
+                        }
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr, bound)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr, bound)?),
+                        _ => e.clone(),
+                    };
+                    done.insert(key, result);
+                }
+            }
+        }
+        done.get(&(e.allocation_identity(), bound))
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
     fn replace_fvar(&mut self, e: &Expr, id: &FVarId, with: &Expr, depth: u32) -> KResult<Expr> {
-        self.step(depth)?;
-        if !e.has_fvar() {
-            return Ok(e.clone());
+        // Post-order heap walk. Zeta of a deep let body used to recurse one
+        // frame per node (FL-INV-07).
+        enum Op {
+            Enter { e: Expr, depth: u32 },
+            Finish { e: Expr },
         }
-        Ok(match e.node() {
-            ExprNode::FVar { id: found } if found == id => with.clone(),
-            ExprNode::App { f, a } => {
-                let f2 = self.replace_fvar(f, id, with, depth + 1)?;
-                let a2 = self.replace_fvar(a, id, with, depth + 1)?;
-                Expr::app(f2, a2)
+        let lookup = |done: &HashMap<usize, Expr>, child: &Expr| -> KResult<Expr> {
+            done.get(&child.allocation_identity())
+                .cloned()
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
+        };
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut stack = vec![Op::Enter {
+            e: e.clone(),
+            depth,
+        }];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Enter { e, depth } => {
+                    self.step(depth)?;
+                    let key = e.allocation_identity();
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    if !e.has_fvar() {
+                        done.insert(key, e);
+                        continue;
+                    }
+                    match e.node() {
+                        ExprNode::FVar { id: found } if found == id => {
+                            done.insert(key, with.clone());
+                        }
+                        ExprNode::FVar { .. } => {
+                            done.insert(key, e);
+                        }
+                        ExprNode::App { f, a } => {
+                            let (f, a) = (f.clone(), a.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: a,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: f,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            let (ty, body) = (binder_type.clone(), body.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: body,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            let (ty, value, body) = (type_.clone(), value.clone(), body.clone());
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: body,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: value,
+                                depth: depth + 1,
+                            });
+                            stack.push(Op::Enter {
+                                e: ty,
+                                depth: depth + 1,
+                            });
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            let inner = expr.clone();
+                            stack.push(Op::Finish { e });
+                            stack.push(Op::Enter {
+                                e: inner,
+                                depth: depth + 1,
+                            });
+                        }
+                        _ => {
+                            done.insert(key, e);
+                        }
+                    }
+                }
+                Op::Finish { e } => {
+                    let key = e.allocation_identity();
+                    if done.contains_key(&key) {
+                        continue;
+                    }
+                    let result = match e.node() {
+                        ExprNode::App { f, a } => Expr::app(lookup(&done, f)?, lookup(&done, a)?),
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::lam(
+                            binder_name.clone(),
+                            lookup(&done, binder_type)?,
+                            lookup(&done, body)?,
+                            *binder_info,
+                        ),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => Expr::forall_e(
+                            binder_name.clone(),
+                            lookup(&done, binder_type)?,
+                            lookup(&done, body)?,
+                            *binder_info,
+                        ),
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => Expr::let_e(
+                            decl_name.clone(),
+                            lookup(&done, type_)?,
+                            lookup(&done, value)?,
+                            lookup(&done, body)?,
+                            *non_dep,
+                        ),
+                        ExprNode::MData { data, expr } => {
+                            Expr::mdata(data.clone(), lookup(&done, expr)?)
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => Expr::proj(struct_name.clone(), *idx, lookup(&done, expr)?),
+                        _ => e.clone(),
+                    };
+                    done.insert(key, result);
+                }
             }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.replace_fvar(binder_type, id, with, depth + 1)?;
-                let b2 = self.replace_fvar(body, id, with, depth + 1)?;
-                Expr::lam(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let t2 = self.replace_fvar(binder_type, id, with, depth + 1)?;
-                let b2 = self.replace_fvar(body, id, with, depth + 1)?;
-                Expr::forall_e(binder_name.clone(), t2, b2, *binder_info)
-            }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                let t2 = self.replace_fvar(type_, id, with, depth + 1)?;
-                let v2 = self.replace_fvar(value, id, with, depth + 1)?;
-                let b2 = self.replace_fvar(body, id, with, depth + 1)?;
-                Expr::let_e(decl_name.clone(), t2, v2, b2, *non_dep)
-            }
-            ExprNode::MData { data, expr } => {
-                let inner = self.replace_fvar(expr, id, with, depth + 1)?;
-                Expr::mdata(data.clone(), inner)
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => {
-                let inner = self.replace_fvar(expr, id, with, depth + 1)?;
-                Expr::proj(struct_name.clone(), *idx, inner)
-            }
-            _ => e.clone(),
-        })
+        }
+        done.get(&e.allocation_identity())
+            .cloned()
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))
     }
 
     /// KR-112 + KR-901.
@@ -5424,6 +5644,63 @@ mod tests {
             matches!(current.node(), ExprNode::Sort { level } if *level == Level::zero()),
             "Sort u becomes Sort 0"
         );
+    }
+
+    #[test]
+    fn abstract_fvar_set_walks_a_deep_app_nest_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "x"));
+        let fvar = Expr::fvar(id.clone());
+        let mut expr = fvar.clone();
+        for _ in 0..400 {
+            expr = Expr::app(expr, fvar.clone());
+        }
+        let mut ordinals = HashMap::new();
+        ordinals.insert(id, 0);
+        let result = tc
+            .abstract_fvar_set(&expr, &ordinals, 1, 0, 0)
+            .expect("a 400-app fvar nest must not stack-fault");
+        let mut current = &result;
+        let mut apps = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            assert!(
+                matches!(a.node(), ExprNode::BVar { idx } if *idx == 0),
+                "the single active fvar closes to bvar 0"
+            );
+            current = f;
+            apps += 1;
+        }
+        assert!(apps == 400, "the app spine length is preserved");
+        assert!(
+            matches!(current.node(), ExprNode::BVar { idx } if *idx == 0),
+            "the head fvar closes to bvar 0"
+        );
+    }
+
+    #[test]
+    fn replace_fvar_walks_a_deep_app_nest_without_stack_fault() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "x"));
+        let fvar = Expr::fvar(id.clone());
+        let subst = Expr::sort(Level::zero());
+        let mut expr = fvar.clone();
+        for _ in 0..400 {
+            expr = Expr::app(expr, fvar.clone());
+        }
+        let result = tc
+            .replace_fvar(&expr, &id, &subst, 0)
+            .expect("a 400-app fvar nest must not stack-fault");
+        let mut current = &result;
+        let mut apps = 0usize;
+        while let ExprNode::App { f, a } = current.node() {
+            assert!(a == &subst, "every fvar argument is replaced");
+            current = f;
+            apps += 1;
+        }
+        assert!(apps == 400, "the app spine length is preserved");
+        assert!(current == &subst, "the head fvar is replaced");
     }
 
     #[test]
