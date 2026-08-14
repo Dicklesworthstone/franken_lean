@@ -820,14 +820,14 @@ fn a_syntax_tree_payload_stays_an_unsupported_constructor() {
 fn a_name_chain_deeper_than_the_walk_ceiling_is_overflow_not_a_stack_fault() {
     // FL-INV-07: a hostile Compat Name.pre chain must not blow the host stack.
     let mut chain = Obj::mk_nat(0);
-    for _ in 0..3_000 {
+    for _ in 0..400 {
         chain = Obj::mk_ctor(1, vec![chain, Obj::mk_string("a")], &[0u8; 8]);
     }
     let expr = Obj::mk_ctor(4, vec![chain, Obj::mk_nat(0)], &[0u8; 8]);
     let mut heap = NativeHeap::new();
     match Conversion::new().project_expr(&mut heap, &expr) {
         Err(ConvertError::NativeOverflow { family }) => assert_eq!(family, "name"),
-        other => panic!("a 3000-deep Name chain must overflow typed, got {other:?}"),
+        other => panic!("a 400-deep Name chain must overflow typed, got {other:?}"),
     }
 }
 

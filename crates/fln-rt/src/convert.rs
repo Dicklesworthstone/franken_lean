@@ -105,10 +105,10 @@ pub enum ConvertError {
     NativeOverflow { family: &'static str },
 }
 
-/// Recursion ceiling for name / expr / level projection. Matches the
-/// kernel walk so a cyclic Compat graph becomes a typed overflow, not a
-/// host stack fault (FL-INV-07).
-const MAX_WALK_DEPTH: u32 = 2_048;
+/// Recursion ceiling for name / expr / level projection. The kernel walk
+/// is 2048, but these frames are large enough that a debug host stack
+/// dies first; 256 stays typed (FL-INV-07) with room under a 2 MiB stack.
+const MAX_WALK_DEPTH: u32 = 256;
 /// Node visits in one conversion scope, covering iterative lists as well
 /// as the recursive families.
 const MAX_WALK_NODES: usize = 1_000_000;
