@@ -823,42 +823,88 @@ impl Level {
         ///   its own arm before `k` ever runs, and `k` is what handles `imax` on
         ///   the right. Testing the right-hand `imax` first — as the old code did —
         ///   answers a different question.
-        fn go(u: &Level, v: &Level) -> bool {
-            if u == v {
-                return true;
-            }
-            // `k` in the pin: the offset comparison, with the right-hand `imax`
-            // decomposed here rather than in the match.
-            let k = |u: &Level, v: &Level| -> bool {
-                match v.view() {
-                    LevelView::IMax(v1, v2) => go(u, v1) && go(u, v2),
-                    _ => {
-                        let v_base = v.get_level_offset();
-                        (u.get_level_offset() == v_base || v_base.is_zero())
-                            && u.get_offset() >= v.get_offset()
-                    }
+        fn offset_k(u: &Level, v: &Level) -> bool {
+            let v_base = v.get_level_offset();
+            (u.get_level_offset() == v_base || v_base.is_zero()) && u.get_offset() >= v.get_offset()
+        }
+
+        enum Op<'a> {
+            Go(&'a Level, &'a Level),
+            And,
+            Or,
+            OffsetK(&'a Level, &'a Level),
+        }
+
+        fn push_k<'a>(ops: &mut Vec<Op<'a>>, u: &'a Level, v: &'a Level) {
+            match v.view() {
+                LevelView::IMax(v1, v2) => {
+                    ops.push(Op::And);
+                    ops.push(Op::Go(u, v2));
+                    ops.push(Op::Go(u, v1));
                 }
-            };
-            match (u.view(), v.view()) {
-                (_, LevelView::Zero) => true,
-                (_, LevelView::Max(v1, v2)) => go(u, v1) && go(u, v2),
-                (LevelView::Max(u1, u2), _) => go(u1, v) || go(u2, v) || k(u, v),
-                (LevelView::IMax(_, u2), _) => go(u2, v),
-                (LevelView::Succ(_), LevelView::Succ(_)) => {
-                    let mut left = u;
-                    let mut right = v;
-                    while let (LevelView::Succ(u1), LevelView::Succ(v1)) =
-                        (left.view(), right.view())
-                    {
-                        left = u1;
-                        right = v1;
-                    }
-                    go(left, right)
-                }
-                _ => k(u, v),
+                _ => ops.push(Op::OffsetK(u, v)),
             }
         }
-        go(&self.normalize(), &other.normalize())
+
+        // Same arms as recursive `go`, evaluated on an explicit heap stack
+        // so a legal max/imax spine cannot blow the host stack (FL-INV-07).
+        // Combinators are pure, so evaluating both sides of ∧/∨ is the same
+        // answer as short-circuiting.
+        let lhs = self.normalize();
+        let rhs = other.normalize();
+        let mut ops = vec![Op::Go(&lhs, &rhs)];
+        let mut vals: Vec<bool> = Vec::new();
+        while let Some(op) = ops.pop() {
+            match op {
+                Op::And => {
+                    let right = vals.pop().expect("geq ∧ has a right operand");
+                    let left = vals.pop().expect("geq ∧ has a left operand");
+                    vals.push(left && right);
+                }
+                Op::Or => {
+                    let right = vals.pop().expect("geq ∨ has a right operand");
+                    let left = vals.pop().expect("geq ∨ has a left operand");
+                    vals.push(left || right);
+                }
+                Op::OffsetK(u, v) => vals.push(offset_k(u, v)),
+                Op::Go(u, v) => {
+                    if u == v {
+                        vals.push(true);
+                        continue;
+                    }
+                    match (u.view(), v.view()) {
+                        (_, LevelView::Zero) => vals.push(true),
+                        (_, LevelView::Max(v1, v2)) => {
+                            ops.push(Op::And);
+                            ops.push(Op::Go(u, v2));
+                            ops.push(Op::Go(u, v1));
+                        }
+                        (LevelView::Max(u1, u2), _) => {
+                            // go(u1, v) || go(u2, v) || k(u, v)
+                            ops.push(Op::Or);
+                            push_k(&mut ops, u, v);
+                            ops.push(Op::Or);
+                            ops.push(Op::Go(u2, v));
+                            ops.push(Op::Go(u1, v));
+                        }
+                        (LevelView::IMax(_, u2), _) => ops.push(Op::Go(u2, v)),
+                        (LevelView::Succ(_), LevelView::Succ(_)) => {
+                            let mut left = u;
+                            let mut right = v;
+                            while let (LevelView::Succ(u1), LevelView::Succ(v1)) =
+                                (left.view(), right.view())
+                            {
+                                left = u1;
+                                right = v1;
+                            }
+                            ops.push(Op::Go(left, right));
+                        }
+                        _ => push_k(&mut ops, u, v),
+                    }
+                }
+            }
+        }
+        vals.pop().expect("geq produces one answer")
     }
 
     // ---- cheap smart constructors ------------------------------------------------------
@@ -1915,9 +1961,9 @@ mod tests {
         );
     }
 
-    /// The remaining Level predicates used to recurse down `succ` towers.
-    /// Convert now injects a 400-deep tower; 24-bit depth is 16M. A 1 MiB
-    /// worker is far below one frame per succ.
+    /// The remaining Level predicates used to recurse down `succ` towers
+    /// and `max`/`imax` spines. Convert now injects a 400-deep tower;
+    /// 24-bit depth is 16M. A 1 MiB worker is far below one frame per node.
     #[test]
     fn deep_level_predicates_are_stack_bounded() {
         const DEPTH: usize = 100_000;
@@ -1949,6 +1995,21 @@ mod tests {
                 assert!(deep.is_equiv(&other));
                 assert!(deep.is_geq(&other));
                 assert!(deep.norm_lt(&succ_chain(DEPTH + 1)));
+
+                // max-only: normalize flattens Max iteratively. An alternating
+                // imax spine still recurses inside normalize (separate hole).
+                // Distinct params so go cannot exit on identity.
+                let mut left_spine = Level::zero();
+                let mut right_spine = Level::zero();
+                for _ in 0..DEPTH {
+                    left_spine = Level::max(left_spine, p("a")).expect("shallow width");
+                    right_spine = Level::max(right_spine, p("b")).expect("shallow width");
+                }
+                assert!(
+                    left_spine.is_geq(&left_spine),
+                    "geq of a deep max spine with itself"
+                );
+                let _ = left_spine.is_geq(&right_spine);
             })
             .expect("spawn bounded-stack Level predicate worker")
             .join();
