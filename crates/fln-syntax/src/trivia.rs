@@ -114,7 +114,12 @@ pub fn scan_trivia(text: &SourceText, from: BytePos) -> Result<BytePos, TriviaEr
             b'\r' => {
                 return Err(TriviaError::IsolatedCarriageReturn { at: BytePos(at) });
             }
-            b' ' | b'\n' | 0x0B | 0x0C => at += 1,
+            // After the tab/CR refusals, pin `curr.isWhitespace` is only space
+            // and LF. `Char.isWhitespace` is `' ' | '\t' | '\r' | '\n'`
+            // (`Init/Data/Char/Basic.lean:97`). Rust `u8::is_ascii_whitespace`
+            // also includes VT (0x0B) and FF (0x0C); skipping those is a
+            // silent language widening — the pin's `tokenFn` would refuse them.
+            b' ' | b'\n' => at += 1,
             b'-' if bytes.get(at + 1) == Some(&b'-') => {
                 // A line comment runs to, but does not consume, the newline.
                 at += 2;
@@ -321,5 +326,28 @@ mod tests {
         // The position maps back to the original byte for a diagnostic.
         let in_original = view.to_original(end);
         assert_eq!(original.as_bytes()[in_original.0], b'x');
+    }
+
+    /// Form feed and vertical tab are Unicode / ASCII whitespace, not Lean
+    /// `Char.isWhitespace`. Skipping them would accept `x\x0Cy` as `x` then
+    /// `y`; the pin stops and `tokenFn` reports `"token"`.
+    #[test]
+    fn form_feed_and_vertical_tab_are_not_file_trivia() {
+        assert_eq!(
+            scan("\u{000b}x"),
+            Ok(0),
+            "vertical tab is not Char.isWhitespace"
+        );
+        assert_eq!(
+            scan("\u{000c}x"),
+            Ok(0),
+            "form feed is not Char.isWhitespace"
+        );
+        assert_eq!(
+            scan(" \u{000c}x"),
+            Ok(1),
+            "space is trivia; form feed stops the scan"
+        );
+        assert_eq!(scan("\u{00a0}x"), Ok(0), "NBSP is not file trivia either");
     }
 }
