@@ -64,7 +64,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported String metric source");
     std::fs::write(
         &bounded_nat_source,
-        b"def legacy := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\ndef power := Nat.pow 3 4\ndef shifted := Nat.add (Nat.shiftLeft 7 3) (Nat.shiftRight 56 3)\ndef subtotal := Nat.add legacy (Nat.add power (Nat.add (Nat.log2 8) shifted))\ndef huge := Nat.pow 2 80\ndef answer := Nat.add huge subtotal\n",
+        b"def legacy := Nat.add (Nat.pred 9) (Nat.add (Nat.div 20 6) (Nat.add (Nat.mod 20 6) (Nat.add (Nat.gcd 48 18) (Nat.add (Nat.land 12 10) (Nat.add (Nat.lor 12 10) (Nat.xor 12 10))))))\ndef power := Nat.pow 3 4\ndef shifted := Nat.add (Nat.shiftLeft 7 3) (Nat.shiftRight 56 3)\ndef subtotal := Nat.add legacy (Nat.add power (Nat.add (Nat.log2 8) shifted))\ndef huge := 1208925819614629174706176\ndef answer := Nat.add huge subtotal\n",
     )
     .expect("write supported bounded Nat source");
     std::fs::write(

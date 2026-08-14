@@ -277,8 +277,9 @@ checked `Nat.add`/`Nat.sub`/`Nat.mul` plus `Nat.div`/`Nat.mod`/`Nat.gcd`/
 `Nat.pred`/`Nat.pow`/`Nat.log2`/`Nat.shiftLeft`/`Nat.shiftRight`/`Nat.land`/
 `Nat.lor`/`Nat.xor`, `String.append`, `String.length`, and
 `String.utf8ByteSize`, plus Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq`
-intrinsics. Nat results use the Marrow ABI's canonical tagged-scalar-or-positive-mpz
-representation, cross dependent definitions and emitted FLBC products without
+intrinsics. Nat literals and results use the Marrow ABI's canonical
+tagged-scalar-or-positive-mpz representation, including direct source literals larger
+than 64 bits; they cross dependent definitions and emitted FLBC products without
 narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceiling.
 The facade also retains explicit
 budgets, immutable environment successors, K1 plus the independent checker,

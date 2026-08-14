@@ -150,7 +150,8 @@ fn fixture_register_result(
             Instruction::Nat { dst, .. } if *dst == register => {
                 return CallableResultOwnership::Scalar;
             }
-            Instruction::String { dst, .. }
+            Instruction::NatBig { dst, .. }
+            | Instruction::String { dst, .. }
             | Instruction::Ctor { dst, .. }
             | Instruction::Array { dst, .. }
             | Instruction::Closure { dst, .. }
@@ -492,6 +493,55 @@ fn generated_string_length_rows_distinguish_scalars_from_utf8_bytes() {
         let completed = returned(execute(&program, ExecutionLimits::default(), None));
         assert_eq!(completed.value.unbox(), expected, "{row}");
     }
+}
+
+#[test]
+fn arbitrary_precision_nat_constants_execute_and_stop_before_over_budget_boxing() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        1,
+        vec![
+            Instruction::NatBig {
+                dst: r(0),
+                limbs_le: vec![u64::MAX, 1],
+            },
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+
+    shadow::enable();
+    let stopped = execute(
+        &program,
+        ExecutionLimits {
+            max_nat_magnitude_bytes: 8,
+            ..ExecutionLimits::default()
+        },
+        None,
+    );
+    assert_eq!(stopped.authority(), Authority::NonAuthoritative);
+    assert!(matches!(
+        stopped,
+        Outcome::Inconclusive(ref inconclusive)
+            if matches!(
+                inconclusive.cause,
+                InconclusiveCause::ResourceExhausted { ref usage }
+                    if usage.allowed == 8
+                        && usage.observed == 16
+                        && usage.reason == ResourceReason::Memory { limit_bytes: 8 }
+            ) && inconclusive.progress.is_some()
+    ));
+
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&completed.value), vec![u64::MAX, 1]);
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "Nat constant stop and recovery retain no mpz");
+    assert!(events.iter().all(|event| {
+        event.kind != shadow::EventKind::DoubleRelease
+            && event.kind != shadow::EventKind::ForeignPointer
+    }));
 }
 
 #[test]

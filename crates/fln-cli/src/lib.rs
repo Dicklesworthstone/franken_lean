@@ -3034,7 +3034,7 @@ mod tests {
 
     const PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
-    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x07\0\x0c\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
+    const STRING_FLBC: &[u8] = b"FLNFLBC\0\x08\0\x0d\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
         let invoked_from = std::env::current_dir().expect("the test has an invocation directory");

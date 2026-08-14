@@ -6443,7 +6443,7 @@ mod tests {
         let mut limited = test_limits();
         limited.vm.max_nat_magnitude_bytes = 8;
         let stopped = engine
-            .execute_source_definition(b"def tooWide := Nat.pow 2 64", &options, limited)
+            .execute_source_definition(b"def tooWide := 18446744073709551616", &options, limited)
             .expect("the checked source reaches Golem before its magnitude stop");
         assert_eq!(stopped.authority(), Authority::NonAuthoritative);
         assert!(matches!(
@@ -6466,7 +6466,7 @@ mod tests {
         let completed = engine
             .execute_source_definitions(
                 &[
-                    b"def huge := Nat.pow 2 80",
+                    b"def huge := 1208925819614629174706176",
                     b"def answer := Nat.add huge 194",
                 ],
                 &options,
@@ -6489,6 +6489,20 @@ mod tests {
                 "1208925819614629174706370".to_owned()
             )))
         );
+
+        let literal_executable = fln_comp::flbc::decode_canonical(
+            &completed.executions[0].flbc_artifact,
+            CodecLimits::default(),
+        )
+        .expect("the direct arbitrary-precision Nat literal artifact decodes canonically");
+        assert!(literal_executable.functions().iter().any(|function| {
+            function.code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::NatBig { limbs_le, .. } if limbs_le == &[0, 65_536]
+                )
+            })
+        }));
 
         let executable = fln_comp::flbc::decode_canonical(
             &completed.executions[1].flbc_artifact,

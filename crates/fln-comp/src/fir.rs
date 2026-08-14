@@ -27,8 +27,9 @@ use std::fmt;
 /// ownership; version 12 binds Owned-or-Scalar callable results into every
 /// function, closure signature, and dynamic application; version 13 represents
 /// each `Lean.Core.checkSystem` call as an explicit effect checkpoint; version
-/// 14 carries computed module-name values into that checkpoint.
-pub const FIR_SCHEMA_VERSION: u16 = 14;
+/// 14 carries computed module-name values into that checkpoint; version 15
+/// carries canonical arbitrary-precision Nat literal limbs through lowering.
+pub const FIR_SCHEMA_VERSION: u16 = 15;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,6 +379,10 @@ pub enum Operation {
     Unit,
     Bool(bool),
     Nat(u64),
+    /// A canonical non-scalar natural literal in little-endian 64-bit limbs.
+    /// Empty vectors, high zero limbs, and values representable by `Nat` are
+    /// refused by validation so one semantic literal has one FIR spelling.
+    NatBig(Vec<u64>),
     String(String),
     Alias(ValueId),
     /// Preserve one concrete semantic value as an ABI-polymorphic value.
@@ -460,6 +465,7 @@ impl Operation {
             Self::Unit
             | Self::Bool(_)
             | Self::Nat(_)
+            | Self::NatBig(_)
             | Self::String(_)
             | Self::CheckSystem { .. } => OperationReads {
                 first: None,
@@ -517,6 +523,7 @@ impl Operation {
 
     fn literal_bytes(&self) -> usize {
         match self {
+            Self::NatBig(limbs) => limbs.len().saturating_mul(8),
             Self::String(value) => value.len(),
             Self::CheckSystem { module_name } => module_name.len(),
             _ => 0,
@@ -1120,6 +1127,19 @@ pub enum ValidationError {
         actual: ValueType,
     },
     NatConstantOutOfRange {
+        function: FunctionId,
+        block: BlockId,
+        value: u64,
+    },
+    EmptyBigNatConstant {
+        function: FunctionId,
+        block: BlockId,
+    },
+    BigNatConstantHasHighZeroLimb {
+        function: FunctionId,
+        block: BlockId,
+    },
+    BigNatConstantFitsScalar {
         function: FunctionId,
         block: BlockId,
         value: u64,
@@ -1798,6 +1818,28 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} Nat {value} exceeds the ABI scalar range",
+                function.get(),
+                block.get()
+            ),
+            Self::EmptyBigNatConstant { function, block } => write!(
+                formatter,
+                "function {} block {} has an empty arbitrary-precision Nat literal",
+                function.get(),
+                block.get()
+            ),
+            Self::BigNatConstantHasHighZeroLimb { function, block } => write!(
+                formatter,
+                "function {} block {} arbitrary-precision Nat literal has a high zero limb",
+                function.get(),
+                block.get()
+            ),
+            Self::BigNatConstantFitsScalar {
+                function,
+                block,
+                value,
+            } => write!(
+                formatter,
+                "function {} block {} arbitrary-precision Nat literal {value} has a noncanonical scalar spelling",
                 function.get(),
                 block.get()
             ),
@@ -2590,6 +2632,28 @@ fn infer_operation_type(
                     function: function.id,
                     block: block.id,
                     value: *value,
+                });
+            }
+            Ok(ValueType::Nat)
+        }
+        Operation::NatBig(limbs) => {
+            let Some(high) = limbs.last() else {
+                return Err(ValidationError::EmptyBigNatConstant {
+                    function: function.id,
+                    block: block.id,
+                });
+            };
+            if *high == 0 {
+                return Err(ValidationError::BigNatConstantHasHighZeroLimb {
+                    function: function.id,
+                    block: block.id,
+                });
+            }
+            if limbs.len() == 1 && limbs[0] <= (usize::MAX >> 1) as u64 {
+                return Err(ValidationError::BigNatConstantFitsScalar {
+                    function: function.id,
+                    block: block.id,
+                    value: limbs[0],
                 });
             }
             Ok(ValueType::Nat)
@@ -3515,6 +3579,10 @@ fn lower_single_binding(
             value: u64::from(*value),
         }),
         Operation::Nat(value) => Ok(flbc::Instruction::Nat { dst, value: *value }),
+        Operation::NatBig(limbs_le) => Ok(flbc::Instruction::NatBig {
+            dst,
+            limbs_le: clone_u64s(limbs_le, "arbitrary-precision Nat literal limbs")?,
+        }),
         Operation::String(value) => Ok(flbc::Instruction::String {
             dst,
             value: clone_string(value, "string bytes")?,
@@ -3724,6 +3792,18 @@ fn clone_bytes(value: &[u8], table: &'static str) -> Result<Vec<u8>, LoweringErr
     Ok(clone)
 }
 
+fn clone_u64s(value: &[u64], table: &'static str) -> Result<Vec<u64>, LoweringError> {
+    let mut clone = Vec::new();
+    clone
+        .try_reserve_exact(value.len())
+        .map_err(|_| LoweringError::AllocationFailure {
+            table,
+            requested: value.len(),
+        })?;
+    clone.extend_from_slice(value);
+    Ok(clone)
+}
+
 fn clone_argument_ownership(
     value: &[flbc::ArgumentOwnership],
 ) -> Result<Vec<flbc::ArgumentOwnership>, LoweringError> {
@@ -3793,6 +3873,13 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         Operation::Unit => output.write_str("unit"),
         Operation::Bool(value) => write!(output, "bool {}", u8::from(*value)),
         Operation::Nat(value) => write!(output, "nat {value}"),
+        Operation::NatBig(limbs) => {
+            write!(output, "nat-big {}:", limbs.len())?;
+            for limb in limbs {
+                write!(output, "{limb:016x}")?;
+            }
+            Ok(())
+        }
         Operation::String(value) => {
             output.write_str("string ")?;
             write_hex_bytes(output, value.as_bytes())
@@ -4521,6 +4608,65 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_precision_nat_operations_are_canonical_and_lower_exactly() {
+        let program = |limbs: Vec<u64>| {
+            Program::new(
+                f(0),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Function {
+                    id: f(0),
+                    parameters: Vec::new(),
+                    parameter_ownership: Vec::new(),
+                    result: ValueType::Nat,
+                    result_ownership: flbc::CallableResultOwnership::OwnedOrScalar,
+                    blocks: vec![Block {
+                        id: b(0),
+                        bindings: vec![Binding {
+                            id: v(0),
+                            ty: ValueType::Nat,
+                            operation: Operation::NatBig(limbs),
+                        }],
+                        terminator: Terminator::Return { value: v(0) },
+                    }],
+                }],
+            )
+        };
+
+        let validated = validate(program(vec![0, 1]), ValidationLimits::default())
+            .expect("2^64 has one canonical arbitrary-precision FIR spelling");
+        let lowered = lower_to_flbc(&validated).expect("canonical Nat limbs lower to FLBC");
+        assert!(matches!(
+            &lowered.functions()[0].code[0],
+            flbc::Instruction::NatBig { limbs_le, .. } if limbs_le == &[0, 1]
+        ));
+
+        assert_eq!(
+            validate(program(Vec::new()), ValidationLimits::default()),
+            Err(ValidationError::EmptyBigNatConstant {
+                function: f(0),
+                block: b(0),
+            })
+        );
+        assert_eq!(
+            validate(program(vec![1, 0]), ValidationLimits::default()),
+            Err(ValidationError::BigNatConstantHasHighZeroLimb {
+                function: f(0),
+                block: b(0),
+            })
+        );
+        assert_eq!(
+            validate(program(vec![7]), ValidationLimits::default()),
+            Err(ValidationError::BigNatConstantFitsScalar {
+                function: f(0),
+                block: b(0),
+                value: 7,
+            })
+        );
+    }
+
+    #[test]
     fn intrinsic_result_ownership_is_canonical_and_lowers_exactly() {
         let mut program = branch_program();
         program.intrinsics[0].result_ownership = flbc::ResultOwnership::Borrowed;
@@ -4594,7 +4740,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/14 entry=f0\n",
+                "fir/15 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",
