@@ -541,12 +541,6 @@ fn inject_emits_a_nat_child_for_bvar() {
     );
 }
 
-fn data_then(extra: u8) -> Vec<u8> {
-    let mut bytes = 0u64.to_le_bytes().to_vec();
-    bytes.push(extra);
-    bytes
-}
-
 #[test]
 fn inject_and_project_round_trip_lam_forall_let_mvar_proj_and_mdata() {
     let mut heap = NativeHeap::new();
@@ -617,16 +611,56 @@ fn inject_and_project_round_trip_lam_forall_let_mvar_proj_and_mdata() {
 #[test]
 fn a_lean_true_lam_projects_its_binder_info() {
     let mut heap = NativeHeap::new();
-    let ty = Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &[]);
-    let body = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
-    let lam = Obj::mk_ctor(6, vec![mk_name(&["x"]), ty, body], &data_then(2));
-    let handle = Conversion::new()
-        .project_expr(&mut heap, &lam)
+    let ty = Expr::sort(Level::zero());
+    let body = Expr::bvar(0).expect("bvar 0 packs");
+    let native = Expr::lam(
+        Name::from_components(["x"]),
+        ty,
+        body,
+        BinderInfo::StrictImplicit,
+    );
+    let handle = heap.alloc(native);
+    let injected = inject_expr(&heap, handle).expect("lam injects");
+    let back = Conversion::new()
+        .project_expr(&mut heap, &injected)
         .expect("a Lean-true lam must project");
-    let ExprNode::Lam { binder_info, .. } = heap.get(handle).expect("handle").node() else {
+    let ExprNode::Lam { binder_info, .. } = heap.get(back).expect("handle").node() else {
         panic!("expected a lam");
     };
     assert_eq!(*binder_info, BinderInfo::StrictImplicit);
+}
+
+#[test]
+fn a_stored_expr_data_word_that_disagrees_with_the_children_is_malformed() {
+    let mut heap = NativeHeap::new();
+    let sort = Obj::mk_ctor(3, vec![Obj::mk_nat(0)], &0xDEAD_BEEF_u64.to_le_bytes());
+    match Conversion::new().project_expr(&mut heap, &sort) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "expr");
+            assert!(
+                reason.contains("Expr.Data"),
+                "a hostile Data word must name Expr.Data, got {reason}"
+            );
+        }
+        other => panic!("mismatched Expr.Data must be malformed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_stored_level_data_word_that_disagrees_with_the_children_is_malformed() {
+    let mut heap = NativeHeap::new();
+    let succ = Obj::mk_ctor(1, vec![Obj::mk_nat(0)], &0xDEAD_BEEF_u64.to_le_bytes());
+    let sort = Obj::mk_ctor(3, vec![succ], &[]);
+    match Conversion::new().project_expr(&mut heap, &sort) {
+        Err(ConvertError::MalformedCompat { family, reason }) => {
+            assert_eq!(family, "level");
+            assert!(
+                reason.contains("Level.Data"),
+                "a hostile Data word must name Level.Data, got {reason}"
+            );
+        }
+        other => panic!("mismatched Level.Data must be malformed, got {other:?}"),
+    }
 }
 
 #[test]
