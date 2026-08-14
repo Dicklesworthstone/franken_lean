@@ -1701,13 +1701,6 @@ fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
     selected
 }
 
-fn run_leanchecker(
-    reference_lib: &Path,
-    targets: &[String],
-) -> Result<ReferenceCorpusVerdict, String> {
-    run_leanchecker_with_search_roots(reference_lib, &[reference_lib], targets)
-}
-
 fn run_leanchecker_with_search_roots(
     reference_lib: &Path,
     search_roots: &[&Path],
@@ -2141,6 +2134,7 @@ fn persist_checkpoint(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> R
 
 fn reference_verdict_with_resume(
     reference_lib: &Path,
+    search_roots: &[&Path],
     inventory: &CorpusInventory,
 ) -> Result<(ReferenceCorpusVerdict, &'static str), String> {
     let oracle_hash = oracle_binary_hash(reference_lib)?;
@@ -2174,7 +2168,7 @@ fn reference_verdict_with_resume(
     if targets.is_empty() {
         return Err("present-olean corpus produced no declaration-bearing targets".to_string());
     }
-    let verdict = run_leanchecker(reference_lib, &targets)?;
+    let verdict = run_leanchecker_with_search_roots(reference_lib, search_roots, &targets)?;
     if matches!(verdict, ReferenceCorpusVerdict::Accepted { .. })
         && let Some(dir) = &checkpoint_dir
     {
@@ -3824,6 +3818,42 @@ fn whole_mathlib_corpus_resurrection_preflight() {
     }
 }
 
+struct WholeMathlibCorpus {
+    mathlib_modules: Vec<String>,
+    roots: Vec<(String, PathBuf)>,
+    inventory: CorpusInventory,
+}
+
+fn closed_whole_mathlib_corpus(reference_lib: &Path) -> Result<WholeMathlibCorpus, String> {
+    let library = preflight_mathlib_corpus()?;
+    let mathlib_modules = module_names_below(&library, Some("Mathlib"))?;
+    let roots = chosen_set_roots(reference_lib);
+    for (_, root) in &roots {
+        if !root.is_dir() {
+            return Err(format!(
+                "whole-Mathlib closure root missing: {}",
+                root.display()
+            ));
+        }
+    }
+    let inventory = closure_inventory_from_seeds(&roots, &mathlib_modules)?;
+    if !inventory.missing_imports.is_empty() {
+        return Err(format!(
+            "whole-Mathlib closure has unresolved imports: {:?}",
+            inventory
+                .missing_imports
+                .iter()
+                .take(20)
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(WholeMathlibCorpus {
+        mathlib_modules,
+        roots,
+        inventory,
+    })
+}
+
 /// Decode the entire built Mathlib import closure before attempting replay. The
 /// old sweep decoded only paths below `Mathlib/`: its order silently ignored
 /// every `Init`, `Std`, `Lean`, and package import because those modules were
@@ -3840,34 +3870,18 @@ fn whole_mathlib_corpus_resurrection_preflight() {
 #[test]
 #[ignore = "cost: decode the full pinned Mathlib corpus; on-demand resurrection sweep for franken_lean-t6r7"]
 fn whole_mathlib_corpus_resurrection_sweep() {
-    let library = preflight_mathlib_corpus().expect("the exact built Mathlib corpus is ready");
-    let mathlib_modules =
-        module_names_below(&library, Some("Mathlib")).expect("enumerate every Mathlib module");
+    let reference_lib =
+        reference_lib().expect("pinned Reference stdlib required for the Mathlib closure");
+    let WholeMathlibCorpus {
+        mathlib_modules,
+        roots: _,
+        inventory,
+    } = closed_whole_mathlib_corpus(&reference_lib)
+        .expect("decode the closed whole-Mathlib import graph");
     assert!(
         mathlib_modules.len() >= 8_000,
         "whole-Mathlib resurrection found only {} modules; a truncated corpus is not a smaller green sweep",
         mathlib_modules.len(),
-    );
-    let reference_lib =
-        reference_lib().expect("pinned Reference stdlib required for the Mathlib closure");
-    let roots = chosen_set_roots(&reference_lib);
-    for (_, root) in &roots {
-        assert!(
-            root.is_dir(),
-            "whole-Mathlib closure root missing: {}",
-            root.display()
-        );
-    }
-    let inventory = closure_inventory_from_seeds(&roots, &mathlib_modules)
-        .expect("decode the closed whole-Mathlib import graph");
-    assert!(
-        inventory.missing_imports.is_empty(),
-        "whole-Mathlib closure has unresolved imports: {:?}",
-        inventory
-            .missing_imports
-            .iter()
-            .take(20)
-            .collect::<Vec<_>>()
     );
     assert!(
         mathlib_modules
@@ -3908,6 +3922,63 @@ fn whole_mathlib_corpus_resurrection_sweep() {
     );
 }
 
+/// The full pinned Mathlib kernel differential over the exact closed graph
+/// established by `whole_mathlib_corpus_resurrection_sweep`. It reuses the
+/// Reference-library corpus scorer and reconstructed-context executor; only
+/// the seed set and sealed oracle search roots differ.
+///
+/// This is intentionally on demand. A run is one bounded observation at this
+/// pin/corpus/host, and any subject resource exhaustion remains an unscorable
+/// non-answer. Run explicitly:
+///
+/// `cargo test --locked -p fln-conformance --test kernel_replay \
+///   whole_mathlib_kernel_differential -- --ignored --exact --nocapture`
+#[test]
+#[ignore = "cost: replay the exact closed whole-Mathlib graph through both kernels; on-demand bounded observation"]
+fn whole_mathlib_kernel_differential() {
+    let reference_lib =
+        reference_lib().expect("pinned Reference stdlib required for the Mathlib differential");
+    let WholeMathlibCorpus {
+        mathlib_modules,
+        roots,
+        inventory,
+    } = closed_whole_mathlib_corpus(&reference_lib)
+        .expect("inventory the exact closed whole-Mathlib graph");
+    assert!(
+        mathlib_modules.len() >= 8_000,
+        "whole-Mathlib differential seed floor: {} < 8000",
+        mathlib_modules.len()
+    );
+    let mathlib_oracle_applicable = mathlib_modules
+        .iter()
+        .map(|name| {
+            let module = &inventory.modules[name];
+            module.decoded - module.oracle_skipped
+        })
+        .sum::<u64>();
+    assert!(
+        mathlib_oracle_applicable != 0,
+        "whole-Mathlib differential has no oracle-applicable declarations"
+    );
+    let order = corpus_module_order(&inventory).expect("canonical whole-Mathlib module order");
+    let search_roots = roots
+        .iter()
+        .map(|(_, root)| root.as_path())
+        .collect::<Vec<_>>();
+    run_accepted_corpus_kernel_differential(
+        &reference_lib,
+        &search_roots,
+        inventory,
+        order,
+        CorpusDifferentialScope {
+            module_floor: 10_000,
+            decoded_floor: 700_000,
+            compared_floor: mathlib_oracle_applicable,
+            label: "pinned-whole-mathlib",
+        },
+    );
+}
+
 /// The executable corpus obligation. It remains ignored while fln-7odd is
 /// open because the selected oracle itself supplies no verdict for 3,612
 /// decoded rows; enabling a gate that is known to fail before that contract is
@@ -3923,16 +3994,54 @@ fn pinned_present_olean_kernel_differential() {
     let inventory =
         inventory_present_oleans(&reference_lib).expect("inventory every present pinned olean");
     let order = corpus_module_order(&inventory).expect("canonical present-module order");
+    let search_roots = [reference_lib.as_path()];
+    run_accepted_corpus_kernel_differential(
+        &reference_lib,
+        &search_roots,
+        inventory,
+        order,
+        CorpusDifferentialScope {
+            module_floor: PINNED_PRESENT_OLEAN_FLOOR,
+            decoded_floor: PINNED_DECODED_DECL_FLOOR,
+            compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR,
+            label: "pinned-reference-library",
+        },
+    );
+}
+
+struct CorpusDifferentialScope {
+    module_floor: u64,
+    decoded_floor: u64,
+    compared_floor: u64,
+    label: &'static str,
+}
+
+fn run_accepted_corpus_kernel_differential(
+    reference_lib: &Path,
+    oracle_search_roots: &[&Path],
+    inventory: CorpusInventory,
+    order: Vec<String>,
+    scope: CorpusDifferentialScope,
+) {
+    let CorpusDifferentialScope {
+        module_floor,
+        decoded_floor,
+        compared_floor,
+        label: corpus_label,
+    } = scope;
     assert!(
-        inventory.modules.len() as u64 >= PINNED_PRESENT_OLEAN_FLOOR,
-        "present-module coverage floor"
+        inventory.modules.len() as u64 >= module_floor,
+        "{corpus_label} module coverage floor: {} < {module_floor}",
+        inventory.modules.len()
     );
     assert!(
-        inventory.decoded >= PINNED_DECODED_DECL_FLOOR,
-        "decoded-declaration coverage floor"
+        inventory.decoded >= decoded_floor,
+        "{corpus_label} decoded-declaration coverage floor: {} < {decoded_floor}",
+        inventory.decoded
     );
     let (oracle, oracle_source) =
-        reference_verdict_with_resume(&reference_lib, &inventory).expect("run pinned leanchecker");
+        reference_verdict_with_resume(reference_lib, oracle_search_roots, &inventory)
+            .expect("run pinned leanchecker");
     match oracle {
         ReferenceCorpusVerdict::Accepted {
             duration,
@@ -4158,14 +4267,15 @@ fn pinned_present_olean_kernel_differential() {
             },
         );
     }
-    total.assert_conservation("full present-olean corpus");
+    total.assert_conservation(corpus_label);
     println!(
-        "kernel_reference_corpus SUMMARY: {} of {} decoded declarations compared, \
+        "kernel_reference_corpus SUMMARY: corpus={} {} of {} decoded declarations compared, \
          {} disagreements, split by direction: unsoundly_permissive={} \
          restrictive_with_carve_out={} restrictive_without_carve_out={}; \
          unscorable={} oracle_skipped={} subject_no_answer={} modules={} \
          missing_imports={} fixture_hash={} \
          schedule_independence=not_measured_in_this_run",
+        corpus_label,
         total.compared,
         total.decoded,
         total.disagreements(),
@@ -4200,10 +4310,10 @@ fn pinned_present_olean_kernel_differential() {
          bead=fln-8zsq,fln-corpus-thread-matrix-93te"
     );
     assert!(
-        total.compared >= PINNED_ORACLE_APPLICABLE_FLOOR,
+        total.compared >= compared_floor,
         "kernel differential coverage silently stopped: {} < {} scoreable declarations",
         total.compared,
-        PINNED_ORACLE_APPLICABLE_FLOOR
+        compared_floor
     );
     assert_eq!(
         total.unsoundly_permissive, 0,
