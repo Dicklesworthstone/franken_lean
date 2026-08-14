@@ -160,7 +160,7 @@ covenant fln-kernel max-loc=12000
 # Every name here must have a matching `crate` row in SUITE.lock (bidirectional check);
 # any use must be a path dependency at the SUITE.lock-pinned repo.
 suite-dep asupersync
-suite-dep frankensqlite
+suite-dep fsqlite
 suite-dep franken_networkx
 suite-dep frankensearch
 suite-dep frankentui
