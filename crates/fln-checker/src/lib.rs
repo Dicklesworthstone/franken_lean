@@ -61,8 +61,8 @@
 //! * **Universe judgments.** [`fln_core::level::Level::is_equiv`],
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
-//!   directly as its verdict — `tc.rs:2602` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:2542`/`2896`/`3860` decide
+//!   directly as its verdict — `tc.rs:2619` answers KR-303 sort definitional
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:2559`/`2928`/`3896` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -74,7 +74,7 @@
 //!   kernel *skips work* on: `instantiate` returns early when
 //!   `loose_bvar_range() <= k` (`tc.rs:1487`), and the iterative
 //!   `abstract_fvar_set` and `replace_fvar` paths return early when
-//!   `!has_fvar()` (`tc.rs:3674`/`3749`). An under-reporting flag makes
+//!   `!has_fvar()` (`tc.rs:3710`/`3785`). An under-reporting flag makes
 //!   substitution silently skip a subterm that needed rewriting. Shared, both
 //!   engines skip the same subterm and agree for the same wrong reason.
 //! * **Hashing that feeds a decision.** [`fln_core::lean_hash`] and the
@@ -146,7 +146,7 @@
 //! ### Deliberately on the SCHEMA side, with the reason
 //!
 //! `Expr`'s `PartialEq` compares the data word first and then walks the
-//! structure on a heap worklist (`expr.rs:510`). The data word is a fast
+//! structure on a heap worklist (`expr.rs:511`). The data word is a fast
 //! **reject** only, so a hash collision costs a structural walk and cannot
 //! manufacture a false "equal". Sharing it is therefore safe in the direction
 //! that matters. It still inherits the flag correctness above, which is why
@@ -314,16 +314,16 @@
 //! that the prose reading the site is sound.
 //!
 //! ```text
-//! cite crates/fln-kernel/src/tc.rs:2602 :: lt.is_equiv(ls)
-//! cite crates/fln-kernel/src/tc.rs:2542 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
-//! cite crates/fln-kernel/src/tc.rs:2896 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:3860 :: ExprNode::Sort { level } @@ fn infer_proj
+//! cite crates/fln-kernel/src/tc.rs:2619 :: lt.is_equiv(ls)
+//! cite crates/fln-kernel/src/tc.rs:2559 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
+//! cite crates/fln-kernel/src/tc.rs:2928 :: ExprNode::Sort { level } @@ fn is_prop
+//! cite crates/fln-kernel/src/tc.rs:3896 :: ExprNode::Sort { level } @@ fn infer_proj
 //! cite crates/fln-kernel/src/tc.rs:1487 :: e.loose_bvar_range() <= k
-//! cite crates/fln-kernel/src/tc.rs:3674 :: !e.has_fvar() @@ fn abstract_fvar_set
-//! cite crates/fln-kernel/src/tc.rs:3749 :: !e.has_fvar() @@ fn replace_fvar
+//! cite crates/fln-kernel/src/tc.rs:3710 :: !e.has_fvar() @@ fn abstract_fvar_set
+//! cite crates/fln-kernel/src/tc.rs:3785 :: !e.has_fvar() @@ fn replace_fvar
 //! cite crates/fln-hash/src/canon.rs:1160 :: impl Canonical for Expr
 //! cite crates/fln-hash/src/canon.rs:658 :: pub trait Canonical: Sized
-//! cite crates/fln-core/src/expr.rs:510 :: impl PartialEq for Expr
+//! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:542 :: id: "B3-INDEPENDENT-CHECKER"
 //! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
 //! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
