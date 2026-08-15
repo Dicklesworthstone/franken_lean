@@ -537,7 +537,7 @@ const PLANTS: &[Plant] = &[
         file: "crates/fln-kernel/src/admit.rs",
         // Short-circuiting the recursive-occurrence test makes `check_positivity` return
         // `Ok(())` for every argument, which is precisely "skipped".
-        find: "if !self.mentions_block(&t) {",
+        find: "if !self.mentions_block(&current) {",
         replace: "if true {",
         package: "fln-kernel",
         target: &["--test", "k1_judgments"],
