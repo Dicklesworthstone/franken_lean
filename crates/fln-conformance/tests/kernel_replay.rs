@@ -7912,6 +7912,13 @@ fn run_chosen_leg(inventory: &CorpusInventory, chosen: &str) -> Result<ChosenLeg
 ///   cargo test -p fln-conformance --test kernel_replay \
 ///     selected_real_module_resource_probe -- --ignored --nocapture
 ///
+/// Set `FLN_CORPUS_PROBE_DIAGNOSTIC=1` to print the bounded authoritative
+/// diagnostic in addition to its digest when investigating a rejection.
+/// `FLN_CORPUS_PROBE_ENV` may additionally name a comma-separated set of
+/// constants whose decoded kinds and definition bodies should be shown.
+/// `FLN_CORPUS_PROBE_EXPECT` makes the process fail unless the exact rendered
+/// outcome matches (for example, `accepted` or `rejected:TypeMismatch`).
+///
 /// Omitting `FLN_CORPUS_PROBE_STACK_BYTES` and `FLN_CORPUS_PROBE_STEPS` uses
 /// `Budget::DEFAULT` on its required stack. Supplying either value is a
 /// diagnostic-only way to derive an explicitly calibrated budget for that
@@ -7997,11 +8004,48 @@ fn selected_real_module_resource_probe() {
     let (unit_index, item) = matches[0];
     let verdict = check_work_item_with_stack(item, budget, stack_bytes);
     let outcome = unit_outcome(item, &verdict);
+    if let Ok(expected) = std::env::var("FLN_CORPUS_PROBE_EXPECT") {
+        assert!(
+            !expected.is_empty(),
+            "FLN_CORPUS_PROBE_EXPECT must be a non-empty exact outcome"
+        );
+        assert!(
+            outcome.outcome == expected,
+            "{chosen}: declaration `{selector}` produced `{}`; expected `{expected}`",
+            outcome.outcome
+        );
+    }
     let message_digest = if outcome.message.is_empty() {
         "none".to_string()
     } else {
         hash(Domain::Fixture, outcome.message.as_bytes()).to_hex()
     };
+    if std::env::var_os("FLN_CORPUS_PROBE_DIAGNOSTIC").is_some() {
+        eprintln!("kernel_resource_probe diagnostic={}", outcome.message);
+    }
+    if let Ok(names) = std::env::var("FLN_CORPUS_PROBE_ENV") {
+        for entry in names.split(',') {
+            let mut target = Name::anonymous();
+            for segment in entry.trim().split('.') {
+                target = Name::str(target, segment);
+            }
+            match item.env.find(&target) {
+                Some(ConstantInfo::Defn(definition)) => eprintln!(
+                    "kernel_resource_probe env {}=definition safety={:?} hints={:?} value={}",
+                    entry.trim(),
+                    definition.safety,
+                    definition.hints,
+                    shape(&definition.value, 10)
+                ),
+                Some(other) => eprintln!(
+                    "kernel_resource_probe env {}={}",
+                    entry.trim(),
+                    other.kind_name()
+                ),
+                None => eprintln!("kernel_resource_probe env {}=ABSENT", entry.trim()),
+            }
+        }
+    }
     eprintln!(
         "kernel_resource_probe module={} declaration={} unit_index={} unit_lead={} \
          kind={} members={} outcome={} steps_used={} max_depth={} \

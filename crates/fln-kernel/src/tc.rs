@@ -2385,13 +2385,20 @@ impl<'a> TypeChecker<'a> {
                     depth += 1;
                     self.step(depth)?;
                     // Pin: the non-cheap path fully WHNFs the scrutinee
-                    // (including delta) before the first `reduce_proj`.
-                    if !cheap_proj
-                        && !matches!(
-                            current.node(),
-                            ExprNode::Proj { .. } | ExprNode::MData { .. }
-                        )
-                    {
+                    // (including delta) before the first `reduce_proj`. MData
+                    // is WHNF-transparent, so expose its payload before
+                    // deciding whether the scrutinee is another projection or
+                    // requires full WHNF. Otherwise `Proj S i (mdata (f a))`
+                    // reaches the application arm without delta-unfolding `f`
+                    // and is incorrectly cached as stuck.
+                    if !cheap_proj {
+                        while let ExprNode::MData { expr, .. } = current.node() {
+                            current = expr.clone();
+                            depth += 1;
+                            self.step(depth)?;
+                        }
+                    }
+                    if !cheap_proj && !matches!(current.node(), ExprNode::Proj { .. }) {
                         current = self.whnf(&current, depth + 1)?;
                         match self.finish_pending_projs(current, &mut pending_projs, &mut depth)? {
                             PendingProj::Done(value) => break value,
@@ -5395,21 +5402,28 @@ fn first_divergence(t: &Expr, s: &Expr) -> Option<String> {
                     binder_info: i2,
                 },
             ) => {
-                if i1 != i2 {
-                    return Some(format!("{path}: binder info {i1:?} vs {i2:?}"));
-                }
-                if n1 != n2 {
-                    return Some(format!(
-                        "{path}: binder name {} vs {}",
-                        n1.to_display_string(),
-                        n2.to_display_string()
-                    ));
-                }
+                // Binder names and annotations are not part of kernel
+                // definitional equality (pin: type_checker.cpp:690). Report
+                // a type/body difference first so cosmetic metadata cannot
+                // hide the semantic reason an application was rejected.
                 if t1 != t2 {
                     current_t = t1;
                     current_s = t2;
                     path.push_str(".binder_type");
                     continue;
+                }
+                if b1 == b2 {
+                    return if i1 != i2 {
+                        Some(format!("{path}: binder info {i1:?} vs {i2:?}"))
+                    } else if n1 != n2 {
+                        Some(format!(
+                            "{path}: binder name {} vs {}",
+                            n1.to_display_string(),
+                            n2.to_display_string()
+                        ))
+                    } else {
+                        Some(format!("{path}: binders differ undetectably"))
+                    };
                 }
                 current_t = b1;
                 current_s = b2;
@@ -6861,6 +6875,29 @@ mod tests {
     }
 
     #[test]
+    fn first_divergence_does_not_let_binder_metadata_mask_a_body_difference() {
+        let type_ = Expr::sort(Level::zero());
+        let left = Expr::forall_e(
+            Name::str(Name::anonymous(), "left"),
+            type_.clone(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Implicit,
+        );
+        let right = Expr::forall_e(
+            Name::anonymous(),
+            type_,
+            Expr::bvar(1).expect("packs"),
+            BinderInfo::Default,
+        );
+
+        let report = first_divergence(&left, &right).expect("bodies differ");
+        assert!(
+            report.contains(".body") && report.contains("#0 vs #1"),
+            "binder metadata must not mask the semantic body difference: {report}"
+        );
+    }
+
+    #[test]
     fn pi_inference_uses_the_pin_smart_imax_constructor() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
@@ -7688,6 +7725,62 @@ mod tests {
                 .get(&beta_sort_zero, &tc.locals, &tc.local_positions),
             Some(sort_zero),
             "lazy-delta unfolding must retain the ordinary WHNF result"
+        );
+    }
+
+    #[test]
+    fn full_whnf_projection_strips_mdata_before_delta_normalizing_scrutinee() {
+        use fln_core::options::KVMap;
+        use fln_env::constants::{ConstantVal, DefinitionVal};
+
+        // `Array.toList (mdata (List.toArray []))` in
+        // `Init.Data.Array.Bootstrap.Array.foldrM_eq_reverse_foldlM_toList`
+        // exposed this ordering bug: the projection pre-pass saw MData and
+        // postponed full WHNF, then the core application loop stripped MData
+        // but deliberately did not delta-unfold the newly exposed definition.
+        // Use a stuck projection here so the assertion isolates exactly the
+        // scrutinee normalization step without fabricating an inductive block.
+        let sort_zero = Expr::sort(Level::zero());
+        let sort_one = Expr::sort(Level::one());
+        let source_name = Name::str(Name::anonymous(), "metadataProjectionSource");
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: source_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        sort_one.clone(),
+                        sort_one.clone(),
+                        BinderInfo::Default,
+                    ),
+                },
+                value: Expr::lam(
+                    Name::anonymous(),
+                    sort_one,
+                    Expr::bvar(0).expect("packs"),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![source_name.clone()],
+            }),
+        );
+        let reducible_scrutinee =
+            Expr::app(Expr::const_(source_name, Vec::new()), sort_zero.clone());
+        let structure_name = Name::str(Name::anonymous(), "ProjectionProbe");
+        let term = Expr::proj(
+            structure_name.clone(),
+            0,
+            Expr::mdata(KVMap::default(), reducible_scrutinee),
+        );
+        let expected = Expr::proj(structure_name, 0, sort_zero);
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT.narrowed(1_000, 32));
+
+        assert!(
+            tc.whnf(&term, 0).expect("full projection WHNF completes") == expected,
+            "metadata must not prevent full WHNF from delta-normalizing a projection scrutinee"
         );
     }
 
