@@ -3836,7 +3836,17 @@ impl<'a> TypeChecker<'a> {
         if let Some(cached) = cached {
             return Ok(cached);
         }
-        let result = match e.node() {
+        // Peel MData on the heap. Convert can inject a 400-deep metadata
+        // nest; one native frame per KR-111 used to abort the check that
+        // found it (FL-INV-07). WHNF already strips these in its loop.
+        let mut current = e.clone();
+        let mut depth = depth;
+        while let ExprNode::MData { expr, .. } = current.node() {
+            current = expr.clone();
+            depth = depth.saturating_add(1);
+            self.step(depth)?;
+        }
+        let result = match current.node() {
             // KR-101: unreachable given the closed-term precondition; still a typed
             // rejection, never a panic.
             ExprNode::BVar { .. } => reject(
@@ -3924,8 +3934,8 @@ impl<'a> TypeChecker<'a> {
             // steps instead of native stack.
             ExprNode::App { .. } => {
                 let result = match mode {
-                    InferMode::Check => self.infer_app_check(e, depth + 1),
-                    InferMode::Only => self.infer_app_only(e, depth + 1),
+                    InferMode::Check => self.infer_app_check(&current, depth + 1),
+                    InferMode::Only => self.infer_app_only(&current, depth + 1),
                 };
                 if let Ok(inferred) = &result {
                     match mode {
@@ -3949,7 +3959,7 @@ impl<'a> TypeChecker<'a> {
             }
             // KR-107.
             ExprNode::Lam { .. } => {
-                let result = self.infer_lambda_spine(e, depth + 1, mode);
+                let result = self.infer_lambda_spine(&current, depth + 1, mode);
                 if let Ok(inferred) = &result {
                     match mode {
                         InferMode::Check => self.infer_cache.insert(
@@ -3972,7 +3982,7 @@ impl<'a> TypeChecker<'a> {
             }
             // KR-108: the imax rule.
             ExprNode::ForallE { .. } => {
-                let result = self.infer_pi_spine(e, depth + 1, mode);
+                let result = self.infer_pi_spine(&current, depth + 1, mode);
                 if let Ok(inferred) = &result {
                     match mode {
                         InferMode::Check => self.infer_cache.insert(
@@ -3995,7 +4005,7 @@ impl<'a> TypeChecker<'a> {
             }
             // KR-109.
             ExprNode::LetE { .. } => {
-                let result = self.infer_let_spine(e, depth + 1, mode);
+                let result = self.infer_let_spine(&current, depth + 1, mode);
                 if let Ok(inferred) = &result {
                     match mode {
                         InferMode::Check => self.infer_cache.insert(
@@ -4027,7 +4037,9 @@ impl<'a> TypeChecker<'a> {
                 ),
                 Vec::new(),
             )),
-            // KR-111.
+            // KR-111 is the peel above. A leftover wrapper here would mean
+            // the while-loop missed a node; keep a typed descent rather
+            // than treating that as an invariant failure.
             ExprNode::MData { expr, .. } => {
                 let expr = expr.clone();
                 self.infer_core_mode(&expr, depth + 1, mode)
@@ -6589,6 +6601,32 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= budget.depth,
             "lambda arity must consume loop steps rather than native-stack depth"
+        );
+    }
+
+    #[test]
+    fn infer_strips_a_deep_mdata_nest_without_stack_fault() {
+        let mut term = Expr::lit(Literal::Nat(NatLit::from_u64(7)));
+        for _ in 0..400 {
+            term = Expr::mdata(fln_core::options::KVMap::default(), term);
+        }
+        let budget = Budget::DEFAULT;
+        let env = Environment::new();
+        let mut checking = TypeChecker::new(&env, &[], budget);
+        let inferred = checking
+            .infer(&term, 0)
+            .expect("a 400-mdata nest must not stack-fault");
+        assert!(
+            matches!(
+                inferred.node(),
+                ExprNode::Const { name, .. } if name.to_display_string() == "Nat"
+            ),
+            "KR-111 must infer the inner literal, got {}",
+            brief_public(&inferred)
+        );
+        assert!(
+            checking.consumption().max_depth <= budget.depth,
+            "mdata wrappers must consume loop steps, not native-stack depth"
         );
     }
 
