@@ -335,6 +335,7 @@ fn a_string_whose_m_length_is_not_the_scalar_count_is_refused() {
         let view = OleanView::parse(&bytes).expect("pilot parses");
         view.walk(WalkBudget::default())
             .expect("the unmutated pilot walks");
+        rebuild(&bytes).expect("the unmutated pilot rebuilds");
     }
     let objects = collect_objects(&bytes);
     let string = objects
@@ -358,6 +359,17 @@ fn a_string_whose_m_length_is_not_the_scalar_count_is_refused() {
             }
         ),
         "expected m_length integrity, got {error:?}"
+    );
+    let error = rebuild(&hostile).expect_err("rebuild must not re-emit a lying m_length");
+    assert!(
+        matches!(
+            error,
+            RegionError::StringIntegrity {
+                reason: "m_length is not the UTF-8 scalar count",
+                ..
+            }
+        ),
+        "rebuild expected m_length integrity, got {error:?}"
     );
 }
 
@@ -462,6 +474,7 @@ fn an_mpz_with_foreign_limbs_is_refused_by_the_inline_law() {
         let view = OleanView::parse(&bytes).expect("pilot parses");
         view.walk(WalkBudget::default())
             .expect("the unmutated pilot walks");
+        rebuild(&bytes).expect("the unmutated pilot rebuilds");
     }
 
     let mut hostile = bytes.clone();
@@ -479,6 +492,13 @@ fn an_mpz_with_foreign_limbs_is_refused_by_the_inline_law() {
     assert!(
         matches!(error, RegionError::MpzIntegrity { .. }),
         "expected MpzIntegrity, got {error:?}"
+    );
+    // Rebuild is an independent DFS and used to copy `deref(limb)` without
+    // the inline law, so foreign bytes became an mpz-limbs span.
+    let error = rebuild(&hostile).expect_err("rebuild must not copy foreign limbs");
+    assert!(
+        matches!(error, RegionError::MpzIntegrity { .. }),
+        "rebuild expected MpzIntegrity, got {error:?}"
     );
 }
 

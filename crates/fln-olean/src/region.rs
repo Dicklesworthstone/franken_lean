@@ -796,7 +796,7 @@ impl<'a> OleanView<'a> {
         Ok(report)
     }
 
-    fn check_string(&self, off: u64) -> RResult<()> {
+    pub(crate) fn check_string(&self, off: u64) -> RResult<()> {
         let size = self.read_u64(off + 8)?;
         let capacity = self.read_u64(off + 16)?;
         if size == 0 || size > capacity {
@@ -832,7 +832,7 @@ impl<'a> OleanView<'a> {
         Ok(())
     }
 
-    fn check_mpz(&self, off: u64) -> RResult<()> {
+    pub(crate) fn check_mpz(&self, off: u64) -> RResult<()> {
         // GMP encoding (header flags bit 0 set at the pin): the mpz_object
         // carries {alloc: i32, size: i32, limbs: ptr}; the compactor copies
         // the limb array right after the object and rewrites the one pointer.

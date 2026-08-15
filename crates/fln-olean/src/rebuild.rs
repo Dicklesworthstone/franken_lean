@@ -286,6 +286,10 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
                     reason: "string size exceeds capacity",
                 });
             }
+            // Walk's `check_string` also refuses a missing NUL, invalid
+            // UTF-8, and a stored m_length that is not the scalar count.
+            // Rebuild used to copy the payload and re-emit those lies.
+            view.check_string(off)?;
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
             out.extend_from_slice(&length.to_le_bytes());
@@ -301,6 +305,12 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             }
         } else if tag == abi::TAG_MPZ {
             kind = "mpz";
+            // Walk's `check_mpz` refuses zero live limbs, alloc < |size|,
+            // and a limb pointer that is not the inline block after this
+            // object. Copying from `deref(limb_raw)` first would treat
+            // another object's bytes as this number whenever that address
+            // was in-file, then only fail later if the new span overlapped.
+            view.check_mpz(off)?;
             let packed = view.read_u64(off + 8)?;
             out.extend_from_slice(&packed.to_le_bytes());
             let limb_raw = view.read_u64(off + 16)?;
