@@ -432,6 +432,32 @@ fn kernel_line_covenant_is_enforced() {
 }
 
 #[test]
+fn kernel_test_tail_is_not_misreported_as_release_authority() {
+    let ws = TempWs::new("covenant-test-tail");
+    base(&ws);
+    let mut source = String::from("#![forbid(unsafe_code)]\n");
+    for i in 0..99 {
+        source.push_str(&format!("fn release_{i}() {{}}\n"));
+    }
+    source.push_str(
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn private_probe() { assert_eq!(1, 1); }\n}\n",
+    );
+    ws.write("crates/fln-kernel/src/lib.rs", &source);
+    assert!(
+        ws.run().findings.is_empty(),
+        "test-only assertions are absent from both the release LOC and generated-authority closure"
+    );
+
+    source.push_str("fn authority_after_test_module() {}\n");
+    ws.write("crates/fln-kernel/src/lib.rs", &source);
+    assert_eq!(
+        codes(&ws.run()),
+        vec!["FLN-STRUCT-015", "FLN-STRUCT-030"],
+        "later authority must make the exclusion fail closed and restore the whole-file scan"
+    );
+}
+
+#[test]
 fn wrong_edition_is_flagged() {
     let ws = TempWs::new("edition");
     base(&ws);

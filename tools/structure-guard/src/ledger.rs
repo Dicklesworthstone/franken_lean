@@ -111,6 +111,7 @@ fn marker_id(line: &str) -> Option<String> {
 struct Lexeme {
     text: String,
     line: usize,
+    offset: usize,
     delimiter_depth: usize,
 }
 
@@ -259,6 +260,7 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
             out.push(Lexeme {
                 text: text[start..cursor].to_string(),
                 line,
+                offset: start,
                 delimiter_depth,
             });
             continue;
@@ -274,6 +276,7 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
             out.push(Lexeme {
                 text: text[start..cursor].to_string(),
                 line,
+                offset: start,
                 delimiter_depth,
             });
             continue;
@@ -281,6 +284,7 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
         out.push(Lexeme {
             text: (byte as char).to_string(),
             line,
+            offset: cursor,
             delimiter_depth,
         });
         match byte {
@@ -291,6 +295,54 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
         cursor += 1;
     }
     out
+}
+
+/// The source prefix compiled into an ordinary (non-test) build.
+///
+/// Unit tests in the kernel need private access, so its three large test modules live at the
+/// ends of their production files. They are not part of the release TCB and must not consume
+/// the kernel's 12 KLOC covenant or its generated-authority inventory. This exclusion is
+/// intentionally much narrower than a general `cfg` evaluator: only an exact, top-level
+/// `#[cfg(test)] mod tests { ... }` that owns the lexical tail is removed. A nested module, a
+/// string/comment decoy, a compound predicate, or any later production token keeps the whole
+/// file in the governed release closure.
+pub fn release_authority_source(text: &str) -> &str {
+    const SPELLING: [(&str, usize); 10] = [
+        ("#", 0),
+        ("[", 0),
+        ("cfg", 1),
+        ("(", 1),
+        ("test", 2),
+        (")", 2),
+        ("]", 1),
+        ("mod", 0),
+        ("tests", 0),
+        ("{", 0),
+    ];
+    let lexemes = rust_lexemes(text);
+    for start in 0..lexemes.len() {
+        let Some(candidate) = lexemes.get(start..start + SPELLING.len()) else {
+            break;
+        };
+        if !candidate
+            .iter()
+            .zip(SPELLING)
+            .all(|(lexeme, (spelling, depth))| {
+                lexeme.text == spelling && lexeme.delimiter_depth == depth
+            })
+        {
+            continue;
+        }
+        let closing = lexemes
+            .iter()
+            .enumerate()
+            .skip(start + SPELLING.len())
+            .find(|(_, lexeme)| lexeme.text == "}" && lexeme.delimiter_depth == 1);
+        if closing.is_some_and(|(index, _)| index + 1 == lexemes.len()) {
+            return &text[..candidate[0].offset];
+        }
+    }
+    text
 }
 
 fn attributes(text: &str) -> Vec<Attribute> {
@@ -1490,6 +1542,30 @@ fn two() {}
             .filter(|attribute| attribute_contains_lint_call(attribute, "allow", "unsafe_code"))
             .collect();
         assert_eq!(allows.len(), 2);
+    }
+
+    #[test]
+    fn release_authority_excludes_only_an_exact_top_level_test_tail() {
+        let production = "fn release() {}\n";
+        let test_tail = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn private_probe() { assert_eq!(1, 1); }\n}\n";
+        let source = format!("{production}{test_tail}");
+        assert_eq!(release_authority_source(&source), production);
+
+        let trailing_release = format!("{source}fn hidden_after_tests() {{}}\n");
+        assert_eq!(
+            release_authority_source(&trailing_release),
+            trailing_release,
+            "a test module that does not own the lexical tail cannot hide later authority"
+        );
+
+        let nested = format!("mod outer {{\n{test_tail}}}\n");
+        assert_eq!(release_authority_source(&nested), nested);
+
+        let compound = "fn release() {}\n#[cfg(all(test, feature = \"probe\"))]\nmod tests {}\n";
+        assert_eq!(release_authority_source(compound), compound);
+
+        let decoy = "const DECOY: &str = \"#[cfg(test)] mod tests { assert_eq!(1, 1); }\";\n";
+        assert_eq!(release_authority_source(decoy), decoy);
     }
 
     #[test]

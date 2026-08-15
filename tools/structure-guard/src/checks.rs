@@ -953,8 +953,11 @@ fn read_governed(path: &Path, rel: &str, findings: &mut Vec<Finding>) -> Option<
     }
 }
 
-/// Count covenant-relevant lines: non-blank, not starting with `//` after trim.
-/// Block comments count as code — the covenant is deliberately conservative.
+/// Count release-covenant lines: non-blank, not starting with `//` after trim.
+/// Block comments count as code — the covenant is deliberately conservative. An exact
+/// top-level `#[cfg(test)] mod tests { ... }` lexical tail is excluded because it is absent
+/// from ordinary builds and therefore is not part of the trusted release checker. The
+/// recognizer fails closed; see [`ledger::release_authority_source`].
 ///
 /// A file that cannot be decoded is reported and skipped, so an unreadable source file
 /// understates the count as a finding rather than passing the covenant silently.
@@ -994,7 +997,7 @@ fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usi
                 let Some(text) = read_governed(&p, &rel, findings) else {
                     continue;
                 };
-                total += text
+                total += ledger::release_authority_source(&text)
                     .lines()
                     .filter(|l| {
                         let t = l.trim();
@@ -2627,7 +2630,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
                 continue;
             };
-            audit_declaration_admission_surface(&text, &source_rel, &mut findings);
+            audit_declaration_admission_surface(
+                ledger::release_authority_source(&text),
+                &source_rel,
+                &mut findings,
+            );
         }
     }
 
@@ -2651,10 +2658,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
                 continue;
             };
+            let authority_source = ledger::release_authority_source(&text);
             if crate_name == "fln-kernel" {
-                audit_kernel_generated_authority(&text, &source_rel, &mut findings);
+                audit_kernel_generated_authority(authority_source, &source_rel, &mut findings);
             }
-            for escape in ledger::source_escape_sites(&text) {
+            for escape in ledger::source_escape_sites(authority_source) {
                 let rel = source_rel.clone();
                 findings.push(Finding {
                     code: "FLN-STRUCT-015",
