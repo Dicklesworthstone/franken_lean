@@ -640,19 +640,24 @@ fn checked_rel(buf: &[u8], field: usize, from: u64, len: usize) -> RResult<Optio
     Ok(Some(rel))
 }
 
-/// The mpz limb-pointer law shared by [`relocate`] and [`audit`]: the limb
-/// pointer must land inside this object's inline block, aligned.
+/// The mpz limb-pointer law shared by [`relocate`], [`audit`], and
+/// [`materialize`]: the pin's compactor copies live limbs immediately
+/// after the object and rewrites the one pointer to that address. A
+/// pointer that is merely *somewhere* in the inline block used to
+/// pass; reading `|_mp_size|` limbs from there then treated the next
+/// object as this number. The only legal address is the start of the
+/// inline block.
 fn checked_limb_rel(
     buf: &[u8],
     field: usize,
     from: u64,
     offset: usize,
-    size: usize,
+    _size: usize,
 ) -> RResult<u64> {
     let v = read_u64(buf, field);
     let rel = v.wrapping_sub(from);
-    let block = (offset + MPZ_FIXED) as u64..(offset + size) as u64;
-    if !block.contains(&rel) || !rel.is_multiple_of(8) {
+    let inline_start = (offset + MPZ_FIXED) as u64;
+    if rel != inline_start {
         return Err(RegionFault::MpzIntegrity { offset });
     }
     Ok(rel)
@@ -876,6 +881,12 @@ pub fn materialize(buf: &[u8], base: u64) -> RResult<Obj> {
         } else if h.tag == abi::TAG_TASK {
             Obj::mk_task_pure(children.pop().expect("one fixed slot"))
         } else if h.tag == abi::TAG_MPZ {
+            // `walk_step` proved alloc/size coherence and the inline
+            // extent. It does not see `base`, so the limb POINTER is
+            // this reader's job. Audit already refused a foreign or
+            // mid-block pointer; materialize used to ignore it and
+            // always copy from `off + MPZ_FIXED`.
+            checked_limb_rel(buf, off + 16, base, off, step.size)?;
             let mp_size = read_i32(buf, off + 12);
             let limbs = usize::try_from(mp_size.unsigned_abs()).expect("u32");
             let mut vals = Vec::with_capacity(limbs);

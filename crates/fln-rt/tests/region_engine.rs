@@ -393,6 +393,56 @@ fn mpz_header_extremes_are_typed_faults_not_panics() {
     );
 }
 
+/// Audit already refused a limb pointer outside the inline block.
+/// Materialize used to ignore the pointer and copy from `off + 24`,
+/// so a foreign-limb mpz became a live number (FL-INV-07).
+#[test]
+fn a_mpz_with_foreign_or_midblock_limbs_is_refused_by_materialize() {
+    let _g = lock();
+    // Root points at the mpz so materialize actually builds it.
+    let mut buf = vec![0u8; 48];
+    buf[0..8].copy_from_slice(&8u64.to_le_bytes());
+    buf[15] = fln_rt::abi::TAG_MPZ;
+    buf[16..20].copy_from_slice(&2i32.to_le_bytes());
+    buf[20..24].copy_from_slice(&2i32.to_le_bytes());
+    // Inline block is [32, 48). Point at the root word.
+    buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        fln_rt::region::audit(&buf, 0),
+        Err(RegionFault::MpzIntegrity { offset: 8 }),
+        "audit must refuse a foreign limb pointer"
+    );
+    assert_eq!(
+        materialize(&buf, 0),
+        Err(RegionFault::MpzIntegrity { offset: 8 }),
+        "materialize must not mint a Nat from a foreign limb pointer"
+    );
+
+    // Mid-block: start is in the inline span, but reading 2 limbs from
+    // there overruns the object into whatever follows.
+    buf[24..32].copy_from_slice(&40u64.to_le_bytes());
+    assert_eq!(
+        fln_rt::region::audit(&buf, 0),
+        Err(RegionFault::MpzIntegrity { offset: 8 }),
+        "audit must refuse a mid-block limb pointer"
+    );
+    assert_eq!(
+        materialize(&buf, 0),
+        Err(RegionFault::MpzIntegrity { offset: 8 }),
+        "materialize must not read past the minted mpz"
+    );
+
+    buf[24..32].copy_from_slice(&32u64.to_le_bytes());
+    assert!(
+        fln_rt::region::audit(&buf, 0).is_ok(),
+        "the unmutated inline start still audits"
+    );
+    assert!(
+        materialize(&buf, 0).is_ok(),
+        "the unmutated inline start still materializes"
+    );
+}
+
 /// Two threads publishing the SAME target must never produce a mixture.
 ///
 /// The staging file used to be keyed on the process id alone, so two threads
