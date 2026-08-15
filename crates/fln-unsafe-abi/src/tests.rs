@@ -741,6 +741,37 @@ fn try_sarray_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn try_ref_get_refuses_an_empty_or_non_ref_cell() {
+    let _g = lock();
+    let cell = Obj::mk_ref(Obj::mk_nat(7));
+    let occupant = cell.try_ref_get().expect("a well-formed ref is readable");
+    assert_eq!(occupant.unbox(), 7);
+
+    assert!(
+        Obj::mk_nat(3).try_ref_get().is_none(),
+        "a scalar is not a ref"
+    );
+    assert!(
+        Obj::mk_string("n").try_ref_get().is_none(),
+        "a string is not a ref"
+    );
+
+    let taken = cell.ref_take();
+    assert_eq!(taken.unbox(), 7);
+    assert!(
+        cell.try_ref_get().is_none(),
+        "a taken cell is empty, not an abort"
+    );
+    cell.ref_set(Obj::mk_nat(8));
+    assert_eq!(
+        cell.try_ref_get()
+            .expect("refill restores the occupant")
+            .unbox(),
+        8
+    );
+}
+
+#[test]
 fn try_ctor_child_refuses_slots_past_the_allocation() {
     let _g = lock();
     let well = Obj::mk_ctor(1, vec![Obj::mk_nat(1), Obj::mk_nat(2)], &[]);

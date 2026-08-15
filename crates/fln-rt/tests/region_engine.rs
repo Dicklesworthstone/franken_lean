@@ -27,7 +27,19 @@ fn sample_graph() -> Obj {
     let pair = Obj::mk_ctor(2, vec![shared.clone_ref(), Obj::mk_nat(41)], &[0xEE; 4]);
     let big = Obj::mk_mpz(&[0xDEAD_BEEF_u64, 7], true);
     let scalars = Obj::mk_sarray(4, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
-    Obj::mk_array(vec![pair, shared, big, scalars, Obj::mk_nat(0)])
+    let cell = Obj::mk_ref(shared.clone_ref());
+    let delayed = Obj::mk_thunk_value(Obj::mk_nat(7));
+    let done = Obj::mk_task_pure(shared.clone_ref());
+    Obj::mk_array(vec![
+        pair,
+        shared,
+        big,
+        scalars,
+        cell,
+        delayed,
+        done,
+        Obj::mk_nat(0),
+    ])
 }
 
 const BASE_A: u64 = 0x7000_0000_0000;
@@ -271,6 +283,76 @@ fn compact_emits_a_live_sarray_and_materialize_recovers_the_payload() {
         .expect("empty sarray survives the join");
     assert_eq!((elem, n, cap), (4, 0, 0));
     assert!(data.is_empty());
+}
+
+/// Walk and materialize already handled evaluated thunks, refs, and
+/// finished tasks. Compact refused the whole tags as UnsupportedCategory.
+#[test]
+fn compact_emits_evaluated_thunk_ref_and_finished_task() {
+    let _g = lock();
+
+    let cell = Obj::mk_ref(Obj::mk_string("cell"));
+    let cell_bytes = compact(&cell, BASE_A).expect("compact a live ref");
+    let cell_back = materialize(&cell_bytes, BASE_A).expect("materialize the emitted ref");
+    let occupant = cell_back
+        .try_ref_get()
+        .expect("materialized object is a ref");
+    let (size, _, _, bytes) = occupant
+        .try_string_view()
+        .expect("ref occupant is the original string");
+    assert_eq!(&bytes[..size - 1], b"cell");
+    assert_eq!(
+        compact(&cell_back, BASE_A).expect("recompact ref"),
+        cell_bytes,
+        "compact ∘ materialize is the identity on a ref"
+    );
+
+    let delayed = Obj::mk_thunk_value(Obj::mk_nat(9));
+    let thunk_bytes = compact(&delayed, BASE_A).expect("compact an evaluated thunk");
+    let thunk_back = materialize(&thunk_bytes, BASE_A).expect("materialize the emitted thunk");
+    let value = thunk_back
+        .evaluated_thunk_value()
+        .expect("materialized object is an evaluated thunk");
+    assert_eq!(value.unbox(), 9);
+    assert_eq!(
+        compact(&thunk_back, BASE_A).expect("recompact thunk"),
+        thunk_bytes
+    );
+
+    let done = Obj::mk_task_pure(Obj::mk_nat(3));
+    let task_bytes = compact(&done, BASE_A).expect("compact a finished task");
+    let task_back = materialize(&task_bytes, BASE_A).expect("materialize the emitted task");
+    let value = task_back
+        .finished_task_value()
+        .expect("materialized object is a finished task");
+    assert_eq!(value.unbox(), 3);
+    assert_eq!(
+        compact(&task_back, BASE_A).expect("recompact task"),
+        task_bytes
+    );
+
+    let empty = Obj::mk_ref(Obj::mk_nat(1));
+    let _ = empty.ref_take();
+    assert!(
+        matches!(
+            compact(&empty, BASE_A),
+            Err(RegionFault::BuildShape {
+                reason: "ref cell is empty",
+            })
+        ),
+        "a taken ref must refuse, not abort"
+    );
+
+    let unevaluated = Obj::mk_thunk_closure(Obj::mk_closure(1, Vec::new()));
+    assert!(
+        matches!(
+            compact(&unevaluated, BASE_A),
+            Err(RegionFault::BuildShape {
+                reason: "thunk is not evaluated",
+            })
+        ),
+        "an unevaluated thunk stays a typed refusal"
+    );
 }
 
 #[test]

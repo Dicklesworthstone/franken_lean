@@ -964,6 +964,27 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
             }
         } else if tag == abi::TAG_STRING || tag == abi::TAG_MPZ || tag == abi::TAG_SCALAR_ARRAY {
             // leaves
+        } else if tag == abi::TAG_REF {
+            let Some(child) = o.try_ref_get() else {
+                return Err(RegionFault::BuildShape {
+                    reason: "ref cell is empty",
+                });
+            };
+            children.push(child);
+        } else if tag == abi::TAG_THUNK {
+            let Some(child) = o.evaluated_thunk_value() else {
+                return Err(RegionFault::BuildShape {
+                    reason: "thunk is not evaluated",
+                });
+            };
+            children.push(child);
+        } else if tag == abi::TAG_TASK {
+            let Some(child) = o.finished_task_value() else {
+                return Err(RegionFault::BuildShape {
+                    reason: "task is not finished",
+                });
+            };
+            children.push(child);
         } else {
             return Err(RegionFault::UnsupportedCategory {
                 tag,
@@ -1074,6 +1095,34 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     out.extend_from_slice(&(size as u64).to_le_bytes());
                     out.extend_from_slice(&(length as u64).to_le_bytes());
                     out.extend_from_slice(&data);
+                } else if h.tag == abi::TAG_REF {
+                    let Some(child) = o.try_ref_get() else {
+                        return Err(RegionFault::BuildShape {
+                            reason: "ref cell is empty",
+                        });
+                    };
+                    emit_header(&mut out, REF_SIZE, h.tag, 0);
+                    out.extend_from_slice(&word_of(&child, &memo).to_le_bytes());
+                } else if h.tag == abi::TAG_THUNK {
+                    let Some(child) = o.evaluated_thunk_value() else {
+                        return Err(RegionFault::BuildShape {
+                            reason: "thunk is not evaluated",
+                        });
+                    };
+                    emit_header(&mut out, THUNK_SIZE, h.tag, 0);
+                    out.extend_from_slice(&word_of(&child, &memo).to_le_bytes());
+                    // Pin relocates only m_value (compact.cpp:622-625).
+                    out.extend_from_slice(&0u64.to_le_bytes());
+                } else if h.tag == abi::TAG_TASK {
+                    let Some(child) = o.finished_task_value() else {
+                        return Err(RegionFault::BuildShape {
+                            reason: "task is not finished",
+                        });
+                    };
+                    emit_header(&mut out, TASK_SIZE, h.tag, 0);
+                    out.extend_from_slice(&word_of(&child, &memo).to_le_bytes());
+                    // m_imp is not a region pointer; a finished task has none.
+                    out.extend_from_slice(&0u64.to_le_bytes());
                 } else if h.tag == abi::TAG_MPZ {
                     let Some((_, mp_size, limbs)) = o.try_mpz_view() else {
                         return Err(RegionFault::MpzIntegrity {

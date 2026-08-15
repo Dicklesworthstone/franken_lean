@@ -715,11 +715,36 @@ impl Obj {
         }
     }
 
+    /// Fallible `ST.Ref` read.
+    ///
+    /// Returns `None` when the handle is not a ref or the cell is empty.
+    /// Product paths that accept untrusted objects must use this;
+    /// [`ref_get`] still asserts a live occupant. A taken cell used to
+    /// abort in `ref_get_owned` (`null reference read`).
+    pub fn try_ref_get(&self) -> Option<Obj> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_REF) {
+            return None;
+        }
+        // SAFETY: tag is TAG_REF. A null cell is a typed miss, not an
+        // abort: compact of a taken ref must refuse rather than die.
+        unsafe {
+            let value = object::ref_value(self.0);
+            if value.is_null() {
+                return None;
+            }
+            if !tagged::is_scalar(value) {
+                rc::inc_ref_n(value, 1);
+            }
+            Some(Obj(value))
+        }
+    }
+
     /// Read an `ST.Ref` cell as a fresh owned reference.
     pub fn ref_get(&self) -> Obj {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
         // SAFETY: invariant + tag assertion; the raw operation retains the
-        // borrowed cell value before it escapes.
+        // borrowed cell value before it escapes, including the MT atomic
+        // protocol that `try_ref_get`'s snapshot read does not perform.
         unsafe { Obj(object::ref_get_owned(self.0)) }
     }
 
