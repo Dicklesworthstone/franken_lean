@@ -59,20 +59,23 @@ enum Shape {
     /// former abort pairing can prove it answers typed. Not a residual
     /// native-stack shape.
     ProjInfer,
-    /// KR-311 application congruence still recurses on a right-nested
-    /// argument pair. Left spines are a heap peel; `f (f (... a))` vs a
-    /// structurally different but definitionally equal nest is not.
+    /// Converted: KR-311 now compares a right-nested argument pair on a heap
+    /// stack. Kept so the former abort pairing can prove it answers typed.
     DefEqApp,
+    /// `whnf_core` down a projection nest (KR-204): each scrutinee is itself
+    /// a projection, so cheap-proj defeq still re-enters per layer.
+    DefEqProj,
 }
 
 impl Shape {
-    const ALL: [Shape; 1] = [Shape::DefEqApp];
+    const ALL: [Shape; 1] = [Shape::DefEqProj];
 
     fn as_str(self) -> &'static str {
         match self {
             Shape::AppInfer => "app_infer",
             Shape::ProjInfer => "proj_infer",
             Shape::DefEqApp => "defeq_app",
+            Shape::DefEqProj => "defeq_proj",
         }
     }
 
@@ -81,6 +84,7 @@ impl Shape {
             "app_infer" => Some(Shape::AppInfer),
             "proj_infer" => Some(Shape::ProjInfer),
             "defeq_app" => Some(Shape::DefEqApp),
+            "defeq_proj" => Some(Shape::DefEqProj),
             _ => None,
         }
     }
@@ -207,6 +211,25 @@ fn build_probe(shape: Shape, levels: u32) -> Probe {
             for _ in 0..levels {
                 left = Expr::app(f.clone(), left);
                 right = Expr::app(f.clone(), right);
+            }
+            Probe::DefEq(env, left, right)
+        }
+        Shape::DefEqProj => {
+            // Two projection nests that are definitionally equal but not
+            // structurally equal (`mdata` on the innermost leaf only).
+            // Cheap-proj defeq WHNFs each scrutinee, and that walk still
+            // recurses one frame per layer.
+            let env = Environment::new();
+            let env = add(&env, &axiom_decl("T", sort1()));
+            let t = Expr::const_(n("T"), vec![]);
+            let env = add(&env, &axiom_decl("a", t));
+            let a = Expr::const_(n("a"), vec![]);
+            let structure = n("S");
+            let mut left = Expr::mdata(KVMap::default(), a.clone());
+            let mut right = a;
+            for _ in 0..levels {
+                left = Expr::proj(structure.clone(), 0, left);
+                right = Expr::proj(structure.clone(), 0, right);
             }
             Probe::DefEq(env, left, right)
         }
@@ -595,6 +618,23 @@ fn former_proj_infer_abort_pairing_now_answers_typed() {
     );
 }
 
+/// The former DefEqApp abort pairing must now answer typed. If this starts
+/// dying again, the KR-311 heap stack has regressed onto the native stack.
+#[test]
+fn former_defeq_app_abort_pairing_now_answers_typed() {
+    const RUST_DEFAULT_SPAWNED_STACK: usize = 2 * 1024 * 1024;
+    let outcome = run_probe(
+        Shape::DefEqApp,
+        RUST_DEFAULT_SPAWNED_STACK,
+        Budget::DEFAULT.depth,
+    );
+    assert!(
+        matches!(outcome, ProbeOutcome::DepthExhausted),
+        "right-nested app congruence is a heap walk; Budget::DEFAULT on a 2 MiB \
+         stack must hit the depth ceiling, not abort. got {outcome:?}"
+    );
+}
+
 impl Shape {
     /// The shape used by the reproduction witness and by the tripwire's planted
     /// violations: the WORST per-level descent in
@@ -603,12 +643,13 @@ impl Shape {
     ///
     /// Re-measured after the explicit telescope/worklist conversion:
     /// matching binder-defeq (KR-302), right-nested application infer
-    /// (KR-106), and projection-nest infer (KR-112) are heap walks, so they
-    /// no longer belong in a native-stack witness. Retaining a converted
-    /// shape would make "survived without reaching the ceiling" look like a
-    /// calibration failure. `DefEqApp` is the residual worst case (KR-311
-    /// still recurses on a right-nested argument pair).
-    const WITNESS: Shape = Shape::DefEqApp;
+    /// (KR-106), projection-nest infer (KR-112), and right-nested app
+    /// congruence (KR-311) are heap walks, so they no longer belong in a
+    /// native-stack witness. Retaining a converted shape would make
+    /// "survived without reaching the ceiling" look like a calibration
+    /// failure. `DefEqProj` is the residual worst case (`whnf_core` still
+    /// recurses on a projection scrutinee).
+    const WITNESS: Shape = Shape::DefEqProj;
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +658,7 @@ impl Shape {
 // ---------------------------------------------------------------------------
 //
 // WHY THE GUARDS ABOVE DO NOT COVER THIS. They prove SURVIVAL AT THE SHIPPED
-// PAIRING — `Budget::DEFAULT` returns a typed non-answer on a 64 MiB thread,
+// PAIRING — `Budget::DEFAULT` returns a typed non-answer on a MIN_STACK thread,
 // `for_stack_bytes(2 MiB)` does the same on 2 MiB. That is a different claim
 // from "the shipped number still describes this descent". They pass unchanged
 // while the true per-level cost drifts upward, because `STACK_SAFETY_FACTOR`

@@ -321,15 +321,17 @@ impl StackMeasurement {
     pub const K1_SAFETY_FACTOR: usize = 2;
 
     /// K1 measured in the `dev` profile on `x86_64-unknown-linux-gnu` at the
-    /// pinned nightly, 2026-07-25 (bead `franken_lean-kxbj`).
+    /// pinned nightly, 2026-08-15, after the KR-311 right-nested heap walk.
     ///
     /// | shape                        | bytes/depth |
     /// |------------------------------|-------------|
-    /// | `forall` inference (worst)   | 5_935       |
+    /// | `defeq_proj` (worst residual)| 3_567       |
     ///
-    /// The three inference descents land on the same slope because the
-    /// dominating cost is a single `infer_core` frame per level; defeq binder
-    /// congruence is cheaper per level despite using two frames.
+    /// Converted inference/defeq spines (forall, right-nested app infer,
+    /// projection infer, right-nested app congruence) are heap walks and no
+    /// longer belong in this table. The residual is cheap-proj WHNF of a
+    /// `.1.1.1` nest. Re-measured by
+    /// `calibrate_stack_bytes_per_depth` (1 MiB → 288, 4 MiB → 1170).
     ///
     /// Rerun `cargo test -p fln-kernel --test depth_stack_calibration --
     /// --ignored --nocapture calibrate_stack_bytes_per_depth` after any change
@@ -338,15 +340,16 @@ impl StackMeasurement {
     pub const K1_DEV: StackMeasurement = StackMeasurement::measured(
         EngineId::K1,
         ExecConfig::of(Profile::Dev, "x86_64", "linux"),
-        5_935,
+        3_567,
         StackMeasurement::K1_ENTRY_RESERVE_BYTES,
         StackMeasurement::K1_SAFETY_FACTOR,
     );
 
-    /// K1 measured in the `release` profile on the same target and day — 640
-    /// bytes per depth, 9.3x cheaper than [`StackMeasurement::K1_DEV`] for the
+    /// K1 measured in the `release` profile on 2026-07-25 — 640 bytes per
+    /// depth, 5.6x cheaper than [`StackMeasurement::K1_DEV`] for the
     /// identical depth number. This pair IS the bead: same label, different
-    /// resource.
+    /// resource. The release figure was not re-run on 2026-08-15; only the
+    /// residual `dev` descent moved.
     pub const K1_RELEASE: StackMeasurement = StackMeasurement::measured(
         EngineId::K1,
         ExecConfig::of(Profile::Release, "x86_64", "linux"),
@@ -747,7 +750,7 @@ impl Budget {
     /// discovered by aborting. Derived, not chosen: it is exactly the stack
     /// `DEFAULT_DEPTH` needs under the current profile's measurement, rounded
     /// up to the next power of two. In the `dev` profile that is
-    /// `4096 * 5935 * 2 + 64 KiB` = 46.4 MiB, rounded to **64 MiB** — far above
+    /// `4096 * 3567 * 2 + 64 KiB` = 27.9 MiB, rounded to **32 MiB** — far above
     /// Rust's default spawned thread (2 MiB) and above a typical main thread
     /// (8 MiB). Thread stacks are lazily committed, so this is address space,
     /// not resident memory.

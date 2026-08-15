@@ -10,7 +10,7 @@
 //!
 //! | pair produced by cargo         | measured cost | ceiling for 64 MiB |
 //! |--------------------------------|---------------|--------------------|
-//! | `opt-level = 0`, assertions on  | 5,935 B/depth | ~4,096             |
+//! | `opt-level = 0`, assertions on  | 3,567 B/depth | ~4,096             |
 //! | `opt-level = 3`, assertions off | 640 B/depth   | ~38,000            |
 //!
 //! `debug_assertions` is a **proxy** for "unoptimised", and `verdict.rs` says so
@@ -19,8 +19,8 @@
 //!
 //! * A profile pairing `debug-assertions = false` with `opt-level = 0` is
 //!   classified `Release`, so the kernel derives a ceiling from the 640-byte
-//!   figure while the frames it actually gets are the 5,935-byte ones. The
-//!   descent then runs about 9.3x deeper than the stack can hold. A native stack
+//!   figure while the frames it actually gets are the 3,567-byte ones. The
+//!   descent then runs about 5.6x deeper than the stack can hold. A native stack
 //!   overflow is the one exhaustion FL-INV-07 cannot convert into a typed
 //!   `Inconclusive`, because it aborts the process uncatchably — there is no
 //!   "after the fact" in which to type it. The compile-time assertions in
@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 const MEASURED_PAIRS: [(OptLevel, bool); 2] = [
     // `cargo test`: what the Tribunal and every kernel replay run under.
     (OptLevel::Numeric(0), true),
-    // `cargo test --release`: 9.3x cheaper per unit of depth.
+    // `cargo test --release`: 5.6x cheaper per unit of depth.
     (OptLevel::Numeric(3), false),
 ];
 
@@ -115,7 +115,7 @@ struct ProfileTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Finding {
     /// The pair is classified `Release` by the proxy and is not optimised: the
-    /// kernel would derive a ceiling ~9.3x above what the stack holds.
+    /// kernel would derive a ceiling ~5.6x above what the stack holds.
     CeilingAboveFrames {
         manifest: String,
         header: String,
@@ -149,8 +149,8 @@ impl Finding {
                 "{manifest} [{header}]: debug-assertions are OFF at opt-level {opt_level}. \
                  fln-kernel's Profile::current() reads cfg!(debug_assertions), so it would \
                  classify this build `release` and derive its depth ceiling from the 640 \
-                 bytes/depth release measurement — while unoptimised frames cost 5,935. The \
-                 descent would run ~9.3x deeper than the stack holds, and a native stack \
+                 bytes/depth release measurement — while unoptimised frames cost 3,567. The \
+                 descent would run ~5.6x deeper than the stack holds, and a native stack \
                  overflow aborts the process uncatchably: FL-INV-07 cannot type it, so the \
                  guarantee has to be structural and this is where it is structural. Either \
                  restore the pairing, or measure this configuration \
@@ -474,7 +474,7 @@ fn the_workspace_declares_no_profile_overrides_today() {
 // ---------------------------------------------------------------------------
 
 /// THE ABORT CASE. Assertions off, optimisation off: classified `release`, given
-/// the 640-byte ceiling, running on 5,935-byte frames.
+/// the 640-byte ceiling, running on 3,567-byte frames.
 #[test]
 fn a_profile_that_would_abort_the_kernel_is_refused() {
     let findings = audit(

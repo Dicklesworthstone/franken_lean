@@ -3102,167 +3102,310 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn is_def_eq_core(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
-        self.step(depth)?; // KR-300 resource hook
-        if let Some(decided) = self.quick_def_eq_rules(t, s, depth)? {
-            return Ok(decided);
-        }
-        // KR-313's reflection fast path (pin type_checker.cpp:1062): `t` closed
-        // and `s` literally `Bool.true` — fully reduce `t` and compare. This is
-        // how `decide`-style proofs (`Eq.refl true : decide p = true`) close.
-        // One-sided at the pin; the symmetric case still closes through delta.
-        if !t.has_fvar()
-            && matches!(s.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
-        {
-            let reduced = self.whnf(t, depth + 1)?;
-            if matches!(reduced.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
-            {
-                return Ok(true);
-            }
-        }
-        // KR-305: normalize both sides without delta, then RE-RUN the head
-        // rules on the reduced pair (beta/zeta/iota can expose Sort or binder
-        // heads whose levels are equivalent but not structurally equal).
-        let cheap_projection_pair = matches!(
-            (t.node(), s.node()),
-            (
-                ExprNode::Proj { idx: left, .. },
-                ExprNode::Proj { idx: right, .. },
-            ) if left == right
-        );
-        let tn = if cheap_projection_pair {
-            self.whnf_core_for_defeq(t, depth + 1)?
-        } else {
-            self.whnf_core(t, depth + 1)?
-        };
-        let sn = if cheap_projection_pair {
-            self.whnf_core_for_defeq(s, depth + 1)?
-        } else {
-            self.whnf_core(s, depth + 1)?
-        };
-        if (tn != *t || sn != *s)
-            && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
-        {
-            return Ok(decided);
-        }
-        // KR-306 definitional proof irrelevance in Prop.
-        if self.proof_irrel_eq(&tn, &sn, depth + 1)? {
-            return Ok(true);
-        }
-        // KR-307/309 lazy delta by definitional height — with the KR-313 offset
-        // and literal-arithmetic machinery woven into every iteration, as at
-        // the pin — then the head rules once more: delta is exactly how an
-        // abbrev (`outParam`, `ReaderT`, `Not`) exposes its Sort or Π structure.
-        let (tn, sn) = match self.lazy_delta(tn, sn, depth + 1)? {
-            LazyDelta::Decided(decided) => return Ok(decided),
-            LazyDelta::Stuck(t, s) => (t, s),
-        };
-        if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)? {
-            return Ok(decided);
-        }
-        // KR-310: same-name constants with equivalent levels.
-        if let (
-            ExprNode::Const {
-                name: n1,
-                levels: l1,
-            },
-            ExprNode::Const {
-                name: n2,
-                levels: l2,
-            },
-        ) = (tn.node(), sn.node())
-            && n1 == n2
-            && l1.len() == l2.len()
-            && l1.iter().zip(l2).all(|(a, b)| a.is_equiv(b))
-        {
-            return Ok(true);
-        }
-        // KR-310's projection half (pin is_def_eq_core:1101 via
-        // lazy_delta_proj_reduction): same-index projections first compare
-        // their scrutinees by lazy delta, then try constructor-field reduction
-        // on both sides before the ordinary scrutinee-defeq fallback.
-        if let (
-            ExprNode::Proj {
-                idx: i1, expr: e1, ..
-            },
-            ExprNode::Proj {
-                idx: i2, expr: e2, ..
-            },
-        ) = (tn.node(), sn.node())
-            && i1 == i2
-        {
-            let (e1, e2) = (e1.clone(), e2.clone());
-            if self.lazy_delta_proj_reduction(e1, e2, *i1, depth + 1)? {
-                return Ok(true);
-            }
-        }
-        // The cheap pre-pass deliberately leaves projection scrutinees short
-        // of full WHNF. Retry both sides with the ordinary reducer only after
-        // the scrutinee-level shortcut above has had its chance, exactly as at
-        // the pin. A changed pair restarts the complete ladder.
-        let tn_full = self.whnf_core(&tn, depth + 1)?;
-        let sn_full = self.whnf_core(&sn, depth + 1)?;
-        if tn_full != tn || sn_full != sn {
-            return self.is_def_eq_core(&tn_full, &sn_full, depth + 1);
-        }
-        // KR-311 application congruence. The pin is one app per recursive
-        // call (fn then arg). A 400-deep spine is now a legal WHNF residue;
-        // walking it on the call stack would abort (FL-INV-07). Peel both
-        // spines, charge one `step` per extra layer so Budget::depth still
-        // binds, then compare head and arguments left-to-right. Failure
-        // falls through to eta, same as a false conjunct at the pin.
-        if matches!(
-            (tn.node(), sn.node()),
-            (ExprNode::App { .. }, ExprNode::App { .. })
-        ) {
-            let (head1, args1) = app_spine(&tn);
-            let (head2, args2) = app_spine(&sn);
-            if args1.len() == args2.len() {
-                let mut layer = depth;
-                let mut ok = true;
-                for extra in 1..args1.len() {
-                    layer = depth
-                        .checked_add(extra as u32)
-                        .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
-                    self.step(layer)?;
-                }
-                let child_depth = layer
-                    .checked_add(1)
-                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
-                if !self.is_def_eq(&head1, &head2, child_depth)? {
-                    ok = false;
-                }
-                if ok {
-                    for (a1, a2) in args1.iter().zip(&args2) {
-                        if !self.is_def_eq(a1, a2, child_depth)? {
-                            ok = false;
-                            break;
+        // KR-311's pin is one app per recursive call (fn then arg). Left
+        // spines are already a heap peel; a right-nested argument pair
+        // `f (f (... a))` is itself an application, so comparing those
+        // arguments used to re-enter this function on the native stack
+        // (FL-INV-07). Each reduced pair is now a loop iteration; nested
+        // applications become extra frames. Failure still falls through to
+        // eta on the pair that failed congruence, same as a false conjunct
+        // at the pin. The cheap-proj full-WHNF restart is a tail loop here
+        // rather than a native call.
+        let mut stack: Vec<AppCongFrame> = Vec::new();
+        let mut left = t.clone();
+        let mut right = s.clone();
+        let mut depth = depth;
+        loop {
+            match self.defeq_reduce_pair(&left, &right, depth)? {
+                DefeqReduced::Decided(decided) => {
+                    if decided {
+                        self.cache_positive_defeq(&left, &right);
+                    }
+                    match self.advance_app_stack(&mut stack, decided)? {
+                        AppStack::Done(result) => return Ok(result),
+                        AppStack::Next {
+                            left: next_left,
+                            right: next_right,
+                            depth: next_depth,
+                        } => {
+                            left = next_left;
+                            right = next_right;
+                            depth = next_depth;
                         }
                     }
                 }
-                if ok {
-                    return Ok(true);
+                DefeqReduced::Stuck(tn, sn) => {
+                    if let Some(frame) =
+                        self.open_app_congruence(left.clone(), right.clone(), &tn, &sn, depth)?
+                    {
+                        left = frame.args1[0].clone();
+                        right = frame.args2[0].clone();
+                        depth = frame.child_depth;
+                        stack.push(frame);
+                    } else {
+                        let decided = self.defeq_eta_tail(&tn, &sn, depth)?;
+                        if decided {
+                            self.cache_positive_defeq(&left, &right);
+                        }
+                        match self.advance_app_stack(&mut stack, decided)? {
+                            AppStack::Done(result) => return Ok(result),
+                            AppStack::Next {
+                                left: next_left,
+                                right: next_right,
+                                depth: next_depth,
+                            } => {
+                                left = next_left;
+                                right = next_right;
+                                depth = next_depth;
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn cache_positive_defeq(&mut self, t: &Expr, s: &Expr) {
+        self.positive_def_eq_cache.insert(
+            t.clone(),
+            s.clone(),
+            &self.locals,
+            &self.local_positions,
+        );
+    }
+
+    /// KR-300 through the cheap-proj full-WHNF restart. A changed pair
+    /// continues this loop instead of re-entering `is_def_eq_core`.
+    fn defeq_reduce_pair(&mut self, t: &Expr, s: &Expr, mut depth: u32) -> KResult<DefeqReduced> {
+        let mut t = t.clone();
+        let mut s = s.clone();
+        loop {
+            self.step(depth)?; // KR-300 resource hook
+            if let Some(decided) = self.quick_def_eq_rules(&t, &s, depth)? {
+                return Ok(DefeqReduced::Decided(decided));
+            }
+            // KR-313's reflection fast path (pin type_checker.cpp:1062): `t`
+            // closed and `s` literally `Bool.true` — fully reduce `t` and
+            // compare. This is how `decide`-style proofs
+            // (`Eq.refl true : decide p = true`) close. One-sided at the pin;
+            // the symmetric case still closes through delta.
+            if !t.has_fvar()
+                && matches!(s.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
+            {
+                let reduced = self.whnf(&t, depth + 1)?;
+                if matches!(reduced.node(), ExprNode::Const { name, .. } if is_name2(name, "Bool", "true"))
+                {
+                    return Ok(DefeqReduced::Decided(true));
+                }
+            }
+            // KR-305: normalize both sides without delta, then RE-RUN the
+            // head rules on the reduced pair (beta/zeta/iota can expose Sort
+            // or binder heads whose levels are equivalent but not
+            // structurally equal).
+            let cheap_projection_pair = matches!(
+                (t.node(), s.node()),
+                (
+                    ExprNode::Proj { idx: left, .. },
+                    ExprNode::Proj { idx: right, .. },
+                ) if left == right
+            );
+            let tn = if cheap_projection_pair {
+                self.whnf_core_for_defeq(&t, depth + 1)?
+            } else {
+                self.whnf_core(&t, depth + 1)?
+            };
+            let sn = if cheap_projection_pair {
+                self.whnf_core_for_defeq(&s, depth + 1)?
+            } else {
+                self.whnf_core(&s, depth + 1)?
+            };
+            if (tn != t || sn != s)
+                && let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)?
+            {
+                return Ok(DefeqReduced::Decided(decided));
+            }
+            // KR-306 definitional proof irrelevance in Prop.
+            if self.proof_irrel_eq(&tn, &sn, depth + 1)? {
+                return Ok(DefeqReduced::Decided(true));
+            }
+            // KR-307/309 lazy delta by definitional height — with the KR-313
+            // offset and literal-arithmetic machinery woven into every
+            // iteration, as at the pin — then the head rules once more:
+            // delta is exactly how an abbrev (`outParam`, `ReaderT`, `Not`)
+            // exposes its Sort or Π structure.
+            let (tn, sn) = match self.lazy_delta(tn, sn, depth + 1)? {
+                LazyDelta::Decided(decided) => return Ok(DefeqReduced::Decided(decided)),
+                LazyDelta::Stuck(t, s) => (t, s),
+            };
+            if let Some(decided) = self.quick_def_eq_rules(&tn, &sn, depth)? {
+                return Ok(DefeqReduced::Decided(decided));
+            }
+            // KR-310: same-name constants with equivalent levels.
+            if let (
+                ExprNode::Const {
+                    name: n1,
+                    levels: l1,
+                },
+                ExprNode::Const {
+                    name: n2,
+                    levels: l2,
+                },
+            ) = (tn.node(), sn.node())
+                && n1 == n2
+                && l1.len() == l2.len()
+                && l1.iter().zip(l2).all(|(a, b)| a.is_equiv(b))
+            {
+                return Ok(DefeqReduced::Decided(true));
+            }
+            // KR-310's projection half (pin is_def_eq_core:1101 via
+            // lazy_delta_proj_reduction): same-index projections first
+            // compare their scrutinees by lazy delta, then try
+            // constructor-field reduction on both sides before the ordinary
+            // scrutinee-defeq fallback.
+            if let (
+                ExprNode::Proj {
+                    idx: i1, expr: e1, ..
+                },
+                ExprNode::Proj {
+                    idx: i2, expr: e2, ..
+                },
+            ) = (tn.node(), sn.node())
+                && i1 == i2
+            {
+                let (e1, e2) = (e1.clone(), e2.clone());
+                if self.lazy_delta_proj_reduction(e1, e2, *i1, depth + 1)? {
+                    return Ok(DefeqReduced::Decided(true));
+                }
+            }
+            // The cheap pre-pass deliberately leaves projection scrutinees
+            // short of full WHNF. Retry both sides with the ordinary reducer
+            // only after the scrutinee-level shortcut above has had its
+            // chance, exactly as at the pin. A changed pair restarts the
+            // complete ladder.
+            let tn_full = self.whnf_core(&tn, depth + 1)?;
+            let sn_full = self.whnf_core(&sn, depth + 1)?;
+            if tn_full != tn || sn_full != sn {
+                t = tn_full;
+                s = sn_full;
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+                continue;
+            }
+            return Ok(DefeqReduced::Stuck(tn, sn));
+        }
+    }
+
+    fn defeq_eta_tail(&mut self, tn: &Expr, sn: &Expr, depth: u32) -> KResult<bool> {
         // KR-312 function eta, both directions.
-        if self.try_eta(&tn, &sn, depth + 1)? || self.try_eta(&sn, &tn, depth + 1)? {
+        if self.try_eta(tn, sn, depth + 1)? || self.try_eta(sn, tn, depth + 1)? {
             return Ok(true);
         }
         // KR-903 structure eta, both directions (pin: try_eta_struct).
-        if self.try_eta_struct(&tn, &sn, depth + 1)? || self.try_eta_struct(&sn, &tn, depth + 1)? {
+        if self.try_eta_struct(tn, sn, depth + 1)? || self.try_eta_struct(sn, tn, depth + 1)? {
             return Ok(true);
         }
         // KR-314 defeq half (pin try_string_lit_expansion, type_checker.cpp:1030):
-        // a String literal against a `String.ofList _` spine — decisive when the
-        // shape matches, either side.
-        if let Some(decided) = self.try_string_lit_expansion(&tn, &sn, depth + 1)? {
+        // a String literal against a `String.ofList _` spine — decisive when
+        // the shape matches, either side.
+        if let Some(decided) = self.try_string_lit_expansion(tn, sn, depth + 1)? {
             return Ok(decided);
         }
         // KR-315 unit-like structures (pin: is_def_eq_unit_like, one-sided).
-        if self.is_def_eq_unit_like(&tn, &sn, depth + 1)? {
+        if self.is_def_eq_unit_like(tn, sn, depth + 1)? {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn open_app_congruence(
+        &mut self,
+        orig_left: Expr,
+        orig_right: Expr,
+        tn: &Expr,
+        sn: &Expr,
+        depth: u32,
+    ) -> KResult<Option<AppCongFrame>> {
+        if !matches!(
+            (tn.node(), sn.node()),
+            (ExprNode::App { .. }, ExprNode::App { .. })
+        ) {
+            return Ok(None);
+        }
+        let (head1, args1) = app_spine(tn);
+        let (head2, args2) = app_spine(sn);
+        if args1.len() != args2.len() {
+            return Ok(None);
+        }
+        let mut layer = depth;
+        for extra in 1..args1.len() {
+            layer = depth
+                .checked_add(extra as u32)
+                .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+            self.step(layer)?;
+        }
+        let child_depth = layer
+            .checked_add(1)
+            .ok_or(Stop::Exhausted(ExhaustionReason::Depth))?;
+        Ok(Some(AppCongFrame {
+            orig_left,
+            orig_right,
+            tn: tn.clone(),
+            sn: sn.clone(),
+            args1: {
+                let mut args = vec![head1];
+                args.extend(args1);
+                args
+            },
+            args2: {
+                let mut args = vec![head2];
+                args.extend(args2);
+                args
+            },
+            next_arg: 0,
+            child_depth,
+            depth,
+        }))
+    }
+
+    fn advance_app_stack(
+        &mut self,
+        stack: &mut Vec<AppCongFrame>,
+        mut ok: bool,
+    ) -> KResult<AppStack> {
+        loop {
+            let Some(frame) = stack.last_mut() else {
+                return Ok(AppStack::Done(ok));
+            };
+            if !ok {
+                let tn = frame.tn.clone();
+                let sn = frame.sn.clone();
+                let depth = frame.depth;
+                let orig_left = frame.orig_left.clone();
+                let orig_right = frame.orig_right.clone();
+                stack.pop();
+                ok = self.defeq_eta_tail(&tn, &sn, depth)?;
+                if ok {
+                    self.cache_positive_defeq(&orig_left, &orig_right);
+                }
+                continue;
+            }
+            if frame.next_arg + 1 >= frame.args1.len() {
+                let orig_left = frame.orig_left.clone();
+                let orig_right = frame.orig_right.clone();
+                stack.pop();
+                self.cache_positive_defeq(&orig_left, &orig_right);
+                ok = true;
+                continue;
+            }
+            frame.next_arg += 1;
+            let i = frame.next_arg;
+            return Ok(AppStack::Next {
+                left: frame.args1[i].clone(),
+                right: frame.args2[i].clone(),
+                depth: frame.child_depth,
+            });
+        }
     }
 
     /// Pin `is_def_eq_binding` (type_checker.cpp:690). Matching Π/λ telescopes
@@ -5414,6 +5557,32 @@ fn peels_to_app(e: &Expr) -> bool {
     matches!(current.node(), ExprNode::App { .. })
 }
 
+/// Prefix of `is_def_eq_core` through the cheap-proj full-WHNF restart.
+/// `Stuck` is ready for KR-311 / the eta tail.
+enum DefeqReduced {
+    Decided(bool),
+    Stuck(Expr, Expr),
+}
+
+/// One application-congruence layer on the KR-311 heap stack.
+struct AppCongFrame {
+    orig_left: Expr,
+    orig_right: Expr,
+    tn: Expr,
+    sn: Expr,
+    args1: Vec<Expr>,
+    args2: Vec<Expr>,
+    next_arg: usize,
+    child_depth: u32,
+    depth: u32,
+}
+
+/// Result of delivering a child verdict to the KR-311 heap stack.
+enum AppStack {
+    Done(bool),
+    Next { left: Expr, right: Expr, depth: u32 },
+}
+
 /// One left-spine being typed by the checking-mode KR-106 heap stack.
 struct CheckedAppFrame {
     args: Vec<Expr>,
@@ -6151,6 +6320,39 @@ mod tests {
             !tc.def_eq_public(&left, &other, 0)
                 .expect("a 400-app mismatch must not stack-fault"),
             "Sort 0 and Sort 1 heads stay apart"
+        );
+    }
+
+    #[test]
+    fn defeq_right_nested_app_congruence_walks_without_stack_fault() {
+        // Left-spine peel does not reach `f (f (... a))`. The inner `mdata`
+        // keeps the pair off the structural-eq fast path so KR-311 must walk
+        // the nest. Convert can inject 400 layers; one native frame per
+        // argument used to abort (FL-INV-07).
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let f = Expr::sort(Level::zero());
+        let a = Expr::sort(Level::zero());
+        let mut left = Expr::mdata(fln_core::options::KVMap::default(), a.clone());
+        let mut right = a;
+        for _ in 0..400 {
+            left = Expr::app(f.clone(), left);
+            right = Expr::app(f.clone(), right);
+        }
+        assert!(
+            tc.def_eq_public(&left, &right, 0)
+                .expect("a 400-deep right-nested congruence must not stack-fault"),
+            "mdata on the innermost leaf is transparent, so the nests are defeq"
+        );
+
+        let mut other = Expr::sort(Level::one());
+        for _ in 0..400 {
+            other = Expr::app(f.clone(), other);
+        }
+        assert!(
+            !tc.def_eq_public(&right, &other, 0)
+                .expect("a 400-deep right-nested mismatch must not stack-fault"),
+            "Sort 0 and Sort 1 leaves stay apart"
         );
     }
 
