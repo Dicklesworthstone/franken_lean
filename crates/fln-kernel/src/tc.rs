@@ -2308,7 +2308,12 @@ impl<'a> TypeChecker<'a> {
                 }
                 ExprNode::App { .. } => {
                     // Collect the spine, whnf the head, then KR-202 batched beta.
-                    let (head0, args) = app_spine(&current);
+                    // KR-111 wrappers in function position are WHNF-identity.
+                    // `app_spine` stops at them, so `f (mdata (f (... a)))`
+                    // and `(((mdata f) a) a)` used to re-enter this arm once
+                    // per layer (FL-INV-07). Skip them here; rebuild if that
+                    // dropped a wrapper even when the inner head is stable.
+                    let (head0, args) = app_spine_skipping_mdata(&current);
                     let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
                     if matches!(head.node(), ExprNode::Lam { .. }) {
                         let mut body = head;
@@ -2332,34 +2337,38 @@ impl<'a> TypeChecker<'a> {
                         current = reduced;
                         depth += 1;
                         self.step(depth)?;
-                    } else if head == head0 {
-                        // KR-205: the head is stable — try quotient computation, then
-                        // inductive iota, on the original application.
-                        match self.reduce_recursor(&current, depth + 1)? {
-                            Some(reduced) => {
-                                current = reduced;
-                                depth += 1;
-                                self.step(depth)?;
-                            }
-                            None => match self.finish_pending_projs(
-                                current.clone(),
-                                &mut pending_projs,
-                                &mut depth,
-                            )? {
-                                PendingProj::Done(value) => break value,
-                                PendingProj::Continue(field) => current = field,
-                            },
-                        }
                     } else {
-                        // The head changed (let-fvar zeta, mdata strip): rebuild and
-                        // continue, as the pin re-enters whnf_core on the update.
-                        let mut rebuilt = head;
-                        for arg in args {
-                            rebuilt = Expr::app(rebuilt, arg);
+                        let mut rebuilt = head.clone();
+                        for arg in &args {
+                            rebuilt = Expr::app(rebuilt, arg.clone());
                         }
-                        current = rebuilt;
-                        depth += 1;
-                        self.step(depth)?;
+                        if head == head0 && rebuilt == current {
+                            // KR-205: the head is stable and no wrapper was
+                            // dropped — try quotient computation, then
+                            // inductive iota, on the original application.
+                            match self.reduce_recursor(&current, depth + 1)? {
+                                Some(reduced) => {
+                                    current = reduced;
+                                    depth += 1;
+                                    self.step(depth)?;
+                                }
+                                None => match self.finish_pending_projs(
+                                    current.clone(),
+                                    &mut pending_projs,
+                                    &mut depth,
+                                )? {
+                                    PendingProj::Done(value) => break value,
+                                    PendingProj::Continue(field) => current = field,
+                                },
+                            }
+                        } else {
+                            // The head changed (let-fvar zeta, mdata strip):
+                            // rebuild and continue, as the pin re-enters
+                            // whnf_core on the update.
+                            current = rebuilt;
+                            depth += 1;
+                            self.step(depth)?;
+                        }
                     }
                 }
                 ExprNode::Proj {
@@ -4365,7 +4374,7 @@ impl<'a> TypeChecker<'a> {
         depth: u32,
         cache_key: Expr,
     ) -> KResult<CheckedAppFrame> {
-        let (head, args) = app_spine(e);
+        let (head, args) = app_spine_skipping_mdata(e);
         let function_type = self.infer_core(&head, depth)?;
         Ok(CheckedAppFrame {
             args,
@@ -4424,7 +4433,7 @@ impl<'a> TypeChecker<'a> {
     /// substituting every argument immediately would rewalk the whole remaining
     /// telescope and turn linear arity into quadratic step consumption.
     fn infer_app_only(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
-        let (head, args) = app_spine(e);
+        let (head, args) = app_spine_skipping_mdata(e);
         let mut function_type = self.infer_only_core(&head, depth)?;
         let mut pending_start = 0usize;
         for i in 0..args.len() {
@@ -5603,6 +5612,26 @@ fn app_spine(e: &Expr) -> (Expr, Vec<Expr>) {
     (head, args)
 }
 
+/// Like [`app_spine`], but KR-111 wrappers in function position are
+/// skipped. They are WHNF-identity and do not change an inferred type;
+/// leaving them in the head re-enters WHNF / infer once per layer.
+fn app_spine_skipping_mdata(e: &Expr) -> (Expr, Vec<Expr>) {
+    let mut args: Vec<Expr> = Vec::new();
+    let mut head = e.clone();
+    loop {
+        match head.node() {
+            ExprNode::App { f, a } => {
+                args.push(a.clone());
+                head = f.clone();
+            }
+            ExprNode::MData { expr, .. } => head = expr.clone(),
+            _ => break,
+        }
+    }
+    args.reverse();
+    (head, args)
+}
+
 /// True when stripping KR-111 wrappers leaves an application. Checking-mode
 /// KR-106 trampolines those arguments onto the heap stack instead of
 /// re-entering `infer_core_mode`.
@@ -6385,6 +6414,71 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= Budget::DEFAULT.depth,
             "projection nests must consume loop steps, not native-stack depth"
+        );
+    }
+
+    #[test]
+    fn whnf_skips_mdata_in_an_app_spine_without_stack_fault() {
+        // `app_spine` stops at KR-111. A 400-deep `App(MData(f), …)` nest
+        // used to re-enter `whnf_core_mode` once per layer (FL-INV-07).
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let f = Expr::sort(Level::zero());
+        let a = Expr::sort(Level::zero());
+        let mut right = a.clone();
+        for _ in 0..400 {
+            right = Expr::app(
+                Expr::mdata(fln_core::options::KVMap::default(), f.clone()),
+                right,
+            );
+        }
+        let reduced = tc
+            .whnf_public(&right, 0)
+            .expect("a 400-deep mdata-interrupted app nest must not stack-fault");
+        // WHNF does not reduce arguments. Only the outermost function-position
+        // wrapper is stripped; the remaining nest stays in the argument.
+        let ExprNode::App {
+            f: reduced_head,
+            a: reduced_arg,
+        } = reduced.node()
+        else {
+            panic!(
+                "WHNF of an application must stay an application, got {}",
+                brief_public(&reduced)
+            );
+        };
+        assert!(
+            reduced_head == &f,
+            "the outermost function-position mdata must be stripped, got {}",
+            brief_public(reduced_head)
+        );
+        assert!(
+            matches!(reduced_arg.node(), ExprNode::App { .. }),
+            "arguments are not WHNF'd, so the inner nest remains"
+        );
+        assert!(
+            tc.consumption().max_depth <= Budget::DEFAULT.depth,
+            "mdata-interrupted apps must consume loop steps, not native-stack depth"
+        );
+
+        let mut left = f.clone();
+        for _ in 0..400 {
+            left = Expr::app(
+                Expr::mdata(fln_core::options::KVMap::default(), left),
+                a.clone(),
+            );
+        }
+        let reduced_left = tc
+            .whnf_public(&left, 0)
+            .expect("a 400-deep left mdata-interrupted spine must not stack-fault");
+        let mut expected_left = f;
+        for _ in 0..400 {
+            expected_left = Expr::app(expected_left, a.clone());
+        }
+        assert!(
+            reduced_left == expected_left,
+            "WHNF must flatten a left spine through function-position mdata, got {}",
+            brief_public(&reduced_left)
         );
     }
 
@@ -7213,6 +7307,46 @@ mod tests {
         assert!(
             wrapped_tc.consumption().max_depth <= budget.depth,
             "mdata-wrapped right-nested applications must consume loop steps"
+        );
+
+        // Function-position mdata on a left spine: `(((mdata g) a) a) …`.
+        // `app_spine` used to stop at each wrapper and re-enter infer.
+        let g_name = Name::str(Name::anonymous(), "g");
+        let mut g_type = t.clone();
+        for _ in 0..NEST {
+            g_type = Expr::forall_e(Name::anonymous(), t.clone(), g_type, BinderInfo::Default);
+        }
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: g_name.clone(),
+                    level_params: Vec::new(),
+                    type_: g_type,
+                },
+                is_unsafe: false,
+            }),
+        );
+        let mut left = Expr::const_(g_name, Vec::new());
+        let arg = Expr::const_(Name::str(Name::anonymous(), "a"), Vec::new());
+        for _ in 0..NEST {
+            left = Expr::app(
+                Expr::mdata(fln_core::options::KVMap::default(), left),
+                arg.clone(),
+            );
+        }
+        let mut left_tc = TypeChecker::new(&env, &[], budget);
+        let left_inferred = left_tc
+            .infer(&left, 0)
+            .expect("a 400-deep left mdata-interrupted spine must not stack-fault");
+        assert!(
+            left_inferred == t,
+            "KR-111+KR-106 must infer T through function-position metadata, got {}",
+            brief_public(&left_inferred)
+        );
+        assert!(
+            left_tc.consumption().max_depth <= budget.depth,
+            "left mdata-interrupted applications must consume loop steps"
         );
     }
 
