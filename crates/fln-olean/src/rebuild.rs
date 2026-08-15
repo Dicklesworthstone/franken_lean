@@ -169,10 +169,12 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             }
             let fields_end = 8 + 8 * other as u64;
             let total = cs_sz as u64;
-            if total < fields_end {
+            // Walk refuses an unaligned ctor extent. Copying a 1..7-byte
+            // tail would re-emit a shape the shared engine never mints.
+            if total < fields_end || !total.is_multiple_of(8) {
                 return Err(RegionError::DecodeShape {
                     offset: off,
-                    reason: "ctor cs_sz smaller than its pointer fields",
+                    reason: "constructor extent below its minimum or unaligned",
                 });
             }
             let tail = total - fields_end;

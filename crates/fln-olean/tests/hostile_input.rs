@@ -502,6 +502,62 @@ fn an_mpz_with_foreign_limbs_is_refused_by_the_inline_law() {
     );
 }
 
+/// Walk refuses an unaligned ctor extent. Rebuild used to copy a 1..7-byte
+/// tail and re-emit that shape. Compact of a live object with the same
+/// header would then abort in `ctor_scalar_u64`.
+#[test]
+fn an_unaligned_ctor_extent_is_refused_by_walk_and_rebuild() {
+    let bytes = pilot();
+    {
+        let view = OleanView::parse(&bytes).expect("pilot parses");
+        view.walk(WalkBudget::default())
+            .expect("the unmutated pilot walks");
+        rebuild(&bytes).expect("the unmutated pilot rebuilds");
+    }
+    let objects = collect_objects(&bytes);
+    let ctor = objects
+        .iter()
+        .find(|obj| obj.tag <= abi::TAG_MAX_CTOR_TAG)
+        .expect("the pilot carries a constructor");
+    let word = get_u64(&bytes, ctor.off);
+    let cs_sz = (word >> 32) & 0xffff;
+    let other = (word >> 48) & 0xff;
+    let min = 8 + 8 * other;
+    let mut hostile_cs = if cs_sz.is_multiple_of(8) {
+        cs_sz + 1
+    } else {
+        cs_sz
+    };
+    if hostile_cs < min {
+        hostile_cs = min + 1;
+    }
+    if hostile_cs.is_multiple_of(8) {
+        hostile_cs += 1;
+    }
+    let mut hostile = bytes.clone();
+    put_u64(
+        &mut hostile,
+        ctor.off,
+        (word & !0xffff_0000_0000) | (hostile_cs << 32),
+    );
+
+    let view = OleanView::parse(&hostile).expect("hostile parses structurally");
+    let walk_err = view
+        .walk(WalkBudget::default())
+        .expect_err("an unaligned ctor extent must refuse");
+    let walk_text = message_of(&walk_err);
+    assert!(
+        walk_text.contains("unaligned") || walk_text.contains("minimum"),
+        "walk must name the extent law, got: {walk_text}"
+    );
+    let rebuild_err = rebuild(&hostile).expect_err("rebuild must not re-emit an unaligned ctor");
+    let rebuild_text = message_of(&rebuild_err);
+    assert!(
+        rebuild_text.contains("unaligned") || rebuild_text.contains("minimum"),
+        "rebuild must name the extent law, got: {rebuild_text}"
+    );
+}
+
 // --- finding 7: a Level param/mvar of the wrong arity is a typed Shape -------
 
 #[test]

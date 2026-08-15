@@ -999,9 +999,14 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                 if h.tag <= abi::TAG_MAX_CTOR_TAG {
                     let n = usize::from(h.other);
                     let heap_size = usize::from(h.cs_sz);
-                    if heap_size < HDR + 8 * n {
+                    // Walk refuses an unaligned ctor extent. The scalar
+                    // loop below steps by 8 and then `ctor_scalar_u64`
+                    // asserts `off + 8 <= cs_sz - 8`. A leftover tail
+                    // shorter than a word used to abort instead of a
+                    // typed BuildShape (FL-INV-07).
+                    if heap_size < HDR + 8 * n || !heap_size.is_multiple_of(8) {
                         return Err(RegionFault::BuildShape {
-                            reason: "ctor smaller than its slot count",
+                            reason: "constructor extent below its minimum or unaligned",
                         });
                     }
                     emit_header(&mut out, heap_size, h.tag, h.other);
