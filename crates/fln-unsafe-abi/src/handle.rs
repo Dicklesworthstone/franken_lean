@@ -285,6 +285,36 @@ impl Obj {
         unsafe { Obj(object::alloc_task_pure(value.into_raw())) }
     }
 
+    /// `IO.Promise` cell owning one task; consumes the task.
+    pub fn mk_promise(task: Obj) -> Obj {
+        assert!(task.obj_tag() == usize::from(crate::contract::TAG_TASK));
+        // SAFETY: fresh allocation; the promise takes the task's one token.
+        unsafe { Obj(object::alloc_promise(task.into_raw())) }
+    }
+
+    /// Fallible promise result.
+    ///
+    /// Returns `None` when the handle is not a promise or `m_result` is
+    /// null. Product paths that accept untrusted objects must use this.
+    pub fn try_promise_result(&self) -> Option<Obj> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_PROMISE) {
+            return None;
+        }
+        // SAFETY: tag is TAG_PROMISE. A null result is a typed miss.
+        unsafe {
+            let result =
+                (&raw const (*self.0.cast::<crate::layout::LeanPromiseObject>()).m_result).read();
+            if result.is_null() {
+                return None;
+            }
+            let result = result.cast::<crate::layout::LeanObject>();
+            if !tagged::is_scalar(result) {
+                rc::inc_ref_n(result, 1);
+            }
+            Some(Obj(result))
+        }
+    }
+
     /// Structural bignum from sign + little-endian limbs.
     pub fn mk_mpz(limbs: &[u64], negative: bool) -> Obj {
         // SAFETY: fresh allocation; limb buffer copied and owned.

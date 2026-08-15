@@ -835,11 +835,16 @@ pub(crate) unsafe fn alloc_task_scheduled(
 /// Caller owns the result.
 // UNSAFE-LEDGER: FLN-UL-0242
 #[allow(unsafe_code)]
-pub(crate) unsafe fn alloc_promise() -> *mut LeanObject {
-    // SAFETY: two fresh exclusive blocks, fields initialized before
-    // publication; the promise takes ownership of the task's one token.
+pub(crate) unsafe fn alloc_promise(result: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: exclusive blocks, fields initialized before publication;
+    // the promise takes ownership of the task's one token. A null
+    // `result` is the pin's `promise_new` arm (fresh Promised task).
     unsafe {
-        let task = alloc_task_scheduled(core::ptr::null_mut(), 0, false);
+        let task = if result.is_null() {
+            alloc_task_scheduled(core::ptr::null_mut(), 0, false)
+        } else {
+            result
+        };
         let sz = size_of::<crate::layout::LeanPromiseObject>();
         let o = membrane::alloc_small(sz);
         init_st_header(o, crate::contract::TAG_PROMISE, 0);

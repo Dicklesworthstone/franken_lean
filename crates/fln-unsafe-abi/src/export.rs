@@ -3020,7 +3020,7 @@ pub(crate) extern "C" fn export_lean_io_get_task_state_core(t: *mut LeanObject) 
 pub(crate) extern "C" fn export_lean_io_promise_new() -> *mut LeanObject {
     if crate::task_manager::manager().is_some() {
         // SAFETY: the allocator owns header/field init for both objects.
-        return unsafe { object::alloc_promise() };
+        return unsafe { object::alloc_promise(core::ptr::null_mut()) };
     }
     internal_panic_impl(concat!(
         "`IO.Promise.new` called before the task manager is running; this typically ",

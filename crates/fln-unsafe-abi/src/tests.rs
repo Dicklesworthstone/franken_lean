@@ -772,6 +772,37 @@ fn try_ref_get_refuses_an_empty_or_non_ref_cell() {
 }
 
 #[test]
+fn try_promise_result_refuses_a_non_promise() {
+    let _g = lock();
+    let task = Obj::mk_task_pure(Obj::mk_nat(3));
+    let promise = Obj::mk_promise(task);
+    let result = promise
+        .try_promise_result()
+        .expect("a well-formed promise has a result");
+    assert_eq!(
+        result
+            .finished_task_value()
+            .expect("the attached task is finished")
+            .unbox(),
+        3
+    );
+    assert!(
+        Obj::mk_nat(3).try_promise_result().is_none(),
+        "a scalar is not a promise"
+    );
+    assert!(
+        Obj::mk_string("n").try_promise_result().is_none(),
+        "a string is not a promise"
+    );
+    assert!(
+        Obj::mk_task_pure(Obj::mk_nat(1))
+            .try_promise_result()
+            .is_none(),
+        "a task is not a promise"
+    );
+}
+
+#[test]
 fn try_ref_take_refuses_an_empty_or_non_ref_cell() {
     let _g = lock();
     let cell = Obj::mk_ref(Obj::mk_nat(7));

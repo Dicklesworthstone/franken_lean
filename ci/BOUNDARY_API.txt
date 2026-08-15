@@ -53,6 +53,8 @@ row FLN-BX-0026 | crates/fln-unsafe-abi/src/handle.rs | fn mk_closure | (u16, Ve
 row FLN-BX-0027 | crates/fln-unsafe-abi/src/handle.rs | fn mk_ref | (Obj) -> Obj | ref suites | consumes the owned value
 row FLN-BX-0028 | crates/fln-unsafe-abi/src/handle.rs | fn mk_thunk_value | (Obj) -> Obj | thunk suites | evaluated form only (G0-1 item 10)
 row FLN-BX-0029 | crates/fln-unsafe-abi/src/handle.rs | fn mk_task_pure | (Obj) -> Obj | task suites | Finished state only (fln-3gv boundary)
+row FLN-BX-0089 | crates/fln-unsafe-abi/src/handle.rs | fn mk_promise | (Obj) -> Obj | try_promise_result_refuses_a_non_promise; compact promise join | consumes one tag-checked task into a fresh ABI promise; no kernel type escapes
+row FLN-BX-0090 | crates/fln-unsafe-abi/src/handle.rs | fn try_promise_result | (&self) -> Option<Obj> | try_promise_result_refuses_a_non_promise | owned handle or None; no raw pointer, owned authority, or kernel type escapes
 row FLN-BX-0030 | crates/fln-unsafe-abi/src/handle.rs | fn mk_mpz | (&[u64], bool) -> Obj | mpz_view roundtrip | structural container, no arithmetic
 row FLN-BX-0031 | crates/fln-unsafe-abi/src/handle.rs | fn mk_external_counting | () -> Obj | external_finalizer_runs_exactly_once | canned diagnostics class only
 row FLN-BX-0032 | crates/fln-unsafe-abi/src/handle.rs | fn is_scalar | (&self) -> bool | tagged_pointer_law | value query
