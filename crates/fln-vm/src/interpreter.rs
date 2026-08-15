@@ -832,6 +832,7 @@ pub enum VmRefusal {
     InvalidStringObject,
     InvalidArrayObject,
     InvalidCtorObject,
+    InvalidRefObject,
     UnsupportedNativeClosure,
     MalformedClosure {
         reason: &'static str,
@@ -986,6 +987,7 @@ impl fmt::Display for VmRefusal {
             Self::InvalidCtorObject => {
                 write!(f, "Marrow constructor object slot is past the allocation")
             }
+            Self::InvalidRefObject => write!(f, "Marrow ST.Ref cell is empty"),
             Self::UnsupportedNativeClosure => {
                 write!(
                     f,
@@ -3319,12 +3321,18 @@ fn invoke_intrinsic(
         IntrinsicImplementation::RefGet => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.get", 0, "ST.Ref", ValueKind::Ref)?;
-            Ok(IntrinsicResult::owned(args[0].ref_get()))
+            let Some(value) = args[0].try_ref_get() else {
+                return Err(VmRefusal::InvalidRefObject.into());
+            };
+            Ok(IntrinsicResult::owned(value))
         }
         IntrinsicImplementation::RefTake => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.take", 0, "ST.Ref", ValueKind::Ref)?;
-            Ok(IntrinsicResult::owned(args[0].ref_take()))
+            let Some(value) = args[0].try_ref_take() else {
+                return Err(VmRefusal::InvalidRefObject.into());
+            };
+            Ok(IntrinsicResult::owned(value))
         }
         IntrinsicImplementation::RefSet => {
             expect_arity(row, args, 2)?;
@@ -3335,9 +3343,11 @@ fn invoke_intrinsic(
         IntrinsicImplementation::RefSwap => {
             expect_arity(row, args, 2)?;
             expect_value_kind(&args[0], "ST.Prim.Ref.swap", 0, "ST.Ref", ValueKind::Ref)?;
-            Ok(IntrinsicResult::owned(
-                args[0].ref_swap(args[1].clone_ref()),
-            ))
+            let Some(old) = args[0].try_ref_take() else {
+                return Err(VmRefusal::InvalidRefObject.into());
+            };
+            args[0].ref_set(args[1].clone_ref());
+            Ok(IntrinsicResult::owned(old))
         }
         IntrinsicImplementation::RefPtrEq => {
             expect_arity(row, args, 2)?;

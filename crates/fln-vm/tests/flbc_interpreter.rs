@@ -7264,6 +7264,62 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
     );
 }
 
+/// `ST.Ref.get` / `take` / `swap` on a taken cell used to abort in the
+/// asserting ABI (`null reference read` / `null reference take`). That is
+/// user code, not an invariant failure (FL-INV-07).
+#[test]
+fn st_ref_get_take_and_swap_on_an_empty_cell_are_typed_refusals() {
+    let _guard = lock();
+    let cases = [
+        "extern:ST.Prim.Ref.get",
+        "extern:ST.Prim.Ref.take",
+        "extern:ST.Prim.Ref.swap",
+    ];
+
+    shadow::enable();
+    for row in cases {
+        let mut code = vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 1,
+            },
+            intrinsic(r(1), "extern:ST.Prim.mkRef", vec![r(0)]),
+            intrinsic(r(2), "extern:ST.Prim.Ref.take", vec![r(1)]),
+        ];
+        if row == "extern:ST.Prim.Ref.swap" {
+            code.push(Instruction::Nat {
+                dst: r(3),
+                value: 2,
+            });
+            code.push(intrinsic(r(4), row, vec![r(1), r(3)]));
+            code.push(Instruction::Return { src: r(4) });
+        } else {
+            code.push(intrinsic(r(3), row, vec![r(1)]));
+            code.push(Instruction::Return { src: r(3) });
+        }
+        let program = validated(vec![function(0, 0, 5, code)]);
+        assert!(
+            matches!(
+                execute(&program, ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::InvalidRefObject,
+                    ..
+                })
+            ),
+            "{row} on an empty cell must refuse, not abort"
+        );
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "empty-cell refusals retain no operand");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "empty-cell refusals preserve the owned object graph"
+    );
+}
+
 #[test]
 fn heartbeat_io_intrinsics_share_marrow_state_through_the_u64_boundary() {
     let _guard = lock();

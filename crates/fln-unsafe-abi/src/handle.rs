@@ -44,7 +44,7 @@ pub(crate) type BoxedFn2 = extern "C" fn(*mut LeanObject, *mut LeanObject) -> *m
 pub(crate) type BoxedFn3 =
     extern "C" fn(*mut LeanObject, *mut LeanObject, *mut LeanObject) -> *mut LeanObject;
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Count of canned-class external finalizer runs (test observability).
 pub static EXTERNAL_FINALIZED: AtomicUsize = AtomicUsize::new(0);
@@ -748,6 +748,40 @@ impl Obj {
         unsafe { Obj(object::ref_get_owned(self.0)) }
     }
 
+    /// Fallible `ST.Ref` take.
+    ///
+    /// Returns `None` when the handle is not a ref or the cell is empty,
+    /// without spinning on a vacant MT cell. Product paths that accept
+    /// untrusted objects must use this; [`ref_take`] still asserts a live
+    /// occupant (`null reference take`).
+    pub fn try_ref_take(&self) -> Option<Obj> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_REF) {
+            return None;
+        }
+        // SAFETY: tag is TAG_REF. An empty cell is a typed miss. The MT
+        // arm does a single exchange rather than the pin's retry loop, so
+        // a vacant cell cannot hang the caller.
+        unsafe {
+            if rc::read_header(self.0).rc <= 0 {
+                let slot = AtomicPtr::from_ptr(
+                    &raw mut (*self.0.cast::<crate::layout::LeanRefObject>()).m_value,
+                );
+                let value = slot.swap(core::ptr::null_mut(), Ordering::SeqCst);
+                if value.is_null() {
+                    return None;
+                }
+                return Some(Obj(value));
+            }
+            let slot = &raw mut (*self.0.cast::<crate::layout::LeanRefObject>()).m_value;
+            let value = slot.read();
+            if value.is_null() {
+                return None;
+            }
+            slot.write(core::ptr::null_mut());
+            Some(Obj(value))
+        }
+    }
+
     /// Transfer the current `ST.Ref` value and leave the cell empty.
     ///
     /// The caller must refill the cell with [`Obj::ref_set`] before any
@@ -755,7 +789,8 @@ impl Obj {
     pub fn ref_take(&self) -> Obj {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_REF));
         // SAFETY: invariant + tag assertion; the raw operation transfers the
-        // cell's owned token without retaining or releasing it.
+        // cell's owned token without retaining or releasing it, including
+        // the MT retry loop that `try_ref_take` does not perform.
         unsafe { Obj(object::ref_take(self.0)) }
     }
 

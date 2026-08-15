@@ -772,6 +772,33 @@ fn try_ref_get_refuses_an_empty_or_non_ref_cell() {
 }
 
 #[test]
+fn try_ref_take_refuses_an_empty_or_non_ref_cell() {
+    let _g = lock();
+    let cell = Obj::mk_ref(Obj::mk_nat(7));
+    let occupant = cell.try_ref_take().expect("a well-formed ref is takeable");
+    assert_eq!(occupant.unbox(), 7);
+    assert!(
+        cell.try_ref_take().is_none(),
+        "a second take of an empty cell is not an abort"
+    );
+    assert!(
+        Obj::mk_nat(3).try_ref_take().is_none(),
+        "a scalar is not a ref"
+    );
+    assert!(
+        Obj::mk_string("n").try_ref_take().is_none(),
+        "a string is not a ref"
+    );
+    cell.ref_set(Obj::mk_nat(8));
+    assert_eq!(
+        cell.try_ref_take()
+            .expect("refill restores a takeable occupant")
+            .unbox(),
+        8
+    );
+}
+
+#[test]
 fn try_ctor_child_refuses_slots_past_the_allocation() {
     let _g = lock();
     let well = Obj::mk_ctor(1, vec![Obj::mk_nat(1), Obj::mk_nat(2)], &[]);
