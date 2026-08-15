@@ -4774,6 +4774,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// KR-112 + KR-901.
+    ///
+    /// A projection nest `a.1.1.1` used to re-enter `infer_core_mode` once per
+    /// layer. Convert can inject a 400-deep nest; walking it on the native
+    /// stack aborted the check that found it (FL-INV-07). Peel projections
+    /// (and the KR-111 wrappers between them) on the heap, infer the
+    /// innermost scrutinee once, then finish each layer inside-out.
     fn infer_proj(
         &mut self,
         struct_name: &Name,
@@ -4782,7 +4788,88 @@ impl<'a> TypeChecker<'a> {
         depth: u32,
         mode: InferMode,
     ) -> KResult<Expr> {
-        let s_type = self.infer_core_mode(scrutinee, depth, mode)?;
+        struct ProjFrame {
+            struct_name: Name,
+            idx: u64,
+            scrutinee: Expr,
+            depth: u32,
+        }
+        let mut frames = vec![ProjFrame {
+            struct_name: struct_name.clone(),
+            idx,
+            scrutinee: scrutinee.clone(),
+            depth,
+        }];
+        let mut current = scrutinee.clone();
+        let mut nest_depth = depth;
+        loop {
+            match current.node() {
+                ExprNode::MData { expr, .. } => {
+                    nest_depth = nest_depth.saturating_add(1);
+                    self.step(nest_depth)?;
+                    current = expr.clone();
+                }
+                ExprNode::Proj {
+                    struct_name: nested_name,
+                    idx: nested_idx,
+                    expr,
+                } => {
+                    let nested_name = nested_name.clone();
+                    let nested_idx = *nested_idx;
+                    let expr = expr.clone();
+                    self.step(nest_depth)?;
+                    nest_depth = nest_depth.saturating_add(1);
+                    current = expr;
+                    frames.push(ProjFrame {
+                        struct_name: nested_name,
+                        idx: nested_idx,
+                        scrutinee: current.clone(),
+                        depth: nest_depth,
+                    });
+                }
+                _ => break,
+            }
+        }
+        let mut field_type = self.infer_core_mode(&current, nest_depth, mode)?;
+        let outermost = frames.len().saturating_sub(1);
+        for (i, frame) in frames.into_iter().rev().enumerate() {
+            field_type = self.finish_infer_proj(
+                &frame.struct_name,
+                frame.idx,
+                &frame.scrutinee,
+                field_type,
+                frame.depth,
+            )?;
+            if i == outermost {
+                continue;
+            }
+            let term = Expr::proj(frame.struct_name, frame.idx, frame.scrutinee);
+            match mode {
+                InferMode::Check => self.infer_cache.insert(
+                    term,
+                    field_type.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                ),
+                InferMode::Only => self.infer_only_cache.insert(
+                    term,
+                    field_type.clone(),
+                    &self.locals,
+                    &self.local_positions,
+                ),
+            }
+        }
+        Ok(field_type)
+    }
+
+    fn finish_infer_proj(
+        &mut self,
+        struct_name: &Name,
+        idx: u64,
+        scrutinee: &Expr,
+        s_type: Expr,
+        depth: u32,
+    ) -> KResult<Expr> {
         let s_type = self.whnf(&s_type, depth)?;
         let mut args: Vec<Expr> = Vec::new();
         let mut head = s_type.clone();
@@ -6831,6 +6918,54 @@ mod tests {
         assert!(
             wrapped_tc.consumption().max_depth <= budget.depth,
             "mdata-wrapped right-nested applications must consume loop steps"
+        );
+    }
+
+    #[test]
+    fn infer_proj_walks_a_deep_nest_without_stack_fault() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+
+        const NEST: usize = 400;
+        let t_name = Name::str(Name::anonymous(), "T");
+        let a_name = Name::str(Name::anonymous(), "a");
+        let t = Expr::const_(t_name.clone(), Vec::new());
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: t_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: a_name.clone(),
+                    level_params: Vec::new(),
+                    type_: t,
+                },
+                is_unsafe: false,
+            }),
+        );
+        let mut term = Expr::const_(a_name, Vec::new());
+        let structure = Name::str(Name::anonymous(), "S");
+        for _ in 0..NEST {
+            term = Expr::proj(structure.clone(), 0, term);
+        }
+        let budget = Budget::DEFAULT;
+        let mut tc = TypeChecker::new(&env, &[], budget);
+        let result = tc.infer(&term, 0);
+        assert!(
+            matches!(result, Err(Stop::Reject(RejectClass::InvalidProjection, _))),
+            "a 400-deep projection of a non-structure must reject, not abort; got {result:?}"
+        );
+        assert!(
+            tc.consumption().max_depth <= budget.depth,
+            "projection nests must consume loop steps, not native-stack depth"
         );
     }
 

@@ -62,7 +62,7 @@
 //!   `normalize`, `normalize_fixpoint`, `is_zero`. These are not helpers; they
 //!   *are* judgments of the type theory, and `fln-kernel` returns their result
 //!   directly as its verdict — `tc.rs:3077` answers KR-303 sort definitional
-//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3017`/`3485`/`4829` decide
+//!   equality with `lt.is_equiv(ls)`, and `tc.rs:3017`/`3485`/`4916` decide
 //!   "is this a Prop?" (the KR-974 theorem check) with
 //!   `level.is_equiv(&Level::zero())`. A checker that calls `is_equiv` does not
 //!   check universe equivalence at all. `imax`/`max` fixpoint normalization is
@@ -317,7 +317,7 @@
 //! cite crates/fln-kernel/src/tc.rs:3077 :: lt.is_equiv(ls)
 //! cite crates/fln-kernel/src/tc.rs:3017 :: ExprNode::Sort { level } @@ fn major_to_cnstr_when_structure
 //! cite crates/fln-kernel/src/tc.rs:3485 :: ExprNode::Sort { level } @@ fn is_prop
-//! cite crates/fln-kernel/src/tc.rs:4829 :: ExprNode::Sort { level } @@ fn infer_proj
+//! cite crates/fln-kernel/src/tc.rs:4916 :: ExprNode::Sort { level } @@ fn finish_infer_proj
 //! cite crates/fln-kernel/src/tc.rs:1528 :: e.loose_bvar_range() <= k
 //! cite crates/fln-kernel/src/tc.rs:4449 :: !e.has_fvar() || active == 0
 //! cite crates/fln-kernel/src/tc.rs:4644 :: if !e.has_fvar() {

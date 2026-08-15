@@ -30,13 +30,14 @@ use fln_core::diag::ResourceReason;
 use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
+use fln_core::options::KVMap;
 use fln_core::outcome::{InconclusiveCause, Outcome};
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
-use fln_kernel::{Declaration, check};
+use fln_kernel::{Declaration, check, check_def_eq};
 
 // ---------------------------------------------------------------------------
 // Probe shapes
@@ -54,18 +55,24 @@ enum Shape {
     /// on a heap stack. Kept so the former abort pairing can prove it answers
     /// typed rather than dying. Not a residual native-stack shape.
     AppInfer,
-    /// `infer_proj` down a projection nest (KR-112): each scrutinee is itself
-    /// a projection, so `infer_core_mode` still re-enters per layer.
+    /// Converted: `infer_proj` peels a `.1.1.1` nest on the heap. Kept so the
+    /// former abort pairing can prove it answers typed. Not a residual
+    /// native-stack shape.
     ProjInfer,
+    /// KR-311 application congruence still recurses on a right-nested
+    /// argument pair. Left spines are a heap peel; `f (f (... a))` vs a
+    /// structurally different but definitionally equal nest is not.
+    DefEqApp,
 }
 
 impl Shape {
-    const ALL: [Shape; 1] = [Shape::ProjInfer];
+    const ALL: [Shape; 1] = [Shape::DefEqApp];
 
     fn as_str(self) -> &'static str {
         match self {
             Shape::AppInfer => "app_infer",
             Shape::ProjInfer => "proj_infer",
+            Shape::DefEqApp => "defeq_app",
         }
     }
 
@@ -73,6 +80,7 @@ impl Shape {
         match s {
             "app_infer" => Some(Shape::AppInfer),
             "proj_infer" => Some(Shape::ProjInfer),
+            "defeq_app" => Some(Shape::DefEqApp),
             _ => None,
         }
     }
@@ -123,12 +131,14 @@ fn add(env: &Environment, decl: &Declaration) -> Environment {
 /// What a probe run submits to the kernel's public authority.
 enum Probe {
     Decl(Environment, Declaration),
+    DefEq(Environment, Expr, Expr),
 }
 
 impl Probe {
     fn run(&self, budget: Budget) -> Outcome<Verdict> {
         match self {
             Probe::Decl(env, decl) => check(env, decl, budget),
+            Probe::DefEq(env, left, right) => check_def_eq(env, &[], left, right, budget),
         }
     }
 }
@@ -159,9 +169,9 @@ fn build_probe(shape: Shape, levels: u32) -> Probe {
             Probe::Decl(env, defn_decl("Probe", t, e))
         }
         Shape::ProjInfer => {
-            // `T : Sort 1`, `a : T`; term `a.1.1...`. The nest is ill-typed
-            // (T is not a structure) but `infer_proj` infers the scrutinee
-            // before that rejection, so the descent still reaches the ceiling.
+            // `T : Sort 1`, `a : T`; term `a.1.1...`. Infer now walks this
+            // on the heap and rejects (T is not a structure); the shape
+            // remains so the former abort pairing can prove it answers typed.
             let env = Environment::new();
             let env = add(&env, &axiom_decl("T", sort1()));
             let t = Expr::const_(n("T"), vec![]);
@@ -172,6 +182,33 @@ fn build_probe(shape: Shape, levels: u32) -> Probe {
                 e = Expr::proj(structure.clone(), 0, e);
             }
             Probe::Decl(env, defn_decl("Probe", t, e))
+        }
+        Shape::DefEqApp => {
+            // Two right-nested applications that are definitionally equal
+            // but not structurally equal (`mdata` on the innermost leaf
+            // only). Top-level `t == s` would short-circuit; a wrapper on
+            // the outside would peel in WHNF and then short-circuit. The
+            // inner wrapper forces KR-311 to walk the nest.
+            let env = Environment::new();
+            let env = add(&env, &axiom_decl("T", sort1()));
+            let t = Expr::const_(n("T"), vec![]);
+            let env = add(
+                &env,
+                &axiom_decl(
+                    "f",
+                    Expr::forall_e(n("_"), t.clone(), t.clone(), BinderInfo::Default),
+                ),
+            );
+            let env = add(&env, &axiom_decl("a", t));
+            let f = Expr::const_(n("f"), vec![]);
+            let a = Expr::const_(n("a"), vec![]);
+            let mut left = Expr::mdata(KVMap::default(), a.clone());
+            let mut right = a;
+            for _ in 0..levels {
+                left = Expr::app(f.clone(), left);
+                right = Expr::app(f.clone(), right);
+            }
+            Probe::DefEq(env, left, right)
         }
     }
 }
@@ -538,6 +575,26 @@ fn former_app_infer_abort_pairing_now_answers_typed() {
     );
 }
 
+/// The former ProjInfer abort pairing must now answer typed. If this starts
+/// dying again, the heap peel has regressed onto the native stack.
+#[test]
+fn former_proj_infer_abort_pairing_now_answers_typed() {
+    const RUST_DEFAULT_SPAWNED_STACK: usize = 2 * 1024 * 1024;
+    let outcome = run_probe(
+        Shape::ProjInfer,
+        RUST_DEFAULT_SPAWNED_STACK,
+        Budget::DEFAULT.depth,
+    );
+    assert!(
+        matches!(
+            outcome,
+            ProbeOutcome::DepthExhausted | ProbeOutcome::SurvivedOther(_)
+        ),
+        "projection-nest infer is a heap walk; Budget::DEFAULT on a 2 MiB stack \
+         must answer typed, not abort. got {outcome:?}"
+    );
+}
+
 impl Shape {
     /// The shape used by the reproduction witness and by the tripwire's planted
     /// violations: the WORST per-level descent in
@@ -545,13 +602,13 @@ impl Shape {
     /// first.
     ///
     /// Re-measured after the explicit telescope/worklist conversion:
-    /// matching binder-defeq (KR-302) and right-nested application infer
-    /// (KR-106) are heap walks, so they no longer belong in a native-stack
-    /// witness. Retaining a converted shape would make "survived without
-    /// reaching the ceiling" look like a calibration failure. `ProjInfer`
-    /// is the residual worst case (`infer_proj` still recurses on the
-    /// scrutinee).
-    const WITNESS: Shape = Shape::ProjInfer;
+    /// matching binder-defeq (KR-302), right-nested application infer
+    /// (KR-106), and projection-nest infer (KR-112) are heap walks, so they
+    /// no longer belong in a native-stack witness. Retaining a converted
+    /// shape would make "survived without reaching the ceiling" look like a
+    /// calibration failure. `DefEqApp` is the residual worst case (KR-311
+    /// still recurses on a right-nested argument pair).
+    const WITNESS: Shape = Shape::DefEqApp;
 }
 
 // ---------------------------------------------------------------------------
