@@ -1984,8 +1984,8 @@ fn reference_lean_path(reference_lib: &Path) -> Result<PathBuf, String> {
 }
 
 fn exact_leanchecker_driver_path() -> Result<PathBuf, String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/tribunal/exact_leanchecker.lean");
+    let path =
+        fln_conformance::checked_workspace_root!().join("scripts/tribunal/exact_leanchecker.lean");
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
         format!(
             "stat exact-module Reference driver {}: {error}",
