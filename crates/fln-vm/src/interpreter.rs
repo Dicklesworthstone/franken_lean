@@ -830,6 +830,7 @@ pub enum VmRefusal {
         actual_fields: usize,
     },
     InvalidStringObject,
+    InvalidArrayObject,
     UnsupportedNativeClosure,
     MalformedClosure {
         reason: &'static str,
@@ -980,6 +981,7 @@ impl fmt::Display for VmRefusal {
                 "constructor projection expected {expected_fields} object fields, got {actual_fields}"
             ),
             Self::InvalidStringObject => write!(f, "Marrow String object is not canonical UTF-8"),
+            Self::InvalidArrayObject => write!(f, "Marrow Array object header is inconsistent"),
             Self::UnsupportedNativeClosure => {
                 write!(
                     f,
@@ -3737,7 +3739,7 @@ fn array_value(
     if value_kind(value) != ValueKind::Array {
         return Err(type_mismatch(operation, argument, "Array", value));
     }
-    Ok(value.array_view())
+    value.try_array_view().ok_or(VmRefusal::InvalidArrayObject)
 }
 
 fn string_value(

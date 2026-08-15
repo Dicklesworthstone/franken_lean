@@ -74,6 +74,8 @@ pub enum RegionFault {
     ClosureUnsupported { offset: usize },
     /// String object violating its stored size/length/NUL/UTF-8 laws.
     StringIntegrity { offset: usize, reason: &'static str },
+    /// Array object whose `m_size` is past `m_capacity`.
+    ArrayIntegrity { offset: usize },
     /// Mpz object with an incoherent limb block.
     MpzIntegrity { offset: usize },
     /// The category is legal but this operation does not support it.
@@ -114,6 +116,7 @@ impl std::fmt::Display for RegionFault {
             Self::StringIntegrity { offset, reason } => {
                 write!(f, "string at {offset}: {reason}")
             }
+            Self::ArrayIntegrity { offset } => write!(f, "array at {offset} incoherent"),
             Self::MpzIntegrity { offset } => write!(f, "mpz at {offset} incoherent"),
             Self::UnsupportedCategory { tag, operation } => {
                 write!(f, "category tag {tag} unsupported by {operation}")
@@ -929,7 +932,12 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                 children.push(o.ctor_child(i));
             }
         } else if tag == abi::TAG_ARRAY {
-            for i in 0..o.array_view().0 {
+            let Some((n, _)) = o.try_array_view() else {
+                // The region has not been emitted yet, so there is no
+                // file offset to name. 0 is the pre-placement form.
+                return Err(RegionFault::ArrayIntegrity { offset: 0 });
+            };
+            for i in 0..n {
                 children.push(o.array_child(i));
             }
         } else if tag == abi::TAG_STRING || tag == abi::TAG_MPZ {
@@ -999,7 +1007,11 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                         off += 8;
                     }
                 } else if h.tag == abi::TAG_ARRAY {
-                    let (n, _) = o.array_view();
+                    let Some((n, _)) = o.try_array_view() else {
+                        return Err(RegionFault::ArrayIntegrity {
+                            offset: offset as usize,
+                        });
+                    };
                     emit_header(&mut out, ARRAY_FIXED + 8 * n, h.tag, 0);
                     out.extend_from_slice(&(n as u64).to_le_bytes());
                     out.extend_from_slice(&(n as u64).to_le_bytes());

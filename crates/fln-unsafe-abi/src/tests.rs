@@ -664,6 +664,36 @@ fn try_string_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn try_array_view_refuses_hostile_headers() {
+    let _g = lock();
+    let empty = Obj::mk_array(Vec::new());
+    assert_eq!(
+        empty.try_array_view(),
+        Some((0, 0)),
+        "an empty array is well-formed"
+    );
+
+    let well = Obj::mk_array(vec![Obj::mk_nat(1), Obj::mk_nat(2)]);
+    assert_eq!(well.try_array_view(), Some((2, 2)));
+
+    assert!(
+        Obj::mk_nat(3).try_array_view().is_none(),
+        "a scalar is not an array"
+    );
+    assert!(
+        Obj::mk_string("n").try_array_view().is_none(),
+        "a string is not an array"
+    );
+
+    well.plant_array_size(3);
+    assert!(
+        well.try_array_view().is_none(),
+        "m_size past m_capacity is not a view"
+    );
+    well.restore_array_size(2);
+}
+
+#[test]
 fn external_finalizer_runs_exactly_once() {
     let _g = lock();
     let before = EXTERNAL_FINALIZED.load(Ordering::SeqCst);

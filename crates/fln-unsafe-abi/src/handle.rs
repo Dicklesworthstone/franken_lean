@@ -460,11 +460,51 @@ impl Obj {
         }
     }
 
+    /// Fallible array view `(size, capacity)`.
+    ///
+    /// Returns `None` when the handle is not an array or `m_size` is past
+    /// `m_capacity`. Product paths that accept untrusted objects must use
+    /// this; [`array_view`] still asserts. Empty arrays (`m_size == 0`)
+    /// are well-formed. Inflating both fields past the minted allocation
+    /// remains outside this check (same residual as [`try_string_view`]).
+    pub fn try_array_view(&self) -> Option<(usize, usize)> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_ARRAY) {
+            return None;
+        }
+        // SAFETY: tag is TAG_ARRAY, so the object is a LeanArrayObject.
+        unsafe {
+            let (size, cap) = object::array_fields(self.0);
+            if size > cap {
+                return None;
+            }
+            Some((size, cap))
+        }
+    }
+
     /// Array `(size, capacity)`.
     pub fn array_view(&self) -> (usize, usize) {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_ARRAY));
-        // SAFETY: invariant + tag assertion.
-        unsafe { object::array_fields(self.0) }
+        self.try_array_view().expect("array header is consistent")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_array_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_ARRAY));
+        // SAFETY: tag is TAG_ARRAY; test-only header vandalism.
+        unsafe {
+            let a = self.0.cast::<crate::layout::LeanArrayObject>();
+            (*a).m_size = size;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_array_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_ARRAY));
+        // SAFETY: tag is TAG_ARRAY; restores the planted header so Drop frees.
+        unsafe {
+            let a = self.0.cast::<crate::layout::LeanArrayObject>();
+            (*a).m_size = size;
+        }
     }
 
     /// Array element as a fresh owned reference.

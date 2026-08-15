@@ -167,6 +167,10 @@ fn shared_fault(
             offset: shift + offset as u64,
             reason,
         },
+        F::ArrayIntegrity { offset } => RegionError::DecodeShape {
+            offset: shift + offset as u64,
+            reason: "array header incoherent",
+        },
         F::MpzIntegrity { offset } => RegionError::MpzIntegrity {
             offset: shift + offset as u64,
         },
