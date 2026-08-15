@@ -547,6 +547,66 @@ impl Obj {
         }
     }
 
+    /// Fallible sarray view `(elem_size, size, capacity, live-bytes)`.
+    ///
+    /// Returns `None` when the handle is not a scalar array, `m_other`
+    /// (element size) is 0, `m_size` is past `m_capacity`, or
+    /// `m_size * elem_size` overflows. Product paths that accept
+    /// untrusted objects must use this. Empty sarrays (`m_size == 0`
+    /// with a positive element size) are well-formed. Inflating both
+    /// `m_size` and `m_capacity` past the minted allocation remains
+    /// outside this check (same residual as [`try_array_view`]): the
+    /// test plants `m_size` only, so Drop still frees with the real
+    /// `m_capacity`.
+    pub fn try_sarray_view(&self) -> Option<(u8, usize, usize, Vec<u8>)> {
+        if self.is_scalar() || self.obj_tag() != usize::from(crate::contract::TAG_SCALAR_ARRAY) {
+            return None;
+        }
+        // SAFETY: tag is TAG_SCALAR_ARRAY, so the object is a
+        // LeanSarrayObject. `m_size <= m_capacity` is the inline-buffer
+        // law: the minted data area is `m_capacity * elem_size` bytes.
+        // Copying `m_size * elem_size` after that check and the overflow
+        // check cannot run past the header's own capacity claim.
+        unsafe {
+            let (elem, size, cap, data) = object::sarray_fields(self.0);
+            if elem == 0 || size > cap {
+                return None;
+            }
+            let nbytes = size.checked_mul(usize::from(elem))?;
+            let copy = core::slice::from_raw_parts(data, nbytes).to_vec();
+            Some((elem, size, cap, copy))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_sarray_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_SCALAR_ARRAY));
+        // SAFETY: tag is TAG_SCALAR_ARRAY; test-only header vandalism.
+        unsafe {
+            let a = self.0.cast::<crate::layout::LeanSarrayObject>();
+            (*a).m_size = size;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_sarray_size(&self, size: usize) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_SCALAR_ARRAY));
+        // SAFETY: tag is TAG_SCALAR_ARRAY; restores the planted header so Drop frees.
+        unsafe {
+            let a = self.0.cast::<crate::layout::LeanSarrayObject>();
+            (*a).m_size = size;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_sarray_elem(&self, elem: u8) {
+        assert!(self.obj_tag() == usize::from(crate::contract::TAG_SCALAR_ARRAY));
+        // SAFETY: tag is TAG_SCALAR_ARRAY; test-only header vandalism.
+        unsafe {
+            (*self.0).m_other = elem;
+        }
+    }
+
     /// Array element as a fresh owned reference.
     pub fn array_child(&self, i: usize) -> Obj {
         let (size, _) = self.array_view();

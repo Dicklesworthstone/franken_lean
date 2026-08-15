@@ -962,7 +962,7 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
             for i in 0..n {
                 children.push(o.array_child(i));
             }
-        } else if tag == abi::TAG_STRING || tag == abi::TAG_MPZ {
+        } else if tag == abi::TAG_STRING || tag == abi::TAG_MPZ || tag == abi::TAG_SCALAR_ARRAY {
             // leaves
         } else {
             return Err(RegionFault::UnsupportedCategory {
@@ -1051,6 +1051,17 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                         let w = word_of(&c, &memo);
                         out.extend_from_slice(&w.to_le_bytes());
                     }
+                } else if h.tag == abi::TAG_SCALAR_ARRAY {
+                    let Some((elem, n, _, data)) = o.try_sarray_view() else {
+                        return Err(RegionFault::BadObjectSize {
+                            offset: offset as usize,
+                            size: 0,
+                        });
+                    };
+                    emit_header(&mut out, SARRAY_FIXED + data.len(), h.tag, elem);
+                    out.extend_from_slice(&(n as u64).to_le_bytes());
+                    out.extend_from_slice(&(n as u64).to_le_bytes());
+                    out.extend_from_slice(&data);
                 } else if h.tag == abi::TAG_STRING {
                     let Some((size, _, length, data)) = o.try_string_view() else {
                         return Err(RegionFault::StringIntegrity {

@@ -694,6 +694,53 @@ fn try_array_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn try_sarray_view_refuses_hostile_headers() {
+    let _g = lock();
+    let empty = Obj::mk_sarray(4, &[]);
+    let (elem, size, cap, bytes) = empty
+        .try_sarray_view()
+        .expect("an empty sarray with a positive element size is well-formed");
+    assert_eq!((elem, size, cap), (4, 0, 0));
+    assert!(bytes.is_empty());
+
+    let well = Obj::mk_sarray(4, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+    let (elem, size, cap, bytes) = well
+        .try_sarray_view()
+        .expect("a well-formed sarray is viewable");
+    assert_eq!((elem, size, cap), (4, 3, 3));
+    assert_eq!(bytes, vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+
+    assert!(
+        Obj::mk_nat(3).try_sarray_view().is_none(),
+        "a scalar is not an sarray"
+    );
+    assert!(
+        Obj::mk_string("n").try_sarray_view().is_none(),
+        "a string is not an sarray"
+    );
+    assert!(
+        Obj::mk_array(vec![Obj::mk_nat(1)])
+            .try_sarray_view()
+            .is_none(),
+        "an object array is not a scalar array"
+    );
+
+    well.plant_sarray_size(4);
+    assert!(
+        well.try_sarray_view().is_none(),
+        "m_size past m_capacity is not a view"
+    );
+    well.restore_sarray_size(3);
+
+    well.plant_sarray_elem(0);
+    assert!(
+        well.try_sarray_view().is_none(),
+        "a zero element size is not a view"
+    );
+    well.plant_sarray_elem(4);
+}
+
+#[test]
 fn try_ctor_child_refuses_slots_past_the_allocation() {
     let _g = lock();
     let well = Obj::mk_ctor(1, vec![Obj::mk_nat(1), Obj::mk_nat(2)], &[]);

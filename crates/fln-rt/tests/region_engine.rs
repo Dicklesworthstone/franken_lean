@@ -26,7 +26,8 @@ fn sample_graph() -> Obj {
     let shared = Obj::mk_string("shared-leaf");
     let pair = Obj::mk_ctor(2, vec![shared.clone_ref(), Obj::mk_nat(41)], &[0xEE; 4]);
     let big = Obj::mk_mpz(&[0xDEAD_BEEF_u64, 7], true);
-    Obj::mk_array(vec![pair, shared, big, Obj::mk_nat(0)])
+    let scalars = Obj::mk_sarray(4, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+    Obj::mk_array(vec![pair, shared, big, scalars, Obj::mk_nat(0)])
 }
 
 const BASE_A: u64 = 0x7000_0000_0000;
@@ -238,6 +239,38 @@ fn a_sarray_with_zero_element_size_is_a_typed_fault_not_a_panic() {
         ),
         "materialize must not reach mk_sarray's elem_size assert"
     );
+}
+
+/// Live scalar arrays used to fall through compact's first loop and
+/// emit arm as `UnsupportedCategory`, while materialize could already
+/// *build* them from a walk-validated buffer. Compact now emits them
+/// as leaves (size = capacity = live count) and the join is a fixpoint.
+#[test]
+fn compact_emits_a_live_sarray_and_materialize_recovers_the_payload() {
+    let _g = lock();
+    let payload = [1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+    let live = Obj::mk_sarray(4, &payload);
+    let bytes = compact(&live, BASE_A).expect("compact a live sarray");
+    let rebuilt = materialize(&bytes, BASE_A).expect("materialize the emitted sarray");
+    let (elem, n, cap, data) = rebuilt
+        .try_sarray_view()
+        .expect("materialized object is a well-formed sarray");
+    assert_eq!((elem, n, cap), (4, 3, 3));
+    assert_eq!(data, payload);
+    let bytes2 = compact(&rebuilt, BASE_A).expect("recompact");
+    assert_eq!(
+        bytes, bytes2,
+        "compact ∘ materialize is the identity on an sarray"
+    );
+
+    let empty = Obj::mk_sarray(4, &[]);
+    let empty_bytes = compact(&empty, BASE_A).expect("empty sarray is legal");
+    let empty_rebuilt = materialize(&empty_bytes, BASE_A).expect("materialize empty sarray");
+    let (elem, n, cap, data) = empty_rebuilt
+        .try_sarray_view()
+        .expect("empty sarray survives the join");
+    assert_eq!((elem, n, cap), (4, 0, 0));
+    assert!(data.is_empty());
 }
 
 #[test]
