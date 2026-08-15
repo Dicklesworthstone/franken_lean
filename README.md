@@ -281,6 +281,10 @@ intrinsics. Nat literals and results use the Marrow ABI's canonical
 tagged-scalar-or-positive-mpz representation, including direct source literals larger
 than 64 bits; they cross dependent definitions and emitted FLBC products without
 narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceiling.
+The `fln.source-run/6` robot result binds that runtime value back to the checked
+source result type, so Bool results remain JSON booleans instead of being mislabeled
+as Nat. A standalone FLBC scalar remains type-erased and is reported only by its
+runtime kind because the current artifact carries no source-result type witness.
 The facade also retains explicit
 budgets, immutable environment successors, K1 plus the independent checker,
 canonical FLBC, and Golem. The planned `Cx`

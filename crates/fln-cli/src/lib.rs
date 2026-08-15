@@ -40,7 +40,7 @@ const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/5";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/6";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
@@ -66,10 +66,10 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String/Bool definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
+    "`run` executes supported Nat/String/Bool definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
     "from each path in dependency order,\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
-    "and Golem. The final path must produce a closed Nat or String result to report. The\n",
+    "and Golem. The final path must produce a closed Nat, String, or Bool result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
     "--emit-flbc, the final definition's exact executed artifact is published\n",
     "only after the whole batch succeeds; any existing PATH is refused, never\n",
@@ -689,6 +689,129 @@ fn closed_cli_value(
             fln::ClosedVmValue::String(value) => SourceFinalValue::String(value),
         })
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceResultKind {
+    Nat,
+    String,
+    Bool,
+}
+
+impl SourceResultKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Nat => "Nat",
+            Self::String => "String",
+            Self::Bool => "Bool",
+        }
+    }
+}
+
+fn source_result_kind(declaration: &fln::Declaration) -> Option<SourceResultKind> {
+    let fln::Declaration::Defn(definition) = declaration else {
+        return None;
+    };
+    let type_ = &definition.base.type_;
+    if type_ == &fln::Expr::const_(fln::Name::from_components(["Nat"]), Vec::new()) {
+        Some(SourceResultKind::Nat)
+    } else if type_ == &fln::Expr::const_(fln::Name::from_components(["String"]), Vec::new()) {
+        Some(SourceResultKind::String)
+    } else if type_ == &fln::Expr::const_(fln::Name::from_components(["Bool"]), Vec::new()) {
+        Some(SourceResultKind::Bool)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+enum SourceValueProjectionError {
+    Runtime(fln::ClosedVmValueError),
+    InvalidBoolScalar(usize),
+    RepresentationMismatch {
+        declared: SourceResultKind,
+        runtime: &'static str,
+    },
+}
+
+impl std::fmt::Display for SourceValueProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => error.fmt(formatter),
+            Self::InvalidBoolScalar(value) => write!(
+                formatter,
+                "checked Bool result used invalid runtime scalar {value}; expected 0 or 1"
+            ),
+            Self::RepresentationMismatch { declared, runtime } => write!(
+                formatter,
+                "checked {} result used incompatible {runtime} runtime representation",
+                declared.name()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceValueProjectionError {}
+
+impl From<fln::ClosedVmValueError> for SourceValueProjectionError {
+    fn from(error: fln::ClosedVmValueError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+fn closed_source_cli_value(
+    declaration: &fln::Declaration,
+    exit: &fln::VmExit,
+) -> Result<Option<SourceFinalValue>, SourceValueProjectionError> {
+    let Some(declared) = source_result_kind(declaration) else {
+        return Ok(None);
+    };
+    let Some(value) = fln::closed_vm_value(exit)? else {
+        return Ok(None);
+    };
+    project_source_closed_value(declared, value).map(Some)
+}
+
+fn project_source_closed_value(
+    declared: SourceResultKind,
+    value: fln::ClosedVmValue,
+) -> Result<SourceFinalValue, SourceValueProjectionError> {
+    match (declared, value) {
+        (SourceResultKind::Nat, fln::ClosedVmValue::Scalar(value)) => {
+            Ok(SourceFinalValue::Nat(value.to_string()))
+        }
+        (SourceResultKind::Nat, fln::ClosedVmValue::NonnegativeMpz(value)) => {
+            Ok(SourceFinalValue::Nat(value))
+        }
+        (SourceResultKind::String, fln::ClosedVmValue::String(value)) => {
+            Ok(SourceFinalValue::String(value))
+        }
+        (SourceResultKind::Bool, fln::ClosedVmValue::Scalar(0)) => {
+            Ok(SourceFinalValue::Bool(false))
+        }
+        (SourceResultKind::Bool, fln::ClosedVmValue::Scalar(1)) => Ok(SourceFinalValue::Bool(true)),
+        (SourceResultKind::Bool, fln::ClosedVmValue::Scalar(value)) => {
+            Err(SourceValueProjectionError::InvalidBoolScalar(value))
+        }
+        (declared, fln::ClosedVmValue::Scalar(_)) => {
+            Err(SourceValueProjectionError::RepresentationMismatch {
+                declared,
+                runtime: "scalar",
+            })
+        }
+        (declared, fln::ClosedVmValue::NonnegativeMpz(_)) => {
+            Err(SourceValueProjectionError::RepresentationMismatch {
+                declared,
+                runtime: "nonnegative mpz",
+            })
+        }
+        (declared, fln::ClosedVmValue::String(_)) => {
+            Err(SourceValueProjectionError::RepresentationMismatch {
+                declared,
+                runtime: "String",
+            })
+        }
+    }
 }
 
 fn render_flbc_success(
@@ -1952,9 +2075,11 @@ struct SourceSuccess<'a> {
     peak_stack_depth: u64,
 }
 
+#[derive(Debug)]
 enum SourceFinalValue {
     Nat(String),
     String(String),
+    Bool(bool),
 }
 
 impl SourceFinalValue {
@@ -1962,6 +2087,7 @@ impl SourceFinalValue {
         match self {
             Self::Nat(_) => "nat",
             Self::String(_) => "string",
+            Self::Bool(_) => "bool",
         }
     }
 
@@ -1969,6 +2095,7 @@ impl SourceFinalValue {
         match self {
             Self::Nat(value) => value.clone(),
             Self::String(value) => json_string(value),
+            Self::Bool(value) => value.to_string(),
         }
     }
 }
@@ -1978,6 +2105,7 @@ impl std::fmt::Display for SourceFinalValue {
         match self {
             Self::Nat(value) => write!(formatter, "{value}"),
             Self::String(value) => write!(formatter, "{value:?}"),
+            Self::Bool(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -2356,21 +2484,22 @@ where
             4,
         );
     };
-    let final_value = match closed_cli_value(&final_execution.exit) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            return source_failure(
-                "execution",
-                "final definition did not produce a closed Nat or String value",
-                true,
-                json,
-                1,
-            );
-        }
-        Err(error) => {
-            return source_failure("internal-fault", &error.to_string(), false, json, 4);
-        }
-    };
+    let final_value =
+        match closed_source_cli_value(&final_execution.declaration, &final_execution.exit) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return source_failure(
+                    "execution",
+                    "final definition did not produce a closed Nat, String, or Bool value",
+                    true,
+                    json,
+                    1,
+                );
+            }
+            Err(error) => {
+                return source_failure("internal-fault", &error.to_string(), false, json, 4);
+            }
+        };
     let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
         let toolchain_image = match toolchain_image {
             Some(image) => image,
@@ -3561,6 +3690,37 @@ mod tests {
     }
 
     #[test]
+    fn source_run_projects_checked_bool_results_as_json_booleans() {
+        let output =
+            execute_source_bytes(vec![b"def answer : Bool := Nat.beq 42 42".to_vec()], true);
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
+        assert!(output.stdout.contains("\"finalKind\":\"bool\""));
+        assert!(output.stdout.contains("\"finalValue\":true"));
+        assert!(!output.stdout.contains("\"finalValue\":1"));
+    }
+
+    #[test]
+    fn source_bool_projection_refuses_non_bool_runtime_scalars() {
+        let error = super::project_source_closed_value(
+            super::SourceResultKind::Bool,
+            fln::ClosedVmValue::Scalar(2),
+        )
+        .expect_err("a checked Bool cannot use a scalar other than 0 or 1");
+
+        assert!(matches!(
+            &error,
+            super::SourceValueProjectionError::InvalidBoolScalar(2)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "checked Bool result used invalid runtime scalar 2; expected 0 or 1"
+        );
+    }
+
+    #[test]
     fn source_run_executes_checked_string_batches_and_publishes_the_executed_product() {
         let output = execute_source_bytes(
             vec![
@@ -3572,7 +3732,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/5\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
         assert!(output.stdout.contains("\"definitions\":2"));
         assert!(output.stdout.contains("\"finalKind\":\"string\""));
         assert!(output.stdout.contains("\"finalValue\":\"cli\\nconnected\""));
@@ -3624,7 +3784,7 @@ mod tests {
         assert!(
             refused
                 .stderr
-                .contains("did not produce a closed Nat or String value")
+                .contains("did not produce a closed Nat, String, or Bool value")
         );
     }
 
@@ -3651,7 +3811,7 @@ mod tests {
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
         assert_eq!(publications, vec![(target, expected.clone())]);
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/5\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
         assert!(
             output
                 .stdout
@@ -3943,7 +4103,7 @@ mod tests {
         assert!(
             output
                 .stderr
-                .contains("final definition did not produce a closed Nat or String value")
+                .contains("final definition did not produce a closed Nat, String, or Bool value")
         );
     }
 

@@ -85,7 +85,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     ]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/5\""));
+    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/6\""));
     assert!(matches!(
         std::fs::symlink_metadata(&failed_product),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -105,7 +105,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(produced.stderr.is_empty());
     let producer_stdout = utf8(&produced.stdout);
-    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/5\""));
+    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/6\""));
     assert!(producer_stdout.contains("\"definitions\":3"));
     assert!(producer_stdout.contains("\"finalValue\":42"));
     assert!(producer_stdout.contains("\"emittedFlbc\":{"));
@@ -281,7 +281,8 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     assert!(comparison_produced.stderr.is_empty());
     let comparison_stdout = utf8(&comparison_produced.stdout);
     assert!(comparison_stdout.contains("\"definitions\":5"));
-    assert!(comparison_stdout.contains("\"finalValue\":1"));
+    assert!(comparison_stdout.contains("\"finalKind\":\"bool\""));
+    assert!(comparison_stdout.contains("\"finalValue\":true"));
     let comparison_consumed = run_fln(&[
         Path::new("flbc"),
         Path::new("run"),
@@ -417,7 +418,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     );
     assert!(first.stderr.is_empty());
     let first_stdout = utf8(&first.stdout);
-    assert!(first_stdout.contains("\"schema\":\"fln.source-run/5\""));
+    assert!(first_stdout.contains("\"schema\":\"fln.source-run/6\""));
     assert!(first_stdout.contains("\"finalValue\":42"));
     assert!(first_stdout.contains("\"emittedSidecar\":{"));
     assert!(first_stdout.contains("\"profile\":\"standard\""));
