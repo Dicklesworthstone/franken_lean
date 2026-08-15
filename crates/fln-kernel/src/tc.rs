@@ -3930,8 +3930,8 @@ impl<'a> TypeChecker<'a> {
             }
             // KR-106. Both modes flatten the left-associated application
             // spine. Infer-only matches the pin directly; checking mode is the
-            // same judgment expressed as a loop so adversarial arity consumes
-            // steps instead of native stack.
+            // same judgment as a heap stack so a right-nested argument tree
+            // consumes steps instead of native stack (FL-INV-07).
             ExprNode::App { .. } => {
                 let result = match mode {
                     InferMode::Check => self.infer_app_check(&current, depth + 1),
@@ -4082,47 +4082,139 @@ impl<'a> TypeChecker<'a> {
     /// then each argument left-to-right, instantiating the Π body after every
     /// successful comparison. Prefix results are retained just as the
     /// recursive implementation would cache them while unwinding.
+    ///
+    /// Flattening the left spine does not reach an application nested inside
+    /// an argument (`f (f (... a))`). Convert can inject a 400-deep nest;
+    /// `infer_core` on that argument used to re-enter this function on the
+    /// native stack and abort the check that found it (FL-INV-07). Nested
+    /// applications become extra frames on this heap stack. Depth still
+    /// grows one unit per nest, so `Budget::depth` binds the same descent.
     fn infer_app_check(&mut self, e: &Expr, depth: u32) -> KResult<Expr> {
-        let (head, args) = app_spine(e);
-        let mut prefix = head.clone();
-        let mut function_type = self.infer_core(&head, depth)?;
-        for argument in args {
-            self.step(depth)?;
-            function_type = self.whnf(&function_type, depth)?;
-            let ExprNode::ForallE {
-                binder_type, body, ..
-            } = function_type.node()
-            else {
-                return reject(RejectClass::FunctionExpected, "function expected");
-            };
-            let (binder_type, body) = (binder_type.clone(), body.clone());
-            let argument_type = self.infer_core(&argument, depth)?;
-            if !self.is_def_eq(&argument_type, &binder_type, depth)? {
-                return reject(
-                    RejectClass::TypeMismatch,
-                    format!(
-                        "application type mismatch: argument `{}` has type `{}` but the function expects `{}`{}",
-                        brief_expr(&argument, 4),
-                        brief_expr(&argument_type, 5),
-                        brief_expr(&binder_type, 5),
-                        match first_divergence(&argument_type, &binder_type) {
-                            Some(divergence) =>
-                                format!(" (first structural divergence: {divergence})"),
-                            None => String::new(),
-                        }
-                    ),
-                );
+        let mut stack = vec![self.open_checked_app(e, depth, e.clone())?];
+        let mut completed: Option<Expr> = None;
+        while !stack.is_empty() {
+            if let Some(argument_type) = completed.take() {
+                self.finish_checked_app_argument(
+                    stack
+                        .last_mut()
+                        .ok_or_else(|| Stop::Fault("application frame vanished".into()))?,
+                    argument_type,
+                )?;
+                continue;
             }
-            function_type = self.instantiate(&body, 0, &argument, depth)?;
-            prefix = Expr::app(prefix, argument);
-            self.infer_cache.insert(
-                prefix.clone(),
-                function_type.clone(),
-                &self.locals,
-                &self.local_positions,
+            let frame_done = stack
+                .last()
+                .is_some_and(|frame| frame.idx >= frame.args.len());
+            if frame_done {
+                let frame = stack
+                    .pop()
+                    .ok_or_else(|| Stop::Fault("application frame vanished".into()))?;
+                if frame.cache_key != frame.prefix {
+                    self.infer_cache.insert(
+                        frame.cache_key,
+                        frame.function_type.clone(),
+                        &self.locals,
+                        &self.local_positions,
+                    );
+                }
+                completed = Some(frame.function_type);
+                continue;
+            }
+            let (argument, arg_depth) = {
+                let frame = stack
+                    .last_mut()
+                    .ok_or_else(|| Stop::Fault("application frame vanished".into()))?;
+                self.step(frame.depth)?;
+                frame.function_type = self.whnf(&frame.function_type, frame.depth)?;
+                if !matches!(frame.function_type.node(), ExprNode::ForallE { .. }) {
+                    return reject(RejectClass::FunctionExpected, "function expected");
+                }
+                (frame.args[frame.idx].clone(), frame.depth)
+            };
+            if peels_to_app(&argument) {
+                // Replicate `infer_core_mode`'s prefix so an App argument
+                // does not re-enter this function through `infer_core`.
+                self.step(arg_depth)?;
+                if let Some(cached) =
+                    self.infer_cache
+                        .get(&argument, &self.locals, &self.local_positions)
+                {
+                    completed = Some(cached);
+                    continue;
+                }
+                let mut current = argument.clone();
+                let mut nested_depth = arg_depth;
+                while let ExprNode::MData { expr, .. } = current.node() {
+                    current = expr.clone();
+                    nested_depth = nested_depth.saturating_add(1);
+                    self.step(nested_depth)?;
+                }
+                let child = self.open_checked_app(&current, nested_depth + 1, argument)?;
+                stack.push(child);
+                continue;
+            }
+            let argument_type = self.infer_core(&argument, arg_depth)?;
+            completed = Some(argument_type);
+        }
+        completed.ok_or_else(|| Stop::Fault("application inference finished with no result".into()))
+    }
+
+    fn open_checked_app(
+        &mut self,
+        e: &Expr,
+        depth: u32,
+        cache_key: Expr,
+    ) -> KResult<CheckedAppFrame> {
+        let (head, args) = app_spine(e);
+        let function_type = self.infer_core(&head, depth)?;
+        Ok(CheckedAppFrame {
+            args,
+            idx: 0,
+            prefix: head,
+            function_type,
+            depth,
+            cache_key,
+        })
+    }
+
+    fn finish_checked_app_argument(
+        &mut self,
+        frame: &mut CheckedAppFrame,
+        argument_type: Expr,
+    ) -> KResult<()> {
+        let ExprNode::ForallE {
+            binder_type, body, ..
+        } = frame.function_type.node()
+        else {
+            return reject(RejectClass::FunctionExpected, "function expected");
+        };
+        let (binder_type, body) = (binder_type.clone(), body.clone());
+        let argument = frame.args[frame.idx].clone();
+        if !self.is_def_eq(&argument_type, &binder_type, frame.depth)? {
+            return reject(
+                RejectClass::TypeMismatch,
+                format!(
+                    "application type mismatch: argument `{}` has type `{}` but the function expects `{}`{}",
+                    brief_expr(&argument, 4),
+                    brief_expr(&argument_type, 5),
+                    brief_expr(&binder_type, 5),
+                    match first_divergence(&argument_type, &binder_type) {
+                        Some(divergence) => format!(" (first structural divergence: {divergence})"),
+                        None => String::new(),
+                    }
+                ),
             );
         }
-        Ok(function_type)
+        frame.function_type = self.instantiate(&body, 0, &argument, frame.depth)?;
+        frame.prefix = Expr::app(frame.prefix.clone(), argument);
+        self.infer_cache.insert(
+            frame.prefix.clone(),
+            frame.function_type.clone(),
+            &self.locals,
+            &self.local_positions,
+        );
+        frame.idx += 1;
+        Ok(())
     }
 
     /// Pin `infer_app(..., infer_only=true)`: flatten a left-associated
@@ -5222,6 +5314,29 @@ fn app_spine(e: &Expr) -> (Expr, Vec<Expr>) {
     }
     args.reverse();
     (head, args)
+}
+
+/// True when stripping KR-111 wrappers leaves an application. Checking-mode
+/// KR-106 trampolines those arguments onto the heap stack instead of
+/// re-entering `infer_core_mode`.
+fn peels_to_app(e: &Expr) -> bool {
+    let mut current = e;
+    while let ExprNode::MData { expr, .. } = current.node() {
+        current = expr;
+    }
+    matches!(current.node(), ExprNode::App { .. })
+}
+
+/// One left-spine being typed by the checking-mode KR-106 heap stack.
+struct CheckedAppFrame {
+    args: Vec<Expr>,
+    idx: usize,
+    prefix: Expr,
+    function_type: Expr,
+    depth: u32,
+    /// Original term this frame types, including any MData wrappers peeled
+    /// to reach the application. Completed nested frames cache under this key.
+    cache_key: Expr,
 }
 
 /// Outcome of the lazy-delta loop: a decisive literal/offset verdict, or the
@@ -6627,6 +6742,95 @@ mod tests {
         assert!(
             checking.consumption().max_depth <= budget.depth,
             "mdata wrappers must consume loop steps, not native-stack depth"
+        );
+    }
+
+    #[test]
+    fn infer_checks_a_deep_right_nested_app_without_stack_fault() {
+        use fln_env::constants::{AxiomVal, ConstantVal};
+
+        const NEST: usize = 400;
+        let t_name = Name::str(Name::anonymous(), "T");
+        let f_name = Name::str(Name::anonymous(), "f");
+        let a_name = Name::str(Name::anonymous(), "a");
+        let t = Expr::const_(t_name.clone(), Vec::new());
+        let env = publish_checked(
+            &Environment::new(),
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: t_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: f_name.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::forall_e(
+                        Name::anonymous(),
+                        t.clone(),
+                        t.clone(),
+                        BinderInfo::Default,
+                    ),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let env = publish_checked(
+            &env,
+            Declaration::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: a_name.clone(),
+                    level_params: Vec::new(),
+                    type_: t.clone(),
+                },
+                is_unsafe: false,
+            }),
+        );
+        let f = Expr::const_(f_name, Vec::new());
+        let mut term = Expr::const_(a_name, Vec::new());
+        for _ in 0..NEST {
+            term = Expr::app(f.clone(), term);
+        }
+        let budget = Budget::DEFAULT;
+        let mut tc = TypeChecker::new(&env, &[], budget);
+        let inferred = tc
+            .infer(&term, 0)
+            .expect("a 400-deep right-nested application must not stack-fault");
+        assert!(
+            inferred == t,
+            "KR-106 must infer T, got {}",
+            brief_public(&inferred)
+        );
+        assert!(
+            tc.consumption().max_depth <= budget.depth,
+            "right-nested applications must consume loop steps, not native-stack depth"
+        );
+
+        let mut wrapped = Expr::const_(Name::str(Name::anonymous(), "a"), Vec::new());
+        for _ in 0..NEST {
+            wrapped = Expr::mdata(
+                fln_core::options::KVMap::default(),
+                Expr::app(f.clone(), wrapped),
+            );
+        }
+        let mut wrapped_tc = TypeChecker::new(&env, &[], budget);
+        let wrapped_inferred = wrapped_tc
+            .infer(&wrapped, 0)
+            .expect("a 400-deep mdata-wrapped application nest must not stack-fault");
+        assert!(
+            wrapped_inferred == t,
+            "KR-111+KR-106 must infer T through metadata, got {}",
+            brief_public(&wrapped_inferred)
+        );
+        assert!(
+            wrapped_tc.consumption().max_depth <= budget.depth,
+            "mdata-wrapped right-nested applications must consume loop steps"
         );
     }
 
