@@ -291,6 +291,16 @@ canonical FLBC, and Golem. The planned `Cx`
 builder, project/import elaboration, and receipt API from §17.2 do not exist yet;
 the example deliberately does not pretend otherwise.
 
+The currently implemented `.olean` surface is likewise narrower than the target
+codec suite. `fln olean inspect` audits and decodes one artifact at the pinned
+epoch; `fln olean verify-rebuild` re-derives that artifact from decoded semantics
+and requires byte identity; and `fln olean diff LEFT RIGHT` compares two decoded
+artifacts without collapsing byte, header, module-metadata, or declaration-order
+identity into one claim. Diff output is deterministic and bounded (at most 256
+changed names, with explicit omission counts), and `--max-bytes` bounds the two
+inputs together. These commands do not resolve imports, kernel-check declarations,
+read `olean-next`, or establish corpus-wide codec compatibility.
+
 ## Quick start
 
 ```bash

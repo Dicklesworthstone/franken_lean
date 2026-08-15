@@ -37,12 +37,16 @@ pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
+const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/6";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
+const OLEAN_DIFF_MAX_RENDERED_NAME_CHARS: usize = 256;
+const OLEAN_DIFF_MAX_RENDERED_KINDS_PER_SIDE: usize = 16;
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -50,12 +54,16 @@ const USAGE: &str = concat!(
     "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
+    "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
     "`olean inspect` audits and decodes one pinned-format .olean. It does not\n",
     "resolve imports, kernel-check declarations, or re-emit an artifact.\n",
+    "`olean diff` audits and decodes two pinned-format .oleans, then reports\n",
+    "bounded structural changes in module metadata and declarations. It does\n",
+    "not resolve imports, kernel-check either side, or convert olean-next.\n",
     "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
     "semantics and requires byte identity with no codec findings. It is not\n",
     "fresh emission and does not kernel-check declarations.\n",
@@ -137,6 +145,12 @@ enum MultiplexerCommand {
     },
     OleanInspect {
         path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
+    OleanDiff {
+        left: PathBuf,
+        right: PathBuf,
         max_bytes: usize,
         json: bool,
     },
@@ -223,6 +237,46 @@ impl fmt::Display for OleanInspectFailure {
         match self {
             Self::Read(error) => write!(f, "{error}"),
             Self::Decode(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OleanDiffFailure {
+    Read(BoundedReadFailure),
+    Decode {
+        side: &'static str,
+        error: fln::OleanDecodeError,
+    },
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+    },
+}
+
+impl OleanDiffFailure {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::Read(error) => error.class(),
+            Self::Decode { error, .. } if error.is_resource_exhaustion() => "resource",
+            Self::Allocation { .. } => "resource",
+            Self::Decode { .. } => "decode",
+        }
+    }
+}
+
+impl fmt::Display for OleanDiffFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::Decode { side, error } => write!(formatter, "{side} artifact: {error}"),
+            Self::Allocation {
+                resource,
+                requested,
+            } => write!(
+                formatter,
+                "could not reserve {requested} entries for {resource}"
+            ),
         }
     }
 }
@@ -519,6 +573,25 @@ fn parse_olean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, U
     })
 }
 
+fn parse_olean_diff(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(arguments, "olean diff", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [left, right] = paths.as_slice() else {
+        return Err(UsageError(
+            "olean diff accepts exactly two input paths".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::OleanDiff {
+        left: left.clone(),
+        right: right.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_olean_verify_rebuild(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let Some((paths, max_bytes, json)) = parse_path_options(
         arguments,
@@ -582,7 +655,7 @@ fn parse_command(
     }
     let Some(subcommand) = arguments.next() else {
         return Err(UsageError(
-            "olean requires the `inspect` subcommand".to_owned(),
+            "olean requires an `inspect`, `diff`, or `verify-rebuild` subcommand".to_owned(),
         ));
     };
     if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
@@ -590,6 +663,9 @@ fn parse_command(
     }
     if subcommand == "inspect" {
         return parse_olean_inspect(arguments.collect());
+    }
+    if subcommand == "diff" {
+        return parse_olean_diff(arguments.collect());
     }
     if subcommand == "verify-rebuild" {
         return parse_olean_verify_rebuild(arguments.collect());
@@ -1193,6 +1269,521 @@ fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput
         Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
         Err(error) => inspect_failure(OleanInspectFailure::Read(error), json),
     }
+}
+
+#[derive(Clone, Copy)]
+enum OleanDiffChange {
+    Added,
+    Removed,
+    Modified,
+}
+
+impl OleanDiffChange {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Modified => "modified",
+        }
+    }
+}
+
+struct OleanDiffEntry {
+    name: String,
+    name_truncated: bool,
+    change: OleanDiffChange,
+    left_kinds: Vec<&'static str>,
+    left_kinds_omitted: usize,
+    right_kinds: Vec<&'static str>,
+    right_kinds_omitted: usize,
+}
+
+struct OleanDiffSummary {
+    byte_identity: bool,
+    header_identity: bool,
+    module_identity: bool,
+    constant_sequence_identity: bool,
+    left_bytes: usize,
+    right_bytes: usize,
+    left_constants: usize,
+    right_constants: usize,
+    added_constants: usize,
+    removed_constants: usize,
+    modified_names: usize,
+    unchanged_constants: usize,
+    changes: Vec<OleanDiffEntry>,
+    omitted_changes: usize,
+}
+
+impl OleanDiffSummary {
+    const fn semantic_identity(&self) -> bool {
+        self.module_identity && self.constant_sequence_identity
+    }
+}
+
+fn bounded_olean_diff_name(name: &fln::Name) -> (String, bool) {
+    let full = name.to_display_string();
+    let mut characters = full.chars();
+    let mut rendered = characters
+        .by_ref()
+        .take(OLEAN_DIFF_MAX_RENDERED_NAME_CHARS)
+        .collect::<String>();
+    let truncated = characters.next().is_some();
+    if truncated {
+        rendered.push('…');
+    }
+    (rendered, truncated)
+}
+
+fn constant_order(
+    constants: &[fln::ConstantInfo],
+    side: &'static str,
+) -> Result<Vec<usize>, OleanDiffFailure> {
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(constants.len())
+        .map_err(|_| OleanDiffFailure::Allocation {
+            resource: side,
+            requested: constants.len(),
+        })?;
+    order.extend(0..constants.len());
+    order.sort_unstable_by(|left, right| {
+        constants[*left]
+            .name()
+            .cmp(constants[*right].name())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(order)
+}
+
+fn constant_group_end(constants: &[fln::ConstantInfo], order: &[usize], start: usize) -> usize {
+    let name = constants[order[start]].name();
+    let mut end = start + 1;
+    while end < order.len() && constants[order[end]].name() == name {
+        end += 1;
+    }
+    end
+}
+
+fn constant_groups_equal(
+    left: &[fln::ConstantInfo],
+    left_order: &[usize],
+    right: &[fln::ConstantInfo],
+    right_order: &[usize],
+) -> bool {
+    left_order.len() == right_order.len()
+        && left_order
+            .iter()
+            .zip(right_order)
+            .all(|(left_index, right_index)| left[*left_index] == right[*right_index])
+}
+
+fn rendered_constant_kinds(
+    constants: &[fln::ConstantInfo],
+    order: &[usize],
+    side: &'static str,
+) -> Result<(Vec<&'static str>, usize), OleanDiffFailure> {
+    let shown = order.len().min(OLEAN_DIFF_MAX_RENDERED_KINDS_PER_SIDE);
+    let mut kinds = Vec::new();
+    kinds
+        .try_reserve_exact(shown)
+        .map_err(|_| OleanDiffFailure::Allocation {
+            resource: side,
+            requested: shown,
+        })?;
+    kinds.extend(
+        order
+            .iter()
+            .take(shown)
+            .map(|index| constants[*index].kind_name()),
+    );
+    Ok((kinds, order.len() - shown))
+}
+
+fn record_olean_diff_entry(
+    summary: &mut OleanDiffSummary,
+    name: &fln::Name,
+    change: OleanDiffChange,
+    left: &[fln::ConstantInfo],
+    left_order: &[usize],
+    right: &[fln::ConstantInfo],
+    right_order: &[usize],
+) -> Result<(), OleanDiffFailure> {
+    if summary.changes.len() >= OLEAN_DIFF_MAX_RENDERED_CHANGES {
+        summary.omitted_changes = summary.omitted_changes.saturating_add(1);
+        return Ok(());
+    }
+    let (left_kinds, left_kinds_omitted) =
+        rendered_constant_kinds(left, left_order, "left diff kind list")?;
+    let (right_kinds, right_kinds_omitted) =
+        rendered_constant_kinds(right, right_order, "right diff kind list")?;
+    let (name, name_truncated) = bounded_olean_diff_name(name);
+    summary.changes.push(OleanDiffEntry {
+        name,
+        name_truncated,
+        change,
+        left_kinds,
+        left_kinds_omitted,
+        right_kinds,
+        right_kinds_omitted,
+    });
+    Ok(())
+}
+
+fn compare_decoded_oleans(
+    left_bytes: &[u8],
+    left: &fln::DecodedOlean,
+    right_bytes: &[u8],
+    right: &fln::DecodedOlean,
+) -> Result<OleanDiffSummary, OleanDiffFailure> {
+    let left_order = constant_order(&left.constants, "left constant order")?;
+    let right_order = constant_order(&right.constants, "right constant order")?;
+    let mut summary = OleanDiffSummary {
+        byte_identity: left_bytes == right_bytes,
+        header_identity: left.header == right.header,
+        module_identity: left.module == right.module,
+        constant_sequence_identity: left.constants == right.constants,
+        left_bytes: left_bytes.len(),
+        right_bytes: right_bytes.len(),
+        left_constants: left.constants.len(),
+        right_constants: right.constants.len(),
+        added_constants: 0,
+        removed_constants: 0,
+        modified_names: 0,
+        unchanged_constants: 0,
+        changes: Vec::new(),
+        omitted_changes: 0,
+    };
+    summary
+        .changes
+        .try_reserve_exact(
+            left.constants
+                .len()
+                .saturating_add(right.constants.len())
+                .min(OLEAN_DIFF_MAX_RENDERED_CHANGES),
+        )
+        .map_err(|_| OleanDiffFailure::Allocation {
+            resource: ".olean diff change list",
+            requested: OLEAN_DIFF_MAX_RENDERED_CHANGES,
+        })?;
+
+    let mut left_position = 0;
+    let mut right_position = 0;
+    while left_position < left_order.len() || right_position < right_order.len() {
+        let left_name = left_order
+            .get(left_position)
+            .map(|index| left.constants[*index].name());
+        let right_name = right_order
+            .get(right_position)
+            .map(|index| right.constants[*index].name());
+        match (left_name, right_name) {
+            (Some(left_name), Some(right_name)) if left_name < right_name => {
+                let left_end = constant_group_end(&left.constants, &left_order, left_position);
+                let group = &left_order[left_position..left_end];
+                summary.removed_constants = summary.removed_constants.saturating_add(group.len());
+                record_olean_diff_entry(
+                    &mut summary,
+                    left_name,
+                    OleanDiffChange::Removed,
+                    &left.constants,
+                    group,
+                    &right.constants,
+                    &[],
+                )?;
+                left_position = left_end;
+            }
+            (Some(left_name), Some(right_name)) if left_name > right_name => {
+                let right_end = constant_group_end(&right.constants, &right_order, right_position);
+                let group = &right_order[right_position..right_end];
+                summary.added_constants = summary.added_constants.saturating_add(group.len());
+                record_olean_diff_entry(
+                    &mut summary,
+                    right_name,
+                    OleanDiffChange::Added,
+                    &left.constants,
+                    &[],
+                    &right.constants,
+                    group,
+                )?;
+                right_position = right_end;
+            }
+            (Some(name), Some(_)) => {
+                let left_end = constant_group_end(&left.constants, &left_order, left_position);
+                let right_end = constant_group_end(&right.constants, &right_order, right_position);
+                let left_group = &left_order[left_position..left_end];
+                let right_group = &right_order[right_position..right_end];
+                if constant_groups_equal(&left.constants, left_group, &right.constants, right_group)
+                {
+                    summary.unchanged_constants =
+                        summary.unchanged_constants.saturating_add(left_group.len());
+                } else {
+                    summary.modified_names = summary.modified_names.saturating_add(1);
+                    record_olean_diff_entry(
+                        &mut summary,
+                        name,
+                        OleanDiffChange::Modified,
+                        &left.constants,
+                        left_group,
+                        &right.constants,
+                        right_group,
+                    )?;
+                }
+                left_position = left_end;
+                right_position = right_end;
+            }
+            (Some(name), None) => {
+                let left_end = constant_group_end(&left.constants, &left_order, left_position);
+                let group = &left_order[left_position..left_end];
+                summary.removed_constants = summary.removed_constants.saturating_add(group.len());
+                record_olean_diff_entry(
+                    &mut summary,
+                    name,
+                    OleanDiffChange::Removed,
+                    &left.constants,
+                    group,
+                    &right.constants,
+                    &[],
+                )?;
+                left_position = left_end;
+            }
+            (None, Some(name)) => {
+                let right_end = constant_group_end(&right.constants, &right_order, right_position);
+                let group = &right_order[right_position..right_end];
+                summary.added_constants = summary.added_constants.saturating_add(group.len());
+                record_olean_diff_entry(
+                    &mut summary,
+                    name,
+                    OleanDiffChange::Added,
+                    &left.constants,
+                    &[],
+                    &right.constants,
+                    group,
+                )?;
+                right_position = right_end;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(summary)
+}
+
+fn render_olean_diff_kinds(kinds: &[&str]) -> String {
+    format!(
+        "[{}]",
+        kinds
+            .iter()
+            .map(|kind| json_string(kind))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_olean_diff_success(summary: &OleanDiffSummary, json: bool) -> MultiplexerOutput {
+    if json {
+        let changes = summary
+            .changes
+            .iter()
+            .map(|entry| {
+                format!(
+                    concat!(
+                        "{{\"name\":{},\"nameTruncated\":{},\"change\":{},",
+                        "\"leftKinds\":{},\"leftKindsOmitted\":{},",
+                        "\"rightKinds\":{},\"rightKindsOmitted\":{}}}"
+                    ),
+                    json_string(&entry.name),
+                    entry.name_truncated,
+                    json_string(entry.change.name()),
+                    render_olean_diff_kinds(&entry.left_kinds),
+                    entry.left_kinds_omitted,
+                    render_olean_diff_kinds(&entry.right_kinds),
+                    entry.right_kinds_omitted,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return MultiplexerOutput::success(format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":false,",
+                "\"leftBytes\":{},\"rightBytes\":{},\"byteIdentity\":{},",
+                "\"semanticIdentity\":{},\"headerIdentity\":{},",
+                "\"moduleIdentity\":{},\"constantSequenceIdentity\":{},",
+                "\"constants\":{{\"left\":{},\"right\":{},\"added\":{},",
+                "\"removed\":{},\"modifiedNames\":{},\"unchanged\":{}}},",
+                "\"changes\":[{}],\"omittedChanges\":{}}}\n"
+            ),
+            json_string(OLEAN_DIFF_SCHEMA),
+            summary.left_bytes,
+            summary.right_bytes,
+            summary.byte_identity,
+            summary.semantic_identity(),
+            summary.header_identity,
+            summary.module_identity,
+            summary.constant_sequence_identity,
+            summary.left_constants,
+            summary.right_constants,
+            summary.added_constants,
+            summary.removed_constants,
+            summary.modified_names,
+            summary.unchanged_constants,
+            changes,
+            summary.omitted_changes,
+        ));
+    }
+
+    let mut changes = String::new();
+    for entry in &summary.changes {
+        let left = if entry.left_kinds.is_empty() {
+            "none".to_owned()
+        } else {
+            entry.left_kinds.join(",")
+        };
+        let right = if entry.right_kinds.is_empty() {
+            "none".to_owned()
+        } else {
+            entry.right_kinds.join(",")
+        };
+        changes.push_str(&format!(
+            "- {} {}: {} -> {}",
+            entry.change.name(),
+            entry.name,
+            left,
+            right
+        ));
+        if entry.name_truncated || entry.left_kinds_omitted != 0 || entry.right_kinds_omitted != 0 {
+            changes.push_str(&format!(
+                " [truncated: name={}, left kinds={}, right kinds={}]",
+                entry.name_truncated, entry.left_kinds_omitted, entry.right_kinds_omitted
+            ));
+        }
+        changes.push('\n');
+    }
+    MultiplexerOutput::success(format!(
+        concat!(
+            "pinned .olean semantic diff: {}\n",
+            "bytes: left {} / right {} (identical: {})\n",
+            "header identical: {}\n",
+            "module metadata identical: {}\n",
+            "constant sequence identical: {}\n",
+            "constants: left {}, right {}, added {}, removed {}, modified names {}, unchanged {}\n",
+            "changes shown: {} ({} omitted)\n",
+            "{}"
+        ),
+        if summary.semantic_identity() {
+            "identical"
+        } else {
+            "different"
+        },
+        summary.left_bytes,
+        summary.right_bytes,
+        summary.byte_identity,
+        summary.header_identity,
+        summary.module_identity,
+        summary.constant_sequence_identity,
+        summary.left_constants,
+        summary.right_constants,
+        summary.added_constants,
+        summary.removed_constants,
+        summary.modified_names,
+        summary.unchanged_constants,
+        summary.changes.len(),
+        summary.omitted_changes,
+        changes,
+    ))
+}
+
+fn olean_diff_failure(error: OleanDiffFailure, json: bool) -> MultiplexerOutput {
+    let class = error.class();
+    let detail = BoundedText::new(error.to_string());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":false,",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(OLEAN_DIFF_SCHEMA),
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        format!("fln olean diff: {class}: {}\n", detail.text())
+    };
+    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
+}
+
+fn diff_olean_bytes(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    max_bytes: usize,
+    json: bool,
+) -> MultiplexerOutput {
+    let observed = left_bytes.len().checked_add(right_bytes.len());
+    let Some(observed) = observed else {
+        return olean_diff_failure(
+            OleanDiffFailure::Read(BoundedReadFailure::TooLarge {
+                subject: ".olean diff inputs",
+                observed: usize::MAX,
+                limit: max_bytes,
+            }),
+            json,
+        );
+    };
+    if observed > max_bytes {
+        return olean_diff_failure(
+            OleanDiffFailure::Read(BoundedReadFailure::TooLarge {
+                subject: ".olean diff inputs",
+                observed,
+                limit: max_bytes,
+            }),
+            json,
+        );
+    }
+    let left =
+        match fln::decode_olean_artifact(left_bytes, fln::OleanDecodeLimits::new(left_bytes.len()))
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return olean_diff_failure(
+                    OleanDiffFailure::Decode {
+                        side: "left",
+                        error,
+                    },
+                    json,
+                );
+            }
+        };
+    let right = match fln::decode_olean_artifact(
+        right_bytes,
+        fln::OleanDecodeLimits::new(right_bytes.len()),
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return olean_diff_failure(
+                OleanDiffFailure::Decode {
+                    side: "right",
+                    error,
+                },
+                json,
+            );
+        }
+    };
+    match compare_decoded_oleans(left_bytes, &left, right_bytes, &right) {
+        Ok(summary) => render_olean_diff_success(&summary, json),
+        Err(error) => olean_diff_failure(error, json),
+    }
+}
+
+fn diff_olean(left: &Path, right: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let left_bytes = match read_bounded(left, max_bytes, "left .olean artifact") {
+        Ok(bytes) => bytes,
+        Err(error) => return olean_diff_failure(OleanDiffFailure::Read(error), json),
+    };
+    let remaining = max_bytes.saturating_sub(left_bytes.len());
+    let right_bytes = match read_bounded(right, remaining, "right .olean artifact") {
+        Ok(bytes) => bytes,
+        Err(error) => return olean_diff_failure(OleanDiffFailure::Read(error), json),
+    };
+    diff_olean_bytes(&left_bytes, &right_bytes, max_bytes, json)
 }
 
 fn render_olean_rebuild_success(
@@ -2709,6 +3300,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => inspect_olean(&path, max_bytes, json),
+        Ok(MultiplexerCommand::OleanDiff {
+            left,
+            right,
+            max_bytes,
+            json,
+        }) => diff_olean(&left, &right, max_bytes, json),
         Ok(MultiplexerCommand::OleanVerifyRebuild {
             path,
             max_bytes,
@@ -3150,12 +3747,13 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_INSPECT_SCHEMA,
-        OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA,
-        admission_error_disposition, check_olean_bytes, check_olean_module_bytes,
-        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
-        execution_error_disposition, inspect_olean_bytes, module_name_from_relative,
-        parse_source_run, read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
+        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_DIFF_SCHEMA,
+        OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES,
+        SOURCE_RUN_SCHEMA, admission_error_disposition, check_olean_bytes,
+        check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
+        execute_source_bytes_with_publisher, execution_error_disposition, inspect_olean_bytes,
+        module_name_from_relative, parse_source_run, read_bounded_from, run, source_failure,
+        verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -3163,6 +3761,8 @@ mod tests {
 
     const PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
+    const SECOND_PINNED_OLEAN: &[u8] =
+        include_bytes!("../../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
     const STRING_FLBC: &[u8] = b"FLNFLBC\0\x08\0\x0d\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
@@ -3380,6 +3980,148 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"outcome\":\"complete\""));
         assert!(robot.stdout.contains("\"decodedConstants\":2"));
+    }
+
+    #[test]
+    fn olean_diff_separates_byte_identity_from_decoded_semantic_changes() {
+        let identical = diff_olean_bytes(PINNED_OLEAN, PINNED_OLEAN, PINNED_OLEAN.len() * 2, true);
+        assert_eq!(identical.exit_code, 0, "{}", identical.stderr);
+        assert!(identical.stderr.is_empty());
+        assert!(
+            identical
+                .stdout
+                .contains(&format!("\"schema\":\"{OLEAN_DIFF_SCHEMA}\""))
+        );
+        assert!(identical.stdout.contains("\"authority\":false"));
+        assert!(identical.stdout.contains("\"byteIdentity\":true"));
+        assert!(identical.stdout.contains("\"semanticIdentity\":true"));
+        assert!(identical.stdout.contains("\"changes\":[]"));
+        assert!(identical.stdout.contains("\"omittedChanges\":0"));
+
+        let changed = diff_olean_bytes(
+            PINNED_OLEAN,
+            SECOND_PINNED_OLEAN,
+            PINNED_OLEAN.len() + SECOND_PINNED_OLEAN.len(),
+            true,
+        );
+        assert_eq!(changed.exit_code, 0, "{}", changed.stderr);
+        assert!(changed.stderr.is_empty());
+        assert!(changed.stdout.contains("\"byteIdentity\":false"));
+        assert!(changed.stdout.contains("\"semanticIdentity\":false"));
+        assert!(!changed.stdout.contains("\"changes\":[]"));
+
+        let human = diff_olean_bytes(
+            PINNED_OLEAN,
+            SECOND_PINNED_OLEAN,
+            PINNED_OLEAN.len() + SECOND_PINNED_OLEAN.len(),
+            false,
+        );
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(
+            human
+                .stdout
+                .contains("pinned .olean semantic diff: different")
+        );
+        assert!(human.stdout.contains("changes shown:"));
+
+        let wired = run([
+            OsString::from("olean"),
+            OsString::from("diff"),
+            OsString::from("--json"),
+            repository_path("tribunal/fixtures/c3/Init.BinderNameHint.olean").into_os_string(),
+            repository_path("tribunal/fixtures/c3/Init.SizeOfLemmas.olean").into_os_string(),
+        ]);
+        assert_eq!(wired.exit_code, 0, "{}", wired.stderr);
+        assert!(wired.stderr.is_empty());
+        assert!(wired.stdout.contains("\"schema\":\"fln.olean-diff/1\""));
+
+        let missing_side = run([
+            OsString::from("olean"),
+            OsString::from("diff"),
+            OsString::from("only-one.olean"),
+        ]);
+        assert_eq!(missing_side.exit_code, 2);
+        assert!(missing_side.stdout.is_empty());
+        assert!(
+            missing_side
+                .stderr
+                .contains("olean diff accepts exactly two input paths")
+        );
+    }
+
+    #[test]
+    fn olean_diff_preserves_side_and_resource_failures_as_non_authority() {
+        let mut corrupt = SECOND_PINNED_OLEAN.to_vec();
+        corrupt[0] ^= 0xff;
+        let malformed = diff_olean_bytes(
+            PINNED_OLEAN,
+            &corrupt,
+            PINNED_OLEAN.len() + corrupt.len(),
+            true,
+        );
+        assert_eq!(malformed.exit_code, 1);
+        assert!(malformed.stdout.is_empty());
+        assert!(malformed.stderr.contains("\"authority\":false"));
+        assert!(malformed.stderr.contains("\"class\":\"decode\""));
+        assert!(malformed.stderr.contains("right artifact"));
+
+        let exhausted = diff_olean_bytes(
+            PINNED_OLEAN,
+            SECOND_PINNED_OLEAN,
+            PINNED_OLEAN.len() + SECOND_PINNED_OLEAN.len() - 1,
+            true,
+        );
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"authority\":false"));
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+    }
+
+    #[test]
+    fn olean_diff_detects_same_name_changes_and_observable_constant_order() {
+        let left = fln::decode_olean_artifact(
+            PINNED_OLEAN,
+            fln::OleanDecodeLimits::new(PINNED_OLEAN.len()),
+        )
+        .expect("decode the real pinned diff fixture");
+        let mut changed = left.clone();
+        let first = changed.constants.first_mut();
+        assert!(
+            first.is_some(),
+            "the real diff fixture must remain nonempty"
+        );
+        let Some(first) = first else {
+            return;
+        };
+        assert!(
+            matches!(first, fln::ConstantInfo::Defn(_)),
+            "the real fixture's first row must remain a definition"
+        );
+        let fln::ConstantInfo::Defn(definition) = first else {
+            return;
+        };
+        definition.safety = fln::DefinitionSafety::Unsafe;
+        let summary = super::compare_decoded_oleans(PINNED_OLEAN, &left, PINNED_OLEAN, &changed)
+            .expect("compare the planted same-name semantic change");
+        assert!(summary.byte_identity);
+        assert!(!summary.semantic_identity());
+        assert_eq!(summary.modified_names, 1);
+        assert_eq!(summary.changes.len(), 1);
+        assert!(matches!(
+            summary.changes[0].change,
+            super::OleanDiffChange::Modified
+        ));
+
+        let mut reordered = left.clone();
+        reordered.constants.swap(0, 1);
+        let order_summary =
+            super::compare_decoded_oleans(PINNED_OLEAN, &left, PINNED_OLEAN, &reordered)
+                .expect("compare the planted constant-order change");
+        assert!(!order_summary.constant_sequence_identity);
+        assert!(!order_summary.semantic_identity());
+        assert!(order_summary.changes.is_empty());
+        assert_eq!(order_summary.unchanged_constants, left.constants.len());
     }
 
     #[test]
@@ -4240,6 +4982,7 @@ mod tests {
         assert_eq!(help.exit_code, 0);
         assert!(help.stdout.starts_with("Usage:\n  fln check-olean"));
         assert!(help.stdout.contains("\n  fln run"));
+        assert!(help.stdout.contains("fln olean diff"));
 
         let error = run([OsString::from("olean"), OsString::from("decode")]);
         assert_eq!(error.exit_code, 2);
