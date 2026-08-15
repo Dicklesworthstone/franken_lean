@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1237,7 +1237,12 @@ const _: () = assert!(
      configuration the matrix never compared"
 );
 const MAX_PINNED_OLEAN_BYTES: u64 = 512 * 1024 * 1024;
-const LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
+/// The closed Mathlib graph is more than three times the decoded size of the
+/// Reference-library corpus. Its live oracle exceeded the ordinary lane's
+/// five-minute ceiling at the pinned epoch, so the full-corpus lane owns a
+/// larger explicit bound instead of weakening every smaller probe.
+const WHOLE_MATHLIB_LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -1701,10 +1706,81 @@ fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
     selected
 }
 
+fn wait_for_child_with_timeout(
+    child: &mut Child,
+    started: Instant,
+    timeout: Duration,
+    process_name: &str,
+) -> Result<(ExitStatus, bool), String> {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll {process_name}: {error}"))?
+        {
+            return Ok((status, false));
+        }
+        if started.elapsed() >= timeout {
+            child
+                .kill()
+                .map_err(|error| format!("kill timed-out {process_name}: {error}"))?;
+            let status = child
+                .wait()
+                .map_err(|error| format!("reap timed-out {process_name}: {error}"))?;
+            return Ok((status, true));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const LEANCHECKER_TIMEOUT_PROBE_CHILD_ENV: &str = "_FLN_TEST_LEANCHECKER_TIMEOUT_CHILD";
+
+#[test]
+fn leanchecker_timeout_probe_child() {
+    if std::env::var_os(LEANCHECKER_TIMEOUT_PROBE_CHILD_ENV).is_none() {
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn leanchecker_timeout_kills_and_reaps_the_child() {
+    let executable = std::env::current_exe().expect("locate the current test binary");
+    let mut child = Command::new(executable)
+        .env_clear()
+        .env(LEANCHECKER_TIMEOUT_PROBE_CHILD_ENV, "1")
+        .arg("--exact")
+        .arg("leanchecker_timeout_probe_child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the non-answer timeout probe child");
+    let started = Instant::now();
+    let (status, timed_out) = wait_for_child_with_timeout(
+        &mut child,
+        started,
+        Duration::from_millis(40),
+        "timeout probe child",
+    )
+    .expect("kill and reap the timeout probe child");
+    assert!(timed_out, "the non-answer timeout path was not exercised");
+    assert!(
+        !status.success(),
+        "a killed oracle child cannot be acceptance"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the timeout probe did not remain promptly bounded"
+    );
+}
+
 fn run_leanchecker_with_search_roots(
     reference_lib: &Path,
     search_roots: &[&Path],
     targets: &[String],
+    timeout: Duration,
 ) -> Result<ReferenceCorpusVerdict, String> {
     let binary = leanchecker_path(reference_lib)?;
     let pinned_bin = binary
@@ -1741,25 +1817,8 @@ fn run_leanchecker_with_search_roots(
         .ok_or_else(|| "leanchecker stderr pipe missing".to_string())?;
     let stdout_reader = std::thread::spawn(move || read_capped(stdout, ORACLE_OUTPUT_LIMIT));
     let stderr_reader = std::thread::spawn(move || read_capped(stderr, ORACLE_OUTPUT_LIMIT));
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("poll leanchecker: {error}"))?
-        {
-            break status;
-        }
-        if started.elapsed() >= LEANCHECKER_TIMEOUT {
-            timed_out = true;
-            child
-                .kill()
-                .map_err(|error| format!("kill timed-out leanchecker: {error}"))?;
-            break child
-                .wait()
-                .map_err(|error| format!("reap timed-out leanchecker: {error}"))?;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let (status, timed_out) =
+        wait_for_child_with_timeout(&mut child, started, timeout, "leanchecker")?;
     let (stdout_bytes, stdout_truncated) = stdout_reader
         .join()
         .map_err(|_| "leanchecker stdout reader panicked".to_string())?
@@ -1773,10 +1832,7 @@ fn run_leanchecker_with_search_roots(
     let duration = started.elapsed();
     if timed_out {
         return Ok(ReferenceCorpusVerdict::NoAnswer {
-            reason: format!(
-                "leanchecker exceeded {} seconds",
-                LEANCHECKER_TIMEOUT.as_secs()
-            ),
+            reason: format!("leanchecker exceeded {} seconds", timeout.as_secs()),
             duration,
             stdout,
             stderr,
@@ -1956,8 +2012,13 @@ fn closure_free_v2_and_v3_modules_cross_load_with_the_pin_and_reject_bad_semanti
 
     let search_roots = [output_dir.as_path(), reference_lib.as_path()];
     for module in ["FlnWriterReferenceV2", "FlnWriterReferenceV3"] {
-        match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[module.to_owned()])
-            .expect("run pinned Reference over fresh good module")
+        match run_leanchecker_with_search_roots(
+            &reference_lib,
+            &search_roots,
+            &[module.to_owned()],
+            DEFAULT_LEANCHECKER_TIMEOUT,
+        )
+        .expect("run pinned Reference over fresh good module")
         {
             ReferenceCorpusVerdict::Accepted { stdout, stderr, .. } => {
                 assert!(stdout.contains(&format!("replaying {module}")));
@@ -1967,8 +2028,13 @@ fn closure_free_v2_and_v3_modules_cross_load_with_the_pin_and_reject_bad_semanti
         }
     }
     for module in ["FlnWriterReferenceV2Bad", "FlnWriterReferenceV3Bad"] {
-        match run_leanchecker_with_search_roots(&reference_lib, &search_roots, &[module.to_owned()])
-            .expect("run pinned Reference over fresh ill-typed module")
+        match run_leanchecker_with_search_roots(
+            &reference_lib,
+            &search_roots,
+            &[module.to_owned()],
+            DEFAULT_LEANCHECKER_TIMEOUT,
+        )
+        .expect("run pinned Reference over fresh ill-typed module")
         {
             ReferenceCorpusVerdict::Rejected { stderr, .. } => {
                 assert!(stderr.contains("(kernel) declaration type mismatch"));
@@ -2136,6 +2202,7 @@ fn reference_verdict_with_resume(
     reference_lib: &Path,
     search_roots: &[&Path],
     inventory: &CorpusInventory,
+    timeout: Duration,
 ) -> Result<(ReferenceCorpusVerdict, &'static str), String> {
     let oracle_hash = oracle_binary_hash(reference_lib)?;
     let checkpoint_dir = std::env::var_os("FLN_CORPUS_CHECKPOINT_DIR").map(PathBuf::from);
@@ -2168,7 +2235,8 @@ fn reference_verdict_with_resume(
     if targets.is_empty() {
         return Err("present-olean corpus produced no declaration-bearing targets".to_string());
     }
-    let verdict = run_leanchecker_with_search_roots(reference_lib, search_roots, &targets)?;
+    let verdict =
+        run_leanchecker_with_search_roots(reference_lib, search_roots, &targets, timeout)?;
     if matches!(verdict, ReferenceCorpusVerdict::Accepted { .. })
         && let Some(dir) = &checkpoint_dir
     {
@@ -3974,6 +4042,7 @@ fn whole_mathlib_kernel_differential() {
             module_floor: 10_000,
             decoded_floor: 700_000,
             compared_floor: mathlib_oracle_applicable,
+            oracle_timeout: WHOLE_MATHLIB_LEANCHECKER_TIMEOUT,
             label: "pinned-whole-mathlib",
         },
     );
@@ -4004,6 +4073,7 @@ fn pinned_present_olean_kernel_differential() {
             module_floor: PINNED_PRESENT_OLEAN_FLOOR,
             decoded_floor: PINNED_DECODED_DECL_FLOOR,
             compared_floor: PINNED_ORACLE_APPLICABLE_FLOOR,
+            oracle_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             label: "pinned-reference-library",
         },
     );
@@ -4013,6 +4083,7 @@ struct CorpusDifferentialScope {
     module_floor: u64,
     decoded_floor: u64,
     compared_floor: u64,
+    oracle_timeout: Duration,
     label: &'static str,
 }
 
@@ -4027,6 +4098,7 @@ fn run_accepted_corpus_kernel_differential(
         module_floor,
         decoded_floor,
         compared_floor,
+        oracle_timeout,
         label: corpus_label,
     } = scope;
     assert!(
@@ -4039,9 +4111,13 @@ fn run_accepted_corpus_kernel_differential(
         "{corpus_label} decoded-declaration coverage floor: {} < {decoded_floor}",
         inventory.decoded
     );
-    let (oracle, oracle_source) =
-        reference_verdict_with_resume(reference_lib, oracle_search_roots, &inventory)
-            .expect("run pinned leanchecker");
+    let (oracle, oracle_source) = reference_verdict_with_resume(
+        reference_lib,
+        oracle_search_roots,
+        &inventory,
+        oracle_timeout,
+    )
+    .expect("run pinned leanchecker");
     match oracle {
         ReferenceCorpusVerdict::Accepted {
             duration,
@@ -7545,6 +7621,7 @@ fn chosen_set_replays_and_witnesses() {
             &reference_lib,
             &search_roots,
             std::slice::from_ref(&report.module),
+            DEFAULT_LEANCHECKER_TIMEOUT,
         )
         .unwrap_or_else(|error| panic!("{}: sealed leanchecker failed: {error}", report.module));
         let accepted = matches!(verdict, ReferenceCorpusVerdict::Accepted { .. });
