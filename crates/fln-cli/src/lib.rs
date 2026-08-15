@@ -39,6 +39,7 @@ const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
 const OLEAN_DIFF_SCHEMA: &str = "fln.olean-diff/1";
 const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
+const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
 const SOURCE_RUN_SCHEMA: &str = "fln.source-run/6";
@@ -56,6 +57,7 @@ const USAGE: &str = concat!(
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
+    "  fln ilean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
@@ -67,6 +69,9 @@ const USAGE: &str = concat!(
     "`olean verify-rebuild` re-derives one pinned-format .olean from parsed\n",
     "semantics and requires byte identity with no codec findings. It is not\n",
     "fresh emission and does not kernel-check declarations.\n",
+    "`ilean inspect` budget-decodes one pinned-format .ilean and canonical-\n",
+    "reencodes it, reporting byte identity and bounded aggregate counts. It\n",
+    "does not resolve modules, read source, or establish LSP compatibility.\n",
     "`check-olean` checks every declaration in one import-free pinned-format\n",
     ".olean, or a directory containing a closed import set, through K1 and the\n",
     "independent checker, atomically. It derives dependency order but does not\n",
@@ -155,6 +160,11 @@ enum MultiplexerCommand {
         json: bool,
     },
     OleanVerifyRebuild {
+        path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+    },
+    IleanInspect {
         path: PathBuf,
         max_bytes: usize,
         json: bool,
@@ -613,6 +623,24 @@ fn parse_olean_verify_rebuild(arguments: Vec<OsString>) -> Result<MultiplexerCom
     })
 }
 
+fn parse_ilean_inspect(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
+    let Some((paths, max_bytes, json)) =
+        parse_path_options(arguments, "ilean inspect", OLEAN_INSPECT_DEFAULT_MAX_BYTES)?
+    else {
+        return Ok(MultiplexerCommand::Help);
+    };
+    let [path] = paths.as_slice() else {
+        return Err(UsageError(
+            "ilean inspect accepts exactly one input path".to_owned(),
+        ));
+    };
+    Ok(MultiplexerCommand::IleanInspect {
+        path: path.clone(),
+        max_bytes,
+        json,
+    })
+}
+
 fn parse_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<MultiplexerCommand, UsageError> {
@@ -644,6 +672,23 @@ fn parse_command(
         }
         return Err(UsageError(format!(
             "unknown flbc subcommand {:?}",
+            subcommand.to_string_lossy()
+        )));
+    }
+    if command == "ilean" {
+        let Some(subcommand) = arguments.next() else {
+            return Err(UsageError(
+                "ilean requires the `inspect` subcommand".to_owned(),
+            ));
+        };
+        if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+            return Ok(MultiplexerCommand::Help);
+        }
+        if subcommand == "inspect" {
+            return parse_ilean_inspect(arguments.collect());
+        }
+        return Err(UsageError(format!(
+            "unknown ilean subcommand {:?}",
             subcommand.to_string_lossy()
         )));
     }
@@ -1268,6 +1313,146 @@ fn inspect_olean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput
     match read_bounded(path, max_bytes, ".olean artifact") {
         Ok(bytes) => inspect_olean_bytes(&bytes, max_bytes, json),
         Err(error) => inspect_failure(OleanInspectFailure::Read(error), json),
+    }
+}
+
+#[derive(Debug)]
+enum IleanInspectFailure {
+    Read(BoundedReadFailure),
+    Codec {
+        phase: &'static str,
+        error: fln::IleanError,
+    },
+}
+
+impl IleanInspectFailure {
+    const fn class(&self) -> &'static str {
+        match self {
+            Self::Read(error) => error.class(),
+            Self::Codec {
+                error: fln::IleanError::Budget { .. },
+                ..
+            } => "resource",
+            Self::Codec { .. } => "codec",
+        }
+    }
+}
+
+impl fmt::Display for IleanInspectFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::Codec { phase, error } => write!(formatter, "{phase}: {error}"),
+        }
+    }
+}
+
+fn ilean_inspect_failure(error: IleanInspectFailure, json: bool) -> MultiplexerOutput {
+    let class = error.class();
+    let detail = BoundedText::new(error.to_string());
+    let stderr = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"error\",\"authority\":false,",
+                "\"class\":{},\"detail\":{},\"detailTruncated\":{}}}\n"
+            ),
+            json_string(ILEAN_INSPECT_SCHEMA),
+            json_string(class),
+            json_string(detail.text()),
+            detail.truncated(),
+        )
+    } else {
+        format!("fln ilean inspect: {class}: {}\n", detail.text())
+    };
+    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
+}
+
+fn inspect_ilean_bytes(bytes: &[u8], max_bytes: usize, json: bool) -> MultiplexerOutput {
+    let budget = fln::IleanBudget {
+        max_bytes,
+        ..fln::IleanBudget::default()
+    };
+    let decoded = match fln::decode_ilean(bytes, budget) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return ilean_inspect_failure(
+                IleanInspectFailure::Codec {
+                    phase: "decode",
+                    error,
+                },
+                json,
+            );
+        }
+    };
+    let canonical = match fln::encode_ilean(&decoded, budget) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return ilean_inspect_failure(
+                IleanInspectFailure::Codec {
+                    phase: "canonical re-encode",
+                    error,
+                },
+                json,
+            );
+        }
+    };
+    let module = BoundedText::new(decoded.module.clone());
+    let byte_identity = canonical == bytes;
+    let stdout = if json {
+        format!(
+            concat!(
+                "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":false,",
+                "\"bytes\":{},\"canonicalBytes\":{},\"byteIdentity\":{},",
+                "\"version\":{},\"module\":{},\"moduleTruncated\":{},",
+                "\"directImports\":{},\"references\":{},\"declarations\":{}}}\n"
+            ),
+            json_string(ILEAN_INSPECT_SCHEMA),
+            bytes.len(),
+            canonical.len(),
+            byte_identity,
+            decoded.version,
+            json_string(module.text()),
+            module.truncated(),
+            decoded.direct_imports.len(),
+            decoded.references.len(),
+            decoded.decls.len(),
+        )
+    } else {
+        format!(
+            concat!(
+                "pinned .ilean audit: complete\n",
+                "authority: no\n",
+                "bytes: {}\n",
+                "canonical bytes: {}\n",
+                "byte identity: {}\n",
+                "format version: {}\n",
+                "module: {}{}\n",
+                "direct imports: {}\n",
+                "references: {}\n",
+                "declarations: {}\n"
+            ),
+            bytes.len(),
+            canonical.len(),
+            if byte_identity { "exact" } else { "different" },
+            decoded.version,
+            module.text(),
+            if module.truncated() {
+                " [truncated]"
+            } else {
+                ""
+            },
+            decoded.direct_imports.len(),
+            decoded.references.len(),
+            decoded.decls.len(),
+        )
+    };
+    MultiplexerOutput::success(stdout)
+}
+
+fn inspect_ilean(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
+    match read_bounded(path, max_bytes, ".ilean artifact") {
+        Ok(bytes) => inspect_ilean_bytes(&bytes, max_bytes, json),
+        Err(error) => ilean_inspect_failure(IleanInspectFailure::Read(error), json),
     }
 }
 
@@ -3311,6 +3496,11 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             max_bytes,
             json,
         }) => verify_olean_rebuild(&path, max_bytes, json),
+        Ok(MultiplexerCommand::IleanInspect {
+            path,
+            max_bytes,
+            json,
+        }) => inspect_ilean(&path, max_bytes, json),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
     }
 }
@@ -3747,13 +3937,13 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, NamedOleanBytes, OLEAN_DIFF_SCHEMA,
-        OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA, SOURCE_RUN_KERNEL_STACK_BYTES,
-        SOURCE_RUN_SCHEMA, admission_error_disposition, check_olean_bytes,
-        check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
-        execute_source_bytes_with_publisher, execution_error_disposition, inspect_olean_bytes,
-        module_name_from_relative, parse_source_run, read_bounded_from, run, source_failure,
-        verify_olean_rebuild_bytes,
+        CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, NamedOleanBytes,
+        OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
+        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, admission_error_disposition,
+        check_olean_bytes, check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes,
+        execute_source_bytes, execute_source_bytes_with_publisher, execution_error_disposition,
+        inspect_ilean_bytes, inspect_olean_bytes, module_name_from_relative, parse_source_run,
+        read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -3763,6 +3953,7 @@ mod tests {
         include_bytes!("../../../tribunal/fixtures/c3/Init.BinderNameHint.olean");
     const SECOND_PINNED_OLEAN: &[u8] =
         include_bytes!("../../../tribunal/fixtures/c3/Init.SizeOfLemmas.olean");
+    const PINNED_ILEAN_HEX: &str = include_str!("../../fln-olean/tests/corpus/ilean_probe.hex");
     const STRING_FLBC: &[u8] = b"FLNFLBC\0\x08\0\x0d\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\x02\0\0\0\x01\0\0\x02\0\0\0hi\x0d\0\0";
 
     fn repository_path(relative: &str) -> PathBuf {
@@ -3772,6 +3963,30 @@ mod tests {
             .find(|candidate| candidate.join("crates/fln-cli/Cargo.toml").is_file())
             .expect("the test is invoked from inside the FrankenLean workspace");
         root.join(relative)
+    }
+
+    fn pinned_ilean_bytes() -> Vec<u8> {
+        let hex = PINNED_ILEAN_HEX.trim().as_bytes();
+        let (pairs, remainder) = hex.as_chunks::<2>();
+        assert!(
+            remainder.is_empty(),
+            "the pinned .ilean hex has whole bytes"
+        );
+        pairs
+            .iter()
+            .map(|pair| {
+                let nibble = |byte| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => u8::MAX,
+                };
+                let high = nibble(pair[0]);
+                let low = nibble(pair[1]);
+                assert!(high < 16 && low < 16, "the pinned .ilean fixture is hex");
+                (high << 4) | low
+            })
+            .collect()
     }
 
     fn scalar_flbc_fixture(value: u64) -> Vec<u8> {
@@ -3980,6 +4195,89 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"outcome\":\"complete\""));
         assert!(robot.stdout.contains("\"decodedConstants\":2"));
+    }
+
+    #[test]
+    fn ilean_inspect_reaches_the_pinned_codec_and_separates_canonical_bytes() {
+        let bytes = pinned_ilean_bytes();
+        let robot = inspect_ilean_bytes(&bytes, bytes.len(), true);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(
+            robot
+                .stdout
+                .contains(&format!("\"schema\":\"{ILEAN_INSPECT_SCHEMA}\""))
+        );
+        assert!(robot.stdout.contains("\"authority\":false"));
+        assert!(robot.stdout.contains("\"byteIdentity\":true"));
+        assert!(robot.stdout.contains("\"version\":5"));
+        assert!(robot.stdout.contains("\"module\":\"IleanProbe\""));
+        assert!(robot.stdout.contains("\"directImports\":0"));
+        assert!(robot.stdout.contains("\"references\":2"));
+        assert!(robot.stdout.contains("\"declarations\":1"));
+
+        let human = inspect_ilean_bytes(&bytes, bytes.len(), false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(human.stdout.contains("pinned .ilean audit: complete"));
+        assert!(human.stdout.contains("byte identity: exact"));
+
+        let mut noncanonical = b" \n".to_vec();
+        noncanonical.extend_from_slice(&bytes);
+        let semantic_only = inspect_ilean_bytes(&noncanonical, noncanonical.len(), true);
+        assert_eq!(semantic_only.exit_code, 0, "{}", semantic_only.stderr);
+        assert!(semantic_only.stdout.contains("\"byteIdentity\":false"));
+        assert!(
+            semantic_only
+                .stdout
+                .contains(&format!("\"canonicalBytes\":{}", bytes.len()))
+        );
+    }
+
+    #[test]
+    fn ilean_inspect_preserves_codec_and_budget_failures_as_non_authority() {
+        let bytes = pinned_ilean_bytes();
+        let mut corrupt = bytes.clone();
+        corrupt[0] = b'!';
+        let malformed = inspect_ilean_bytes(&corrupt, corrupt.len(), true);
+        assert_eq!(malformed.exit_code, 1);
+        assert!(malformed.stdout.is_empty());
+        assert!(malformed.stderr.contains("\"authority\":false"));
+        assert!(malformed.stderr.contains("\"class\":\"codec\""));
+        assert!(malformed.stderr.contains("decode:"));
+
+        let exhausted = inspect_ilean_bytes(&bytes, bytes.len() - 1, true);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.contains("\"authority\":false"));
+        assert!(exhausted.stderr.contains("\"class\":\"resource\""));
+
+        let wired = run([
+            OsString::from("ilean"),
+            OsString::from("inspect"),
+            OsString::from("--json"),
+            repository_path("crates/fln-olean/tests/corpus/ilean_probe.hex").into_os_string(),
+        ]);
+        assert_eq!(wired.exit_code, 1);
+        assert!(wired.stderr.contains("\"schema\":\"fln.ilean-inspect/1\""));
+        assert!(wired.stderr.contains("\"class\":\"codec\""));
+
+        let missing = run([OsString::from("ilean"), OsString::from("inspect")]);
+        assert_eq!(missing.exit_code, 2);
+        assert!(missing.stderr.contains("ilean inspect requires PATH"));
+
+        let extra = run([
+            OsString::from("ilean"),
+            OsString::from("inspect"),
+            OsString::from("one.ilean"),
+            OsString::from("two.ilean"),
+        ]);
+        assert_eq!(extra.exit_code, 2);
+        assert!(
+            extra
+                .stderr
+                .contains("ilean inspect accepts exactly one input path")
+        );
     }
 
     #[test]
@@ -4983,6 +5281,7 @@ mod tests {
         assert!(help.stdout.starts_with("Usage:\n  fln check-olean"));
         assert!(help.stdout.contains("\n  fln run"));
         assert!(help.stdout.contains("fln olean diff"));
+        assert!(help.stdout.contains("fln ilean inspect"));
 
         let error = run([OsString::from("olean"), OsString::from("decode")]);
         assert_eq!(error.exit_code, 2);

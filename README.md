@@ -301,6 +301,12 @@ changed names, with explicit omission counts), and `--max-bytes` bounds the two
 inputs together. These commands do not resolve imports, kernel-check declarations,
 read `olean-next`, or establish corpus-wide codec compatibility.
 
+`fln ilean inspect` exposes the existing pinned `.ilean` codec through the same
+bounded CLI posture: it decodes the compact JSON, canonical-reencodes it, and
+reports byte identity plus aggregate import/reference/declaration counts. It does
+not resolve imported modules, read Lean source, or by itself establish LSP wire
+compatibility.
+
 ## Quick start
 
 ```bash
