@@ -74,8 +74,9 @@ const USAGE: &str = concat!(
     "does not resolve modules, read source, or establish LSP compatibility.\n",
     "`check-olean` checks every declaration in one import-free pinned-format\n",
     ".olean, or a directory containing a closed import set, through K1 and the\n",
-    "independent checker, atomically. It derives dependency order but does not\n",
-    "reconstruct inductive/quotient or mutual units, interpret extensions, run\n",
+    "independent checker, atomically. It reconstructs non-safe mutual definition\n",
+    "blocks and derives dependency order, but does not reconstruct inductive/\n",
+    "quotient or other mutual units, interpret extensions, run\n",
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
@@ -4013,12 +4014,36 @@ mod tests {
         }
     }
 
+    fn encode_checkable_olean(constants: &[fln::ConstantInfo]) -> Vec<u8> {
+        let lean_version = fln::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the pin tag starts with v");
+        fln::encode_olean_module(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants,
+                extra_const_names: &[],
+            },
+            fln::OleanWriteHeader {
+                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version,
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr: (fln::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            fln::OleanWriteBudget::default(),
+        )
+        .expect("the CLI check fixture encodes")
+        .bytes
+    }
+
     fn checkable_olean_fixture() -> Vec<u8> {
         let proposition = fln::Name::from_components(["CliFixture", "P"]);
         let witness = fln::Name::from_components(["CliFixture", "p"]);
         let theorem = fln::Name::from_components(["CliFixture", "t"]);
         let proposition_expr = fln::Expr::const_(proposition.clone(), Vec::new());
-        let constants = vec![
+        encode_checkable_olean(&[
             fln::ConstantInfo::Thm(fln::TheoremVal {
                 base: fln::ConstantVal {
                     name: theorem,
@@ -4044,28 +4069,46 @@ mod tests {
                 },
                 is_unsafe: false,
             }),
-        ];
-        let lean_version = fln::OLEAN_PIN_TAG
-            .strip_prefix('v')
-            .expect("the pin tag starts with v");
-        fln::encode_olean_module(
-            fln::OleanModuleWriteInput {
-                is_module: false,
-                imports: &[],
-                constants: &constants,
-                extra_const_names: &[],
-            },
-            fln::OleanWriteHeader {
-                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
-                flags: 1,
-                lean_version,
-                githash: fln::OLEAN_PIN_COMMIT,
-                base_addr: (fln::OLEAN_REGION_ALIGN as u64) * 2,
-            },
-            fln::OleanWriteBudget::default(),
-        )
-        .expect("the CLI check fixture encodes")
-        .bytes
+        ])
+    }
+
+    fn mutual_checkable_olean_fixture() -> Vec<u8> {
+        let base = fln::Name::from_components(["CliFixture", "mutualBase"]);
+        let left = fln::Name::from_components(["CliFixture", "mutualLeft"]);
+        let right = fln::Name::from_components(["CliFixture", "mutualRight"]);
+        let members = vec![left.clone(), right.clone()];
+        encode_checkable_olean(&[
+            fln::ConstantInfo::Defn(fln::DefinitionVal {
+                base: fln::ConstantVal {
+                    name: right.clone(),
+                    level_params: Vec::new(),
+                    type_: fln::Expr::const_(base.clone(), Vec::new()),
+                },
+                value: fln::Expr::const_(left.clone(), Vec::new()),
+                hints: fln::ReducibilityHints::Regular(1),
+                safety: fln::DefinitionSafety::Partial,
+                all: members.clone(),
+            }),
+            fln::ConstantInfo::Defn(fln::DefinitionVal {
+                base: fln::ConstantVal {
+                    name: left,
+                    level_params: Vec::new(),
+                    type_: fln::Expr::const_(base.clone(), Vec::new()),
+                },
+                value: fln::Expr::const_(right, Vec::new()),
+                hints: fln::ReducibilityHints::Regular(1),
+                safety: fln::DefinitionSafety::Partial,
+                all: members,
+            }),
+            fln::ConstantInfo::Axiom(fln::AxiomVal {
+                base: fln::ConstantVal {
+                    name: base,
+                    level_params: Vec::new(),
+                    type_: fln::Expr::sort(fln::Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+        ])
     }
 
     fn empty_olean_fixture(imports: &[fln::OleanModuleImport]) -> Vec<u8> {
@@ -4466,6 +4509,24 @@ mod tests {
         assert!(malformed.stdout.is_empty());
         assert!(malformed.stderr.contains("\"class\":\"decode\""));
         assert!(malformed.stderr.contains("bad magic"));
+    }
+
+    #[test]
+    fn check_olean_cli_reaches_reconstructed_non_safe_mutual_units() {
+        let artifact = mutual_checkable_olean_fixture();
+        let robot = check_olean_bytes(artifact.clone(), artifact.len(), true);
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(robot.stdout.contains("\"authority\":true"));
+        assert!(robot.stdout.contains("\"declarationsChecked\":3"));
+        assert!(robot.stdout.contains("\"dependencyOrderDerived\":true"));
+        assert!(robot.stdout.contains("\"g1Satisfied\":false"));
+
+        let human = check_olean_bytes(artifact.clone(), artifact.len(), false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(human.stdout.contains("declarations checked: 3"));
+        assert!(human.stdout.contains("authority: K1 + independent checker"));
     }
 
     #[test]

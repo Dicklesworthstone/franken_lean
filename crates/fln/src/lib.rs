@@ -800,11 +800,12 @@ pub struct CheckedOleanSet {
 
 /// Typed non-success from the `.olean` declaration-checking doors.
 ///
-/// This first production slice intentionally refuses imports, complete
-/// inductive/quotient units, and mutual declaration envelopes. Those are not
-/// silently inserted as trusted context. Environment extensions are decoded
-/// and counted by [`DecodedOlean`] but are not interpreted by this
-/// declaration-only operation.
+/// This production slice handles closed import sets and reconstructs complete
+/// non-safe mutual definition envelopes as one authority transition. Complete
+/// inductive/quotient units and other mutual envelope kinds remain explicit
+/// refusals rather than silently entering trusted context. Environment
+/// extensions are decoded and counted by [`DecodedOlean`] but are not
+/// interpreted by this declaration-only operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OleanCheckError {
     Decode(OleanDecodeError),
@@ -1050,6 +1051,126 @@ fn checked_olean_declaration(info: &ConstantInfo) -> Result<Declaration, OleanCh
     }
 }
 
+#[derive(Debug, Clone)]
+struct OleanDeclarationUnit {
+    constant_indices: Vec<usize>,
+    names: Vec<Name>,
+    declaration: Declaration,
+}
+
+#[derive(Debug)]
+struct OleanDeclarationPlan {
+    units: Vec<OleanDeclarationUnit>,
+    order: Vec<usize>,
+}
+
+fn unsupported_mutual_envelope(value: &DefinitionVal) -> OleanCheckError {
+    OleanCheckError::MutualEnvelopeUnsupported {
+        name: value.base.name.clone(),
+        members: value.all.clone(),
+    }
+}
+
+fn build_olean_declaration_units(
+    constants: &[ConstantInfo],
+    owners: &BTreeMap<Name, usize>,
+) -> Result<(Vec<OleanDeclarationUnit>, Vec<usize>), OleanCheckError> {
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(constants.len())
+        .map_err(|_| OleanCheckError::AllocationFailure {
+            resource: ".olean declaration units",
+            requested: constants.len(),
+        })?;
+    let mut constant_units = vec![usize::MAX; constants.len()];
+
+    for (index, info) in constants.iter().enumerate() {
+        if constant_units[index] != usize::MAX {
+            continue;
+        }
+        let ConstantInfo::Defn(definition) = info else {
+            let declaration = checked_olean_declaration(info)?;
+            let unit = units.len();
+            constant_units[index] = unit;
+            units.push(OleanDeclarationUnit {
+                constant_indices: vec![index],
+                names: vec![info.name().clone()],
+                declaration,
+            });
+            continue;
+        };
+        if definition.all.len() <= 1 {
+            let declaration = checked_olean_declaration(info)?;
+            let unit = units.len();
+            constant_units[index] = unit;
+            units.push(OleanDeclarationUnit {
+                constant_indices: vec![index],
+                names: vec![info.name().clone()],
+                declaration,
+            });
+            continue;
+        }
+        if definition.safety == DefinitionSafety::Safe {
+            return Err(unsupported_mutual_envelope(definition));
+        }
+
+        let mut member_indices = Vec::new();
+        member_indices
+            .try_reserve_exact(definition.all.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean mutual member indices",
+                requested: definition.all.len(),
+            })?;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(definition.all.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean mutual definitions",
+                requested: definition.all.len(),
+            })?;
+        let mut unique = BTreeSet::new();
+        for name in &definition.all {
+            if !unique.insert(name.clone()) {
+                return Err(unsupported_mutual_envelope(definition));
+            }
+            let Some(&member_index) = owners.get(name) else {
+                return Err(unsupported_mutual_envelope(definition));
+            };
+            if constant_units[member_index] != usize::MAX {
+                return Err(unsupported_mutual_envelope(definition));
+            }
+            let Some(ConstantInfo::Defn(member)) = constants.get(member_index) else {
+                return Err(unsupported_mutual_envelope(definition));
+            };
+            if member.safety == DefinitionSafety::Safe || member.all != definition.all {
+                return Err(unsupported_mutual_envelope(definition));
+            }
+            member_indices.push(member_index);
+            members.push(member.clone());
+        }
+        if !unique.contains(&definition.base.name) {
+            return Err(unsupported_mutual_envelope(definition));
+        }
+
+        let unit = units.len();
+        for member_index in &member_indices {
+            constant_units[*member_index] = unit;
+        }
+        units.push(OleanDeclarationUnit {
+            constant_indices: member_indices,
+            names: definition.all.clone(),
+            declaration: Declaration::Mutual(members),
+        });
+    }
+
+    if constant_units.contains(&usize::MAX) {
+        return Err(OleanCheckError::InternalInvariant {
+            detail: "a decoded declaration was not assigned to an authority unit",
+        });
+    }
+    Ok((units, constant_units))
+}
+
 fn collect_olean_dependencies(
     expression: &Expr,
     names: &mut BTreeSet<Name>,
@@ -1163,7 +1284,7 @@ fn plan_olean_declarations(
     base: &Environment,
     constants: &[ConstantInfo],
     limits: OleanCheckLimits,
-) -> Result<Vec<usize>, OleanCheckError> {
+) -> Result<OleanDeclarationPlan, OleanCheckError> {
     if constants.len() > limits.max_declarations {
         return Err(OleanCheckError::DeclarationLimit {
             observed: constants.len(),
@@ -1172,7 +1293,6 @@ fn plan_olean_declarations(
     }
     let mut owners = BTreeMap::new();
     for (index, info) in constants.iter().enumerate() {
-        checked_olean_declaration(info)?;
         if owners.insert(info.name().clone(), index).is_some() {
             return Err(OleanCheckError::DuplicateDeclaration {
                 name: info.name().clone(),
@@ -1180,53 +1300,77 @@ fn plan_olean_declarations(
         }
     }
 
-    let mut remaining = vec![0_usize; constants.len()];
-    let mut dependents = vec![Vec::new(); constants.len()];
+    let (units, constant_units) = build_olean_declaration_units(constants, &owners)?;
+
+    let mut remaining = vec![0_usize; units.len()];
+    let mut dependents = vec![Vec::new(); units.len()];
     let mut presentations = 0_usize;
-    for (index, info) in constants.iter().enumerate() {
-        let mut missing = Vec::new();
-        for dependency in olean_dependencies(
-            info,
-            &mut presentations,
-            limits.max_dependency_presentations,
-        )? {
-            match owners.get(&dependency).copied() {
-                Some(owner) if owner != index => {
-                    remaining[index] = remaining[index].saturating_add(1);
-                    dependents[owner].push(index);
+    for (unit_index, unit) in units.iter().enumerate() {
+        let mut missing = BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
+        for constant_index in &unit.constant_indices {
+            let Some(info) = constants.get(*constant_index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "authority unit names a declaration outside the decoded table",
+                });
+            };
+            for dependency in olean_dependencies(
+                info,
+                &mut presentations,
+                limits.max_dependency_presentations,
+            )? {
+                match owners.get(&dependency).copied() {
+                    Some(owner) => {
+                        let Some(&dependency_unit) = constant_units.get(owner) else {
+                            return Err(OleanCheckError::InternalInvariant {
+                                detail: "declaration owner has no authority unit",
+                            });
+                        };
+                        if dependency_unit != unit_index {
+                            dependencies.insert(dependency_unit);
+                        }
+                    }
+                    None if base.find(&dependency).is_some() => {}
+                    None => {
+                        missing.insert(dependency);
+                    }
                 }
-                Some(_) => {}
-                None if base.find(&dependency).is_some() => {}
-                None => missing.push(dependency),
             }
         }
         if !missing.is_empty() {
             return Err(OleanCheckError::MissingConstants {
-                declaration: info.name().clone(),
-                names: missing,
+                declaration: unit.names[0].clone(),
+                names: missing.into_iter().collect(),
             });
+        }
+        remaining[unit_index] = dependencies.len();
+        for dependency in dependencies {
+            dependents[dependency].push(unit_index);
         }
     }
 
-    let mut ready: BTreeSet<Name> = constants
+    let mut ready: BTreeSet<(Name, usize)> = units
         .iter()
         .enumerate()
         .filter(|(index, _)| remaining[*index] == 0)
-        .map(|(_, info)| info.name().clone())
+        .map(|(index, unit)| {
+            let key = unit
+                .names
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or_else(Name::anonymous);
+            (key, index)
+        })
         .collect();
     let mut order = Vec::new();
     order
-        .try_reserve_exact(constants.len())
+        .try_reserve_exact(units.len())
         .map_err(|_| OleanCheckError::AllocationFailure {
             resource: ".olean declaration order",
-            requested: constants.len(),
+            requested: units.len(),
         })?;
-    while let Some(name) = ready.pop_first() {
-        let Some(&index) = owners.get(&name) else {
-            return Err(OleanCheckError::InternalInvariant {
-                detail: "ready declaration has no owner",
-            });
-        };
+    while let Some((_, index)) = ready.pop_first() {
         order.push(index);
         let Some(next) = dependents.get(index) else {
             return Err(OleanCheckError::InternalInvariant {
@@ -1245,25 +1389,31 @@ fn plan_olean_declarations(
                     detail: "declaration dependency count underflowed",
                 })?;
             if *count == 0 {
-                let Some(constant) = constants.get(*dependent) else {
+                let Some(unit) = units.get(*dependent) else {
                     return Err(OleanCheckError::InternalInvariant {
                         detail: "ready dependent is outside the constant table",
                     });
                 };
-                ready.insert(constant.name().clone());
+                let key = unit
+                    .names
+                    .iter()
+                    .min()
+                    .cloned()
+                    .unwrap_or_else(Name::anonymous);
+                ready.insert((key, *dependent));
             }
         }
     }
-    if order.len() != constants.len() {
-        let declarations = constants
+    if order.len() != units.len() {
+        let declarations = units
             .iter()
             .enumerate()
             .filter(|(index, _)| remaining[*index] != 0)
-            .map(|(_, info)| info.name().clone())
+            .flat_map(|(_, unit)| unit.names.iter().cloned())
             .collect();
         return Err(OleanCheckError::DependencyCycle { declarations });
     }
-    Ok(order)
+    Ok(OleanDeclarationPlan { units, order })
 }
 
 /// Caller-supplied bounds for one proof-producing bitvector decision and its
@@ -1576,9 +1726,10 @@ impl Engine {
     /// pinned-format `.olean`.
     ///
     /// The declaration array is not trusted to be dependency-ordered. This
-    /// method derives a stable Kahn order from exact constant references, then
-    /// sends every declaration through the same K1-plus-independent-checker
-    /// council as [`Self::admit_declaration`]. The artifact must be import-free:
+    /// method reconstructs validated non-safe mutual definition units, derives
+    /// a stable Kahn order from exact inter-unit constant references, then sends
+    /// every unit through the same K1-plus-independent-checker council as
+    /// [`Self::admit_declaration`]. The artifact must be import-free:
     /// resolving module names to exact predecessor environments belongs to the
     /// module loader, and treating unresolved imports as axioms would violate
     /// the Oracle-Only and single-authority laws.
@@ -1883,9 +2034,9 @@ impl Engine {
         options: &KVMap,
         limits: OleanCheckLimits,
     ) -> Result<Outcome<CheckedOlean>, OleanCheckError> {
-        let order = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
+        let plan = plan_olean_declarations(&self.environment, &decoded.constants, limits)?;
         let base_logical_root = self.logical_root(options);
-        if order.is_empty() {
+        if plan.order.is_empty() {
             return Ok(Outcome::Complete(CheckedOlean {
                 engine: self.clone(),
                 decoded,
@@ -1896,19 +2047,19 @@ impl Engine {
         }
 
         let mut declarations = Vec::new();
-        declarations.try_reserve_exact(order.len()).map_err(|_| {
-            OleanCheckError::AllocationFailure {
+        declarations
+            .try_reserve_exact(plan.order.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
                 resource: ".olean declaration batch",
-                requested: order.len(),
-            }
-        })?;
-        for index in &order {
-            let Some(info) = decoded.constants.get(*index) else {
+                requested: plan.order.len(),
+            })?;
+        for index in &plan.order {
+            let Some(unit) = plan.units.get(*index) else {
                 return Err(OleanCheckError::InternalInvariant {
-                    detail: "planned declaration is outside the decoded constant table",
+                    detail: "planned declaration unit is outside the unit table",
                 });
             };
-            declarations.push(checked_olean_declaration(info)?);
+            declarations.push(unit.declaration.clone());
         }
         let admitted = match self
             .admit_declarations(&declarations, options, limits.admission)
@@ -1918,27 +2069,34 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let mut checked = Vec::new();
-        checked
-            .try_reserve_exact(admitted.admissions.len())
-            .map_err(|_| OleanCheckError::AllocationFailure {
-                resource: ".olean completed declaration records",
-                requested: admitted.admissions.len(),
-            })?;
-        for (constant_index, admission) in order.iter().zip(&admitted.admissions) {
-            let Some(info) = decoded.constants.get(*constant_index) else {
-                return Err(OleanCheckError::InternalInvariant {
-                    detail: "completed declaration is outside the decoded constant table",
-                });
-            };
-            checked.push(OleanCheckedDeclaration {
-                name: info.name().clone(),
-                checker: admission.checker,
+        if admitted.admissions.len() != plan.order.len() {
+            return Err(OleanCheckError::InternalInvariant {
+                detail: "admission result count differs from the authority-unit plan",
             });
         }
-        if checked.len() != order.len() {
+        let mut checked = Vec::new();
+        checked
+            .try_reserve_exact(decoded.constants.len())
+            .map_err(|_| OleanCheckError::AllocationFailure {
+                resource: ".olean completed declaration records",
+                requested: decoded.constants.len(),
+            })?;
+        for (unit_index, admission) in plan.order.iter().zip(&admitted.admissions) {
+            let Some(unit) = plan.units.get(*unit_index) else {
+                return Err(OleanCheckError::InternalInvariant {
+                    detail: "completed declaration unit is outside the unit table",
+                });
+            };
+            for name in &unit.names {
+                checked.push(OleanCheckedDeclaration {
+                    name: name.clone(),
+                    checker: admission.checker,
+                });
+            }
+        }
+        if checked.len() != decoded.constants.len() {
             return Err(OleanCheckError::InternalInvariant {
-                detail: "admission result count differs from the declaration plan",
+                detail: "checked declaration count differs from the decoded declaration table",
             });
         }
         Ok(Outcome::Complete(CheckedOlean {
@@ -4202,6 +4360,45 @@ mod tests {
         ]
     }
 
+    fn mutual_olean_declarations() -> Vec<ConstantInfo> {
+        let base = Name::from_components(["Fixture", "mutualBase"]);
+        let left = Name::from_components(["Fixture", "mutualLeft"]);
+        let right = Name::from_components(["Fixture", "mutualRight"]);
+        let members = vec![left.clone(), right.clone()];
+        vec![
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: right.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::const_(base.clone(), Vec::new()),
+                },
+                value: Expr::const_(left.clone(), Vec::new()),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Partial,
+                all: members.clone(),
+            }),
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: left.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::const_(base.clone(), Vec::new()),
+                },
+                value: Expr::const_(right, Vec::new()),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Partial,
+                all: members,
+            }),
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: base,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+        ]
+    }
+
     fn heartbeat_program(new_count: u64, check_system: bool) -> ValidatedProgram {
         let mut code = vec![
             Instruction::Nat {
@@ -4431,6 +4628,176 @@ mod tests {
         assert!(checked.declarations.iter().all(|declaration| {
             declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
         }));
+    }
+
+    #[test]
+    fn standalone_olean_check_reconstructs_non_safe_mutual_definition_units() {
+        let constants = mutual_olean_declarations();
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let outcome = engine
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("the complete non-safe mutual envelope reaches both checkers");
+        let Outcome::Complete(checked) = outcome else {
+            panic!("the mutual fixture must complete: {outcome:?}");
+        };
+
+        let names: Vec<String> = checked
+            .declarations
+            .iter()
+            .map(|declaration| declaration.name.to_display_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Fixture.mutualBase",
+                "Fixture.mutualLeft",
+                "Fixture.mutualRight"
+            ]
+        );
+        assert_eq!(checked.engine.environment().len(), 3);
+        assert_eq!(checked.decoded.constants, constants);
+        assert_eq!(
+            checked.declarations[0].checker.ground,
+            CheckerAdmissionGround::AxiomPreamble
+        );
+        assert_eq!(
+            checked.declarations[2].checker, checked.declarations[1].checker,
+            "one mutual authority transition reports its agreement on every member"
+        );
+        assert_eq!(
+            checked.declarations[1].checker.ground,
+            CheckerAdmissionGround::PartialQuarantine
+        );
+    }
+
+    #[test]
+    fn standalone_olean_check_refuses_malformed_or_rejected_mutual_units_atomically() {
+        let engine = Engine::from_environment(Environment::new());
+        let limits_for = |bytes: &[u8]| OleanCheckLimits::new(bytes.len(), test_budget());
+
+        let mut mismatched = mutual_olean_declarations();
+        let ConstantInfo::Defn(right) = &mut mismatched[0] else {
+            panic!("the fixture's first row is the right mutual definition")
+        };
+        right.all.reverse();
+        let bytes = standalone_olean(&mismatched);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::MutualEnvelopeUnsupported { ref name, .. })
+                if name == &Name::from_components(["Fixture", "mutualRight"])
+        ));
+
+        let mut missing = mutual_olean_declarations();
+        missing.remove(1);
+        let bytes = standalone_olean(&missing);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::MutualEnvelopeUnsupported { .. })
+        ));
+
+        let mut mixed = mutual_olean_declarations();
+        let left = Name::from_components(["Fixture", "mutualLeft"]);
+        mixed[1] = ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: left,
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::zero()),
+            },
+            is_unsafe: false,
+        });
+        let bytes = standalone_olean(&mixed);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::MutualEnvelopeUnsupported { .. })
+        ));
+
+        let mut duplicate = mutual_olean_declarations();
+        let ConstantInfo::Defn(right) = &mut duplicate[0] else {
+            panic!("the fixture's first row is the right mutual definition")
+        };
+        right.all[1] = right.all[0].clone();
+        let bytes = standalone_olean(&duplicate);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::MutualEnvelopeUnsupported { .. })
+        ));
+
+        let mut safe = mutual_olean_declarations();
+        for info in &mut safe[..2] {
+            let ConstantInfo::Defn(definition) = info else {
+                panic!("the first two fixture rows are mutual definitions")
+            };
+            definition.safety = DefinitionSafety::Safe;
+        }
+        let bytes = standalone_olean(&safe);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::MutualEnvelopeUnsupported { .. })
+        ));
+
+        let bounded = mutual_olean_declarations();
+        let bytes = standalone_olean(&bounded);
+        let mut limits = limits_for(&bytes);
+        limits.max_dependency_presentations = 0;
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits),
+            Err(OleanCheckError::DependencyPresentationLimit {
+                observed: 1,
+                limit: 0
+            })
+        ));
+
+        let cycle_left = Name::from_components(["Fixture", "cycleLeft"]);
+        let cycle_right = Name::from_components(["Fixture", "cycleRight"]);
+        let unbound_cycle = [
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: cycle_left.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                value: Expr::const_(cycle_right.clone(), Vec::new()),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Partial,
+                all: vec![cycle_left.clone()],
+            }),
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: cycle_right.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                value: Expr::const_(cycle_left.clone(), Vec::new()),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Partial,
+                all: vec![cycle_right.clone()],
+            }),
+        ];
+        let bytes = standalone_olean(&unbound_cycle);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::DependencyCycle { declarations })
+                if declarations == vec![cycle_left, cycle_right]
+        ));
+
+        let mut rejected = mutual_olean_declarations();
+        let ConstantInfo::Defn(right) = &mut rejected[0] else {
+            panic!("the fixture's first row is the right mutual definition")
+        };
+        right.value = Expr::sort(Level::zero());
+        let bytes = standalone_olean(&rejected);
+        assert!(matches!(
+            engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
+            Err(OleanCheckError::Admission(
+                EngineAdmissionError::BatchDeclaration { index: 1, .. }
+            ))
+        ));
+        assert!(engine.environment().is_empty());
     }
 
     #[test]
