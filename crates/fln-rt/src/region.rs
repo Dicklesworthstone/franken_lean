@@ -880,6 +880,14 @@ pub fn materialize(buf: &[u8], base: u64) -> RResult<Obj> {
             Obj::mk_ref(children.pop().expect("one fixed slot"))
         } else if h.tag == abi::TAG_TASK {
             Obj::mk_task_pure(children.pop().expect("one fixed slot"))
+        } else if h.tag == abi::TAG_PROMISE {
+            let child = children.pop().expect("one fixed slot");
+            if child.obj_tag() != usize::from(abi::TAG_TASK) {
+                return Err(RegionFault::BuildShape {
+                    reason: "promise result is not a task",
+                });
+            }
+            Obj::mk_promise(child)
         } else if h.tag == abi::TAG_MPZ {
             // `walk_step` proved alloc/size coherence and the inline
             // extent. It does not see `base`, so the limb POINTER is
@@ -982,6 +990,13 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
             let Some(child) = o.finished_task_value() else {
                 return Err(RegionFault::BuildShape {
                     reason: "task is not finished",
+                });
+            };
+            children.push(child);
+        } else if tag == abi::TAG_PROMISE {
+            let Some(child) = o.try_promise_result() else {
+                return Err(RegionFault::BuildShape {
+                    reason: "promise result is missing",
                 });
             };
             children.push(child);
@@ -1123,6 +1138,14 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     out.extend_from_slice(&word_of(&child, &memo).to_le_bytes());
                     // m_imp is not a region pointer; a finished task has none.
                     out.extend_from_slice(&0u64.to_le_bytes());
+                } else if h.tag == abi::TAG_PROMISE {
+                    let Some(child) = o.try_promise_result() else {
+                        return Err(RegionFault::BuildShape {
+                            reason: "promise result is missing",
+                        });
+                    };
+                    emit_header(&mut out, PROMISE_SIZE, h.tag, 0);
+                    out.extend_from_slice(&word_of(&child, &memo).to_le_bytes());
                 } else if h.tag == abi::TAG_MPZ {
                     let Some((_, mp_size, limbs)) = o.try_mpz_view() else {
                         return Err(RegionFault::MpzIntegrity {

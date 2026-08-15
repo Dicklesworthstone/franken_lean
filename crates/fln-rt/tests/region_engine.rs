@@ -30,6 +30,7 @@ fn sample_graph() -> Obj {
     let cell = Obj::mk_ref(shared.clone_ref());
     let delayed = Obj::mk_thunk_value(Obj::mk_nat(7));
     let done = Obj::mk_task_pure(shared.clone_ref());
+    let promised = Obj::mk_promise(done.clone_ref());
     Obj::mk_array(vec![
         pair,
         shared,
@@ -38,6 +39,7 @@ fn sample_graph() -> Obj {
         cell,
         delayed,
         done,
+        promised,
         Obj::mk_nat(0),
     ])
 }
@@ -352,6 +354,28 @@ fn compact_emits_evaluated_thunk_ref_and_finished_task() {
             })
         ),
         "an unevaluated thunk stays a typed refusal"
+    );
+}
+
+/// Walk already accepted TAG_PROMISE. Materialize and compact refused
+/// the whole category, so a live IO.Promise could never re-enter a region.
+#[test]
+fn compact_emits_a_promise_whose_result_is_a_finished_task() {
+    let _g = lock();
+    let promised = Obj::mk_promise(Obj::mk_task_pure(Obj::mk_nat(4)));
+    let bytes = compact(&promised, BASE_A).expect("compact a live promise");
+    let rebuilt = materialize(&bytes, BASE_A).expect("materialize the emitted promise");
+    let task = rebuilt
+        .try_promise_result()
+        .expect("materialized object is a promise");
+    let value = task
+        .finished_task_value()
+        .expect("the result is a finished task");
+    assert_eq!(value.unbox(), 4);
+    assert_eq!(
+        compact(&rebuilt, BASE_A).expect("recompact promise"),
+        bytes,
+        "compact ∘ materialize is the identity on a promise"
     );
 }
 
