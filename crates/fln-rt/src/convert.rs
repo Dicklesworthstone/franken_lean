@@ -209,7 +209,8 @@ fn ctor_field(obj: &Obj, i: usize, family: &'static str) -> Result<Obj, ConvertE
             format!("constructor has {} fields, needed field {i}", header.other),
         ));
     }
-    Ok(obj.ctor_child(i))
+    obj.try_ctor_child(i)
+        .ok_or_else(|| malformed(family, "constructor slot is past the allocated object"))
 }
 
 /// `ctor_scalar_u64` asserts the offset is inside the scalar area. A missing

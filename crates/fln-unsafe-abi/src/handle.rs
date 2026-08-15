@@ -343,6 +343,28 @@ impl Obj {
         unsafe { rc::object_byte_size(self.0) }
     }
 
+    /// Fallible ctor child.
+    ///
+    /// Returns `None` when the handle is not a ctor, `i` is past `m_other`,
+    /// or slot `i` sits past the allocated object (`m_cs_sz`). Product
+    /// paths that accept untrusted objects must use this; [`ctor_child`]
+    /// still asserts the header count. Inflating `m_cs_sz` with `m_other`
+    /// remains outside this check (same residual as [`try_array_view`]).
+    pub fn try_ctor_child(&self, i: usize) -> Option<Obj> {
+        if self.is_scalar() {
+            return None;
+        }
+        let h = self.header();
+        if h.tag > TAG_MAX_CTOR_TAG || i >= usize::from(h.other) {
+            return None;
+        }
+        let slot_end = 8usize.checked_add(8usize.checked_mul(i.checked_add(1)?)?)?;
+        if slot_end > self.byte_size() {
+            return None;
+        }
+        Some(self.ctor_child(i))
+    }
+
     /// Borrow a ctor child as a fresh owned reference.
     pub fn ctor_child(&self, i: usize) -> Obj {
         let h = self.header();
@@ -355,6 +377,24 @@ impl Obj {
                 rc::inc_ref_n(c, 1);
             }
             Obj(c)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plant_ctor_other(&self, other: u8) {
+        assert!(!self.is_scalar() && self.header().tag <= TAG_MAX_CTOR_TAG);
+        // SAFETY: tag is a ctor; test-only header vandalism.
+        unsafe {
+            (*self.0).m_other = other;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_ctor_other(&self, other: u8) {
+        assert!(!self.is_scalar() && self.header().tag <= TAG_MAX_CTOR_TAG);
+        // SAFETY: tag is a ctor; restores the planted header so Drop frees.
+        unsafe {
+            (*self.0).m_other = other;
         }
     }
 

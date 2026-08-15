@@ -694,6 +694,37 @@ fn try_array_view_refuses_hostile_headers() {
 }
 
 #[test]
+fn try_ctor_child_refuses_slots_past_the_allocation() {
+    let _g = lock();
+    let well = Obj::mk_ctor(1, vec![Obj::mk_nat(1), Obj::mk_nat(2)], &[]);
+    assert!(well.try_ctor_child(0).is_some());
+    assert!(well.try_ctor_child(1).is_some());
+    assert!(
+        well.try_ctor_child(2).is_none(),
+        "a well-formed two-slot ctor has no third child"
+    );
+    assert!(
+        Obj::mk_nat(3).try_ctor_child(0).is_none(),
+        "a scalar is not a ctor"
+    );
+    assert!(
+        Obj::mk_string("n").try_ctor_child(0).is_none(),
+        "a string is not a ctor"
+    );
+
+    well.plant_ctor_other(10);
+    assert!(
+        well.try_ctor_child(0).is_some(),
+        "slots inside the minted object stay readable"
+    );
+    assert!(
+        well.try_ctor_child(2).is_none(),
+        "an inflated m_other must not index past the allocation"
+    );
+    well.restore_ctor_other(2);
+}
+
+#[test]
 fn external_finalizer_runs_exactly_once() {
     let _g = lock();
     let before = EXTERNAL_FINALIZED.load(Ordering::SeqCst);

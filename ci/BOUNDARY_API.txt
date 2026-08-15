@@ -61,6 +61,7 @@ row FLN-BX-0034 | crates/fln-unsafe-abi/src/handle.rs | fn header | (&self) -> H
 row FLN-BX-0035 | crates/fln-unsafe-abi/src/handle.rs | fn obj_tag | (&self) -> usize | C4 tag facts | value copy
 row FLN-BX-0036 | crates/fln-unsafe-abi/src/handle.rs | fn byte_size | (&self) -> usize | byte-size assertions | value copy
 row FLN-BX-0037 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_child | (&self, usize) -> Obj | ctor suites | inc-before-escape; returns owned handle
+row FLN-BX-0085 | crates/fln-unsafe-abi/src/handle.rs | fn try_ctor_child | (&self, usize) -> Option<Obj> | try_ctor_child_refuses_slots_past_the_allocation | owned handle or None; no raw pointer or kernel type escapes
 row FLN-BX-0038 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_retag | (&self, u8) | ctor_retag_and_scalar_write | ctor-range asserted
 row FLN-BX-0039 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_set_u64 | (&self, usize, u64) | ctor_retag_and_scalar_write | scalar-area write, offset law asserted
 row FLN-BX-0040 | crates/fln-unsafe-abi/src/handle.rs | fn ctor_scalar_u64 | (&self, usize) -> u64 | ctor scalar suites; C4 scalar facts | value copy

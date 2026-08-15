@@ -935,7 +935,12 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
         let mut children: Vec<Obj> = Vec::new();
         if tag <= abi::TAG_MAX_CTOR_TAG {
             for i in 0..usize::from(o.header().other) {
-                children.push(o.ctor_child(i));
+                let Some(child) = o.try_ctor_child(i) else {
+                    return Err(RegionFault::BuildShape {
+                        reason: "ctor slot is past the allocated object",
+                    });
+                };
+                children.push(child);
             }
         } else if tag == abi::TAG_ARRAY {
             let Some((n, _)) = o.try_array_view() else {
