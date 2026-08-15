@@ -3284,10 +3284,64 @@ pub(crate) fn scratch_admit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fln_env::constants::ConstantVal;
+    use fln_env::constants::{AxiomVal, ConstantVal};
 
     fn n(s: &str) -> Name {
         Name::str(Name::anonymous(), s)
+    }
+
+    #[test]
+    fn scratch_admission_publishes_once_and_rejects_a_duplicate_atomically() {
+        let name = n("ScratchAxiom");
+        let info = ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::one()),
+            },
+            is_unsafe: false,
+        });
+        let empty = Environment::new();
+        let published = scratch_admit(&empty, info.clone(), &name)
+            .expect("an already-checked fresh axiom must enter the scratch environment");
+        assert!(!empty.contains(&name), "scratch admission mutated its base");
+        assert!(
+            published.contains(&name),
+            "scratch admission did not publish the fresh declaration"
+        );
+
+        let duplicate = scratch_admit(&published, info, &name);
+        assert!(
+            matches!(
+                duplicate,
+                Err(Stop::Reject(RejectClass::AlreadyDeclared, _))
+            ),
+            "duplicate scratch admission was not a typed rejection: {duplicate:?}"
+        );
+        if let Err(Stop::Reject(RejectClass::AlreadyDeclared, detail)) = duplicate {
+            assert!(detail.contains("ScratchAxiom"));
+        }
+        assert!(
+            published.contains(&name),
+            "duplicate refusal changed the retained environment"
+        );
+    }
+
+    #[test]
+    fn scratch_admission_fault_maps_to_a_nonanswer_not_a_verdict() {
+        let outcome = crate::stop_to_outcome(
+            Stop::Fault("planted scratch admission fault".to_owned()),
+            Consumption::default(),
+            Budget::DEFAULT,
+        );
+        assert!(
+            matches!(outcome, Outcome::InternalFault(_)),
+            "scratch admission fault became a domain verdict: {outcome:?}"
+        );
+        if let Outcome::InternalFault(fault) = outcome {
+            assert_eq!(fault.invariant, "kernel scratch admission");
+            assert_eq!(fault.detail.text(), "planted scratch admission fault");
+        }
     }
 
     #[test]

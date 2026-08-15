@@ -333,6 +333,23 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          is decoded by our reader; no coverage row may cite the ignored function as a CI run",
     ),
     (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "exact_module_driver_replays_one_real_pinned_module",
+        "not per-commit evidence — an operator-run smoke probe for the exact-module Reference \
+         driver. Its non-ignored sibling exact_module_completion_join_refuses_missing_duplicate_\
+         and_unexpected_rows binds the completion parser, while the live process invocation \
+         remains an explicitly bounded observation and no coverage row may cite it as a CI run",
+    ),
+    (
+        "crates/fln-conformance/tests/kernel_replay.rs",
+        "whole_mathlib_kernel_differential",
+        "not per-commit evidence — the exact closed 10,000-module-scale differential is an \
+         operator-run bounded observation whose oracle and native replay costs are hours. Its \
+         output must retain the exact source and corpus pins before it can support even that \
+         bounded claim; no coverage row may cite the ignored function as a CI run or promote one \
+         observation to an invariant",
+    ),
+    (
         "crates/fln-conformance/tests/mutation_kill_ledger_model.rs",
         "the_module_apply_mutants_are_killed_for_their_recipe_bound_reasons",
         "its per-commit sibling `module_apply_receipts_are_canonical_current_complete_and_\
@@ -398,7 +415,13 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// retained, previously absent output directory and therefore cannot run in the
 /// ordinary per-commit suite. The declaration keeps that scope honest; it does not
 /// manufacture a replacement gate or a compatibility claim.
-const IGNORED_PRODUCER_CEILING: usize = 11;
+///
+/// 11 -> 13 for the exact-module smoke probe and the whole-Mathlib differential,
+/// both deliberately on demand. The former is a live Reference-process check; the
+/// latter is an hours-scale bounded corpus observation. Declaring them prevents an
+/// ignored run from masquerading as per-commit evidence without inventing a ceremony
+/// that cannot provide equivalent coverage.
+const IGNORED_PRODUCER_CEILING: usize = 13;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
