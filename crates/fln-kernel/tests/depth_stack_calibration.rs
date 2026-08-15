@@ -62,13 +62,16 @@ enum Shape {
     /// Converted: KR-311 now compares a right-nested argument pair on a heap
     /// stack. Kept so the former abort pairing can prove it answers typed.
     DefEqApp,
-    /// `whnf_core` down a projection nest (KR-204): each scrutinee is itself
-    /// a projection, so cheap-proj defeq still re-enters per layer.
+    /// Converted: `whnf_core` peels a `.1.1.1` nest on the heap. Kept so the
+    /// former abort pairing can prove it answers typed. Not a residual
+    /// native-stack shape.
     DefEqProj,
 }
 
 impl Shape {
-    const ALL: [Shape; 1] = [Shape::DefEqProj];
+    /// No residual native-stack descent remains. Converted shapes stay in
+    /// the enum so former abort pairings can prove they now answer typed.
+    const ALL: [Shape; 0] = [];
 
     fn as_str(self) -> &'static str {
         match self {
@@ -407,6 +410,14 @@ const CALIBRATION_SEARCH_CAP: u32 = 32_768;
 #[test]
 #[ignore = "calibration: spawns hundreds of subprocesses; run explicitly"]
 fn calibrate_stack_bytes_per_depth() {
+    if Shape::ALL.is_empty() {
+        println!("no residual native-stack shapes");
+        println!(
+            "SHIPPED Budget::MEASURED_STACK_BYTES_PER_DEPTH = {}",
+            Budget::MEASURED_STACK_BYTES_PER_DEPTH
+        );
+        return;
+    }
     let mut worst = 0f64;
     let mut worst_shape = None;
     println!(
@@ -558,8 +569,25 @@ fn undersized_stack_still_aborts_and_the_derived_budget_prevents_it() {
     const RUST_DEFAULT_SPAWNED_STACK: usize = 2 * 1024 * 1024;
     assert!(
         Budget::DEFAULT.depth > Budget::depth_for_stack_bytes(RUST_DEFAULT_SPAWNED_STACK),
-        "this witness is only meaningful while DEFAULT assumes more stack than 2 MiB"
+        "DEFAULT still assumes more stack than 2 MiB; that pairing is only a \
+         stack-overflow witness while a residual native-stack shape remains"
     );
+    if Shape::ALL.is_empty() {
+        let outcome = run_probe(
+            Shape::WITNESS,
+            RUST_DEFAULT_SPAWNED_STACK,
+            Budget::DEFAULT.depth,
+        );
+        assert!(
+            matches!(
+                outcome,
+                ProbeOutcome::DepthExhausted | ProbeOutcome::SurvivedOther(_)
+            ),
+            "no residual native-stack shape remains; the former witness must now \
+             answer typed on the pairing that used to abort. got {outcome:?}"
+        );
+        return;
+    }
     let shape = Shape::WITNESS;
 
     let uncalibrated = run_probe(shape, RUST_DEFAULT_SPAWNED_STACK, Budget::DEFAULT.depth);
@@ -635,6 +663,26 @@ fn former_defeq_app_abort_pairing_now_answers_typed() {
     );
 }
 
+/// The former DefEqProj abort pairing must now answer typed. If this starts
+/// dying again, the WHNF projection peel has regressed onto the native stack.
+#[test]
+fn former_defeq_proj_abort_pairing_now_answers_typed() {
+    const RUST_DEFAULT_SPAWNED_STACK: usize = 2 * 1024 * 1024;
+    let outcome = run_probe(
+        Shape::DefEqProj,
+        RUST_DEFAULT_SPAWNED_STACK,
+        Budget::DEFAULT.depth,
+    );
+    assert!(
+        matches!(
+            outcome,
+            ProbeOutcome::DepthExhausted | ProbeOutcome::SurvivedOther(_)
+        ),
+        "projection-nest WHNF is a heap walk; Budget::DEFAULT on a 2 MiB stack \
+         must answer typed, not abort. got {outcome:?}"
+    );
+}
+
 impl Shape {
     /// The shape used by the reproduction witness and by the tripwire's planted
     /// violations: the WORST per-level descent in
@@ -644,11 +692,10 @@ impl Shape {
     /// Re-measured after the explicit telescope/worklist conversion:
     /// matching binder-defeq (KR-302), right-nested application infer
     /// (KR-106), projection-nest infer (KR-112), and right-nested app
-    /// congruence (KR-311) are heap walks, so they no longer belong in a
-    /// native-stack witness. Retaining a converted shape would make
-    /// "survived without reaching the ceiling" look like a calibration
-    /// failure. `DefEqProj` is the residual worst case (`whnf_core` still
-    /// recurses on a projection scrutinee).
+    /// congruence (KR-311), and projection-nest WHNF (KR-204) are heap
+    /// walks, so they no longer belong in a native-stack witness. There is
+    /// no residual shape; `WITNESS` names the last converted one so the
+    /// former abort pairing can prove it now answers typed.
     const WITNESS: Shape = Shape::DefEqProj;
 }
 
@@ -834,7 +881,7 @@ fn calibration_refusals(
         }
     }
 
-    if observations.iter().all(|o| o.below_low_bound) {
+    if !observations.is_empty() && observations.iter().all(|o| o.below_low_bound) {
         refusals.push(format!(
             "every shape survived its low-bound probe (depths {:?}), so the WORST per-level \
              cost is more than {:.0}% BELOW the claimed {claimed_bytes_per_depth} bytes/depth. \
@@ -880,6 +927,9 @@ fn the_shipped_calibration_still_describes_the_descent() {
 /// defect.
 #[test]
 fn a_calibration_that_understates_the_cost_is_refused() {
+    if Shape::ALL.is_empty() {
+        return;
+    }
     let claim = Budget::MEASURED_STACK_BYTES_PER_DEPTH / 2;
     let refusals = calibration_refusals(claim, Budget::STACK_ENTRY_RESERVE_BYTES);
     assert!(
@@ -895,6 +945,9 @@ fn a_calibration_that_understates_the_cost_is_refused() {
 /// typed non-answers that erode a consensus seat.
 #[test]
 fn a_calibration_that_overstates_the_cost_is_refused() {
+    if Shape::ALL.is_empty() {
+        return;
+    }
     let claim = Budget::MEASURED_STACK_BYTES_PER_DEPTH * 3;
     let refusals = calibration_refusals(claim, Budget::STACK_ENTRY_RESERVE_BYTES);
     assert!(
@@ -909,6 +962,9 @@ fn a_calibration_that_overstates_the_cost_is_refused() {
 /// the intercept that moved while the slope held exactly.
 #[test]
 fn an_entry_reserve_below_the_fixed_cost_is_refused() {
+    if Shape::ALL.is_empty() {
+        return;
+    }
     let refusals = calibration_refusals(Budget::MEASURED_STACK_BYTES_PER_DEPTH, 8 * 1024);
     assert!(
         refusals.iter().any(|r| r.contains("entry reserve")),

@@ -2259,15 +2259,17 @@ impl<'a> TypeChecker<'a> {
         {
             return Ok(cached);
         }
-        // Peel mdata / zeta / let-bound fvars on the heap. The seed elaborator
-        // can now emit a 400-deep let spine; recursing one frame per zeta
-        // would abort the check that found it (FL-INV-07). App/proj tail
-        // reductions continue the same loop.
+        // Peel mdata / zeta / let-bound fvars / projection nests on the heap.
+        // Convert can inject a 400-deep `.1.1.1` nest; one native frame per
+        // KR-204 used to abort the check that found it (FL-INV-07). Cheap-proj
+        // defeq peels the same way so `a.i =?= b.i` no longer re-enters.
         let mut current = e.clone();
         let mut depth = depth;
+        let mut pending_projs: Vec<(Name, u64)> = Vec::new();
         let result = loop {
             if !cheap_proj
                 && current != *e
+                && pending_projs.is_empty()
                 && let Some(cached) =
                     self.whnf_core_cache
                         .get(&current, &self.locals, &self.local_positions)
@@ -2287,7 +2289,14 @@ impl<'a> TypeChecker<'a> {
                         depth += 1;
                         self.step(depth)?;
                     }
-                    None => break current.clone(),
+                    None => match self.finish_pending_projs(
+                        current.clone(),
+                        &mut pending_projs,
+                        &mut depth,
+                    )? {
+                        PendingProj::Done(value) => break value,
+                        PendingProj::Continue(field) => current = field,
+                    },
                 },
                 ExprNode::LetE { value, body, .. } => {
                     // KR-203 zeta.
@@ -2332,7 +2341,14 @@ impl<'a> TypeChecker<'a> {
                                 depth += 1;
                                 self.step(depth)?;
                             }
-                            None => break current.clone(),
+                            None => match self.finish_pending_projs(
+                                current.clone(),
+                                &mut pending_projs,
+                                &mut depth,
+                            )? {
+                                PendingProj::Done(value) => break value,
+                                PendingProj::Continue(field) => current = field,
+                            },
                         }
                     } else {
                         // The head changed (let-fvar zeta, mdata strip): rebuild and
@@ -2351,37 +2367,37 @@ impl<'a> TypeChecker<'a> {
                     idx,
                     expr,
                 } => {
-                    // KR-204: projection of a constructor application.
+                    // KR-204: peel the nest, then reduce from the inside out.
                     let struct_name = struct_name.clone();
                     let idx = *idx;
-                    let scrutinee = if cheap_proj {
-                        self.whnf_core_mode(expr, depth + 1, true)?
-                    } else {
-                        self.whnf(&expr.clone(), depth + 1)?
-                    };
-                    // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a
-                    // String-literal scrutinee expands to its constructor spine
-                    // (whnf'd so `String.ofList` unfolds to the real constructor)
-                    // before field extraction.
-                    let scrutinee = if let ExprNode::Lit {
-                        literal: Literal::Str(value),
-                    } = scrutinee.node()
+                    let expr = expr.clone();
+                    pending_projs.push((struct_name, idx));
+                    current = expr;
+                    depth += 1;
+                    self.step(depth)?;
+                    // Pin: the non-cheap path fully WHNFs the scrutinee
+                    // (including delta) before the first `reduce_proj`.
+                    if !cheap_proj
+                        && !matches!(
+                            current.node(),
+                            ExprNode::Proj { .. } | ExprNode::MData { .. }
+                        )
                     {
-                        let expanded = string_lit_to_constructor(value);
-                        self.whnf(&expanded, depth + 1)?
-                    } else {
-                        scrutinee
-                    };
-                    match self.reduce_proj(&struct_name, idx, &scrutinee) {
-                        Some(field) => {
-                            current = field;
-                            depth += 1;
-                            self.step(depth)?;
+                        current = self.whnf(&current, depth + 1)?;
+                        match self.finish_pending_projs(current, &mut pending_projs, &mut depth)? {
+                            PendingProj::Done(value) => break value,
+                            PendingProj::Continue(field) => current = field,
                         }
-                        None => break Expr::proj(struct_name, idx, scrutinee),
                     }
                 }
-                _ => break current.clone(),
+                _ => match self.finish_pending_projs(
+                    current.clone(),
+                    &mut pending_projs,
+                    &mut depth,
+                )? {
+                    PendingProj::Done(value) => break value,
+                    PendingProj::Continue(field) => current = field,
+                },
             }
         };
         // The explicit recursor continuation may retry an outer application
@@ -2403,6 +2419,47 @@ impl<'a> TypeChecker<'a> {
             );
         }
         Ok(result)
+    }
+
+    /// Apply the innermost pending projection to a WHNF scrutinee. A successful
+    /// field extraction continues the core loop on that field; a miss wraps
+    /// every remaining pending layer as a stuck projection.
+    fn finish_pending_projs(
+        &mut self,
+        value: Expr,
+        pending: &mut Vec<(Name, u64)>,
+        depth: &mut u32,
+    ) -> KResult<PendingProj> {
+        let Some((struct_name, idx)) = pending.pop() else {
+            return Ok(PendingProj::Done(value));
+        };
+        // KR-314 (pin reduce_proj_core, type_checker.cpp:358): a String-literal
+        // scrutinee expands to its constructor spine (whnf'd so
+        // `String.ofList` unfolds to the real constructor) before field
+        // extraction.
+        let scrutinee = if let ExprNode::Lit {
+            literal: Literal::Str(s),
+        } = value.node()
+        {
+            let expanded = string_lit_to_constructor(s);
+            self.whnf(&expanded, *depth + 1)?
+        } else {
+            value
+        };
+        match self.reduce_proj(&struct_name, idx, &scrutinee) {
+            Some(field) => {
+                *depth = depth.saturating_add(1);
+                self.step(*depth)?;
+                Ok(PendingProj::Continue(field))
+            }
+            None => {
+                let mut result = Expr::proj(struct_name, idx, scrutinee);
+                while let Some((struct_name, idx)) = pending.pop() {
+                    result = Expr::proj(struct_name, idx, result);
+                }
+                Ok(PendingProj::Done(result))
+            }
+        }
     }
 
     /// KR-204's constructor recognition: `proj I idx (mk params fields)`.
@@ -5583,6 +5640,12 @@ enum AppStack {
     Next { left: Expr, right: Expr, depth: u32 },
 }
 
+/// Outcome of applying one pending KR-204 projection to a WHNF scrutinee.
+enum PendingProj {
+    Done(Expr),
+    Continue(Expr),
+}
+
 /// One left-spine being typed by the checking-mode KR-106 heap stack.
 struct CheckedAppFrame {
     args: Vec<Expr>,
@@ -6292,6 +6355,36 @@ mod tests {
         assert!(
             result == one,
             "zeta of unused lets around a literal is the literal"
+        );
+    }
+
+    #[test]
+    fn whnf_peels_a_deep_proj_nest_without_stack_fault() {
+        // Cheap-proj defeq used to re-enter `whnf_core_mode` once per `.1`.
+        // Convert can inject a 400-deep nest; that abort is FL-INV-07.
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let a = Expr::sort(Level::zero());
+        let structure = Name::str(Name::anonymous(), "S");
+        let mut term = a.clone();
+        for _ in 0..400 {
+            term = Expr::proj(structure.clone(), 0, term);
+        }
+        let reduced = tc
+            .whnf_public(&term, 0)
+            .expect("a 400-deep projection nest must not stack-fault");
+        let mut expected = a;
+        for _ in 0..400 {
+            expected = Expr::proj(structure.clone(), 0, expected);
+        }
+        assert!(
+            reduced == expected,
+            "a stuck projection nest must WHNF to itself, got {}",
+            brief_public(&reduced)
+        );
+        assert!(
+            tc.consumption().max_depth <= Budget::DEFAULT.depth,
+            "projection nests must consume loop steps, not native-stack depth"
         );
     }
 
