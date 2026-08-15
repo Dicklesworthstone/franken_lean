@@ -209,6 +209,37 @@ fn a_string_whose_m_length_drifted_from_the_payload_is_refused() {
     );
 }
 
+/// A scalar-array whose `m_other` (element size) is 0 used to pass the
+/// walk and then panic in `Obj::mk_sarray` on materialize (FL-INV-07).
+#[test]
+fn a_sarray_with_zero_element_size_is_a_typed_fault_not_a_panic() {
+    let _g = lock();
+    // [root word][sarray]: root points at the object at offset 8 so
+    // materialize actually builds it instead of taking the scalar-root door.
+    let mut buf = vec![0u8; 32];
+    buf[0..8].copy_from_slice(&(BASE_A + 8).to_le_bytes());
+    buf[12..14].copy_from_slice(&1u16.to_le_bytes()); // big-path cs_sz sentinel
+    buf[14] = 0; // hostile element size
+    buf[15] = fln_rt::abi::TAG_SCALAR_ARRAY;
+    assert_eq!(
+        fln_rt::region::audit(&buf, BASE_A),
+        Err(RegionFault::BadObjectSize { offset: 8, size: 0 }),
+        "audit must refuse a zero element size"
+    );
+    assert_eq!(
+        relocate(&mut buf.clone(), BASE_A, BASE_B),
+        Err(RegionFault::BadObjectSize { offset: 8, size: 0 }),
+        "relocate shares walk_step with audit"
+    );
+    assert!(
+        matches!(
+            materialize(&buf, BASE_A),
+            Err(RegionFault::BadObjectSize { offset: 8, size: 0 })
+        ),
+        "materialize must not reach mk_sarray's elem_size assert"
+    );
+}
+
 #[test]
 fn envelope_laws() {
     let _g = lock();

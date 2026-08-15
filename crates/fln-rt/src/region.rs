@@ -487,6 +487,12 @@ fn walk_step(buf: &[u8], offset: usize) -> RResult<WalkStep> {
         size
     } else if h.tag == abi::TAG_SCALAR_ARRAY {
         need(buf, offset, SARRAY_FIXED)?;
+        // `m_other` is the element size. Zero is not a Lean sarray: the
+        // materializer would hit `Obj::mk_sarray`'s `elem_size > 0` assert
+        // (FL-INV-07). Refuse here so audit/relocate/materialize agree.
+        if h.other == 0 {
+            return Err(RegionFault::BadObjectSize { offset, size: 0 });
+        }
         let n =
             usize::try_from(read_u64(buf, offset + 8)).map_err(|_| RegionFault::BadObjectSize {
                 offset,
