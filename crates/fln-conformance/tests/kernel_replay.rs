@@ -1238,14 +1238,16 @@ const _: () = assert!(
 );
 const MAX_PINNED_OLEAN_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
-/// Leanchecker expands every prefix, launches one task per matching module,
-/// and only then joins the tasks. The absent `Mathlib` namespace root used to
-/// expand to all 8,264 modules at once: the pinned process exceeded 30 minutes
-/// and peaked above 150 GiB RSS. Partition only that large oracle scope into
-/// deterministic children while retaining a finite deadline for every child
-/// and for the plan as a whole.
+/// Stock leanchecker expands every prefix, launches one task per matching
+/// module, and only then joins the tasks. The absent `Mathlib` namespace root
+/// used to expand to all 8,264 modules at once: the pinned process exceeded 30
+/// minutes and peaked above 150 GiB RSS. Even a 139-module AlgebraicGeometry
+/// prefix peaked at 186 GiB. The whole-corpus lane therefore gives an exact
+/// module list to the Tribunal driver, which runs eight replay tasks at a time,
+/// while these outer batches retain bounded deadlines and durable resume
+/// points. The 256 is a checkpoint/process interval, not the concurrency.
 const WHOLE_MATHLIB_ORACLE_MODULES_PER_PROCESS: usize = 256;
-const WHOLE_MATHLIB_ORACLE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const WHOLE_MATHLIB_ORACLE_PROCESS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WHOLE_MATHLIB_ORACLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -1719,67 +1721,38 @@ fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
     leanchecker_targets_for_required(inventory, &required_modules)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeancheckerBatchMode {
+    Prefix,
+    Exact,
+}
+
+impl LeancheckerBatchMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeancheckerBatch {
     targets: Vec<String>,
     matched_modules: usize,
+    mode: LeancheckerBatchMode,
 }
 
-fn matching_inventory_modules(inventory: &CorpusInventory, prefix: &str) -> usize {
-    inventory
-        .modules
-        .keys()
-        .filter(|module| component_prefix(prefix, module))
-        .count()
-}
-
-fn partition_leanchecker_prefix(
-    inventory: &CorpusInventory,
-    required_modules: &[&str],
-    prefix: String,
-    max_modules: usize,
-    partitions: &mut Vec<(String, usize)>,
-) -> Result<(), String> {
-    let matching_required = required_modules
-        .iter()
-        .copied()
-        .filter(|module| component_prefix(&prefix, module))
-        .collect::<Vec<_>>();
-    if matching_required.is_empty() {
-        return Err(format!(
-            "leanchecker partition {prefix} covers no declaration-bearing module"
-        ));
+impl LeancheckerBatch {
+    fn covers_module(&self, module: &str) -> bool {
+        match self.mode {
+            LeancheckerBatchMode::Prefix => self
+                .targets
+                .iter()
+                .any(|target| component_prefix(target, module)),
+            LeancheckerBatchMode::Exact => self.targets.iter().any(|target| target == module),
+        }
     }
-    let matching_all = matching_inventory_modules(inventory, &prefix);
-    let exact_is_required = matching_required.contains(&prefix.as_str());
-    if matching_all <= max_modules || exact_is_required {
-        partitions.push((prefix, matching_all));
-        return Ok(());
-    }
-
-    let depth = prefix.split('.').count();
-    let children = matching_required
-        .iter()
-        .filter_map(|module| {
-            let components = module.split('.').collect::<Vec<_>>();
-            (components.len() > depth).then(|| components[..=depth].join("."))
-        })
-        .collect::<BTreeSet<_>>();
-    if children.is_empty() {
-        return Err(format!(
-            "leanchecker partition {prefix} exceeds {max_modules} modules but has no child prefix"
-        ));
-    }
-    for child in children {
-        partition_leanchecker_prefix(
-            inventory,
-            &matching_required,
-            child,
-            max_modules,
-            partitions,
-        )?;
-    }
-    Ok(())
 }
 
 fn leanchecker_batches_for_required(
@@ -1798,80 +1771,21 @@ fn leanchecker_batches_for_required(
         return Ok(vec![LeancheckerBatch {
             targets,
             matched_modules: inventory.modules.len(),
+            mode: LeancheckerBatchMode::Prefix,
         }]);
     }
 
     if required_modules.is_empty() {
         return Err("present-olean corpus produced no declaration-bearing targets".to_string());
     }
-    let roots = required_modules
-        .iter()
-        .map(|module| {
-            module
-                .split('.')
-                .next()
-                .expect("a nonempty module name has a root")
-                .to_string()
+    Ok(required_modules
+        .chunks(max_modules)
+        .map(|modules| LeancheckerBatch {
+            targets: modules.iter().map(|module| (*module).to_string()).collect(),
+            matched_modules: modules.len(),
+            mode: LeancheckerBatchMode::Exact,
         })
-        .collect::<BTreeSet<_>>();
-    let mut partitions = Vec::new();
-    for root in roots {
-        partition_leanchecker_prefix(
-            inventory,
-            required_modules,
-            root,
-            max_modules,
-            &mut partitions,
-        )?;
-    }
-
-    for module in required_modules {
-        let matches = partitions
-            .iter()
-            .filter(|(prefix, _)| component_prefix(prefix, module))
-            .count();
-        if matches != 1 {
-            return Err(format!(
-                "leanchecker partition cover matched {module} {matches} times instead of once"
-            ));
-        }
-    }
-
-    let mut batches = Vec::new();
-    let mut targets = Vec::new();
-    let mut matched_modules = 0_usize;
-    for (prefix, prefix_modules) in partitions {
-        if !targets.is_empty()
-            && (prefix_modules > max_modules
-                || matched_modules
-                    .checked_add(prefix_modules)
-                    .is_none_or(|total| total > max_modules))
-        {
-            batches.push(LeancheckerBatch {
-                targets: std::mem::take(&mut targets),
-                matched_modules,
-            });
-            matched_modules = 0;
-        }
-        targets.push(prefix);
-        matched_modules = matched_modules
-            .checked_add(prefix_modules)
-            .ok_or_else(|| "leanchecker batch module count overflow".to_string())?;
-        if matched_modules > max_modules {
-            batches.push(LeancheckerBatch {
-                targets: std::mem::take(&mut targets),
-                matched_modules,
-            });
-            matched_modules = 0;
-        }
-    }
-    if !targets.is_empty() {
-        batches.push(LeancheckerBatch {
-            targets,
-            matched_modules,
-        });
-    }
-    Ok(batches)
+        .collect())
 }
 
 fn leanchecker_batches(
@@ -1888,7 +1802,7 @@ fn leanchecker_batches(
 }
 
 #[test]
-fn leanchecker_batches_split_absent_namespace_roots_and_preserve_exact_modules() {
+fn finite_leanchecker_batches_are_exact_and_preserve_every_required_module() {
     let rows = [
         ("Mathlib.Algebra.A", 1_u64),
         ("Mathlib.Algebra.B", 1),
@@ -1927,19 +1841,25 @@ fn leanchecker_batches_split_absent_namespace_roots_and_preserve_exact_modules()
         batches,
         [
             LeancheckerBatch {
-                targets: vec!["Mathlib.Algebra".to_string()],
+                targets: vec![
+                    "Mathlib.Algebra.A".to_string(),
+                    "Mathlib.Algebra.B".to_string(),
+                ],
                 matched_modules: 2,
+                mode: LeancheckerBatchMode::Exact,
             },
             LeancheckerBatch {
-                targets: vec!["Mathlib.Analysis".to_string()],
+                targets: vec!["Mathlib.Analysis.A".to_string(), "Std".to_string()],
                 matched_modules: 2,
+                mode: LeancheckerBatchMode::Exact,
             },
             LeancheckerBatch {
-                targets: vec!["Std".to_string()],
-                matched_modules: 3,
+                targets: vec!["Std.Data.A".to_string(), "Std.Data.B".to_string()],
+                matched_modules: 2,
+                mode: LeancheckerBatchMode::Exact,
             },
         ],
-        "an absent namespace root may split, while an exact declaration-bearing module must retain its descendants"
+        "a finite batch must name modules exactly; prefix expansion is not a concurrency bound"
     );
     assert!(
         batches
@@ -1948,11 +1868,15 @@ fn leanchecker_batches_split_absent_namespace_roots_and_preserve_exact_modules()
             .all(|target| target != "Mathlib"),
         "the absent Mathlib root would recreate the all-module task explosion"
     );
+    assert!(batches.iter().all(|batch| {
+        batch.mode == LeancheckerBatchMode::Exact && batch.targets.len() == batch.matched_modules
+    }));
 
     let compact = leanchecker_batches(&inventory, usize::MAX)
         .expect("retain the ordinary corpus's compact one-process cover");
     assert_eq!(compact.len(), 1);
     assert_eq!(compact[0].targets, ["Mathlib", "Std"]);
+    assert_eq!(compact[0].mode, LeancheckerBatchMode::Prefix);
 
     let pending_after_std_checkpoint = ["Std.Data.A", "Std.Data.B"];
     let resumed = leanchecker_batches_for_required(&inventory, &pending_after_std_checkpoint, 1)
@@ -1965,6 +1889,11 @@ fn leanchecker_batches_split_absent_namespace_roots_and_preserve_exact_modules()
             .collect::<Vec<_>>(),
         ["Std.Data.A", "Std.Data.B"],
         "a completed exact parent must not force all of its descendants back into one replay"
+    );
+    assert!(
+        resumed
+            .iter()
+            .all(|batch| batch.mode == LeancheckerBatchMode::Exact)
     );
 }
 
@@ -2038,19 +1967,47 @@ fn leanchecker_timeout_kills_and_reaps_the_child() {
     );
 }
 
-fn run_leanchecker_with_search_roots(
-    reference_lib: &Path,
-    search_roots: &[&Path],
-    targets: &[String],
-    timeout: Duration,
-) -> Result<ReferenceCorpusVerdict, String> {
-    let binary = leanchecker_path(reference_lib)?;
+fn reference_lean_path(reference_lib: &Path) -> Result<PathBuf, String> {
+    let toolchain = reference_lib
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "Reference library {} has no toolchain root",
+                reference_lib.display()
+            )
+        })?;
+    let path = toolchain.join("bin/lean");
+    path.is_file()
+        .then_some(path.clone())
+        .ok_or_else(|| format!("pinned lean not found at {}", path.display()))
+}
+
+fn exact_leanchecker_driver_path() -> Result<PathBuf, String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/tribunal/exact_leanchecker.lean");
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "stat exact-module Reference driver {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "exact-module Reference driver {} must be a real file",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn configured_reference_command(binary: &Path, search_roots: &[&Path]) -> Result<Command, String> {
     let pinned_bin = binary
         .parent()
-        .ok_or_else(|| format!("leanchecker {} has no bin directory", binary.display()))?;
+        .ok_or_else(|| format!("Reference binary {} has no bin directory", binary.display()))?;
     let lean_path = std::env::join_paths(search_roots)
-        .map_err(|error| format!("construct pinned leanchecker search path: {error}"))?;
-    let mut command = Command::new(&binary); // ubs:ignore — path is derived from the SUITE.lock-pinned Reference installation.
+        .map_err(|error| format!("construct pinned Reference search path: {error}"))?;
+    let mut command = Command::new(binary); // ubs:ignore — path is derived from the SUITE.lock-pinned Reference installation.
     command
         .env_clear()
         // `Lean.findSysroot` invokes the sibling `lean --print-prefix` by
@@ -2060,11 +2017,18 @@ fn run_leanchecker_with_search_roots(
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("TZ", "UTC")
-        .arg("-v")
-        .args(targets)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    Ok(command)
+}
+
+fn run_reference_replay_command(
+    mut command: Command,
+    binary: &Path,
+    process_name: &str,
+    timeout: Duration,
+) -> Result<ReferenceCorpusVerdict, String> {
     let started = Instant::now();
     let mut child = command
         .spawn()
@@ -2072,29 +2036,29 @@ fn run_leanchecker_with_search_roots(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "leanchecker stdout pipe missing".to_string())?;
+        .ok_or_else(|| format!("{process_name} stdout pipe missing"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "leanchecker stderr pipe missing".to_string())?;
+        .ok_or_else(|| format!("{process_name} stderr pipe missing"))?;
     let stdout_reader = std::thread::spawn(move || read_capped(stdout, ORACLE_OUTPUT_LIMIT));
     let stderr_reader = std::thread::spawn(move || read_capped(stderr, ORACLE_OUTPUT_LIMIT));
     let (status, timed_out) =
-        wait_for_child_with_timeout(&mut child, started, timeout, "leanchecker")?;
+        wait_for_child_with_timeout(&mut child, started, timeout, process_name)?;
     let (stdout_bytes, stdout_truncated) = stdout_reader
         .join()
-        .map_err(|_| "leanchecker stdout reader panicked".to_string())?
-        .map_err(|error| format!("read leanchecker stdout: {error}"))?;
+        .map_err(|_| format!("{process_name} stdout reader panicked"))?
+        .map_err(|error| format!("read {process_name} stdout: {error}"))?;
     let (stderr_bytes, stderr_truncated) = stderr_reader
         .join()
-        .map_err(|_| "leanchecker stderr reader panicked".to_string())?
-        .map_err(|error| format!("read leanchecker stderr: {error}"))?;
+        .map_err(|_| format!("{process_name} stderr reader panicked"))?
+        .map_err(|error| format!("read {process_name} stderr: {error}"))?;
     let stdout = bounded_text(stdout_bytes, stdout_truncated);
     let stderr = bounded_text(stderr_bytes, stderr_truncated);
     let duration = started.elapsed();
     if timed_out {
         return Ok(ReferenceCorpusVerdict::NoAnswer {
-            reason: format!("leanchecker exceeded {} seconds", timeout.as_secs()),
+            reason: format!("{process_name} exceeded {} seconds", timeout.as_secs()),
             duration,
             stdout,
             stderr,
@@ -2109,7 +2073,7 @@ fn run_leanchecker_with_search_roots(
     }
     if status.code().is_none() {
         return Ok(ReferenceCorpusVerdict::NoAnswer {
-            reason: format!("leanchecker terminated by signal: {status}"),
+            reason: format!("{process_name} terminated by signal: {status}"),
             duration,
             stdout,
             stderr,
@@ -2124,10 +2088,10 @@ fn run_leanchecker_with_search_roots(
         "could not execute external process 'lean'",
     ]
     .iter()
-    .any(|needle| stderr.contains(needle));
+    .any(|needle| stdout.contains(needle) || stderr.contains(needle));
     if packaging_or_setup {
         Ok(ReferenceCorpusVerdict::NoAnswer {
-            reason: format!("leanchecker setup/artifact failure: {status}"),
+            reason: format!("{process_name} setup/artifact failure: {status}"),
             duration,
             stdout,
             stderr,
@@ -2142,6 +2106,125 @@ fn run_leanchecker_with_search_roots(
     }
 }
 
+fn run_leanchecker_with_search_roots(
+    reference_lib: &Path,
+    search_roots: &[&Path],
+    targets: &[String],
+    timeout: Duration,
+) -> Result<ReferenceCorpusVerdict, String> {
+    let binary = leanchecker_path(reference_lib)?;
+    let mut command = configured_reference_command(&binary, search_roots)?;
+    command.arg("-v").args(targets);
+    run_reference_replay_command(command, &binary, "leanchecker", timeout)
+}
+
+fn exact_completion_modules(stdout: &str) -> Result<BTreeSet<String>, String> {
+    const PREFIX: &str = "replayed exact module ";
+    let mut completed = BTreeSet::new();
+    for module in stdout.lines().filter_map(|line| line.strip_prefix(PREFIX)) {
+        if module.is_empty() {
+            return Err("exact-module Reference driver emitted an empty completion".to_string());
+        }
+        if !completed.insert(module.to_string()) {
+            return Err(format!(
+                "exact-module Reference driver completed {module} more than once"
+            ));
+        }
+    }
+    Ok(completed)
+}
+
+fn validate_exact_completions(targets: &[String], stdout: &str) -> Result<(), String> {
+    let expected = targets.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.len() != targets.len() {
+        return Err("exact-module Reference request contains duplicate modules".to_string());
+    }
+    let completed = exact_completion_modules(stdout)?;
+    if completed != expected {
+        let missing = expected.difference(&completed).take(8).collect::<Vec<_>>();
+        let unexpected = completed.difference(&expected).take(8).collect::<Vec<_>>();
+        return Err(format!(
+            "exact-module Reference completion mismatch: missing={missing:?} unexpected={unexpected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn run_exact_leanchecker_with_search_roots(
+    reference_lib: &Path,
+    search_roots: &[&Path],
+    targets: &[String],
+    timeout: Duration,
+) -> Result<ReferenceCorpusVerdict, String> {
+    let binary = reference_lean_path(reference_lib)?;
+    let driver = exact_leanchecker_driver_path()?;
+    let mut command = configured_reference_command(&binary, search_roots)?;
+    command.arg("--run").arg(driver).args(targets);
+    match run_reference_replay_command(command, &binary, "exact_leanchecker", timeout)? {
+        ReferenceCorpusVerdict::Accepted {
+            duration,
+            stdout,
+            stderr,
+        } => match validate_exact_completions(targets, &stdout) {
+            Ok(()) => Ok(ReferenceCorpusVerdict::Accepted {
+                duration,
+                stdout,
+                stderr,
+            }),
+            Err(reason) => Ok(ReferenceCorpusVerdict::NoAnswer {
+                reason,
+                duration,
+                stdout,
+                stderr,
+            }),
+        },
+        other => Ok(other),
+    }
+}
+
+#[test]
+fn exact_module_completion_join_refuses_missing_duplicate_and_unexpected_rows() {
+    let targets = ["Mathlib.A".to_string(), "Mathlib.B".to_string()];
+    validate_exact_completions(
+        &targets,
+        "replayed exact module Mathlib.A\nreplayed exact module Mathlib.B\n",
+    )
+    .expect("accept the exact two-sided completion join");
+    for mutant in [
+        "replayed exact module Mathlib.A\n",
+        "replayed exact module Mathlib.A\nreplayed exact module Mathlib.A\n",
+        "replayed exact module Mathlib.A\nreplayed exact module Mathlib.C\n",
+    ] {
+        assert!(
+            validate_exact_completions(&targets, mutant).is_err(),
+            "completion mutant survived: {mutant:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "on-demand live process check against the SUITE.lock-pinned Reference"]
+fn exact_module_driver_replays_one_real_pinned_module() {
+    let reference_lib =
+        reference_lib().expect("pinned Reference library required for the exact-driver probe");
+    let targets = vec!["Init.Prelude".to_string()];
+    match run_exact_leanchecker_with_search_roots(
+        &reference_lib,
+        &[reference_lib.as_path()],
+        &targets,
+        DEFAULT_LEANCHECKER_TIMEOUT,
+    )
+    .expect("launch exact-module Reference driver")
+    {
+        ReferenceCorpusVerdict::Accepted { stdout, stderr, .. } => {
+            validate_exact_completions(&targets, &stdout)
+                .expect("the live driver must prove exact completion");
+            assert!(stderr.is_empty(), "live exact driver stderr: {stderr}");
+        }
+        other => panic!("live exact-module Reference replay did not accept: {other:?}"),
+    }
+}
+
 fn run_leanchecker_batches_with_search_roots(
     reference_lib: &Path,
     search_roots: &[&Path],
@@ -2151,14 +2234,23 @@ fn run_leanchecker_batches_with_search_roots(
     mut batch_accepted: impl FnMut(&LeancheckerBatch) -> Result<(), String>,
 ) -> Result<ReferenceCorpusVerdict, String> {
     if batches.len() == 1 {
-        let verdict = run_leanchecker_with_search_roots(
-            reference_lib,
-            search_roots,
-            &batches[0].targets,
-            total_timeout.min(process_timeout),
-        )?;
+        let batch = &batches[0];
+        let verdict = match batch.mode {
+            LeancheckerBatchMode::Prefix => run_leanchecker_with_search_roots(
+                reference_lib,
+                search_roots,
+                &batch.targets,
+                total_timeout.min(process_timeout),
+            ),
+            LeancheckerBatchMode::Exact => run_exact_leanchecker_with_search_roots(
+                reference_lib,
+                search_roots,
+                &batch.targets,
+                total_timeout.min(process_timeout),
+            ),
+        }?;
         if matches!(&verdict, ReferenceCorpusVerdict::Accepted { .. }) {
-            batch_accepted(&batches[0])?;
+            batch_accepted(batch)?;
         }
         return Ok(verdict);
     }
@@ -2182,12 +2274,20 @@ fn run_leanchecker_batches_with_search_roots(
                 stderr: String::new(),
             });
         }
-        let verdict = run_leanchecker_with_search_roots(
-            reference_lib,
-            search_roots,
-            &batch.targets,
-            remaining.min(process_timeout),
-        )?;
+        let verdict = match batch.mode {
+            LeancheckerBatchMode::Prefix => run_leanchecker_with_search_roots(
+                reference_lib,
+                search_roots,
+                &batch.targets,
+                remaining.min(process_timeout),
+            ),
+            LeancheckerBatchMode::Exact => run_exact_leanchecker_with_search_roots(
+                reference_lib,
+                search_roots,
+                &batch.targets,
+                remaining.min(process_timeout),
+            ),
+        }?;
         match verdict {
             ReferenceCorpusVerdict::Accepted {
                 duration,
@@ -2199,9 +2299,10 @@ fn run_leanchecker_batches_with_search_roots(
                 accepted_stderr_bytes = accepted_stderr_bytes.saturating_add(stderr.len());
                 eprintln!(
                     "kernel_reference_corpus oracle-batch: verdict=accepted batch={}/{} \
-                     targets={} inventory_modules={} duration_ms={} stdout_bytes={} stderr_bytes={}",
+                     mode={} targets={} inventory_modules={} duration_ms={} stdout_bytes={} stderr_bytes={}",
                     index + 1,
                     batch_count,
+                    batch.mode.label(),
                     batch.targets.len(),
                     batch.matched_modules,
                     duration.as_millis(),
@@ -2230,9 +2331,10 @@ fn run_leanchecker_batches_with_search_roots(
             } => {
                 return Ok(ReferenceCorpusVerdict::NoAnswer {
                     reason: format!(
-                        "leanchecker batch {}/{} for targets {:?}: {reason}",
+                        "Reference replay batch {}/{} mode={} for targets {:?}: {reason}",
                         index + 1,
                         batch_count,
+                        batch.mode.label(),
                         batch.targets.iter().take(8).collect::<Vec<_>>()
                     ),
                     duration: started.elapsed(),
@@ -2472,7 +2574,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     assert_eq!(module.extra_const_names, 1);
 }
 
-fn oracle_binary_hash(reference_lib: &Path) -> Result<String, String> {
+fn prefix_oracle_hash(reference_lib: &Path) -> Result<String, String> {
     let path = leanchecker_path(reference_lib)?;
     let checker_bytes =
         fs::read(&path).map_err(|error| format!("read oracle {}: {error}", path.display()))?;
@@ -2486,6 +2588,37 @@ fn oracle_binary_hash(reference_lib: &Path) -> Result<String, String> {
         b"fln.kernel-reference-corpus.oracle/1",
         &[&checker_bytes, &lean_bytes],
     ))
+}
+
+fn exact_oracle_hash(reference_lib: &Path) -> Result<String, String> {
+    let lean_path = reference_lean_path(reference_lib)?;
+    let lean_bytes = fs::read(&lean_path)
+        .map_err(|error| format!("read exact oracle {}: {error}", lean_path.display()))?;
+    let driver_path = exact_leanchecker_driver_path()?;
+    let driver_bytes = fs::read(&driver_path).map_err(|error| {
+        format!(
+            "read exact oracle driver {}: {error}",
+            driver_path.display()
+        )
+    })?;
+    Ok(tagged_fixture_hash(
+        b"fln.kernel-reference-corpus.exact-oracle/1",
+        &[&lean_bytes, &driver_bytes],
+    ))
+}
+
+struct ReferenceOracleHashes {
+    prefix: String,
+    exact: String,
+}
+
+impl ReferenceOracleHashes {
+    fn for_batch(&self, mode: LeancheckerBatchMode) -> &str {
+        match mode {
+            LeancheckerBatchMode::Prefix => &self.prefix,
+            LeancheckerBatchMode::Exact => &self.exact,
+        }
+    }
 }
 
 fn checkpoint_content(module: &CorpusModule, oracle_hash: &str) -> String {
@@ -2535,6 +2668,17 @@ fn checkpoint_is_complete(
     }
 }
 
+fn checkpoint_is_complete_under_either_oracle(
+    dir: &Path,
+    module: &CorpusModule,
+    hashes: &ReferenceOracleHashes,
+) -> Result<bool, String> {
+    if checkpoint_is_complete(dir, module, &hashes.prefix)? {
+        return Ok(true);
+    }
+    checkpoint_is_complete(dir, module, &hashes.exact)
+}
+
 fn persist_checkpoint(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(dir)
         && metadata.file_type().is_symlink()
@@ -2582,7 +2726,10 @@ fn reference_verdict_with_resume(
     process_timeout: Duration,
     max_modules_per_process: usize,
 ) -> Result<(ReferenceCorpusVerdict, &'static str), String> {
-    let oracle_hash = oracle_binary_hash(reference_lib)?;
+    let oracle_hashes = ReferenceOracleHashes {
+        prefix: prefix_oracle_hash(reference_lib)?,
+        exact: exact_oracle_hash(reference_lib)?,
+    };
     let checkpoint_dir = std::env::var_os("FLN_CORPUS_CHECKPOINT_DIR").map(PathBuf::from);
     let mut completed_modules = BTreeSet::new();
     if let Some(dir) = &checkpoint_dir {
@@ -2593,7 +2740,7 @@ fn reference_verdict_with_resume(
             .filter(|module| module.decoded != 0)
         {
             expected += 1;
-            if checkpoint_is_complete(dir, module, &oracle_hash)? {
+            if checkpoint_is_complete_under_either_oracle(dir, module, &oracle_hashes)? {
                 completed_modules.insert(module.name.clone());
             }
         }
@@ -2631,14 +2778,13 @@ fn reference_verdict_with_resume(
             let Some(dir) = &checkpoint_dir else {
                 return Ok(());
             };
-            for module in inventory.modules.values().filter(|module| {
-                module.decoded != 0
-                    && batch
-                        .targets
-                        .iter()
-                        .any(|target| component_prefix(target, &module.name))
-            }) {
-                persist_checkpoint(dir, module, &oracle_hash)?;
+            let oracle_hash = oracle_hashes.for_batch(batch.mode);
+            for module in inventory
+                .modules
+                .values()
+                .filter(|module| module.decoded != 0 && batch.covers_module(&module.name))
+            {
+                persist_checkpoint(dir, module, oracle_hash)?;
             }
             Ok(())
         },
@@ -2651,7 +2797,12 @@ fn reference_verdict_with_resume(
             .values()
             .filter(|module| module.decoded != 0)
         {
-            persist_checkpoint(dir, module, &oracle_hash)?;
+            if !checkpoint_is_complete_under_either_oracle(dir, module, &oracle_hashes)? {
+                return Err(format!(
+                    "accepted Reference replay left no complete checkpoint for {}",
+                    module.name
+                ));
+            }
         }
     }
     Ok((verdict, if resumed { "live+checkpoint" } else { "live" }))
