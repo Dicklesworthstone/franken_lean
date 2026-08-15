@@ -412,9 +412,11 @@ fn a_mpz_with_foreign_or_midblock_limbs_is_refused_by_materialize() {
         Err(RegionFault::MpzIntegrity { offset: 8 }),
         "audit must refuse a foreign limb pointer"
     );
-    assert_eq!(
-        materialize(&buf, 0),
-        Err(RegionFault::MpzIntegrity { offset: 8 }),
+    assert!(
+        matches!(
+            materialize(&buf, 0),
+            Err(RegionFault::MpzIntegrity { offset: 8 })
+        ),
         "materialize must not mint a Nat from a foreign limb pointer"
     );
 
@@ -426,9 +428,11 @@ fn a_mpz_with_foreign_or_midblock_limbs_is_refused_by_materialize() {
         Err(RegionFault::MpzIntegrity { offset: 8 }),
         "audit must refuse a mid-block limb pointer"
     );
-    assert_eq!(
-        materialize(&buf, 0),
-        Err(RegionFault::MpzIntegrity { offset: 8 }),
+    assert!(
+        matches!(
+            materialize(&buf, 0),
+            Err(RegionFault::MpzIntegrity { offset: 8 })
+        ),
         "materialize must not read past the minted mpz"
     );
 
