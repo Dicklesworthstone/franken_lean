@@ -1246,7 +1246,7 @@ const DEFAULT_LEANCHECKER_TIMEOUT: Duration = Duration::from_secs(300);
 /// and for the plan as a whole.
 const WHOLE_MATHLIB_ORACLE_MODULES_PER_PROCESS: usize = 256;
 const WHOLE_MATHLIB_ORACLE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const WHOLE_MATHLIB_ORACLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const WHOLE_MATHLIB_ORACLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const ORACLE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -1683,14 +1683,13 @@ fn component_prefix(prefix: &str, module: &str) -> bool {
 /// zero-declaration umbrella is replaced by its immediate children; this
 /// avoids the pin's packaging-only root failures without expanding the CLI to
 /// one target per leaf (leanchecker rescans every olean for every target).
-fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
+fn leanchecker_targets_for_required(
+    inventory: &CorpusInventory,
+    required_modules: &[&str],
+) -> Vec<String> {
     let mut candidates = BTreeSet::new();
-    for module in inventory
-        .modules
-        .values()
-        .filter(|module| module.decoded != 0)
-    {
-        let components = module.name.split('.').collect::<Vec<_>>();
+    for module in required_modules {
+        let components = module.split('.').collect::<Vec<_>>();
         let top = components[0];
         let width = match inventory.modules.get(top) {
             Some(exact) if exact.decoded == 0 && components.len() > 1 => 2,
@@ -1708,6 +1707,16 @@ fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
         }
     }
     selected
+}
+
+fn leanchecker_targets(inventory: &CorpusInventory) -> Vec<String> {
+    let required_modules = inventory
+        .modules
+        .values()
+        .filter(|module| module.decoded != 0)
+        .map(|module| module.name.as_str())
+        .collect::<Vec<_>>();
+    leanchecker_targets_for_required(inventory, &required_modules)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1742,10 +1751,7 @@ fn partition_leanchecker_prefix(
         ));
     }
     let matching_all = matching_inventory_modules(inventory, &prefix);
-    let exact_is_required = inventory
-        .modules
-        .get(&prefix)
-        .is_some_and(|module| module.decoded != 0);
+    let exact_is_required = matching_required.contains(&prefix.as_str());
     if matching_all <= max_modules || exact_is_required {
         partitions.push((prefix, matching_all));
         return Ok(());
@@ -1776,15 +1782,16 @@ fn partition_leanchecker_prefix(
     Ok(())
 }
 
-fn leanchecker_batches(
+fn leanchecker_batches_for_required(
     inventory: &CorpusInventory,
+    required_modules: &[&str],
     max_modules: usize,
 ) -> Result<Vec<LeancheckerBatch>, String> {
     if max_modules == 0 {
         return Err("leanchecker module batch size must be nonzero".to_string());
     }
     if max_modules == usize::MAX {
-        let targets = leanchecker_targets(inventory);
+        let targets = leanchecker_targets_for_required(inventory, required_modules);
         if targets.is_empty() {
             return Err("present-olean corpus produced no declaration-bearing targets".to_string());
         }
@@ -1794,12 +1801,6 @@ fn leanchecker_batches(
         }]);
     }
 
-    let required_modules = inventory
-        .modules
-        .values()
-        .filter(|module| module.decoded != 0)
-        .map(|module| module.name.as_str())
-        .collect::<Vec<_>>();
     if required_modules.is_empty() {
         return Err("present-olean corpus produced no declaration-bearing targets".to_string());
     }
@@ -1817,14 +1818,14 @@ fn leanchecker_batches(
     for root in roots {
         partition_leanchecker_prefix(
             inventory,
-            &required_modules,
+            required_modules,
             root,
             max_modules,
             &mut partitions,
         )?;
     }
 
-    for module in &required_modules {
+    for module in required_modules {
         let matches = partitions
             .iter()
             .filter(|(prefix, _)| component_prefix(prefix, module))
@@ -1871,6 +1872,19 @@ fn leanchecker_batches(
         });
     }
     Ok(batches)
+}
+
+fn leanchecker_batches(
+    inventory: &CorpusInventory,
+    max_modules: usize,
+) -> Result<Vec<LeancheckerBatch>, String> {
+    let required_modules = inventory
+        .modules
+        .values()
+        .filter(|module| module.decoded != 0)
+        .map(|module| module.name.as_str())
+        .collect::<Vec<_>>();
+    leanchecker_batches_for_required(inventory, &required_modules, max_modules)
 }
 
 #[test]
@@ -1939,6 +1953,19 @@ fn leanchecker_batches_split_absent_namespace_roots_and_preserve_exact_modules()
         .expect("retain the ordinary corpus's compact one-process cover");
     assert_eq!(compact.len(), 1);
     assert_eq!(compact[0].targets, ["Mathlib", "Std"]);
+
+    let pending_after_std_checkpoint = ["Std.Data.A", "Std.Data.B"];
+    let resumed = leanchecker_batches_for_required(&inventory, &pending_after_std_checkpoint, 1)
+        .expect("partition only declarations without complete oracle checkpoints");
+    assert_eq!(
+        resumed
+            .iter()
+            .flat_map(|batch| &batch.targets)
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["Std.Data.A", "Std.Data.B"],
+        "a completed exact parent must not force all of its descendants back into one replay"
+    );
 }
 
 fn wait_for_child_with_timeout(
@@ -2118,19 +2145,22 @@ fn run_leanchecker_with_search_roots(
 fn run_leanchecker_batches_with_search_roots(
     reference_lib: &Path,
     search_roots: &[&Path],
-    inventory: &CorpusInventory,
+    batches: Vec<LeancheckerBatch>,
     total_timeout: Duration,
     process_timeout: Duration,
-    max_modules_per_process: usize,
+    mut batch_accepted: impl FnMut(&LeancheckerBatch) -> Result<(), String>,
 ) -> Result<ReferenceCorpusVerdict, String> {
-    let batches = leanchecker_batches(inventory, max_modules_per_process)?;
     if batches.len() == 1 {
-        return run_leanchecker_with_search_roots(
+        let verdict = run_leanchecker_with_search_roots(
             reference_lib,
             search_roots,
             &batches[0].targets,
             total_timeout.min(process_timeout),
-        );
+        )?;
+        if matches!(&verdict, ReferenceCorpusVerdict::Accepted { .. }) {
+            batch_accepted(&batches[0])?;
+        }
+        return Ok(verdict);
     }
 
     let started = Instant::now();
@@ -2164,6 +2194,7 @@ fn run_leanchecker_batches_with_search_roots(
                 stdout,
                 stderr,
             } => {
+                batch_accepted(batch)?;
                 accepted_stdout_bytes = accepted_stdout_bytes.saturating_add(stdout.len());
                 accepted_stderr_bytes = accepted_stderr_bytes.saturating_add(stderr.len());
                 eprintln!(
@@ -2553,8 +2584,8 @@ fn reference_verdict_with_resume(
 ) -> Result<(ReferenceCorpusVerdict, &'static str), String> {
     let oracle_hash = oracle_binary_hash(reference_lib)?;
     let checkpoint_dir = std::env::var_os("FLN_CORPUS_CHECKPOINT_DIR").map(PathBuf::from);
+    let mut completed_modules = BTreeSet::new();
     if let Some(dir) = &checkpoint_dir {
-        let mut complete = 0_u64;
         let mut expected = 0_u64;
         for module in inventory
             .modules
@@ -2562,14 +2593,17 @@ fn reference_verdict_with_resume(
             .filter(|module| module.decoded != 0)
         {
             expected += 1;
-            complete += u64::from(checkpoint_is_complete(dir, module, &oracle_hash)?);
+            if checkpoint_is_complete(dir, module, &oracle_hash)? {
+                completed_modules.insert(module.name.clone());
+            }
         }
-        if expected != 0 && complete == expected {
+        if expected != 0 && completed_modules.len() as u64 == expected {
             return Ok((
                 ReferenceCorpusVerdict::Accepted {
                     duration: Duration::ZERO,
                     stdout: format!(
-                        "resumed {complete} immutable per-module oracle records from {}",
+                        "resumed {} immutable per-module oracle records from {}",
+                        completed_modules.len(),
                         dir.display()
                     ),
                     stderr: String::new(),
@@ -2578,13 +2612,36 @@ fn reference_verdict_with_resume(
             ));
         }
     }
+    let required_modules = inventory
+        .modules
+        .values()
+        .filter(|module| module.decoded != 0 && !completed_modules.contains(&module.name))
+        .map(|module| module.name.as_str())
+        .collect::<Vec<_>>();
+    let resumed = !completed_modules.is_empty();
+    let batches =
+        leanchecker_batches_for_required(inventory, &required_modules, max_modules_per_process)?;
     let verdict = run_leanchecker_batches_with_search_roots(
         reference_lib,
         search_roots,
-        inventory,
+        batches,
         total_timeout,
         process_timeout,
-        max_modules_per_process,
+        |batch| {
+            let Some(dir) = &checkpoint_dir else {
+                return Ok(());
+            };
+            for module in inventory.modules.values().filter(|module| {
+                module.decoded != 0
+                    && batch
+                        .targets
+                        .iter()
+                        .any(|target| component_prefix(target, &module.name))
+            }) {
+                persist_checkpoint(dir, module, &oracle_hash)?;
+            }
+            Ok(())
+        },
     )?;
     if matches!(verdict, ReferenceCorpusVerdict::Accepted { .. })
         && let Some(dir) = &checkpoint_dir
@@ -2597,7 +2654,7 @@ fn reference_verdict_with_resume(
             persist_checkpoint(dir, module, &oracle_hash)?;
         }
     }
-    Ok((verdict, "live"))
+    Ok((verdict, if resumed { "live+checkpoint" } else { "live" }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
