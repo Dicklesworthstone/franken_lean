@@ -8022,6 +8022,27 @@ fn selected_real_module_resource_probe() {
     };
     if std::env::var_os("FLN_CORPUS_PROBE_DIAGNOSTIC").is_some() {
         eprintln!("kernel_resource_probe diagnostic={}", outcome.message);
+        eprintln!(
+            "kernel_resource_probe selected_type={}",
+            shape(&item.info.constant_val().type_, 10)
+        );
+        match &item.info {
+            ConstantInfo::Defn(value) => eprintln!(
+                "kernel_resource_probe selected_value=definition safety={:?} hints={:?} {}",
+                value.safety,
+                value.hints,
+                shape(&value.value, 12)
+            ),
+            ConstantInfo::Thm(value) => eprintln!(
+                "kernel_resource_probe selected_value=theorem {}",
+                shape(&value.value, 12)
+            ),
+            ConstantInfo::Opaque(value) => eprintln!(
+                "kernel_resource_probe selected_value=opaque {}",
+                shape(&value.value, 12)
+            ),
+            _ => {}
+        }
     }
     if let Ok(names) = std::env::var("FLN_CORPUS_PROBE_ENV") {
         for entry in names.split(',') {

@@ -1007,6 +1007,52 @@ fn kr204_projection_of_a_constructor_reduces_to_the_field() {
         check_def_eq(&env, &[], &proj1, &d1, Budget::DEFAULT).is_accepted(),
         "proj S 1 (mk d0 d1) should reduce to d1"
     );
+    let beta_d0 = Expr::app(
+        Expr::lam(
+            n("x"),
+            d.clone(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        d0.clone(),
+    );
+    let beta_mk = Expr::app(
+        Expr::app(Expr::const_(n("mk"), vec![]), beta_d0),
+        d1.clone(),
+    );
+    let cheap_left = Expr::proj(n("S"), 0, beta_mk);
+    let cheap_right = Expr::proj(n("S"), 0, mk_app);
+    let cheap_verdict = check_def_eq(&env, &[], &cheap_left, &cheap_right, Budget::DEFAULT);
+    let cheap_steps = match &cheap_verdict {
+        Outcome::Complete(Verdict::Accepted { consumption }) => consumption.steps_used,
+        other => panic!("equal constructor projections must close: {other:?}"),
+    };
+    assert_eq!(
+        cheap_steps, 13,
+        "constructor projections must not pay for futile recursor dispatch"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &cheap_left,
+            &cheap_right,
+            Budget::DEFAULT.narrowed(cheap_steps, Budget::DEFAULT.depth),
+        )
+        .is_accepted(),
+        "the exact cheap-projection step boundary must accept"
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &cheap_left,
+            &cheap_right,
+            Budget::DEFAULT.narrowed(cheap_steps - 1, Budget::DEFAULT.depth),
+        )
+        .is_inconclusive(),
+        "one step below the cheap-projection boundary must remain typed exhaustion"
+    );
     // And it must NOT reduce to the wrong field.
     assert_eq!(
         reject_class(&check_def_eq(&env, &[], &proj0, &d1, Budget::DEFAULT)),

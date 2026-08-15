@@ -2344,22 +2344,39 @@ impl<'a> TypeChecker<'a> {
                         }
                         if head == head0 && rebuilt == current {
                             // KR-205: the head is stable and no wrapper was
-                            // dropped — try quotient computation, then
-                            // inductive iota, on the original application.
-                            match self.reduce_recursor(&current, depth + 1)? {
-                                Some(reduced) => {
-                                    current = reduced;
-                                    depth += 1;
-                                    self.step(depth)?;
+                            // dropped. A pending projection of an already
+                            // exposed constructor can extract its field
+                            // directly; recursor dispatch cannot reduce a
+                            // constructor head and only burns one governed
+                            // step before the same projection check. Other
+                            // applications still try quotient computation and
+                            // inductive iota before a projection may remain
+                            // stuck.
+                            let constructor_field =
+                                pending_projs.last().and_then(|(struct_name, idx)| {
+                                    self.reduce_proj(struct_name, *idx, &current)
+                                });
+                            if let Some(field) = constructor_field {
+                                pending_projs.pop();
+                                depth = depth.saturating_add(1);
+                                self.step(depth)?;
+                                current = field;
+                            } else {
+                                match self.reduce_recursor(&current, depth + 1)? {
+                                    Some(reduced) => {
+                                        current = reduced;
+                                        depth += 1;
+                                        self.step(depth)?;
+                                    }
+                                    None => match self.finish_pending_projs(
+                                        current.clone(),
+                                        &mut pending_projs,
+                                        &mut depth,
+                                    )? {
+                                        PendingProj::Done(value) => break value,
+                                        PendingProj::Continue(field) => current = field,
+                                    },
                                 }
-                                None => match self.finish_pending_projs(
-                                    current.clone(),
-                                    &mut pending_projs,
-                                    &mut depth,
-                                )? {
-                                    PendingProj::Done(value) => break value,
-                                    PendingProj::Continue(field) => current = field,
-                                },
                             }
                         } else {
                             // The head changed (let-fvar zeta, mdata strip):
