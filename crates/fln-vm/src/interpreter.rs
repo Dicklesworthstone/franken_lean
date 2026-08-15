@@ -831,6 +831,7 @@ pub enum VmRefusal {
     },
     InvalidStringObject,
     InvalidArrayObject,
+    InvalidCtorObject,
     UnsupportedNativeClosure,
     MalformedClosure {
         reason: &'static str,
@@ -982,6 +983,9 @@ impl fmt::Display for VmRefusal {
             ),
             Self::InvalidStringObject => write!(f, "Marrow String object is not canonical UTF-8"),
             Self::InvalidArrayObject => write!(f, "Marrow Array object header is inconsistent"),
+            Self::InvalidCtorObject => {
+                write!(f, "Marrow constructor object slot is past the allocation")
+            }
             Self::UnsupportedNativeClosure => {
                 write!(
                     f,
@@ -1541,7 +1545,13 @@ fn run(
                             caches.record_ctor(cache_key);
                         }
                     }
-                    value.ctor_child(usize::from(field))
+                    let Some(projected) = value.try_ctor_child(usize::from(field)) else {
+                        return Ok(VmExit::Refused {
+                            refusal: VmRefusal::InvalidCtorObject,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    };
+                    projected
                 };
                 set_register(current_frame_mut(&mut stack)?, dst, projected)?;
                 advance(current_frame_mut(&mut stack)?)?;

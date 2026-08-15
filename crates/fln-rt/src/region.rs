@@ -1006,7 +1006,11 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
                     }
                     emit_header(&mut out, heap_size, h.tag, h.other);
                     for i in 0..n {
-                        let c = o.ctor_child(i);
+                        let Some(c) = o.try_ctor_child(i) else {
+                            return Err(RegionFault::BuildShape {
+                                reason: "ctor slot is past the allocated object",
+                            });
+                        };
                         let w = word_of(&c, &memo);
                         out.extend_from_slice(&w.to_le_bytes());
                     }
