@@ -188,11 +188,11 @@
 //!
 //! * **ENFORCED at item granularity.** `FLN-STRUCT-037` refuses `fln-checker`
 //!   *reaching* a SEMANTIC item across this boundary
-//!   (`tools/structure-guard/src/checks.rs:1113`). It is planted three ways:
-//!   `seeded.rs:1296` proves the baseline clean, `seeded.rs:1306`
+//!   (`tools/structure-guard/src/checks.rs:1116`). It is planted three ways:
+//!   `seeded.rs:1322` proves the baseline clean, `seeded.rs:1332`
 //!   `every_semantic_item_is_refused_inside_fln_checker` plants one violation per
 //!   inventory item and asserts each fires **alone** so an over-broad matcher
-//!   cannot fake green, and `seeded.rs:1341` proves that *naming* a semantic item
+//!   cannot fake green, and `seeded.rs:1367` proves that *naming* a semantic item
 //!   in prose is not a violation — which is why this document may keep citing
 //!   `Level::is_equiv` and `from_canonical_bytes` by name.
 //! * **DECLARED AND NOT WALKED — three items, and the number is bound.** Not every
@@ -325,10 +325,10 @@
 //! cite crates/fln-hash/src/canon.rs:658 :: pub trait Canonical: Sized
 //! cite crates/fln-core/src/expr.rs:511 :: impl PartialEq for Expr
 //! cite crates/fln-conformance/src/witness.rs:542 :: id: "B3-INDEPENDENT-CHECKER"
-//! cite tools/structure-guard/src/checks.rs:1113 :: code: "FLN-STRUCT-037"
-//! cite tools/structure-guard/tests/seeded.rs:1296 :: fn the_checker_boundary_baseline_is_clean
-//! cite tools/structure-guard/tests/seeded.rs:1306 :: fn every_semantic_item_is_refused_inside_fln_checker
-//! cite tools/structure-guard/tests/seeded.rs:1341 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
+//! cite tools/structure-guard/src/checks.rs:1116 :: code: "FLN-STRUCT-037"
+//! cite tools/structure-guard/tests/seeded.rs:1322 :: fn the_checker_boundary_baseline_is_clean
+//! cite tools/structure-guard/tests/seeded.rs:1332 :: fn every_semantic_item_is_refused_inside_fln_checker
+//! cite tools/structure-guard/tests/seeded.rs:1367 :: fn naming_a_semantic_item_in_prose_is_not_a_violation
 //! ```
 //!
 //! **What this does not earn.** A bound citation proves the line still holds the construct
