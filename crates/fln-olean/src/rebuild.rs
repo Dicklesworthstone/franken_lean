@@ -222,6 +222,16 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             kind = "sarray";
             let size = view.read_u64(off + 8)?;
             let capacity = view.read_u64(off + 16)?;
+            // The walk already refuses size > capacity. Copying `size * elem`
+            // first would treat the next object's bytes as this payload
+            // whenever the file was long enough, then fail only at slack
+            // `checked_sub` with the wrong reason.
+            if size > capacity {
+                return Err(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "scalar-array size > capacity",
+                });
+            }
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
             if other == 0 {
@@ -260,6 +270,22 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             let size = view.read_u64(off + 8)?;
             let capacity = view.read_u64(off + 16)?;
             let length = view.read_u64(off + 24)?;
+            // Walk's `check_string` refuses size == 0 and size > capacity
+            // before touching the payload. Copying `size` bytes first would
+            // read the next object as string content (or emit a NUL-less
+            // size-0 string the walk already rejects).
+            if size == 0 {
+                return Err(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "string size is 0",
+                });
+            }
+            if size > capacity {
+                return Err(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "string size exceeds capacity",
+                });
+            }
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
             out.extend_from_slice(&length.to_le_bytes());
@@ -604,6 +630,18 @@ mod tests {
             }
             Err(other) => panic!("refused, but not by the capacity law: {other:?}"),
             Ok(_) => panic!("a size>capacity string was rebuilt instead of refused"),
+        }
+
+        // Walk refuses size == 0 before touching the payload. Rebuild used
+        // to emit a NUL-less string and only trip size>capacity via slack.
+        let mut empty = PILOT.to_vec();
+        empty[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes());
+        match rebuild(&empty) {
+            Err(RegionError::DecodeShape { reason, .. }) => {
+                assert!(reason.contains("size is 0"), "wrong refusal: {reason}");
+            }
+            Err(other) => panic!("refused, but not by the size-0 law: {other:?}"),
+            Ok(_) => panic!("a size-0 string was rebuilt instead of refused"),
         }
     }
 

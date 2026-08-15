@@ -370,6 +370,7 @@ fn a_scalar_array_past_eof_is_refused_by_the_walk() {
         let view = OleanView::parse(&bytes).expect("pilot parses");
         view.walk(WalkBudget::default())
             .expect("the unmutated pilot walks");
+        rebuild(&bytes).expect("the unmutated pilot rebuilds");
     }
     let objects = collect_objects(&bytes);
     let array = objects
@@ -417,6 +418,18 @@ fn a_scalar_array_past_eof_is_refused_by_the_walk() {
     assert!(
         text.contains("capacity"),
         "the refusal must name the capacity law, got: {text}"
+    );
+
+    // Rebuild is an independent DFS and used to copy `size * elem` before
+    // the slack `checked_sub`, so a file long enough to satisfy that read
+    // treated the next object as payload and only then refused with the
+    // slack-overflow reason.
+    let error =
+        rebuild(&hostile).expect_err("rebuild must not copy neighbor bytes as sarray payload");
+    let text = message_of(&error);
+    assert!(
+        text.contains("capacity"),
+        "rebuild must name the capacity law, got: {text}"
     );
 
     // (b) capacity * elem past EOF: the old walk charged `size` bytes and the
