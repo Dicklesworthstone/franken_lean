@@ -860,10 +860,11 @@ impl<'a> OleanView<'a> {
         let inline_start = off
             .checked_add(24)
             .ok_or(RegionError::MpzIntegrity { offset: off })?;
-        let inline_end = inline_start
-            .checked_add(limb_bytes)
-            .ok_or(RegionError::MpzIntegrity { offset: off })?;
-        if limb_off < inline_start || limb_off >= inline_end {
+        // The pin's compactor rewrites the pointer to the start of the
+        // inline block. A mid-block address used to pass a range check;
+        // `read_bytes(limb_off, limb_bytes)` then treated the next
+        // object as this number.
+        if limb_off != inline_start {
             return Err(RegionError::MpzIntegrity { offset: off });
         }
         self.read_bytes(limb_off, limb_bytes)

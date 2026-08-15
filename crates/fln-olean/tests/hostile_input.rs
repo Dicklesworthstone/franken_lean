@@ -500,6 +500,26 @@ fn an_mpz_with_foreign_limbs_is_refused_by_the_inline_law() {
         matches!(error, RegionError::MpzIntegrity { .. }),
         "rebuild expected MpzIntegrity, got {error:?}"
     );
+
+    // Mid-block: still inside the inline span, but reading the live
+    // limb count from there overruns into the next object.
+    let mut mid = bytes.clone();
+    let envelope = parse_olean_envelope(&bytes).expect("envelope");
+    let mid_ptr = envelope.base_addr + (mpz.off as u64) + 24 + 8;
+    put_u64(&mut mid, mpz.off + 16, mid_ptr);
+    let view = OleanView::parse(&mid).expect("hostile parses structurally");
+    let error = view
+        .walk(WalkBudget::default())
+        .expect_err("a mid-block limb pointer must refuse");
+    assert!(
+        matches!(error, RegionError::MpzIntegrity { .. }),
+        "walk expected MpzIntegrity for mid-block limbs, got {error:?}"
+    );
+    let error = rebuild(&mid).expect_err("rebuild must not copy mid-block limbs");
+    assert!(
+        matches!(error, RegionError::MpzIntegrity { .. }),
+        "rebuild expected MpzIntegrity for mid-block limbs, got {error:?}"
+    );
 }
 
 /// Walk refuses an unaligned ctor extent. Rebuild used to copy a 1..7-byte
