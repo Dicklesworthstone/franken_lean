@@ -221,6 +221,7 @@ pub enum ClosedVmValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClosedVmValueError {
     NonReturningExit,
+    InconsistentStringHeader,
     StringMissingTrailingNul,
     StringSizeExceedsBuffer { size: usize, buffer: usize },
     StringPayloadIsNotUtf8,
@@ -231,6 +232,9 @@ impl fmt::Display for ClosedVmValueError {
         match self {
             Self::NonReturningExit => {
                 formatter.write_str("non-returning VM exit has no closed return value")
+            }
+            Self::InconsistentStringHeader => {
+                formatter.write_str("returned String header is inconsistent")
             }
             Self::StringMissingTrailingNul => {
                 formatter.write_str("returned String did not contain its required trailing NUL")
@@ -269,7 +273,11 @@ pub fn closed_vm_value(exit: &VmExit) -> Result<Option<ClosedVmValue>, ClosedVmV
         return Ok(None);
     }
 
-    let (size, _, _, bytes) = returned.value.string_view();
+    // `string_view` asserts. This door is embedder-facing: a hostile
+    // header must be a typed `ClosedVmValueError`, never a process death.
+    let Some((size, _, _, bytes)) = returned.value.try_string_view() else {
+        return Err(ClosedVmValueError::InconsistentStringHeader);
+    };
     let Some(content_size) = size.checked_sub(1) else {
         return Err(ClosedVmValueError::StringMissingTrailingNul);
     };
