@@ -1030,6 +1030,17 @@ impl<'a> OleanView<'a> {
             });
         }
         let len = self.read_u64(off + 8)?;
+        let capacity = self.read_u64(off + 16)?;
+        // The walk already refuses size > capacity. This reader is the
+        // ModuleData path; without the same law it would treat the next
+        // object's bytes as extra elements whenever the file was long
+        // enough to satisfy the size*8 charge below.
+        if len > capacity {
+            return Err(RegionError::DecodeShape {
+                offset: off,
+                reason: "array size > capacity",
+            });
+        }
         // The length is attacker-controlled and must be proven to fit BEFORE it
         // reaches a caller, because callers size allocations from it. Without this,
         // a 24-byte array object claiming 2^40 elements makes the decoder allocate

@@ -184,6 +184,12 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             kind = "array";
             let size = view.read_u64(off + 8)?;
             let capacity = view.read_u64(off + 16)?;
+            if size > capacity {
+                return Err(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "array size > capacity",
+                });
+            }
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
             for i in 0..size {

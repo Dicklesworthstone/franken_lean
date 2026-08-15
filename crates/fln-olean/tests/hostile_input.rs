@@ -234,6 +234,38 @@ fn an_array_capacity_high_bit_flip_is_refused_without_overflow() {
     );
 }
 
+/// The walk already refuses size > capacity. ModuleData's `array_view` used
+/// to charge `size * 8` against the file only, so a short array claiming
+/// extra elements would read the next object as pointers.
+#[test]
+fn a_module_array_past_its_capacity_is_refused_by_array_view() {
+    let bytes = pilot();
+    {
+        let view = OleanView::parse(&bytes).expect("pilot parses");
+        view.module_data(WalkBudget::default())
+            .expect("the unmutated pilot decodes ModuleData");
+    }
+    let objects = collect_objects(&bytes);
+    let mut hostile = bytes.clone();
+    let mut n = 0usize;
+    for array in objects.iter().filter(|obj| obj.tag == abi::TAG_ARRAY) {
+        let capacity = get_u64(&hostile, array.off + 16);
+        put_u64(&mut hostile, array.off + 8, capacity + 1);
+        n += 1;
+    }
+    assert!(n > 0, "the pilot carries at least one array");
+
+    let view = OleanView::parse(&hostile).expect("hostile parses structurally");
+    let error = view
+        .module_data(WalkBudget::default())
+        .expect_err("ModuleData must not treat overflowed array slots as elements");
+    let text = message_of(&error);
+    assert!(
+        text.contains("capacity"),
+        "the refusal must name the capacity law, got: {text}"
+    );
+}
+
 // --- finding 3: a wrap-around base is refused at the envelope ----------------
 
 #[test]
