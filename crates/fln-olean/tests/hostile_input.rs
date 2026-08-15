@@ -356,6 +356,23 @@ fn a_scalar_array_past_eof_is_refused_by_the_walk() {
         hostile
     };
 
+    // (a0) element size 0: the shared engine refuses this; `.max(1)` used
+    // to charge the wrong extent and let the walk succeed.
+    let mut zero_elem = bytes.to_vec();
+    let word = get_u64(&zero_elem, array.off);
+    let retagged_zero =
+        (word & !(0xffu64 << 56) & !(0xffu64 << 48)) | ((abi::TAG_SCALAR_ARRAY as u64) << 56);
+    put_u64(&mut zero_elem, array.off, retagged_zero);
+    let view = OleanView::parse(&zero_elem).expect("hostile parses structurally");
+    let error = view
+        .walk(WalkBudget::default())
+        .expect_err("a zero element size must refuse");
+    let text = message_of(&error);
+    assert!(
+        text.contains("element size"),
+        "the refusal must name the element-size law, got: {text}"
+    );
+
     // (a) size beyond capacity: the new capacity check refuses it.
     let mut hostile = retag(&bytes);
     let capacity = get_u64(&hostile, array.off + 16);

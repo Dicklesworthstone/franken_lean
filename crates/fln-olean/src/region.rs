@@ -744,10 +744,19 @@ impl<'a> OleanView<'a> {
                         reason: "scalar-array size > capacity",
                     });
                 }
+                // `m_other` is the element size. Zero is not a Lean sarray:
+                // the shared engine refuses it (FL-INV-07) and `.max(1)`
+                // would silently charge the wrong extent.
+                if other == 0 {
+                    return Err(RegionError::DecodeShape {
+                        offset: off,
+                        reason: "scalar-array element size is 0",
+                    });
+                }
                 // The allocation spans capacity * elem bytes, not `size` bytes —
                 // charging only `size` let a payload run past EOF with a clean
                 // verdict (fln-abaz finding 5).
-                let elem = u64::from(other).max(1);
+                let elem = u64::from(other);
                 let extent = capacity.checked_mul(elem).ok_or(RegionError::DecodeShape {
                     offset: off,
                     reason: "scalar-array extent overflows the address space",

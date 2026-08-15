@@ -218,7 +218,13 @@ pub fn rebuild(bytes: &[u8]) -> Result<(Vec<u8>, RebuildReport), RegionError> {
             let capacity = view.read_u64(off + 16)?;
             out.extend_from_slice(&size.to_le_bytes());
             out.extend_from_slice(&capacity.to_le_bytes());
-            let elem = other.max(1) as u64;
+            if other == 0 {
+                return Err(RegionError::DecodeShape {
+                    offset: off,
+                    reason: "scalar-array element size is 0",
+                });
+            }
+            let elem = u64::from(other);
             let payload = size.checked_mul(elem).ok_or(RegionError::DecodeShape {
                 offset: off,
                 reason: "scalar-array payload overflows the address space",
