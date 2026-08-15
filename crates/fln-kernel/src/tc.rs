@@ -2596,7 +2596,14 @@ impl<'a> TypeChecker<'a> {
     /// fln-bignum; results re-enter the term plane loss-free via interop.
     fn reduce_nat(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
         const REDUCE_POW_MAX_EXP: u64 = 1 << 24;
-        let (head, args) = app_spine(e);
+        // `reduce_nat` is offered every WHNF candidate. Inspect the borrowed
+        // head before cloning the application spine: real corpus checks reach
+        // this point tens of thousands of times for non-Nat heads, while only
+        // a handful are members of the pinned reduction table.
+        let mut head = e;
+        while let ExprNode::App { f, .. } = head.node() {
+            head = f;
+        }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -2606,6 +2613,7 @@ impl<'a> TypeChecker<'a> {
         let Some(op) = nat_op_leaf(name) else {
             return Ok(None);
         };
+        let (_, args) = app_spine(e);
         if args.len() == 1 {
             if op != "succ" {
                 return Ok(None);
