@@ -2344,24 +2344,22 @@ impl<'a> TypeChecker<'a> {
                         }
                         if head == head0 && rebuilt == current {
                             // KR-205: the head is stable and no wrapper was
-                            // dropped. A pending projection of an already
-                            // exposed constructor can extract its field
-                            // directly; recursor dispatch cannot reduce a
-                            // constructor head and only burns one governed
-                            // step before the same projection check. Other
-                            // applications still try quotient computation and
-                            // inductive iota before a projection may remain
-                            // stuck.
-                            let constructor_field =
-                                pending_projs.last().and_then(|(struct_name, idx)| {
-                                    self.reduce_proj(struct_name, *idx, &current)
-                                });
-                            if let Some(field) = constructor_field {
-                                pending_projs.pop();
-                                depth = depth.saturating_add(1);
-                                self.step(depth)?;
-                                current = field;
-                            } else {
+                            // dropped. Recursor and quotient reduction dispatch
+                            // exclusively by the application head's environment
+                            // kind; every other head is a known miss. Avoiding
+                            // that futile governed step also lets a pending
+                            // constructor projection extract its field directly.
+                            let recursor_candidate = match head.node() {
+                                ExprNode::Const { name, .. } => match self.env.find(name) {
+                                    Some(ConstantInfo::Rec(_)) => true,
+                                    Some(ConstantInfo::Quot(quot)) => {
+                                        matches!(quot.kind, QuotKind::Lift | QuotKind::Ind)
+                                    }
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+                            if recursor_candidate {
                                 match self.reduce_recursor(&current, depth + 1)? {
                                     Some(reduced) => {
                                         current = reduced;
@@ -2376,6 +2374,15 @@ impl<'a> TypeChecker<'a> {
                                         PendingProj::Done(value) => break value,
                                         PendingProj::Continue(field) => current = field,
                                     },
+                                }
+                            } else {
+                                match self.finish_pending_projs(
+                                    current.clone(),
+                                    &mut pending_projs,
+                                    &mut depth,
+                                )? {
+                                    PendingProj::Done(value) => break value,
+                                    PendingProj::Continue(field) => current = field,
                                 }
                             }
                         } else {
