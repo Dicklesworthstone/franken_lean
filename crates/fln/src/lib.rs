@@ -4068,6 +4068,7 @@ pub struct EngineExecutionLimits {
     pub ingress: IngressLimits,
     pub flbc_codec: CodecLimits,
     pub vm: VmExecutionLimits,
+    pub source_modules: SourceModuleLimits,
 }
 
 impl EngineExecutionLimits {
@@ -4081,6 +4082,7 @@ impl EngineExecutionLimits {
             ingress: IngressLimits::default(),
             flbc_codec: CodecLimits::default(),
             vm: VmExecutionLimits::default(),
+            source_modules: SourceModuleLimits::default(),
         }
     }
 
@@ -4091,6 +4093,22 @@ impl EngineExecutionLimits {
             checker: self.checker,
             declaration: self.declaration,
             collisions: self.collisions,
+        }
+    }
+}
+
+/// Explicit planning bounds for a closed bounded-source import graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceModuleLimits {
+    pub max_modules: usize,
+    pub max_imports: usize,
+}
+
+impl Default for SourceModuleLimits {
+    fn default() -> Self {
+        Self {
+            max_modules: 4_096,
+            max_imports: 65_536,
         }
     }
 }
@@ -4147,6 +4165,17 @@ pub struct DefinitionExecution {
     pub exit: VmExit,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+}
+
+/// One exact source module in a caller-supplied closed import set.
+///
+/// `name` is resolver authority supplied by the caller. The source header must
+/// agree by importing only other names present in the same closed set; the
+/// engine never invents a missing predecessor environment.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceModuleInput<'source> {
+    pub name: &'source Name,
+    pub source: &'source [u8],
 }
 
 /// The authoritative result of one atomic nonempty definition batch.
@@ -4521,6 +4550,34 @@ impl std::error::Error for EngineAdmissionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineExecutionError {
     EmptyBatch,
+    SourceModuleLimit {
+        observed: usize,
+        limit: usize,
+    },
+    SourceImportLimit {
+        observed: usize,
+        limit: usize,
+    },
+    ImportsRequireResolver {
+        imports: Vec<Name>,
+    },
+    DuplicateSourceModule {
+        module: Name,
+    },
+    MissingSourceEntry {
+        module: Name,
+    },
+    MissingSourceImports {
+        module: Name,
+        imports: Vec<Name>,
+    },
+    UnreachableSourceModules {
+        entry: Name,
+        modules: Vec<Name>,
+    },
+    SourceModuleCycle {
+        modules: Vec<Name>,
+    },
     AllocationFailure {
         resource: &'static str,
         requested: usize,
@@ -4558,6 +4615,46 @@ impl fmt::Display for EngineExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
+            Self::SourceModuleLimit { observed, limit } => write!(
+                formatter,
+                "source set contains {observed} modules; planning limit is {limit}"
+            ),
+            Self::SourceImportLimit { observed, limit } => write!(
+                formatter,
+                "source set presents {observed} imports; planning limit is {limit}"
+            ),
+            Self::ImportsRequireResolver { imports } => write!(
+                formatter,
+                "source imports require a closed module resolver: {}",
+                display_names(imports)
+            ),
+            Self::DuplicateSourceModule { module } => write!(
+                formatter,
+                "source set repeats module `{}`",
+                module.to_display_string()
+            ),
+            Self::MissingSourceEntry { module } => write!(
+                formatter,
+                "source entry module `{}` is absent from the closed set",
+                module.to_display_string()
+            ),
+            Self::MissingSourceImports { module, imports } => write!(
+                formatter,
+                "source module `{}` imports modules absent from the closed set: {}",
+                module.to_display_string(),
+                display_names(imports)
+            ),
+            Self::UnreachableSourceModules { entry, modules } => write!(
+                formatter,
+                "source modules are outside entry `{}`'s import closure: {}",
+                entry.to_display_string(),
+                display_names(modules)
+            ),
+            Self::SourceModuleCycle { modules } => write!(
+                formatter,
+                "source import graph contains a cycle: {}",
+                display_names(modules)
+            ),
             Self::AllocationFailure {
                 resource,
                 requested,

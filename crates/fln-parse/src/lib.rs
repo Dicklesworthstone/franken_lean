@@ -1080,8 +1080,16 @@ mod nat_definition_tests {
         assert_eq!(module.commands.len(), 2);
         assert_eq!(module.commands[0].1, b"def first := 1\r\n");
         assert_eq!(module.commands[1].1, b"def answer := first");
-        assert_eq!(&source[module.commands[0].0.0..], module.commands[0].1);
-        assert_eq!(&source[module.commands[1].0.0..], module.commands[1].1);
+        assert_eq!(
+            &source[module.commands[0].0.0
+                ..module.commands[0].0.0 + module.commands[0].1.len()],
+            module.commands[0].1
+        );
+        assert_eq!(
+            &source[module.commands[1].0.0
+                ..module.commands[1].0.0 + module.commands[1].1.len()],
+            module.commands[1].1
+        );
     }
 
     #[test]
