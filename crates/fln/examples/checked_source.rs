@@ -1,8 +1,9 @@
 //! Minimal embedder over the currently implemented bounded source facade.
 //!
 //! This example uses source bytes supplied by the caller and explicit resource
-//! limits. It does not claim the planned `Cx`, project/import, receipt, or full
-//! Lean APIs already exist.
+//! limits. It does not claim the planned `Cx`, automatic project discovery,
+//! implicit Prelude, receipt, or full Lean APIs already exist. The library's
+//! separate `SourceModuleInput` door covers exact caller-supplied import sets.
 
 #![forbid(unsafe_code)]
 

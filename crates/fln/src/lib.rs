@@ -65,7 +65,7 @@ pub use fln_core::mode::{
     BuildProfileId, CgsePolicyId, ClosureComponent, ContentRoot, DeterminismClass, EpochId, Mode,
     ReproducibilityProfile, TargetId,
 };
-pub use fln_core::name::Name;
+pub use fln_core::name::{LeafView, Name};
 pub use fln_core::options::KVMap;
 pub use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
 pub use fln_elab::{
@@ -125,6 +125,7 @@ pub use fln_olean::write::{
     WriteError as OleanWriteError, WriteResource as OleanWriteResource,
     encode_expr_region as encode_olean_expr_region, encode_module as encode_olean_module,
 };
+pub use fln_parse::{DefinitionParseError, PartitionedSourceModule, partition_source_module};
 pub use fln_server::LspProjection;
 pub use fln_verdict as verdict;
 pub use fln_verdict::{
@@ -1743,6 +1744,45 @@ pub struct Engine {
     checker_environment: Option<CheckerConstantEnvironment>,
 }
 
+fn bounded_source_module_name_depth(
+    module: &Name,
+    limit: usize,
+) -> Result<usize, EngineExecutionError> {
+    let mut cursor = module.clone();
+    let mut depth = 0_usize;
+    while !cursor.is_anonymous() {
+        match cursor.leaf_view() {
+            LeafView::Str(component) if !component.is_empty() => {}
+            LeafView::Anonymous | LeafView::Num(_) | LeafView::Str(_) => {
+                return Err(EngineExecutionError::InvalidSourceModuleName {
+                    module: module.clone(),
+                });
+            }
+        }
+        depth = depth
+            .checked_add(1)
+            .ok_or_else(|| EngineExecutionError::SourceModuleNameLimit {
+                module: module.clone(),
+                observed: usize::MAX,
+                limit,
+            })?;
+        if depth > limit {
+            return Err(EngineExecutionError::SourceModuleNameLimit {
+                module: module.clone(),
+                observed: depth,
+                limit,
+            });
+        }
+        cursor = cursor.parent();
+    }
+    if depth == 0 {
+        return Err(EngineExecutionError::InvalidSourceModuleName {
+            module: module.clone(),
+        });
+    }
+    Ok(depth)
+}
+
 impl Engine {
     /// Attach the embeddable facade to an existing immutable environment
     /// produced by an importer, module transaction, or earlier engine session.
@@ -2590,29 +2630,247 @@ impl Engine {
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         let mut commands = Vec::new();
         for source in sources {
-            let partitioned =
-                fln_parse::partition_definition_commands(source).map_err(|error| {
-                    EngineExecutionError::BatchCommand {
-                        index: commands.len(),
-                        error: Box::new(EngineExecutionError::Frontend(
-                            DefinitionFrontendError::Parse(error),
-                        )),
-                    }
-                })?;
-            let requested = commands.len().checked_add(partitioned.len()).ok_or(
-                EngineExecutionError::AllocationFailure {
-                    resource: "definition command table",
-                    requested: usize::MAX,
-                },
-            )?;
-            commands.try_reserve(partitioned.len()).map_err(|_| {
-                EngineExecutionError::AllocationFailure {
-                    resource: "definition command table",
-                    requested,
+            let partitioned = fln_parse::partition_source_module(source).map_err(|error| {
+                EngineExecutionError::BatchCommand {
+                    index: commands.len(),
+                    error: Box::new(EngineExecutionError::Frontend(
+                        DefinitionFrontendError::Parse(error),
+                    )),
                 }
             })?;
-            commands.extend(partitioned);
+            if !partitioned.imports.is_empty() {
+                return Err(EngineExecutionError::ImportsRequireResolver {
+                    imports: partitioned.imports,
+                });
+            }
+            let requested = commands
+                .len()
+                .checked_add(partitioned.commands.len())
+                .ok_or(EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested: usize::MAX,
+                })?;
+            commands
+                .try_reserve(partitioned.commands.len())
+                .map_err(|_| EngineExecutionError::AllocationFailure {
+                    resource: "definition command table",
+                    requested,
+                })?;
+            commands.extend(partitioned.commands);
         }
+        self.execute_source_commands(commands, options, limits)
+    }
+
+    /// Execute an exact, caller-named closed source-module import graph.
+    ///
+    /// Every direct import must name another supplied module. The entry must
+    /// reach every row, so an unused file cannot silently influence which final
+    /// definition is reported. Modules are dependency-sorted with structural
+    /// [`Name`] order as the CGSE tie-break; definitions retain source order
+    /// within a module. Graph refusal, frontend refusal, admission non-answer,
+    /// or execution failure exposes no successor engine.
+    pub fn execute_source_modules(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+        if modules.is_empty() {
+            return Err(EngineExecutionError::EmptyBatch);
+        }
+        if modules.len() > limits.source_modules.max_modules {
+            return Err(EngineExecutionError::SourceModuleLimit {
+                observed: modules.len(),
+                limit: limits.source_modules.max_modules,
+            });
+        }
+
+        let mut owners = BTreeMap::new();
+        for (index, module) in modules.iter().enumerate() {
+            bounded_source_module_name_depth(
+                module.name,
+                limits.source_modules.max_name_depth,
+            )?;
+            if owners.insert(module.name.clone(), index).is_some() {
+                return Err(EngineExecutionError::DuplicateSourceModule {
+                    module: module.name.clone(),
+                });
+            }
+        }
+        let Some(&entry_index) = owners.get(entry) else {
+            return Err(EngineExecutionError::MissingSourceEntry {
+                module: entry.clone(),
+            });
+        };
+
+        let mut parsed = Vec::new();
+        parsed.try_reserve_exact(modules.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "parsed source module table",
+                requested: modules.len(),
+            }
+        })?;
+        let mut import_presentations = 0_usize;
+        for module in modules {
+            let partitioned =
+                fln_parse::partition_source_module(module.source).map_err(|error| {
+                    EngineExecutionError::Frontend(DefinitionFrontendError::Parse(error))
+                })?;
+            for import in &partitioned.imports {
+                bounded_source_module_name_depth(
+                    import,
+                    limits.source_modules.max_name_depth,
+                )?;
+            }
+            import_presentations = import_presentations
+                .checked_add(partitioned.imports.len())
+                .ok_or(EngineExecutionError::SourceImportLimit {
+                    observed: usize::MAX,
+                    limit: limits.source_modules.max_imports,
+                })?;
+            if import_presentations > limits.source_modules.max_imports {
+                return Err(EngineExecutionError::SourceImportLimit {
+                    observed: import_presentations,
+                    limit: limits.source_modules.max_imports,
+                });
+            }
+            parsed.push(partitioned);
+        }
+
+        let mut dependencies = vec![Vec::new(); modules.len()];
+        let mut remaining = vec![0_usize; modules.len()];
+        let mut dependents = vec![Vec::new(); modules.len()];
+        for (index, module) in parsed.iter().enumerate() {
+            let mut unique = BTreeSet::new();
+            let mut missing = BTreeSet::new();
+            for import in &module.imports {
+                match owners.get(import).copied() {
+                    Some(owner) => {
+                        unique.insert(owner);
+                    }
+                    None => {
+                        missing.insert(import.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                return Err(EngineExecutionError::MissingSourceImports {
+                    module: modules[index].name.clone(),
+                    imports: missing.into_iter().collect(),
+                });
+            }
+            dependencies[index]
+                .try_reserve_exact(unique.len())
+                .map_err(|_| EngineExecutionError::AllocationFailure {
+                    resource: "source module dependency table",
+                    requested: unique.len(),
+                })?;
+            dependencies[index].extend(unique.iter().copied());
+            remaining[index] = unique.len();
+            for dependency in unique {
+                dependents[dependency].push(index);
+            }
+        }
+
+        let mut reachable = vec![false; modules.len()];
+        let mut pending = vec![entry_index];
+        while let Some(index) = pending.pop() {
+            if reachable[index] {
+                continue;
+            }
+            reachable[index] = true;
+            pending.extend(dependencies[index].iter().copied());
+        }
+        let unreachable = modules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !reachable[*index])
+            .map(|(_, module)| module.name.clone())
+            .collect::<Vec<_>>();
+        if !unreachable.is_empty() {
+            return Err(EngineExecutionError::UnreachableSourceModules {
+                entry: entry.clone(),
+                modules: unreachable,
+            });
+        }
+
+        let mut ready = modules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| remaining[*index] == 0)
+            .map(|(index, module)| (module.name.clone(), index))
+            .collect::<BTreeSet<_>>();
+        let mut order = Vec::new();
+        order.try_reserve_exact(modules.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source module order",
+                requested: modules.len(),
+            }
+        })?;
+        while let Some((_, index)) = ready.pop_first() {
+            order.push(index);
+            for dependent in &dependents[index] {
+                remaining[*dependent] = remaining[*dependent].checked_sub(1).ok_or(
+                    EngineExecutionError::UnexpectedPublication {
+                        detail: "source module dependency count underflowed",
+                    },
+                )?;
+                if remaining[*dependent] == 0 {
+                    ready.insert((modules[*dependent].name.clone(), *dependent));
+                }
+            }
+        }
+        if order.len() != modules.len() {
+            return Err(EngineExecutionError::SourceModuleCycle {
+                modules: modules
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| remaining[*index] != 0)
+                    .map(|(_, module)| module.name.clone())
+                    .collect(),
+            });
+        }
+
+        let module_order = order
+            .iter()
+            .map(|index| modules[*index].name.clone())
+            .collect::<Vec<_>>();
+        let command_count = order.iter().try_fold(0_usize, |total, index| {
+            total.checked_add(parsed[*index].commands.len())
+        });
+        let Some(command_count) = command_count else {
+            return Err(EngineExecutionError::AllocationFailure {
+                resource: "definition command table",
+                requested: usize::MAX,
+            });
+        };
+        let mut commands = Vec::new();
+        commands.try_reserve_exact(command_count).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "definition command table",
+                requested: command_count,
+            }
+        })?;
+        for index in order {
+            commands.extend(parsed[index].commands.iter().copied());
+        }
+        match self.execute_source_commands(commands, options, limits)? {
+            Outcome::Complete(mut completed) => {
+                completed.source_module_order = module_order;
+                Ok(Outcome::Complete(completed))
+            }
+            Outcome::Inconclusive(inconclusive) => Ok(Outcome::Inconclusive(inconclusive)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        }
+    }
+
+    fn execute_source_commands(
+        &self,
+        commands: Vec<(fln_parse::BytePos, &[u8])>,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         self.execute_batch(commands.len(), options, |engine, index| {
             let (original_offset, source) = commands[index];
             let parsed = fln_parse::parse_definition(source)
@@ -2683,6 +2941,7 @@ impl Engine {
             base_logical_root,
             result_logical_root,
             executions,
+            source_module_order: Vec::new(),
         }))
     }
 
@@ -4102,6 +4361,7 @@ impl EngineExecutionLimits {
 pub struct SourceModuleLimits {
     pub max_modules: usize,
     pub max_imports: usize,
+    pub max_name_depth: usize,
 }
 
 impl Default for SourceModuleLimits {
@@ -4109,6 +4369,7 @@ impl Default for SourceModuleLimits {
         Self {
             max_modules: 4_096,
             max_imports: 65_536,
+            max_name_depth: 256,
         }
     }
 }
@@ -4189,6 +4450,9 @@ pub struct DefinitionBatchExecution {
     pub result_logical_root: LogicalRoot,
     /// Every completed definition in input order, including its root transition.
     pub executions: Vec<DefinitionExecution>,
+    /// Canonical dependency order for a closed source-module execution.
+    /// Empty for declaration batches and legacy caller-ordered source batches.
+    pub source_module_order: Vec<Name>,
 }
 
 const SOURCE_RUN_EPOCH_ID: EpochId = EpochId::new(4_032_000);
@@ -4558,6 +4822,14 @@ pub enum EngineExecutionError {
         observed: usize,
         limit: usize,
     },
+    SourceModuleNameLimit {
+        module: Name,
+        observed: usize,
+        limit: usize,
+    },
+    InvalidSourceModuleName {
+        module: Name,
+    },
     ImportsRequireResolver {
         imports: Vec<Name>,
     },
@@ -4622,6 +4894,20 @@ impl fmt::Display for EngineExecutionError {
             Self::SourceImportLimit { observed, limit } => write!(
                 formatter,
                 "source set presents {observed} imports; planning limit is {limit}"
+            ),
+            Self::SourceModuleNameLimit {
+                module,
+                observed,
+                limit,
+            } => write!(
+                formatter,
+                "source module name `{}` has {observed} components; planning limit is {limit}",
+                module.to_display_string()
+            ),
+            Self::InvalidSourceModuleName { module } => write!(
+                formatter,
+                "source module name `{}` is not a nonempty string-component name",
+                module.to_display_string()
             ),
             Self::ImportsRequireResolver { imports } => write!(
                 formatter,
@@ -4754,8 +5040,8 @@ mod tests {
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
-        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, closed_vm_value,
-        decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
+        ReducibilityHints, RejectClass, SourceModuleInput, TheoremVal, VmExecutionLimits,
+        closed_vm_value, decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
         project_lsp_diagnostics, rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
@@ -9271,6 +9557,196 @@ mod tests {
             panic!("the dependent second definition must return normally");
         };
         assert_eq!(returned.value.unbox(), 1);
+    }
+
+    #[test]
+    fn closed_source_modules_derive_import_order_and_execute_the_entry_last() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let middle = Name::from_components(["Project", "Middle"]);
+        let base = Name::from_components(["Project", "Base"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Project.Middle\ndef answer : Nat := Nat.add middle 1",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"def base : Nat := 20",
+            },
+            SourceModuleInput {
+                name: &middle,
+                source: b"import Project.Base\ndef middle : Nat := Nat.mul base 2",
+            },
+        ];
+
+        let completed = engine
+            .execute_source_modules(&modules, &main, &options, test_limits())
+            .expect("the exact closed source graph reaches the native pipeline");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the bounded source graph must answer completely");
+        };
+
+        let names = completed
+            .executions
+            .iter()
+            .map(|execution| match &execution.declaration {
+                Declaration::Defn(definition) => definition.base.name.to_display_string(),
+                other => panic!("source execution produced non-definition {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["base", "middle", "answer"]);
+        assert_eq!(completed.source_module_order, [base, middle, main]);
+        let VmExit::Returned(returned) = &completed.executions[2].exit else {
+            panic!("the entry definition must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 41);
+        assert!(
+            completed
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+    }
+
+    #[test]
+    fn unresolved_source_imports_never_enter_the_legacy_ordered_batch() {
+        let engine = seeded_engine();
+        let imports: [&[u8]; 1] = [b"import Missing\ndef answer := 1"];
+        let error = engine
+            .execute_source_definitions(&imports, &KVMap::new(), test_limits())
+            .expect_err("an ordered byte batch is not import resolver authority");
+        assert!(matches!(
+            error,
+            EngineExecutionError::ImportsRequireResolver { imports }
+                if imports == vec![Name::from_components(["Missing"])]
+        ));
+        assert_eq!(engine.environment().len(), 1);
+    }
+
+    #[test]
+    fn closed_source_modules_refuse_missing_duplicate_cyclic_and_unused_rows() {
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let other = Name::from_components(["Other"]);
+        let missing = [SourceModuleInput {
+            name: &main,
+            source: b"import Absent\ndef answer := 1",
+        }];
+        assert!(matches!(
+            engine.execute_source_modules(&missing, &main, &options, test_limits()),
+            Err(EngineExecutionError::MissingSourceImports { module, imports })
+                if module == main && imports == vec![Name::from_components(["Absent"])]
+        ));
+
+        let duplicate = [
+            SourceModuleInput {
+                name: &main,
+                source: b"def first := 1",
+            },
+            SourceModuleInput {
+                name: &main,
+                source: b"def second := 2",
+            },
+        ];
+        assert!(matches!(
+            engine.execute_source_modules(&duplicate, &main, &options, test_limits()),
+            Err(EngineExecutionError::DuplicateSourceModule { module }) if module == main
+        ));
+
+        let cycle = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Other\ndef answer := other",
+            },
+            SourceModuleInput {
+                name: &other,
+                source: b"import Main\ndef other := answer",
+            },
+        ];
+        assert!(matches!(
+            engine.execute_source_modules(&cycle, &main, &options, test_limits()),
+            Err(EngineExecutionError::SourceModuleCycle { modules }) if modules.len() == 2
+        ));
+
+        let unused = [
+            SourceModuleInput {
+                name: &main,
+                source: b"def answer := 1",
+            },
+            SourceModuleInput {
+                name: &other,
+                source: b"def other := 2",
+            },
+        ];
+        assert!(matches!(
+            engine.execute_source_modules(&unused, &main, &options, test_limits()),
+            Err(EngineExecutionError::UnreachableSourceModules { entry, modules })
+                if entry == main && modules == vec![other]
+        ));
+        assert_eq!(engine.environment().len(), 1);
+    }
+
+    #[test]
+    fn closed_source_module_planning_limits_are_typed_and_recoverable() {
+        let engine = seeded_engine();
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let dependency = Name::from_components(["Dependency"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Dependency\ndef answer := dependency",
+            },
+            SourceModuleInput {
+                name: &dependency,
+                source: b"def dependency := 7",
+            },
+        ];
+        let mut limited = test_limits();
+        limited.source_modules.max_imports = 0;
+        assert_eq!(
+            engine
+                .execute_source_modules(&modules, &main, &options, limited)
+                .expect_err("zero import presentations is an explicit planning stop"),
+            EngineExecutionError::SourceImportLimit {
+                observed: 1,
+                limit: 0,
+            }
+        );
+        assert_eq!(engine.environment().len(), 1);
+
+        let completed = engine
+            .execute_source_modules(&modules, &main, &options, test_limits())
+            .expect("the same graph recovers under the ordinary bound");
+        assert!(matches!(completed, Outcome::Complete(_)));
+
+        let hierarchical = Name::from_components(["Project", "Dependency"]);
+        let hierarchical_modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Project.Dependency\ndef answer := dependency",
+            },
+            SourceModuleInput {
+                name: &hierarchical,
+                source: b"def dependency := 7",
+            },
+        ];
+        let mut shallow = test_limits();
+        shallow.source_modules.max_name_depth = 1;
+        assert!(matches!(
+            engine.execute_source_modules(&hierarchical_modules, &main, &options, shallow),
+            Err(EngineExecutionError::SourceModuleNameLimit {
+                module,
+                observed: 2,
+                limit: 1,
+            }) if module == hierarchical
+        ));
     }
 
     #[test]

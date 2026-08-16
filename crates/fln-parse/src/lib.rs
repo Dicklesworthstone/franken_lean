@@ -28,7 +28,8 @@ use build::{BuildError, Leaves};
 use fln_core::name::Name;
 use fln_syntax::literal::LiteralKind;
 use fln_syntax::run::{Event, lex_run};
-use fln_syntax::source::{BytePos, ByteSpan, SourceError, SourceInfo, SourceText};
+pub use fln_syntax::source::BytePos;
+use fln_syntax::source::{ByteSpan, SourceError, SourceInfo, SourceText};
 use fln_syntax::token::{LexedToken, TokenKind, TokenTable};
 use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
@@ -998,8 +999,7 @@ pub fn partition_source_module(
         }
     };
 
-    let body_start =
-        definition_start.unwrap_or_else(|| if imports.is_empty() { 0 } else { source.len() });
+    let body_start = definition_start.unwrap_or(if imports.is_empty() { 0 } else { source.len() });
     let mut commands = partition_definition_commands(&source[body_start..])
         .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
     for (offset, _) in &mut commands {
@@ -1081,13 +1081,11 @@ mod nat_definition_tests {
         assert_eq!(module.commands[0].1, b"def first := 1\r\n");
         assert_eq!(module.commands[1].1, b"def answer := first");
         assert_eq!(
-            &source[module.commands[0].0.0
-                ..module.commands[0].0.0 + module.commands[0].1.len()],
+            &source[module.commands[0].0.0..module.commands[0].0.0 + module.commands[0].1.len()],
             module.commands[0].1
         );
         assert_eq!(
-            &source[module.commands[1].0.0
-                ..module.commands[1].0.0 + module.commands[1].1.len()],
+            &source[module.commands[1].0.0..module.commands[1].0.0 + module.commands[1].1.len()],
             module.commands[1].1
         );
     }

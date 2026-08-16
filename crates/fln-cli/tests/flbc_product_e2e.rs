@@ -23,6 +23,105 @@ fn utf8(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("CLI output is UTF-8")
 }
 
+fn fresh_test_root(label: &str) -> PathBuf {
+    let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    for attempt in 0..1_024_u32 {
+        let candidate = parent.join(format!(
+            "{label}-{}-{:?}-{attempt}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create retained integration-test directory: {error}"),
+        }
+    }
+    panic!("could not allocate a retained integration-test directory");
+}
+
+#[test]
+fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
+    let root = fresh_test_root("source-import-closure-e2e");
+    let project = root.join("Project");
+    std::fs::create_dir(&project).expect("create module namespace directory");
+    let base = project.join("Base.lean");
+    let middle = project.join("Middle.lean");
+    let main = root.join("Main.lean");
+    let product = root.join("Main.flbc");
+    std::fs::write(&base, b"def base : Nat := 20\n").expect("write base module");
+    std::fs::write(
+        &middle,
+        b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
+    )
+    .expect("write middle module");
+    std::fs::write(
+        &main,
+        b"import Project.Middle\ndef answer : Nat := Nat.add middle 2\n",
+    )
+    .expect("write entry module");
+
+    let produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &product,
+        &middle,
+        &base,
+        &main,
+    ]);
+    assert!(
+        produced.status.success(),
+        "module producer stderr: {}",
+        utf8(&produced.stderr)
+    );
+    assert!(produced.stderr.is_empty());
+    let stdout = utf8(&produced.stdout);
+    assert!(stdout.contains("\"schema\":\"fln.source-run/6\""));
+    assert!(stdout.contains("\"definitions\":3"));
+    assert!(stdout.contains("\"finalValue\":42"));
+
+    let consumed = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &product,
+    ]);
+    assert!(
+        consumed.status.success(),
+        "module consumer stderr: {}",
+        utf8(&consumed.stderr)
+    );
+    assert!(consumed.stderr.is_empty());
+    assert!(utf8(&consumed.stdout).contains("\"returnValue\":42"));
+
+    let missing = root.join("MissingMain.lean");
+    std::fs::write(&missing, b"import Project.Absent\ndef answer : Nat := 1\n")
+        .expect("write open import graph");
+    let refused = run_fln(&[Path::new("run"), Path::new("--json"), &missing]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let stderr = utf8(&refused.stderr);
+    assert!(stderr.contains("\"class\":\"module-graph\""));
+    assert!(stderr.contains("\"authority\":false"));
+    assert!(stderr.contains("Project.Absent"));
+
+    let cycle_dir = root.join("Cycle");
+    std::fs::create_dir(&cycle_dir).expect("create cyclic module namespace");
+    let cycle_a = cycle_dir.join("A.lean");
+    let cycle_b = cycle_dir.join("B.lean");
+    std::fs::write(&cycle_a, b"import Cycle.B\ndef a : Nat := 1\n")
+        .expect("write first cyclic module");
+    std::fs::write(&cycle_b, b"import Cycle.A\ndef b : Nat := 2\n")
+        .expect("write second cyclic module");
+    let cycled = run_fln(&[Path::new("run"), Path::new("--json"), &cycle_b, &cycle_a]);
+    assert!(!cycled.status.success());
+    assert!(cycled.stdout.is_empty());
+    let stderr = utf8(&cycled.stderr);
+    assert!(stderr.contains("\"class\":\"module-graph\""));
+    assert!(stderr.contains("source import graph contains a cycle"));
+}
+
 #[test]
 fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     // ubs:ignore — test-only retained scratch discriminator, not a security token.

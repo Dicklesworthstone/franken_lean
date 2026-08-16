@@ -82,7 +82,9 @@ const USAGE: &str = concat!(
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
     "`run` executes supported Nat/String/Bool definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
-    "from each path in dependency order,\n",
+    "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
+    "import set. In the latter form the last path is the entry, `import A.B` binds\n",
+    "only a supplied path ending in A/B.lean, and dependency order is derived.\n",
     "through the native parser, elaborator, K1, independent checker, compiler,\n",
     "and Golem. The final path must produce a closed Nat, String, or Bool result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
@@ -91,8 +93,8 @@ const USAGE: &str = concat!(
     "replaced. --emit-sidecar requires\n",
     "--emit-flbc and publishes a standard-profile closure manifest before the\n",
     "product, so any interrupted pair fails closed by root mismatch. It is not\n",
-    "general Lean,\n",
-    "Prelude/import processing, a project build, a certified build product, or\n",
+    "general Lean, automatic module discovery, implicit Prelude processing, a\n",
+    "project build, a certified build product, or\n",
     "evidence that `check-olean` is complete.\n",
     "\n",
     "`flbc run` validates and executes one canonical FLBC artifact through Golem.\n",
@@ -3053,7 +3055,19 @@ fn source_terminal(
 fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static str, bool, u8) {
     match error {
         fln::EngineExecutionError::BatchCommand { error, .. } => execution_error_disposition(error),
-        fln::EngineExecutionError::AllocationFailure { .. } => ("resource", false, 3),
+        fln::EngineExecutionError::AllocationFailure { .. }
+        | fln::EngineExecutionError::SourceModuleLimit { .. }
+        | fln::EngineExecutionError::SourceImportLimit { .. }
+        | fln::EngineExecutionError::SourceModuleNameLimit { .. } => ("resource", false, 3),
+        fln::EngineExecutionError::ImportsRequireResolver { .. }
+        | fln::EngineExecutionError::DuplicateSourceModule { .. }
+        | fln::EngineExecutionError::MissingSourceEntry { .. }
+        | fln::EngineExecutionError::MissingSourceImports { .. }
+        | fln::EngineExecutionError::UnreachableSourceModules { .. }
+        | fln::EngineExecutionError::SourceModuleCycle { .. }
+        | fln::EngineExecutionError::InvalidSourceModuleName { .. } => {
+            ("module-graph", false, 1)
+        }
         fln::EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
             ("resource", false, 3)
         }
@@ -3134,6 +3148,7 @@ fn publication_failure_disposition(
 
 fn execute_source_bytes_with_publisher<P, E>(
     sources: Vec<Vec<u8>>,
+    module_plan: Option<SourceModulePlan>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     toolchain_image: Option<Vec<u8>>,
@@ -3186,11 +3201,20 @@ where
         }
     };
     let options = fln::KVMap::new();
-    let execution = match engine.execute_source_definitions(
-        &source_refs,
-        &options,
-        fln::EngineExecutionLimits::new(kernel_budget),
-    ) {
+    let limits = fln::EngineExecutionLimits::new(kernel_budget);
+    let execution = match module_plan.as_ref() {
+        Some(plan) => {
+            let modules = plan
+                .names
+                .iter()
+                .zip(source_refs.iter().copied())
+                .map(|(name, source)| fln::SourceModuleInput { name, source })
+                .collect::<Vec<_>>();
+            engine.execute_source_modules(&modules, &plan.entry, &options, limits)
+        }
+        None => engine.execute_source_definitions(&source_refs, &options, limits),
+    };
+    let execution = match execution {
         Ok(execution) => execution,
         Err(error) => {
             let (class, authority, exit_code) = execution_error_disposition(&error);
@@ -3206,6 +3230,50 @@ where
             return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
         }
     };
+    if let Some(plan) = module_plan.as_ref() {
+        let owners = plan
+            .names
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut ordered = Vec::new();
+        if ordered
+            .try_reserve_exact(completed.source_module_order.len())
+            .is_err()
+        {
+            return source_failure(
+                "resource",
+                "could not reserve the canonical source module closure",
+                false,
+                json,
+                3,
+            );
+        }
+        for name in &completed.source_module_order {
+            let Some(index) = owners.get(name).copied() else {
+                return source_failure(
+                    "internal-fault",
+                    "engine returned a source module absent from the input plan",
+                    false,
+                    json,
+                    4,
+                );
+            };
+            ordered.push(source_refs[index]);
+        }
+        if ordered.len() != source_refs.len() {
+            return source_failure(
+                "internal-fault",
+                "engine returned an incomplete canonical source module order",
+                false,
+                json,
+                4,
+            );
+        }
+        source_refs = ordered;
+    }
     let definitions = completed.executions.len();
     let Some(final_execution) = completed.executions.last() else {
         return source_failure(
@@ -3370,17 +3438,27 @@ where
 
 #[cfg(test)]
 fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput {
-    execute_source_bytes_with_publisher(sources, None, None, None, json, fln::publish_file_atomic)
+    execute_source_bytes_with_publisher(
+        sources,
+        None,
+        None,
+        None,
+        None,
+        json,
+        fln::publish_file_atomic,
+    )
 }
 
 fn execute_source_bytes_with_output(
     sources: Vec<Vec<u8>>,
+    module_plan: Option<SourceModulePlan>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     json: bool,
 ) -> MultiplexerOutput {
     execute_source_bytes_with_publisher(
         sources,
+        module_plan,
         emit_flbc,
         emit_sidecar,
         None,
@@ -3420,6 +3498,234 @@ fn read_source_batch(
     Ok(sources)
 }
 
+#[derive(Debug)]
+struct SourceModulePlan {
+    names: Vec<fln::Name>,
+    entry: fln::Name,
+}
+
+#[derive(Debug)]
+enum SourceModulePlanFailure {
+    Input(String),
+    Resource(String),
+}
+
+impl SourceModulePlanFailure {
+    fn detail(&self) -> &str {
+        match self {
+            Self::Input(detail) | Self::Resource(detail) => detail,
+        }
+    }
+
+    fn disposition(&self) -> (&'static str, bool, u8) {
+        match self {
+            Self::Input(_) => ("input", true, 1),
+            Self::Resource(_) => ("resource", false, 3),
+        }
+    }
+}
+
+fn source_module_components(name: &fln::Name) -> Option<Vec<String>> {
+    let mut reversed = Vec::new();
+    let mut cursor = name.clone();
+    while !cursor.is_anonymous() {
+        match cursor.leaf_view() {
+            fln::LeafView::Str(component) if !component.is_empty() => {
+                reversed.push(component.to_owned());
+            }
+            fln::LeafView::Anonymous | fln::LeafView::Num(_) | fln::LeafView::Str(_) => {
+                return None;
+            }
+        }
+        cursor = cursor.parent();
+    }
+    reversed.reverse();
+    (!reversed.is_empty()).then_some(reversed)
+}
+
+fn bounded_source_path_components(path: &Path, max_depth: usize) -> Option<Vec<String>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return None;
+    };
+    if path.extension().and_then(|extension| extension.to_str()) != Some("lean") {
+        return None;
+    }
+    let mut reversed = Vec::new();
+    reversed.push(stem.to_owned());
+    let mut parent = path.parent();
+    while reversed.len() < max_depth {
+        let Some(component) = parent
+            .and_then(Path::file_name)
+            .and_then(|component| component.to_str())
+        else {
+            break;
+        };
+        reversed.push(component.to_owned());
+        parent = parent.and_then(Path::parent);
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+fn source_entry_name(path: &Path) -> Result<fln::Name, String> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("lean") {
+        return Err(format!(
+            "source module path {} must end in .lean",
+            path.display()
+        ));
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "source module path {} has no UTF-8 module stem",
+                path.display()
+            )
+        })?;
+    if stem.contains('.') {
+        return Err(format!(
+            "source module path {} has a dotted file stem; use directories for module components",
+            path.display()
+        ));
+    }
+    Ok(fln::Name::from_components([stem]))
+}
+
+fn derive_source_module_plan(
+    paths: &[PathBuf],
+    sources: &[Vec<u8>],
+) -> Result<Option<SourceModulePlan>, SourceModulePlanFailure> {
+    let limits = fln::SourceModuleLimits::default();
+    if paths.len() > limits.max_modules {
+        return Err(SourceModulePlanFailure::Resource(format!(
+            "source set contains {} modules; planning limit is {}",
+            paths.len(),
+            limits.max_modules
+        )));
+    }
+    let mut imports = BTreeMap::new();
+    let mut import_presentations = 0_usize;
+    for source in sources {
+        if let Ok(module) = fln::partition_source_module(source) {
+            import_presentations = import_presentations
+                .checked_add(module.imports.len())
+                .ok_or_else(|| {
+                    SourceModulePlanFailure::Resource(
+                        "source import presentation count exceeded this platform".to_owned(),
+                    )
+                })?;
+            if import_presentations > limits.max_imports {
+                return Err(SourceModulePlanFailure::Resource(format!(
+                    "source set presents {import_presentations} imports; planning limit is {}",
+                    limits.max_imports
+                )));
+            }
+            for import in module.imports {
+                let components = source_module_components(&import).ok_or_else(|| {
+                    SourceModulePlanFailure::Input(format!(
+                        "import `{}` is not a nonempty string-component module name",
+                        import.to_display_string()
+                    ))
+                })?;
+                if components.len() > limits.max_name_depth {
+                    return Err(SourceModulePlanFailure::Resource(format!(
+                        "source module name `{}` has {} components; planning limit is {}",
+                        import.to_display_string(),
+                        components.len(),
+                        limits.max_name_depth
+                    )));
+                }
+                imports.entry(components).or_insert(import);
+            }
+        }
+    }
+    if imports.is_empty() {
+        return Ok(None);
+    }
+
+    let depths = imports
+        .keys()
+        .map(Vec::len)
+        .collect::<BTreeSet<usize>>();
+    let mut candidates = imports
+        .keys()
+        .cloned()
+        .map(|components| (components, Vec::new()))
+        .collect::<BTreeMap<Vec<String>, Vec<usize>>>();
+    for (index, path) in paths.iter().enumerate() {
+        let Some(components) = bounded_source_path_components(path, limits.max_name_depth) else {
+            continue;
+        };
+        for depth in &depths {
+            if *depth > components.len() {
+                continue;
+            }
+            let suffix = &components[components.len() - depth..];
+            if let Some(matches) = candidates.get_mut(suffix)
+                && matches.len() < 2
+            {
+                matches.push(index);
+            }
+        }
+    }
+
+    let mut names: Vec<Option<fln::Name>> = vec![None; paths.len()];
+    for (components, import) in imports {
+        let matches = candidates
+            .get(components.as_slice())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match matches {
+            [] => {}
+            [index] => {
+                if let Some(existing) = &names[*index]
+                    && existing != &import
+                {
+                    return Err(SourceModulePlanFailure::Input(format!(
+                        "source path {} ambiguously names both `{}` and `{}`",
+                        paths[*index].display(),
+                        existing.to_display_string(),
+                        import.to_display_string()
+                    )));
+                }
+                if names[*index].is_none() {
+                    names[*index] = Some(import);
+                }
+            }
+            _ => {
+                return Err(SourceModulePlanFailure::Input(format!(
+                    "import `{}` matches more than one supplied source path",
+                    import.to_display_string()
+                )));
+            }
+        }
+    }
+    for (index, path) in paths.iter().enumerate() {
+        if names[index].is_none() {
+            names[index] = Some(
+                source_entry_name(path).map_err(SourceModulePlanFailure::Input)?,
+            );
+        }
+    }
+    let names = names
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            SourceModulePlanFailure::Resource(
+                "source module identity table was incomplete".to_owned(),
+            )
+        })?;
+    let entry = names
+        .last()
+        .cloned()
+        .ok_or_else(|| {
+            SourceModulePlanFailure::Input("source module set has no entry path".to_owned())
+        })?;
+    Ok(Some(SourceModulePlan { names, entry }))
+}
+
 fn run_sources(
     paths: &[PathBuf],
     max_bytes: usize,
@@ -3434,11 +3740,19 @@ fn run_sources(
             return source_failure(error.class(), &error.to_string(), false, json, exit_code);
         }
     };
+    let module_plan = match derive_source_module_plan(paths, &sources) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let (class, authority, exit_code) = error.disposition();
+            return source_failure(class, error.detail(), authority, json, exit_code);
+        }
+    };
     let worker = match std::thread::Builder::new()
         .name("fln-source-run".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
-        .spawn(move || execute_source_bytes_with_output(sources, emit_flbc, emit_sidecar, json))
-    {
+        .spawn(move || {
+            execute_source_bytes_with_output(sources, module_plan, emit_flbc, emit_sidecar, json)
+        }) {
         Ok(worker) => worker,
         Err(error) => {
             return source_failure(
@@ -4798,6 +5112,66 @@ mod tests {
     }
 
     #[test]
+    fn source_module_plan_binds_import_names_to_exact_path_suffixes() {
+        let paths = vec![
+            PathBuf::from("/workspace/Project/Base.lean"),
+            PathBuf::from("/workspace/Project/Middle.lean"),
+            PathBuf::from("/workspace/Main.lean"),
+        ];
+        let sources = vec![
+            b"def base := 20".to_vec(),
+            b"import Project.Base\ndef middle := base".to_vec(),
+            b"import Project.Middle\ndef answer := middle".to_vec(),
+        ];
+        let plan = super::derive_source_module_plan(&paths, &sources)
+            .expect("the exact suffix mapping is unambiguous")
+            .expect("imports select closed-module execution");
+
+        assert_eq!(
+            plan.names,
+            vec![
+                fln::Name::from_components(["Project", "Base"]),
+                fln::Name::from_components(["Project", "Middle"]),
+                fln::Name::from_components(["Main"]),
+            ]
+        );
+        assert_eq!(plan.entry, fln::Name::from_components(["Main"]));
+    }
+
+    #[test]
+    fn source_module_plan_refuses_ambiguous_suffixes_and_dotted_entry_stems() {
+        let ambiguous_paths = vec![
+            PathBuf::from("/one/Project/Base.lean"),
+            PathBuf::from("/two/Project/Base.lean"),
+            PathBuf::from("/workspace/Main.lean"),
+        ];
+        let ambiguous_sources = vec![
+            b"def first := 1".to_vec(),
+            b"def second := 2".to_vec(),
+            b"import Project.Base\ndef answer := first".to_vec(),
+        ];
+        let ambiguity = super::derive_source_module_plan(&ambiguous_paths, &ambiguous_sources)
+            .expect_err("one import cannot select two byte inputs");
+        assert!(
+            ambiguity
+                .detail()
+                .contains("matches more than one supplied source path")
+        );
+
+        let dotted_paths = vec![
+            PathBuf::from("/workspace/Dependency.lean"),
+            PathBuf::from("/workspace/Main.Entry.lean"),
+        ];
+        let dotted_sources = vec![
+            b"def dependency := 1".to_vec(),
+            b"import Missing\ndef answer := dependency".to_vec(),
+        ];
+        let dotted = super::derive_source_module_plan(&dotted_paths, &dotted_sources)
+            .expect_err("a dotted file stem cannot invent a module hierarchy");
+        assert!(dotted.detail().contains("dotted file stem"));
+    }
+
+    #[test]
     fn source_run_projects_checked_bool_results_as_json_booleans() {
         let output =
             execute_source_bytes(vec![b"def answer : Bool := Nat.beq 42 42".to_vec()], true);
@@ -4850,6 +5224,7 @@ mod tests {
         let mut publications = Vec::new();
         let published = execute_source_bytes_with_publisher(
             vec![b"def message : String := \"published\\nstring\"".to_vec()],
+            None,
             Some(PathBuf::from("string.flbc")),
             None,
             None,
@@ -4876,6 +5251,7 @@ mod tests {
         let mut failed_publications = 0;
         let refused = execute_source_bytes_with_publisher(
             vec![b"def open (value : String) : String := value".to_vec()],
+            None,
             Some(PathBuf::from("open.flbc")),
             None,
             None,
@@ -4906,6 +5282,7 @@ mod tests {
                 b"def earlier : Nat := 11".to_vec(),
                 b"def emitted : Nat := 17".to_vec(),
             ],
+            None,
             Some(target.clone()),
             None,
             None,
@@ -4933,6 +5310,7 @@ mod tests {
                 b"def earlier : Nat := 11".to_vec(),
                 b"def open (x : Nat) : Nat := x".to_vec(),
             ],
+            None,
             Some(PathBuf::from("must-not-publish.flbc")),
             None,
             None,
@@ -4947,6 +5325,7 @@ mod tests {
 
         let publication_failure = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 17".to_vec()],
+            None,
             Some(PathBuf::from("refused.flbc")),
             None,
             None,
@@ -4986,6 +5365,7 @@ mod tests {
         for (target_created, step, state) in cases {
             let output = execute_source_bytes_with_publisher(
                 vec![b"def emitted : Nat := 17".to_vec()],
+                None,
                 Some(PathBuf::from("resource-exhausted.flbc")),
                 None,
                 None,
@@ -5009,6 +5389,7 @@ mod tests {
 
         let compound = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 17".to_vec()],
+            None,
             Some(PathBuf::from("resource-exhausted-compound.flbc")),
             None,
             None,
@@ -5052,6 +5433,7 @@ mod tests {
         let mut publications = Vec::new();
         let output = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 23".to_vec()],
+            None,
             Some(flbc_path.clone()),
             Some(sidecar_path.clone()),
             Some(b"injected toolchain image".to_vec()),
@@ -5086,6 +5468,7 @@ mod tests {
         let mut failed_publications = 0;
         let failed = execute_source_bytes_with_publisher(
             vec![b"def open (x : Nat) : Nat := x".to_vec()],
+            None,
             Some(PathBuf::from("not-published.flbc")),
             Some(PathBuf::from("not-published.sidecar")),
             Some(b"injected toolchain image".to_vec()),
@@ -5295,6 +5678,23 @@ mod tests {
         };
         assert_eq!(
             admission_error_disposition(&seed_exhausted),
+            ("resource", false, 3)
+        );
+
+        let open_graph = fln::EngineExecutionError::MissingSourceImports {
+            module: fln::Name::from_components(["Main"]),
+            imports: vec![fln::Name::from_components(["Missing"])],
+        };
+        assert_eq!(
+            execution_error_disposition(&open_graph),
+            ("module-graph", false, 1)
+        );
+        let module_budget = fln::EngineExecutionError::SourceModuleLimit {
+            observed: 2,
+            limit: 1,
+        };
+        assert_eq!(
+            execution_error_disposition(&module_budget),
             ("resource", false, 3)
         );
     }
