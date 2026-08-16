@@ -2177,6 +2177,7 @@ fn check_olean_error_disposition(error: &fln::OleanCheckError) -> (&'static str,
         fln::OleanCheckError::InternalInvariant { .. } => ("internal-fault", false, 4),
         fln::OleanCheckError::UnsupportedDeclaration { .. }
         | fln::OleanCheckError::MutualEnvelopeUnsupported { .. }
+        | fln::OleanCheckError::InductiveEnvelopeUnsupported { .. }
         | fln::OleanCheckError::QuotientEnvelopeUnsupported { .. } => {
             ("unsupported-declaration-unit", false, 1)
         }
@@ -2833,6 +2834,7 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
             "body-checked-against-declared-type"
         }
         fln::CheckerAdmissionGround::QuotientPrimitiveChecked => "quotient-primitive-checked",
+        fln::CheckerAdmissionGround::InductiveEnumerationChecked => "inductive-enumeration-checked",
         fln::CheckerAdmissionGround::UnsafeQuarantine => "unsafe-quarantine",
         fln::CheckerAdmissionGround::PartialQuarantine => "partial-quarantine",
     }

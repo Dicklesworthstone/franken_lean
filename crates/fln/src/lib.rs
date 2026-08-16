@@ -7,9 +7,10 @@
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
 //! Prelude support. Already-elaborated axioms, definitions, theorems, opaques,
-//! and non-safe mutual definition blocks can also advance an immutable engine
-//! snapshot through admission and publication without compiling or executing a
-//! body. Embedders can also validate and execute an existing canonical FLBC
+//! non-safe mutual definition blocks, fixed quotient initialization, and a
+//! bounded class of nullary `Type` enumerations can also advance an immutable
+//! engine snapshot through admission and publication without compiling or
+//! executing a body. Embedders can also validate and execute an existing canonical FLBC
 //! artifact without reaching into the compiler or VM crates, and inspect or
 //! re-derive a real pinned-format `.olean` through the codec's audited reader.
 //! Verdict's proof-producing `bv_decide` pipeline is also available through an
@@ -24,8 +25,8 @@ pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
 };
 use fln_checker::admit::{
-    BlockVerdict as CheckerBlockVerdict, QuotientVerdict as CheckerQuotientVerdict,
-    Verdict as CheckerVerdict,
+    BlockVerdict as CheckerBlockVerdict, InductiveVerdict as CheckerInductiveVerdict,
+    QuotientVerdict as CheckerQuotientVerdict, Verdict as CheckerVerdict,
 };
 pub use fln_checker::environment::EnvironmentBudget as CheckerEnvironmentBudget;
 use fln_checker::environment::{
@@ -809,9 +810,10 @@ pub struct CheckedOleanSet {
 /// Typed non-success from the `.olean` declaration-checking doors.
 ///
 /// This production slice handles closed import sets and reconstructs complete
-/// non-safe mutual definition envelopes and the fixed quotient initializer as
-/// authority transitions. Complete inductive units remain explicit refusals
-/// rather than silently entering trusted context. Safe definitions, theorems, and opaques retain
+/// non-safe mutual definition envelopes, the fixed quotient initializer, and
+/// safe nullary `Type` enumeration units as authority transitions. Other
+/// inductive shapes remain explicit checker non-answers rather than silently
+/// entering trusted context. Safe definitions, theorems, and opaques retain
 /// their multi-name metadata and check individually inside the atomic artifact
 /// batch when their actual dependency graph is acyclic. Environment extensions
 /// are decoded and counted by [`DecodedOlean`] but are not interpreted by this
@@ -873,6 +875,10 @@ pub enum OleanCheckError {
         kind: &'static str,
     },
     MutualEnvelopeUnsupported {
+        name: Name,
+        members: Vec<Name>,
+    },
+    InductiveEnvelopeUnsupported {
         name: Name,
         members: Vec<Name>,
     },
@@ -982,6 +988,12 @@ impl fmt::Display for OleanCheckError {
                 name.to_display_string(),
                 display_names(members)
             ),
+            Self::InductiveEnvelopeUnsupported { name, members } => write!(
+                formatter,
+                "cannot reconstruct the inductive declaration envelope for `{}` from {}",
+                name.to_display_string(),
+                display_names(members)
+            ),
             Self::QuotientEnvelopeUnsupported { names } => write!(
                 formatter,
                 "cannot reconstruct the four-row quotient initialization envelope from {}",
@@ -1065,6 +1077,13 @@ fn unsupported_mutual_envelope(value: &DefinitionVal) -> OleanCheckError {
     }
 }
 
+fn unsupported_inductive_envelope(name: &Name, members: Vec<Name>) -> OleanCheckError {
+    OleanCheckError::InductiveEnvelopeUnsupported {
+        name: name.clone(),
+        members,
+    }
+}
+
 fn quotient_initialization_names() -> [Name; 4] {
     [
         Name::from_components(["Quot"]),
@@ -1099,6 +1118,115 @@ fn build_olean_declaration_units(
 
     for (index, info) in constants.iter().enumerate() {
         if constant_units[index] != usize::MAX {
+            continue;
+        }
+        if let ConstantInfo::Induct(inductive) = info {
+            if inductive.all.first() != Some(&inductive.base.name) {
+                continue;
+            }
+            let mut member_indices = Vec::new();
+            let mut members = Vec::new();
+            let mut unique = BTreeSet::new();
+            for type_name in &inductive.all {
+                if !unique.insert(type_name.clone()) {
+                    return Err(unsupported_inductive_envelope(
+                        &inductive.base.name,
+                        inductive.all.clone(),
+                    ));
+                }
+                let Some(&type_index) = owners.get(type_name) else {
+                    return Err(unsupported_inductive_envelope(
+                        &inductive.base.name,
+                        inductive.all.clone(),
+                    ));
+                };
+                let Some(ConstantInfo::Induct(member)) = constants.get(type_index) else {
+                    return Err(unsupported_inductive_envelope(
+                        &inductive.base.name,
+                        inductive.all.clone(),
+                    ));
+                };
+                if member.all != inductive.all || constant_units[type_index] != usize::MAX {
+                    return Err(unsupported_inductive_envelope(
+                        &inductive.base.name,
+                        inductive.all.clone(),
+                    ));
+                }
+                member_indices.push(type_index);
+                members.push(member.base.name.clone());
+                for (ctor_index, ctor_name) in member.ctors.iter().enumerate() {
+                    let Some(&constant_index) = owners.get(ctor_name) else {
+                        return Err(unsupported_inductive_envelope(
+                            &inductive.base.name,
+                            inductive.all.clone(),
+                        ));
+                    };
+                    let Some(ConstantInfo::Ctor(constructor)) = constants.get(constant_index)
+                    else {
+                        return Err(unsupported_inductive_envelope(
+                            &inductive.base.name,
+                            inductive.all.clone(),
+                        ));
+                    };
+                    if constructor.induct != member.base.name
+                        || usize::try_from(constructor.cidx).ok() != Some(ctor_index)
+                        || constant_units[constant_index] != usize::MAX
+                    {
+                        return Err(unsupported_inductive_envelope(
+                            &inductive.base.name,
+                            inductive.all.clone(),
+                        ));
+                    }
+                    member_indices.push(constant_index);
+                    members.push(constructor.base.name.clone());
+                }
+            }
+            for (constant_index, candidate) in constants.iter().enumerate() {
+                let ConstantInfo::Rec(recursor) = candidate else {
+                    continue;
+                };
+                if recursor.all.first() == Some(&inductive.base.name) {
+                    if constant_units[constant_index] != usize::MAX {
+                        return Err(unsupported_inductive_envelope(
+                            &inductive.base.name,
+                            inductive.all.clone(),
+                        ));
+                    }
+                    member_indices.push(constant_index);
+                    members.push(recursor.base.name.clone());
+                }
+            }
+            let mut types = Vec::new();
+            let mut constructors = Vec::new();
+            let mut recursors = Vec::new();
+            for member_index in &member_indices {
+                match &constants[*member_index] {
+                    ConstantInfo::Induct(value) => types.push(value.clone()),
+                    ConstantInfo::Ctor(value) => constructors.push(value.clone()),
+                    ConstantInfo::Rec(value) => recursors.push(value.clone()),
+                    _ => {
+                        return Err(OleanCheckError::InternalInvariant {
+                            detail: "inductive unit contains a non-inductive row",
+                        });
+                    }
+                }
+            }
+            let unit = units.len();
+            for member_index in &member_indices {
+                constant_units[*member_index] = unit;
+            }
+            units.push(OleanDeclarationUnit {
+                constant_indices: member_indices,
+                names: members,
+                declaration: Declaration::Inductive(fln_kernel::InductiveBlock {
+                    types,
+                    ctors: constructors,
+                    recursors,
+                }),
+            });
+            continue;
+        }
+        if matches!(info, ConstantInfo::Ctor(_) | ConstantInfo::Rec(_)) {
             continue;
         }
         if matches!(info, ConstantInfo::Quot(_)) {
@@ -1215,10 +1343,19 @@ fn build_olean_declaration_units(
         });
     }
 
-    if constant_units.contains(&usize::MAX) {
-        return Err(OleanCheckError::InternalInvariant {
-            detail: "a decoded declaration was not assigned to an authority unit",
-        });
+    if let Some((index, _)) = constant_units
+        .iter()
+        .enumerate()
+        .find(|(_, unit)| **unit == usize::MAX)
+    {
+        let name = constants[index].name();
+        let members = match &constants[index] {
+            ConstantInfo::Induct(value) => value.all.clone(),
+            ConstantInfo::Ctor(value) => vec![value.induct.clone(), value.base.name.clone()],
+            ConstantInfo::Rec(value) => value.all.clone(),
+            _ => Vec::new(),
+        };
+        return Err(unsupported_inductive_envelope(name, members));
     }
     Ok((units, constant_units))
 }
@@ -2167,10 +2304,11 @@ impl Engine {
     /// This is the environment-building counterpart to
     /// [`Self::execute_definition`]. It currently accepts the declaration kinds
     /// on which both K1 and the independent checker can issue a completed
-    /// verdict: axioms, definitions, theorems, opaques, and non-safe mutual
-    /// definition blocks, and the fixed quotient initialization unit.
-    /// Inductive families remain explicit refusals until the independent
-    /// checker decides their complete block input.
+    /// verdict: axioms, definitions, theorems, opaques, non-safe mutual
+    /// definition blocks, the fixed quotient initialization unit, and safe,
+    /// nonrecursive, non-nested, parameter-free `Type` enumerations with
+    /// nullary constructors. Other inductive families remain checker
+    /// non-answers until an independent complete-unit ground exists for them.
     ///
     /// Success returns a new immutable engine snapshot. A rejection,
     /// independent-checker non-answer, duplicate, resource stop, or internal
@@ -2188,6 +2326,7 @@ impl Engine {
                 | Declaration::Thm(_)
                 | Declaration::Opaque(_)
                 | Declaration::Mutual(_)
+                | Declaration::Inductive(_)
                 | Declaration::Quotient(_)
         ) {
             return Err(EngineAdmissionError::UnsupportedDeclaration {
@@ -2232,7 +2371,7 @@ impl Engine {
         })?;
         let expects_block = matches!(
             declaration,
-            Declaration::Mutual(_) | Declaration::Quotient(_)
+            Declaration::Mutual(_) | Declaration::Inductive(_) | Declaration::Quotient(_)
         );
         let environment = match checked.publish(limits.declaration, limits.collisions, None) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
@@ -3081,6 +3220,119 @@ fn review_quotient_with_independent_checker(
     }
 }
 
+fn review_inductive_with_independent_checker(
+    environment: &Environment,
+    retained_environment: Option<&CheckerConstantEnvironment>,
+    block: &fln_kernel::InductiveBlock,
+    limits: CheckerExecutionLimits,
+) -> CheckerReview {
+    let member_count = block
+        .types
+        .len()
+        .saturating_add(block.ctors.len())
+        .saturating_add(block.recursors.len());
+    let mut candidates = Vec::new();
+    if candidates.try_reserve_exact(member_count).is_err() {
+        return CheckerReview::no_answer(format!(
+            "could not reserve {member_count} checker inductive-block members"
+        ));
+    }
+    for declaration in &block.types {
+        match checker_entry(&ConstantInfo::Induct(declaration.clone()), limits.decode) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "inductive type projection into fln-checker failed: {detail}"
+                ));
+            }
+        }
+    }
+    for declaration in &block.ctors {
+        match checker_entry(&ConstantInfo::Ctor(declaration.clone()), limits.decode) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "constructor projection into fln-checker failed: {detail}"
+                ));
+            }
+        }
+    }
+    for declaration in &block.recursors {
+        match checker_entry(&ConstantInfo::Rec(declaration.clone()), limits.decode) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "recursor projection into fln-checker failed: {detail}"
+                ));
+            }
+        }
+    }
+
+    let environment = match retained_environment {
+        Some(environment) => environment.clone(),
+        None => match checker_environment(environment, limits) {
+            Ok(environment) => environment,
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "base projection into fln-checker failed: {detail}"
+                ));
+            }
+        },
+    };
+
+    match fln_checker::admit::admit_inductive(&environment, &candidates, limits.admission) {
+        CheckerInductiveVerdict::Admitted(admission) => {
+            let agreement = CheckerAgreement {
+                schema: admission.schema(),
+                ground: admission.ground(),
+            };
+            let mut successor = environment;
+            for candidate in candidates {
+                let member = candidate.name().clone();
+                match successor.extend(candidate, limits.environment) {
+                    CheckerEnvironmentOutcome::Complete {
+                        environment: extended,
+                        ..
+                    } => successor = extended,
+                    CheckerEnvironmentOutcome::Refused { refusal, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker refused inductive member {member:?} retention: {refusal:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::Inconclusive(stop) => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker could not retain inductive member {member:?}: {stop:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker faulted while retaining inductive member {member:?}: \
+                             {fault:?}"
+                        ));
+                    }
+                }
+            }
+            CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+        }
+        CheckerInductiveVerdict::Rejected(rejection) => CheckerReview::from_seat(
+            SeatVerdict::Disagrees {
+                detail: format!("fln-checker rejected the inductive block: {rejection:?}"),
+            },
+            None,
+            None,
+        ),
+        CheckerInductiveVerdict::Deferred(limit) => CheckerReview::no_answer(format!(
+            "fln-checker does not yet decide this inductive shape: {limit:?}"
+        )),
+        CheckerInductiveVerdict::Inconclusive(stop) => CheckerReview::no_answer(format!(
+            "fln-checker exhausted or was cancelled during inductive admission: {stop:?}"
+        )),
+        CheckerInductiveVerdict::InternalFault(fault) => CheckerReview::no_answer(format!(
+            "fln-checker faulted during inductive admission: {fault:?}"
+        )),
+    }
+}
+
 fn review_with_independent_checker(
     environment: &Environment,
     retained_environment: Option<&CheckerConstantEnvironment>,
@@ -3100,6 +3352,14 @@ fn review_with_independent_checker(
             environment,
             retained_environment,
             declarations,
+            limits,
+        );
+    }
+    if let Declaration::Inductive(block) = declaration {
+        return review_inductive_with_independent_checker(
+            environment,
+            retained_environment,
+            block,
             limits,
         );
     }
@@ -4391,10 +4651,10 @@ mod tests {
         Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
-        ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, ReducibilityHints, RejectClass,
-        TheoremVal, VmExecutionLimits, closed_vm_value, decode_olean_artifact,
-        execute_flbc_artifact, execute_golem_with_options, project_lsp_diagnostics,
-        rebuild_olean_artifact,
+        ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
+        ReducibilityHints, RejectClass, TheoremVal, VmExecutionLimits, closed_vm_value,
+        decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
+        project_lsp_diagnostics, rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -4586,6 +4846,131 @@ mod tests {
                     level_params: Vec::new(),
                     type_: Expr::sort(Level::zero()),
                 },
+                is_unsafe: false,
+            }),
+        ]
+    }
+
+    fn enumeration_declarations(recursor_motive_binder: BinderInfo) -> Vec<ConstantInfo> {
+        let color = Name::from_components(["Fixture", "Color"]);
+        let red = Name::from_components(["Fixture", "Color", "red"]);
+        let blue = Name::from_components(["Fixture", "Color", "blue"]);
+        let recursor = Name::from_components(["Fixture", "Color", "rec"]);
+        let u_name = Name::from_components(["u"]);
+        let u = Level::param(u_name.clone());
+        let color_expr = || Expr::const_(color.clone(), Vec::new());
+        let red_expr = || Expr::const_(red.clone(), Vec::new());
+        let blue_expr = || Expr::const_(blue.clone(), Vec::new());
+        let bv = |index| Expr::bvar(index).expect("packs");
+        let motive_type = pi(
+            "t",
+            BinderInfo::Default,
+            color_expr(),
+            Expr::sort(u.clone()),
+        );
+        let recursor_type = pi(
+            "motive",
+            recursor_motive_binder,
+            motive_type.clone(),
+            pi(
+                "red",
+                BinderInfo::Default,
+                Expr::app(bv(0), red_expr()),
+                pi(
+                    "blue",
+                    BinderInfo::Default,
+                    Expr::app(bv(1), blue_expr()),
+                    pi(
+                        "t",
+                        BinderInfo::Default,
+                        color_expr(),
+                        Expr::app(bv(3), bv(0)),
+                    ),
+                ),
+            ),
+        );
+        let rule_rhs = |selected: u32| {
+            Expr::lam(
+                Name::from_components(["motive"]),
+                motive_type.clone(),
+                Expr::lam(
+                    Name::from_components(["red"]),
+                    Expr::app(bv(0), red_expr()),
+                    Expr::lam(
+                        Name::from_components(["blue"]),
+                        Expr::app(bv(1), blue_expr()),
+                        bv(selected),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            )
+        };
+        vec![
+            ConstantInfo::Rec(RecursorVal {
+                base: ConstantVal {
+                    name: recursor,
+                    level_params: vec![u_name],
+                    type_: recursor_type,
+                },
+                all: vec![color.clone()],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 2,
+                rules: vec![
+                    RecursorRule {
+                        ctor: red.clone(),
+                        nfields: 0,
+                        rhs: rule_rhs(1),
+                    },
+                    RecursorRule {
+                        ctor: blue.clone(),
+                        nfields: 0,
+                        rhs: rule_rhs(0),
+                    },
+                ],
+                k: false,
+                is_unsafe: false,
+            }),
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: blue.clone(),
+                    level_params: Vec::new(),
+                    type_: color_expr(),
+                },
+                induct: color.clone(),
+                cidx: 1,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            }),
+            ConstantInfo::Induct(InductiveVal {
+                base: ConstantVal {
+                    name: color.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                num_params: 0,
+                num_indices: 0,
+                all: vec![color.clone()],
+                ctors: vec![red.clone(), blue],
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            }),
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: red,
+                    level_params: Vec::new(),
+                    type_: color_expr(),
+                },
+                induct: color,
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
                 is_unsafe: false,
             }),
         ]
@@ -5469,6 +5854,127 @@ mod tests {
             assert!(checked.engine.environment().contains(&name));
             assert!(!engine.environment().contains(&name));
         }
+
+        let mut candidate_only = EngineAdmissionLimits::new(test_budget());
+        candidate_only.checker.environment = fln_checker::environment::EnvironmentBudget::new(
+            u64::MAX,
+            1,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
+        let retained = checked
+            .engine
+            .admit_declaration(
+                typed_axiom("AfterColor", Expr::sort(Level::zero())),
+                &KVMap::new(),
+                candidate_only,
+            )
+            .expect("the retained four-row checker block leaves one row for its consumer")
+            .into_complete()
+            .expect("the follower admission answers completely");
+        assert!(
+            retained
+                .engine
+                .environment()
+                .contains(&Name::from_components(["AfterColor"]))
+        );
+
+        let uncached = Engine::from_environment(checked.engine.environment().clone());
+        assert!(matches!(
+            uncached.admit_declaration(
+                typed_axiom("UncachedAfterColor", Expr::sort(Level::zero())),
+                &KVMap::new(),
+                candidate_only,
+            ),
+            Err(EngineAdmissionError::CouncilHalted { .. })
+        ));
+        assert!(
+            !uncached
+                .environment()
+                .contains(&Name::from_components(["UncachedAfterColor"]))
+        );
+    }
+
+    #[test]
+    fn standalone_olean_check_reconstructs_a_nullary_enumeration_authority_unit() {
+        let constants = enumeration_declarations(BinderInfo::Implicit);
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let checked = engine
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("the complete enumeration envelope is reconstructible")
+            .into_complete()
+            .expect("K1 and the independent enumeration judgment complete");
+
+        assert_eq!(checked.declarations.len(), 4);
+        assert!(checked.declarations.iter().all(|declaration| {
+            declaration.checker.ground == CheckerAdmissionGround::InductiveEnumerationChecked
+        }));
+        for name in [
+            Name::from_components(["Fixture", "Color"]),
+            Name::from_components(["Fixture", "Color", "red"]),
+            Name::from_components(["Fixture", "Color", "blue"]),
+            Name::from_components(["Fixture", "Color", "rec"]),
+        ] {
+            assert!(checked.engine.environment().contains(&name));
+            assert!(!engine.environment().contains(&name));
+        }
+    }
+
+    #[test]
+    fn enumeration_envelope_and_checker_nonanswers_are_failure_atomic() {
+        let mut incomplete = enumeration_declarations(BinderInfo::Implicit);
+        incomplete.pop();
+        let bytes = standalone_olean(&incomplete);
+        let engine = Engine::from_environment(Environment::new());
+        assert!(matches!(
+            engine.check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            ),
+            Err(OleanCheckError::InductiveEnvelopeUnsupported { .. })
+        ));
+        assert!(engine.environment().is_empty());
+
+        let constants = enumeration_declarations(BinderInfo::Implicit);
+        let constant_count = constants.len();
+        let mut types = Vec::new();
+        let mut constructors = Vec::new();
+        let mut recursors = Vec::new();
+        for constant in constants {
+            match constant {
+                ConstantInfo::Induct(value) => types.push(value),
+                ConstantInfo::Ctor(value) => constructors.push(value),
+                ConstantInfo::Rec(value) => recursors.push(value),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            types.len() + constructors.len() + recursors.len(),
+            constant_count,
+            "the enumeration fixture must contain only inductive authority rows"
+        );
+        constructors.sort_by_key(|constructor| constructor.cidx);
+        let declaration = Declaration::Inductive(fln_kernel::InductiveBlock {
+            types,
+            ctors: constructors,
+            recursors,
+        });
+        let mut limits = EngineAdmissionLimits::new(test_budget());
+        limits.checker.admission.conversion.quick.max_comparisons = 0;
+        let result = engine.admit_declaration(declaration, &KVMap::new(), limits);
+        assert!(
+            matches!(result, Err(EngineAdmissionError::CouncilHalted { .. })),
+            "checker exhaustion must halt the council, got {result:?}"
+        );
+        assert!(engine.environment().is_empty());
     }
 
     #[test]

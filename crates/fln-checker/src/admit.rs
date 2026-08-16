@@ -354,9 +354,8 @@ pub enum Quarantine {
 
 /// Why a declaration was admitted.
 ///
-/// One variant today, and it is an enum rather than a unit so that KR-974's
-/// grounds arrive as a *new variant* — a caller matching exhaustively fails to
-/// compile rather than silently treating a body-checked admission as this one.
+/// An enum rather than an untyped success bit so every new admission ground
+/// makes exhaustive callers fail to compile until they classify its authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionGround {
     /// KR-973 — an axiom whose KR-970/971/972 preamble passed. There is no body,
@@ -373,6 +372,11 @@ pub enum AdmissionGround {
     /// KR-950..954 — the fixed quotient primitive rows and their required
     /// equality prelude were reconstructed and compared independently.
     QuotientPrimitiveChecked,
+    /// KR-600..803, bounded ground — one safe, nonrecursive, non-nested,
+    /// parameter-free `Type` enumeration and its nullary constructors and
+    /// recursor were reconstructed from checker-owned rows. Other inductive
+    /// shapes remain deferred, never accepted under this ground.
+    InductiveEnumerationChecked,
     /// KR-975 — admitted INTO THE UNSAFE QUARANTINE. Everything the ordinary
     /// grounds claim, plus the fact that this declaration is not safe: a council
     /// reading this ground must not treat it as an ordinary admission, and the
@@ -1298,13 +1302,13 @@ fn checker_child(parent: &WireName, value: &str) -> WireName {
     WireName::from_parts(parts)
 }
 
-struct QuotientTermBuilder {
+struct StructuralTermBuilder {
     nodes: Vec<ExprNode>,
     levels: Vec<LevelNode>,
     overflowed: bool,
 }
 
-impl QuotientTermBuilder {
+impl StructuralTermBuilder {
     fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -1346,6 +1350,12 @@ impl QuotientTermBuilder {
         self.expression(ExprNode::Sort { level })
     }
 
+    fn sort_one(&mut self) -> ExprId {
+        let zero = self.level(LevelNode::Zero);
+        let level = self.level(LevelNode::Succ(zero));
+        self.expression(ExprNode::Sort { level })
+    }
+
     fn sort_parameter(&mut self, parameter: &WireName) -> ExprId {
         let level = self.level(LevelNode::Parameter(parameter.clone()));
         self.expression(ExprNode::Sort { level })
@@ -1381,6 +1391,21 @@ impl QuotientTermBuilder {
         })
     }
 
+    fn lambda(
+        &mut self,
+        name: &str,
+        style: BinderStyle,
+        binder_type: ExprId,
+        body: ExprId,
+    ) -> ExprId {
+        self.expression(ExprNode::Lambda {
+            binder_name: checker_atom(name),
+            binder_type,
+            body,
+            style,
+        })
+    }
+
     fn arrow(&mut self, domain: ExprId, codomain: ExprId) -> ExprId {
         self.forall("a", BinderStyle::Default, domain, codomain)
     }
@@ -1395,7 +1420,7 @@ fn structural_level_equal(
     left_root: LevelId,
     right: &WireExpr,
     right_root: LevelId,
-    control: &mut QuotientComparisonControl,
+    control: &mut StructuralComparisonControl,
     seen: &mut BTreeSet<(LevelId, LevelId)>,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Result<bool, QuickDefEqStop>, QuickDefEqFault> {
@@ -1447,14 +1472,14 @@ fn structural_level_equal(
     Ok(Ok(true))
 }
 
-struct QuotientComparisonControl {
+struct StructuralComparisonControl {
     budget: QuickDefEqBudget,
     comparisons: u64,
     level_nodes: u64,
     polls: u64,
 }
 
-impl QuotientComparisonControl {
+impl StructuralComparisonControl {
     const fn new(budget: QuickDefEqBudget) -> Self {
         Self {
             budget,
@@ -1494,7 +1519,8 @@ impl QuotientComparisonControl {
 fn structural_expression_equal(
     left: &WireExpr,
     right: &WireExpr,
-    control: &mut QuotientComparisonControl,
+    control: &mut StructuralComparisonControl,
+    compare_binder_styles: bool,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Result<bool, QuickDefEqStop>, QuickDefEqFault> {
     if let Err(stop) = control.poll(cancelled) {
@@ -1618,26 +1644,33 @@ fn structural_expression_equal(
                 ExprNode::Lambda {
                     binder_type: left_type,
                     body: left_body,
+                    style: left_style,
                     ..
                 },
                 ExprNode::Lambda {
                     binder_type: right_type,
                     body: right_body,
+                    style: right_style,
                     ..
                 },
-            )
-            | (
+            ) if !compare_binder_styles || left_style == right_style => {
+                push(*left_body, *right_body)?;
+                push(*left_type, *right_type)?;
+            }
+            (
                 ExprNode::Forall {
                     binder_type: left_type,
                     body: left_body,
+                    style: left_style,
                     ..
                 },
                 ExprNode::Forall {
                     binder_type: right_type,
                     body: right_body,
+                    style: right_style,
                     ..
                 },
-            ) => {
+            ) if !compare_binder_styles || left_style == right_style => {
                 push(*left_body, *right_body)?;
                 push(*left_type, *right_type)?;
             }
@@ -1698,6 +1731,429 @@ fn structural_expression_equal(
     Ok(Ok(true))
 }
 
+// ---------------------------------------------------------------- KR-600..803 (bounded enumeration ground)
+
+/// Maximum number of nullary constructors reconstructed by the bounded
+/// enumeration judgment. Expected recursor rules are quadratic in this count;
+/// larger but otherwise valid blocks remain typed deferrals.
+pub const MAX_ENUMERATION_CONSTRUCTORS: usize = 32;
+
+/// The exact boundary of the independent checker's first inductive ground.
+/// These are non-answers: K1 may decide the shape, but this checker does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InductiveSupportLimit {
+    DeclarationRows { observed: usize, limit: usize },
+    MultipleTypes { observed: usize },
+    MutualMetadata,
+    UniverseParameters { observed: usize },
+    Parameters { observed: u32 },
+    Indices { observed: u32 },
+    Nested { observed: u32 },
+    Recursive,
+    Reflexive,
+    Unsafe,
+    ResultUniverse,
+    ConstructorCount { observed: usize, limit: usize },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InductiveRejection {
+    MissingInductive,
+    MissingMetadata { name: WireName },
+    DeclarationCount { observed: usize, expected: usize },
+    ConstructorMissing { name: WireName },
+    RecursorMissing { name: WireName },
+    RepeatedConstructor { name: WireName },
+    NameAlreadyDeclared { name: WireName },
+    ConstructorShape { name: WireName },
+    RecursorShape { name: WireName },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InductiveFault {
+    Structural(QuickDefEqFault),
+    ExpectedArenaOverflow,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct InductiveAdmission {
+    members: Vec<WireName>,
+}
+
+impl InductiveAdmission {
+    pub fn members(&self) -> &[WireName] {
+        &self.members
+    }
+
+    pub const fn ground(&self) -> AdmissionGround {
+        AdmissionGround::InductiveEnumerationChecked
+    }
+
+    pub const fn schema(&self) -> &'static str {
+        ADMISSION_SCHEMA
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InductiveVerdict {
+    Admitted(InductiveAdmission),
+    Rejected(InductiveRejection),
+    Deferred(InductiveSupportLimit),
+    Inconclusive(QuickDefEqStop),
+    InternalFault(InductiveFault),
+}
+
+impl InductiveVerdict {
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted(_))
+    }
+
+    pub const fn is_inconclusive_family(&self) -> bool {
+        matches!(
+            self,
+            Self::Deferred(_) | Self::Inconclusive(_) | Self::InternalFault(_)
+        )
+    }
+}
+
+fn enumeration_type() -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let root = builder.sort_one();
+    builder.finish(root)
+}
+
+fn enumeration_constant_type(name: &WireName) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let root = builder.constant(name, &[]);
+    builder.finish(root)
+}
+
+fn enumeration_recursor_type(
+    inductive: &WireName,
+    constructors: &[WireName],
+    level_parameter: &WireName,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let inductive_type = builder.constant(inductive, &[]);
+    let motive_sort = builder.sort_parameter(level_parameter);
+    let motive_type = builder.forall("t", BinderStyle::Default, inductive_type, motive_sort);
+
+    let motive = builder.bvar(u32::try_from(constructors.len()).ok()?.checked_add(1)?);
+    let major = builder.bvar(0);
+    let mut result = builder.apply(motive, major);
+    let major_type = builder.constant(inductive, &[]);
+    result = builder.forall("t", BinderStyle::Default, major_type, result);
+
+    for (index, constructor) in constructors.iter().enumerate().rev() {
+        let motive = builder.bvar(u32::try_from(index).ok()?);
+        let constructor = builder.constant(constructor, &[]);
+        let minor_type = builder.apply(motive, constructor);
+        result = builder.forall("minor", BinderStyle::Default, minor_type, result);
+    }
+    let root = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
+    builder.finish(root)
+}
+
+fn enumeration_rule_rhs(
+    inductive: &WireName,
+    constructors: &[WireName],
+    level_parameter: &WireName,
+    selected: usize,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let selected = constructors.len().checked_sub(selected.checked_add(1)?)?;
+    let mut result = builder.bvar(u32::try_from(selected).ok()?);
+    for (index, constructor) in constructors.iter().enumerate().rev() {
+        let motive = builder.bvar(u32::try_from(index).ok()?);
+        let constructor = builder.constant(constructor, &[]);
+        let minor_type = builder.apply(motive, constructor);
+        result = builder.lambda("minor", BinderStyle::Default, minor_type, result);
+    }
+    let inductive_type = builder.constant(inductive, &[]);
+    let motive_sort = builder.sort_parameter(level_parameter);
+    let motive_type = builder.forall("t", BinderStyle::Default, inductive_type, motive_sort);
+    let root = builder.lambda("motive", BinderStyle::Default, motive_type, result);
+    builder.finish(root)
+}
+
+fn compare_inductive_expression(
+    actual: &WireExpr,
+    expected: &WireExpr,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, InductiveVerdict> {
+    match structural_expression_equal(actual, expected, comparison, true, cancelled) {
+        Ok(Ok(equal)) => Ok(equal),
+        Ok(Err(stop)) => Err(InductiveVerdict::Inconclusive(stop)),
+        Err(fault) => Err(InductiveVerdict::InternalFault(InductiveFault::Structural(
+            fault,
+        ))),
+    }
+}
+
+/// Independently reconstruct one bounded, nullary `Type` enumeration.
+pub fn admit_inductive(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    budget: AdmissionBudget,
+) -> InductiveVerdict {
+    admit_inductive_with(environment, declarations, budget, || false)
+}
+
+/// [`admit_inductive`] with cooperative cancellation shared by all row and
+/// expression checks.
+pub fn admit_inductive_with(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    budget: AdmissionBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> InductiveVerdict {
+    let maximum_rows = MAX_ENUMERATION_CONSTRUCTORS.saturating_add(2);
+    if declarations.len() > maximum_rows {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::DeclarationRows {
+            observed: declarations.len(),
+            limit: maximum_rows,
+        });
+    }
+    let mut comparison = StructuralComparisonControl::new(budget.conversion.quick);
+    let mut inductives = declarations
+        .iter()
+        .filter(|entry| entry.declaration().kind() == ConstantKind::Inductive);
+    let Some(inductive) = inductives.next() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingInductive);
+    };
+    let extra_types = inductives.count();
+    if extra_types != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::MultipleTypes {
+            observed: extra_types.saturating_add(1),
+        });
+    }
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    if declaration.safety() != ConstantSafety::Safe {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+    }
+    if !declaration.level_parameters().is_empty() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: declaration.level_parameters().len(),
+        });
+    }
+    if metadata.mutual() != std::slice::from_ref(name) {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::MutualMetadata);
+    }
+    if metadata.num_parameters() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    if metadata.num_indices() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    }
+    if metadata.num_nested() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
+            observed: metadata.num_nested(),
+        });
+    }
+    if metadata.is_recursive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
+    }
+    if metadata.is_reflexive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
+    }
+    if metadata.constructors().is_empty()
+        || metadata.constructors().len() > MAX_ENUMERATION_CONSTRUCTORS
+    {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
+            observed: metadata.constructors().len(),
+            limit: MAX_ENUMERATION_CONSTRUCTORS,
+        });
+    }
+    let Some(expected_type) = enumeration_type() else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        declaration.type_(),
+        &expected_type,
+        &mut comparison,
+        &mut cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse);
+        }
+        Err(verdict) => return verdict,
+    }
+
+    let expected_count = metadata.constructors().len().saturating_add(2);
+    if declarations.len() != expected_count {
+        return InductiveVerdict::Rejected(InductiveRejection::DeclarationCount {
+            observed: declarations.len(),
+            expected: expected_count,
+        });
+    }
+    if environment.find(name).is_some() {
+        return InductiveVerdict::Rejected(InductiveRejection::NameAlreadyDeclared {
+            name: name.clone(),
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut members = Vec::new();
+    members.push(name.clone());
+    for (index, constructor_name) in metadata.constructors().iter().enumerate() {
+        if let Err(stop) = comparison.comparison(&mut cancelled) {
+            return InductiveVerdict::Inconclusive(stop);
+        }
+        if !seen.insert(constructor_name) {
+            return InductiveVerdict::Rejected(InductiveRejection::RepeatedConstructor {
+                name: constructor_name.clone(),
+            });
+        }
+        let Some(constructor) = declarations
+            .iter()
+            .find(|entry| entry.name() == constructor_name)
+        else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+                name: constructor_name.clone(),
+            });
+        };
+        let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: constructor_name.clone(),
+            });
+        };
+        let expected_index = match u32::try_from(index) {
+            Ok(index) => index,
+            Err(_) => {
+                return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
+                    observed: metadata.constructors().len(),
+                    limit: MAX_ENUMERATION_CONSTRUCTORS,
+                });
+            }
+        };
+        if constructor.declaration().safety() != ConstantSafety::Safe
+            || !constructor.declaration().level_parameters().is_empty()
+            || constructor_metadata.inductive() != name
+            || constructor_metadata.index() != expected_index
+            || constructor_metadata.num_parameters() != 0
+            || constructor_metadata.num_fields() != 0
+            || environment.find(constructor_name).is_some()
+        {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: constructor_name.clone(),
+            });
+        }
+        let Some(expected) = enumeration_constant_type(name) else {
+            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+        };
+        match compare_inductive_expression(
+            constructor.declaration().type_(),
+            &expected,
+            &mut comparison,
+            &mut cancelled,
+        ) {
+            Ok(true) => members.push(constructor_name.clone()),
+            Ok(false) => {
+                return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                    name: constructor_name.clone(),
+                });
+            }
+            Err(verdict) => return verdict,
+        }
+    }
+
+    let recursor_name = checker_child(name, "rec");
+    let Some(recursor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &recursor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_levels = recursor.declaration().level_parameters();
+    if recursor.declaration().safety() != ConstantSafety::Safe
+        || recursor_levels.len() != 1
+        || recursor_metadata.mutual() != std::slice::from_ref(name)
+        || recursor_metadata.num_parameters() != 0
+        || recursor_metadata.num_indices() != 0
+        || recursor_metadata.num_motives() != 1
+        || u32::try_from(metadata.constructors().len()).ok() != Some(recursor_metadata.num_minors())
+        || recursor_metadata.rules().len() != metadata.constructors().len()
+        || recursor_metadata.k()
+        || environment.find(&recursor_name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    let level_parameter = &recursor_levels[0];
+    let Some(expected_recursor_type) =
+        enumeration_recursor_type(name, metadata.constructors(), level_parameter)
+    else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        recursor.declaration().type_(),
+        &expected_recursor_type,
+        &mut comparison,
+        &mut cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: recursor_name,
+            });
+        }
+        Err(verdict) => return verdict,
+    }
+    for (index, (constructor, rule)) in metadata
+        .constructors()
+        .iter()
+        .zip(recursor_metadata.rules())
+        .enumerate()
+    {
+        if rule.constructor() != constructor || rule.num_fields() != 0 {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: recursor_name,
+            });
+        }
+        let Some(expected_rhs) =
+            enumeration_rule_rhs(name, metadata.constructors(), level_parameter, index)
+        else {
+            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+        };
+        match compare_inductive_expression(
+            rule.rhs(),
+            &expected_rhs,
+            &mut comparison,
+            &mut cancelled,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                    name: recursor_name,
+                });
+            }
+            Err(verdict) => return verdict,
+        }
+    }
+    members.push(recursor_name);
+    InductiveVerdict::Admitted(InductiveAdmission { members })
+}
+
 struct ExpectedQuotient {
     kind: QuotientKind,
     name: WireName,
@@ -1712,7 +2168,7 @@ fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
     let v = checker_atom("v");
 
     let quot_type = {
-        let mut b = QuotientTermBuilder::new();
+        let mut b = StructuralTermBuilder::new();
         let alpha_sort = b.sort_parameter(&u);
         let alpha0 = b.bvar(0);
         let alpha1 = b.bvar(1);
@@ -1726,7 +2182,7 @@ fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
     };
 
     let quot_mk_type = {
-        let mut b = QuotientTermBuilder::new();
+        let mut b = StructuralTermBuilder::new();
         let alpha_sort = b.sort_parameter(&u);
         let alpha0 = b.bvar(0);
         let alpha1 = b.bvar(1);
@@ -1746,7 +2202,7 @@ fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
     };
 
     let quot_lift_type = {
-        let mut b = QuotientTermBuilder::new();
+        let mut b = StructuralTermBuilder::new();
         let alpha_sort = b.sort_parameter(&u);
         let alpha0 = b.bvar(0);
         let alpha1 = b.bvar(1);
@@ -1796,7 +2252,7 @@ fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
     };
 
     let quot_ind_type = {
-        let mut b = QuotientTermBuilder::new();
+        let mut b = StructuralTermBuilder::new();
         let alpha_sort = b.sort_parameter(&u);
         let alpha0 = b.bvar(0);
         let alpha1 = b.bvar(1);
@@ -1870,7 +2326,7 @@ fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
 }
 
 fn expected_equality_type(parameter: &WireName) -> Option<WireExpr> {
-    let mut b = QuotientTermBuilder::new();
+    let mut b = StructuralTermBuilder::new();
     let alpha_sort = b.sort_parameter(parameter);
     let alpha0 = b.bvar(0);
     let alpha1 = b.bvar(1);
@@ -1882,7 +2338,7 @@ fn expected_equality_type(parameter: &WireName) -> Option<WireExpr> {
 }
 
 fn expected_equality_constructor_type(parameter: &WireName) -> Option<WireExpr> {
-    let mut b = QuotientTermBuilder::new();
+    let mut b = StructuralTermBuilder::new();
     let eq = checker_atom("Eq");
     let alpha_sort = b.sort_parameter(parameter);
     let alpha_for_a = b.bvar(0);
@@ -1901,10 +2357,14 @@ fn expected_equality_constructor_type(parameter: &WireName) -> Option<WireExpr> 
 fn compare_or_verdict(
     actual: &WireExpr,
     expected: &WireExpr,
-    control: &mut QuotientComparisonControl,
+    control: &mut StructuralComparisonControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<bool, QuotientVerdict> {
-    match structural_expression_equal(actual, expected, control, cancelled) {
+    // The pinned quotient initializer uses `expr_eq_fn<false>`: binder names
+    // and binder annotations are presentation metadata at this authority
+    // boundary. Keeping this policy separate from inductive recursor
+    // regeneration prevents the two structural contracts from being conflated.
+    match structural_expression_equal(actual, expected, control, false, cancelled) {
         Ok(Ok(equal)) => Ok(equal),
         Ok(Err(stop)) => Err(QuotientVerdict::Inconclusive(stop)),
         Err(fault) => Err(QuotientVerdict::InternalFault(QuotientFault::Structural(
@@ -1929,7 +2389,7 @@ pub fn admit_quotient_with(
     budget: AdmissionBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> QuotientVerdict {
-    let mut comparison = QuotientComparisonControl::new(budget.conversion.quick);
+    let mut comparison = StructuralComparisonControl::new(budget.conversion.quick);
     let eq = checker_atom("Eq");
     let Some(eq_declaration) = environment.find(&eq) else {
         return QuotientVerdict::Rejected(QuotientRejection::EqualityTypeMissing);

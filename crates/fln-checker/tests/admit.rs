@@ -13,13 +13,15 @@ use std::path::{Path, PathBuf};
 use fln_checker::admit::{
     ADMISSION_SCHEMA, AdmissionBudget, AdmissionDeferred, AdmissionGround, AdmissionPhase,
     AdmissionRejection, AdmissionStop, BlockRejection, BlockVerdict, Quarantine, QuotientRejection,
-    QuotientVerdict, Verdict, admit, admit_block, admit_quotient, admit_quotient_with, admit_with,
+    QuotientVerdict, Verdict, admit, admit_block, admit_inductive, admit_inductive_with,
+    admit_quotient, admit_quotient_with, admit_with,
 };
 use fln_checker::defeq::{DefEqBudget, QuickDefEqBudget, QuickDefEqLimit, QuickDefEqStop};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
     ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
-    EnvironmentOutcome, InductiveDeclaration, QuotientKind, ReducibilityHint,
+    EnvironmentOutcome, InductiveDeclaration, QuotientKind, RecursorDeclaration, RecursorRule,
+    ReducibilityHint,
 };
 use fln_checker::infer::InferenceBudget;
 use fln_checker::term::TermBudget;
@@ -228,7 +230,9 @@ fn equality_environment(
     environment_of(entries)
 }
 
-fn quotient_entries() -> Vec<ConstantEntry> {
+fn quotient_entries_with_lift_relation_binder(
+    lift_relation_binder: BinderInfo,
+) -> Vec<ConstantEntry> {
     let quot = primary_name("Quot");
     let u_name = primary_name("u");
     let v_name = primary_name("v");
@@ -289,7 +293,7 @@ fn quotient_entries() -> Vec<ConstantEntry> {
         Expr::sort(u.clone()),
         primary_pi(
             "r",
-            BinderInfo::Implicit,
+            lift_relation_binder,
             primary_arrow(bv(0), primary_arrow(bv(1), prop())),
             primary_pi(
                 "β",
@@ -381,6 +385,289 @@ fn quotient_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn quotient_entries() -> Vec<ConstantEntry> {
+    quotient_entries_with_lift_relation_binder(BinderInfo::Implicit)
+}
+
+fn enumeration_entries_with_binders(
+    recursor_motive_binder: BinderInfo,
+    rule_motive_binder: BinderInfo,
+) -> Vec<ConstantEntry> {
+    let color = primary_name("Color");
+    let red = Name::str(color.clone(), "red");
+    let blue = Name::str(color.clone(), "blue");
+    let u_name = primary_name("u");
+    let u = Level::param(u_name.clone());
+    let color_expr = || Expr::const_(color.clone(), Vec::new());
+    let red_expr = || Expr::const_(red.clone(), Vec::new());
+    let blue_expr = || Expr::const_(blue.clone(), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = primary_pi(
+        "t",
+        BinderInfo::Default,
+        color_expr(),
+        Expr::sort(u.clone()),
+    );
+    let recursor_type = primary_pi(
+        "motive",
+        recursor_motive_binder,
+        motive_type.clone(),
+        primary_pi(
+            "red",
+            BinderInfo::Default,
+            Expr::app(bv(0), red_expr()),
+            primary_pi(
+                "blue",
+                BinderInfo::Default,
+                Expr::app(bv(1), blue_expr()),
+                primary_pi(
+                    "t",
+                    BinderInfo::Default,
+                    color_expr(),
+                    Expr::app(bv(3), bv(0)),
+                ),
+            ),
+        ),
+    );
+    let rule_rhs = |selected: u32| {
+        Expr::lam(
+            primary_name("motive"),
+            motive_type.clone(),
+            Expr::lam(
+                primary_name("red"),
+                Expr::app(bv(0), red_expr()),
+                Expr::lam(
+                    primary_name("blue"),
+                    Expr::app(bv(1), blue_expr()),
+                    bv(selected),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            rule_motive_binder,
+        )
+    };
+    vec![
+        ConstantEntry::new(
+            checker_name("Color"),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![checker_name("Color")],
+                    vec![
+                        checker_qualified(&["Color", "red"]),
+                        checker_qualified(&["Color", "blue"]),
+                    ],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Color", "red"]),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&color_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Color"), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Color", "blue"]),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&color_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Color"), 1, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Color", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![checker_name("Color")],
+                    0,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(
+                            checker_qualified(&["Color", "red"]),
+                            0,
+                            decoded(&rule_rhs(1)),
+                        ),
+                        RecursorRule::new(
+                            checker_qualified(&["Color", "blue"]),
+                            0,
+                            decoded(&rule_rhs(0)),
+                        ),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
+fn enumeration_entries(recursor_motive_binder: BinderInfo) -> Vec<ConstantEntry> {
+    enumeration_entries_with_binders(recursor_motive_binder, BinderInfo::Default)
+}
+
+#[test]
+fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Color block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+    assert_eq!(
+        admission.ground(),
+        AdmissionGround::InductiveEnumerationChecked
+    );
+}
+
+#[test]
+fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
+    let mut bad_constructor = enumeration_entries(BinderInfo::Implicit);
+    bad_constructor[1] = ConstantEntry::new(
+        checker_qualified(&["Color", "red"]),
+        ConstantDeclaration::constructor(
+            Vec::new(),
+            a_type(),
+            ConstantSafety::Safe,
+            ConstructorDeclaration::new(checker_name("Color"), 0, 0, 0),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &bad_constructor,
+            AdmissionBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+
+    let bad_recursor = enumeration_entries(BinderInfo::Default);
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &bad_recursor,
+            AdmissionBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+    let bad_rule = enumeration_entries_with_binders(BinderInfo::Implicit, BinderInfo::Implicit);
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &bad_rule,
+            AdmissionBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+    assert!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &enumeration_entries(BinderInfo::Implicit),
+            AdmissionBudget::unlimited(),
+        )
+        .is_admitted(),
+        "the exact block must remain the positive control"
+    );
+}
+
+#[test]
+fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let oversized = vec![entries[0].clone(); 35];
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &oversized,
+            AdmissionBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Deferred(
+            fln_checker::admit::InductiveSupportLimit::DeclarationRows {
+                observed: 35,
+                limit: 34,
+            }
+        )
+    ));
+    let budget = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget {
+            quick: QuickDefEqBudget::new(0, u64::MAX),
+            ..DefEqBudget::unlimited()
+        },
+    );
+    assert!(matches!(
+        admit_inductive(&ConstantEnvironment::empty(), &entries, budget),
+        fln_checker::admit::InductiveVerdict::Inconclusive(_)
+    ));
+    assert!(matches!(
+        admit_inductive_with(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            || true,
+        ),
+        fln_checker::admit::InductiveVerdict::Inconclusive(_)
+    ));
+
+    let mut recursive = enumeration_entries(BinderInfo::Implicit);
+    recursive[0] = ConstantEntry::new(
+        checker_name("Color"),
+        ConstantDeclaration::inductive(
+            Vec::new(),
+            decoded(&Expr::sort(Level::one())),
+            ConstantSafety::Safe,
+            InductiveDeclaration::new(
+                0,
+                0,
+                vec![checker_name("Color")],
+                vec![
+                    checker_qualified(&["Color", "red"]),
+                    checker_qualified(&["Color", "blue"]),
+                ],
+                0,
+                true,
+                false,
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &recursive,
+            AdmissionBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Deferred(
+            fln_checker::admit::InductiveSupportLimit::Recursive
+        )
+    ));
+}
+
 #[test]
 fn kr950_954_quotient_initialization_is_reconstructed_independently() {
     let environment = equality_environment(false, false);
@@ -400,6 +687,16 @@ fn kr950_954_quotient_initialization_is_reconstructed_independently() {
         AdmissionGround::QuotientPrimitiveChecked
     );
     assert_eq!(admission.schema(), ADMISSION_SCHEMA);
+}
+
+#[test]
+fn kr950_954_quotient_initialization_ignores_kernel_irrelevant_binder_styles() {
+    let environment = equality_environment(false, false);
+    let declarations = quotient_entries_with_lift_relation_binder(BinderInfo::Default);
+    assert!(
+        admit_quotient(&environment, &declarations, AdmissionBudget::unlimited()).is_admitted(),
+        "the pinned quotient equality ignores binder annotations"
+    );
 }
 
 #[test]
