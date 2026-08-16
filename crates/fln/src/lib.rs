@@ -1759,13 +1759,14 @@ fn bounded_source_module_name_depth(
                 });
             }
         }
-        depth = depth
-            .checked_add(1)
-            .ok_or_else(|| EngineExecutionError::SourceModuleNameLimit {
-                module: module.clone(),
-                observed: usize::MAX,
-                limit,
-            })?;
+        depth =
+            depth
+                .checked_add(1)
+                .ok_or_else(|| EngineExecutionError::SourceModuleNameLimit {
+                    module: module.clone(),
+                    observed: usize::MAX,
+                    limit,
+                })?;
         if depth > limit {
             return Err(EngineExecutionError::SourceModuleNameLimit {
                 module: module.clone(),
@@ -2688,10 +2689,7 @@ impl Engine {
 
         let mut owners = BTreeMap::new();
         for (index, module) in modules.iter().enumerate() {
-            bounded_source_module_name_depth(
-                module.name,
-                limits.source_modules.max_name_depth,
-            )?;
+            bounded_source_module_name_depth(module.name, limits.source_modules.max_name_depth)?;
             if owners.insert(module.name.clone(), index).is_some() {
                 return Err(EngineExecutionError::DuplicateSourceModule {
                     module: module.name.clone(),
@@ -2718,10 +2716,7 @@ impl Engine {
                     EngineExecutionError::Frontend(DefinitionFrontendError::Parse(error))
                 })?;
             for import in &partitioned.imports {
-                bounded_source_module_name_depth(
-                    import,
-                    limits.source_modules.max_name_depth,
-                )?;
+                bounded_source_module_name_depth(import, limits.source_modules.max_name_depth)?;
             }
             import_presentations = import_presentations
                 .checked_add(partitioned.imports.len())

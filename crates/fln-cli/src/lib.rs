@@ -3065,9 +3065,7 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
         | fln::EngineExecutionError::MissingSourceImports { .. }
         | fln::EngineExecutionError::UnreachableSourceModules { .. }
         | fln::EngineExecutionError::SourceModuleCycle { .. }
-        | fln::EngineExecutionError::InvalidSourceModuleName { .. } => {
-            ("module-graph", false, 1)
-        }
+        | fln::EngineExecutionError::InvalidSourceModuleName { .. } => ("module-graph", false, 1),
         fln::EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
             ("resource", false, 3)
         }
@@ -3544,9 +3542,7 @@ fn source_module_components(name: &fln::Name) -> Option<Vec<String>> {
 }
 
 fn bounded_source_path_components(path: &Path, max_depth: usize) -> Option<Vec<String>> {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return None;
-    };
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
     if path.extension().and_then(|extension| extension.to_str()) != Some("lean") {
         return None;
     }
@@ -3645,10 +3641,7 @@ fn derive_source_module_plan(
         return Ok(None);
     }
 
-    let depths = imports
-        .keys()
-        .map(Vec::len)
-        .collect::<BTreeSet<usize>>();
+    let depths = imports.keys().map(Vec::len).collect::<BTreeSet<usize>>();
     let mut candidates = imports
         .keys()
         .cloned()
@@ -3704,9 +3697,7 @@ fn derive_source_module_plan(
     }
     for (index, path) in paths.iter().enumerate() {
         if names[index].is_none() {
-            names[index] = Some(
-                source_entry_name(path).map_err(SourceModulePlanFailure::Input)?,
-            );
+            names[index] = Some(source_entry_name(path).map_err(SourceModulePlanFailure::Input)?);
         }
     }
     let names = names
@@ -3717,12 +3708,9 @@ fn derive_source_module_plan(
                 "source module identity table was incomplete".to_owned(),
             )
         })?;
-    let entry = names
-        .last()
-        .cloned()
-        .ok_or_else(|| {
-            SourceModulePlanFailure::Input("source module set has no entry path".to_owned())
-        })?;
+    let entry = names.last().cloned().ok_or_else(|| {
+        SourceModulePlanFailure::Input("source module set has no entry path".to_owned())
+    })?;
     Ok(Some(SourceModulePlan { names, entry }))
 }
 
@@ -5169,6 +5157,14 @@ mod tests {
         let dotted = super::derive_source_module_plan(&dotted_paths, &dotted_sources)
             .expect_err("a dotted file stem cannot invent a module hierarchy");
         assert!(dotted.detail().contains("dotted file stem"));
+
+        let too_many_paths = (0..=fln::SourceModuleLimits::default().max_modules)
+            .map(|index| PathBuf::from(format!("Module{index}.lean")))
+            .collect::<Vec<_>>();
+        let exhausted = super::derive_source_module_plan(&too_many_paths, &[])
+            .expect_err("module planning is bounded before suffix matching");
+        assert_eq!(exhausted.disposition(), ("resource", false, 3));
+        assert!(exhausted.detail().contains("planning limit"));
     }
 
     #[test]
