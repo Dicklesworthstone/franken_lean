@@ -3,7 +3,7 @@ schema-root fnv1a64:df3a038b267eec03
 suite-lock-root fnv1a64:59106815ecabce66
 abi-target-layout-root fnv1a64:ca9297f838ac6c63
 olean-ilean-format-root fnv1a64:81ef218b75c9530e
-raw-root fnv1a64:bd41e3de0889e063
+raw-root fnv1a64:14c703d9ac96a934
 policy-root fnv1a64:98d6f6aef69fbe5f
 reference-root fnv1a64:bd39284374050f56
 extractor suite-lock version=1
@@ -19,8 +19,8 @@ row abi-layout:target:0001 kind=abi-layout extractor=lean-h-clang-layout extract
 row artifact-format:ilean kind=artifact-format extractor=lean-format-source-and-pin-artifacts extractor-version=1 source=contracts/OLEAN_ILEAN_FORMAT.txt:ilean target-class=none abi-class=none raw-evidence-hash=fnv1a64:72e3812e55db2a31 identity=fnv1a64:9bc6b0f1ceb194d3 authority=observed support=required
 row artifact-format:olean:target:0001 kind=artifact-format extractor=lean-format-source-and-pin-artifacts extractor-version=1 source=contracts/OLEAN_ILEAN_FORMAT.txt:olean:target:0001 target-class=certified abi-class=lp64-le raw-evidence-hash=fnv1a64:8d8a11bca4df8a1c identity=fnv1a64:ad65ce9b13c2bda2 authority=observed support=required
 row corpus kind=corpus extractor=suite-lock extractor-version=1 source=SUITE.lock:corpus target-class=none abi-class=none raw-evidence-hash=fnv1a64:6d1b83338ddaa18f identity=fnv1a64:5e555b5e4f99ae35 authority=observed support=required
-row environment-census:builtin kind=environment-census extractor=lean-reference-environment-walk extractor-version=2 source=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt:builtin target-class=none abi-class=none raw-evidence-hash=fnv1a64:a30d26bec3c015b3 identity=fnv1a64:f7544cc4418019d3 authority=observed support=required
-row environment-census:extern kind=environment-census extractor=lean-reference-environment-walk extractor-version=2 source=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt:extern target-class=none abi-class=none raw-evidence-hash=fnv1a64:353384a7c962812d identity=fnv1a64:2d6c0af8840813b9 authority=observed support=required
+row environment-census:builtin kind=environment-census extractor=lean-reference-environment-walk extractor-version=2 source=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt:builtin target-class=none abi-class=none raw-evidence-hash=fnv1a64:e9ca09bd90cad3eb identity=fnv1a64:8b4648fe2927fdda authority=observed support=required
+row environment-census:extern kind=environment-census extractor=lean-reference-environment-walk extractor-version=2 source=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt:extern target-class=none abi-class=none raw-evidence-hash=fnv1a64:e6dbe1a102a345af identity=fnv1a64:2712669385de5f35 authority=observed support=required
 row reference kind=reference extractor=suite-lock extractor-version=1 source=SUITE.lock:reference target-class=none abi-class=none raw-evidence-hash=fnv1a64:1da56b93f1791c9c identity=fnv1a64:a61ba4730c961704 authority=observed support=required
 row suite:asupersync kind=suite extractor=suite-lock extractor-version=1 source=SUITE.lock:suite:asupersync target-class=none abi-class=none raw-evidence-hash=fnv1a64:cb1f4c86beb2bd06 identity=fnv1a64:415dacef842a6859 authority=observed support=required
 row suite:atp kind=suite extractor=suite-lock extractor-version=1 source=SUITE.lock:suite:atp target-class=none abi-class=none raw-evidence-hash=fnv1a64:708f167475754f90 identity=fnv1a64:04bc8e03f2b478f3 authority=observed support=required
@@ -33,4 +33,4 @@ row suite:frankentorch kind=suite extractor=suite-lock extractor-version=1 sourc
 row suite:frankentui kind=suite extractor=suite-lock extractor-version=1 source=SUITE.lock:suite:frankentui target-class=none abi-class=none raw-evidence-hash=fnv1a64:bc21aef797d001e6 identity=fnv1a64:3436b5074e634b12 authority=observed support=required
 row target:0001 kind=target extractor=suite-lock extractor-version=1 source=SUITE.lock:target:0001 target-class=certified abi-class=none raw-evidence-hash=fnv1a64:b6a4c7c3dac6fc5e identity=fnv1a64:1698ed6073a00d6f authority=observed support=required
 row toolchain kind=toolchain extractor=suite-lock extractor-version=1 source=SUITE.lock:rust-toolchain target-class=none abi-class=none raw-evidence-hash=fnv1a64:c475f44ee5684dc2 identity=fnv1a64:9d926faf575c8e63 authority=observed support=required
-inventory-root fnv1a64:3c5cc15ef71430e8
+inventory-root fnv1a64:8740c45927e3590b

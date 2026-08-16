@@ -1206,6 +1206,47 @@ fn every_supervisor_launcher_seals_python_configuration_before_imports() {
     );
 }
 
+#[test]
+fn contract_drift_governed_envelope_satisfies_bundle_finalizer_schema() {
+    let script = trusted_script("scripts/e2e/contract_drift.sh");
+    let capture = script
+        .split_once("--json-value host_facts")
+        .expect("contract_drift must publish host facts")
+        .1
+        .split_once("--string seed")
+        .expect("contract_drift host facts must end before the seed field")
+        .0;
+
+    for field in ["machine", "python", "release", "system"] {
+        assert!(
+            capture.contains(&format!(r#""{field}":"#)),
+            "contract_drift host facts omit the finalizer-required {field:?} field"
+        );
+    }
+
+    let governed_steps = script
+        .split_once("for STEP in \"${STEP_IDS[@]}\"; do")
+        .expect("contract_drift must attest every registered governed step")
+        .1
+        .split_once("set_final pass all_contract_drift_obligations_passed")
+        .expect("contract_drift governed steps must precede its success commit")
+        .0;
+    for binding in [
+        "--stage-id \"$STEP\"",
+        "--expected-stage-id \"$STEP\"",
+        "--json-file supervisor \"$STEP_META\"",
+    ] {
+        assert!(
+            governed_steps.contains(binding),
+            "contract_drift does not bind each registered step to {binding:?}"
+        );
+    }
+    assert!(
+        !governed_steps.contains("--json-file supervisor \"$META\""),
+        "contract_drift must not reuse its composite supervisor identity for registered steps"
+    );
+}
+
 /// The bead-text write guard must compare complete payloads and bind comment read-back to the
 /// immutable record created by this process.
 ///

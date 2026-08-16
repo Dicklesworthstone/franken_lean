@@ -209,7 +209,7 @@ if [[ "${FLN_CONTRACT_DRIFT_LEGACY:-0}" != 1 ]]; then
     --string parity_ledger_row not_applicable_contract_drift_extraction \
     --string epoch lean-v4.32.0 --string mode sound --string profile e2e \
     --string platform "$(uname -srm)" --integer thread_count 1 \
-    --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"machine":platform.machine(),"python":platform.python_version(),"system":platform.system()},sort_keys=True,separators=(",",":")))')" \
+    --json-value host_facts "$("${PYTHON[@]}" -c 'import json,platform; print(json.dumps({"machine":platform.machine(),"python":platform.python_version(),"release":platform.release(),"system":platform.system()},sort_keys=True,separators=(",",":")))')" \
     --string seed "$LEGACY_RUN_ID" --string cache_state "${FLN_E2E_CACHE_STATE:-unspecified}" \
     --string input_root "$INPUT_ROOT" --string vendor_binding vendor-binding.json \
     --producer-binding-root "$ROOT" "${GOVERNED_ARGS[@]}" \
@@ -275,26 +275,53 @@ PY
     [ -f "$LEGACY_LOG" ] && STATUS="$(legacy_status "$STEP")"
     ASSERTION=pass
     EXPECTED="passed"
+    ACCEPTED_STATUSES=passed
     if [ "$STEP" = census_drift ]; then
       EXPECTED="passed_or_typed_skip"
+      ACCEPTED_STATUSES=passed,skipped
       [[ "$STATUS" = passed || "$STATUS" = skipped ]] || ASSERTION=fail
     elif [ "$STATUS" != passed ]; then
       ASSERTION=fail
     fi
+    STEP_META="$ART_DIR/$STEP.meta.json"
+    STEP_OUT="$ART_DIR/$STEP.out"
+    STEP_ERR="$ART_DIR/$STEP.err"
+    STEP_READY="$ART_DIR/$STEP.ready.json"
+    STEP_VALIDATION="$ART_DIR/$STEP.validation.json"
+    set +e
+    "${PYTHON[@]}" "$EVIDENCE" run --cwd "$ROOT" --metadata "$STEP_META" \
+      --stdout "$STEP_OUT" --stderr "$STEP_ERR" --readiness "$STEP_READY" \
+      --artifact-root "$ART_DIR" --capture-bytes "$CAPTURE_BYTES" \
+      --output-budget-bytes "$OUTPUT_BUDGET_BYTES" --timeout-ms "$TIMEOUT_MS" \
+      --grace-ms "$GRACE_MS" --stage-id "$STEP" -- \
+      "${PYTHON[@]}" -c 'import json,pathlib,sys
+rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line]
+matches = [row for row in rows if row.get("step") == sys.argv[2]]
+accepted = set(sys.argv[3].split(","))
+if len(matches) != 1 or matches[0].get("status") not in accepted:
+    raise SystemExit(1)' "$LEGACY_LOG" "$STEP" "$ACCEPTED_STATUSES"
+    STEP_WRAPPER_RC=$?
+    set -e
+    "${PYTHON[@]}" "$EVIDENCE" validate-supervisor --file "$STEP_META" \
+      --expected-stage-id "$STEP" --artifact-root "$ART_DIR" \
+      --output "$STEP_VALIDATION"
+    STEP_CLASS="$(read_meta "$STEP_META" classification)"
+    STEP_CHILD="$(read_meta "$STEP_META" child_exit)"
     if [ "$WRAPPER_RC" -ne 0 ] || [ "$ACTUAL_CLASS" != pass ] \
         || [ "$ACTUAL_CHILD" -ne 0 ] || [ "$BEFORE" != "$INPUT_ROOT" ] \
-        || [ "$AFTER" != "$INPUT_ROOT" ]; then
+        || [ "$AFTER" != "$INPUT_ROOT" ] || [ "$STEP_WRAPPER_RC" -ne 0 ] \
+        || [ "$STEP_CLASS" != pass ] || [ "$STEP_CHILD" -ne 0 ]; then
       ASSERTION=fail
     fi
     emit_event --string event step --string step_id "$STEP" \
       --string assertion "$ASSERTION" --string expected "$EXPECTED" \
       --string actual "legacy:$STATUS" --string input_root "$BEFORE" \
       --string final_state "$AFTER" \
-      --string validation_artifact "$(basename "$VALIDATION")" \
+      --string validation_artifact "$(basename "$STEP_VALIDATION")" \
       --string expected_supervisor_classification pass \
       --integer expected_wrapper_exit 0 --integer expected_child_exit 0 \
       --string subject_root "$BEFORE" --string subject_final_state "$AFTER" \
-      --json-file supervisor "$META"
+      --json-file supervisor "$STEP_META"
     if [ "$ASSERTION" != pass ]; then
       set_final fail "$STEP:legacy_attestation_failed" 1
       exit 1
