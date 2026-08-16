@@ -102,12 +102,13 @@
 //!
 //! # What this does NOT claim
 //!
-//! It does not claim a second in-repo engine exists. `fln-checker` is still a
-//! charter crate and there is still no NbE anywhere; that remains
-//! `franken_lean-gii` and `franken_lean-g3k`. It also does not rescue
-//! FL-INV-02, which is kernel soundness *locality* and is already supported by
-//! [`crate::capability`]. This is the defense-in-depth layer B3 promises on top
-//! of that, and nothing more.
+//! It does not claim K2 or NbE exists, or that the independent checker is
+//! corpus-complete. The bounded `fln` Engine admission surface now supplies
+//! `fln-checker` as an [`IndependentImplementation`](SeatOrigin::IndependentImplementation)
+//! seat, while full checker and K2 completion remain `franken_lean-gii` and
+//! `franken_lean-g3k`. It also does not rescue FL-INV-02, which is kernel
+//! soundness *locality* and is already supported by [`crate::capability`]. This
+//! is the defense-in-depth layer B3 promises on top of that, and nothing more.
 
 use crate::capability::{Admitted, CheckedDecl};
 use crate::verdict::{Bound, Budget, Comparability, ComparabilityDefect, Consumption, RejectClass};
