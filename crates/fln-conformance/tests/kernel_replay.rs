@@ -2692,19 +2692,9 @@ fn persist_checkpoint(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> R
         .map_err(|error| format!("create checkpoint directory {}: {error}", dir.display()))?;
     let path = checkpoint_path(dir, module, oracle_hash);
     let expected = checkpoint_content(module, oracle_hash);
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(expected.as_bytes())
-                .map_err(|error| format!("write checkpoint {}: {error}", path.display()))?;
-            file.sync_all()
-                .map_err(|error| format!("sync checkpoint {}: {error}", path.display()))?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+    match fln::publish_file_atomic_new(expected.as_bytes(), &path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.primary_io_error_kind() == Some(std::io::ErrorKind::AlreadyExists) => {
             checkpoint_is_complete(dir, module, oracle_hash).and_then(|complete| {
                 complete.then_some(()).ok_or_else(|| {
                     format!(
@@ -2714,7 +2704,7 @@ fn persist_checkpoint(dir: &Path, module: &CorpusModule, oracle_hash: &str) -> R
                 })
             })
         }
-        Err(error) => Err(format!("create checkpoint {}: {error}", path.display())),
+        Err(error) => Err(format!("publish checkpoint {}: {error}", path.display())),
     }
 }
 
