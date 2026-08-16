@@ -521,6 +521,125 @@ fn enumeration_entries(recursor_motive_binder: BinderInfo) -> Vec<ConstantEntry>
     enumeration_entries_with_binders(recursor_motive_binder, BinderInfo::Default)
 }
 
+fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
+    let witness = primary_name("Witness");
+    let make = Name::str(witness.clone(), "mk");
+    let u_name = primary_name("u");
+    let u = Level::param(u_name.clone());
+    let witness_expr = || Expr::const_(witness.clone(), Vec::new());
+    let make_expr = || Expr::const_(make.clone(), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let constructor_type = primary_pi(
+        "proposition",
+        BinderInfo::Default,
+        Expr::sort(Level::zero()),
+        primary_pi("proof", BinderInfo::Default, bv(0), witness_expr()),
+    );
+    let motive_type = primary_pi(
+        "t",
+        BinderInfo::Default,
+        witness_expr(),
+        Expr::sort(u.clone()),
+    );
+    let minor_type = primary_pi(
+        "proposition",
+        BinderInfo::Default,
+        Expr::sort(Level::zero()),
+        primary_pi(
+            "proof",
+            BinderInfo::Default,
+            bv(0),
+            Expr::app(bv(2), Expr::app(Expr::app(make_expr(), bv(1)), bv(0))),
+        ),
+    );
+    let recursor_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive_type.clone(),
+        primary_pi(
+            "minor",
+            BinderInfo::Default,
+            minor_type.clone(),
+            primary_pi(
+                "t",
+                BinderInfo::Default,
+                witness_expr(),
+                Expr::app(bv(2), bv(0)),
+            ),
+        ),
+    );
+    let rule_rhs = Expr::lam(
+        primary_name("motive"),
+        motive_type,
+        Expr::lam(
+            primary_name("minor"),
+            minor_type,
+            Expr::lam(
+                primary_name("proposition"),
+                Expr::sort(Level::zero()),
+                Expr::lam(
+                    primary_name("proof"),
+                    bv(0),
+                    Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            checker_name("Witness"),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![checker_name("Witness")],
+                    vec![checker_qualified(&["Witness", "mk"])],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Witness", "mk"]),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&constructor_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Witness"), 0, 0, 2),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Witness", "rec"]),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![checker_name("Witness")],
+                    0,
+                    0,
+                    1,
+                    1,
+                    vec![RecursorRule::new(
+                        checker_qualified(&["Witness", "mk"]),
+                        2,
+                        decoded(&rule_rhs),
+                    )],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -528,6 +647,7 @@ fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
         &ConstantEnvironment::empty(),
         &entries,
         AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
     );
     assert!(verdict.is_admitted(), "exact Color block: {verdict:?}");
     let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
@@ -536,7 +656,155 @@ fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     assert_eq!(admission.members().len(), 4);
     assert_eq!(
         admission.ground(),
-        AdmissionGround::InductiveEnumerationChecked
+        AdmissionGround::InductiveNonrecursiveChecked
+    );
+}
+
+#[test]
+fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
+    let entries = dependent_field_inductive_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Witness block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 3);
+    assert_eq!(
+        admission.ground(),
+        AdmissionGround::InductiveNonrecursiveChecked
+    );
+}
+
+#[test]
+fn kr600_803_field_metadata_recursion_and_rule_forgery_are_refused() {
+    let mut wrong_count = dependent_field_inductive_entries();
+    let constructor = wrong_count[1].declaration();
+    wrong_count[1] = ConstantEntry::new(
+        checker_qualified(&["Witness", "mk"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Witness"), 0, 0, 1),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &wrong_count,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+
+    let mut recursive_field = dependent_field_inductive_entries();
+    let recursive_type = primary_pi(
+        "recursive",
+        BinderInfo::Default,
+        Expr::const_(primary_name("Witness"), Vec::new()),
+        Expr::const_(primary_name("Witness"), Vec::new()),
+    );
+    recursive_field[1] = ConstantEntry::new(
+        checker_qualified(&["Witness", "mk"]),
+        ConstantDeclaration::constructor(
+            Vec::new(),
+            decoded(&recursive_type),
+            ConstantSafety::Safe,
+            ConstructorDeclaration::new(checker_name("Witness"), 0, 0, 1),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &recursive_field,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+
+    let mut bad_rule = dependent_field_inductive_entries();
+    let recursor = bad_rule[2].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    bad_rule[2] = ConstantEntry::new(
+        checker_qualified(&["Witness", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![RecursorRule::new(
+                    checker_qualified(&["Witness", "mk"]),
+                    2,
+                    decoded(&Expr::bvar(0).expect("packs")),
+                )],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &bad_rule,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+
+    assert!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &dependent_field_inductive_entries(),
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        )
+        .is_admitted()
+    );
+}
+
+#[test]
+fn kr600_803_field_environment_exhaustion_is_a_nonanswer() {
+    let entries = dependent_field_inductive_entries();
+    let zero_environment = EnvironmentBudget::new(0, 0, 0, 0, 0, 0);
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            zero_environment,
+        ),
+        fln_checker::admit::InductiveVerdict::Inconclusive(
+            fln_checker::admit::InductiveStop::Environment { .. }
+        )
+    ));
+    assert!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        )
+        .is_admitted()
     );
 }
 
@@ -557,6 +825,7 @@ fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
             &ConstantEnvironment::empty(),
             &bad_constructor,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Rejected(
             fln_checker::admit::InductiveRejection::ConstructorShape { .. }
@@ -569,6 +838,7 @@ fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
             &ConstantEnvironment::empty(),
             &bad_recursor,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Rejected(
             fln_checker::admit::InductiveRejection::RecursorShape { .. }
@@ -580,6 +850,7 @@ fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
             &ConstantEnvironment::empty(),
             &bad_rule,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Rejected(
             fln_checker::admit::InductiveRejection::RecursorShape { .. }
@@ -590,6 +861,7 @@ fn kr600_803_enumeration_rejects_constructor_and_recursor_forgery() {
             &ConstantEnvironment::empty(),
             &enumeration_entries(BinderInfo::Implicit),
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         )
         .is_admitted(),
         "the exact block must remain the positive control"
@@ -605,6 +877,7 @@ fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
             &ConstantEnvironment::empty(),
             &oversized,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Deferred(
             fln_checker::admit::InductiveSupportLimit::DeclarationRows {
@@ -622,7 +895,12 @@ fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
         },
     );
     assert!(matches!(
-        admit_inductive(&ConstantEnvironment::empty(), &entries, budget),
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            budget,
+            EnvironmentBudget::unlimited(),
+        ),
         fln_checker::admit::InductiveVerdict::Inconclusive(_)
     ));
     assert!(matches!(
@@ -630,6 +908,7 @@ fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
             &ConstantEnvironment::empty(),
             &entries,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
             || true,
         ),
         fln_checker::admit::InductiveVerdict::Inconclusive(_)
@@ -661,6 +940,7 @@ fn kr600_803_enumeration_resource_and_cancellation_are_nonanswers() {
             &ConstantEnvironment::empty(),
             &recursive,
             AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
         ),
         fln_checker::admit::InductiveVerdict::Deferred(
             fln_checker::admit::InductiveSupportLimit::Recursive

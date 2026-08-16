@@ -102,7 +102,8 @@ use crate::defeq::{
 };
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, QuotientKind,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentFault, EnvironmentOutcome,
+    EnvironmentRefusal, EnvironmentStop, QuotientKind,
 };
 use crate::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
@@ -373,10 +374,11 @@ pub enum AdmissionGround {
     /// equality prelude were reconstructed and compared independently.
     QuotientPrimitiveChecked,
     /// KR-600..803, bounded ground — one safe, nonrecursive, non-nested,
-    /// parameter-free `Type` enumeration and its nullary constructors and
-    /// recursor were reconstructed from checker-owned rows. Other inductive
-    /// shapes remain deferred, never accepted under this ground.
-    InductiveEnumerationChecked,
+    /// parameter-free `Type` inductive and its bounded constructor telescopes,
+    /// recursor, and computation rules were reconstructed from checker-owned
+    /// rows. Other inductive shapes remain deferred, never accepted under this
+    /// ground.
+    InductiveNonrecursiveChecked,
     /// KR-975 — admitted INTO THE UNSAFE QUARANTINE. Everything the ordinary
     /// grounds claim, plus the fact that this declaration is not safe: a council
     /// reading this ground must not treat it as an ordinary admission, and the
@@ -1341,6 +1343,140 @@ impl StructuralTermBuilder {
         id
     }
 
+    fn shifted_level_id(offset: usize, id: LevelId, source_len: usize) -> Option<LevelId> {
+        (id.index() < source_len)
+            .then(|| offset.checked_add(id.index()))
+            .flatten()
+            .and_then(LevelId::from_index)
+    }
+
+    fn shifted_expr_id(offset: usize, id: ExprId, source_len: usize) -> Option<ExprId> {
+        (id.index() < source_len)
+            .then(|| offset.checked_add(id.index()))
+            .flatten()
+            .and_then(ExprId::from_index)
+    }
+
+    /// Import the source prefix containing `root`, retaining de Bruijn indexes.
+    /// Wire arenas are backward-only, so a root can reference no expression
+    /// beyond that prefix. The caller has already bounded the conservative
+    /// imported size before this allocation starts.
+    fn import(&mut self, source: &WireExpr, root: ExprId) -> Option<ExprId> {
+        let expression_count = root.index().checked_add(1)?;
+        if expression_count > source.nodes().len() {
+            return None;
+        }
+        let level_offset = self.levels.len();
+        let level_count = source.levels().len();
+        for (index, node) in source.levels().iter().enumerate() {
+            let shifted = match node {
+                LevelNode::Zero => LevelNode::Zero,
+                LevelNode::Succ(child) if child.index() < index => {
+                    LevelNode::Succ(Self::shifted_level_id(level_offset, *child, level_count)?)
+                }
+                LevelNode::Max(left, right) if left.index() < index && right.index() < index => {
+                    LevelNode::Max(
+                        Self::shifted_level_id(level_offset, *left, level_count)?,
+                        Self::shifted_level_id(level_offset, *right, level_count)?,
+                    )
+                }
+                LevelNode::IMax(left, right) if left.index() < index && right.index() < index => {
+                    LevelNode::IMax(
+                        Self::shifted_level_id(level_offset, *left, level_count)?,
+                        Self::shifted_level_id(level_offset, *right, level_count)?,
+                    )
+                }
+                LevelNode::Parameter(name) => LevelNode::Parameter(name.clone()),
+                LevelNode::Meta(name) => LevelNode::Meta(name.clone()),
+                _ => return None,
+            };
+            self.level(shifted);
+        }
+
+        let expression_offset = self.nodes.len();
+        let shift_expr = |id| Self::shifted_expr_id(expression_offset, id, expression_count);
+        let shift_level = |id| Self::shifted_level_id(level_offset, id, level_count);
+        for (index, node) in source.nodes().iter().take(expression_count).enumerate() {
+            let child = |id: ExprId| (id.index() < index).then_some(id).and_then(shift_expr);
+            let shifted = match node {
+                ExprNode::Bound { index } => ExprNode::Bound { index: *index },
+                ExprNode::Free { name } => ExprNode::Free { name: name.clone() },
+                ExprNode::Meta { name } => ExprNode::Meta { name: name.clone() },
+                ExprNode::Sort { level } => ExprNode::Sort {
+                    level: shift_level(*level)?,
+                },
+                ExprNode::Constant { name, levels } => ExprNode::Constant {
+                    name: name.clone(),
+                    levels: levels
+                        .iter()
+                        .map(|level| shift_level(*level))
+                        .collect::<Option<Vec<_>>>()?,
+                },
+                ExprNode::Apply { function, argument } => ExprNode::Apply {
+                    function: child(*function)?,
+                    argument: child(*argument)?,
+                },
+                ExprNode::Lambda {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                } => ExprNode::Lambda {
+                    binder_name: binder_name.clone(),
+                    binder_type: child(*binder_type)?,
+                    body: child(*body)?,
+                    style: *style,
+                },
+                ExprNode::Forall {
+                    binder_name,
+                    binder_type,
+                    body,
+                    style,
+                } => ExprNode::Forall {
+                    binder_name: binder_name.clone(),
+                    binder_type: child(*binder_type)?,
+                    body: child(*body)?,
+                    style: *style,
+                },
+                ExprNode::Let {
+                    declaration_name,
+                    type_,
+                    value,
+                    body,
+                    non_dependent,
+                } => ExprNode::Let {
+                    declaration_name: declaration_name.clone(),
+                    type_: child(*type_)?,
+                    value: child(*value)?,
+                    body: child(*body)?,
+                    non_dependent: *non_dependent,
+                },
+                ExprNode::NatLiteral { limbs_le } => ExprNode::NatLiteral {
+                    limbs_le: limbs_le.clone(),
+                },
+                ExprNode::StringLiteral(text) => ExprNode::StringLiteral(text.clone()),
+                ExprNode::Metadata {
+                    entries,
+                    expression,
+                } => ExprNode::Metadata {
+                    entries: entries.clone(),
+                    expression: child(*expression)?,
+                },
+                ExprNode::Projection {
+                    structure_name,
+                    index,
+                    expression,
+                } => ExprNode::Projection {
+                    structure_name: structure_name.clone(),
+                    index: *index,
+                    expression: child(*expression)?,
+                },
+            };
+            self.expression(shifted);
+        }
+        Self::shifted_expr_id(expression_offset, root, expression_count)
+    }
+
     fn bvar(&mut self, index: u32) -> ExprId {
         self.expression(ExprNode::Bound { index })
     }
@@ -1391,6 +1527,21 @@ impl StructuralTermBuilder {
         })
     }
 
+    fn forall_name(
+        &mut self,
+        name: &WireName,
+        style: BinderStyle,
+        binder_type: ExprId,
+        body: ExprId,
+    ) -> ExprId {
+        self.expression(ExprNode::Forall {
+            binder_name: name.clone(),
+            binder_type,
+            body,
+            style,
+        })
+    }
+
     fn lambda(
         &mut self,
         name: &str,
@@ -1400,6 +1551,21 @@ impl StructuralTermBuilder {
     ) -> ExprId {
         self.expression(ExprNode::Lambda {
             binder_name: checker_atom(name),
+            binder_type,
+            body,
+            style,
+        })
+    }
+
+    fn lambda_name(
+        &mut self,
+        name: &WireName,
+        style: BinderStyle,
+        binder_type: ExprId,
+        body: ExprId,
+    ) -> ExprId {
+        self.expression(ExprNode::Lambda {
+            binder_name: name.clone(),
             binder_type,
             body,
             style,
@@ -1731,48 +1897,135 @@ fn structural_expression_equal(
     Ok(Ok(true))
 }
 
-// ---------------------------------------------------------------- KR-600..803 (bounded enumeration ground)
+// ------------------------------------------------------- KR-600..803 (bounded inductive ground)
 
-/// Maximum number of nullary constructors reconstructed by the bounded
-/// enumeration judgment. Expected recursor rules are quadratic in this count;
+/// Maximum number of constructors reconstructed by the bounded independent
+/// inductive judgment. Expected recursor rules are quadratic in this count;
 /// larger but otherwise valid blocks remain typed deferrals.
-pub const MAX_ENUMERATION_CONSTRUCTORS: usize = 32;
+pub const MAX_NONRECURSIVE_CONSTRUCTORS: usize = 32;
+
+/// Maximum aggregate constructor fields in one independently reconstructed
+/// block. This is deliberately a block limit: recursor reconstruction touches
+/// every field type in every minor premise and computation rule.
+pub const MAX_NONRECURSIVE_FIELDS: usize = 64;
+
+/// Maximum conservative node-and-level upper bound for one reconstructed
+/// recursor expression. The builder imports the prefix containing each field
+/// type, so this bound is checked before allocating any expected arena.
+pub const MAX_INDUCTIVE_EXPECTED_ARENA_UNITS: usize = 262_144;
 
 /// The exact boundary of the independent checker's first inductive ground.
 /// These are non-answers: K1 may decide the shape, but this checker does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InductiveSupportLimit {
-    DeclarationRows { observed: usize, limit: usize },
-    MultipleTypes { observed: usize },
+    DeclarationRows {
+        observed: usize,
+        limit: usize,
+    },
+    MultipleTypes {
+        observed: usize,
+    },
     MutualMetadata,
-    UniverseParameters { observed: usize },
-    Parameters { observed: u32 },
-    Indices { observed: u32 },
-    Nested { observed: u32 },
+    UniverseParameters {
+        observed: usize,
+    },
+    Parameters {
+        observed: u32,
+    },
+    Indices {
+        observed: u32,
+    },
+    Nested {
+        observed: u32,
+    },
     Recursive,
     Reflexive,
     Unsafe,
     ResultUniverse,
-    ConstructorCount { observed: usize, limit: usize },
+    ConstructorCount {
+        observed: usize,
+        limit: usize,
+    },
+    FieldCount {
+        observed: usize,
+        limit: usize,
+    },
+    ExpectedArenaUnits {
+        observed: usize,
+        limit: usize,
+    },
+    MemberPreamble {
+        name: WireName,
+        requirement: Box<AdmissionDeferred>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InductiveRejection {
     MissingInductive,
-    MissingMetadata { name: WireName },
-    DeclarationCount { observed: usize, expected: usize },
-    ConstructorMissing { name: WireName },
-    RecursorMissing { name: WireName },
-    RepeatedConstructor { name: WireName },
-    NameAlreadyDeclared { name: WireName },
-    ConstructorShape { name: WireName },
-    RecursorShape { name: WireName },
+    MissingMetadata {
+        name: WireName,
+    },
+    DeclarationCount {
+        observed: usize,
+        expected: usize,
+    },
+    ConstructorMissing {
+        name: WireName,
+    },
+    RecursorMissing {
+        name: WireName,
+    },
+    RepeatedConstructor {
+        name: WireName,
+    },
+    NameAlreadyDeclared {
+        name: WireName,
+    },
+    ConstructorShape {
+        name: WireName,
+    },
+    RecursorShape {
+        name: WireName,
+    },
+    MemberPreamble {
+        name: WireName,
+        rejection: Box<AdmissionRejection>,
+    },
+    Environment {
+        name: WireName,
+        refusal: Box<EnvironmentRefusal>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InductiveFault {
     Structural(QuickDefEqFault),
+    MemberPreamble {
+        name: WireName,
+        fault: Box<AdmissionFault>,
+    },
+    Environment {
+        name: WireName,
+        fault: Box<EnvironmentFault>,
+    },
+    UnexpectedMemberAdmission {
+        name: WireName,
+    },
     ExpectedArenaOverflow,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InductiveStop {
+    Structural(QuickDefEqStop),
+    MemberPreamble {
+        name: WireName,
+        stop: Box<AdmissionStop>,
+    },
+    Environment {
+        name: WireName,
+        stop: Box<EnvironmentStop>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1786,7 +2039,7 @@ impl InductiveAdmission {
     }
 
     pub const fn ground(&self) -> AdmissionGround {
-        AdmissionGround::InductiveEnumerationChecked
+        AdmissionGround::InductiveNonrecursiveChecked
     }
 
     pub const fn schema(&self) -> &'static str {
@@ -1799,7 +2052,7 @@ pub enum InductiveVerdict {
     Admitted(InductiveAdmission),
     Rejected(InductiveRejection),
     Deferred(InductiveSupportLimit),
-    Inconclusive(QuickDefEqStop),
+    Inconclusive(InductiveStop),
     InternalFault(InductiveFault),
 }
 
@@ -1816,21 +2069,85 @@ impl InductiveVerdict {
     }
 }
 
-fn enumeration_type() -> Option<WireExpr> {
+fn nonrecursive_inductive_type() -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
     let root = builder.sort_one();
     builder.finish(root)
 }
 
-fn enumeration_constant_type(name: &WireName) -> Option<WireExpr> {
-    let mut builder = StructuralTermBuilder::new();
-    let root = builder.constant(name, &[]);
-    builder.finish(root)
+struct ConstructorField<'a> {
+    source: &'a WireExpr,
+    name: &'a WireName,
+    style: BinderStyle,
+    type_root: ExprId,
 }
 
-fn enumeration_recursor_type(
+struct CheckedConstructor<'a> {
+    name: &'a WireName,
+    fields: Vec<ConstructorField<'a>>,
+}
+
+fn constructor_shape<'a>(
+    type_: &'a WireExpr,
     inductive: &WireName,
-    constructors: &[WireName],
+    expected_fields: usize,
+) -> Option<Vec<ConstructorField<'a>>> {
+    let mut current = type_.root();
+    let mut fields = Vec::new();
+    fields.try_reserve_exact(expected_fields).ok()?;
+    for _ in 0..expected_fields {
+        let ExprNode::Forall {
+            binder_name,
+            binder_type,
+            body,
+            style,
+        } = type_.node(current)?
+        else {
+            return None;
+        };
+        if binder_type.index() >= current.index() || body.index() >= current.index() {
+            return None;
+        }
+        fields.push(ConstructorField {
+            source: type_,
+            name: binder_name,
+            style: *style,
+            type_root: *binder_type,
+        });
+        current = *body;
+    }
+    matches!(
+        type_.node(current),
+        Some(ExprNode::Constant { name, levels }) if name == inductive && levels.is_empty()
+    )
+    .then_some(fields)
+}
+
+fn expected_minor_type(
+    builder: &mut StructuralTermBuilder,
+    constructor: &CheckedConstructor<'_>,
+    prior_minors: usize,
+) -> Option<ExprId> {
+    let field_count = constructor.fields.len();
+    let motive_index = u32::try_from(field_count.checked_add(prior_minors)?).ok()?;
+    let motive = builder.bvar(motive_index);
+    let mut constructor_application = builder.constant(constructor.name, &[]);
+    for index in 0..field_count {
+        let field =
+            builder.bvar(u32::try_from(field_count.checked_sub(index.checked_add(1)?)?).ok()?);
+        constructor_application = builder.apply(constructor_application, field);
+    }
+    let mut result = builder.apply(motive, constructor_application);
+    for field in constructor.fields.iter().rev() {
+        let field_type = builder.import(field.source, field.type_root)?;
+        result = builder.forall_name(field.name, field.style, field_type, result);
+    }
+    Some(result)
+}
+
+fn nonrecursive_recursor_type(
+    inductive: &WireName,
+    constructors: &[CheckedConstructor<'_>],
     level_parameter: &WireName,
 ) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
@@ -1845,28 +2162,36 @@ fn enumeration_recursor_type(
     result = builder.forall("t", BinderStyle::Default, major_type, result);
 
     for (index, constructor) in constructors.iter().enumerate().rev() {
-        let motive = builder.bvar(u32::try_from(index).ok()?);
-        let constructor = builder.constant(constructor, &[]);
-        let minor_type = builder.apply(motive, constructor);
+        let minor_type = expected_minor_type(&mut builder, constructor, index)?;
         result = builder.forall("minor", BinderStyle::Default, minor_type, result);
     }
     let root = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
     builder.finish(root)
 }
 
-fn enumeration_rule_rhs(
+fn nonrecursive_rule_rhs(
     inductive: &WireName,
-    constructors: &[WireName],
+    constructors: &[CheckedConstructor<'_>],
     level_parameter: &WireName,
     selected: usize,
 ) -> Option<WireExpr> {
     let mut builder = StructuralTermBuilder::new();
-    let selected = constructors.len().checked_sub(selected.checked_add(1)?)?;
-    let mut result = builder.bvar(u32::try_from(selected).ok()?);
+    let selected_constructor = constructors.get(selected)?;
+    let field_count = selected_constructor.fields.len();
+    let selected_minor =
+        field_count.checked_add(constructors.len().checked_sub(selected.checked_add(1)?)?)?;
+    let mut result = builder.bvar(u32::try_from(selected_minor).ok()?);
+    for index in 0..field_count {
+        let field =
+            builder.bvar(u32::try_from(field_count.checked_sub(index.checked_add(1)?)?).ok()?);
+        result = builder.apply(result, field);
+    }
+    for field in selected_constructor.fields.iter().rev() {
+        let field_type = builder.import(field.source, field.type_root)?;
+        result = builder.lambda_name(field.name, field.style, field_type, result);
+    }
     for (index, constructor) in constructors.iter().enumerate().rev() {
-        let motive = builder.bvar(u32::try_from(index).ok()?);
-        let constructor = builder.constant(constructor, &[]);
-        let minor_type = builder.apply(motive, constructor);
+        let minor_type = expected_minor_type(&mut builder, constructor, index)?;
         result = builder.lambda("minor", BinderStyle::Default, minor_type, result);
     }
     let inductive_type = builder.constant(inductive, &[]);
@@ -1884,20 +2209,169 @@ fn compare_inductive_expression(
 ) -> Result<bool, InductiveVerdict> {
     match structural_expression_equal(actual, expected, comparison, true, cancelled) {
         Ok(Ok(equal)) => Ok(equal),
-        Ok(Err(stop)) => Err(InductiveVerdict::Inconclusive(stop)),
+        Ok(Err(stop)) => Err(InductiveVerdict::Inconclusive(InductiveStop::Structural(
+            stop,
+        ))),
         Err(fault) => Err(InductiveVerdict::InternalFault(InductiveFault::Structural(
             fault,
         ))),
     }
 }
 
-/// Independently reconstruct one bounded, nullary `Type` enumeration.
+fn map_member_preamble(name: &WireName, verdict: Verdict) -> InductiveVerdict {
+    match verdict {
+        Verdict::Rejected(rejection) => {
+            InductiveVerdict::Rejected(InductiveRejection::MemberPreamble {
+                name: name.clone(),
+                rejection: Box::new(rejection),
+            })
+        }
+        Verdict::Deferred(requirement) => {
+            InductiveVerdict::Deferred(InductiveSupportLimit::MemberPreamble {
+                name: name.clone(),
+                requirement: Box::new(requirement),
+            })
+        }
+        Verdict::Inconclusive(stop) => {
+            InductiveVerdict::Inconclusive(InductiveStop::MemberPreamble {
+                name: name.clone(),
+                stop: Box::new(stop),
+            })
+        }
+        Verdict::InternalFault(fault) => {
+            InductiveVerdict::InternalFault(InductiveFault::MemberPreamble {
+                name: name.clone(),
+                fault: Box::new(fault),
+            })
+        }
+        Verdict::Admitted(_) => {
+            InductiveVerdict::InternalFault(InductiveFault::UnexpectedMemberAdmission {
+                name: name.clone(),
+            })
+        }
+    }
+}
+
+fn stage_inductive_member(
+    environment: &ConstantEnvironment,
+    entry: &ConstantEntry,
+    budget: EnvironmentBudget,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<ConstantEnvironment, InductiveVerdict> {
+    let name = entry.name();
+    match environment.extend_with(entry.clone(), budget, &mut *cancelled) {
+        EnvironmentOutcome::Complete { environment, .. } => Ok(environment),
+        EnvironmentOutcome::Refused { refusal, .. } => Err(InductiveVerdict::Rejected(
+            InductiveRejection::Environment {
+                name: name.clone(),
+                refusal: Box::new(refusal),
+            },
+        )),
+        EnvironmentOutcome::Inconclusive(stop) => {
+            Err(InductiveVerdict::Inconclusive(InductiveStop::Environment {
+                name: name.clone(),
+                stop: Box::new(stop),
+            }))
+        }
+        EnvironmentOutcome::InternalFault { fault, .. } => Err(InductiveVerdict::InternalFault(
+            InductiveFault::Environment {
+                name: name.clone(),
+                fault: Box::new(fault),
+            },
+        )),
+    }
+}
+
+fn field_mentions_inductive(
+    field: &ConstructorField<'_>,
+    inductive: &WireName,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, InductiveVerdict> {
+    let mut pending = vec![field.type_root];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        comparison
+            .comparison(cancelled)
+            .map_err(|stop| InductiveVerdict::Inconclusive(InductiveStop::Structural(stop)))?;
+        let node = field.source.node(current).ok_or_else(|| {
+            InductiveVerdict::InternalFault(InductiveFault::Structural(
+                QuickDefEqFault::MissingExpression {
+                    side: QuickDefEqSide::Left,
+                    index: current.index(),
+                },
+            ))
+        })?;
+        if matches!(node, ExprNode::Constant { name, .. } if name == inductive) {
+            return Ok(true);
+        }
+        let mut push = |child: ExprId| -> Result<(), InductiveVerdict> {
+            if child.index() >= current.index() {
+                return Err(InductiveVerdict::InternalFault(InductiveFault::Structural(
+                    QuickDefEqFault::NonBackwardExpressionReference {
+                        side: QuickDefEqSide::Left,
+                        parent: current.index(),
+                        child: child.index(),
+                    },
+                )));
+            }
+            pending.push(child);
+            Ok(())
+        };
+        match node {
+            ExprNode::Apply { function, argument } => {
+                push(*argument)?;
+                push(*function)?;
+            }
+            ExprNode::Lambda {
+                binder_type, body, ..
+            }
+            | ExprNode::Forall {
+                binder_type, body, ..
+            } => {
+                push(*body)?;
+                push(*binder_type)?;
+            }
+            ExprNode::Let {
+                type_, value, body, ..
+            } => {
+                push(*body)?;
+                push(*value)?;
+                push(*type_)?;
+            }
+            ExprNode::Metadata { expression, .. } | ExprNode::Projection { expression, .. } => {
+                push(*expression)?
+            }
+            ExprNode::Bound { .. }
+            | ExprNode::Free { .. }
+            | ExprNode::Meta { .. }
+            | ExprNode::Sort { .. }
+            | ExprNode::Constant { .. }
+            | ExprNode::NatLiteral { .. }
+            | ExprNode::StringLiteral(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Independently reconstruct one bounded, field-bearing, nonrecursive `Type`
+/// inductive block.
 pub fn admit_inductive(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
     budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
 ) -> InductiveVerdict {
-    admit_inductive_with(environment, declarations, budget, || false)
+    admit_inductive_with(
+        environment,
+        declarations,
+        budget,
+        environment_budget,
+        || false,
+    )
 }
 
 /// [`admit_inductive`] with cooperative cancellation shared by all row and
@@ -1906,9 +2380,10 @@ pub fn admit_inductive_with(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
     budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> InductiveVerdict {
-    let maximum_rows = MAX_ENUMERATION_CONSTRUCTORS.saturating_add(2);
+    let maximum_rows = MAX_NONRECURSIVE_CONSTRUCTORS.saturating_add(2);
     if declarations.len() > maximum_rows {
         return InductiveVerdict::Deferred(InductiveSupportLimit::DeclarationRows {
             observed: declarations.len(),
@@ -1968,14 +2443,14 @@ pub fn admit_inductive_with(
         return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
     }
     if metadata.constructors().is_empty()
-        || metadata.constructors().len() > MAX_ENUMERATION_CONSTRUCTORS
+        || metadata.constructors().len() > MAX_NONRECURSIVE_CONSTRUCTORS
     {
         return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
             observed: metadata.constructors().len(),
-            limit: MAX_ENUMERATION_CONSTRUCTORS,
+            limit: MAX_NONRECURSIVE_CONSTRUCTORS,
         });
     }
-    let Some(expected_type) = enumeration_type() else {
+    let Some(expected_type) = nonrecursive_inductive_type() else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
     match compare_inductive_expression(
@@ -2004,12 +2479,26 @@ pub fn admit_inductive_with(
         });
     }
 
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, &mut cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let mut staged_environment =
+        match stage_inductive_member(environment, inductive, environment_budget, &mut cancelled) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+
     let mut seen = BTreeSet::new();
     let mut members = Vec::new();
+    let mut checked_constructors = Vec::new();
+    let mut total_fields = 0usize;
+    let mut imported_arena_units = 0usize;
     members.push(name.clone());
     for (index, constructor_name) in metadata.constructors().iter().enumerate() {
         if let Err(stop) = comparison.comparison(&mut cancelled) {
-            return InductiveVerdict::Inconclusive(stop);
+            return InductiveVerdict::Inconclusive(InductiveStop::Structural(stop));
         }
         if !seen.insert(constructor_name) {
             return InductiveVerdict::Rejected(InductiveRejection::RepeatedConstructor {
@@ -2034,7 +2523,7 @@ pub fn admit_inductive_with(
             Err(_) => {
                 return InductiveVerdict::Deferred(InductiveSupportLimit::ConstructorCount {
                     observed: metadata.constructors().len(),
-                    limit: MAX_ENUMERATION_CONSTRUCTORS,
+                    limit: MAX_NONRECURSIVE_CONSTRUCTORS,
                 });
             }
         };
@@ -2043,30 +2532,86 @@ pub fn admit_inductive_with(
             || constructor_metadata.inductive() != name
             || constructor_metadata.index() != expected_index
             || constructor_metadata.num_parameters() != 0
-            || constructor_metadata.num_fields() != 0
             || environment.find(constructor_name).is_some()
         {
             return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
                 name: constructor_name.clone(),
             });
         }
-        let Some(expected) = enumeration_constant_type(name) else {
-            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
-        };
-        match compare_inductive_expression(
-            constructor.declaration().type_(),
-            &expected,
-            &mut comparison,
-            &mut cancelled,
-        ) {
-            Ok(true) => members.push(constructor_name.clone()),
-            Ok(false) => {
-                return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
-                    name: constructor_name.clone(),
+        let field_count = match usize::try_from(constructor_metadata.num_fields()) {
+            Ok(count) => count,
+            Err(_) => {
+                return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+                    observed: usize::MAX,
+                    limit: MAX_NONRECURSIVE_FIELDS,
                 });
             }
-            Err(verdict) => return verdict,
+        };
+        total_fields = total_fields.saturating_add(field_count);
+        if total_fields > MAX_NONRECURSIVE_FIELDS {
+            return InductiveVerdict::Deferred(InductiveSupportLimit::FieldCount {
+                observed: total_fields,
+                limit: MAX_NONRECURSIVE_FIELDS,
+            });
         }
+        let Some(fields) = constructor_shape(constructor.declaration().type_(), name, field_count)
+        else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: constructor_name.clone(),
+            });
+        };
+        for field in &fields {
+            match field_mentions_inductive(field, name, &mut comparison, &mut cancelled) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                        name: constructor_name.clone(),
+                    });
+                }
+                Err(verdict) => return verdict,
+            }
+            imported_arena_units = imported_arena_units
+                .saturating_add(field.type_root.index().saturating_add(1))
+                .saturating_add(field.source.levels().len());
+        }
+        if let Err(verdict) = declared_type_is_a_type(
+            &staged_environment,
+            constructor_name,
+            constructor.declaration(),
+            &budget,
+            &mut cancelled,
+        ) {
+            return map_member_preamble(constructor_name, verdict);
+        }
+        staged_environment = match stage_inductive_member(
+            &staged_environment,
+            constructor,
+            environment_budget,
+            &mut cancelled,
+        ) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+        checked_constructors.push(CheckedConstructor {
+            name: constructor_name,
+            fields,
+        });
+        members.push(constructor_name.clone());
+    }
+
+    let expected_arena_units = imported_arena_units.saturating_mul(2).saturating_add(
+        metadata
+            .constructors()
+            .len()
+            .saturating_add(total_fields)
+            .saturating_add(4)
+            .saturating_mul(8),
+    );
+    if expected_arena_units > MAX_INDUCTIVE_EXPECTED_ARENA_UNITS {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::ExpectedArenaUnits {
+            observed: expected_arena_units,
+            limit: MAX_INDUCTIVE_EXPECTED_ARENA_UNITS,
+        });
     }
 
     let recursor_name = checker_child(name, "rec");
@@ -2101,7 +2646,7 @@ pub fn admit_inductive_with(
     }
     let level_parameter = &recursor_levels[0];
     let Some(expected_recursor_type) =
-        enumeration_recursor_type(name, metadata.constructors(), level_parameter)
+        nonrecursive_recursor_type(name, &checked_constructors, level_parameter)
     else {
         return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
     };
@@ -2125,13 +2670,16 @@ pub fn admit_inductive_with(
         .zip(recursor_metadata.rules())
         .enumerate()
     {
-        if rule.constructor() != constructor || rule.num_fields() != 0 {
+        let expected_fields = checked_constructors[index].fields.len();
+        if rule.constructor() != constructor
+            || usize::try_from(rule.num_fields()).ok() != Some(expected_fields)
+        {
             return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
                 name: recursor_name,
             });
         }
         let Some(expected_rhs) =
-            enumeration_rule_rhs(name, metadata.constructors(), level_parameter, index)
+            nonrecursive_rule_rhs(name, &checked_constructors, level_parameter, index)
         else {
             return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
         };
@@ -2149,6 +2697,23 @@ pub fn admit_inductive_with(
             }
             Err(verdict) => return verdict,
         }
+    }
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged_environment,
+        &recursor_name,
+        recursor.declaration(),
+        &budget,
+        &mut cancelled,
+    ) {
+        return map_member_preamble(&recursor_name, verdict);
+    }
+    if let Err(verdict) = stage_inductive_member(
+        &staged_environment,
+        recursor,
+        environment_budget,
+        &mut cancelled,
+    ) {
+        return verdict;
     }
     members.push(recursor_name);
     InductiveVerdict::Admitted(InductiveAdmission { members })
