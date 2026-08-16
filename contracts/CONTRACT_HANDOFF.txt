@@ -1,27 +1,27 @@
 schema fln-contract-handoff/1
 definition-root fnv1a64:bbeefd58635fa819
-inventory-root fnv1a64:70d9c91c0f2dbc91
-suite-lock-root fnv1a64:ab087004c2a23c4e
+inventory-root fnv1a64:3c5cc15ef71430e8
+suite-lock-root fnv1a64:59106815ecabce66
 policy-root fnv1a64:316fff3ad9eb14bc
-output-root fnv1a64:5a45ba913dcd9fd2
+output-root fnv1a64:13783cae82440459
 row-count 17
 domain-count 4
 output-bytes 243789446
-row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markdown bytes=71283 content-root=fnv1a64:aeca6a6c7a86c0a8 identity=fnv1a64:7b50270bb02e772c authority=observed support=required
-row abi-inventory path=contracts/abi_inventory.json domain=abi role=canonical-intermediate bytes=258652 content-root=fnv1a64:0cb8ca0d9c4d7db6 identity=fnv1a64:9b43d325627bce49 authority=observed support=required
-row abi-layout path=contracts/ABI_TARGET_LAYOUT.txt domain=abi role=target-contract bytes=9975 content-root=fnv1a64:43b0e49c3089f94c identity=fnv1a64:33ea9dbba140f300 authority=observed support=required
-row abi-rust-boundary path=crates/fln-unsafe-abi/src/contract.rs domain=abi role=rust-boundary bytes=13162 content-root=fnv1a64:6fd5fc28d8a53a54 identity=fnv1a64:ef677abfcacff06d authority=observed support=required
-row abi-rust-public path=crates/fln-rt/src/abi.rs domain=abi role=rust-public bytes=236968 content-root=fnv1a64:1711292459b32745 identity=fnv1a64:46c3169319631e1e authority=observed support=required
-row builtin-environment-000 path=contracts/builtin_environment.tsv domain=environment role=observation-shard bytes=55496196 content-root=fnv1a64:cac6a0eda451aeb9 identity=fnv1a64:10aad63a62e6ffe1 authority=observed support=required
-row builtin-environment-001 path=contracts/builtin_environment.001.tsv domain=environment role=observation-shard bytes=86061891 content-root=fnv1a64:836b591a3b6bc813 identity=fnv1a64:ae572a2668757367 authority=observed support=required
-row builtin-environment-002 path=contracts/builtin_environment.002.tsv domain=environment role=observation-shard bytes=74755243 content-root=fnv1a64:6b6b108ef417df45 identity=fnv1a64:67d92904abc5726d authority=observed support=required
-row builtin-partition path=contracts/builtin_partition.tsv domain=environment role=policy-projection bytes=26653514 content-root=fnv1a64:5bafca9e2b62b260 identity=fnv1a64:e5529c32c17feb29 authority=observed support=required
-row contract-inventory path=contracts/PIN_TARGET_INVENTORY.txt domain=inventory role=canonical-join bytes=5500 content-root=fnv1a64:086675135aba1d9d identity=fnv1a64:5ba3773613d6729b authority=observed support=required
-row extern-census path=contracts/extern_census.tsv domain=environment role=extern-census bytes=185758 content-root=fnv1a64:582aa13244796778 identity=fnv1a64:33a9405ea08979d2 authority=observed support=required
-row extern-environment-envelope path=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt domain=environment role=publication-envelope bytes=774 content-root=fnv1a64:3978c4e7669fcfb7 identity=fnv1a64:56d90d9644da6354 authority=observed support=required
-row format-contract-markdown path=OLEAN_CONTRACT.md domain=format role=markdown bytes=8817 content-root=fnv1a64:29dbedaf1a867c83 identity=fnv1a64:4374c3bc7e46d473 authority=observed support=required
-row format-inventory path=contracts/olean_inventory.json domain=format role=canonical-intermediate bytes=6282 content-root=fnv1a64:5887eefa7c3dc8c9 identity=fnv1a64:7a70cd3f66e42771 authority=observed support=required
-row format-rust-public path=crates/fln-olean/src/format.rs domain=format role=rust-public bytes=4962 content-root=fnv1a64:2a794d71716121a4 identity=fnv1a64:ecd247dc1398f0c7 authority=observed support=required
-row format-rust-region path=crates/fln-rt/src/region_contract.rs domain=format role=rust-region bytes=2682 content-root=fnv1a64:8e3a6cb63eb45800 identity=fnv1a64:988007c88f06eb34 authority=observed support=required
-row olean-ilean-format path=contracts/OLEAN_ILEAN_FORMAT.txt domain=format role=exact-format-contract bytes=17787 content-root=fnv1a64:45181f2ea91fa218 identity=fnv1a64:65f907e2ee0564a1 authority=observed support=required
-handoff-root fnv1a64:684001f16c0c3c25
+row abi-contract-markdown path=ABI_CONTRACT.md domain=abi role=markdown bytes=71283 content-root=fnv1a64:aeca6a6c7a86c0a8 identity=fnv1a64:7c9b3e167ad6a7a5 authority=observed support=required
+row abi-inventory path=contracts/abi_inventory.json domain=abi role=canonical-intermediate bytes=258652 content-root=fnv1a64:0cb8ca0d9c4d7db6 identity=fnv1a64:c11fbda816baf108 authority=observed support=required
+row abi-layout path=contracts/ABI_TARGET_LAYOUT.txt domain=abi role=target-contract bytes=9975 content-root=fnv1a64:43b0e49c3089f94c identity=fnv1a64:91fb3ac2c0f2ab83 authority=observed support=required
+row abi-rust-boundary path=crates/fln-unsafe-abi/src/contract.rs domain=abi role=rust-boundary bytes=13162 content-root=fnv1a64:6fd5fc28d8a53a54 identity=fnv1a64:9a79e973c96e5e4a authority=observed support=required
+row abi-rust-public path=crates/fln-rt/src/abi.rs domain=abi role=rust-public bytes=236968 content-root=fnv1a64:1711292459b32745 identity=fnv1a64:5956213d57c13339 authority=observed support=required
+row builtin-environment-000 path=contracts/builtin_environment.tsv domain=environment role=observation-shard bytes=55496196 content-root=fnv1a64:cac6a0eda451aeb9 identity=fnv1a64:2dac6996cabfb534 authority=observed support=required
+row builtin-environment-001 path=contracts/builtin_environment.001.tsv domain=environment role=observation-shard bytes=86061891 content-root=fnv1a64:836b591a3b6bc813 identity=fnv1a64:5ea97659f649d2e2 authority=observed support=required
+row builtin-environment-002 path=contracts/builtin_environment.002.tsv domain=environment role=observation-shard bytes=74755243 content-root=fnv1a64:6b6b108ef417df45 identity=fnv1a64:17e4630872b7df6c authority=observed support=required
+row builtin-partition path=contracts/builtin_partition.tsv domain=environment role=policy-projection bytes=26653514 content-root=fnv1a64:5bafca9e2b62b260 identity=fnv1a64:1ea2da29ccc95e10 authority=observed support=required
+row contract-inventory path=contracts/PIN_TARGET_INVENTORY.txt domain=inventory role=canonical-join bytes=5500 content-root=fnv1a64:1c58aa090e03a597 identity=fnv1a64:05d9646fc86ad953 authority=observed support=required
+row extern-census path=contracts/extern_census.tsv domain=environment role=extern-census bytes=185758 content-root=fnv1a64:582aa13244796778 identity=fnv1a64:63c5241f7b5f435f authority=observed support=required
+row extern-environment-envelope path=contracts/EXTERN_BUILTIN_ENVIRONMENT.txt domain=environment role=publication-envelope bytes=774 content-root=fnv1a64:3978c4e7669fcfb7 identity=fnv1a64:e4a7d13cda8da6eb authority=observed support=required
+row format-contract-markdown path=OLEAN_CONTRACT.md domain=format role=markdown bytes=8817 content-root=fnv1a64:29dbedaf1a867c83 identity=fnv1a64:dda494756199f44c authority=observed support=required
+row format-inventory path=contracts/olean_inventory.json domain=format role=canonical-intermediate bytes=6282 content-root=fnv1a64:5887eefa7c3dc8c9 identity=fnv1a64:970c7efc65eded7c authority=observed support=required
+row format-rust-public path=crates/fln-olean/src/format.rs domain=format role=rust-public bytes=4962 content-root=fnv1a64:2a794d71716121a4 identity=fnv1a64:d1be0bda5371b068 authority=observed support=required
+row format-rust-region path=crates/fln-rt/src/region_contract.rs domain=format role=rust-region bytes=2682 content-root=fnv1a64:8e3a6cb63eb45800 identity=fnv1a64:6eacbd8aa38c04c7 authority=observed support=required
+row olean-ilean-format path=contracts/OLEAN_ILEAN_FORMAT.txt domain=format role=exact-format-contract bytes=17787 content-root=fnv1a64:45181f2ea91fa218 identity=fnv1a64:7e60b069b9325298 authority=observed support=required
+handoff-root fnv1a64:853e221e566e710f

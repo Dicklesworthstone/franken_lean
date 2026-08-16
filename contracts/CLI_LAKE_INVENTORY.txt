@@ -20,7 +20,7 @@ cancellation-outcome typed-inconclusive
 resource-outcome typed-inconclusive
 raw-begin
 reference repo=leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
-source path=SUITE.lock hash=fnv1a64:ded79869ce53ff1c
+source path=SUITE.lock hash=fnv1a64:8bb1b11bfe9fbdc8
 source path=contracts/CLI_LAKE_TRANSCRIPTS.txt hash=fnv1a64:cc1b4ef17f5f5d8c
 source path=crates/fln-conformance/src/cli_lake_census.rs hash=fnv1a64:267aa9cece6ee516
 source path=crates/fln-conformance/tests/cli_lake_census.rs hash=fnv1a64:2a20af3e51910201
@@ -357,7 +357,7 @@ transcript key=leanc:help personality=leanc argv=--help stdin=none exit=0 stdout
 transcript key=leanc:version personality=leanc argv=--version stdin=none exit=0 stdout=fnv1a64:5752864827c78f0f stderr=fnv1a64:cbf29ce484222325 stdout-bytes=184 stderr-bytes=0 channel=stdout normalizer=paths-crlf-ansi-v1
 transcript key=leanc:unknown-option personality=leanc argv=--fln-census-unknown stdin=none exit=1 stdout=fnv1a64:cbf29ce484222325 stderr=fnv1a64:c2ea5af023beaf6c stdout-bytes=0 stderr-bytes=55 channel=stderr normalizer=paths-crlf-ansi-v1
 raw-end
-raw-root fnv1a64:04fe3091d59cdd9b
+raw-root fnv1a64:bda55844c5c459b7
 policy-root fnv1a64:1c626200d46049e6
 transcript-root fnv1a64:a687b3f8f8ae3bdf
-inventory-root fnv1a64:a3742dc674352abc
+inventory-root fnv1a64:84dd4de831074b9b

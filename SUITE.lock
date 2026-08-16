@@ -26,10 +26,10 @@ rust-commit 77cf889bc178ddb44d6a1c78e5a820b5abb31d8d
 target x86_64-unknown-linux-gnu
 
 # ---- the FrankenSuite (D1 closed universe), pinned at exact commits --------------------
-suite asupersync       commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
-suite frankensqlite    commit=38a9ecab220d8a37a41bb4c9860c94beaeff9185 path=/dp/frankensqlite
+suite asupersync       commit=8522f9411c7652accf3996b215fca8df901c1489 path=/dp/asupersync
+suite frankensqlite    commit=bc189a5429bc153cd2160a8ff002544f63bfcda6 path=/dp/frankensqlite
 suite franken_networkx commit=9d710b1c33e99412c94de7fa4de2f7ce4954110f path=/dp/franken_networkx
-suite frankensearch    commit=51209c4628b8f798c315adb07459d1473021dba4 path=/dp/frankensearch
+suite frankensearch    commit=4302c377169c97d52296efa77fc37e66429aad44 path=/dp/frankensearch
 suite frankentui       commit=af2df3e6bdd06abafe03a0ef1e4960114918b26b path=/dp/frankentui
 suite franken_markdown commit=236454e26f17fdd1b9e23902cc11633146bba95d path=/dp/franken_markdown
 suite fastmcp_rust     commit=0e00cae2678987d3518fec2a6388bc0285fb5b92 path=/dp/fastmcp_rust
