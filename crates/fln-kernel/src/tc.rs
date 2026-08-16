@@ -451,6 +451,19 @@ impl ExprResultCache {
         if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
             self.buckets.remove(&packed);
         }
+        // Publishing an already-live row is common while an explicit
+        // reduction continuation unwinds. Its dependency proof is still
+        // current, so rediscovering the same fvars can only spend the bounded
+        // scan allowance without changing the cache.
+        if self.buckets.get(&packed).is_some_and(|bucket| {
+            bucket.iter().any(|entry| {
+                entry.key == key
+                    && entry.value == value
+                    && dependencies_are_live(&entry.dependencies, locals, local_positions)
+            })
+        }) {
+            return;
+        }
         if self.max_bucket_entries == 0 {
             return;
         }
@@ -758,6 +771,18 @@ impl PositiveDefEqCache {
         }
         if self.buckets.get(&packed).is_some_and(Vec::is_empty) {
             self.buckets.remove(&packed);
+        }
+        // Equality is unordered. An exact live pair is already the complete
+        // positive fact this cache can retain, so avoid rediscovering its
+        // dependency slice.
+        if self.buckets.get(&packed).is_some_and(|bucket| {
+            bucket.iter().any(|entry| {
+                ((entry.left == left && entry.right == right)
+                    || (entry.left == right && entry.right == left))
+                    && dependencies_are_live(&entry.dependencies, locals, local_positions)
+            })
+        }) {
+            return;
         }
         let replacement = self.buckets.get(&packed).and_then(|bucket| {
             (bucket.len() >= self.max_bucket_entries)
@@ -2267,14 +2292,30 @@ impl<'a> TypeChecker<'a> {
         let mut depth = depth;
         let mut pending_projs: Vec<(Name, u64)> = Vec::new();
         let result = loop {
-            if !cheap_proj
-                && current != *e
-                && pending_projs.is_empty()
-                && let Some(cached) =
-                    self.whnf_core_cache
+            if !cheap_proj && current != *e {
+                if pending_projs.is_empty() {
+                    if let Some(cached) =
+                        self.whnf_core_cache
+                            .get(&current, &self.locals, &self.local_positions)
+                    {
+                        break cached;
+                    }
+                } else if let Some(cached) =
+                    self.whnf_cache
                         .get(&current, &self.locals, &self.local_positions)
-            {
-                break cached;
+                {
+                    // A successful inner projection can expose a field while
+                    // outer projections remain pending. Such a field needs
+                    // full WHNF (including delta), so reuse the separate full
+                    // cache here rather than the core-only cache above.
+                    match self.finish_pending_projs(cached, &mut pending_projs, &mut depth)? {
+                        PendingProj::Done(value) => break value,
+                        PendingProj::Continue(field) => {
+                            current = field;
+                            continue;
+                        }
+                    }
+                }
             }
             match current.node() {
                 ExprNode::MData { expr, .. } => {
@@ -7034,6 +7075,90 @@ mod tests {
     }
 
     #[test]
+    fn pending_projection_reuses_a_full_whnf_result_for_its_extracted_field() {
+        use fln_env::constants::{ConstantVal, ConstructorVal};
+
+        let one_field_constructor = |type_name: &Name, ctor_name: &str| {
+            let ctor_name = Name::str(Name::anonymous(), ctor_name);
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: ctor_name,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                induct: type_name.clone(),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 1,
+                is_unsafe: false,
+            })
+        };
+
+        let s_name = Name::str(Name::anonymous(), "ProjectionCacheS");
+        let s_ctor_name = Name::str(Name::anonymous(), "ProjectionCacheS.mk");
+        let t_name = Name::str(Name::anonymous(), "ProjectionCacheT");
+        let t_ctor_name = Name::str(Name::anonymous(), "ProjectionCacheT.mk");
+        let sort_zero = Expr::sort(Level::zero());
+        let sort_one = Expr::sort(Level::one());
+        let env = Environment::new()
+            .add_decl(one_field_constructor(&s_name, "ProjectionCacheS.mk"))
+            .and_then(|env| env.add_decl(one_field_constructor(&t_name, "ProjectionCacheT.mk")))
+            .expect("non-authoritative fixture constructor metadata is fresh");
+
+        let s_constructor =
+            |field: Expr| Expr::app(Expr::const_(s_ctor_name.clone(), Vec::new()), field);
+        let beta_to_s = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                sort_one,
+                s_constructor(Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+            sort_zero.clone(),
+        );
+        let inner = Expr::proj(
+            t_name,
+            0,
+            Expr::app(Expr::const_(t_ctor_name, Vec::new()), beta_to_s.clone()),
+        );
+        let nested = Expr::proj(s_name, 0, inner);
+
+        let mut control = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let normalized_beta = control.whnf(&beta_to_s, 0).expect("control normalizes");
+        assert!(
+            normalized_beta == s_constructor(sort_zero.clone()),
+            "the planted full-WHNF row must be semantically true"
+        );
+
+        let mut cached = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        cached.whnf_cache.insert(
+            beta_to_s.clone(),
+            normalized_beta,
+            &cached.locals,
+            &cached.local_positions,
+        );
+        let cached_result = cached
+            .whnf_core(&nested, 0)
+            .expect("cached pending projection normalizes");
+        let cached_steps = cached.consumption().steps_used;
+
+        let mut uncached = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let uncached_result = uncached
+            .whnf_core(&nested, 0)
+            .expect("uncached pending projection normalizes");
+        let uncached_steps = uncached.consumption().steps_used;
+
+        assert!(
+            cached_result == sort_zero && uncached_result == sort_zero,
+            "cache reuse may reduce work but cannot change the normalized projection"
+        );
+        assert!(
+            cached_steps < uncached_steps,
+            "an extracted field under another pending projection must reuse its exact live full-WHNF row ({cached_steps} !< {uncached_steps})"
+        );
+    }
+
+    #[test]
     fn closed_inference_whnf_and_positive_defeq_queries_reuse_only_established_results() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
@@ -8201,6 +8326,53 @@ mod tests {
                 && defeq_cache.entries == 1
                 && defeq_cache.local_dependency_cells == 1,
             "four dead generations must be reclaimed before the collision ceiling is applied"
+        );
+    }
+
+    #[test]
+    fn duplicate_live_cache_publications_do_not_repeat_dependency_discovery() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "duplicate_publication"));
+        let local = Expr::fvar(id.clone());
+        let zero = Expr::sort(Level::zero());
+        let one = Expr::sort(Level::one());
+        tc.adopt_local(id, zero.clone());
+
+        let mut result_cache = ExprResultCache::bounded(4, 4);
+        result_cache.insert(local.clone(), zero.clone(), &tc.locals, &tc.local_positions);
+        let first_result_scan = result_cache.local_dependency_scan_nodes;
+        assert!(
+            first_result_scan > 0,
+            "the control must discover a local dependency"
+        );
+        result_cache.insert(local.clone(), zero.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            result_cache.local_dependency_scan_nodes == first_result_scan,
+            "publishing the same live result twice must not spend dependency-discovery allowance twice"
+        );
+
+        result_cache.insert(local.clone(), one.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            result_cache.local_dependency_scan_nodes > first_result_scan,
+            "a same-key result with a different value must still discover and validate dependencies"
+        );
+        assert!(
+            result_cache.get(&local, &tc.locals, &tc.local_positions) == Some(one.clone()),
+            "duplicate suppression must not turn into a key-only stale-value cache"
+        );
+
+        let mut defeq_cache = PositiveDefEqCache::bounded(4, 4);
+        defeq_cache.insert(local.clone(), one.clone(), &tc.locals, &tc.local_positions);
+        let first_defeq_scan = defeq_cache.local_dependency_scan_nodes;
+        assert!(
+            first_defeq_scan > 0,
+            "the control must discover a local dependency"
+        );
+        defeq_cache.insert(one, local, &tc.locals, &tc.local_positions);
+        assert!(
+            defeq_cache.local_dependency_scan_nodes == first_defeq_scan,
+            "publishing the same live equality twice must not spend dependency-discovery allowance twice"
         );
     }
 
