@@ -4994,12 +4994,7 @@ mod tests {
             "proposition",
             BinderInfo::Default,
             Expr::sort(Level::zero()),
-            pi(
-                "proof",
-                BinderInfo::Default,
-                bv(0),
-                witness_expr(),
-            ),
+            pi("proof", BinderInfo::Default, bv(0), witness_expr()),
         );
         let motive_type = pi(
             "t",
@@ -5015,10 +5010,7 @@ mod tests {
                 "proof",
                 BinderInfo::Default,
                 bv(0),
-                Expr::app(
-                    bv(2),
-                    Expr::app(Expr::app(make_expr(), bv(1)), bv(0)),
-                ),
+                Expr::app(bv(2), Expr::app(Expr::app(make_expr(), bv(1)), bv(0))),
             ),
         );
         let recursor_type = pi(
@@ -5026,7 +5018,7 @@ mod tests {
             BinderInfo::Implicit,
             motive_type.clone(),
             pi(
-                "minor",
+                "mk",
                 BinderInfo::Default,
                 minor_type.clone(),
                 pi(
@@ -5041,7 +5033,7 @@ mod tests {
             Name::from_components(["motive"]),
             motive_type,
             Expr::lam(
-                Name::from_components(["minor"]),
+                Name::from_components(["mk"]),
                 minor_type,
                 Expr::lam(
                     Name::from_components(["proposition"]),
@@ -6057,6 +6049,50 @@ mod tests {
             assert!(checked.engine.environment().contains(&name));
             assert!(!engine.environment().contains(&name));
         }
+    }
+
+    #[test]
+    fn standalone_olean_check_reconstructs_dependent_nonrecursive_fields() {
+        let constants = dependent_field_inductive_declarations();
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(Environment::new());
+        let checked = engine
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("the complete dependent-field inductive is reconstructible")
+            .into_complete()
+            .expect("K1 and the independent field-bearing judgment complete");
+
+        assert_eq!(checked.declarations.len(), 3);
+        assert!(checked.declarations.iter().all(|declaration| {
+            declaration.checker.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked
+        }));
+        for name in [
+            Name::from_components(["Fixture", "Witness"]),
+            Name::from_components(["Fixture", "Witness", "mk"]),
+            Name::from_components(["Fixture", "Witness", "rec"]),
+        ] {
+            assert!(checked.engine.environment().contains(&name));
+            assert!(!engine.environment().contains(&name));
+        }
+
+        let mut exhausted_limits = OleanCheckLimits::new(bytes.len(), test_budget());
+        exhausted_limits.admission.checker.environment =
+            fln_checker::environment::EnvironmentBudget::new(0, 0, 0, 0, 0, 0);
+        let exhausted_engine = Engine::from_environment(Environment::new());
+        assert!(matches!(
+            exhausted_engine.check_olean_artifact(&bytes, &KVMap::new(), exhausted_limits,),
+            Err(OleanCheckError::Admission(
+                EngineAdmissionError::BatchDeclaration { .. }
+            ))
+        ));
+        assert!(
+            exhausted_engine.environment().is_empty(),
+            "checker staging exhaustion cannot publish any K1 prefix"
+        );
     }
 
     #[test]
