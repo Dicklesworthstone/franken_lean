@@ -8,7 +8,7 @@
 //! implemented grammar subset, not a claim of general Lean elaboration or
 //! Prelude support. Already-elaborated axioms, definitions, theorems, opaques,
 //! non-safe mutual definition blocks, fixed quotient initialization, and a
-//! bounded class of nullary `Type` enumerations can also advance an immutable
+//! bounded class of nonrecursive `Type` inductives can also advance an immutable
 //! engine snapshot through admission and publication without compiling or
 //! executing a body. Embedders can also validate and execute an existing canonical FLBC
 //! artifact without reaching into the compiler or VM crates, and inspect or
@@ -811,7 +811,7 @@ pub struct CheckedOleanSet {
 ///
 /// This production slice handles closed import sets and reconstructs complete
 /// non-safe mutual definition envelopes, the fixed quotient initializer, and
-/// safe nullary `Type` enumeration units as authority transitions. Other
+/// safe bounded nonrecursive `Type` inductive units as authority transitions. Other
 /// inductive shapes remain explicit checker non-answers rather than silently
 /// entering trusted context. Safe definitions, theorems, and opaques retain
 /// their multi-name metadata and check individually inside the atomic artifact
@@ -2306,8 +2306,8 @@ impl Engine {
     /// on which both K1 and the independent checker can issue a completed
     /// verdict: axioms, definitions, theorems, opaques, non-safe mutual
     /// definition blocks, the fixed quotient initialization unit, and safe,
-    /// nonrecursive, non-nested, parameter-free `Type` enumerations with
-    /// nullary constructors. Other inductive families remain checker
+    /// nonrecursive, non-nested, parameter-free `Type` inductives with bounded
+    /// constructor fields. Other inductive families remain checker
     /// non-answers until an independent complete-unit ground exists for them.
     ///
     /// Success returns a new immutable engine snapshot. A rejection,
@@ -3280,7 +3280,12 @@ fn review_inductive_with_independent_checker(
         },
     };
 
-    match fln_checker::admit::admit_inductive(&environment, &candidates, limits.admission) {
+    match fln_checker::admit::admit_inductive(
+        &environment,
+        &candidates,
+        limits.admission,
+        limits.environment,
+    ) {
         CheckerInductiveVerdict::Admitted(admission) => {
             let agreement = CheckerAgreement {
                 schema: admission.schema(),
@@ -4976,6 +4981,133 @@ mod tests {
         ]
     }
 
+    fn dependent_field_inductive_declarations() -> Vec<ConstantInfo> {
+        let witness = Name::from_components(["Fixture", "Witness"]);
+        let make = Name::from_components(["Fixture", "Witness", "mk"]);
+        let recursor = Name::from_components(["Fixture", "Witness", "rec"]);
+        let u_name = Name::from_components(["u"]);
+        let u = Level::param(u_name.clone());
+        let witness_expr = || Expr::const_(witness.clone(), Vec::new());
+        let make_expr = || Expr::const_(make.clone(), Vec::new());
+        let bv = |index| Expr::bvar(index).expect("packs");
+        let constructor_type = pi(
+            "proposition",
+            BinderInfo::Default,
+            Expr::sort(Level::zero()),
+            pi(
+                "proof",
+                BinderInfo::Default,
+                bv(0),
+                witness_expr(),
+            ),
+        );
+        let motive_type = pi(
+            "t",
+            BinderInfo::Default,
+            witness_expr(),
+            Expr::sort(u.clone()),
+        );
+        let minor_type = pi(
+            "proposition",
+            BinderInfo::Default,
+            Expr::sort(Level::zero()),
+            pi(
+                "proof",
+                BinderInfo::Default,
+                bv(0),
+                Expr::app(
+                    bv(2),
+                    Expr::app(Expr::app(make_expr(), bv(1)), bv(0)),
+                ),
+            ),
+        );
+        let recursor_type = pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type.clone(),
+            pi(
+                "minor",
+                BinderInfo::Default,
+                minor_type.clone(),
+                pi(
+                    "t",
+                    BinderInfo::Default,
+                    witness_expr(),
+                    Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        );
+        let rule_rhs = Expr::lam(
+            Name::from_components(["motive"]),
+            motive_type,
+            Expr::lam(
+                Name::from_components(["minor"]),
+                minor_type,
+                Expr::lam(
+                    Name::from_components(["proposition"]),
+                    Expr::sort(Level::zero()),
+                    Expr::lam(
+                        Name::from_components(["proof"]),
+                        bv(0),
+                        Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        vec![
+            ConstantInfo::Rec(RecursorVal {
+                base: ConstantVal {
+                    name: recursor,
+                    level_params: vec![u_name],
+                    type_: recursor_type,
+                },
+                all: vec![witness.clone()],
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![RecursorRule {
+                    ctor: make.clone(),
+                    nfields: 2,
+                    rhs: rule_rhs,
+                }],
+                k: false,
+                is_unsafe: false,
+            }),
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: make.clone(),
+                    level_params: Vec::new(),
+                    type_: constructor_type,
+                },
+                induct: witness.clone(),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 2,
+                is_unsafe: false,
+            }),
+            ConstantInfo::Induct(InductiveVal {
+                base: ConstantVal {
+                    name: witness.clone(),
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::one()),
+                },
+                num_params: 0,
+                num_indices: 0,
+                all: vec![witness],
+                ctors: vec![make],
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            }),
+        ]
+    }
+
     fn arrow(domain: Expr, codomain: Expr) -> Expr {
         Expr::forall_e(
             Name::from_components(["a"]),
@@ -5898,7 +6030,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_olean_check_reconstructs_a_nullary_enumeration_authority_unit() {
+    fn standalone_olean_check_reconstructs_a_nullary_inductive_authority_unit() {
         let constants = enumeration_declarations(BinderInfo::Implicit);
         let bytes = standalone_olean(&constants);
         let engine = Engine::from_environment(Environment::new());
@@ -5908,13 +6040,13 @@ mod tests {
                 &KVMap::new(),
                 OleanCheckLimits::new(bytes.len(), test_budget()),
             )
-            .expect("the complete enumeration envelope is reconstructible")
+            .expect("the complete inductive envelope is reconstructible")
             .into_complete()
-            .expect("K1 and the independent enumeration judgment complete");
+            .expect("K1 and the independent inductive judgment complete");
 
         assert_eq!(checked.declarations.len(), 4);
         assert!(checked.declarations.iter().all(|declaration| {
-            declaration.checker.ground == CheckerAdmissionGround::InductiveEnumerationChecked
+            declaration.checker.ground == CheckerAdmissionGround::InductiveNonrecursiveChecked
         }));
         for name in [
             Name::from_components(["Fixture", "Color"]),

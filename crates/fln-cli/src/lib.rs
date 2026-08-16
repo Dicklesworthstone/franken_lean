@@ -2834,7 +2834,9 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
             "body-checked-against-declared-type"
         }
         fln::CheckerAdmissionGround::QuotientPrimitiveChecked => "quotient-primitive-checked",
-        fln::CheckerAdmissionGround::InductiveEnumerationChecked => "inductive-enumeration-checked",
+        fln::CheckerAdmissionGround::InductiveNonrecursiveChecked => {
+            "inductive-nonrecursive-checked"
+        }
         fln::CheckerAdmissionGround::UnsafeQuarantine => "unsafe-quarantine",
         fln::CheckerAdmissionGround::PartialQuarantine => "partial-quarantine",
     }
