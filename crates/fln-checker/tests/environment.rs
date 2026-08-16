@@ -4,8 +4,9 @@ use std::process::Command;
 
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentField, EnvironmentLimit,
-    EnvironmentOutcome, EnvironmentProgress, EnvironmentRefusal, EnvironmentStop, ReducibilityHint,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentField,
+    EnvironmentLimit, EnvironmentOutcome, EnvironmentProgress, EnvironmentRefusal, EnvironmentStop,
+    InductiveDeclaration, QuotientKind, RecursorDeclaration, RecursorRule, ReducibilityHint,
 };
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, NamePart, WireExpr, WireName, decode_expr, decode_name,
@@ -282,6 +283,121 @@ fn constant_schema_retains_common_headers_and_optional_definition_bodies() {
 }
 
 #[test]
+fn block_schema_retains_and_resources_every_inductive_family_field() {
+    let inductive = checker_name("Tree");
+    let constructor = checker_name("Tree.node");
+    let recursor = checker_name("Tree.rec");
+    let rows = vec![
+        ConstantEntry::new(
+            inductive.clone(),
+            ConstantDeclaration::inductive(
+                vec![checker_name("u")],
+                leaf(1),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    2,
+                    vec![inductive.clone()],
+                    vec![constructor.clone()],
+                    3,
+                    true,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            constructor.clone(),
+            ConstantDeclaration::constructor(
+                vec![checker_name("u")],
+                leaf(2),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(inductive.clone(), 4, 1, 5),
+            ),
+        ),
+        ConstantEntry::new(
+            recursor.clone(),
+            ConstantDeclaration::recursor(
+                vec![checker_name("u")],
+                leaf(3),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![recursor.clone()],
+                    1,
+                    2,
+                    1,
+                    1,
+                    vec![RecursorRule::new(constructor.clone(), 5, leaf(4))],
+                    true,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_name("Quot"),
+            ConstantDeclaration::quotient(Vec::new(), leaf(5), QuotientKind::Type),
+        ),
+    ];
+    let (environment, progress) = complete(ConstantEnvironment::build(
+        rows.clone(),
+        EnvironmentBudget::unlimited(),
+    ));
+    assert_eq!(progress.block_members, 5);
+    let tree = environment.find(&inductive).expect("inductive retained");
+    let tree_metadata = tree
+        .inductive_metadata()
+        .expect("inductive metadata retained");
+    assert_eq!(tree_metadata.num_parameters(), 1);
+    assert_eq!(tree_metadata.num_indices(), 2);
+    assert_eq!(tree_metadata.mutual(), std::slice::from_ref(&inductive));
+    assert_eq!(
+        tree_metadata.constructors(),
+        std::slice::from_ref(&constructor)
+    );
+    assert_eq!(tree_metadata.num_nested(), 3);
+    assert!(tree_metadata.is_recursive());
+    assert!(!tree_metadata.is_reflexive());
+    let ctor = environment
+        .find(&constructor)
+        .expect("constructor retained")
+        .constructor_metadata()
+        .expect("constructor metadata retained");
+    assert_eq!(ctor.inductive(), &inductive);
+    assert_eq!(
+        (ctor.index(), ctor.num_parameters(), ctor.num_fields()),
+        (4, 1, 5)
+    );
+    let rec = environment
+        .find(&recursor)
+        .expect("recursor retained")
+        .recursor_metadata()
+        .expect("recursor metadata retained");
+    assert_eq!((rec.num_parameters(), rec.num_indices()), (1, 2));
+    assert_eq!((rec.num_motives(), rec.num_minors()), (1, 1));
+    assert!(rec.k());
+    assert_eq!(rec.rules()[0].constructor(), &constructor);
+    assert_eq!(rec.rules()[0].num_fields(), 5);
+    assert_eq!(rec.rules()[0].rhs(), &leaf(4));
+    assert_eq!(
+        environment
+            .find(&checker_name("Quot"))
+            .expect("quotient retained")
+            .quotient_kind(),
+        Some(QuotientKind::Type)
+    );
+
+    let one_less = EnvironmentBudget {
+        max_block_members: progress.block_members - 1,
+        ..EnvironmentBudget::unlimited()
+    };
+    assert!(matches!(
+        ConstantEnvironment::build(rows, one_less),
+        EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
+            limit: EnvironmentLimit::BlockMembers,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn header_only_rows_never_charge_or_traverse_a_definition_value() {
     let parameter = checker_name("u");
     let header = header_entry(
@@ -314,8 +430,8 @@ fn header_only_rows_never_charge_or_traverse_a_definition_value() {
         header_progress.level_parameters,
         definition_progress.level_parameters
     );
-    assert_eq!(header_progress.mutual_members, 0);
-    assert_eq!(definition_progress.mutual_members, 1);
+    assert_eq!(header_progress.block_members, 0);
+    assert_eq!(definition_progress.block_members, 1);
     assert!(definition_progress.arena_nodes > header_progress.arena_nodes);
     assert!(definition_progress.owned_units > header_progress.owned_units);
     complete(ConstantEnvironment::build(
@@ -327,12 +443,12 @@ fn header_only_rows_never_charge_or_traverse_a_definition_value() {
         ConstantEnvironment::build(
             vec![definition.clone()],
             EnvironmentBudget {
-                max_mutual_members: 0,
+                max_block_members: 0,
                 ..exact_budget(definition_progress)
             },
         ),
         EnvironmentOutcome::Inconclusive(EnvironmentStop::Resource {
-            limit: EnvironmentLimit::MutualMembers,
+            limit: EnvironmentLimit::BlockMembers,
             at,
             ..
         }) if at.field == EnvironmentField::MutualMember
@@ -531,7 +647,7 @@ fn exact_budget(progress: EnvironmentProgress) -> EnvironmentBudget {
         progress.steps,
         progress.constants,
         progress.level_parameters,
-        progress.mutual_members,
+        progress.block_members,
         progress.arena_nodes,
         progress.owned_units,
     )
@@ -580,10 +696,10 @@ fn exact_aggregate_resource_boundaries_pass_and_each_one_less_stops_typed() {
     );
     expect_limit(
         EnvironmentBudget {
-            max_mutual_members: exact.max_mutual_members - 1,
+            max_block_members: exact.max_block_members - 1,
             ..exact
         },
-        EnvironmentLimit::MutualMembers,
+        EnvironmentLimit::BlockMembers,
     );
     expect_limit(
         EnvironmentBudget {

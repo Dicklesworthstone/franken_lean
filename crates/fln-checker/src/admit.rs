@@ -5,8 +5,9 @@
 //! weak-head reduction, quick and slow definitional equality, the constant
 //! environment, Nat and String reduction, eta, and inference KR-100 … KR-112.
 //! Each of the three inference slices named declaration admission as the thing
-//! outside its scope. This module is that thing, for the four rules that need no
-//! body checked:
+//! outside its scope. This module is that thing: first for the common preamble
+//! and body rules, then for atomic non-safe mutual definitions and the fixed
+//! four-row quotient initializer:
 //!
 //! * **KR-970**, one name one constant — a declaration whose name already exists
 //!   in the environment is refused, naming it.
@@ -79,10 +80,12 @@
 //! its own arm, and none is cached or promoted.
 //!
 //! The deferral arm is the load-bearing one for a slice this narrow. A
-//! definition, theorem, opaque, inductive, constructor, recursor or quotient has
-//! a preamble this module can check and a body it cannot, so a preamble-passing
-//! non-axiom is [`Verdict::Deferred`] — **not** rejected, which would be a false
-//! verdict, and not admitted, which would be a worse one.
+//! standalone inductive, constructor, recursor, or quotient row has a preamble
+//! this entry point can check but belongs to a block it cannot reconstruct, so
+//! a preamble-passing row is [`Verdict::Deferred`] — **not** rejected, which
+//! would be a false verdict, and not admitted, which would be a worse one.
+//! [`admit_quotient`] is the distinct complete-unit entry point for quotient
+//! initialization.
 //!
 //! # The stack budget is shared, so this module stays off the inference frame
 //!
@@ -94,11 +97,12 @@
 
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
+    QuickDefEqBudget, QuickDefEqFault, QuickDefEqLimit, QuickDefEqSide, QuickDefEqStop,
     def_eq_with,
 };
 use crate::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome,
+    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, QuotientKind,
 };
 use crate::infer::{
     InferenceBudget, InferenceContext, InferenceContextRefusal, InferenceDeferred, InferenceFault,
@@ -108,7 +112,9 @@ use crate::universe::{NormalNode, normalize};
 use crate::whnf::{WhnfBudget, WhnfFault, WhnfOutcome, WhnfRefusal, WhnfStop, whnf_with};
 use std::collections::BTreeSet;
 
-use crate::wire::{ExprNode, WireExpr, WireLevel, WireName};
+use crate::wire::{
+    BinderStyle, ExprId, ExprNode, LevelId, LevelNode, NamePart, WireExpr, WireLevel, WireName,
+};
 
 /// The schema tag a council quotes when it records one of these observations.
 pub const ADMISSION_SCHEMA: &str = "fln.checker-admission/1";
@@ -364,6 +370,9 @@ pub enum AdmissionGround {
     /// body-checked admission as a preamble-only one. The two are different
     /// claims and an enum is the cheapest place to keep them apart.
     BodyCheckedAgainstDeclaredType,
+    /// KR-950..954 — the fixed quotient primitive rows and their required
+    /// equality prelude were reconstructed and compared independently.
+    QuotientPrimitiveChecked,
     /// KR-975 — admitted INTO THE UNSAFE QUARANTINE. Everything the ordinary
     /// grounds claim, plus the fact that this declaration is not safe: a council
     /// reading this ground must not treat it as an ordinary admission, and the
@@ -1212,6 +1221,818 @@ pub fn admit_block_with(
         AdmissionGround::BodyCheckedAgainstDeclaredType,
     );
     BlockVerdict::Admitted(BlockAdmission { members, ground })
+}
+
+// ---------------------------------------------------------------- KR-950..954
+
+/// A completed independent observation over the four primitive quotient rows.
+///
+/// Like [`Admission`] and [`BlockAdmission`], this is evidence and not a
+/// publication capability: its fields are private and it cannot be cloned or
+/// converted into an environment entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuotientAdmission {
+    members: Vec<WireName>,
+}
+
+impl QuotientAdmission {
+    pub fn members(&self) -> &[WireName] {
+        &self.members
+    }
+
+    pub const fn ground(&self) -> AdmissionGround {
+        AdmissionGround::QuotientPrimitiveChecked
+    }
+
+    pub const fn schema(&self) -> &'static str {
+        ADMISSION_SCHEMA
+    }
+}
+
+/// A completed rejection of quotient initialization.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotientRejection {
+    EqualityTypeMissing,
+    EqualityTypeShape,
+    EqualityConstructorMissing,
+    EqualityConstructorShape,
+    DeclarationCount { observed: usize },
+    DeclarationMissing { kind: QuotientKind },
+    NameAlreadyDeclared { name: WireName },
+    UnexpectedLevelParameters { name: WireName },
+    UnexpectedType { name: WireName },
+}
+
+/// The independent quotient judgment's typed outcomes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotientVerdict {
+    Admitted(QuotientAdmission),
+    Rejected(QuotientRejection),
+    Inconclusive(QuickDefEqStop),
+    InternalFault(QuotientFault),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotientFault {
+    Structural(QuickDefEqFault),
+    ExpectedArenaOverflow,
+}
+
+impl QuotientVerdict {
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted(_))
+    }
+
+    pub const fn is_inconclusive_family(&self) -> bool {
+        matches!(self, Self::Inconclusive(_) | Self::InternalFault(_))
+    }
+}
+
+fn checker_atom(value: &str) -> WireName {
+    WireName::from_parts(vec![NamePart::Text(value.to_owned())])
+}
+
+fn checker_child(parent: &WireName, value: &str) -> WireName {
+    let mut parts = parent.parts().to_vec();
+    parts.push(NamePart::Text(value.to_owned()));
+    WireName::from_parts(parts)
+}
+
+struct QuotientTermBuilder {
+    nodes: Vec<ExprNode>,
+    levels: Vec<LevelNode>,
+    overflowed: bool,
+}
+
+impl QuotientTermBuilder {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            levels: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn level(&mut self, node: LevelNode) -> LevelId {
+        let id = match LevelId::from_index(self.levels.len()) {
+            Some(id) => id,
+            None => {
+                self.overflowed = true;
+                LevelId::ZERO
+            }
+        };
+        self.levels.push(node);
+        id
+    }
+
+    fn expression(&mut self, node: ExprNode) -> ExprId {
+        let id = match ExprId::from_index(self.nodes.len()) {
+            Some(id) => id,
+            None => {
+                self.overflowed = true;
+                ExprId::ZERO
+            }
+        };
+        self.nodes.push(node);
+        id
+    }
+
+    fn bvar(&mut self, index: u32) -> ExprId {
+        self.expression(ExprNode::Bound { index })
+    }
+
+    fn sort_zero(&mut self) -> ExprId {
+        let level = self.level(LevelNode::Zero);
+        self.expression(ExprNode::Sort { level })
+    }
+
+    fn sort_parameter(&mut self, parameter: &WireName) -> ExprId {
+        let level = self.level(LevelNode::Parameter(parameter.clone()));
+        self.expression(ExprNode::Sort { level })
+    }
+
+    fn constant(&mut self, name: &WireName, parameters: &[WireName]) -> ExprId {
+        let levels = parameters
+            .iter()
+            .map(|parameter| self.level(LevelNode::Parameter(parameter.clone())))
+            .collect();
+        self.expression(ExprNode::Constant {
+            name: name.clone(),
+            levels,
+        })
+    }
+
+    fn apply(&mut self, function: ExprId, argument: ExprId) -> ExprId {
+        self.expression(ExprNode::Apply { function, argument })
+    }
+
+    fn forall(
+        &mut self,
+        name: &str,
+        style: BinderStyle,
+        binder_type: ExprId,
+        body: ExprId,
+    ) -> ExprId {
+        self.expression(ExprNode::Forall {
+            binder_name: checker_atom(name),
+            binder_type,
+            body,
+            style,
+        })
+    }
+
+    fn arrow(&mut self, domain: ExprId, codomain: ExprId) -> ExprId {
+        self.forall("a", BinderStyle::Default, domain, codomain)
+    }
+
+    fn finish(self, root: ExprId) -> Option<WireExpr> {
+        (!self.overflowed).then(|| WireExpr::from_parts(self.nodes, self.levels, root))
+    }
+}
+
+fn structural_level_equal(
+    left: &WireExpr,
+    left_root: LevelId,
+    right: &WireExpr,
+    right_root: LevelId,
+    control: &mut QuotientComparisonControl,
+    seen: &mut BTreeSet<(LevelId, LevelId)>,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Result<bool, QuickDefEqStop>, QuickDefEqFault> {
+    let mut pending = vec![(left_root, right_root)];
+    while let Some((left_id, right_id)) = pending.pop() {
+        if !seen.insert((left_id, right_id)) {
+            continue;
+        }
+        if let Err(stop) = control.comparison(cancelled) {
+            return Ok(Err(stop));
+        }
+        let left_node = left.level(left_id).ok_or(QuickDefEqFault::Universe {
+            left: left_id.index(),
+            right: right_id.index(),
+            error: crate::universe::UniverseError::InvalidArena,
+        })?;
+        let right_node = right.level(right_id).ok_or(QuickDefEqFault::Universe {
+            left: left_id.index(),
+            right: right_id.index(),
+            error: crate::universe::UniverseError::InvalidArena,
+        })?;
+        let mut push = |left_child: LevelId, right_child: LevelId| {
+            if left_child.index() >= left_id.index() || right_child.index() >= right_id.index() {
+                return Err(QuickDefEqFault::Universe {
+                    left: left_id.index(),
+                    right: right_id.index(),
+                    error: crate::universe::UniverseError::InvalidArena,
+                });
+            }
+            pending.push((left_child, right_child));
+            Ok(())
+        };
+        match (left_node, right_node) {
+            (LevelNode::Zero, LevelNode::Zero) => {}
+            (LevelNode::Parameter(left), LevelNode::Parameter(right))
+            | (LevelNode::Meta(left), LevelNode::Meta(right))
+                if left == right => {}
+            (LevelNode::Succ(left), LevelNode::Succ(right)) => {
+                push(*left, *right)?;
+            }
+            (LevelNode::Max(ll, lr), LevelNode::Max(rl, rr))
+            | (LevelNode::IMax(ll, lr), LevelNode::IMax(rl, rr)) => {
+                push(*lr, *rr)?;
+                push(*ll, *rl)?;
+            }
+            _ => return Ok(Ok(false)),
+        }
+    }
+    Ok(Ok(true))
+}
+
+struct QuotientComparisonControl {
+    budget: QuickDefEqBudget,
+    comparisons: u64,
+    level_nodes: u64,
+    polls: u64,
+}
+
+impl QuotientComparisonControl {
+    const fn new(budget: QuickDefEqBudget) -> Self {
+        Self {
+            budget,
+            comparisons: 0,
+            level_nodes: 0,
+            polls: 0,
+        }
+    }
+
+    fn poll(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), QuickDefEqStop> {
+        self.polls = self.polls.saturating_add(1);
+        if cancelled() {
+            return Err(QuickDefEqStop::Cancelled {
+                polls: self.polls,
+                completed_comparisons: self.comparisons,
+            });
+        }
+        Ok(())
+    }
+
+    fn comparison(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<(), QuickDefEqStop> {
+        self.poll(cancelled)?;
+        let observed = self.comparisons.saturating_add(1);
+        if observed > self.budget.max_comparisons {
+            return Err(QuickDefEqStop::Resource {
+                limit: QuickDefEqLimit::Comparisons,
+                allowed: self.budget.max_comparisons,
+                observed,
+                completed_comparisons: self.comparisons,
+            });
+        }
+        self.comparisons = observed;
+        Ok(())
+    }
+}
+
+fn structural_expression_equal(
+    left: &WireExpr,
+    right: &WireExpr,
+    control: &mut QuotientComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Result<bool, QuickDefEqStop>, QuickDefEqFault> {
+    if let Err(stop) = control.poll(cancelled) {
+        return Ok(Err(stop));
+    }
+    let added_level_nodes = u64::try_from(left.levels().len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(right.levels().len()).unwrap_or(u64::MAX));
+    let observed_level_nodes = control.level_nodes.saturating_add(added_level_nodes);
+    if observed_level_nodes > control.budget.max_level_arena_nodes {
+        return Ok(Err(QuickDefEqStop::Resource {
+            limit: QuickDefEqLimit::LevelArenaNodes,
+            allowed: control.budget.max_level_arena_nodes,
+            observed: observed_level_nodes,
+            completed_comparisons: control.comparisons,
+        }));
+    }
+    control.level_nodes = observed_level_nodes;
+
+    let mut pending = vec![(left.root(), right.root())];
+    let mut seen = BTreeSet::new();
+    let mut seen_levels = BTreeSet::new();
+    while let Some((left_id, right_id)) = pending.pop() {
+        if !seen.insert((left_id, right_id)) {
+            continue;
+        }
+        if let Err(stop) = control.comparison(cancelled) {
+            return Ok(Err(stop));
+        }
+        let left_node = left
+            .node(left_id)
+            .ok_or(QuickDefEqFault::MissingExpression {
+                side: QuickDefEqSide::Left,
+                index: left_id.index(),
+            })?;
+        let right_node = right
+            .node(right_id)
+            .ok_or(QuickDefEqFault::MissingExpression {
+                side: QuickDefEqSide::Right,
+                index: right_id.index(),
+            })?;
+        let mut push = |left_child: ExprId, right_child: ExprId| {
+            if left_child.index() >= left_id.index() {
+                return Err(QuickDefEqFault::NonBackwardExpressionReference {
+                    side: QuickDefEqSide::Left,
+                    parent: left_id.index(),
+                    child: left_child.index(),
+                });
+            }
+            if right_child.index() >= right_id.index() {
+                return Err(QuickDefEqFault::NonBackwardExpressionReference {
+                    side: QuickDefEqSide::Right,
+                    parent: right_id.index(),
+                    child: right_child.index(),
+                });
+            }
+            pending.push((left_child, right_child));
+            Ok(())
+        };
+
+        match (left_node, right_node) {
+            (ExprNode::Bound { index: left }, ExprNode::Bound { index: right })
+                if left == right => {}
+            (ExprNode::Free { name: left }, ExprNode::Free { name: right }) if left == right => {}
+            (ExprNode::Meta { name: left }, ExprNode::Meta { name: right }) if left == right => {}
+            (ExprNode::Sort { level: left_level }, ExprNode::Sort { level: right_level }) => {
+                match structural_level_equal(
+                    left,
+                    *left_level,
+                    right,
+                    *right_level,
+                    control,
+                    &mut seen_levels,
+                    cancelled,
+                )? {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(false)),
+                    Err(stop) => return Ok(Err(stop)),
+                }
+            }
+            (
+                ExprNode::Constant {
+                    name: left_name,
+                    levels: left_levels,
+                },
+                ExprNode::Constant {
+                    name: right_name,
+                    levels: right_levels,
+                },
+            ) if left_name == right_name && left_levels.len() == right_levels.len() => {
+                for (left_level, right_level) in left_levels.iter().zip(right_levels) {
+                    match structural_level_equal(
+                        left,
+                        *left_level,
+                        right,
+                        *right_level,
+                        control,
+                        &mut seen_levels,
+                        cancelled,
+                    )? {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(false)),
+                        Err(stop) => return Ok(Err(stop)),
+                    }
+                }
+            }
+            (
+                ExprNode::Apply {
+                    function: left_function,
+                    argument: left_argument,
+                },
+                ExprNode::Apply {
+                    function: right_function,
+                    argument: right_argument,
+                },
+            ) => {
+                push(*left_argument, *right_argument)?;
+                push(*left_function, *right_function)?;
+            }
+            (
+                ExprNode::Lambda {
+                    binder_type: left_type,
+                    body: left_body,
+                    ..
+                },
+                ExprNode::Lambda {
+                    binder_type: right_type,
+                    body: right_body,
+                    ..
+                },
+            )
+            | (
+                ExprNode::Forall {
+                    binder_type: left_type,
+                    body: left_body,
+                    ..
+                },
+                ExprNode::Forall {
+                    binder_type: right_type,
+                    body: right_body,
+                    ..
+                },
+            ) => {
+                push(*left_body, *right_body)?;
+                push(*left_type, *right_type)?;
+            }
+            (
+                ExprNode::Let {
+                    type_: left_type,
+                    value: left_value,
+                    body: left_body,
+                    ..
+                },
+                ExprNode::Let {
+                    type_: right_type,
+                    value: right_value,
+                    body: right_body,
+                    ..
+                },
+            ) => {
+                push(*left_body, *right_body)?;
+                push(*left_value, *right_value)?;
+                push(*left_type, *right_type)?;
+            }
+            (
+                ExprNode::NatLiteral {
+                    limbs_le: left_value,
+                },
+                ExprNode::NatLiteral {
+                    limbs_le: right_value,
+                },
+            ) if left_value == right_value => {}
+            (ExprNode::StringLiteral(left), ExprNode::StringLiteral(right)) if left == right => {}
+            (
+                ExprNode::Metadata {
+                    expression: left_expression,
+                    ..
+                },
+                ExprNode::Metadata {
+                    expression: right_expression,
+                    ..
+                },
+            ) => push(*left_expression, *right_expression)?,
+            (
+                ExprNode::Projection {
+                    structure_name: left_structure,
+                    index: left_index,
+                    expression: left_expression,
+                },
+                ExprNode::Projection {
+                    structure_name: right_structure,
+                    index: right_index,
+                    expression: right_expression,
+                },
+            ) if left_structure == right_structure && left_index == right_index => {
+                push(*left_expression, *right_expression)?;
+            }
+            _ => return Ok(Ok(false)),
+        }
+    }
+    Ok(Ok(true))
+}
+
+struct ExpectedQuotient {
+    kind: QuotientKind,
+    name: WireName,
+    level_parameters: Vec<WireName>,
+    type_: WireExpr,
+}
+
+fn quotient_types() -> Option<Vec<ExpectedQuotient>> {
+    let quot = checker_atom("Quot");
+    let eq = checker_atom("Eq");
+    let u = checker_atom("u");
+    let v = checker_atom("v");
+
+    let quot_type = {
+        let mut b = QuotientTermBuilder::new();
+        let alpha_sort = b.sort_parameter(&u);
+        let alpha0 = b.bvar(0);
+        let alpha1 = b.bvar(1);
+        let prop = b.sort_zero();
+        let inner = b.arrow(alpha1, prop);
+        let relation = b.arrow(alpha0, inner);
+        let result = b.sort_parameter(&u);
+        let body = b.arrow(relation, result);
+        let root = b.forall("α", BinderStyle::Implicit, alpha_sort, body);
+        b.finish(root)?
+    };
+
+    let quot_mk_type = {
+        let mut b = QuotientTermBuilder::new();
+        let alpha_sort = b.sort_parameter(&u);
+        let alpha0 = b.bvar(0);
+        let alpha1 = b.bvar(1);
+        let prop = b.sort_zero();
+        let relation_tail = b.arrow(alpha1, prop);
+        let relation = b.arrow(alpha0, relation_tail);
+        let alpha_for_a = b.bvar(1);
+        let quot_const = b.constant(&quot, std::slice::from_ref(&u));
+        let alpha_for_quot = b.bvar(2);
+        let quot_alpha = b.apply(quot_const, alpha_for_quot);
+        let relation_for_quot = b.bvar(1);
+        let quot_app = b.apply(quot_alpha, relation_for_quot);
+        let a = b.forall("a", BinderStyle::Default, alpha_for_a, quot_app);
+        let r = b.forall("r", BinderStyle::Default, relation, a);
+        let root = b.forall("α", BinderStyle::Implicit, alpha_sort, r);
+        b.finish(root)?
+    };
+
+    let quot_lift_type = {
+        let mut b = QuotientTermBuilder::new();
+        let alpha_sort = b.sort_parameter(&u);
+        let alpha0 = b.bvar(0);
+        let alpha1 = b.bvar(1);
+        let prop = b.sort_zero();
+        let relation_tail = b.arrow(alpha1, prop);
+        let relation = b.arrow(alpha0, relation_tail);
+        let beta_sort = b.sort_parameter(&v);
+        let f_alpha = b.bvar(2);
+        let f_beta = b.bvar(1);
+        let f_type = b.arrow(f_alpha, f_beta);
+
+        let sanity_alpha_a = b.bvar(3);
+        let sanity_alpha_b = b.bvar(4);
+        let relation_fn = b.bvar(4);
+        let a_arg = b.bvar(1);
+        let relation_a = b.apply(relation_fn, a_arg);
+        let b_arg = b.bvar(0);
+        let relation_ab = b.apply(relation_a, b_arg);
+        let eq_const = b.constant(&eq, std::slice::from_ref(&v));
+        let beta = b.bvar(4);
+        let eq_beta = b.apply(eq_const, beta);
+        let f_for_a = b.bvar(3);
+        let a_for_f = b.bvar(2);
+        let f_a = b.apply(f_for_a, a_for_f);
+        let eq_fa = b.apply(eq_beta, f_a);
+        let f_for_b = b.bvar(3);
+        let b_for_f = b.bvar(1);
+        let f_b = b.apply(f_for_b, b_for_f);
+        let eq_fafb = b.apply(eq_fa, f_b);
+        let sanity_body = b.arrow(relation_ab, eq_fafb);
+        let sanity_b = b.forall("b", BinderStyle::Default, sanity_alpha_b, sanity_body);
+        let sanity = b.forall("a", BinderStyle::Default, sanity_alpha_a, sanity_b);
+
+        let quot_const = b.constant(&quot, std::slice::from_ref(&u));
+        let quot_alpha = b.bvar(4);
+        let quot_applied_alpha = b.apply(quot_const, quot_alpha);
+        let quot_relation = b.bvar(3);
+        let quot_app = b.apply(quot_applied_alpha, quot_relation);
+        let result_beta = b.bvar(3);
+        let quotient_to_beta = b.arrow(quot_app, result_beta);
+        let after_sanity = b.arrow(sanity, quotient_to_beta);
+        let f = b.forall("f", BinderStyle::Default, f_type, after_sanity);
+        let beta = b.forall("β", BinderStyle::Implicit, beta_sort, f);
+        let r = b.forall("r", BinderStyle::Implicit, relation, beta);
+        let root = b.forall("α", BinderStyle::Implicit, alpha_sort, r);
+        b.finish(root)?
+    };
+
+    let quot_ind_type = {
+        let mut b = QuotientTermBuilder::new();
+        let alpha_sort = b.sort_parameter(&u);
+        let alpha0 = b.bvar(0);
+        let alpha1 = b.bvar(1);
+        let prop = b.sort_zero();
+        let relation_tail = b.arrow(alpha1, prop);
+        let relation = b.arrow(alpha0, relation_tail);
+
+        let quot_const = b.constant(&quot, std::slice::from_ref(&u));
+        let beta_alpha = b.bvar(1);
+        let beta_quot_alpha = b.apply(quot_const, beta_alpha);
+        let beta_relation = b.bvar(0);
+        let beta_quot = b.apply(beta_quot_alpha, beta_relation);
+        let beta_prop = b.sort_zero();
+        let beta_type = b.arrow(beta_quot, beta_prop);
+
+        let mk_alpha = b.bvar(2);
+        let beta_fn = b.bvar(1);
+        let quot_mk_name = checker_child(&quot, "mk");
+        let quot_mk = b.constant(&quot_mk_name, std::slice::from_ref(&u));
+        let mk_const_alpha = b.bvar(3);
+        let mk_with_alpha = b.apply(quot_mk, mk_const_alpha);
+        let mk_relation = b.bvar(2);
+        let mk_with_relation = b.apply(mk_with_alpha, mk_relation);
+        let mk_value = b.bvar(0);
+        let mk_application = b.apply(mk_with_relation, mk_value);
+        let beta_mk = b.apply(beta_fn, mk_application);
+        let mk_premise = b.forall("a", BinderStyle::Default, mk_alpha, beta_mk);
+
+        let q_quot = b.constant(&quot, std::slice::from_ref(&u));
+        let q_alpha = b.bvar(3);
+        let q_quot_alpha = b.apply(q_quot, q_alpha);
+        let q_relation = b.bvar(2);
+        let q_type = b.apply(q_quot_alpha, q_relation);
+        let q_beta = b.bvar(2);
+        let q_value = b.bvar(0);
+        let q_result = b.apply(q_beta, q_value);
+        let q = b.forall("q", BinderStyle::Default, q_type, q_result);
+        let mk = b.forall("mk", BinderStyle::Default, mk_premise, q);
+        let beta = b.forall("β", BinderStyle::Implicit, beta_type, mk);
+        let r = b.forall("r", BinderStyle::Implicit, relation, beta);
+        let root = b.forall("α", BinderStyle::Implicit, alpha_sort, r);
+        b.finish(root)?
+    };
+
+    Some(vec![
+        ExpectedQuotient {
+            kind: QuotientKind::Type,
+            name: quot.clone(),
+            level_parameters: vec![u.clone()],
+            type_: quot_type,
+        },
+        ExpectedQuotient {
+            kind: QuotientKind::Constructor,
+            name: checker_child(&quot, "mk"),
+            level_parameters: vec![u.clone()],
+            type_: quot_mk_type,
+        },
+        ExpectedQuotient {
+            kind: QuotientKind::Lift,
+            name: checker_child(&quot, "lift"),
+            level_parameters: vec![u.clone(), v],
+            type_: quot_lift_type,
+        },
+        ExpectedQuotient {
+            kind: QuotientKind::Induction,
+            name: checker_child(&quot, "ind"),
+            level_parameters: vec![u],
+            type_: quot_ind_type,
+        },
+    ])
+}
+
+fn expected_equality_type(parameter: &WireName) -> Option<WireExpr> {
+    let mut b = QuotientTermBuilder::new();
+    let alpha_sort = b.sort_parameter(parameter);
+    let alpha0 = b.bvar(0);
+    let alpha1 = b.bvar(1);
+    let prop = b.sort_zero();
+    let inner = b.arrow(alpha1, prop);
+    let outer = b.arrow(alpha0, inner);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, outer);
+    b.finish(root)
+}
+
+fn expected_equality_constructor_type(parameter: &WireName) -> Option<WireExpr> {
+    let mut b = QuotientTermBuilder::new();
+    let eq = checker_atom("Eq");
+    let alpha_sort = b.sort_parameter(parameter);
+    let alpha_for_a = b.bvar(0);
+    let eq_const = b.constant(&eq, std::slice::from_ref(parameter));
+    let eq_alpha = b.bvar(1);
+    let eq_at_alpha = b.apply(eq_const, eq_alpha);
+    let a_left = b.bvar(0);
+    let eq_left = b.apply(eq_at_alpha, a_left);
+    let a_right = b.bvar(0);
+    let eq_refl = b.apply(eq_left, a_right);
+    let a = b.forall("a", BinderStyle::Default, alpha_for_a, eq_refl);
+    let root = b.forall("α", BinderStyle::Implicit, alpha_sort, a);
+    b.finish(root)
+}
+
+fn compare_or_verdict(
+    actual: &WireExpr,
+    expected: &WireExpr,
+    control: &mut QuotientComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<bool, QuotientVerdict> {
+    match structural_expression_equal(actual, expected, control, cancelled) {
+        Ok(Ok(equal)) => Ok(equal),
+        Ok(Err(stop)) => Err(QuotientVerdict::Inconclusive(stop)),
+        Err(fault) => Err(QuotientVerdict::InternalFault(QuotientFault::Structural(
+            fault,
+        ))),
+    }
+}
+
+/// Independently check the pinned four-row quotient primitive initialization.
+pub fn admit_quotient(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    budget: AdmissionBudget,
+) -> QuotientVerdict {
+    admit_quotient_with(environment, declarations, budget, || false)
+}
+
+/// [`admit_quotient`] with cooperative cancellation at every structural pair.
+pub fn admit_quotient_with(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    budget: AdmissionBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> QuotientVerdict {
+    let mut comparison = QuotientComparisonControl::new(budget.conversion.quick);
+    let eq = checker_atom("Eq");
+    let Some(eq_declaration) = environment.find(&eq) else {
+        return QuotientVerdict::Rejected(QuotientRejection::EqualityTypeMissing);
+    };
+    let Some(eq_metadata) = eq_declaration.inductive_metadata() else {
+        return QuotientVerdict::Rejected(QuotientRejection::EqualityTypeShape);
+    };
+    if eq_declaration.level_parameters().len() != 1 || eq_metadata.constructors().len() != 1 {
+        return QuotientVerdict::Rejected(QuotientRejection::EqualityTypeShape);
+    }
+    let eq_refl = &eq_metadata.constructors()[0];
+    let parameter = &eq_declaration.level_parameters()[0];
+    let Some(expected_eq) = expected_equality_type(parameter) else {
+        return QuotientVerdict::InternalFault(QuotientFault::ExpectedArenaOverflow);
+    };
+    match compare_or_verdict(
+        eq_declaration.type_(),
+        &expected_eq,
+        &mut comparison,
+        &mut cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return QuotientVerdict::Rejected(QuotientRejection::EqualityTypeShape);
+        }
+        Err(verdict) => return verdict,
+    }
+
+    let Some(refl_declaration) = environment.find(eq_refl) else {
+        return QuotientVerdict::Rejected(QuotientRejection::EqualityConstructorMissing);
+    };
+    if refl_declaration.kind() != ConstantKind::Constructor
+        || refl_declaration.level_parameters().len() != 1
+    {
+        return QuotientVerdict::Rejected(QuotientRejection::EqualityConstructorShape);
+    }
+    let Some(expected_refl) =
+        expected_equality_constructor_type(&refl_declaration.level_parameters()[0])
+    else {
+        return QuotientVerdict::InternalFault(QuotientFault::ExpectedArenaOverflow);
+    };
+    match compare_or_verdict(
+        refl_declaration.type_(),
+        &expected_refl,
+        &mut comparison,
+        &mut cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return QuotientVerdict::Rejected(QuotientRejection::EqualityConstructorShape);
+        }
+        Err(verdict) => return verdict,
+    }
+
+    let Some(expected) = quotient_types() else {
+        return QuotientVerdict::InternalFault(QuotientFault::ExpectedArenaOverflow);
+    };
+    if declarations.len() != expected.len() {
+        return QuotientVerdict::Rejected(QuotientRejection::DeclarationCount {
+            observed: declarations.len(),
+        });
+    }
+    let mut members = Vec::new();
+    for expected in expected {
+        let Some(entry) = declarations
+            .iter()
+            .find(|entry| entry.declaration().quotient_kind() == Some(expected.kind))
+        else {
+            return QuotientVerdict::Rejected(QuotientRejection::DeclarationMissing {
+                kind: expected.kind,
+            });
+        };
+        if entry.name() != &expected.name {
+            return QuotientVerdict::Rejected(QuotientRejection::DeclarationMissing {
+                kind: expected.kind,
+            });
+        }
+        if environment.find(&expected.name).is_some() {
+            return QuotientVerdict::Rejected(QuotientRejection::NameAlreadyDeclared {
+                name: expected.name,
+            });
+        }
+        if entry.declaration().level_parameters() != expected.level_parameters {
+            return QuotientVerdict::Rejected(QuotientRejection::UnexpectedLevelParameters {
+                name: expected.name,
+            });
+        }
+        match compare_or_verdict(
+            entry.declaration().type_(),
+            &expected.type_,
+            &mut comparison,
+            &mut cancelled,
+        ) {
+            Ok(true) => members.push(expected.name),
+            Ok(false) => {
+                return QuotientVerdict::Rejected(QuotientRejection::UnexpectedType {
+                    name: expected.name,
+                });
+            }
+            Err(verdict) => return verdict,
+        }
+    }
+    QuotientVerdict::Admitted(QuotientAdmission { members })
 }
 
 /// KR-977 — the environment a member is checked in: everything already there,

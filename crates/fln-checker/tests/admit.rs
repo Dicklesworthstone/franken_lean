@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 
 use fln_checker::admit::{
     ADMISSION_SCHEMA, AdmissionBudget, AdmissionDeferred, AdmissionGround, AdmissionPhase,
-    AdmissionRejection, AdmissionStop, BlockRejection, BlockVerdict, Quarantine, Verdict, admit,
-    admit_block, admit_with,
+    AdmissionRejection, AdmissionStop, BlockRejection, BlockVerdict, Quarantine, QuotientRejection,
+    QuotientVerdict, Verdict, admit, admit_block, admit_quotient, admit_quotient_with, admit_with,
 };
-use fln_checker::defeq::{DefEqBudget, QuickDefEqBudget};
+use fln_checker::defeq::{DefEqBudget, QuickDefEqBudget, QuickDefEqLimit, QuickDefEqStop};
 use fln_checker::environment::{
     ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantKind, ConstantSafety,
-    DefinitionBody, DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, InductiveDeclaration, QuotientKind, ReducibilityHint,
 };
 use fln_checker::infer::InferenceBudget;
 use fln_checker::term::TermBudget;
@@ -26,7 +27,7 @@ use fln_checker::whnf::WhnfBudget;
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
 };
-use fln_core::expr::{Expr, Literal, NatLit};
+use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_hash::canon::Canonical;
@@ -41,6 +42,16 @@ fn checker_name(component: impl Into<String>) -> WireName {
         DecodeOutcome::Complete(Ok(value)) => value,
         other => panic!("primary-produced name did not decode: {other:?}"),
     }
+}
+
+fn checker_qualified(components: &[&str]) -> WireName {
+    let name = Name::from_components(components.iter().copied());
+    let outcome = decode_name(&name.to_canonical_bytes(), DecodeBudget::unlimited());
+    match outcome {
+        DecodeOutcome::Complete(Ok(value)) => Some(value),
+        _ => None,
+    }
+    .expect("primary-produced qualified name must decode")
 }
 
 fn decoded(expression: &Expr) -> WireExpr {
@@ -119,6 +130,410 @@ fn starved_conversion() -> AdmissionBudget {
             WhnfBudget::new(0, 0, TermBudget::unlimited()),
         ),
     )
+}
+
+fn primary_arrow(domain: Expr, codomain: Expr) -> Expr {
+    Expr::forall_e(primary_name("a"), domain, codomain, BinderInfo::Default)
+}
+
+fn primary_pi(name: &str, info: BinderInfo, type_: Expr, body: Expr) -> Expr {
+    Expr::forall_e(primary_name(name), type_, body, info)
+}
+
+fn equality_environment(
+    extra_constructor: bool,
+    malformed_constructor: bool,
+) -> ConstantEnvironment {
+    let eq = primary_name("Eq");
+    let u_name = primary_name("uEq");
+    let u = Level::param(u_name.clone());
+    let alpha = Expr::bvar(0).expect("packs");
+    let alpha1 = Expr::bvar(1).expect("packs");
+    let eq_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_arrow(
+            alpha.clone(),
+            primary_arrow(alpha1, Expr::sort(Level::zero())),
+        ),
+    );
+    let refl_type = if malformed_constructor {
+        Expr::sort(Level::zero())
+    } else {
+        primary_pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            primary_pi(
+                "a",
+                BinderInfo::Default,
+                Expr::bvar(0).expect("packs"),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(
+                            Expr::const_(eq.clone(), vec![u]),
+                            Expr::bvar(1).expect("packs"),
+                        ),
+                        Expr::bvar(0).expect("packs"),
+                    ),
+                    Expr::bvar(0).expect("packs"),
+                ),
+            ),
+        )
+    };
+    let mut constructors = vec![checker_qualified(&["Eq", "refl"])];
+    if extra_constructor {
+        constructors.push(checker_qualified(&["Eq", "extra"]));
+    }
+    let mut entries = vec![
+        ConstantEntry::new(
+            checker_name("Eq"),
+            ConstantDeclaration::inductive(
+                vec![checker_name("uEq")],
+                decoded(&eq_type),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![checker_name("Eq")],
+                    constructors,
+                    0,
+                    false,
+                    true,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Eq", "refl"]),
+            ConstantDeclaration::constructor(
+                vec![checker_name("uEq")],
+                decoded(&refl_type),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Eq"), 0, 1, 0),
+            ),
+        ),
+    ];
+    if extra_constructor {
+        entries.push(ConstantEntry::new(
+            checker_qualified(&["Eq", "extra"]),
+            ConstantDeclaration::constructor(
+                vec![checker_name("uEq")],
+                a_type(),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name("Eq"), 1, 1, 0),
+            ),
+        ));
+    }
+    environment_of(entries)
+}
+
+fn quotient_entries() -> Vec<ConstantEntry> {
+    let quot = primary_name("Quot");
+    let u_name = primary_name("u");
+    let v_name = primary_name("v");
+    let u = Level::param(u_name.clone());
+    let v = Level::param(v_name.clone());
+    let prop = || Expr::sort(Level::zero());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let quot_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_arrow(
+            primary_arrow(bv(0), primary_arrow(bv(1), prop())),
+            Expr::sort(u.clone()),
+        ),
+    );
+    let quot_app = |alpha: Expr, relation: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), alpha),
+            relation,
+        )
+    };
+    let quot_mk_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "r",
+            BinderInfo::Default,
+            primary_arrow(bv(0), primary_arrow(bv(1), prop())),
+            primary_pi("a", BinderInfo::Default, bv(1), quot_app(bv(2), bv(1))),
+        ),
+    );
+    let eq = primary_name("Eq");
+    let sanity = primary_pi(
+        "a",
+        BinderInfo::Default,
+        bv(3),
+        primary_pi(
+            "b",
+            BinderInfo::Default,
+            bv(4),
+            primary_arrow(
+                Expr::app(Expr::app(bv(4), bv(1)), bv(0)),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(Expr::const_(eq, vec![v.clone()]), bv(4)),
+                        Expr::app(bv(3), bv(2)),
+                    ),
+                    Expr::app(bv(3), bv(1)),
+                ),
+            ),
+        ),
+    );
+    let quot_lift_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "r",
+            BinderInfo::Implicit,
+            primary_arrow(bv(0), primary_arrow(bv(1), prop())),
+            primary_pi(
+                "β",
+                BinderInfo::Implicit,
+                Expr::sort(v.clone()),
+                primary_pi(
+                    "f",
+                    BinderInfo::Default,
+                    primary_arrow(bv(2), bv(1)),
+                    primary_arrow(sanity, primary_arrow(quot_app(bv(4), bv(3)), bv(3))),
+                ),
+            ),
+        ),
+    );
+    let quot_mk = Name::str(quot.clone(), "mk");
+    let quot_ind_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        Expr::sort(u.clone()),
+        primary_pi(
+            "r",
+            BinderInfo::Implicit,
+            primary_arrow(bv(0), primary_arrow(bv(1), prop())),
+            primary_pi(
+                "β",
+                BinderInfo::Implicit,
+                primary_arrow(quot_app(bv(1), bv(0)), prop()),
+                primary_pi(
+                    "mk",
+                    BinderInfo::Default,
+                    primary_pi(
+                        "a",
+                        BinderInfo::Default,
+                        bv(2),
+                        Expr::app(
+                            bv(1),
+                            Expr::app(
+                                Expr::app(
+                                    Expr::app(Expr::const_(quot_mk, vec![u.clone()]), bv(3)),
+                                    bv(2),
+                                ),
+                                bv(0),
+                            ),
+                        ),
+                    ),
+                    primary_pi(
+                        "q",
+                        BinderInfo::Default,
+                        quot_app(bv(3), bv(2)),
+                        Expr::app(bv(2), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    vec![
+        ConstantEntry::new(
+            checker_name("Quot"),
+            ConstantDeclaration::quotient(
+                vec![checker_name("u")],
+                decoded(&quot_type),
+                QuotientKind::Type,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Quot", "mk"]),
+            ConstantDeclaration::quotient(
+                vec![checker_name("u")],
+                decoded(&quot_mk_type),
+                QuotientKind::Constructor,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Quot", "lift"]),
+            ConstantDeclaration::quotient(
+                vec![checker_name("u"), checker_name("v")],
+                decoded(&quot_lift_type),
+                QuotientKind::Lift,
+            ),
+        ),
+        ConstantEntry::new(
+            checker_qualified(&["Quot", "ind"]),
+            ConstantDeclaration::quotient(
+                vec![checker_name("u")],
+                decoded(&quot_ind_type),
+                QuotientKind::Induction,
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn kr950_954_quotient_initialization_is_reconstructed_independently() {
+    let environment = equality_environment(false, false);
+    let mut declarations = quotient_entries();
+    declarations.rotate_left(2);
+    let verdict = admit_quotient(&environment, &declarations, AdmissionBudget::unlimited());
+    assert!(
+        verdict.is_admitted(),
+        "the exact quotient primitive was not admitted: {verdict:?}"
+    );
+    let QuotientVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+    assert_eq!(
+        admission.ground(),
+        AdmissionGround::QuotientPrimitiveChecked
+    );
+    assert_eq!(admission.schema(), ADMISSION_SCHEMA);
+}
+
+#[test]
+fn kr950_quotient_initialization_checks_the_equality_constructor_type() {
+    assert!(matches!(
+        admit_quotient(
+            &equality_environment(false, true),
+            &quotient_entries(),
+            AdmissionBudget::unlimited(),
+        ),
+        QuotientVerdict::Rejected(QuotientRejection::EqualityConstructorShape)
+    ));
+    assert!(
+        admit_quotient(
+            &equality_environment(false, false),
+            &quotient_entries(),
+            AdmissionBudget::unlimited(),
+        )
+        .is_admitted(),
+        "the exact equality constructor must clear the same check"
+    );
+}
+
+#[test]
+fn kr950_level_pairs_consume_the_aggregate_quotient_comparison_budget() {
+    let budget = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget {
+            // The Eq type and constructor contain 18 expression pairs. A
+            // comparer that forgets their level pairs reaches the empty-unit
+            // rejection; the bounded comparer must stop on pair 19 instead.
+            quick: QuickDefEqBudget::new(18, u64::MAX),
+            ..DefEqBudget::unlimited()
+        },
+    );
+    assert!(matches!(
+        admit_quotient(&equality_environment(false, false), &[], budget),
+        QuotientVerdict::Inconclusive(QuickDefEqStop::Resource {
+            limit: QuickDefEqLimit::Comparisons,
+            allowed: 18,
+            observed: 19,
+            completed_comparisons: 18,
+        })
+    ));
+    assert!(matches!(
+        admit_quotient(
+            &equality_environment(false, false),
+            &[],
+            AdmissionBudget::unlimited(),
+        ),
+        QuotientVerdict::Rejected(QuotientRejection::DeclarationCount { observed: 0 })
+    ));
+}
+
+#[test]
+fn kr950_954_quotient_rejections_and_nonanswers_do_not_collapse() {
+    let environment = equality_environment(false, false);
+    let mut malformed = quotient_entries();
+    malformed[2] = ConstantEntry::new(
+        checker_qualified(&["Quot", "lift"]),
+        ConstantDeclaration::quotient(
+            vec![checker_name("u"), checker_name("v")],
+            a_type(),
+            QuotientKind::Lift,
+        ),
+    );
+    assert!(matches!(
+        admit_quotient(&environment, &malformed, AdmissionBudget::unlimited()),
+        QuotientVerdict::Rejected(QuotientRejection::UnexpectedType { ref name })
+            if name == &checker_qualified(&["Quot", "lift"])
+    ));
+
+    let starved = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget {
+            quick: QuickDefEqBudget::new(0, u64::MAX),
+            ..DefEqBudget::unlimited()
+        },
+    );
+    assert!(matches!(
+        admit_quotient(&environment, &quotient_entries(), starved),
+        QuotientVerdict::Inconclusive(_)
+    ));
+    let aggregate = AdmissionBudget::new(
+        InferenceBudget::unlimited(),
+        WhnfBudget::unlimited(),
+        DefEqBudget {
+            quick: QuickDefEqBudget::new(100, u64::MAX),
+            ..DefEqBudget::unlimited()
+        },
+    );
+    assert!(matches!(
+        admit_quotient(&environment, &quotient_entries(), aggregate),
+        QuotientVerdict::Inconclusive(_)
+    ));
+    assert!(matches!(
+        admit_quotient_with(
+            &environment,
+            &quotient_entries(),
+            AdmissionBudget::unlimited(),
+            || true,
+        ),
+        QuotientVerdict::Inconclusive(_)
+    ));
+
+    assert!(matches!(
+        admit_quotient(
+            &equality_environment(true, false),
+            &quotient_entries(),
+            AdmissionBudget::unlimited(),
+        ),
+        QuotientVerdict::Rejected(QuotientRejection::EqualityTypeShape)
+    ));
+
+    let mut repeated = quotient_entries();
+    repeated[3] = repeated[0].clone();
+    assert!(matches!(
+        admit_quotient(&environment, &repeated, AdmissionBudget::unlimited()),
+        QuotientVerdict::Rejected(QuotientRejection::DeclarationMissing {
+            kind: QuotientKind::Induction,
+        })
+    ));
+
+    assert!(
+        admit_quotient(
+            &environment,
+            &quotient_entries(),
+            AdmissionBudget::unlimited(),
+        )
+        .is_admitted(),
+        "a completed rejection or non-answer must not poison a later exact run"
+    );
 }
 
 // ---------------------------------------------------------------- KR-970
@@ -800,16 +1215,18 @@ fn an_axiom_cannot_be_constructed_with_a_body() {
         .split_once("\n}\n")
         .expect("that impl block ends")
         .0;
-    let constructors: Vec<&str> = declaration_impl
+    let constructor_region = declaration_impl
+        .split_once("    pub fn level_parameters")
+        .expect("constructors precede the declaration accessors")
+        .0;
+    let constructors: Vec<&str> = constructor_region
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
-        .filter(|line| line.contains("-> ConstantDeclaration") || line.ends_with('('))
-        .filter(|line| !line.contains("(&self)"))
+        .filter(|line| line.starts_with("pub fn "))
         .collect();
     assert_eq!(
         constructors.len(),
-        4,
+        8,
         "ConstantDeclaration gained or lost a constructor, so the reachability \
          of an axiom-with-a-body must be re-measured: {constructors:?}"
     );
@@ -837,6 +1254,14 @@ fn an_axiom_cannot_be_constructed_with_a_body() {
             .any(|line| line.contains("pub fn opaque(")),
         "expected the opaque constructor: {constructors:?}"
     );
+    for name in ["inductive", "constructor", "recursor", "quotient"] {
+        assert!(
+            constructors
+                .iter()
+                .any(|line| line.contains(&format!("pub fn {name}("))),
+            "expected the {name} constructor: {constructors:?}"
+        );
+    }
     // `header` is the only constructor reachable with `ConstantKind::Axiom`, and
     // it hardcodes an absent body; every body-bearing constructor hardcodes its
     // non-Axiom kind.
@@ -1530,7 +1955,7 @@ fn kr977_the_max_mutual_members_budget_still_binds() {
         member("A", &["A", "B"], DefinitionSafety::Unsafe),
         member("B", &["A", "B"], DefinitionSafety::Unsafe),
     ];
-    // max_mutual_members = 1, everything else unlimited: the meter is the only
+    // max_block_members = 1, everything else unlimited: the meter is the only
     // variable, so a refusal is attributable to it.
     let starved = EnvironmentBudget::new(u64::MAX, u64::MAX, u64::MAX, 1, u64::MAX, u64::MAX);
     assert!(
@@ -1538,7 +1963,7 @@ fn kr977_the_max_mutual_members_budget_still_binds() {
             ConstantEnvironment::build(entries.clone(), starved),
             EnvironmentOutcome::Complete { .. }
         ),
-        "max_mutual_members must still refuse a block that exceeds it"
+        "max_block_members must still refuse a block that exceeds it"
     );
     // Control: the same entries under an unlimited budget build cleanly, so the
     // refusal above is the meter and not the entries.

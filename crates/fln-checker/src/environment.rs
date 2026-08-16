@@ -68,6 +68,209 @@ pub enum DefinitionSafety {
     Partial,
 }
 
+/// Checker-owned metadata for an inductive type row.
+///
+/// These are schema facts decoded independently from the canonical wire object;
+/// retaining them is what lets block admission check more than the common
+/// constant header without importing `fln-env` or `fln-kernel`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InductiveDeclaration {
+    num_parameters: u32,
+    num_indices: u32,
+    mutual: Vec<WireName>,
+    constructors: Vec<WireName>,
+    num_nested: u32,
+    recursive: bool,
+    reflexive: bool,
+}
+
+impl InductiveDeclaration {
+    pub fn new(
+        num_parameters: u32,
+        num_indices: u32,
+        mutual: Vec<WireName>,
+        constructors: Vec<WireName>,
+        num_nested: u32,
+        recursive: bool,
+        reflexive: bool,
+    ) -> Self {
+        Self {
+            num_parameters,
+            num_indices,
+            mutual,
+            constructors,
+            num_nested,
+            recursive,
+            reflexive,
+        }
+    }
+
+    pub const fn num_parameters(&self) -> u32 {
+        self.num_parameters
+    }
+
+    pub const fn num_indices(&self) -> u32 {
+        self.num_indices
+    }
+
+    pub fn mutual(&self) -> &[WireName] {
+        &self.mutual
+    }
+
+    pub fn constructors(&self) -> &[WireName] {
+        &self.constructors
+    }
+
+    pub const fn num_nested(&self) -> u32 {
+        self.num_nested
+    }
+
+    pub const fn is_recursive(&self) -> bool {
+        self.recursive
+    }
+
+    pub const fn is_reflexive(&self) -> bool {
+        self.reflexive
+    }
+}
+
+/// Checker-owned metadata for one constructor row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorDeclaration {
+    inductive: WireName,
+    index: u32,
+    num_parameters: u32,
+    num_fields: u32,
+}
+
+impl ConstructorDeclaration {
+    pub fn new(inductive: WireName, index: u32, num_parameters: u32, num_fields: u32) -> Self {
+        Self {
+            inductive,
+            index,
+            num_parameters,
+            num_fields,
+        }
+    }
+
+    pub fn inductive(&self) -> &WireName {
+        &self.inductive
+    }
+
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub const fn num_parameters(&self) -> u32 {
+        self.num_parameters
+    }
+
+    pub const fn num_fields(&self) -> u32 {
+        self.num_fields
+    }
+}
+
+/// One checker-owned recursor reduction rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursorRule {
+    constructor: WireName,
+    num_fields: u32,
+    rhs: WireExpr,
+}
+
+impl RecursorRule {
+    pub fn new(constructor: WireName, num_fields: u32, rhs: WireExpr) -> Self {
+        Self {
+            constructor,
+            num_fields,
+            rhs,
+        }
+    }
+
+    pub fn constructor(&self) -> &WireName {
+        &self.constructor
+    }
+
+    pub const fn num_fields(&self) -> u32 {
+        self.num_fields
+    }
+
+    pub fn rhs(&self) -> &WireExpr {
+        &self.rhs
+    }
+}
+
+/// Checker-owned metadata for one recursor row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursorDeclaration {
+    mutual: Vec<WireName>,
+    num_parameters: u32,
+    num_indices: u32,
+    num_motives: u32,
+    num_minors: u32,
+    rules: Vec<RecursorRule>,
+    k: bool,
+}
+
+impl RecursorDeclaration {
+    pub fn new(
+        mutual: Vec<WireName>,
+        num_parameters: u32,
+        num_indices: u32,
+        num_motives: u32,
+        num_minors: u32,
+        rules: Vec<RecursorRule>,
+        k: bool,
+    ) -> Self {
+        Self {
+            mutual,
+            num_parameters,
+            num_indices,
+            num_motives,
+            num_minors,
+            rules,
+            k,
+        }
+    }
+
+    pub fn mutual(&self) -> &[WireName] {
+        &self.mutual
+    }
+
+    pub const fn num_parameters(&self) -> u32 {
+        self.num_parameters
+    }
+
+    pub const fn num_indices(&self) -> u32 {
+        self.num_indices
+    }
+
+    pub const fn num_motives(&self) -> u32 {
+        self.num_motives
+    }
+
+    pub const fn num_minors(&self) -> u32 {
+        self.num_minors
+    }
+
+    pub fn rules(&self) -> &[RecursorRule] {
+        &self.rules
+    }
+
+    pub const fn k(&self) -> bool {
+        self.k
+    }
+}
+
+/// The four fixed quotient declarations from the pinned primitive initializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotientKind {
+    Type,
+    Constructor,
+    Lift,
+    Induction,
+}
+
 /// Optional definition-specific payload stored behind the common header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionBody {
@@ -122,6 +325,15 @@ enum ConstantBody {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConstantMetadata {
+    None,
+    Inductive(InductiveDeclaration),
+    Constructor(ConstructorDeclaration),
+    Recursor(RecursorDeclaration),
+    Quotient(QuotientKind),
+}
+
 impl ConstantBody {
     fn value(&self) -> &WireExpr {
         match self {
@@ -139,8 +351,9 @@ impl ConstantBody {
 }
 
 /// One constant declaration. Typing and admission share this header;
-/// definitions, theorems, and opaques have distinct body shapes, while
-/// header-only declarations never receive a fabricated value.
+/// definitions, theorems, and opaques have distinct body shapes; inductive,
+/// constructor, recursor, and quotient rows retain their block metadata; and
+/// deliberately header-only declarations never receive a fabricated value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstantDeclaration {
     level_parameters: Vec<WireName>,
@@ -148,6 +361,7 @@ pub struct ConstantDeclaration {
     kind: ConstantKind,
     safety: ConstantSafety,
     body: Option<ConstantBody>,
+    metadata: ConstantMetadata,
 }
 
 impl ConstantDeclaration {
@@ -163,6 +377,7 @@ impl ConstantDeclaration {
             kind,
             safety,
             body: None,
+            metadata: ConstantMetadata::None,
         }
     }
 
@@ -178,6 +393,7 @@ impl ConstantDeclaration {
             kind: ConstantKind::Definition,
             safety,
             body: Some(ConstantBody::Definition(definition)),
+            metadata: ConstantMetadata::None,
         }
     }
 
@@ -193,6 +409,7 @@ impl ConstantDeclaration {
             kind: ConstantKind::Theorem,
             safety: ConstantSafety::Safe,
             body: Some(ConstantBody::Theorem { value, mutual }),
+            metadata: ConstantMetadata::None,
         }
     }
 
@@ -209,6 +426,66 @@ impl ConstantDeclaration {
             kind: ConstantKind::Opaque,
             safety,
             body: Some(ConstantBody::Opaque { value, mutual }),
+            metadata: ConstantMetadata::None,
+        }
+    }
+
+    pub fn inductive(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        safety: ConstantSafety,
+        metadata: InductiveDeclaration,
+    ) -> Self {
+        Self {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Inductive,
+            safety,
+            body: None,
+            metadata: ConstantMetadata::Inductive(metadata),
+        }
+    }
+
+    pub fn constructor(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        safety: ConstantSafety,
+        metadata: ConstructorDeclaration,
+    ) -> Self {
+        Self {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Constructor,
+            safety,
+            body: None,
+            metadata: ConstantMetadata::Constructor(metadata),
+        }
+    }
+
+    pub fn recursor(
+        level_parameters: Vec<WireName>,
+        type_: WireExpr,
+        safety: ConstantSafety,
+        metadata: RecursorDeclaration,
+    ) -> Self {
+        Self {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Recursor,
+            safety,
+            body: None,
+            metadata: ConstantMetadata::Recursor(metadata),
+        }
+    }
+
+    pub fn quotient(level_parameters: Vec<WireName>, type_: WireExpr, kind: QuotientKind) -> Self {
+        Self {
+            level_parameters,
+            type_,
+            kind: ConstantKind::Quotient,
+            safety: ConstantSafety::Safe,
+            body: None,
+            metadata: ConstantMetadata::Quotient(kind),
         }
     }
 
@@ -258,6 +535,34 @@ impl ConstantDeclaration {
 
     pub fn is_delta_unfoldable(&self) -> bool {
         self.delta_body().is_some()
+    }
+
+    pub fn inductive_metadata(&self) -> Option<&InductiveDeclaration> {
+        match &self.metadata {
+            ConstantMetadata::Inductive(metadata) => Some(metadata),
+            _ => None,
+        }
+    }
+
+    pub fn constructor_metadata(&self) -> Option<&ConstructorDeclaration> {
+        match &self.metadata {
+            ConstantMetadata::Constructor(metadata) => Some(metadata),
+            _ => None,
+        }
+    }
+
+    pub fn recursor_metadata(&self) -> Option<&RecursorDeclaration> {
+        match &self.metadata {
+            ConstantMetadata::Recursor(metadata) => Some(metadata),
+            _ => None,
+        }
+    }
+
+    pub const fn quotient_kind(&self) -> Option<QuotientKind> {
+        match &self.metadata {
+            ConstantMetadata::Quotient(kind) => Some(*kind),
+            _ => None,
+        }
     }
 }
 
@@ -583,7 +888,9 @@ pub struct EnvironmentBudget {
     pub max_steps: u64,
     pub max_constants: u64,
     pub max_level_parameters: u64,
-    pub max_mutual_members: u64,
+    /// Maximum names retained in declaration-specific metadata. This includes
+    /// mutual body lists and inductive/constructor/recursor block links.
+    pub max_block_members: u64,
     pub max_arena_nodes: u64,
     pub max_owned_units: u64,
 }
@@ -593,7 +900,7 @@ impl EnvironmentBudget {
         max_steps: u64,
         max_constants: u64,
         max_level_parameters: u64,
-        max_mutual_members: u64,
+        max_block_members: u64,
         max_arena_nodes: u64,
         max_owned_units: u64,
     ) -> EnvironmentBudget {
@@ -601,7 +908,7 @@ impl EnvironmentBudget {
             max_steps,
             max_constants,
             max_level_parameters,
-            max_mutual_members,
+            max_block_members,
             max_arena_nodes,
             max_owned_units,
         }
@@ -618,7 +925,7 @@ pub struct EnvironmentProgress {
     pub steps: u64,
     pub constants: u64,
     pub level_parameters: u64,
-    pub mutual_members: u64,
+    pub block_members: u64,
     pub arena_nodes: u64,
     pub owned_units: u64,
 }
@@ -628,7 +935,7 @@ pub enum EnvironmentLimit {
     Steps,
     Constants,
     LevelParameters,
-    MutualMembers,
+    BlockMembers,
     ArenaNodes,
     OwnedUnits,
 }
@@ -638,10 +945,17 @@ pub enum EnvironmentField {
     Name,
     LevelParameter,
     MutualMember,
+    InductiveMember,
+    InductiveConstructor,
+    ConstructorInductive,
+    RecursorMember,
+    RecursorRuleConstructor,
     TypeLevel,
     TypeExpression,
     ValueLevel,
     ValueExpression,
+    RecursorRuleLevel,
+    RecursorRuleExpression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,6 +997,7 @@ pub enum EnvironmentRefusal {
 pub enum EnvironmentTerm {
     Type,
     Value,
+    RecursorRule { rule: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -813,11 +1128,11 @@ impl<'a> Control<'a> {
         Ok(())
     }
 
-    fn mutual_member(&mut self, at: EnvironmentPosition) -> Result<(), EnvironmentStop> {
-        self.progress.mutual_members = self.admit(
-            EnvironmentLimit::MutualMembers,
-            self.budget.max_mutual_members,
-            self.progress.mutual_members,
+    fn block_member(&mut self, at: EnvironmentPosition) -> Result<(), EnvironmentStop> {
+        self.progress.block_members = self.admit(
+            EnvironmentLimit::BlockMembers,
+            self.budget.max_block_members,
+            self.progress.block_members,
             at,
         )?;
         Ok(())
@@ -900,6 +1215,8 @@ fn field(term: EnvironmentTerm, levels: bool) -> EnvironmentField {
         (EnvironmentTerm::Type, false) => EnvironmentField::TypeExpression,
         (EnvironmentTerm::Value, true) => EnvironmentField::ValueLevel,
         (EnvironmentTerm::Value, false) => EnvironmentField::ValueExpression,
+        (EnvironmentTerm::RecursorRule { .. }, true) => EnvironmentField::RecursorRuleLevel,
+        (EnvironmentTerm::RecursorRule { .. }, false) => EnvironmentField::RecursorRuleExpression,
     }
 }
 
@@ -1042,6 +1359,30 @@ fn validate_constant(
     constant_index: usize,
     declaration: &ConstantDeclaration,
 ) -> Result<(), ValidationFailure> {
+    fn validate_metadata_name(
+        control: &mut Control<'_>,
+        constant: usize,
+        field: EnvironmentField,
+        index: usize,
+        name: &WireName,
+    ) -> Result<(), ValidationFailure> {
+        let at = EnvironmentPosition {
+            constant,
+            field,
+            index,
+        };
+        control
+            .step(at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        control
+            .block_member(at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        control
+            .owned_units(name_owned_units(name), at)
+            .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+        Ok(())
+    }
+
     let mut parameters = BTreeMap::new();
     for (parameter_index, parameter) in declaration.level_parameters.iter().enumerate() {
         let at = EnvironmentPosition {
@@ -1079,20 +1420,13 @@ fn validate_constant(
 
     if let Some(body) = declaration.body.as_ref() {
         for (member_index, member) in body.mutual().iter().enumerate() {
-            let at = EnvironmentPosition {
-                constant: constant_index,
-                field: EnvironmentField::MutualMember,
-                index: member_index,
-            };
-            control
-                .step(at)
-                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
-            control
-                .mutual_member(at)
-                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
-            control
-                .owned_units(name_owned_units(member), at)
-                .map_err(|stop| ValidationFailure::Halt(Halt::Stop(stop)))?;
+            validate_metadata_name(
+                control,
+                constant_index,
+                EnvironmentField::MutualMember,
+                member_index,
+                member,
+            )?;
         }
 
         validate_term(
@@ -1102,6 +1436,64 @@ fn validate_constant(
             body.value(),
         )
         .map_err(ValidationFailure::Halt)?;
+    }
+
+    match &declaration.metadata {
+        ConstantMetadata::None | ConstantMetadata::Quotient(_) => {}
+        ConstantMetadata::Inductive(metadata) => {
+            for (index, member) in metadata.mutual().iter().enumerate() {
+                validate_metadata_name(
+                    control,
+                    constant_index,
+                    EnvironmentField::InductiveMember,
+                    index,
+                    member,
+                )?;
+            }
+            for (index, constructor) in metadata.constructors().iter().enumerate() {
+                validate_metadata_name(
+                    control,
+                    constant_index,
+                    EnvironmentField::InductiveConstructor,
+                    index,
+                    constructor,
+                )?;
+            }
+        }
+        ConstantMetadata::Constructor(metadata) => validate_metadata_name(
+            control,
+            constant_index,
+            EnvironmentField::ConstructorInductive,
+            0,
+            metadata.inductive(),
+        )?,
+        ConstantMetadata::Recursor(metadata) => {
+            for (index, member) in metadata.mutual().iter().enumerate() {
+                validate_metadata_name(
+                    control,
+                    constant_index,
+                    EnvironmentField::RecursorMember,
+                    index,
+                    member,
+                )?;
+            }
+            for (index, rule) in metadata.rules().iter().enumerate() {
+                validate_metadata_name(
+                    control,
+                    constant_index,
+                    EnvironmentField::RecursorRuleConstructor,
+                    index,
+                    rule.constructor(),
+                )?;
+                validate_term(
+                    control,
+                    constant_index,
+                    EnvironmentTerm::RecursorRule { rule: index },
+                    rule.rhs(),
+                )
+                .map_err(ValidationFailure::Halt)?;
+            }
+        }
     }
     Ok(())
 }

@@ -114,6 +114,8 @@ impl PartialOrd for WireName {
 pub struct LevelId(u32);
 
 impl LevelId {
+    pub(crate) const ZERO: LevelId = LevelId(0);
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -164,6 +166,8 @@ impl WireLevel {
 pub struct ExprId(u32);
 
 impl ExprId {
+    pub(crate) const ZERO: ExprId = ExprId(0);
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
