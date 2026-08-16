@@ -44,6 +44,9 @@ pub struct ParseDiagnostic {
 /// The next form required by the first command grammar slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatDefinitionExpectation {
+    ImportOrDefinition,
+    ImportedModule,
+    EndOfImportCommand,
     DefinitionKeyword,
     DeclarationIdentifier,
     ParameterIdentifier,
@@ -241,6 +244,18 @@ pub type ParsedNatDefinition = ParsedDefinition;
 /// Compatibility name for callers using the wider bounded source door.
 pub type DefinitionParseError = NatDefinitionParseError;
 
+/// One bounded source module split into its direct import names and definition
+/// command slices.
+///
+/// This is a lexical command boundary, not a module resolver. In particular,
+/// returning an import name grants it no environment authority; the caller must
+/// resolve the complete import graph before any definition is elaborated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedSourceModule<'source> {
+    pub imports: Vec<Name>,
+    pub commands: Vec<(BytePos, &'source [u8])>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefinitionGrammar {
     NatOnly,
@@ -284,6 +299,10 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens(["def", "let", "(", ")", ":", ":=", ";"])
+}
+
+fn source_module_token_table() -> TokenTable {
+    TokenTable::from_tokens(["import", "def", "let", "(", ")", ":", ":=", ";"])
 }
 
 fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> BytePos {
@@ -889,6 +908,106 @@ pub fn partition_definition_commands(
     Ok(commands)
 }
 
+/// Parse the bounded source facade's module header and partition its definitions.
+///
+/// The supported header is the ordinary Lean spelling `import A.B C`, with one
+/// import command per physical line and all imports preceding the first `def`.
+/// Comments and blank lines are trivia. Requiring the command to end at its line
+/// is deliberate for this first production slice: accepting a broader layout
+/// without the complete command parser would guess at module boundaries.
+///
+/// Import names are returned exactly as structural [`Name`] values. This
+/// function neither loads them nor makes them available to elaboration. A caller
+/// that cannot prove it has a closed graph must refuse rather than execute the
+/// returned commands.
+pub fn partition_source_module(
+    source: &[u8],
+) -> Result<PartitionedSourceModule<'_>, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let run = lex_run(view.normalized(), &source_module_token_table());
+    let diagnostics = run
+        .diagnostics()
+        .into_iter()
+        .map(|(message, at)| ParseDiagnostic {
+            message,
+            at: view.to_original(at),
+        })
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+
+    let tokens = run
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Token(token) => Some(token),
+            Event::Trivia(_) | Event::Refused { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let at = |index: usize| {
+        tokens.get(index).map_or_else(
+            || BytePos(source.len()),
+            |token| view.to_original(token.extent.start()),
+        )
+    };
+
+    let mut imports = Vec::new();
+    let mut cursor = 0_usize;
+    let definition_start = loop {
+        let Some(token) = tokens.get(cursor) else {
+            break None;
+        };
+        match &token.kind {
+            TokenKind::Symbol(symbol) if symbol == "def" => {
+                break Some(view.to_original(token.extent.start()).0);
+            }
+            TokenKind::Symbol(symbol) if symbol == "import" => {
+                let import_line = view.normalized().line_of(token.extent.start());
+                cursor += 1;
+                let first_module = imports.len();
+                while let Some(module) = tokens.get(cursor) {
+                    if view.normalized().line_of(module.extent.start()) != import_line {
+                        break;
+                    }
+                    match &module.kind {
+                        TokenKind::Ident(name) => imports.push(name.clone()),
+                        TokenKind::Symbol(_) | TokenKind::Literal(_) => {
+                            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                                at: at(cursor),
+                                expected: NatDefinitionExpectation::EndOfImportCommand,
+                            });
+                        }
+                    }
+                    cursor += 1;
+                }
+                if imports.len() == first_module {
+                    return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: at(cursor),
+                        expected: NatDefinitionExpectation::ImportedModule,
+                    });
+                }
+            }
+            TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: at(cursor),
+                    expected: NatDefinitionExpectation::ImportOrDefinition,
+                });
+            }
+        }
+    };
+
+    let body_start =
+        definition_start.unwrap_or_else(|| if imports.is_empty() { 0 } else { source.len() });
+    let mut commands = partition_definition_commands(&source[body_start..])
+        .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
+    for (offset, _) in &mut commands {
+        offset.0 = offset.0.saturating_add(body_start);
+    }
+    Ok(PartitionedSourceModule { imports, commands })
+}
+
 /// Partition a Nat-only source file without changing the original parser's
 /// acceptance authority.
 pub fn partition_nat_definition_commands(
@@ -944,6 +1063,61 @@ mod nat_definition_tests {
         for (_, command) in commands {
             parse_nat_definition(command).expect("each partition is one accepted command");
         }
+    }
+
+    #[test]
+    fn source_module_header_retains_structural_imports_and_original_command_offsets() {
+        let source = b"-- module header\r\nimport Foundation.Nat Text.Tools\r\n\r\ndef first := 1\r\ndef answer := first";
+        let module = partition_source_module(source).expect("the bounded import header parses");
+
+        assert_eq!(
+            module.imports,
+            vec![
+                Name::from_components(["Foundation", "Nat"]),
+                Name::from_components(["Text", "Tools"]),
+            ]
+        );
+        assert_eq!(module.commands.len(), 2);
+        assert_eq!(module.commands[0].1, b"def first := 1\r\n");
+        assert_eq!(module.commands[1].1, b"def answer := first");
+        assert_eq!(&source[module.commands[0].0.0..], module.commands[0].1);
+        assert_eq!(&source[module.commands[1].0.0..], module.commands[1].1);
+    }
+
+    #[test]
+    fn source_module_header_refuses_missing_and_trailing_import_terms() {
+        let missing = partition_source_module(b"import\ndef answer := 1")
+            .expect_err("an import command must name a module");
+        assert!(matches!(
+            missing,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::ImportedModule,
+                ..
+            }
+        ));
+
+        let trailing = partition_source_module(b"import Foundation :\ndef answer := 1")
+            .expect_err("punctuation cannot be guessed as part of an import");
+        assert!(matches!(
+            trailing,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::EndOfImportCommand,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn source_module_header_keeps_late_imports_on_the_refusal_path() {
+        let module = partition_source_module(b"def first := 1\nimport Later\ndef answer := first")
+            .expect("header parsing stops exactly at the first definition");
+        let error = parse_definition(module.commands[0].1)
+            .expect_err("a later import remains visible to the definition parser");
+        assert!(matches!(
+            error,
+            NatDefinitionParseError::OutsideSeedGrammar { .. }
+                | NatDefinitionParseError::Lexical { .. }
+        ));
     }
 
     #[test]
