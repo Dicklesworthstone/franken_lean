@@ -802,10 +802,12 @@ pub struct CheckedOleanSet {
 ///
 /// This production slice handles closed import sets and reconstructs complete
 /// non-safe mutual definition envelopes as one authority transition. Complete
-/// inductive/quotient units and other mutual envelope kinds remain explicit
-/// refusals rather than silently entering trusted context. Environment
-/// extensions are decoded and counted by [`DecodedOlean`] but are not
-/// interpreted by this declaration-only operation.
+/// inductive/quotient units remain explicit refusals rather than silently
+/// entering trusted context. Safe definitions, theorems, and opaques retain
+/// their multi-name metadata and check individually inside the atomic artifact
+/// batch when their actual dependency graph is acyclic. Environment extensions
+/// are decoded and counted by [`DecodedOlean`] but are not interpreted by this
+/// declaration-only operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OleanCheckError {
     Decode(OleanDecodeError),
@@ -1014,33 +1016,9 @@ fn checked_olean_declaration(info: &ConstantInfo) -> Result<Declaration, OleanCh
     let name = info.name().clone();
     match info {
         ConstantInfo::Axiom(value) => Ok(Declaration::Axiom(value.clone())),
-        ConstantInfo::Defn(value) => {
-            if value.all.len() > 1 {
-                return Err(OleanCheckError::MutualEnvelopeUnsupported {
-                    name,
-                    members: value.all.clone(),
-                });
-            }
-            Ok(Declaration::Defn(value.clone()))
-        }
-        ConstantInfo::Thm(value) => {
-            if value.all.len() > 1 {
-                return Err(OleanCheckError::MutualEnvelopeUnsupported {
-                    name,
-                    members: value.all.clone(),
-                });
-            }
-            Ok(Declaration::Thm(value.clone()))
-        }
-        ConstantInfo::Opaque(value) => {
-            if value.all.len() > 1 {
-                return Err(OleanCheckError::MutualEnvelopeUnsupported {
-                    name,
-                    members: value.all.clone(),
-                });
-            }
-            Ok(Declaration::Opaque(value.clone()))
-        }
+        ConstantInfo::Defn(value) => Ok(Declaration::Defn(value.clone())),
+        ConstantInfo::Thm(value) => Ok(Declaration::Thm(value.clone())),
+        ConstantInfo::Opaque(value) => Ok(Declaration::Opaque(value.clone())),
         ConstantInfo::Quot(_)
         | ConstantInfo::Induct(_)
         | ConstantInfo::Ctor(_)
@@ -1099,7 +1077,7 @@ fn build_olean_declaration_units(
             });
             continue;
         };
-        if definition.all.len() <= 1 {
+        if definition.all.len() <= 1 || definition.safety == DefinitionSafety::Safe {
             let declaration = checked_olean_declaration(info)?;
             let unit = units.len();
             constant_units[index] = unit;
@@ -1110,10 +1088,6 @@ fn build_olean_declaration_units(
             });
             continue;
         }
-        if definition.safety == DefinitionSafety::Safe {
-            return Err(unsupported_mutual_envelope(definition));
-        }
-
         let mut member_indices = Vec::new();
         member_indices
             .try_reserve_exact(definition.all.len())
@@ -1729,7 +1703,9 @@ impl Engine {
     /// method reconstructs validated non-safe mutual definition units, derives
     /// a stable Kahn order from exact inter-unit constant references, then sends
     /// every unit through the same K1-plus-independent-checker council as
-    /// [`Self::admit_declaration`]. The artifact must be import-free:
+    /// [`Self::admit_declaration`]. Acyclic safe definitions, theorems, and
+    /// opaques preserve multi-name metadata while remaining individual units.
+    /// The artifact must be import-free:
     /// resolving module names to exact predecessor environments belongs to the
     /// module loader, and treating unresolved imports as axioms would violate
     /// the Oracle-Only and single-authority laws.
@@ -4676,6 +4652,143 @@ mod tests {
     }
 
     #[test]
+    fn standalone_olean_check_retains_acyclic_multi_name_body_metadata() {
+        let proposition = Name::from_components(["Fixture", "Metadata", "P"]);
+        let witness = Name::from_components(["Fixture", "Metadata", "p"]);
+        let definition_left = Name::from_components(["Fixture", "Metadata", "defLeft"]);
+        let definition_right = Name::from_components(["Fixture", "Metadata", "defRight"]);
+        let theorem_left = Name::from_components(["Fixture", "Metadata", "thmLeft"]);
+        let theorem_right = Name::from_components(["Fixture", "Metadata", "thmRight"]);
+        let opaque_left = Name::from_components(["Fixture", "Metadata", "opaqueLeft"]);
+        let opaque_right = Name::from_components(["Fixture", "Metadata", "opaqueRight"]);
+        let definition_members = vec![definition_left.clone(), definition_right.clone()];
+        let theorem_members = vec![theorem_left.clone(), theorem_right.clone()];
+        let opaque_members = vec![opaque_left.clone(), opaque_right.clone()];
+        let proposition_expr = Expr::const_(proposition.clone(), Vec::new());
+        let witness_expr = Expr::const_(witness.clone(), Vec::new());
+        let constants = vec![
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: definition_right.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: Expr::const_(definition_left.clone(), Vec::new()),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: definition_members.clone(),
+            }),
+            ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: theorem_right.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr.clone(),
+                all: theorem_members.clone(),
+            }),
+            ConstantInfo::Opaque(OpaqueVal {
+                base: ConstantVal {
+                    name: opaque_right.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr.clone(),
+                is_unsafe: false,
+                all: opaque_members.clone(),
+            }),
+            ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: definition_left.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr.clone(),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: definition_members.clone(),
+            }),
+            ConstantInfo::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: theorem_left.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr.clone(),
+                all: theorem_members.clone(),
+            }),
+            ConstantInfo::Opaque(OpaqueVal {
+                base: ConstantVal {
+                    name: opaque_left.clone(),
+                    level_params: Vec::new(),
+                    type_: proposition_expr.clone(),
+                },
+                value: witness_expr,
+                is_unsafe: false,
+                all: opaque_members.clone(),
+            }),
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: witness,
+                    level_params: Vec::new(),
+                    type_: proposition_expr,
+                },
+                is_unsafe: false,
+            }),
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: proposition,
+                    level_params: Vec::new(),
+                    type_: Expr::sort(Level::zero()),
+                },
+                is_unsafe: false,
+            }),
+        ];
+        let bytes = standalone_olean(&constants);
+        let outcome = Engine::from_environment(Environment::new())
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("acyclic multi-name body rows reach both checkers");
+        let Outcome::Complete(checked) = outcome else {
+            panic!("the metadata fixture must complete: {outcome:?}");
+        };
+        assert_eq!(checked.declarations.len(), constants.len());
+        assert_eq!(checked.engine.environment().len(), constants.len());
+        assert!(checked.declarations.iter().all(|declaration| {
+            declaration.checker.schema == fln_checker::admit::ADMISSION_SCHEMA
+        }));
+
+        let environment = checked.engine.environment();
+        assert!(matches!(
+            environment.find(&definition_left),
+            Some(ConstantInfo::Defn(value)) if value.all == definition_members
+        ));
+        assert!(matches!(
+            environment.find(&definition_right),
+            Some(ConstantInfo::Defn(value)) if value.all == definition_members
+        ));
+        assert!(matches!(
+            environment.find(&theorem_left),
+            Some(ConstantInfo::Thm(value)) if value.all == theorem_members
+        ));
+        assert!(matches!(
+            environment.find(&theorem_right),
+            Some(ConstantInfo::Thm(value)) if value.all == theorem_members
+        ));
+        assert!(matches!(
+            environment.find(&opaque_left),
+            Some(ConstantInfo::Opaque(value)) if value.all == opaque_members
+        ));
+        assert!(matches!(
+            environment.find(&opaque_right),
+            Some(ConstantInfo::Opaque(value)) if value.all == opaque_members
+        ));
+    }
+
+    #[test]
     fn standalone_olean_check_refuses_malformed_or_rejected_mutual_units_atomically() {
         let engine = Engine::from_environment(Environment::new());
         let limits_for = |bytes: &[u8]| OleanCheckLimits::new(bytes.len(), test_budget());
@@ -4737,7 +4850,10 @@ mod tests {
         let bytes = standalone_olean(&safe);
         assert!(matches!(
             engine.check_olean_artifact(&bytes, &KVMap::new(), limits_for(&bytes)),
-            Err(OleanCheckError::MutualEnvelopeUnsupported { .. })
+            Err(OleanCheckError::DependencyCycle { declarations })
+                if declarations.len() == 2
+                    && declarations.contains(&Name::from_components(["Fixture", "mutualLeft"]))
+                    && declarations.contains(&Name::from_components(["Fixture", "mutualRight"]))
         ));
 
         let bounded = mutual_olean_declarations();
