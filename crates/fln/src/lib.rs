@@ -23,13 +23,20 @@
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
 };
-use fln_checker::admit::{BlockVerdict as CheckerBlockVerdict, Verdict as CheckerVerdict};
+use fln_checker::admit::{
+    BlockVerdict as CheckerBlockVerdict, QuotientVerdict as CheckerQuotientVerdict,
+    Verdict as CheckerVerdict,
+};
 pub use fln_checker::environment::EnvironmentBudget as CheckerEnvironmentBudget;
 use fln_checker::environment::{
     ConstantDeclaration as CheckerConstantDeclaration, ConstantEntry as CheckerConstantEntry,
     ConstantEnvironment as CheckerConstantEnvironment, ConstantKind as CheckerConstantKind,
-    ConstantSafety as CheckerConstantSafety, DefinitionBody as CheckerDefinitionBody,
-    DefinitionSafety as CheckerDefinitionSafety, EnvironmentOutcome as CheckerEnvironmentOutcome,
+    ConstantSafety as CheckerConstantSafety,
+    ConstructorDeclaration as CheckerConstructorDeclaration,
+    DefinitionBody as CheckerDefinitionBody, DefinitionSafety as CheckerDefinitionSafety,
+    EnvironmentOutcome as CheckerEnvironmentOutcome,
+    InductiveDeclaration as CheckerInductiveDeclaration, QuotientKind as CheckerQuotientKind,
+    RecursorDeclaration as CheckerRecursorDeclaration, RecursorRule as CheckerRecursorRule,
     ReducibilityHint as CheckerReducibilityHint,
 };
 pub use fln_checker::wire::DecodeBudget as CheckerDecodeBudget;
@@ -64,8 +71,9 @@ pub use fln_elab::{
     DefinitionFrontendError, NatDefinitionFrontendError, seed::SeedEnvironmentError,
 };
 pub use fln_env::constants::{
-    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, OpaqueVal,
-    ReducibilityHints, TheoremVal,
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
+    InductiveVal, OpaqueVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints,
+    TheoremVal,
 };
 use fln_env::environment::DeclarationCommitted;
 pub use fln_env::environment::{DeclarationBudget, Environment};
@@ -801,9 +809,9 @@ pub struct CheckedOleanSet {
 /// Typed non-success from the `.olean` declaration-checking doors.
 ///
 /// This production slice handles closed import sets and reconstructs complete
-/// non-safe mutual definition envelopes as one authority transition. Complete
-/// inductive/quotient units remain explicit refusals rather than silently
-/// entering trusted context. Safe definitions, theorems, and opaques retain
+/// non-safe mutual definition envelopes and the fixed quotient initializer as
+/// authority transitions. Complete inductive units remain explicit refusals
+/// rather than silently entering trusted context. Safe definitions, theorems, and opaques retain
 /// their multi-name metadata and check individually inside the atomic artifact
 /// batch when their actual dependency graph is acyclic. Environment extensions
 /// are decoded and counted by [`DecodedOlean`] but are not interpreted by this
@@ -867,6 +875,9 @@ pub enum OleanCheckError {
     MutualEnvelopeUnsupported {
         name: Name,
         members: Vec<Name>,
+    },
+    QuotientEnvelopeUnsupported {
+        names: Vec<Name>,
     },
     MissingConstants {
         declaration: Name,
@@ -971,6 +982,11 @@ impl fmt::Display for OleanCheckError {
                 name.to_display_string(),
                 display_names(members)
             ),
+            Self::QuotientEnvelopeUnsupported { names } => write!(
+                formatter,
+                "cannot reconstruct the four-row quotient initialization envelope from {}",
+                display_names(names)
+            ),
             Self::MissingConstants { declaration, names } => write!(
                 formatter,
                 "declaration `{}` references constants absent from the base environment and artifact: {}",
@@ -1049,6 +1065,25 @@ fn unsupported_mutual_envelope(value: &DefinitionVal) -> OleanCheckError {
     }
 }
 
+fn quotient_initialization_names() -> [Name; 4] {
+    [
+        Name::from_components(["Quot"]),
+        Name::from_components(["Quot", "mk"]),
+        Name::from_components(["Quot", "lift"]),
+        Name::from_components(["Quot", "ind"]),
+    ]
+}
+
+fn unsupported_quotient_envelope(constants: &[ConstantInfo]) -> OleanCheckError {
+    OleanCheckError::QuotientEnvelopeUnsupported {
+        names: constants
+            .iter()
+            .filter(|constant| matches!(constant, ConstantInfo::Quot(_)))
+            .map(|constant| constant.name().clone())
+            .collect(),
+    }
+}
+
 fn build_olean_declaration_units(
     constants: &[ConstantInfo],
     owners: &BTreeMap<Name, usize>,
@@ -1064,6 +1099,49 @@ fn build_olean_declaration_units(
 
     for (index, info) in constants.iter().enumerate() {
         if constant_units[index] != usize::MAX {
+            continue;
+        }
+        if matches!(info, ConstantInfo::Quot(_)) {
+            let names = quotient_initialization_names();
+            let mut member_indices = Vec::new();
+            member_indices.try_reserve_exact(names.len()).map_err(|_| {
+                OleanCheckError::AllocationFailure {
+                    resource: ".olean quotient member indices",
+                    requested: names.len(),
+                }
+            })?;
+            let mut members = Vec::new();
+            members.try_reserve_exact(names.len()).map_err(|_| {
+                OleanCheckError::AllocationFailure {
+                    resource: ".olean quotient declarations",
+                    requested: names.len(),
+                }
+            })?;
+            for name in &names {
+                let Some(&member_index) = owners.get(name) else {
+                    return Err(unsupported_quotient_envelope(constants));
+                };
+                if constant_units[member_index] != usize::MAX {
+                    return Err(unsupported_quotient_envelope(constants));
+                }
+                let Some(ConstantInfo::Quot(member)) = constants.get(member_index) else {
+                    return Err(unsupported_quotient_envelope(constants));
+                };
+                member_indices.push(member_index);
+                members.push(member.clone());
+            }
+            if !names.contains(info.name()) {
+                return Err(unsupported_quotient_envelope(constants));
+            }
+            let unit = units.len();
+            for member_index in &member_indices {
+                constant_units[*member_index] = unit;
+            }
+            units.push(OleanDeclarationUnit {
+                constant_indices: member_indices,
+                names: names.to_vec(),
+                declaration: Declaration::Quotient(members),
+            });
             continue;
         }
         let ConstantInfo::Defn(definition) = info else {
@@ -2090,9 +2168,9 @@ impl Engine {
     /// [`Self::execute_definition`]. It currently accepts the declaration kinds
     /// on which both K1 and the independent checker can issue a completed
     /// verdict: axioms, definitions, theorems, opaques, and non-safe mutual
-    /// definition blocks. Inductives and quotient initialization remain
-    /// explicit refusals until the independent checker can represent and decide
-    /// their complete input.
+    /// definition blocks, and the fixed quotient initialization unit.
+    /// Inductive families remain explicit refusals until the independent
+    /// checker decides their complete block input.
     ///
     /// Success returns a new immutable engine snapshot. A rejection,
     /// independent-checker non-answer, duplicate, resource stop, or internal
@@ -2110,6 +2188,7 @@ impl Engine {
                 | Declaration::Thm(_)
                 | Declaration::Opaque(_)
                 | Declaration::Mutual(_)
+                | Declaration::Quotient(_)
         ) {
             return Err(EngineAdmissionError::UnsupportedDeclaration {
                 kind: declaration_kind(&declaration),
@@ -2151,7 +2230,10 @@ impl Engine {
                     .to_owned(),
             }
         })?;
-        let expects_block = matches!(declaration, Declaration::Mutual(_));
+        let expects_block = matches!(
+            declaration,
+            Declaration::Mutual(_) | Declaration::Quotient(_)
+        );
         let environment = match checked.publish(limits.declaration, limits.collisions, None) {
             Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
                 publication,
@@ -2724,30 +2806,70 @@ fn checker_entry(
             decode_checker_expr(&value.value, budget)?,
             decode_checker_names(&value.all, budget)?,
         ),
-        ConstantInfo::Quot(_) => CheckerConstantDeclaration::header(
+        ConstantInfo::Quot(value) => {
+            let kind = match value.kind {
+                QuotKind::Type => CheckerQuotientKind::Type,
+                QuotKind::Ctor => CheckerQuotientKind::Constructor,
+                QuotKind::Lift => CheckerQuotientKind::Lift,
+                QuotKind::Ind => CheckerQuotientKind::Induction,
+            };
+            CheckerConstantDeclaration::quotient(level_parameters, type_, kind)
+        }
+        ConstantInfo::Induct(value) => CheckerConstantDeclaration::inductive(
             level_parameters,
             type_,
-            CheckerConstantKind::Quotient,
-            CheckerConstantSafety::Safe,
-        ),
-        ConstantInfo::Induct(value) => CheckerConstantDeclaration::header(
-            level_parameters,
-            type_,
-            CheckerConstantKind::Inductive,
             checker_constant_safety(value.is_unsafe),
+            CheckerInductiveDeclaration::new(
+                value.num_params,
+                value.num_indices,
+                decode_checker_names(&value.all, budget)?,
+                decode_checker_names(&value.ctors, budget)?,
+                value.num_nested,
+                value.is_rec,
+                value.is_reflexive,
+            ),
         ),
-        ConstantInfo::Ctor(value) => CheckerConstantDeclaration::header(
+        ConstantInfo::Ctor(value) => CheckerConstantDeclaration::constructor(
             level_parameters,
             type_,
-            CheckerConstantKind::Constructor,
             checker_constant_safety(value.is_unsafe),
+            CheckerConstructorDeclaration::new(
+                decode_checker_name(&value.induct, budget)?,
+                value.cidx,
+                value.num_params,
+                value.num_fields,
+            ),
         ),
-        ConstantInfo::Rec(value) => CheckerConstantDeclaration::header(
-            level_parameters,
-            type_,
-            CheckerConstantKind::Recursor,
-            checker_constant_safety(value.is_unsafe),
-        ),
+        ConstantInfo::Rec(value) => {
+            let mut rules = Vec::new();
+            rules.try_reserve_exact(value.rules.len()).map_err(|_| {
+                format!(
+                    "could not reserve {} checker recursor rules",
+                    value.rules.len()
+                )
+            })?;
+            for rule in &value.rules {
+                rules.push(CheckerRecursorRule::new(
+                    decode_checker_name(&rule.ctor, budget)?,
+                    rule.nfields,
+                    decode_checker_expr(&rule.rhs, budget)?,
+                ));
+            }
+            CheckerConstantDeclaration::recursor(
+                level_parameters,
+                type_,
+                checker_constant_safety(value.is_unsafe),
+                CheckerRecursorDeclaration::new(
+                    decode_checker_names(&value.all, budget)?,
+                    value.num_params,
+                    value.num_indices,
+                    value.num_motives,
+                    value.num_minors,
+                    rules,
+                    value.k,
+                ),
+            )
+        }
     };
     Ok(CheckerConstantEntry::new(name, declaration))
 }
@@ -2873,6 +2995,92 @@ fn review_mutual_with_independent_checker(
     }
 }
 
+fn review_quotient_with_independent_checker(
+    environment: &Environment,
+    retained_environment: Option<&CheckerConstantEnvironment>,
+    declarations: &[QuotVal],
+    limits: CheckerExecutionLimits,
+) -> CheckerReview {
+    let mut candidates = Vec::new();
+    if candidates.try_reserve_exact(declarations.len()).is_err() {
+        return CheckerReview::no_answer(format!(
+            "could not reserve {} checker quotient members",
+            declarations.len()
+        ));
+    }
+    for (index, declaration) in declarations.iter().enumerate() {
+        match checker_entry(&ConstantInfo::Quot(declaration.clone()), limits.decode) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "quotient member {index} projection into fln-checker failed: {detail}"
+                ));
+            }
+        }
+    }
+
+    let environment = match retained_environment {
+        Some(environment) => environment.clone(),
+        None => match checker_environment(environment, limits) {
+            Ok(environment) => environment,
+            Err(detail) => {
+                return CheckerReview::no_answer(format!(
+                    "base projection into fln-checker failed: {detail}"
+                ));
+            }
+        },
+    };
+
+    match fln_checker::admit::admit_quotient(&environment, &candidates, limits.admission) {
+        CheckerQuotientVerdict::Admitted(admission) => {
+            let agreement = CheckerAgreement {
+                schema: admission.schema(),
+                ground: admission.ground(),
+            };
+            let mut successor = environment;
+            for candidate in candidates {
+                let member = candidate.name().clone();
+                match successor.extend(candidate, limits.environment) {
+                    CheckerEnvironmentOutcome::Complete {
+                        environment: extended,
+                        ..
+                    } => successor = extended,
+                    CheckerEnvironmentOutcome::Refused { refusal, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker refused quotient member {member:?} retention: {refusal:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::Inconclusive(stop) => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker could not retain quotient member {member:?}: {stop:?}"
+                        ));
+                    }
+                    CheckerEnvironmentOutcome::InternalFault { fault, .. } => {
+                        return CheckerReview::no_answer(format!(
+                            "fln-checker faulted while retaining quotient member {member:?}: \
+                             {fault:?}"
+                        ));
+                    }
+                }
+            }
+            CheckerReview::from_seat(SeatVerdict::Agrees, Some(agreement), Some(successor))
+        }
+        CheckerQuotientVerdict::Rejected(rejection) => CheckerReview::from_seat(
+            SeatVerdict::Disagrees {
+                detail: format!("fln-checker rejected quotient initialization: {rejection:?}"),
+            },
+            None,
+            None,
+        ),
+        CheckerQuotientVerdict::Inconclusive(stop) => CheckerReview::no_answer(format!(
+            "fln-checker exhausted or was cancelled during quotient initialization: {stop:?}"
+        )),
+        CheckerQuotientVerdict::InternalFault(fault) => CheckerReview::no_answer(format!(
+            "fln-checker faulted during quotient initialization: {fault:?}"
+        )),
+    }
+}
+
 fn review_with_independent_checker(
     environment: &Environment,
     retained_environment: Option<&CheckerConstantEnvironment>,
@@ -2884,6 +3092,14 @@ fn review_with_independent_checker(
             environment,
             retained_environment,
             definitions,
+            limits,
+        );
+    }
+    if let Declaration::Quotient(declarations) = declaration {
+        return review_quotient_with_independent_checker(
+            environment,
+            retained_environment,
+            declarations,
             limits,
         );
     }
@@ -4165,14 +4381,14 @@ impl From<EngineAdmissionError> for EngineExecutionError {
 mod tests {
     use super::{
         AxiomVal, BinderInfo, Budget, CheckerAdmissionBudget, CheckerAdmissionGround,
-        ClosedVmValue, ClosedVmValueError, ConstantInfo, ConstantVal, Declaration,
+        ClosedVmValue, ClosedVmValueError, ConstantInfo, ConstantVal, ConstructorVal, Declaration,
         DefinitionSafety, DefinitionVal, DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch,
         DiagnosticFormat, DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, Engine,
         EngineAdmissionError, EngineAdmissionLimits, EngineBvDecideError,
         EngineBvDecideInconclusive, EngineBvDecideLimits, EngineBvDecideOutcome,
         EngineExecutionError, EngineExecutionLimits, Environment, ExitClass, Expr,
-        FlbcExecutionLimits, IngressError, IngressResource, KVMap, Level, Literal, Name,
-        NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
+        FlbcExecutionLimits, InductiveVal, IngressError, IngressResource, KVMap, Level, Literal,
+        Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, ReducibilityHints, RejectClass,
@@ -4371,6 +4587,239 @@ mod tests {
                     type_: Expr::sort(Level::zero()),
                 },
                 is_unsafe: false,
+            }),
+        ]
+    }
+
+    fn arrow(domain: Expr, codomain: Expr) -> Expr {
+        Expr::forall_e(
+            Name::from_components(["a"]),
+            domain,
+            codomain,
+            BinderInfo::Default,
+        )
+    }
+
+    fn pi(name: &str, info: BinderInfo, type_: Expr, body: Expr) -> Expr {
+        Expr::forall_e(Name::from_components([name]), type_, body, info)
+    }
+
+    fn equality_environment() -> Environment {
+        let eq = Name::from_components(["Eq"]);
+        let refl = Name::from_components(["Eq", "refl"]);
+        let u_name = Name::from_components(["uEq"]);
+        let u = Level::param(u_name.clone());
+        let eq_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            arrow(
+                Expr::bvar(0).expect("packs"),
+                arrow(Expr::bvar(1).expect("packs"), Expr::sort(Level::zero())),
+            ),
+        );
+        let refl_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            pi(
+                "a",
+                BinderInfo::Default,
+                Expr::bvar(0).expect("packs"),
+                Expr::app(
+                    Expr::app(
+                        Expr::app(
+                            Expr::const_(eq.clone(), vec![u]),
+                            Expr::bvar(1).expect("packs"),
+                        ),
+                        Expr::bvar(0).expect("packs"),
+                    ),
+                    Expr::bvar(0).expect("packs"),
+                ),
+            ),
+        );
+        let inductive = ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: eq.clone(),
+                level_params: vec![u_name.clone()],
+                type_: eq_type,
+            },
+            num_params: 1,
+            num_indices: 0,
+            all: vec![eq.clone()],
+            ctors: vec![refl.clone()],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: true,
+        });
+        let constructor = ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: refl,
+                level_params: vec![u_name],
+                type_: refl_type,
+            },
+            induct: eq,
+            cidx: 0,
+            num_params: 1,
+            num_fields: 0,
+            is_unsafe: false,
+        });
+        Environment::new()
+            .add_decl(inductive)
+            .expect("test equality type enters the imported base")
+            .add_decl(constructor)
+            .expect("test equality constructor enters the imported base")
+    }
+
+    fn quotient_declarations() -> Vec<ConstantInfo> {
+        let quot = Name::from_components(["Quot"]);
+        let u_name = Name::from_components(["u"]);
+        let v_name = Name::from_components(["v"]);
+        let u = Level::param(u_name.clone());
+        let v = Level::param(v_name.clone());
+        let prop = || Expr::sort(Level::zero());
+        let bv = |index| Expr::bvar(index).expect("packs");
+        let quot_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            arrow(arrow(bv(0), arrow(bv(1), prop())), Expr::sort(u.clone())),
+        );
+        let quot_app = |alpha: Expr, relation: Expr| {
+            Expr::app(
+                Expr::app(Expr::const_(quot.clone(), vec![u.clone()]), alpha),
+                relation,
+            )
+        };
+        let quot_mk_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            pi(
+                "r",
+                BinderInfo::Default,
+                arrow(bv(0), arrow(bv(1), prop())),
+                pi("a", BinderInfo::Default, bv(1), quot_app(bv(2), bv(1))),
+            ),
+        );
+        let sanity = pi(
+            "a",
+            BinderInfo::Default,
+            bv(3),
+            pi(
+                "b",
+                BinderInfo::Default,
+                bv(4),
+                arrow(
+                    Expr::app(Expr::app(bv(4), bv(1)), bv(0)),
+                    Expr::app(
+                        Expr::app(
+                            Expr::app(
+                                Expr::const_(Name::from_components(["Eq"]), vec![v.clone()]),
+                                bv(4),
+                            ),
+                            Expr::app(bv(3), bv(2)),
+                        ),
+                        Expr::app(bv(3), bv(1)),
+                    ),
+                ),
+            ),
+        );
+        let quot_lift_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            pi(
+                "r",
+                BinderInfo::Implicit,
+                arrow(bv(0), arrow(bv(1), prop())),
+                pi(
+                    "β",
+                    BinderInfo::Implicit,
+                    Expr::sort(v.clone()),
+                    pi(
+                        "f",
+                        BinderInfo::Default,
+                        arrow(bv(2), bv(1)),
+                        arrow(sanity, arrow(quot_app(bv(4), bv(3)), bv(3))),
+                    ),
+                ),
+            ),
+        );
+        let quot_mk = Name::from_components(["Quot", "mk"]);
+        let quot_ind_type = pi(
+            "α",
+            BinderInfo::Implicit,
+            Expr::sort(u.clone()),
+            pi(
+                "r",
+                BinderInfo::Implicit,
+                arrow(bv(0), arrow(bv(1), prop())),
+                pi(
+                    "β",
+                    BinderInfo::Implicit,
+                    arrow(quot_app(bv(1), bv(0)), prop()),
+                    pi(
+                        "mk",
+                        BinderInfo::Default,
+                        pi(
+                            "a",
+                            BinderInfo::Default,
+                            bv(2),
+                            Expr::app(
+                                bv(1),
+                                Expr::app(
+                                    Expr::app(
+                                        Expr::app(Expr::const_(quot_mk, vec![u.clone()]), bv(3)),
+                                        bv(2),
+                                    ),
+                                    bv(0),
+                                ),
+                            ),
+                        ),
+                        pi(
+                            "q",
+                            BinderInfo::Default,
+                            quot_app(bv(3), bv(2)),
+                            Expr::app(bv(2), bv(0)),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        vec![
+            ConstantInfo::Quot(QuotVal {
+                base: ConstantVal {
+                    name: quot.clone(),
+                    level_params: vec![u_name.clone()],
+                    type_: quot_type,
+                },
+                kind: QuotKind::Type,
+            }),
+            ConstantInfo::Quot(QuotVal {
+                base: ConstantVal {
+                    name: Name::from_components(["Quot", "mk"]),
+                    level_params: vec![u_name.clone()],
+                    type_: quot_mk_type,
+                },
+                kind: QuotKind::Ctor,
+            }),
+            ConstantInfo::Quot(QuotVal {
+                base: ConstantVal {
+                    name: Name::from_components(["Quot", "lift"]),
+                    level_params: vec![u_name.clone(), v_name],
+                    type_: quot_lift_type,
+                },
+                kind: QuotKind::Lift,
+            }),
+            ConstantInfo::Quot(QuotVal {
+                base: ConstantVal {
+                    name: Name::from_components(["Quot", "ind"]),
+                    level_params: vec![u_name],
+                    type_: quot_ind_type,
+                },
+                kind: QuotKind::Ind,
             }),
         ]
     }
@@ -4945,7 +5394,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_olean_check_refuses_unresolved_imports_and_unsupported_units() {
+    fn standalone_olean_check_refuses_unresolved_imports_and_incomplete_units() {
         let reference = olean_with_imports(
             &[],
             &[OleanModuleImport {
@@ -4982,9 +5431,96 @@ mod tests {
                 &KVMap::new(),
                 OleanCheckLimits::new(bytes.len(), test_budget()),
             ),
-            Err(OleanCheckError::UnsupportedDeclaration { name, kind: "quotient" })
-                if name == quotient_name
+            Err(OleanCheckError::QuotientEnvelopeUnsupported { ref names })
+                if names == &vec![quotient_name]
         ));
+    }
+
+    #[test]
+    fn standalone_olean_check_reconstructs_the_quotient_authority_unit() {
+        let mut constants = quotient_declarations();
+        constants.rotate_left(2);
+        let bytes = standalone_olean(&constants);
+        let engine = Engine::from_environment(equality_environment());
+        let checked = engine
+            .check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            )
+            .expect("the fixed quotient envelope is reconstructible")
+            .into_complete()
+            .expect("both checkers complete the fixed quotient judgment");
+
+        assert_eq!(checked.declarations.len(), 4);
+        assert!(
+            checked
+                .declarations
+                .iter()
+                .all(|declaration| declaration.checker.ground
+                    == CheckerAdmissionGround::QuotientPrimitiveChecked)
+        );
+        for name in [
+            Name::from_components(["Quot"]),
+            Name::from_components(["Quot", "mk"]),
+            Name::from_components(["Quot", "lift"]),
+            Name::from_components(["Quot", "ind"]),
+        ] {
+            assert!(checked.engine.environment().contains(&name));
+            assert!(!engine.environment().contains(&name));
+        }
+    }
+
+    #[test]
+    fn malformed_quotient_unit_is_atomic_and_checker_exhaustion_is_not_rejection() {
+        let mut malformed = quotient_declarations();
+        let lift = malformed
+            .get_mut(2)
+            .and_then(|constant| match constant {
+                ConstantInfo::Quot(value) => Some(value),
+                _ => None,
+            })
+            .expect("fixture row 2 must be Quot.lift");
+        lift.base.type_ = Expr::sort(Level::zero());
+        let bytes = standalone_olean(&malformed);
+        let engine = Engine::from_environment(equality_environment());
+        assert!(matches!(
+            engine.check_olean_artifact(
+                &bytes,
+                &KVMap::new(),
+                OleanCheckLimits::new(bytes.len(), test_budget()),
+            ),
+            Err(OleanCheckError::Admission(
+                EngineAdmissionError::BatchDeclaration { index: 0, .. }
+            ))
+        ));
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["Quot"]))
+        );
+
+        let quotient_rows: Option<Vec<_>> = quotient_declarations()
+            .into_iter()
+            .map(|constant| match constant {
+                ConstantInfo::Quot(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        let declaration = Declaration::Quotient(
+            quotient_rows.expect("the quotient fixture must contain only quotient rows"),
+        );
+        let mut limits = EngineAdmissionLimits::new(test_budget());
+        limits.checker.admission.conversion.quick.max_comparisons = 0;
+        assert!(matches!(
+            engine.admit_declaration(declaration, &KVMap::new(), limits),
+            Err(EngineAdmissionError::CouncilHalted { .. })
+        ));
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["Quot"]))
+        );
     }
 
     #[test]
