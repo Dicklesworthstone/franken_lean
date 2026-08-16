@@ -8179,12 +8179,13 @@ fn leanchecker_lane_is_bound_to_reference_kernel_oracle_authority() {
 /// kernel, so it is ReferenceKernelOracle, never ForeignIndependent).
 ///
 /// `#[ignore]`d: the mathlib leg costs its ~200-module closure decode plus a
-/// defeq-heavy replay — on-demand evidence, produced into a committed receipt
-/// the way the corpus matrix's receipt works (bead franken_lean-p6x1's
-/// retention law). Run with:
+/// defeq-heavy replay. By default the on-demand lane verifies the committed
+/// receipt's semantic rows without rewriting it. Set
+/// `FLN_UPDATE_CHOSEN_SET_RECEIPT=1` to atomically regenerate the pin-keyed
+/// receipt after reviewing an intentional semantic change. Run with:
 ///   cargo test -p fln-conformance --test kernel_replay \
 ///     chosen_set_replays_and_witnesses -- --ignored --nocapture
-#[ignore = "cost: two closure inventories plus a defeq-heavy replay; on-demand probe lane, receipt committed per run"]
+#[ignore = "cost: two closure inventories plus a defeq-heavy replay; on-demand probe lane, receipt verified by default"]
 #[test]
 fn chosen_set_replays_and_witnesses() {
     let reference_lib = reference_lib().expect("pinned toolchain required for the chosen set");
@@ -8264,7 +8265,6 @@ fn chosen_set_replays_and_witnesses() {
     // the pin so advancing SUITE.lock makes the file absent rather than stale.
     let evidence_dir = fln_conformance::checked_manifest_dir!()
         .join("../../crates/fln-conformance/evidence/g02_kernel_verdict");
-    std::fs::create_dir_all(&evidence_dir).expect("create g02 evidence dir");
     let receipt_path = evidence_dir.join("chosen_set_v4.32.0.jsonl");
     let mut receipt = String::new();
     for (report, (_, witness_accepted)) in reports.iter().zip(&witness_rows) {
@@ -8297,10 +8297,155 @@ fn chosen_set_replays_and_witnesses() {
             wm = report.wall_ms,
         ));
     }
-    std::fs::write(&receipt_path, receipt).expect("write chosen-set receipt");
-    eprintln!(
-        "chosen_set receipt written: {} ({} legs)",
-        receipt_path.display(),
-        reports.len()
+    let mode = chosen_set_receipt_mode(std::env::var_os(CHOSEN_SET_RECEIPT_UPDATE_ENV).as_deref())
+        .unwrap_or_else(|error| panic!("chosen-set receipt mode refused: {error}"));
+    match mode {
+        ChosenSetReceiptMode::Verify => {
+            let retained = std::fs::read_to_string(&receipt_path).unwrap_or_else(|error| {
+                panic!(
+                    "read retained chosen-set receipt {}: {error}; regenerate explicitly with {}=1 only after reviewing the live result",
+                    receipt_path.display(),
+                    CHOSEN_SET_RECEIPT_UPDATE_ENV,
+                )
+            });
+            verify_chosen_set_receipt(&receipt, &retained).unwrap_or_else(|error| {
+                panic!(
+                    "retained chosen-set receipt {} is stale: {error}; regenerate explicitly with {}=1 only after reviewing the live result",
+                    receipt_path.display(),
+                    CHOSEN_SET_RECEIPT_UPDATE_ENV,
+                )
+            });
+            eprintln!(
+                "chosen_set receipt verified: {} ({} legs; wall_ms retained as run telemetry)",
+                receipt_path.display(),
+                reports.len()
+            );
+        }
+        ChosenSetReceiptMode::Regenerate => {
+            std::fs::create_dir_all(&evidence_dir).expect("create g02 evidence dir");
+            fln::publish_file_atomic(receipt.as_bytes(), &receipt_path)
+                .expect("atomically regenerate chosen-set receipt");
+            eprintln!(
+                "chosen_set receipt regenerated: {} ({} legs)",
+                receipt_path.display(),
+                reports.len()
+            );
+        }
+    }
+}
+
+const CHOSEN_SET_RECEIPT_UPDATE_ENV: &str = "FLN_UPDATE_CHOSEN_SET_RECEIPT";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChosenSetReceiptMode {
+    Verify,
+    Regenerate,
+}
+
+fn chosen_set_receipt_mode(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<ChosenSetReceiptMode, String> {
+    match value {
+        None => Ok(ChosenSetReceiptMode::Verify),
+        Some(value) if value == "1" => Ok(ChosenSetReceiptMode::Regenerate),
+        Some(value) => Err(format!(
+            "{CHOSEN_SET_RECEIPT_UPDATE_ENV} must be absent for verification or exactly 1 for regeneration, got {value:?}"
+        )),
+    }
+}
+
+fn chosen_set_receipt_semantics(receipt: &str) -> Result<String, String> {
+    if !receipt.ends_with('\n') {
+        return Err("receipt must end with a newline".to_string());
+    }
+    let mut semantic = String::new();
+    for (index, line) in receipt.lines().enumerate() {
+        if line.is_empty() {
+            return Err(format!("receipt row {} is empty", index + 1));
+        }
+        let (prefix, wall_ms) = line
+            .rsplit_once(",\"wall_ms\":")
+            .ok_or_else(|| format!("receipt row {} has no terminal wall_ms", index + 1))?;
+        let wall_ms = wall_ms
+            .strip_suffix('}')
+            .ok_or_else(|| format!("receipt row {} has a malformed wall_ms tail", index + 1))?;
+        wall_ms.parse::<u128>().map_err(|error| {
+            format!(
+                "receipt row {} has a non-numeric wall_ms {wall_ms:?}: {error}",
+                index + 1
+            )
+        })?;
+        semantic.push_str(prefix);
+        semantic.push_str("}\n");
+    }
+    Ok(semantic)
+}
+
+fn verify_chosen_set_receipt(expected: &str, retained: &str) -> Result<(), String> {
+    let expected = chosen_set_receipt_semantics(expected)?;
+    let retained = chosen_set_receipt_semantics(retained)?;
+    if expected == retained {
+        return Ok(());
+    }
+    Err(format!(
+        "semantic rows differ\n--- retained semantics\n{retained}--- live semantics\n{expected}"
+    ))
+}
+
+#[test]
+fn chosen_set_receipt_mode_requires_an_exact_regeneration_opt_in() {
+    assert_eq!(
+        chosen_set_receipt_mode(None),
+        Ok(ChosenSetReceiptMode::Verify)
     );
+    assert_eq!(
+        chosen_set_receipt_mode(Some(std::ffi::OsStr::new("1"))),
+        Ok(ChosenSetReceiptMode::Regenerate)
+    );
+    for refused in ["", "0", "true", "yes", "2"] {
+        assert!(
+            chosen_set_receipt_mode(Some(std::ffi::OsStr::new(refused))).is_err(),
+            "a non-canonical opt-in must not enable receipt replacement: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn chosen_set_receipt_verification_ignores_only_wall_clock_telemetry() {
+    let first = concat!(
+        "{\"schema\":\"fln-g02-chosen-set/1\",\"module\":\"Std.A\",\"stream_digest\":\"aaa\",\"wall_ms\":10}\n",
+        "{\"schema\":\"fln-g02-chosen-set/1\",\"module\":\"Mathlib.B\",\"stream_digest\":\"bbb\",\"wall_ms\":20}\n",
+    );
+    let different_timing = first.replace("\"wall_ms\":10", "\"wall_ms\":999");
+    verify_chosen_set_receipt(first, &different_timing)
+        .expect("wall-clock telemetry is not semantic receipt identity");
+
+    let stale_digest = first.replace("\"aaa\"", "\"stale\"");
+    let missing_row = first
+        .lines()
+        .next()
+        .map(|line| format!("{line}\n"))
+        .unwrap();
+    let extra_row = format!("{first}{first}");
+    let swapped_rows = first.lines().rev().collect::<Vec<_>>().join("\n") + "\n";
+    for (label, candidate) in [
+        ("stale digest", stale_digest),
+        ("missing row", missing_row),
+        ("extra row", extra_row),
+        ("swapped rows", swapped_rows),
+    ] {
+        assert!(
+            verify_chosen_set_receipt(first, &candidate).is_err(),
+            "verification must refuse a {label}"
+        );
+    }
+
+    for malformed in [
+        "{\"schema\":\"fln-g02-chosen-set/1\"}\n",
+        "{\"schema\":\"fln-g02-chosen-set/1\",\"wall_ms\":-1}\n",
+        "{\"schema\":\"fln-g02-chosen-set/1\",\"wall_ms\":x}\n",
+        "{\"schema\":\"fln-g02-chosen-set/1\",\"wall_ms\":1}",
+    ] {
+        assert!(chosen_set_receipt_semantics(malformed).is_err());
+    }
 }

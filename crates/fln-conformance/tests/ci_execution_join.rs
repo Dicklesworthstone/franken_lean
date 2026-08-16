@@ -289,11 +289,12 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
         "chosen_set_replays_and_witnesses",
-        "an on-demand probe lane whose every run commits a pin-keyed receipt at \
-         evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl — keyed by pin, so advancing \
-         SUITE.lock makes the file absent rather than stale (93te's retention law). Declared \
-         from the lane's own docstring after bc4e1b3d swept it in mid-flight; the first \
-         recorded run and its retention guard are the owner's remainder",
+        "an on-demand probe lane that verifies the pin-keyed semantic receipt at \
+         evidence/g02_kernel_verdict/chosen_set_v4.32.0.jsonl without rewriting it; exact \
+         FLN_UPDATE_CHOSEN_SET_RECEIPT=1 is the explicit atomic regeneration door. The path \
+         remains keyed by pin, so advancing SUITE.lock makes the file absent rather than stale \
+         (93te's retention law). Wall-clock telemetry belongs to the retained producing run and \
+         is excluded from semantic identity; row order, counts, verdicts, and stream digests are not",
     ),
     (
         "crates/fln-conformance/tests/kernel_replay.rs",
@@ -386,8 +387,9 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// 5 -> 6 at the bc4e1b3d sweep: the anonymous commit landed MistyEagle's mid-flight
 /// `chosen_set_replays_and_witnesses` — an on-demand, pin-keyed-receipt probe lane
 /// whose design is the corpus-matrix retention pattern — with no declaration. The
-/// entry is the repair; the ceiling moves with it, disclosed here, and the lane's
-/// first recorded run plus its retention guard remain the owner's remainder.
+/// entry is the repair; the ceiling moves with it, disclosed here. The lane now
+/// verifies retained semantics by default and requires an exact opt-in for atomic
+/// regeneration, so executing evidence no longer silently rewrites its own oracle.
 ///
 /// 6 -> 8 at `e81c57fc`, which landed `franken_lean-t6r7`'s two whole-Mathlib lanes
 /// `#[ignore]`d and undeclared, reddening `cargo test` for every pane. Same shape as
