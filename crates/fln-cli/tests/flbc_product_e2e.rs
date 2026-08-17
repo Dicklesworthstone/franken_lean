@@ -120,6 +120,70 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     let stderr = utf8(&cycled.stderr);
     assert!(stderr.contains("\"class\":\"module-graph\""));
     assert!(stderr.contains("source import graph contains a cycle"));
+
+    let provider = root.join("A.lean");
+    let consumer = root.join("B.lean");
+    let sibling_main = root.join("SiblingMain.lean");
+    let sibling_product = root.join("SiblingMain.flbc");
+    std::fs::write(&provider, b"def leaked : Nat := 40\n").expect("write sibling provider");
+    std::fs::write(&consumer, b"def borrowed : Nat := Nat.add leaked 1\n")
+        .expect("write sibling consumer without its import");
+    std::fs::write(
+        &sibling_main,
+        b"import A\nimport B\ndef answer : Nat := Nat.add borrowed 1\n",
+    )
+    .expect("write sibling entry");
+    let leaked = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &sibling_product,
+        &consumer,
+        &provider,
+        &sibling_main,
+    ]);
+    assert!(!leaked.status.success());
+    assert!(leaked.stdout.is_empty());
+    let stderr = utf8(&leaked.stderr);
+    assert!(stderr.contains("\"class\":\"module-graph\""));
+    assert!(stderr.contains("declaration `borrowed` in module `B`"));
+    assert!(stderr.contains("references `leaked` from module `A`"));
+    assert!(matches!(
+        std::fs::symlink_metadata(&sibling_product),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+
+    std::fs::write(
+        &consumer,
+        b"import A\ndef borrowed : Nat := Nat.add leaked 1\n",
+    )
+    .expect("repair sibling consumer with an exact import");
+    std::fs::write(
+        &sibling_main,
+        b"import B\ndef answer : Nat := Nat.add leaked 2\n",
+    )
+    .expect("exercise visibility through the repaired transitive import chain");
+    let recovered = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &sibling_product,
+        &provider,
+        &consumer,
+        &sibling_main,
+    ]);
+    assert!(
+        recovered.status.success(),
+        "repaired sibling graph stderr: {}",
+        utf8(&recovered.stderr)
+    );
+    assert!(recovered.stderr.is_empty());
+    assert!(utf8(&recovered.stdout).contains("\"finalValue\":42"));
+    assert!(
+        !std::fs::read(&sibling_product)
+            .expect("read repaired sibling product")
+            .is_empty()
+    );
 }
 
 #[test]

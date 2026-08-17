@@ -3058,6 +3058,7 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
         fln::EngineExecutionError::AllocationFailure { .. }
         | fln::EngineExecutionError::SourceModuleLimit { .. }
         | fln::EngineExecutionError::SourceImportLimit { .. }
+        | fln::EngineExecutionError::SourceDependencyPresentationLimit { .. }
         | fln::EngineExecutionError::SourceModuleNameLimit { .. } => ("resource", false, 3),
         fln::EngineExecutionError::ImportsRequireResolver { .. }
         | fln::EngineExecutionError::DuplicateSourceModule { .. }
@@ -3065,6 +3066,7 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
         | fln::EngineExecutionError::MissingSourceImports { .. }
         | fln::EngineExecutionError::UnreachableSourceModules { .. }
         | fln::EngineExecutionError::SourceModuleCycle { .. }
+        | fln::EngineExecutionError::SourceModuleVisibility { .. }
         | fln::EngineExecutionError::InvalidSourceModuleName { .. } => ("module-graph", false, 1),
         fln::EngineExecutionError::Ingress(error) if error.is_resource_exhaustion() => {
             ("resource", false, 3)
@@ -5691,6 +5693,24 @@ mod tests {
         };
         assert_eq!(
             execution_error_disposition(&module_budget),
+            ("resource", false, 3)
+        );
+        let visibility = fln::EngineExecutionError::SourceModuleVisibility {
+            module: fln::Name::from_components(["B"]),
+            declaration: fln::Name::from_components(["borrowed"]),
+            referenced: fln::Name::from_components(["leaked"]),
+            owner: fln::Name::from_components(["A"]),
+        };
+        assert_eq!(
+            execution_error_disposition(&visibility),
+            ("module-graph", false, 1)
+        );
+        let visibility_budget = fln::EngineExecutionError::SourceDependencyPresentationLimit {
+            observed: 2,
+            limit: 1,
+        };
+        assert_eq!(
+            execution_error_disposition(&visibility_budget),
             ("resource", false, 3)
         );
     }

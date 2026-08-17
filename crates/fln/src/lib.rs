@@ -1361,26 +1361,29 @@ fn build_olean_declaration_units(
     Ok((units, constant_units))
 }
 
-fn collect_olean_dependencies(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstantReferenceCollectionError {
+    PresentationLimit { observed: usize, limit: usize },
+    AllocationFailure { requested: usize },
+}
+
+fn collect_constant_references(
     expression: &Expr,
     names: &mut BTreeSet<Name>,
     presentations: &mut usize,
     limit: usize,
-) -> Result<(), OleanCheckError> {
+) -> Result<(), ConstantReferenceCollectionError> {
     use fln_core::expr::ExprNode;
 
     let mut pending = Vec::new();
     pending
         .try_reserve(1)
-        .map_err(|_| OleanCheckError::AllocationFailure {
-            resource: ".olean dependency worklist",
-            requested: 1,
-        })?;
+        .map_err(|_| ConstantReferenceCollectionError::AllocationFailure { requested: 1 })?;
     pending.push(expression);
     while let Some(expression) = pending.pop() {
         *presentations = presentations.saturating_add(1);
         if *presentations > limit {
-            return Err(OleanCheckError::DependencyPresentationLimit {
+            return Err(ConstantReferenceCollectionError::PresentationLimit {
                 observed: *presentations,
                 limit,
             });
@@ -1390,12 +1393,11 @@ fn collect_olean_dependencies(
                 names.insert(name.clone());
             }
             ExprNode::App { f, a } => {
-                pending
-                    .try_reserve(2)
-                    .map_err(|_| OleanCheckError::AllocationFailure {
-                        resource: ".olean dependency worklist",
+                pending.try_reserve(2).map_err(|_| {
+                    ConstantReferenceCollectionError::AllocationFailure {
                         requested: pending.len().saturating_add(2),
-                    })?;
+                    }
+                })?;
                 pending.push(a);
                 pending.push(f);
             }
@@ -1405,24 +1407,22 @@ fn collect_olean_dependencies(
             | ExprNode::ForallE {
                 binder_type, body, ..
             } => {
-                pending
-                    .try_reserve(2)
-                    .map_err(|_| OleanCheckError::AllocationFailure {
-                        resource: ".olean dependency worklist",
+                pending.try_reserve(2).map_err(|_| {
+                    ConstantReferenceCollectionError::AllocationFailure {
                         requested: pending.len().saturating_add(2),
-                    })?;
+                    }
+                })?;
                 pending.push(body);
                 pending.push(binder_type);
             }
             ExprNode::LetE {
                 type_, value, body, ..
             } => {
-                pending
-                    .try_reserve(3)
-                    .map_err(|_| OleanCheckError::AllocationFailure {
-                        resource: ".olean dependency worklist",
+                pending.try_reserve(3).map_err(|_| {
+                    ConstantReferenceCollectionError::AllocationFailure {
                         requested: pending.len().saturating_add(3),
-                    })?;
+                    }
+                })?;
                 pending.push(body);
                 pending.push(value);
                 pending.push(type_);
@@ -1442,6 +1442,27 @@ fn collect_olean_dependencies(
         }
     }
     Ok(())
+}
+
+fn collect_olean_dependencies(
+    expression: &Expr,
+    names: &mut BTreeSet<Name>,
+    presentations: &mut usize,
+    limit: usize,
+) -> Result<(), OleanCheckError> {
+    collect_constant_references(expression, names, presentations, limit).map_err(
+        |error| match error {
+            ConstantReferenceCollectionError::PresentationLimit { observed, limit } => {
+                OleanCheckError::DependencyPresentationLimit { observed, limit }
+            }
+            ConstantReferenceCollectionError::AllocationFailure { requested } => {
+                OleanCheckError::AllocationFailure {
+                    resource: ".olean dependency worklist",
+                    requested,
+                }
+            }
+        },
+    )
 }
 
 fn olean_dependencies(
@@ -1782,6 +1803,113 @@ fn bounded_source_module_name_depth(
         });
     }
     Ok(depth)
+}
+
+fn verify_source_module_visibility(
+    modules: &[SourceModuleInput<'_>],
+    dependencies: &[Vec<usize>],
+    order: &[usize],
+    command_owners: &[usize],
+    completed: &DefinitionBatchExecution,
+    limit: usize,
+) -> Result<(), EngineExecutionError> {
+    if command_owners.len() != completed.executions.len() {
+        return Err(EngineExecutionError::UnexpectedPublication {
+            detail: "source command ownership does not cover every completed execution",
+        });
+    }
+
+    let words = modules.len().div_ceil(u64::BITS as usize);
+    let cells =
+        modules
+            .len()
+            .checked_mul(words)
+            .ok_or(EngineExecutionError::AllocationFailure {
+                resource: "source module visibility matrix",
+                requested: usize::MAX,
+            })?;
+    let mut visible = Vec::new();
+    visible
+        .try_reserve_exact(cells)
+        .map_err(|_| EngineExecutionError::AllocationFailure {
+            resource: "source module visibility matrix",
+            requested: cells,
+        })?;
+    visible.resize(cells, 0_u64);
+    for &module in order {
+        let row = module
+            .checked_mul(words)
+            .ok_or(EngineExecutionError::UnexpectedPublication {
+                detail: "source module visibility row overflowed",
+            })?;
+        visible[row + module / u64::BITS as usize] |= 1_u64 << (module % u64::BITS as usize);
+        for &dependency in &dependencies[module] {
+            let dependency_row = dependency.checked_mul(words).ok_or(
+                EngineExecutionError::UnexpectedPublication {
+                    detail: "source dependency visibility row overflowed",
+                },
+            )?;
+            for word in 0..words {
+                visible[row + word] |= visible[dependency_row + word];
+            }
+        }
+    }
+
+    let mut declaration_owners = BTreeMap::new();
+    for (execution, &owner) in completed.executions.iter().zip(command_owners) {
+        let Declaration::Defn(definition) = &execution.declaration else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "source execution published a non-definition declaration",
+            });
+        };
+        if declaration_owners
+            .insert(definition.base.name.clone(), owner)
+            .is_some()
+        {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "source execution published a duplicate declaration name",
+            });
+        }
+    }
+
+    let mut presentations = 0_usize;
+    for (execution, &owner) in completed.executions.iter().zip(command_owners) {
+        let Declaration::Defn(definition) = &execution.declaration else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "source execution published a non-definition declaration",
+            });
+        };
+        let mut references = BTreeSet::new();
+        for expression in [&definition.base.type_, &definition.value] {
+            collect_constant_references(expression, &mut references, &mut presentations, limit)
+                .map_err(|error| match error {
+                    ConstantReferenceCollectionError::PresentationLimit { observed, limit } => {
+                        EngineExecutionError::SourceDependencyPresentationLimit { observed, limit }
+                    }
+                    ConstantReferenceCollectionError::AllocationFailure { requested } => {
+                        EngineExecutionError::AllocationFailure {
+                            resource: "source declaration dependency worklist",
+                            requested,
+                        }
+                    }
+                })?;
+        }
+        for referenced in references {
+            let Some(&referenced_owner) = declaration_owners.get(&referenced) else {
+                continue;
+            };
+            let bit = 1_u64 << (referenced_owner % u64::BITS as usize);
+            if visible[owner * words + referenced_owner / u64::BITS as usize] & bit == 0 {
+                return Err(EngineExecutionError::SourceModuleVisibility {
+                    module: modules[owner].name.clone(),
+                    declaration: definition.base.name.clone(),
+                    referenced,
+                    owner: modules[referenced_owner].name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Engine {
@@ -2668,8 +2796,10 @@ impl Engine {
     /// reach every row, so an unused file cannot silently influence which final
     /// definition is reported. Modules are dependency-sorted with structural
     /// [`Name`] order as the CGSE tie-break; definitions retain source order
-    /// within a module. Graph refusal, frontend refusal, admission non-answer,
-    /// or execution failure exposes no successor engine.
+    /// within a module. A completed declaration may reference definitions from
+    /// only its own module or a transitive import; scheduling order grants no
+    /// visibility. Graph refusal, frontend refusal, admission non-answer, or
+    /// execution failure exposes no successor engine.
     pub fn execute_source_modules(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -2847,11 +2977,27 @@ impl Engine {
                 requested: command_count,
             }
         })?;
-        for index in order {
+        let mut command_owners = Vec::new();
+        command_owners
+            .try_reserve_exact(command_count)
+            .map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "source command ownership table",
+                requested: command_count,
+            })?;
+        for &index in &order {
             commands.extend(parsed[index].commands.iter().copied());
+            command_owners.extend(std::iter::repeat_n(index, parsed[index].commands.len()));
         }
         match self.execute_source_commands(commands, options, limits)? {
             Outcome::Complete(mut completed) => {
+                verify_source_module_visibility(
+                    modules,
+                    &dependencies,
+                    &order,
+                    &command_owners,
+                    &completed,
+                    limits.source_modules.max_dependency_presentations,
+                )?;
                 completed.source_module_order = module_order;
                 Ok(Outcome::Complete(completed))
             }
@@ -4357,6 +4503,9 @@ pub struct SourceModuleLimits {
     pub max_modules: usize,
     pub max_imports: usize,
     pub max_name_depth: usize,
+    /// Maximum expression-node presentations while proving that declarations
+    /// use only their own module or transitive imports.
+    pub max_dependency_presentations: usize,
 }
 
 impl Default for SourceModuleLimits {
@@ -4365,6 +4514,7 @@ impl Default for SourceModuleLimits {
             max_modules: 4_096,
             max_imports: 65_536,
             max_name_depth: 256,
+            max_dependency_presentations: 1_000_000,
         }
     }
 }
@@ -4845,6 +4995,16 @@ pub enum EngineExecutionError {
     SourceModuleCycle {
         modules: Vec<Name>,
     },
+    SourceDependencyPresentationLimit {
+        observed: usize,
+        limit: usize,
+    },
+    SourceModuleVisibility {
+        module: Name,
+        declaration: Name,
+        referenced: Name,
+        owner: Name,
+    },
     AllocationFailure {
         resource: &'static str,
         requested: usize,
@@ -4935,6 +5095,23 @@ impl fmt::Display for EngineExecutionError {
                 formatter,
                 "source import graph contains a cycle: {}",
                 display_names(modules)
+            ),
+            Self::SourceDependencyPresentationLimit { observed, limit } => write!(
+                formatter,
+                "source declarations presented {observed} expression nodes while checking import visibility; planning limit is {limit}"
+            ),
+            Self::SourceModuleVisibility {
+                module,
+                declaration,
+                referenced,
+                owner,
+            } => write!(
+                formatter,
+                "source declaration `{}` in module `{}` references `{}` from module `{}` without a transitive import",
+                declaration.to_display_string(),
+                module.to_display_string(),
+                referenced.to_display_string(),
+                owner.to_display_string(),
             ),
             Self::AllocationFailure {
                 resource,
@@ -9606,6 +9783,120 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["answer"]))
         );
+    }
+
+    #[test]
+    fn source_modules_cannot_borrow_declarations_from_unimported_siblings() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let provider = Name::from_components(["A"]);
+        let consumer = Name::from_components(["B"]);
+        let leaking = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import A\nimport B\ndef answer : Nat := Nat.add borrowed 1",
+            },
+            SourceModuleInput {
+                name: &provider,
+                source: b"def leaked : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &consumer,
+                source: b"def borrowed : Nat := Nat.add leaked 1",
+            },
+        ];
+        let base_root = engine.logical_root(&options);
+
+        let error = engine
+            .execute_source_modules(&leaking, &main, &options, test_limits())
+            .expect_err("topological order must not grant one sibling visibility into another");
+        assert_eq!(
+            error,
+            EngineExecutionError::SourceModuleVisibility {
+                module: consumer.clone(),
+                declaration: Name::from_components(["borrowed"]),
+                referenced: Name::from_components(["leaked"]),
+                owner: provider.clone(),
+            }
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["borrowed"]))
+        );
+
+        let closed = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import B\ndef answer : Nat := Nat.add leaked 2",
+            },
+            SourceModuleInput {
+                name: &provider,
+                source: b"def leaked : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &consumer,
+                source: b"import A\ndef borrowed : Nat := Nat.add leaked 1",
+            },
+        ];
+        let completed = engine
+            .execute_source_modules(&closed, &main, &options, test_limits())
+            .expect("adding the missing transitive import repairs the same source closure")
+            .into_complete()
+            .expect("the repaired source closure answers completely");
+        assert_eq!(completed.source_module_order, [provider, consumer, main]);
+        let VmExit::Returned(returned) = &completed.executions[2].exit else {
+            panic!("the repaired entry definition must return normally");
+        };
+        assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn source_module_visibility_scan_is_bounded_and_recoverable() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let dependency = Name::from_components(["Dependency"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Dependency\ndef answer : Nat := dependency",
+            },
+            SourceModuleInput {
+                name: &dependency,
+                source: b"def dependency : Nat := 7",
+            },
+        ];
+        let mut exhausted = test_limits();
+        exhausted.source_modules.max_dependency_presentations = 0;
+
+        assert_eq!(
+            engine
+                .execute_source_modules(&modules, &main, &options, exhausted)
+                .expect_err("zero visibility presentations is a typed resource stop"),
+            EngineExecutionError::SourceDependencyPresentationLimit {
+                observed: 1,
+                limit: 0,
+            }
+        );
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+
+        assert!(matches!(
+            engine.execute_source_modules(&modules, &main, &options, test_limits()),
+            Ok(Outcome::Complete(_))
+        ));
     }
 
     #[test]

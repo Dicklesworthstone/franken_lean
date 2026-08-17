@@ -292,10 +292,12 @@ builder and receipt API from §17.2 do not exist yet. A bounded import slice is
 now live: embedders can pass a caller-named closed `SourceModuleInput` set, while
 `fln run` binds `import A.B` only to an explicitly supplied path ending in
 `A/B.lean`, derives a deterministic dependency order, and rejects missing,
-duplicate, cyclic, or entry-unreachable modules before elaboration. This is not
-automatic project-root/`LEAN_PATH` discovery, implicit Prelude ingestion, Lake,
-or general Lean module elaboration; the example deliberately does not pretend
-otherwise.
+duplicate, cyclic, or entry-unreachable modules before elaboration. It also
+checks every completed declaration against the graph's transitive visibility,
+so dependency order cannot let one sibling borrow definitions from another
+sibling it did not import. This is not automatic project-root/`LEAN_PATH`
+discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
+the example deliberately does not pretend otherwise.
 
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned
