@@ -276,11 +276,16 @@ optionally ascribed local lets, the
 checked `Nat.add`/`Nat.sub`/`Nat.mul` plus `Nat.div`/`Nat.mod`/`Nat.gcd`/
 `Nat.pred`/`Nat.pow`/`Nat.log2`/`Nat.shiftLeft`/`Nat.shiftRight`/`Nat.land`/
 `Nat.lor`/`Nat.xor`, `String.append`, `String.length`, and
-`String.utf8ByteSize`, plus Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq`
-intrinsics. Nat literals and results use the Marrow ABI's canonical
-tagged-scalar-or-positive-mpz representation, including direct source literals larger
-than 64 bits; they cross dependent definitions and emitted FLBC products without
-narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceiling.
+`String.utf8ByteSize`, plus the exact `true`/`false` Bool constructors and
+Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq` intrinsics. The source seed admits
+the pin-shaped `Bool` block through K1 and the independent checker, and the
+compiler derives its scalar `0`/`1` ABI binding from those exact checked
+constructor rows. This does not yet add source pattern matching, recursor
+elaboration, or the wider Bool library. Nat literals and results use the Marrow
+ABI's canonical tagged-scalar-or-positive-mpz representation, including direct
+source literals larger than 64 bits; they cross dependent definitions and
+emitted FLBC products without narrowing, and stop as a typed non-answer at
+Golem's explicit mpz-magnitude ceiling.
 The `fln.source-run/8` robot result binds runtime values back to their checked
 source result type, so Bool results remain JSON booleans instead of being mislabeled
 as Nat, reports definition and evaluation counts separately, and retains every

@@ -51,6 +51,7 @@ use fln_comp::flbc::CallableResultOwnership;
 pub use fln_comp::flbc::{CodecError, CodecLimits};
 use fln_comp::ingress::{
     FunctionBinding, IngressResource, IntrinsicBinding, LambdaBinding, LambdaRecursion,
+    ScalarConstructorBinding,
 };
 pub use fln_comp::ingress::{IngressError, IngressLimits};
 pub use fln_core::diag::{
@@ -1753,12 +1754,12 @@ impl std::error::Error for EngineBvDecideError {
 
 /// One immutable embeddable engine snapshot.
 ///
-/// The live source constructors seed only the opaque type names needed by their
-/// bounded frontends: `Nat : Sort 1`, or exact `Nat` plus `String` and the
-/// checked Nat arithmetic and `String.append` extern signatures. Neither seed is the
-/// real Prelude. Successful admission or execution returns a new `Engine`
-/// snapshot containing the published declaration; the receiver is never
-/// mutated.
+/// The live source constructors seed only the declarations needed by their
+/// bounded frontends: opaque `Nat : Sort 1`, or exact Nat/String type rows plus
+/// the pin-shaped Bool block and checked scalar extern signatures. Neither seed
+/// is the real Prelude. Successful admission or execution returns a new
+/// `Engine` snapshot containing the published declaration; the receiver is
+/// never mutated.
 #[derive(Debug, Clone)]
 pub struct Engine {
     environment: Environment,
@@ -1977,12 +1978,13 @@ impl Engine {
     /// Construct the bounded Nat/String/Bool source engine through the ordinary K1
     /// and independent-checker council, retaining every checker projection.
     ///
-    /// The three opaque type names check literals, Bool comparison results, and
-    /// exact first-order signatures. The remaining declarations are an exact
-    /// allowlist of checked Nat operations with scalar-or-mpz results plus
-    /// String operations recognized by the compiler's generated-row bridge.
-    /// This is not a Prelude substitute and grants no constructors or
-    /// eliminators.
+    /// Opaque Nat/String type names plus the exact Bool inductive block check
+    /// literals, Bool comparison results, and exact first-order signatures.
+    /// The remaining declarations are an exact allowlist of checked Nat
+    /// operations with scalar-or-mpz results plus String operations recognized
+    /// by the compiler's generated-row bridge. This is not a Prelude substitute:
+    /// only Bool's two nullary constructors are live, without source pattern or
+    /// recursor elaboration.
     pub fn with_source_seed(
         limits: EngineAdmissionLimits,
     ) -> Result<Outcome<Self>, EngineAdmissionError> {
@@ -3221,8 +3223,9 @@ impl Engine {
         let local_lambda = executable_lambda(&admission.declaration, limits.ingress)
             .map_err(EngineExecutionError::Ingress)?;
         let lambdas = local_lambda.as_slice();
-        let ingress = fln_comp::ingress::lower_closed_expr_with_lambdas(
+        let ingress = fln_comp::ingress::lower_closed_expr_with_scalar_constructors_and_lambdas(
             &expression,
+            &catalog.scalar_constructors,
             &catalog.intrinsics,
             &[],
             &catalog.functions,
@@ -3928,6 +3931,7 @@ fn review_with_independent_checker(
 /// constant's body or lie about its runtime type; neither is an acceptable
 /// embeddable-engine boundary.
 struct ExecutableCatalog {
+    scalar_constructors: Vec<ScalarConstructorBinding>,
     intrinsics: Vec<IntrinsicBinding>,
     functions: Vec<FunctionBinding>,
 }
@@ -3960,10 +3964,21 @@ fn executable_dependencies(
     collect_executable_constants(source, &mut pending, &mut visited_nodes, limits)?;
 
     let maximum_functions = limits.fir.max_functions.saturating_sub(1);
+    let mut scalar_constructors = Vec::new();
     let mut intrinsics = Vec::new();
     let mut functions = Vec::new();
     while let Some(name) = pending.pop_first() {
         if !resolved.insert(name.clone()) {
+            continue;
+        }
+        if let Some(binding) = source_scalar_constructor_binding(environment, &name) {
+            scalar_constructors
+                .try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::ProgramTables,
+                    requested: 1,
+                })?;
+            scalar_constructors.push(binding);
             continue;
         }
         if let Some(binding) = source_intrinsic_binding(environment, &name) {
@@ -4011,8 +4026,40 @@ fn executable_dependencies(
         });
     }
     Ok(ExecutableCatalog {
+        scalar_constructors,
         intrinsics,
         functions,
+    })
+}
+
+fn source_scalar_constructor_binding(
+    environment: &Environment,
+    name: &Name,
+) -> Option<ScalarConstructorBinding> {
+    let value = if name == &Name::from_components(["Bool", "false"]) {
+        false
+    } else if name == &Name::from_components(["Bool", "true"]) {
+        true
+    } else {
+        return None;
+    };
+    let ConstantInfo::Ctor(actual) = environment.find(name)? else {
+        return None;
+    };
+    let Declaration::Inductive(expected_block) = fln_elab::seed::bool_seed_declaration() else {
+        return None;
+    };
+    let expected = expected_block
+        .ctors
+        .iter()
+        .find(|constructor| &constructor.base.name == name)?;
+    if actual != expected {
+        return None;
+    }
+    Some(ScalarConstructorBinding {
+        name: name.clone(),
+        universe_arity: 0,
+        value,
     })
 }
 
@@ -5290,9 +5337,10 @@ mod tests {
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
-        ReducibilityHints, RejectClass, SourceModuleInput, TheoremVal, VmExecutionLimits,
-        closed_vm_value, decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
-        fresh_evaluation_name, project_lsp_diagnostics, rebuild_olean_artifact,
+        ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceModuleInput, TheoremVal,
+        VmExecutionLimits, closed_vm_value, decode_olean_artifact, execute_flbc_artifact,
+        execute_golem_with_options, fresh_evaluation_name, project_lsp_diagnostics,
+        rebuild_olean_artifact, source_scalar_constructor_binding,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -8425,7 +8473,7 @@ mod tests {
             .expect("the source seed passes the dual-checker council")
             .into_complete()
             .expect("the bounded source seed answers completely");
-        assert_eq!(engine.environment().len(), 23);
+        assert_eq!(engine.environment().len(), 26);
         assert!(
             engine
                 .environment()
@@ -8441,6 +8489,13 @@ mod tests {
                 .environment()
                 .contains(&Name::from_components(["Bool"]))
         );
+        for name in [
+            Name::from_components(["Bool", "false"]),
+            Name::from_components(["Bool", "true"]),
+            Name::from_components(["Bool", "rec"]),
+        ] {
+            assert!(engine.environment().contains(&name));
+        }
         assert!(
             engine
                 .environment()
@@ -8529,7 +8584,7 @@ mod tests {
             std::str::from_utf8(&bytes[..size - 1]).expect("Marrow String output is UTF-8"),
             "source\nconnected"
         );
-        assert_eq!(completed.engine.environment().len(), 25);
+        assert_eq!(completed.engine.environment().len(), 28);
     }
 
     #[test]
@@ -9237,6 +9292,135 @@ mod tests {
                 })
             }));
         }
+    }
+
+    #[test]
+    fn checked_bool_literals_reach_golem_through_exact_constructor_rows() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let missing = nat_only
+            .execute_source_definition(b"def answer := true", &options, test_limits())
+            .expect_err("the Nat-only door must not invent Bool constructor authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the exact Bool block passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded Bool source seed answers completely");
+        assert!(matches!(
+            engine
+                .environment()
+                .find(&Name::from_components(["Bool", "false"])),
+            Some(ConstantInfo::Ctor(constructor)) if constructor.cidx == 0
+        ));
+        assert!(matches!(
+            engine
+                .environment()
+                .find(&Name::from_components(["Bool", "true"])),
+            Some(ConstantInfo::Ctor(constructor)) if constructor.cidx == 1
+        ));
+
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def yes := true",
+                    b"def no := Bool.false",
+                    b"def keep (flag : Bool) : Bool := flag",
+                    b"def answer := keep yes",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("checked Bool constructors and a Bool parameter reach Golem");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the checked Bool literal batch must answer completely");
+        };
+        assert_eq!(completed.executions.len(), 4);
+        assert_eq!(
+            closed_vm_value(&completed.executions[0].exit),
+            Ok(Some(ClosedVmValue::Scalar(1)))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::Scalar(0)))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.executions[3].exit),
+            Ok(Some(ClosedVmValue::Scalar(1)))
+        );
+
+        for (execution, expected) in [
+            (&completed.executions[0], 1_u64),
+            (&completed.executions[1], 0_u64),
+        ] {
+            let executable =
+                fln_comp::flbc::decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                    .expect("the Bool constructor artifact decodes canonically");
+            assert!(matches!(
+                &executable.functions()[0].code[0],
+                fln_comp::flbc::Instruction::Nat { value, .. } if *value == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn scalar_bool_compiler_binding_requires_the_exact_seed_constructor_row() {
+        let Declaration::Inductive(block) = fln_elab::seed::bool_seed_declaration() else {
+            panic!("the source seed must expose the exact Bool block");
+        };
+        let exact = block.ctors[1].clone();
+        let name = exact.base.name.clone();
+        let exact_environment = Environment::new()
+            .add_decl(ConstantInfo::Ctor(exact.clone()))
+            .expect("the exact constructor row enters the isolated fixture");
+        assert_eq!(
+            source_scalar_constructor_binding(&exact_environment, &name),
+            Some(ScalarConstructorBinding {
+                name: name.clone(),
+                universe_arity: 0,
+                value: true,
+            })
+        );
+
+        let mut forged = exact;
+        forged.cidx = 0;
+        let forged_environment = Environment::new()
+            .add_decl(ConstantInfo::Ctor(forged))
+            .expect("the untrusted imported fixture can carry a forged row");
+        assert_eq!(
+            source_scalar_constructor_binding(&forged_environment, &name),
+            None,
+            "a Bool.true spelling cannot grant scalar true authority to a nonmatching row"
+        );
+    }
+
+    #[test]
+    fn checked_global_named_true_remains_an_ordinary_nat_definition() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the exact Bool block passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded Bool source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[b"def true : Nat := 7", b"def answer := Nat.add true 1"],
+                &options,
+                test_limits(),
+            )
+            .expect("a checked exact global named true wins ordinary name resolution");
+        let Outcome::Complete(completed) = completed else {
+            panic!("the ordinary true-name batch must answer completely");
+        };
+        assert_eq!(
+            closed_vm_value(&completed.executions[1].exit),
+            Ok(Some(ClosedVmValue::Scalar(8)))
+        );
     }
 
     #[test]

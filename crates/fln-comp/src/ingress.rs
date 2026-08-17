@@ -4,8 +4,9 @@
 //! Reference code, trusts no source text, and does not type-check the `type_`
 //! annotation carried by [`ExprNode::LetE`]. The executable subset is Nat and
 //! String literals, transparent metadata, let bindings, de Bruijn lookup, and
-//! saturated direct applications of caller-supplied intrinsic and constructor
-//! bindings, the pin-defined `Lean.Core.checkSystem` checkpoint when its module
+//! saturated direct applications of caller-supplied intrinsic, scalar-
+//! constructor, and object-constructor bindings, the pin-defined
+//! `Lean.Core.checkSystem` checkpoint when its module
 //! context is compile-time static, declaration-bound structure projections,
 //! saturated direct calls into caller-supplied first-order function bodies, and
 //! explicitly typed local lambda closures with under-, exact, closure-result
@@ -18,8 +19,8 @@
 //! source evaluation order remains the execution order.
 //! Bindings are untrusted input: this module canonicalizes and checks their
 //! shape, while the caller remains responsible for deriving intrinsics from the
-//! generated extern contract, deriving constructor layouts from elaborated
-//! declarations, stripping top-level lambdas from function bodies, and binding
+//! generated extern contract, deriving scalar and object constructor layouts
+//! from elaborated declarations, stripping top-level lambdas from function bodies, and binding
 //! local lambda spines to reviewed runtime signatures. Those signatures may
 //! pass and return closures by canonical FIR closure-type id; every such
 //! reference is checked against the final deduplicated signature table before
@@ -153,6 +154,9 @@ pub enum IngressError {
     CheckSystemIntrinsicNameCollision {
         binding: usize,
     },
+    CheckSystemScalarConstructorNameCollision {
+        binding: usize,
+    },
     CheckSystemConstructorNameCollision {
         binding: usize,
     },
@@ -174,6 +178,16 @@ pub enum IngressError {
         argument: usize,
         expected: fir::ValueType,
         actual: fir::ValueType,
+    },
+    ScalarConstructorUniverseArity {
+        name_hash: u64,
+        expected: usize,
+        actual: usize,
+    },
+    ScalarConstructorTermArity {
+        name_hash: u64,
+        expected: usize,
+        actual: usize,
     },
     ConstructorUniverseArity {
         name_hash: u64,
@@ -237,6 +251,17 @@ pub enum IngressError {
         name_hash: u64,
         first: usize,
         second: usize,
+    },
+    AnonymousScalarConstructorName {
+        binding: usize,
+    },
+    DuplicateScalarConstructorName {
+        name_hash: u64,
+        first: usize,
+        second: usize,
+    },
+    ScalarConstructorNameCollision {
+        name_hash: u64,
     },
     AnonymousConstructorName {
         binding: usize,
@@ -473,6 +498,10 @@ impl fmt::Display for IngressError {
                 formatter,
                 "intrinsic catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
             ),
+            Self::CheckSystemScalarConstructorNameCollision { binding } => write!(
+                formatter,
+                "scalar-constructor catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
+            ),
             Self::CheckSystemConstructorNameCollision { binding } => write!(
                 formatter,
                 "constructor catalog binding {binding} attempts to replace native Lean.Core.checkSystem"
@@ -505,6 +534,22 @@ impl fmt::Display for IngressError {
             } => write!(
                 formatter,
                 "intrinsic constant with observable name hash {name_hash} argument {argument} expects {expected:?}, observed {actual:?}"
+            ),
+            Self::ScalarConstructorUniverseArity {
+                name_hash,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "scalar constructor with observable name hash {name_hash} expects {expected} universe arguments, observed {actual}"
+            ),
+            Self::ScalarConstructorTermArity {
+                name_hash,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "scalar constructor with observable name hash {name_hash} expects {expected} term arguments, observed {actual}"
             ),
             Self::ConstructorUniverseArity {
                 name_hash,
@@ -599,6 +644,22 @@ impl fmt::Display for IngressError {
             } => write!(
                 formatter,
                 "intrinsic catalog bindings {first} and {second} duplicate source name hash {name_hash}"
+            ),
+            Self::AnonymousScalarConstructorName { binding } => write!(
+                formatter,
+                "scalar-constructor catalog binding {binding} has an anonymous source name"
+            ),
+            Self::DuplicateScalarConstructorName {
+                name_hash,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "scalar-constructor catalog bindings {first} and {second} duplicate source name hash {name_hash}"
+            ),
+            Self::ScalarConstructorNameCollision { name_hash } => write!(
+                formatter,
+                "scalar-constructor source name hash {name_hash} collides with another runtime catalog"
             ),
             Self::AnonymousConstructorName { binding } => write!(
                 formatter,
@@ -915,6 +976,19 @@ pub struct IntrinsicBinding {
     pub effect: fir::EffectClass,
 }
 
+/// One checked nullary constructor whose ABI representation is a scalar Bool.
+///
+/// The binding is resolution metadata, not authority: callers must derive it
+/// from an admitted constructor declaration. Ingress canonicalizes the source
+/// name and lowers the exact constant to FIR's ordinary typed Bool operation;
+/// no constructor object or host-side shadow value enters the program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarConstructorBinding {
+    pub name: Name,
+    pub universe_arity: usize,
+    pub value: bool,
+}
+
 /// One untrusted source constructor and its already-erased runtime layout.
 ///
 /// Every term argument becomes one ABI-valued object field in declaration
@@ -1054,6 +1128,13 @@ struct PreparedIntrinsic {
     declaration: fir::IntrinsicDecl,
 }
 
+struct PreparedScalarConstructor {
+    source_index: usize,
+    name: Name,
+    universe_arity: usize,
+    value: bool,
+}
+
 struct PreparedConstructor {
     source_index: usize,
     name: Name,
@@ -1105,6 +1186,8 @@ struct MutualGroupRow {
 }
 
 struct PreparedCatalog<'a> {
+    scalar_constructors: Vec<PreparedScalarConstructor>,
+    scalar_constructors_by_name: Vec<usize>,
     constructors: Vec<PreparedConstructor>,
     constructors_by_name: Vec<usize>,
     projections: Vec<PreparedProjection>,
@@ -1121,12 +1204,14 @@ struct PreparedCatalog<'a> {
 #[derive(Clone, Copy)]
 enum CallTarget {
     CheckSystem { name_hash: u64 },
+    ScalarConstructor(usize),
     Constructor(usize),
     Intrinsic(usize),
     Function(usize),
 }
 
 const CHECK_SYSTEM_ARGUMENTS: [fir::ValueType; 1] = [fir::ValueType::String];
+const NO_ARGUMENTS: [fir::ValueType; 0] = [];
 
 enum Task<'a> {
     Eval(&'a Expr),
@@ -1611,6 +1696,8 @@ fn prepare_intrinsics<'a>(
     }
 
     Ok(PreparedCatalog {
+        scalar_constructors: Vec::new(),
+        scalar_constructors_by_name: Vec::new(),
         constructors: Vec::new(),
         constructors_by_name: Vec::new(),
         projections: Vec::new(),
@@ -1623,6 +1710,67 @@ fn prepare_intrinsics<'a>(
         mutual_groups: Vec::new(),
         closure_types: Vec::new(),
     })
+}
+
+fn prepare_scalar_constructors(
+    catalog: &mut PreparedCatalog<'_>,
+    bindings: &[ScalarConstructorBinding],
+) -> Result<(), IngressError> {
+    catalog
+        .scalar_constructors
+        .try_reserve_exact(bindings.len())
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::ProgramTables,
+            requested: bindings.len(),
+        })?;
+    for (source_index, binding) in bindings.iter().enumerate() {
+        if binding.name.is_anonymous() {
+            return Err(IngressError::AnonymousScalarConstructorName {
+                binding: source_index,
+            });
+        }
+        if is_check_system_name(&binding.name) {
+            return Err(IngressError::CheckSystemScalarConstructorNameCollision {
+                binding: source_index,
+            });
+        }
+        catalog.scalar_constructors.push(PreparedScalarConstructor {
+            source_index,
+            name: binding.name.clone(),
+            universe_arity: binding.universe_arity,
+            value: binding.value,
+        });
+    }
+    catalog
+        .scalar_constructors
+        .sort_unstable_by(|left, right| left.name.quick_cmp(&right.name));
+    for pair in catalog.scalar_constructors.windows(2) {
+        if pair[0].name == pair[1].name {
+            return Err(IngressError::DuplicateScalarConstructorName {
+                name_hash: pair[0].name.hash(),
+                first: pair[0].source_index.min(pair[1].source_index),
+                second: pair[0].source_index.max(pair[1].source_index),
+            });
+        }
+    }
+    catalog
+        .scalar_constructors_by_name
+        .try_reserve_exact(catalog.scalar_constructors.len())
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::ProgramTables,
+            requested: catalog.scalar_constructors.len(),
+        })?;
+    catalog
+        .scalar_constructors_by_name
+        .extend(0..catalog.scalar_constructors.len());
+    for scalar in &catalog.scalar_constructors {
+        if catalog.resolve_intrinsic(&scalar.name).is_some() {
+            return Err(IngressError::ScalarConstructorNameCollision {
+                name_hash: scalar.name.hash(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn prepare_constructors(
@@ -1807,6 +1955,14 @@ fn prepare_constructors(
         .extend(0..catalog.constructors.len());
     for index in &catalog.constructors_by_name {
         let constructor = &catalog.constructors[*index];
+        if catalog
+            .resolve_scalar_constructor(&constructor.name)
+            .is_some()
+        {
+            return Err(IngressError::ScalarConstructorNameCollision {
+                name_hash: constructor.name.hash(),
+            });
+        }
         if let Some(intrinsic_index) = catalog.resolve_intrinsic(&constructor.name) {
             return Err(IngressError::ConstructorIntrinsicNameCollision {
                 name_hash: constructor.name.hash(),
@@ -1819,6 +1975,13 @@ fn prepare_constructors(
 }
 
 impl PreparedCatalog<'_> {
+    fn resolve_scalar_constructor(&self, name: &Name) -> Option<usize> {
+        self.scalar_constructors_by_name
+            .binary_search_by(|index| self.scalar_constructors[*index].name.quick_cmp(name))
+            .ok()
+            .and_then(|position| self.scalar_constructors_by_name.get(position).copied())
+    }
+
     fn resolve_constructor(&self, name: &Name) -> Option<usize> {
         self.constructors_by_name
             .binary_search_by(|index| self.constructors[*index].name.quick_cmp(name))
@@ -2211,12 +2374,19 @@ fn prepare_lambdas<'a>(
 }
 
 fn prepare_catalog<'a>(
+    scalar_constructors: &[ScalarConstructorBinding],
     intrinsics: &[IntrinsicBinding],
     constructors: &[ConstructorBinding],
     functions: &'a [FunctionBinding],
     lambdas: &'a [LambdaBinding],
     limits: IngressLimits,
 ) -> Result<PreparedCatalog<'a>, IngressError> {
+    let constructor_count = scalar_constructors.len().saturating_add(constructors.len());
+    charge_fir(
+        fir::ValidationResource::Constructors,
+        constructor_count,
+        limits.fir.max_constructors,
+    )?;
     let function_count = functions.len().saturating_add(1);
     charge_fir(
         fir::ValidationResource::Functions,
@@ -2224,6 +2394,7 @@ fn prepare_catalog<'a>(
         limits.fir.max_functions,
     )?;
     let mut catalog = prepare_intrinsics(intrinsics, limits)?;
+    prepare_scalar_constructors(&mut catalog, scalar_constructors)?;
     prepare_constructors(&mut catalog, constructors, limits)?;
     catalog
         .functions
@@ -2351,6 +2522,11 @@ fn prepare_catalog<'a>(
                 function: function.source_index,
             });
         }
+        if catalog.resolve_scalar_constructor(&function.name).is_some() {
+            return Err(IngressError::ScalarConstructorNameCollision {
+                name_hash: function.name.hash(),
+            });
+        }
     }
     prepare_lambdas(&mut catalog, lambdas, limits)?;
 
@@ -2386,6 +2562,27 @@ fn resolve_call<'a>(
         }
         return Ok(ScheduledCall {
             target: CallTarget::CheckSystem { name_hash },
+            arguments,
+        });
+    }
+    if let Some(binding_index) = catalog.resolve_scalar_constructor(name) {
+        let binding = &catalog.scalar_constructors[binding_index];
+        if universe_arity != binding.universe_arity {
+            return Err(IngressError::ScalarConstructorUniverseArity {
+                name_hash,
+                expected: binding.universe_arity,
+                actual: universe_arity,
+            });
+        }
+        if !arguments.is_empty() {
+            return Err(IngressError::ScalarConstructorTermArity {
+                name_hash,
+                expected: 0,
+                actual: arguments.len(),
+            });
+        }
+        return Ok(ScheduledCall {
+            target: CallTarget::ScalarConstructor(binding_index),
             arguments,
         });
     }
@@ -3453,6 +3650,9 @@ fn lower_body<'a>(
                             CallTarget::CheckSystem { .. } => {
                                 work.check_system_calls = work.check_system_calls.saturating_add(1);
                             }
+                            CallTarget::ScalarConstructor(_) => {
+                                work.constructor_calls = work.constructor_calls.saturating_add(1);
+                            }
                             CallTarget::Constructor(_) => {
                                 work.constructor_calls = work.constructor_calls.saturating_add(1);
                             }
@@ -3526,6 +3726,10 @@ fn lower_body<'a>(
                                 CallTarget::CheckSystem { .. } => {
                                     work.check_system_calls =
                                         work.check_system_calls.saturating_add(1);
+                                }
+                                CallTarget::ScalarConstructor(_) => {
+                                    work.constructor_calls =
+                                        work.constructor_calls.saturating_add(1);
                                 }
                                 CallTarget::Constructor(_) => {
                                     work.constructor_calls =
@@ -3720,6 +3924,20 @@ fn lower_body<'a>(
                         CHECK_SYSTEM_ARGUMENTS.as_slice(),
                         fir::ValueType::Unit,
                     ),
+                    CallTarget::ScalarConstructor(binding_index) => {
+                        let binding = catalog.scalar_constructors.get(binding_index).ok_or(
+                            IngressError::MalformedResultState {
+                                phase: "scalar-constructor catalog lookup",
+                                expected: catalog.scalar_constructors.len(),
+                                observed: binding_index,
+                            },
+                        )?;
+                        (
+                            binding.name.hash(),
+                            NO_ARGUMENTS.as_slice(),
+                            fir::ValueType::Bool,
+                        )
+                    }
                     CallTarget::Constructor(binding_index) => {
                         let binding = catalog.constructors.get(binding_index).ok_or(
                             IngressError::MalformedResultState {
@@ -3789,6 +4007,13 @@ fn lower_body<'a>(
                                     actual: actual.ty,
                                 }
                             }
+                            CallTarget::ScalarConstructor(_) => {
+                                IngressError::ScalarConstructorTermArity {
+                                    name_hash,
+                                    expected: 0,
+                                    actual: argument.saturating_add(1),
+                                }
+                            }
                             CallTarget::Constructor(_) => IngressError::ConstructorArgumentType {
                                 name_hash,
                                 argument,
@@ -3848,6 +4073,9 @@ fn lower_body<'a>(
                                 module_name: argument.id,
                             }
                         }
+                    }
+                    CallTarget::ScalarConstructor(binding_index) => {
+                        fir::Operation::Bool(catalog.scalar_constructors[binding_index].value)
                     }
                     CallTarget::Constructor(binding_index) => {
                         let binding = &catalog.constructors[binding_index];
@@ -4233,6 +4461,33 @@ pub fn lower_closed_expr_with_lambdas<'a>(
     lambdas: &'a [LambdaBinding],
     limits: IngressLimits,
 ) -> Result<IngressedProgram, IngressError> {
+    lower_closed_expr_with_scalar_constructors_and_lambdas(
+        source,
+        &[],
+        intrinsics,
+        constructors,
+        functions,
+        lambdas,
+        limits,
+    )
+}
+
+/// Lower through exact scalar-constructor metadata plus every ordinary catalog.
+///
+/// This is the executable boundary for admitted nullary constructors such as
+/// `Bool.false` and `Bool.true`, whose pin ABI is the scalar values zero and
+/// one. The caller still owns the proof that each binding came from the exact
+/// checked constructor declaration; ingress rejects collisions and malformed
+/// arities before publishing validated FIR.
+pub fn lower_closed_expr_with_scalar_constructors_and_lambdas<'a>(
+    source: &'a Expr,
+    scalar_constructors: &[ScalarConstructorBinding],
+    intrinsics: &[IntrinsicBinding],
+    constructors: &[ConstructorBinding],
+    functions: &'a [FunctionBinding],
+    lambdas: &'a [LambdaBinding],
+    limits: IngressLimits,
+) -> Result<IngressedProgram, IngressError> {
     if source.has_fvar() {
         return Err(IngressError::OpenFreeVariable);
     }
@@ -4245,7 +4500,14 @@ pub fn lower_closed_expr_with_lambdas<'a>(
         });
     }
 
-    let catalog = prepare_catalog(intrinsics, constructors, functions, lambdas, limits)?;
+    let catalog = prepare_catalog(
+        scalar_constructors,
+        intrinsics,
+        constructors,
+        functions,
+        lambdas,
+        limits,
+    )?;
     let mut closure_build = ClosureBuild::new(&catalog)?;
     let generated_functions = catalog.functions.len().saturating_add(1);
     let function_parameters = catalog.functions.iter().fold(0usize, |total, function| {
@@ -4636,6 +4898,14 @@ mod tests {
             tag,
             fields,
             static_scalar_bytes,
+        }
+    }
+
+    fn scalar_bool_constructor(name: &[&str], value: bool) -> ScalarConstructorBinding {
+        ScalarConstructorBinding {
+            name: Name::from_components(name.iter().copied()),
+            universe_arity: 0,
+            value,
         }
     }
 
@@ -5258,6 +5528,118 @@ mod tests {
                 ..
             } if fields == &[crate::flbc::Register::new(0), crate::flbc::Register::new(1)]
                 && scalar_bytes == &[0xAB, 0xCD]
+        ));
+    }
+
+    #[test]
+    fn scalar_bool_constructors_lower_to_typed_canonical_scalar_operations() {
+        for (leaf, value) in [("false", false), ("true", true)] {
+            let source = Expr::const_(Name::from_components(["Bool", leaf]), Vec::new());
+            let binding = scalar_bool_constructor(&["Bool", leaf], value);
+            let ingress = lower_closed_expr_with_scalar_constructors_and_lambdas(
+                &source,
+                &[binding],
+                &[],
+                &[],
+                &[],
+                &[],
+                IngressLimits::default(),
+            )
+            .expect("an exact scalar Bool constructor lowers");
+            assert_eq!(ingress.work().constructor_calls, 1);
+            assert_eq!(ingress.work().generated_constructors, 0);
+            assert!(
+                ingress
+                    .fir()
+                    .canonical_text()
+                    .contains(&format!("v0:bool = bool {}", u8::from(value)))
+            );
+            let lowered = fir::lower_to_flbc(ingress.fir())
+                .expect("the validated Bool operation lowers to FLBC");
+            assert!(matches!(
+                &lowered.functions()[0].code[0],
+                crate::flbc::Instruction::Nat { value: actual, .. }
+                    if *actual == u64::from(value)
+            ));
+        }
+    }
+
+    #[test]
+    fn scalar_constructor_catalog_refuses_missing_malformed_and_colliding_rows() {
+        let name = Name::from_components(["Bool", "true"]);
+        let source = Expr::const_(name.clone(), Vec::new());
+        assert!(matches!(
+            lower_closed_expr(&source, IngressLimits::default()),
+            Err(IngressError::UnknownConstant { name_hash }) if name_hash == name.hash()
+        ));
+
+        let binding = scalar_bool_constructor(&["Bool", "true"], true);
+        let applied = Expr::app(source.clone(), nat(0));
+        assert!(matches!(
+            lower_closed_expr_with_scalar_constructors_and_lambdas(
+                &applied,
+                std::slice::from_ref(&binding),
+                &[],
+                &[],
+                &[],
+                &[],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::ScalarConstructorTermArity {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+
+        let universe_applied = Expr::const_(name.clone(), vec![fln_core::level::Level::zero()]);
+        assert!(matches!(
+            lower_closed_expr_with_scalar_constructors_and_lambdas(
+                &universe_applied,
+                std::slice::from_ref(&binding),
+                &[],
+                &[],
+                &[],
+                &[],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::ScalarConstructorUniverseArity {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            lower_closed_expr_with_scalar_constructors_and_lambdas(
+                &source,
+                &[binding.clone(), binding.clone()],
+                &[],
+                &[],
+                &[],
+                &[],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::DuplicateScalarConstructorName {
+                first: 0,
+                second: 1,
+                ..
+            })
+        ));
+
+        let object_constructor = constructor_binding(&["Bool", "true"], 1, Vec::new(), Vec::new());
+        assert!(matches!(
+            lower_closed_expr_with_scalar_constructors_and_lambdas(
+                &source,
+                &[binding],
+                &[],
+                &[object_constructor],
+                &[],
+                &[],
+                IngressLimits::default(),
+            ),
+            Err(IngressError::ScalarConstructorNameCollision { name_hash })
+                if name_hash == name.hash()
         ));
     }
 
@@ -7506,7 +7888,7 @@ mod tests {
 
     #[test]
     fn an_elided_source_slot_is_a_typed_refusal_if_capture_analysis_and_lowering_disagree() {
-        let catalog = prepare_catalog(&[], &[], &[], &[], IngressLimits::default())
+        let catalog = prepare_catalog(&[], &[], &[], &[], &[], IngressLimits::default())
             .expect("empty catalog is canonical");
         let mut closure_build = ClosureBuild::new(&catalog).expect("empty closure worklist");
         let context = vec![

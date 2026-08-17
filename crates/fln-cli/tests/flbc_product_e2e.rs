@@ -375,7 +375,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     .expect("write supported bounded Nat source");
     std::fs::write(
         &comparison_source,
-        "def choose (left right : Bool) : Bool := left\ndef natEq : Bool := Nat.beq 42 42\ndef natLe : Bool := Nat.ble 41 42\ndef stringEq : Bool := String.decEq \"βeta\" \"βeta\"\ndef answer : Bool := choose (choose natEq natLe) stringEq\n"
+        "def choose (left right : Bool) : Bool := left\n#eval false\ndef natEq : Bool := Nat.beq 42 42\ndef natLe : Bool := Nat.ble 41 42\ndef stringEq : Bool := String.decEq \"βeta\" \"βeta\"\ndef literal := true\ndef answer : Bool := choose (choose natEq natLe) (choose stringEq literal)\n"
             .as_bytes(),
     )
     .expect("write supported Bool comparison source");
@@ -586,7 +586,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(comparison_produced.stderr.is_empty());
     let comparison_stdout = utf8(&comparison_produced.stdout);
-    assert!(comparison_stdout.contains("\"definitions\":5"));
+    assert!(comparison_stdout.contains("\"definitions\":6"));
+    assert!(comparison_stdout.contains("\"evaluations\":1"));
+    assert!(
+        comparison_stdout
+            .contains("\"evaluationResults\":[{\"command\":1,\"kind\":\"bool\",\"value\":false}]")
+    );
     assert!(comparison_stdout.contains("\"finalKind\":\"bool\""));
     assert!(comparison_stdout.contains("\"finalValue\":true"));
     let comparison_consumed = run_fln(&[

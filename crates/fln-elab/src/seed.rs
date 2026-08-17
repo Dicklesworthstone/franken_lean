@@ -10,12 +10,12 @@
 //!
 //! This is not FrankenLean's real Prelude. Its raw fixture admits an opaque
 //! `Nat : Sort 1`; the embeddable source constructor additionally admits opaque
-//! `String : Sort 1` and `Bool : Sort 1`, an explicit allowlist of checked
-//! scalar Nat operations, and the checked String extern signatures. The types
-//! are enough to resolve literals and comparison results, while those checked
-//! rows let the compiler reach Golem's matching intrinsic implementations; no
-//! constructor or eliminator is implied. The real inductive blocks belong to
-//! inductive elaboration and Prelude ingestion.
+//! `String : Sort 1`, the pin-shaped `Bool` inductive block, an explicit
+//! allowlist of checked scalar Nat operations, and the checked String extern
+//! signatures. Those checked rows let the compiler reach Golem's matching
+//! intrinsic implementations. Bool's two nullary constructors are live; source
+//! pattern syntax, recursor elaboration, Nat/String constructors, and the rest
+//! of Prelude still belong to later ingestion work.
 //!
 //! Every refusal and non-answer remains typed. In particular, a budget stop or
 //! internal fault while constructing this environment is never rendered as a
@@ -25,13 +25,15 @@ use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::{Inconclusive, InternalFault, Outcome};
-use fln_env::constants::{AxiomVal, ConstantVal};
+use fln_env::constants::{
+    AxiomVal, ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal,
+};
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
 use fln_env::pmap::CollisionBudget;
-use fln_kernel::Declaration;
 use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget, RejectClass};
+use fln_kernel::{Declaration, InductiveBlock};
 
 /// Why the minimal seed environment could not be constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,20 +116,138 @@ pub fn string_seed_declaration() -> Declaration {
     })
 }
 
-/// Construct the opaque `Bool : Sort 1` candidate needed to type the bounded
-/// comparison rows.
+/// Construct the pin-shaped `Bool` inductive block used by the bounded source
+/// facade.
 ///
-/// This grants no constructors, eliminator, literals, or reduction rules. The
-/// generated comparison rows return the runtime's checked `0`/`1` scalar
-/// representation, while real Bool induction remains Prelude work.
+/// The block contains the exact type, nullary constructors, and generated
+/// recursor names and shapes from `Init.Prelude`. It is still only one tiny
+/// Prelude slice: source pattern syntax, recursor elaboration, and the wider
+/// Bool library remain outside this facade.
 pub fn bool_seed_declaration() -> Declaration {
-    Declaration::Axiom(AxiomVal {
-        base: ConstantVal {
-            name: Name::from_components(["Bool"]),
-            level_params: Vec::new(),
-            type_: Expr::sort(Level::one()),
-        },
-        is_unsafe: false,
+    let bool_name = Name::from_components(["Bool"]);
+    let false_name = Name::from_components(["Bool", "false"]);
+    let true_name = Name::from_components(["Bool", "true"]);
+    let rec_name = Name::from_components(["Bool", "rec"]);
+    let bool_type = || Expr::const_(bool_name.clone(), Vec::new());
+    let false_value = || Expr::const_(false_name.clone(), Vec::new());
+    let true_value = || Expr::const_(true_name.clone(), Vec::new());
+    let bvar = |index| Expr::bvar(index).expect("the fixed Bool recursor indices fit");
+    let universe_name = Name::from_components(["u"]);
+    let universe = Level::param(universe_name.clone());
+    let motive_type = Expr::forall_e(
+        Name::from_components(["t"]),
+        bool_type(),
+        Expr::sort(universe.clone()),
+        BinderInfo::Default,
+    );
+    let recursor_type = Expr::forall_e(
+        Name::from_components(["motive"]),
+        motive_type.clone(),
+        Expr::forall_e(
+            Name::from_components(["false"]),
+            Expr::app(bvar(0), false_value()),
+            Expr::forall_e(
+                Name::from_components(["true"]),
+                Expr::app(bvar(1), true_value()),
+                Expr::forall_e(
+                    Name::from_components(["t"]),
+                    bool_type(),
+                    Expr::app(bvar(3), bvar(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let rule_rhs = |selected| {
+        Expr::lam(
+            Name::from_components(["motive"]),
+            motive_type.clone(),
+            Expr::lam(
+                Name::from_components(["false"]),
+                Expr::app(bvar(0), false_value()),
+                Expr::lam(
+                    Name::from_components(["true"]),
+                    Expr::app(bvar(1), true_value()),
+                    bvar(selected),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+
+    Declaration::Inductive(InductiveBlock {
+        types: vec![InductiveVal {
+            base: ConstantVal {
+                name: bool_name.clone(),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::one()),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![bool_name.clone()],
+            ctors: vec![false_name.clone(), true_name.clone()],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }],
+        ctors: vec![
+            ConstructorVal {
+                base: ConstantVal {
+                    name: false_name.clone(),
+                    level_params: Vec::new(),
+                    type_: bool_type(),
+                },
+                induct: bool_name.clone(),
+                cidx: 0,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+            ConstructorVal {
+                base: ConstantVal {
+                    name: true_name.clone(),
+                    level_params: Vec::new(),
+                    type_: bool_type(),
+                },
+                induct: bool_name.clone(),
+                cidx: 1,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            },
+        ],
+        recursors: vec![RecursorVal {
+            base: ConstantVal {
+                name: rec_name,
+                level_params: vec![universe_name],
+                type_: recursor_type,
+            },
+            all: vec![bool_name],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 2,
+            rules: vec![
+                RecursorRule {
+                    ctor: false_name.clone(),
+                    nfields: 0,
+                    rhs: rule_rhs(1),
+                },
+                RecursorRule {
+                    ctor: true_name.clone(),
+                    nfields: 0,
+                    rhs: rule_rhs(0),
+                },
+            ],
+            k: false,
+            is_unsafe: false,
+        }],
     })
 }
 
@@ -418,9 +538,10 @@ pub fn source_intrinsic_seed_declaration(name: &Name) -> Option<Declaration> {
     }
 }
 
-/// The exact declaration sequence required by the bounded Nat/String source
-/// frontend. Order is part of the deterministic seed contract: both types must
-/// exist before the intrinsic signature can be admitted.
+/// The exact declaration sequence required by the bounded Nat/String/Bool
+/// source frontend. Order is part of the deterministic seed contract: the
+/// scalar type rows and Bool block must exist before intrinsic signatures can
+/// be admitted.
 pub fn source_seed_declarations() -> [Declaration; 23] {
     [
         nat_seed_declaration(),
@@ -545,5 +666,47 @@ mod tests {
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
             "an unimplemented generated row is not source authority"
         );
+    }
+
+    #[test]
+    fn bool_seed_is_the_exact_two_constructor_inductive_block() {
+        let Declaration::Inductive(block) = bool_seed_declaration() else {
+            panic!("the Bool seed must not remain an opaque axiom");
+        };
+        assert_eq!(block.types.len(), 1);
+        assert_eq!(block.ctors.len(), 2);
+        assert_eq!(block.recursors.len(), 1);
+
+        let bool_name = Name::from_components(["Bool"]);
+        let false_name = Name::from_components(["Bool", "false"]);
+        let true_name = Name::from_components(["Bool", "true"]);
+        let bool_type = Expr::const_(bool_name.clone(), Vec::new());
+        let inductive = &block.types[0];
+        assert_eq!(inductive.base.name, bool_name);
+        assert_eq!(inductive.base.type_, Expr::sort(Level::one()));
+        assert_eq!(inductive.ctors, vec![false_name.clone(), true_name.clone()]);
+        assert_eq!(inductive.num_params, 0);
+        assert_eq!(inductive.num_indices, 0);
+        assert!(!inductive.is_rec);
+
+        for (constructor, expected_name, expected_index) in [
+            (&block.ctors[0], false_name.clone(), 0),
+            (&block.ctors[1], true_name.clone(), 1),
+        ] {
+            assert_eq!(constructor.base.name, expected_name);
+            assert_eq!(constructor.base.type_, bool_type);
+            assert_eq!(constructor.induct, bool_name);
+            assert_eq!(constructor.cidx, expected_index);
+            assert_eq!(constructor.num_params, 0);
+            assert_eq!(constructor.num_fields, 0);
+        }
+
+        let recursor = &block.recursors[0];
+        assert_eq!(recursor.base.name, Name::from_components(["Bool", "rec"]));
+        assert_eq!(recursor.rules.len(), 2);
+        assert_eq!(recursor.rules[0].ctor, false_name);
+        assert_eq!(recursor.rules[1].ctor, true_name);
+        assert_eq!(recursor.rules[0].nfields, 0);
+        assert_eq!(recursor.rules[1].nfields, 0);
     }
 }

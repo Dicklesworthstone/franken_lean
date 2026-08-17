@@ -654,6 +654,8 @@ fn elaborate_definition_with_types(
 fn elaborate_nat_reference(
     name: &Name,
     locals: &[(Name, Expr)],
+    allow_bool_literals: bool,
+    environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
     if name.is_anonymous() {
         return Err(NatDefinitionElabError::AnonymousReferenceName);
@@ -666,6 +668,20 @@ fn elaborate_nat_reference(
         let index = u32::try_from(index).map_err(|_| NatDefinitionElabError::TooManyParameters)?;
         return Expr::bvar(index).map_err(|_| NatDefinitionElabError::TooManyParameters);
     }
+    if allow_bool_literals && !environment.is_some_and(|environment| environment.contains(name)) {
+        if name == &Name::from_components(["true"]) {
+            return Ok(Expr::const_(
+                Name::from_components(["Bool", "true"]),
+                Vec::new(),
+            ));
+        }
+        if name == &Name::from_components(["false"]) {
+            return Ok(Expr::const_(
+                Name::from_components(["Bool", "false"]),
+                Vec::new(),
+            ));
+        }
+    }
     Ok(Expr::const_(name.clone(), Vec::new()))
 }
 
@@ -673,6 +689,7 @@ fn elaborate_atom(
     syntax: &Syntax,
     locals: &[(Name, Expr)],
     allow_string: bool,
+    environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
     Ok(match syntax {
         Syntax::Node { kind, args, .. }
@@ -695,7 +712,9 @@ fn elaborate_atom(
             };
             Expr::lit(decode_string(spelling)?)
         }
-        Syntax::Ident { val: name, .. } => elaborate_nat_reference(name, locals)?,
+        Syntax::Ident { val: name, .. } => {
+            elaborate_nat_reference(name, locals, allow_string, environment)?
+        }
         _ => {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "supported scalar literal or constant identifier",
@@ -748,6 +767,7 @@ fn elaborate_nonlet_term(
     syntax: &Syntax,
     locals: &[(Name, Expr)],
     allow_string: bool,
+    environment: Option<&Environment>,
 ) -> Result<Expr, NatDefinitionElabError> {
     enum Task<'a> {
         Visit(&'a Syntax),
@@ -764,11 +784,11 @@ fn elaborate_nonlet_term(
                     continue;
                 }
                 let Syntax::Node { kind, .. } = term else {
-                    values.push(elaborate_atom(term, locals, allow_string)?);
+                    values.push(elaborate_atom(term, locals, allow_string, environment)?);
                     continue;
                 };
                 if kind != &parser_kind(&["Term", "app"]) {
-                    values.push(elaborate_atom(term, locals, allow_string)?);
+                    values.push(elaborate_atom(term, locals, allow_string, environment)?);
                     continue;
                 }
                 let parts = expect_node(
@@ -848,7 +868,7 @@ fn elaborate_term(
         bindings.push((name, binder_type, value));
         current = body;
     }
-    let mut expression = elaborate_nonlet_term(current, &locals, allow_string)?;
+    let mut expression = elaborate_nonlet_term(current, &locals, allow_string, environment)?;
     for (name, binder_type, value) in bindings.into_iter().rev() {
         expression = Expr::let_e(name, binder_type, value, expression, false);
     }
@@ -861,6 +881,10 @@ fn nat_const() -> Expr {
 
 fn string_const() -> Expr {
     Expr::const_(Name::from_components(["String"]), Vec::new())
+}
+
+fn bool_const() -> Expr {
+    Expr::const_(Name::from_components(["Bool"]), Vec::new())
 }
 
 fn environment_constant_type(name: &Name, environment: Option<&Environment>) -> Option<Expr> {
@@ -928,6 +952,13 @@ fn infer_expr_type(
             .rev()
             .nth(usize::try_from(*idx).ok()?)
             .map(|(_, ty)| ty.clone()),
+        ExprNode::Const { name, levels }
+            if levels.is_empty()
+                && (name == &Name::from_components(["Bool", "false"])
+                    || name == &Name::from_components(["Bool", "true"])) =>
+        {
+            Some(bool_const())
+        }
         ExprNode::Const { name, levels } if levels.is_empty() => {
             environment_constant_type(name, environment)
         }
@@ -1146,7 +1177,7 @@ mod tests {
     fn publish_test_axiom(environment: &Environment, name: &str, type_: Expr) -> Environment {
         let declaration = Declaration::Axiom(AxiomVal {
             base: ConstantVal {
-                name: Name::from_components([name]),
+                name: Name::from_components(name.split('.')),
                 level_params: Vec::new(),
                 type_,
             },
@@ -1679,6 +1710,91 @@ mod tests {
             panic!("the un-ascribed Nat command must elaborate to a definition");
         };
         assert_eq!(answer.base.type_, nat_ty);
+    }
+
+    #[test]
+    fn scalar_bool_literals_resolve_to_exact_constructor_names() {
+        let bool_ty = Expr::const_(Name::from_components(["Bool"]), Vec::new());
+        let env = publish_test_axiom(&nat_environment(), "Bool", Expr::sort(Level::one()));
+        let env = publish_test_axiom(&env, "Bool.false", bool_ty.clone());
+        let env = publish_test_axiom(&env, "Bool.true", bool_ty.clone());
+
+        for (spelling, expected) in [
+            ("true", "Bool.true"),
+            ("false", "Bool.false"),
+            ("Bool.true", "Bool.true"),
+            ("Bool.false", "Bool.false"),
+        ] {
+            let source = format!("def answer := {spelling}");
+            let parsed = parse_definition(source.as_bytes())
+                .expect("the bounded parser accepts a Bool constructor reference");
+            let Declaration::Defn(definition) = elaborate_definition_in(parsed.syntax(), &env)
+                .expect("the bounded scalar elaborator resolves the Bool constructor")
+            else {
+                panic!("the Bool literal command must elaborate to a definition");
+            };
+            assert_eq!(definition.base.type_, bool_ty, "source spelling {spelling}");
+            assert!(matches!(
+                definition.value.node(),
+                ExprNode::Const { name, levels }
+                    if name.to_display_string() == expected && levels.is_empty()
+            ));
+
+            let Declaration::Defn(without_environment) = elaborate_definition(parsed.syntax())
+                .expect("the environment-free helper still constructs a coherent candidate")
+            else {
+                panic!("the environment-free Bool command must elaborate to a definition");
+            };
+            assert_eq!(
+                without_environment.base.type_, bool_ty,
+                "source spelling {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_literal_resolution_never_overrides_a_local_or_checked_global() {
+        let parsed = parse_definition(b"def keep (true : Nat) := true")
+            .expect("a parameter named true remains source-spellable");
+        let Declaration::Defn(local) = elaborate_definition(parsed.syntax())
+            .expect("a local named true takes precedence over exported Bool.true")
+        else {
+            panic!("the local-precedence command must elaborate to a definition");
+        };
+        let ExprNode::Lam { body, .. } = local.value.node() else {
+            panic!("the checked local must become a lambda");
+        };
+        assert!(matches!(body.node(), ExprNode::BVar { idx } if *idx == 0));
+
+        let nat_ty = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let env = publish_test_axiom(&nat_environment(), "true", nat_ty.clone());
+        let parsed = parse_definition(b"def answer := true")
+            .expect("an exact checked global named true remains source-spellable");
+        let Declaration::Defn(global) = elaborate_definition_in(parsed.syntax(), &env)
+            .expect("the exact checked global takes precedence over exported Bool.true")
+        else {
+            panic!("the global-precedence command must elaborate to a definition");
+        };
+        assert_eq!(global.base.type_, nat_ty);
+        assert!(matches!(
+            global.value.node(),
+            ExprNode::Const { name, levels }
+                if name.to_display_string() == "true" && levels.is_empty()
+        ));
+
+        let parsed = parse_nat_definition(b"def answer := true")
+            .expect("the legacy Nat door still parses an ordinary identifier");
+        let Declaration::Defn(legacy) = elaborate_nat_definition(parsed.syntax())
+            .expect("the legacy Nat door does not acquire Bool literal semantics")
+        else {
+            panic!("the legacy Nat command must elaborate to a definition");
+        };
+        assert_eq!(legacy.base.type_, nat_ty);
+        assert!(matches!(
+            legacy.value.node(),
+            ExprNode::Const { name, levels }
+                if name.to_display_string() == "true" && levels.is_empty()
+        ));
     }
 
     #[test]
