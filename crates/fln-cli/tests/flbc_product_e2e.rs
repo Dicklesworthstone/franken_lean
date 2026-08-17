@@ -74,7 +74,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     );
     assert!(produced.stderr.is_empty());
     let stdout = utf8(&produced.stdout);
-    assert!(stdout.contains("\"schema\":\"fln.source-run/7\""));
+    assert!(stdout.contains("\"schema\":\"fln.source-run/8\""));
     assert!(stdout.contains("\"commands\":3"));
     assert!(stdout.contains("\"definitions\":2"));
     assert!(stdout.contains("\"evaluations\":1"));
@@ -94,38 +94,84 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(consumed.stderr.is_empty());
     assert!(utf8(&consumed.stdout).contains("\"returnValue\":42"));
 
-    let nonterminal_eval = root.join("NonterminalEval.lean");
-    let nonterminal_product = root.join("NonterminalEval.flbc");
+    let interleaved_eval = root.join("InterleavedEval.lean");
+    let interleaved_product = root.join("InterleavedEval.flbc");
     std::fs::write(
-        &nonterminal_eval,
+        &interleaved_eval,
         b"#eval Nat.add 40 2\ndef later : Nat := 7\n",
     )
-    .expect("write a nonterminal bounded evaluation");
-    let nonterminal = run_fln(&[
+    .expect("write an evaluation followed by a definition");
+    let interleaved = run_fln(&[
         Path::new("run"),
         Path::new("--json"),
         Path::new("--emit-flbc"),
-        &nonterminal_product,
-        &nonterminal_eval,
+        &interleaved_product,
+        &interleaved_eval,
     ]);
-    assert!(!nonterminal.status.success());
-    assert!(nonterminal.stdout.is_empty());
-    let nonterminal_stderr = utf8(&nonterminal.stderr);
-    assert!(nonterminal_stderr.contains("\"class\":\"execution\""));
-    assert!(nonterminal_stderr.contains("must be the final command"));
+    assert!(
+        interleaved.status.success(),
+        "interleaved #eval stderr: {}",
+        utf8(&interleaved.stderr)
+    );
+    assert!(interleaved.stderr.is_empty());
+    let interleaved_stdout = utf8(&interleaved.stdout);
+    assert!(interleaved_stdout.contains("\"commands\":2"));
+    assert!(interleaved_stdout.contains("\"definitions\":1"));
+    assert!(interleaved_stdout.contains("\"evaluations\":1"));
+    assert!(
+        interleaved_stdout
+            .contains("\"evaluationResults\":[{\"command\":0,\"kind\":\"nat\",\"value\":42}]")
+    );
+    assert!(interleaved_stdout.contains("\"finalValue\":7"));
+    let pristine_product =
+        std::fs::read(&interleaved_product).expect("read the interleaved final product");
+    let consumed_interleaved = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &interleaved_product,
+    ]);
+    assert!(
+        consumed_interleaved.status.success(),
+        "interleaved consumer stderr: {}",
+        utf8(&consumed_interleaved.stderr)
+    );
+    assert!(consumed_interleaved.stderr.is_empty());
+    assert!(utf8(&consumed_interleaved.stdout).contains("\"returnValue\":7"));
+
+    let failed_product = root.join("FailedInterleavedEval.flbc");
+    std::fs::write(
+        &interleaved_eval,
+        b"#eval Nat.add 40 2\ndef later : Nat := missing\n",
+    )
+    .expect("plant a later checked-definition failure");
+    let failed_interleaved = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &failed_product,
+        &interleaved_eval,
+    ]);
+    assert!(!failed_interleaved.status.success());
+    assert!(failed_interleaved.stdout.is_empty());
+    assert!(utf8(&failed_interleaved.stderr).contains("\"class\":\"execution\""));
     assert!(matches!(
-        std::fs::symlink_metadata(&nonterminal_product),
+        std::fs::symlink_metadata(&failed_product),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     ));
 
-    std::fs::write(&nonterminal_eval, b"#eval Nat.add 40 2\n")
-        .expect("repair the bounded evaluation into terminal position");
+    let recovered_product = root.join("RecoveredInterleavedEval.flbc");
+    std::fs::write(
+        &interleaved_eval,
+        b"#eval Nat.add 40 2\ndef later : Nat := 7\n",
+    )
+    .expect("restore the interleaved source bytes");
     let recovered_eval = run_fln(&[
         Path::new("run"),
         Path::new("--json"),
         Path::new("--emit-flbc"),
-        &nonterminal_product,
-        &nonterminal_eval,
+        &recovered_product,
+        &interleaved_eval,
     ]);
     assert!(
         recovered_eval.status.success(),
@@ -134,10 +180,14 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     );
     assert!(recovered_eval.stderr.is_empty());
     let recovered_stdout = utf8(&recovered_eval.stdout);
-    assert!(recovered_stdout.contains("\"commands\":1"));
-    assert!(recovered_stdout.contains("\"definitions\":0"));
+    assert!(recovered_stdout.contains("\"commands\":2"));
+    assert!(recovered_stdout.contains("\"definitions\":1"));
     assert!(recovered_stdout.contains("\"evaluations\":1"));
-    assert!(recovered_stdout.contains("\"finalValue\":42"));
+    assert!(recovered_stdout.contains("\"finalValue\":7"));
+    assert_eq!(
+        std::fs::read(&recovered_product).expect("read the recovered final product"),
+        pristine_product
+    );
 
     let empty_entry = root.join("EmptyEntry.lean");
     let empty_entry_product = root.join("EmptyEntry.flbc");
@@ -341,7 +391,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     ]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/7\""));
+    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/8\""));
     assert!(matches!(
         std::fs::symlink_metadata(&failed_product),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -361,7 +411,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(produced.stderr.is_empty());
     let producer_stdout = utf8(&produced.stdout);
-    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/7\""));
+    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/8\""));
     assert!(producer_stdout.contains("\"definitions\":3"));
     assert!(producer_stdout.contains("\"finalValue\":42"));
     assert!(producer_stdout.contains("\"emittedFlbc\":{"));
@@ -674,7 +724,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     );
     assert!(first.stderr.is_empty());
     let first_stdout = utf8(&first.stdout);
-    assert!(first_stdout.contains("\"schema\":\"fln.source-run/7\""));
+    assert!(first_stdout.contains("\"schema\":\"fln.source-run/8\""));
     assert!(first_stdout.contains("\"finalValue\":42"));
     assert!(first_stdout.contains("\"emittedSidecar\":{"));
     assert!(first_stdout.contains("\"profile\":\"standard\""));

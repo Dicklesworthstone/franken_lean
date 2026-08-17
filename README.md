@@ -281,16 +281,16 @@ intrinsics. Nat literals and results use the Marrow ABI's canonical
 tagged-scalar-or-positive-mpz representation, including direct source literals larger
 than 64 bits; they cross dependent definitions and emitted FLBC products without
 narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceiling.
-The `fln.source-run/7` robot result binds that runtime value back to the checked
+The `fln.source-run/8` robot result binds runtime values back to their checked
 source result type, so Bool results remain JSON booleans instead of being mislabeled
-as Nat, and reports definition and evaluation counts separately. The ordinary
-`#eval <bounded-term>` spelling is live in terminal command position: the parser
-builds the pin's `Lean.Parser.Command.eval` tree, the bounded expression
-elaborator gives it an unspellable generated declaration identity, and it
-crosses the same K1, independent-checker, compiler, canonical-FLBC, and Golem
-path as a bounded `def`. No fabricated `def` source is reparsed, and there is no
-second evaluator. This is not yet general command elaboration or support for
-nonterminal/effectful `#eval`.
+as Nat, reports definition and evaluation counts separately, and retains every
+ordered `#eval` command result even when later definitions or evaluations follow.
+The parser builds the pin's `Lean.Parser.Command.eval` tree, the bounded
+expression elaborator gives it an unspellable generated declaration identity,
+and it crosses the same K1, independent-checker, compiler, canonical-FLBC, and
+Golem path as a bounded `def`. No fabricated `def` source is reparsed, and there
+is no second evaluator. This is not yet general command elaboration or support
+for effectful `#eval`.
 A standalone FLBC scalar remains type-erased and is reported only by its
 runtime kind because the current artifact carries no source-result type witness.
 The facade also retains explicit

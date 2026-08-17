@@ -42,7 +42,7 @@ const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/7";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/8";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
@@ -81,7 +81,7 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String/Bool definitions and one terminal bounded #eval, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
+    "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
     "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
     "import set. In the latter form the last path is the entry, `import A.B` binds\n",
     "only a supplied path ending in A/B.lean. Dependency order is derived, then\n",
@@ -2849,6 +2849,7 @@ struct SourceSuccess<'a> {
     commands: usize,
     definitions: usize,
     evaluations: usize,
+    evaluation_results: Vec<SourceEvaluationResult>,
     source_bytes: usize,
     final_value: SourceFinalValue,
     flbc_bytes: usize,
@@ -2868,6 +2869,12 @@ enum SourceFinalValue {
     Nat(String),
     String(String),
     Bool(bool),
+}
+
+#[derive(Debug)]
+struct SourceEvaluationResult {
+    command: usize,
+    value: SourceFinalValue,
 }
 
 impl SourceFinalValue {
@@ -2899,6 +2906,39 @@ impl std::fmt::Display for SourceFinalValue {
 }
 
 fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOutput {
+    let evaluation_results_json = format!(
+        "[{}]",
+        result
+            .evaluation_results
+            .iter()
+            .map(|evaluation| {
+                format!(
+                    "{{\"command\":{},\"kind\":{},\"value\":{}}}",
+                    evaluation.command,
+                    json_string(evaluation.value.kind()),
+                    evaluation.value.json(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let evaluation_results_human = if result.evaluation_results.is_empty() {
+        "evaluation results: none\n".to_owned()
+    } else {
+        let rows = result
+            .evaluation_results
+            .iter()
+            .map(|evaluation| {
+                format!(
+                    "  command {} ({}): {}\n",
+                    evaluation.command,
+                    evaluation.value.kind(),
+                    evaluation.value,
+                )
+            })
+            .collect::<String>();
+        format!("evaluation results:\n{rows}")
+    };
     let emitted_flbc_json = result.emitted_flbc.map_or_else(
         || "null".to_owned(),
         |(path, bytes)| {
@@ -2929,6 +2969,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
                 "\"commands\":{},\"definitions\":{},\"evaluations\":{},",
+                "\"evaluationResults\":{},",
                 "\"sourceBytes\":{},\"finalKind\":{},\"finalValue\":{},",
                 "\"flbcBytes\":{},\"emittedFlbc\":{},\"emittedSidecar\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
@@ -2941,6 +2982,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.commands,
             result.definitions,
             result.evaluations,
+            evaluation_results_json,
             result.source_bytes,
             json_string(result.final_value.kind()),
             result.final_value.json(),
@@ -2984,6 +3026,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
                 "commands: {}\n",
                 "definitions: {}\n",
                 "evaluations: {}\n",
+                "{}",
                 "final value: {}\n",
                 "source bytes: {}\n",
                 "canonical FLBC bytes: {} total\n",
@@ -2997,6 +3040,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             result.commands,
             result.definitions,
             result.evaluations,
+            evaluation_results_human,
             result.final_value,
             result.source_bytes,
             result.flbc_bytes,
@@ -3285,7 +3329,7 @@ where
         source_refs = ordered;
     }
     let commands = completed.executions.len();
-    let evaluations = completed.source_evaluations;
+    let evaluations = completed.source_evaluation_indices.len();
     let Some(definitions) = commands.checked_sub(evaluations) else {
         return source_failure(
             "internal-fault",
@@ -3343,6 +3387,59 @@ where
                 );
             }
         }
+    }
+    let mut evaluation_results = Vec::new();
+    if evaluation_results.try_reserve_exact(evaluations).is_err() {
+        return source_failure(
+            "resource",
+            "could not reserve the source evaluation result table",
+            false,
+            json,
+            3,
+        );
+    }
+    let mut previous_evaluation = None;
+    for &index in &completed.source_evaluation_indices {
+        if index >= commands || previous_evaluation.is_some_and(|previous| previous >= index) {
+            return source_failure(
+                "internal-fault",
+                "engine returned invalid source evaluation command indices",
+                false,
+                json,
+                4,
+            );
+        }
+        previous_evaluation = Some(index);
+        let Some(execution) = completed.executions.get(index) else {
+            return source_failure(
+                "internal-fault",
+                "engine returned a source evaluation index outside the execution table",
+                false,
+                json,
+                4,
+            );
+        };
+        let value = match closed_source_cli_value(&execution.declaration, &execution.exit) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return source_failure(
+                    "execution",
+                    &format!(
+                        "evaluation command {index} did not produce a closed Nat, String, or Bool value"
+                    ),
+                    true,
+                    json,
+                    1,
+                );
+            }
+            Err(error) => {
+                return source_failure("internal-fault", &error.to_string(), false, json, 4);
+            }
+        };
+        evaluation_results.push(SourceEvaluationResult {
+            command: index,
+            value,
+        });
     }
     let base_root = completed.base_logical_root.to_string();
     let result_root = completed.result_logical_root.to_string();
@@ -3441,6 +3538,7 @@ where
             commands,
             definitions,
             evaluations,
+            evaluation_results,
             source_bytes,
             final_value,
             flbc_bytes,
@@ -5202,10 +5300,40 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
         assert!(output.stdout.contains("\"finalKind\":\"bool\""));
         assert!(output.stdout.contains("\"finalValue\":true"));
         assert!(!output.stdout.contains("\"finalValue\":1"));
+    }
+
+    #[test]
+    fn source_run_reports_every_interleaved_evaluation_in_command_order() {
+        let source = b"#eval Nat.add 40 2\ndef keep : Nat := 7\n#eval Nat.beq keep 7\ndef answer : Nat := Nat.add keep 2".to_vec();
+        let robot = execute_source_bytes(vec![source.clone()], true);
+
+        assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
+        assert!(robot.stderr.is_empty());
+        assert!(robot.stdout.contains("\"schema\":\"fln.source-run/8\""));
+        assert!(robot.stdout.contains("\"commands\":4"));
+        assert!(robot.stdout.contains("\"definitions\":2"));
+        assert!(robot.stdout.contains("\"evaluations\":2"));
+        assert!(robot.stdout.contains(concat!(
+            "\"evaluationResults\":[",
+            "{\"command\":0,\"kind\":\"nat\",\"value\":42},",
+            "{\"command\":2,\"kind\":\"bool\",\"value\":true}]"
+        )));
+        assert!(robot.stdout.contains("\"finalKind\":\"nat\""));
+        assert!(robot.stdout.contains("\"finalValue\":9"));
+
+        let human = execute_source_bytes(vec![source], false);
+        assert_eq!(human.exit_code, 0, "{}", human.stderr);
+        assert!(human.stderr.is_empty());
+        assert!(human.stdout.contains(concat!(
+            "evaluation results:\n",
+            "  command 0 (nat): 42\n",
+            "  command 2 (bool): true\n"
+        )));
+        assert!(human.stdout.contains("final value: 9\n"));
     }
 
     #[test]
@@ -5238,7 +5366,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
         assert!(output.stdout.contains("\"definitions\":2"));
         assert!(output.stdout.contains("\"finalKind\":\"string\""));
         assert!(output.stdout.contains("\"finalValue\":\"cli\\nconnected\""));
@@ -5320,7 +5448,7 @@ mod tests {
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
         assert_eq!(publications, vec![(target, expected.clone())]);
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
         assert!(
             output
                 .stdout
@@ -5797,7 +5925,7 @@ mod tests {
         assert_eq!(help.exit_code, 0);
         assert!(help.stdout.starts_with("Usage:\n  fln check-olean"));
         assert!(help.stdout.contains("\n  fln run"));
-        assert!(help.stdout.contains("one terminal bounded #eval"));
+        assert!(help.stdout.contains("ordered bounded #eval commands"));
         assert!(
             help.stdout
                 .contains("final command's exact executed artifact")

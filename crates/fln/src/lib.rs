@@ -3045,21 +3045,28 @@ impl Engine {
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         let command_count = commands.len();
-        let mut evaluation_count = 0_usize;
+        let mut evaluation_indices = Vec::new();
         let outcome = self.execute_batch(command_count, options, |engine, index| {
             let (original_offset, source) = commands[index];
             let parsed = fln_parse::parse_source_command(source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
-            if parsed.kind() == fln_parse::SourceCommandKind::Evaluation
-                && index.saturating_add(1) != command_count
-            {
-                return Err(EngineExecutionError::NonterminalEvaluation { index });
-            }
             let declaration = if parsed.kind() == fln_parse::SourceCommandKind::Evaluation {
+                let requested = evaluation_indices.len().checked_add(1).ok_or(
+                    EngineExecutionError::AllocationFailure {
+                        resource: "source evaluation command index table",
+                        requested: usize::MAX,
+                    },
+                )?;
+                evaluation_indices.try_reserve(1).map_err(|_| {
+                    EngineExecutionError::AllocationFailure {
+                        resource: "source evaluation command index table",
+                        requested,
+                    }
+                })?;
+                evaluation_indices.push(index);
                 let name = fresh_evaluation_name(engine.environment(), index)?;
-                evaluation_count = evaluation_count.saturating_add(1);
                 fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?
@@ -3072,7 +3079,7 @@ impl Engine {
         })?;
         Ok(match outcome {
             Outcome::Complete(mut completed) => {
-                completed.source_evaluations = evaluation_count;
+                completed.source_evaluation_indices = evaluation_indices;
                 Outcome::Complete(completed)
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -3141,7 +3148,7 @@ impl Engine {
             result_logical_root,
             executions,
             source_module_order: Vec::new(),
-            source_evaluations: 0,
+            source_evaluation_indices: Vec::new(),
         }))
     }
 
@@ -4657,9 +4664,10 @@ pub struct DefinitionBatchExecution {
     /// Canonical dependency order for a closed source-module execution.
     /// Empty for declaration batches and legacy caller-ordered source batches.
     pub source_module_order: Vec<Name>,
-    /// Number of terminal `#eval` commands lowered through checked generated
-    /// definitions. Zero for already-elaborated and definition-only batches.
-    pub source_evaluations: usize,
+    /// Strictly increasing execution indices for source `#eval` commands
+    /// lowered through checked generated definitions. Empty for
+    /// already-elaborated and definition-only batches.
+    pub source_evaluation_indices: Vec<usize>,
 }
 
 const SOURCE_RUN_EPOCH_ID: EpochId = EpochId::new(4_032_000);
@@ -5078,9 +5086,6 @@ pub enum EngineExecutionError {
         index: usize,
         error: Box<EngineExecutionError>,
     },
-    NonterminalEvaluation {
-        index: usize,
-    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5199,10 +5204,6 @@ impl fmt::Display for EngineExecutionError {
                     "definition batch command {index} failed: {error}"
                 )
             }
-            Self::NonterminalEvaluation { index } => write!(
-                formatter,
-                "bounded #eval command {index} must be the final command in its closed source batch"
-            ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
                 write!(
@@ -8550,6 +8551,7 @@ mod tests {
         };
 
         assert_eq!(completed.executions.len(), 2);
+        assert_eq!(completed.source_evaluation_indices, vec![1]);
         let Declaration::Defn(evaluation) = &completed.executions[1].declaration else {
             panic!("evaluation was not a definition"); // ubs:ignore — test-only diagnostic.
         };
@@ -8565,7 +8567,7 @@ mod tests {
     }
 
     #[test]
-    fn nonterminal_evaluation_is_atomic_and_the_same_term_recovers_when_terminal() {
+    fn interleaved_evaluations_are_ordered_and_later_failure_remains_atomic() {
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the bounded source seed reaches both council seats")
             .into_complete()
@@ -8574,30 +8576,51 @@ mod tests {
         let base_root = engine.logical_root(&options);
         let refusal = engine
             .execute_source_definitions(
-                &[b"#eval Nat.add 40 2\ndef answer := 7"],
+                &[b"#eval Nat.add 40 2\ndef answer := missing"],
                 &options,
                 test_limits(),
             )
-            .expect_err("the bounded facade executes only a terminal #eval");
+            .expect_err("a later definition refusal exposes no partial evaluation batch");
         assert!(matches!(
             refusal,
             EngineExecutionError::BatchCommand {
-                index: 0,
+                index: 1,
                 error,
-            } if matches!(*error, EngineExecutionError::NonterminalEvaluation { index: 0 })
+            } if matches!(*error, EngineExecutionError::KernelRejected { .. })
         ));
         assert_eq!(engine.logical_root(&options), base_root);
 
         let recovered = engine
-            .execute_source_definitions(&[b"#eval Nat.add 40 2"], &options, test_limits())
-            .expect("the same evaluation is supported in terminal position");
+            .execute_source_definitions(
+                &[b"#eval Nat.add 40 2\ndef answer := 7\n#eval Nat.add answer 1\ndef final := answer"],
+                &options,
+                test_limits(),
+            )
+            .expect("evaluations and definitions execute in one checked source order");
         let Outcome::Complete(recovered) = recovered else {
-            panic!("terminal recovery was not complete"); // ubs:ignore — test-only diagnostic.
+            panic!("interleaved recovery was not complete"); // ubs:ignore — test-only diagnostic.
         };
-        let VmExit::Returned(returned) = &recovered.executions[0].exit else {
-            panic!("recovered evaluation did not return"); // ubs:ignore — test-only diagnostic.
+        assert_eq!(recovered.executions.len(), 4);
+        assert_eq!(recovered.source_evaluation_indices, vec![0, 2]);
+        for pair in recovered.executions.windows(2) {
+            assert_eq!(pair[0].result_logical_root, pair[1].base_logical_root);
+        }
+        let Declaration::Defn(first_evaluation) = &recovered.executions[0].declaration else {
+            panic!("first evaluation was not a definition candidate"); // ubs:ignore — test-only diagnostic.
         };
-        assert_eq!(returned.value.unbox(), 42);
+        let Declaration::Defn(second_evaluation) = &recovered.executions[2].declaration else {
+            panic!("second evaluation was not a definition candidate"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(first_evaluation.base.name, Name::num(Name::anonymous(), 0));
+        assert_eq!(second_evaluation.base.name, Name::num(Name::anonymous(), 2));
+        let VmExit::Returned(first_returned) = &recovered.executions[0].exit else {
+            panic!("first recovered evaluation did not return"); // ubs:ignore — test-only diagnostic.
+        };
+        let VmExit::Returned(second_returned) = &recovered.executions[2].exit else {
+            panic!("second recovered evaluation did not return"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(first_returned.value.unbox(), 42);
+        assert_eq!(second_returned.value.unbox(), 8);
     }
 
     #[test]
