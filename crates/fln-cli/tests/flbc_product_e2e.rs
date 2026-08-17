@@ -95,6 +95,55 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(consumed.stderr.is_empty());
     assert!(utf8(&consumed.stdout).contains("\"returnValue\":42"));
 
+    let empty_entry = root.join("EmptyEntry.lean");
+    let empty_entry_product = root.join("EmptyEntry.flbc");
+    std::fs::write(&empty_entry, b"import Project.Base\n")
+        .expect("write imports-only entry module");
+    let empty_entry_run = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &empty_entry_product,
+        &base,
+        &empty_entry,
+    ]);
+    assert!(!empty_entry_run.status.success());
+    assert!(empty_entry_run.stdout.is_empty());
+    let empty_entry_stderr = utf8(&empty_entry_run.stderr);
+    assert!(empty_entry_stderr.contains("\"class\":\"module-graph\""));
+    assert!(empty_entry_stderr.contains("\"authority\":false"));
+    assert!(empty_entry_stderr.contains("contains no definition to execute"));
+    assert!(matches!(
+        std::fs::symlink_metadata(&empty_entry_product),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+
+    std::fs::write(
+        &empty_entry,
+        b"import Project.Base\ndef answer : Nat := Nat.add base 22\n",
+    )
+    .expect("repair entry module with an exact final definition");
+    let repaired_entry = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &empty_entry_product,
+        &base,
+        &empty_entry,
+    ]);
+    assert!(
+        repaired_entry.status.success(),
+        "repaired entry stderr: {}",
+        utf8(&repaired_entry.stderr)
+    );
+    assert!(repaired_entry.stderr.is_empty());
+    assert!(utf8(&repaired_entry.stdout).contains("\"finalValue\":42"));
+    assert!(
+        !std::fs::read(&empty_entry_product)
+            .expect("read repaired entry product")
+            .is_empty()
+    );
+
     let missing = root.join("MissingMain.lean");
     std::fs::write(&missing, b"import Project.Absent\ndef answer : Nat := 1\n")
         .expect("write open import graph");

@@ -2862,7 +2862,6 @@ impl Engine {
             }
             parsed.push(partitioned);
         }
-
         let mut dependencies = vec![Vec::new(); modules.len()];
         let mut remaining = vec![0_usize; modules.len()];
         let mut dependents = vec![Vec::new(); modules.len()];
@@ -2954,6 +2953,11 @@ impl Engine {
                     .filter(|(index, _)| remaining[*index] != 0)
                     .map(|(_, module)| module.name.clone())
                     .collect(),
+            });
+        }
+        if parsed[entry_index].commands.is_empty() {
+            return Err(EngineExecutionError::EmptySourceEntry {
+                module: entry.clone(),
             });
         }
 
@@ -4984,6 +4988,9 @@ pub enum EngineExecutionError {
     MissingSourceEntry {
         module: Name,
     },
+    EmptySourceEntry {
+        module: Name,
+    },
     MissingSourceImports {
         module: Name,
         imports: Vec<Name>,
@@ -5077,6 +5084,11 @@ impl fmt::Display for EngineExecutionError {
             Self::MissingSourceEntry { module } => write!(
                 formatter,
                 "source entry module `{}` is absent from the closed set",
+                module.to_display_string()
+            ),
+            Self::EmptySourceEntry { module } => write!(
+                formatter,
+                "source entry module `{}` contains no definition to execute",
                 module.to_display_string()
             ),
             Self::MissingSourceImports { module, imports } => write!(
@@ -9786,6 +9798,70 @@ mod tests {
     }
 
     #[test]
+    fn closed_source_modules_require_a_definition_in_the_entry_only() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let main = Name::from_components(["Main"]);
+        let dependency = Name::from_components(["Dependency"]);
+        let empty_entry = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Dependency\n",
+            },
+            SourceModuleInput {
+                name: &dependency,
+                source: b"def dependency : Nat := 42",
+            },
+        ];
+        let base_root = engine.logical_root(&options);
+
+        let error = engine
+            .execute_source_modules(&empty_entry, &main, &options, test_limits())
+            .expect_err("a dependency result must not masquerade as the entry product");
+        assert_eq!(
+            error,
+            EngineExecutionError::EmptySourceEntry {
+                module: main.clone(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "source entry module `Main` contains no definition to execute"
+        );
+        assert_eq!(engine.logical_root(&options), base_root);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["dependency"]))
+        );
+
+        let empty_dependency = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Dependency\ndef answer : Nat := 42",
+            },
+            SourceModuleInput {
+                name: &dependency,
+                source: b"",
+            },
+        ];
+        let completed = engine
+            .execute_source_modules(&empty_dependency, &main, &options, test_limits())
+            .expect("only the entry needs an executable product")
+            .into_complete()
+            .expect("the repaired entry answers completely");
+        assert_eq!(completed.executions.len(), 1);
+        assert_eq!(completed.source_module_order, [dependency, main]);
+        assert!(matches!(completed.executions[0].exit, VmExit::Returned(_)));
+        if let VmExit::Returned(returned) = &completed.executions[0].exit {
+            assert_eq!(returned.value.unbox(), 42);
+        }
+    }
+
+    #[test]
     fn source_modules_cannot_borrow_declarations_from_unimported_siblings() {
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the bounded source seed reaches both council seats")
@@ -9926,6 +10002,15 @@ mod tests {
         }];
         assert!(matches!(
             engine.execute_source_modules(&missing, &main, &options, test_limits()),
+            Err(EngineExecutionError::MissingSourceImports { module, imports })
+                if module == main && imports == vec![Name::from_components(["Absent"])]
+        ));
+        let empty_missing = [SourceModuleInput {
+            name: &main,
+            source: b"import Absent\n",
+        }];
+        assert!(matches!(
+            engine.execute_source_modules(&empty_missing, &main, &options, test_limits()),
             Err(EngineExecutionError::MissingSourceImports { module, imports })
                 if module == main && imports == vec![Name::from_components(["Absent"])]
         ));

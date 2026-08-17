@@ -3063,6 +3063,7 @@ fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static s
         fln::EngineExecutionError::ImportsRequireResolver { .. }
         | fln::EngineExecutionError::DuplicateSourceModule { .. }
         | fln::EngineExecutionError::MissingSourceEntry { .. }
+        | fln::EngineExecutionError::EmptySourceEntry { .. }
         | fln::EngineExecutionError::MissingSourceImports { .. }
         | fln::EngineExecutionError::UnreachableSourceModules { .. }
         | fln::EngineExecutionError::SourceModuleCycle { .. }
@@ -5685,6 +5686,13 @@ mod tests {
         };
         assert_eq!(
             execution_error_disposition(&open_graph),
+            ("module-graph", false, 1)
+        );
+        let empty_entry = fln::EngineExecutionError::EmptySourceEntry {
+            module: fln::Name::from_components(["Main"]),
+        };
+        assert_eq!(
+            execution_error_disposition(&empty_entry),
             ("module-graph", false, 1)
         );
         let module_budget = fln::EngineExecutionError::SourceModuleLimit {

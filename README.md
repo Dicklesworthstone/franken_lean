@@ -295,7 +295,10 @@ now live: embedders can pass a caller-named closed `SourceModuleInput` set, whil
 duplicate, cyclic, or entry-unreachable modules before elaboration. It also
 checks every completed declaration against the graph's transitive visibility,
 so dependency order cannot let one sibling borrow definitions from another
-sibling it did not import. This is not automatic project-root/`LEAN_PATH`
+sibling it did not import. Import-only dependency modules remain valid graph
+rows, while the selected entry must contain a definition so a dependency's
+result can never be reported or published as the entry product. This is not
+automatic project-root/`LEAN_PATH`
 discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 

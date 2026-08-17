@@ -999,9 +999,17 @@ pub fn partition_source_module(
         }
     };
 
-    let body_start = definition_start.unwrap_or(if imports.is_empty() { 0 } else { source.len() });
-    let mut commands = partition_definition_commands(&source[body_start..])
-        .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
+    let (body_start, mut commands) = if let Some(body_start) = definition_start {
+        let commands = partition_definition_commands(&source[body_start..])
+            .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
+        (body_start, commands)
+    } else {
+        // The header loop already refuses every non-trivia token other than
+        // `import` or `def`. Reaching EOF without `def` is therefore a valid
+        // zero-definition module, not one empty command for the definition
+        // parser to reject.
+        (source.len(), Vec::new())
+    };
     for (offset, _) in &mut commands {
         offset.0 = offset.0.saturating_add(body_start);
     }
@@ -1088,6 +1096,31 @@ mod nat_definition_tests {
             &source[module.commands[1].0.0..module.commands[1].0.0 + module.commands[1].1.len()],
             module.commands[1].1
         );
+    }
+
+    #[test]
+    fn source_module_header_reports_zero_commands_for_an_import_only_module() {
+        let module = partition_source_module(
+            b"import Foundation.Nat\n\n-- importing a module is itself a valid Lean module\n",
+        )
+        .expect("an import-only module has a complete bounded header");
+
+        assert_eq!(
+            module.imports,
+            vec![Name::from_components(["Foundation", "Nat"])]
+        );
+        assert!(module.commands.is_empty());
+
+        let empty = partition_source_module(b"").expect("an empty module contains no commands");
+        assert!(empty.imports.is_empty());
+        assert!(empty.commands.is_empty());
+
+        let unsupported = partition_source_module(b"theorem answer : Nat := 42")
+            .expect_err("unsupported source without imports must still reach typed refusal");
+        assert!(matches!(
+            unsupported,
+            NatDefinitionParseError::OutsideSeedGrammar { .. }
+        ));
     }
 
     #[test]
