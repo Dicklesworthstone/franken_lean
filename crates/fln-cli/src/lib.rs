@@ -42,7 +42,7 @@ const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/6";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/7";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
@@ -81,14 +81,14 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String/Bool definitions, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
+    "`run` executes supported Nat/String/Bool definitions and one terminal bounded #eval, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
     "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
     "import set. In the latter form the last path is the entry, `import A.B` binds\n",
-    "only a supplied path ending in A/B.lean, and dependency order is derived.\n",
-    "through the native parser, elaborator, K1, independent checker, compiler,\n",
-    "and Golem. The final path must produce a closed Nat, String, or Bool result to report. The\n",
+    "only a supplied path ending in A/B.lean. Dependency order is derived, then\n",
+    "every command crosses the native parser, elaborator, K1, independent checker,\n",
+    "compiler, and Golem. The final command must produce a closed Nat, String, or Bool result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
-    "--emit-flbc, the final definition's exact executed artifact is published\n",
+    "--emit-flbc, the final command's exact executed artifact is published\n",
     "only after the whole batch succeeds; any existing PATH is refused, never\n",
     "replaced. --emit-sidecar requires\n",
     "--emit-flbc and publishes a standard-profile closure manifest before the\n",
@@ -2846,7 +2846,9 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
 }
 
 struct SourceSuccess<'a> {
+    commands: usize,
     definitions: usize,
+    evaluations: usize,
     source_bytes: usize,
     final_value: SourceFinalValue,
     flbc_bytes: usize,
@@ -2926,16 +2928,19 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
-                "\"definitions\":{},\"sourceBytes\":{},\"finalKind\":{},\"finalValue\":{},",
+                "\"commands\":{},\"definitions\":{},\"evaluations\":{},",
+                "\"sourceBytes\":{},\"finalKind\":{},\"finalValue\":{},",
                 "\"flbcBytes\":{},\"emittedFlbc\":{},\"emittedSidecar\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
-                "\"checker\":{{\"definitions\":{},\"finalSchema\":{},",
+                "\"checker\":{{\"admissions\":{},\"finalSchema\":{},",
                 "\"finalGround\":{}}},",
                 "\"finalExecution\":{{\"steps\":{},\"systemPolls\":{},",
                 "\"peakStackDepth\":{}}}}}\n"
             ),
             json_string(SOURCE_RUN_SCHEMA),
+            result.commands,
             result.definitions,
+            result.evaluations,
             result.source_bytes,
             json_string(result.final_value.kind()),
             result.final_value.json(),
@@ -2944,7 +2949,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             emitted_sidecar_json,
             json_string(result.base_root),
             json_string(result.result_root),
-            result.definitions,
+            result.commands,
             json_string(result.checker_schema),
             json_string(result.checker_ground),
             result.steps,
@@ -2976,7 +2981,9 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
         format!(
             concat!(
                 "native source batch: complete\n",
+                "commands: {}\n",
                 "definitions: {}\n",
+                "evaluations: {}\n",
                 "final value: {}\n",
                 "source bytes: {}\n",
                 "canonical FLBC bytes: {} total\n",
@@ -2984,10 +2991,12 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
                 "{}",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
-                "independent checker: {} definitions agreed; final {} ({})\n",
+                "independent checker: {} admissions agreed; final {} ({})\n",
                 "final execution: {} steps, {} system polls, peak stack {}\n"
             ),
+            result.commands,
             result.definitions,
+            result.evaluations,
             result.final_value,
             result.source_bytes,
             result.flbc_bytes,
@@ -2995,7 +3004,7 @@ fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOu
             emitted_sidecar,
             result.base_root,
             result.result_root,
-            result.definitions,
+            result.commands,
             result.checker_schema,
             result.checker_ground,
             result.steps,
@@ -3275,7 +3284,17 @@ where
         }
         source_refs = ordered;
     }
-    let definitions = completed.executions.len();
+    let commands = completed.executions.len();
+    let evaluations = completed.source_evaluations;
+    let Some(definitions) = commands.checked_sub(evaluations) else {
+        return source_failure(
+            "internal-fault",
+            "source evaluation count exceeded completed command count",
+            false,
+            json,
+            4,
+        );
+    };
     let Some(final_execution) = completed.executions.last() else {
         return source_failure(
             "internal-fault",
@@ -3343,7 +3362,7 @@ where
             Ok(None) => {
                 return source_failure(
                     "execution",
-                    "final definition did not produce a closed Nat, String, or Bool value",
+                    "final command did not produce a closed Nat, String, or Bool value",
                     true,
                     json,
                     1,
@@ -3419,7 +3438,9 @@ where
     };
     render_source_success(
         SourceSuccess {
+            commands,
             definitions,
+            evaluations,
             source_bytes,
             final_value,
             flbc_bytes,
@@ -5044,7 +5065,9 @@ mod tests {
         );
         assert!(robot.stdout.contains("\"outcome\":\"complete\""));
         assert!(robot.stdout.contains("\"authority\":true"));
+        assert!(robot.stdout.contains("\"commands\":1"));
         assert!(robot.stdout.contains("\"definitions\":1"));
+        assert!(robot.stdout.contains("\"evaluations\":0"));
         assert!(robot.stdout.contains("\"finalValue\":0"));
         assert!(
             robot
@@ -5066,10 +5089,12 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
+        assert!(output.stdout.contains("\"commands\":2"));
         assert!(output.stdout.contains("\"definitions\":2"));
+        assert!(output.stdout.contains("\"evaluations\":0"));
         assert!(output.stdout.contains("\"sourceBytes\":28"));
         assert!(output.stdout.contains("\"finalValue\":0"));
-        assert!(output.stdout.contains("\"definitions\":2,\"finalSchema\""));
+        assert!(output.stdout.contains("\"admissions\":2,\"finalSchema\""));
 
         let exhausted = run([
             OsString::from("run"),
@@ -5177,7 +5202,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
         assert!(output.stdout.contains("\"finalKind\":\"bool\""));
         assert!(output.stdout.contains("\"finalValue\":true"));
         assert!(!output.stdout.contains("\"finalValue\":1"));
@@ -5213,7 +5238,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
         assert!(output.stdout.contains("\"definitions\":2"));
         assert!(output.stdout.contains("\"finalKind\":\"string\""));
         assert!(output.stdout.contains("\"finalValue\":\"cli\\nconnected\""));
@@ -5295,7 +5320,7 @@ mod tests {
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
         assert_eq!(publications, vec![(target, expected.clone())]);
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/6\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/7\""));
         assert!(
             output
                 .stdout
@@ -5593,7 +5618,7 @@ mod tests {
         assert!(
             output
                 .stderr
-                .contains("final definition did not produce a closed Nat, String, or Bool value")
+                .contains("final command did not produce a closed Nat, String, or Bool value")
         );
     }
 
@@ -5772,6 +5797,11 @@ mod tests {
         assert_eq!(help.exit_code, 0);
         assert!(help.stdout.starts_with("Usage:\n  fln check-olean"));
         assert!(help.stdout.contains("\n  fln run"));
+        assert!(help.stdout.contains("one terminal bounded #eval"));
+        assert!(
+            help.stdout
+                .contains("final command's exact executed artifact")
+        );
         assert!(help.stdout.contains("fln olean diff"));
         assert!(help.stdout.contains("fln ilean inspect"));
 

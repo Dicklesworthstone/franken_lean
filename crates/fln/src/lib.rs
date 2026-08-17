@@ -3016,13 +3016,50 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_batch(commands.len(), options, |engine, index| {
+        let command_count = commands.len();
+        let mut evaluation_count = 0_usize;
+        let outcome = self.execute_batch(command_count, options, |engine, index| {
             let (original_offset, source) = commands[index];
-            let parsed = fln_parse::parse_definition(source)
+            let parsed = fln_parse::parse_source_command(source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
-            engine.execute_parsed_source_definition(parsed, options, limits)
+            if parsed.kind() == fln_parse::SourceCommandKind::Evaluation
+                && index.saturating_add(1) != command_count
+            {
+                return Err(EngineExecutionError::NonterminalEvaluation { index });
+            }
+            let mut declaration =
+                fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+            if parsed.kind() == fln_parse::SourceCommandKind::Evaluation {
+                evaluation_count = evaluation_count.saturating_add(1);
+                let Declaration::Defn(definition) = &mut declaration else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "bounded evaluation did not elaborate to a definition",
+                    });
+                };
+                let start = index as u64;
+                let name = (0..=engine.environment().len())
+                    .map(|offset| Name::num(Name::anonymous(), start.wrapping_add(offset as u64)))
+                    .find(|candidate| !engine.environment().contains(candidate))
+                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                        detail: "bounded evaluation could not derive a fresh generated name",
+                    })?;
+                definition.base.name = name.clone();
+                definition.all.clear();
+                definition.all.push(name);
+            }
+            engine.execute_definition(declaration, options, limits)
+        })?;
+        Ok(match outcome {
+            Outcome::Complete(mut completed) => {
+                completed.source_evaluations = evaluation_count;
+                Outcome::Complete(completed)
+            }
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         })
     }
 
@@ -3087,6 +3124,7 @@ impl Engine {
             result_logical_root,
             executions,
             source_module_order: Vec::new(),
+            source_evaluations: 0,
         }))
     }
 
@@ -4602,6 +4640,9 @@ pub struct DefinitionBatchExecution {
     /// Canonical dependency order for a closed source-module execution.
     /// Empty for declaration batches and legacy caller-ordered source batches.
     pub source_module_order: Vec<Name>,
+    /// Number of terminal `#eval` commands lowered through checked generated
+    /// definitions. Zero for already-elaborated and definition-only batches.
+    pub source_evaluations: usize,
 }
 
 const SOURCE_RUN_EPOCH_ID: EpochId = EpochId::new(4_032_000);
@@ -5020,6 +5061,9 @@ pub enum EngineExecutionError {
         index: usize,
         error: Box<EngineExecutionError>,
     },
+    NonterminalEvaluation {
+        index: usize,
+    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5088,7 +5132,7 @@ impl fmt::Display for EngineExecutionError {
             ),
             Self::EmptySourceEntry { module } => write!(
                 formatter,
-                "source entry module `{}` contains no definition to execute",
+                "source entry module `{}` contains no supported command to execute",
                 module.to_display_string()
             ),
             Self::MissingSourceImports { module, imports } => write!(
@@ -5138,6 +5182,10 @@ impl fmt::Display for EngineExecutionError {
                     "definition batch command {index} failed: {error}"
                 )
             }
+            Self::NonterminalEvaluation { index } => write!(
+                formatter,
+                "bounded #eval command {index} must be the final command in its closed source batch"
+            ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
                 write!(
@@ -8467,6 +8515,114 @@ mod tests {
     }
 
     #[test]
+    fn terminal_source_evaluation_reuses_the_checked_definition_pipeline() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let completed = engine
+            .execute_source_definitions(
+                &[b"def first (x y : Nat) : Nat := x\n#eval first 42 9"],
+                &options,
+                test_limits(),
+            )
+            .expect("a terminal bounded evaluation reaches the native pipeline");
+        let Outcome::Complete(completed) = completed else {
+            panic!("evaluation batch was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+
+        assert_eq!(completed.executions.len(), 2);
+        let Declaration::Defn(evaluation) = &completed.executions[1].declaration else {
+            panic!("evaluation was not a definition"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(evaluation.base.name, Name::num(Name::anonymous(), 1));
+        assert_eq!(
+            evaluation.all.as_slice(),
+            std::slice::from_ref(&evaluation.base.name)
+        );
+        let VmExit::Returned(returned) = &completed.executions[1].exit else {
+            panic!("evaluation did not return"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn nonterminal_evaluation_is_atomic_and_the_same_term_recovers_when_terminal() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let base_root = engine.logical_root(&options);
+        let refusal = engine
+            .execute_source_definitions(
+                &[b"#eval Nat.add 40 2\ndef answer := 7"],
+                &options,
+                test_limits(),
+            )
+            .expect_err("the bounded facade executes only a terminal #eval");
+        assert!(matches!(
+            refusal,
+            EngineExecutionError::BatchCommand {
+                index: 0,
+                error,
+            } if matches!(*error, EngineExecutionError::NonterminalEvaluation { index: 0 })
+        ));
+        assert_eq!(engine.logical_root(&options), base_root);
+
+        let recovered = engine
+            .execute_source_definitions(&[b"#eval Nat.add 40 2"], &options, test_limits())
+            .expect("the same evaluation is supported in terminal position");
+        let Outcome::Complete(recovered) = recovered else {
+            panic!("terminal recovery was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        let VmExit::Returned(returned) = &recovered.executions[0].exit else {
+            panic!("recovered evaluation did not return"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(returned.value.unbox(), 42);
+    }
+
+    #[test]
+    fn generated_evaluation_names_skip_existing_unspellable_constants() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let occupied = Name::num(Name::anonymous(), 0);
+        let declaration = Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: occupied.clone(),
+                level_params: Vec::new(),
+                type_: nat_type(),
+            },
+            value: Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![occupied],
+        });
+        let Outcome::Complete(seed) = engine
+            .execute_definition(declaration, &options, test_limits())
+            .expect("the planted numeric-name definition is checked and executable")
+        else {
+            panic!("planted definition was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+
+        let Outcome::Complete(completed) = seed
+            .engine
+            .execute_source_definitions(&[b"#eval Nat.add 40 2"], &options, test_limits())
+            .expect("evaluation deterministically skips the occupied generated name")
+        else {
+            panic!("collision recovery was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        let Declaration::Defn(evaluation) = &completed.executions[0].declaration else {
+            panic!("evaluation was not a definition"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(evaluation.base.name, Name::num(Name::anonymous(), 1));
+    }
+
+    #[test]
     fn checked_nat_add_source_reaches_the_existing_intrinsic_runtime() {
         let options = KVMap::new();
         let nat_only = seeded_engine();
@@ -9798,7 +9954,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_source_modules_require_a_definition_in_the_entry_only() {
+    fn closed_source_modules_require_a_supported_command_in_the_entry_only() {
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the bounded source seed reaches both council seats")
             .into_complete()
@@ -9829,7 +9985,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "source entry module `Main` contains no definition to execute"
+            "source entry module `Main` contains no supported command to execute"
         );
         assert_eq!(engine.logical_root(&options), base_root);
         assert!(

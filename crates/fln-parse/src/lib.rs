@@ -7,7 +7,9 @@
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
 //! signatures followed by a matching literal, identifier, parenthesized first-order
 //! application, or non-recursive local let chain with optional exact scalar type
-//! ascriptions over those forms. [`parse_nat_definition`]
+//! ascriptions over those forms. [`parse_source_command`] also lowers a terminal
+//! bounded `#eval` through that exact definition tree so evaluation reaches the
+//! same elaborator and kernel authority. [`parse_nat_definition`]
 //! retains the original Nat-only authority. Both use the same source view,
 //! lexer, attachment, and canonical `Syntax` shape as the general engine. Being
 //! outside these seed grammars is a typed refusal, not a claim that the source is
@@ -45,7 +47,7 @@ pub struct ParseDiagnostic {
 /// The next form required by the first command grammar slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatDefinitionExpectation {
-    ImportOrDefinition,
+    ImportOrCommand,
     ImportedModule,
     EndOfImportCommand,
     DefinitionKeyword,
@@ -64,7 +66,7 @@ pub enum NatDefinitionExpectation {
     EndOfCommand,
 }
 
-/// Why a bounded definition command parser refused.
+/// Why the bounded source command parser refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatDefinitionParseError {
     Source(SourceError),
@@ -102,7 +104,7 @@ impl std::fmt::Display for NatDefinitionParseError {
             },
             Self::OutsideSeedGrammar { at, expected } => write!(
                 formatter,
-                "source is outside the bounded definition grammar at {at}; expected {expected:?}"
+                "source is outside the bounded source grammar at {at}; expected {expected:?}"
             ),
             Self::Build(error) => write!(formatter, "syntax construction failed: {error:?}"),
         }
@@ -245,12 +247,40 @@ pub type ParsedNatDefinition = ParsedDefinition;
 /// Compatibility name for callers using the wider bounded source door.
 pub type DefinitionParseError = NatDefinitionParseError;
 
-/// One bounded source module split into its direct import names and definition
-/// command slices.
+/// Which supported source command produced a bounded definition tree.
+///
+/// Evaluation is represented by a generated definition only inside the
+/// execution pipeline. Callers must not publish its placeholder name: the
+/// engine replaces it with an unspellable numeric name before admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCommandKind {
+    Definition,
+    Evaluation,
+}
+
+/// One command accepted by the bounded source facade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSourceCommand {
+    kind: SourceCommandKind,
+    definition: ParsedDefinition,
+}
+
+impl ParsedSourceCommand {
+    pub const fn kind(&self) -> SourceCommandKind {
+        self.kind
+    }
+
+    pub fn syntax(&self) -> &Syntax {
+        self.definition.syntax()
+    }
+}
+
+/// One bounded source module split into its direct import names and command
+/// slices.
 ///
 /// This is a lexical command boundary, not a module resolver. In particular,
 /// returning an import name grants it no environment authority; the caller must
-/// resolve the complete import graph before any definition is elaborated.
+/// resolve the complete import graph before any command is elaborated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionedSourceModule<'source> {
     pub imports: Vec<Name>,
@@ -303,7 +333,7 @@ fn nat_definition_token_table() -> TokenTable {
 }
 
 fn source_module_token_table() -> TokenTable {
-    TokenTable::from_tokens(["import", "def", "let", "(", ")", ":", ":=", ";"])
+    TokenTable::from_tokens(["import", "def", "#eval", "let", "(", ")", ":", ":=", ";"])
 }
 
 fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> BytePos {
@@ -520,6 +550,104 @@ pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDef
 /// typed [`NatDefinitionParseError::OutsideSeedGrammar`] refusal.
 pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionParseError> {
     parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
+}
+
+const EVALUATION_DEFINITION_PREFIX: &[u8] = b"def __fln_eval := ";
+
+fn rebase_evaluation_error(
+    error: DefinitionParseError,
+    term_start: BytePos,
+) -> DefinitionParseError {
+    let mapped = |at: BytePos| {
+        BytePos(
+            term_start
+                .0
+                .saturating_add(at.0.saturating_sub(EVALUATION_DEFINITION_PREFIX.len())),
+        )
+    };
+    match error {
+        NatDefinitionParseError::Source(SourceError::NotUtf8 { at }) => {
+            NatDefinitionParseError::Source(SourceError::NotUtf8 { at: mapped(at) })
+        }
+        NatDefinitionParseError::Lexical { diagnostics } => NatDefinitionParseError::Lexical {
+            diagnostics: diagnostics
+                .into_iter()
+                .map(|diagnostic| ParseDiagnostic {
+                    message: diagnostic.message,
+                    at: mapped(diagnostic.at),
+                })
+                .collect(),
+        },
+        NatDefinitionParseError::OutsideSeedGrammar { at, expected } => {
+            NatDefinitionParseError::OutsideSeedGrammar {
+                at: mapped(at),
+                expected,
+            }
+        }
+        NatDefinitionParseError::Build(error) => NatDefinitionParseError::Build(error),
+    }
+}
+
+/// Parse one bounded `def` or `#eval` command.
+///
+/// `#eval <term>` is lowered to the canonical definition tree already consumed
+/// by `fln-elab`. This is deliberately a terminal-command execution seam, not a
+/// second evaluator: the engine renames the generated declaration before K1
+/// admission and sends it through the ordinary compiler and Golem path.
+pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
+    let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
+    let view = SourceView::of(&original);
+    let run = lex_run(view.normalized(), &source_module_token_table());
+    let diagnostics = run
+        .diagnostics()
+        .into_iter()
+        .map(|(message, at)| ParseDiagnostic {
+            message,
+            at: view.to_original(at),
+        })
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(NatDefinitionParseError::Lexical { diagnostics });
+    }
+    let first = run.events.iter().find_map(|event| match event {
+        Event::Token(token) => Some(token),
+        Event::Trivia(_) | Event::Refused { .. } => None,
+    });
+    match first {
+        Some(token) => match &token.kind {
+            TokenKind::Symbol(symbol) if symbol == "def" => Ok(ParsedSourceCommand {
+                kind: SourceCommandKind::Definition,
+                definition: parse_definition(source)?,
+            }),
+            TokenKind::Symbol(symbol) if symbol == "#eval" => {
+                let term_start = view.to_original(token.extent.end());
+                let term = &source[term_start.0..];
+                let mut lowered = Vec::with_capacity(
+                    EVALUATION_DEFINITION_PREFIX
+                        .len()
+                        .saturating_add(term.len()),
+                );
+                lowered.extend_from_slice(EVALUATION_DEFINITION_PREFIX);
+                lowered.extend_from_slice(term);
+                let definition = parse_definition(&lowered)
+                    .map_err(|error| rebase_evaluation_error(error, term_start))?;
+                Ok(ParsedSourceCommand {
+                    kind: SourceCommandKind::Evaluation,
+                    definition,
+                })
+            }
+            TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
+                Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: view.to_original(token.extent.start()),
+                    expected: NatDefinitionExpectation::DefinitionKeyword,
+                })
+            }
+        },
+        None => Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: BytePos(source.len()),
+            expected: NatDefinitionExpectation::DefinitionKeyword,
+        }),
+    }
 }
 
 fn parse_definition_with_grammar(
@@ -851,18 +979,18 @@ fn parse_definition_with_grammar(
     })
 }
 
-/// Partition one source file into bounded definition command slices.
+/// Partition one source file into bounded `def`/`#eval` command slices.
 ///
 /// This is deliberately a lexical partition, not a second parser. In the seed
-/// grammar `def` cannot occur inside a definition body, while occurrences in
-/// comments remain trivia, so every `def` token after the first begins the next
-/// command. Each returned slice is still parsed independently by
-/// [`parse_definition`] or [`parse_nat_definition`], which remain the only
-/// acceptance authorities for their respective grammar slices.
+/// grammar neither command introducer can occur inside a term, while occurrences
+/// in comments remain trivia, so every later introducer begins the next command.
+/// Each returned slice is still parsed independently by [`parse_source_command`]
+/// (or by the definition-only compatibility entries), which remains the
+/// acceptance authority for the bounded source slice.
 /// Boundaries are mapped back through [`SourceView`] before slicing, preserving
 /// original CRLF bytes exactly.
 ///
-/// A file containing zero or one `def` token is returned as one slice, including
+/// A file containing zero or one command token is returned as one slice, including
 /// an empty file. That keeps malformed or unsupported input on the parser's typed
 /// refusal path instead of misclassifying it as an empty batch.
 pub fn partition_definition_commands(
@@ -870,7 +998,7 @@ pub fn partition_definition_commands(
 ) -> Result<Vec<(BytePos, &[u8])>, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
-    let table = nat_definition_token_table();
+    let table = source_module_token_table();
     let run = lex_run(view.normalized(), &table);
     let diagnostics = run
         .diagnostics()
@@ -891,7 +1019,7 @@ pub fn partition_definition_commands(
             Event::Token(LexedToken {
                 kind: TokenKind::Symbol(symbol),
                 extent,
-            }) if symbol == "def" => Some(view.to_original(extent.start()).0),
+            }) if symbol == "def" || symbol == "#eval" => Some(view.to_original(extent.start()).0),
             Event::Trivia(_) | Event::Refused { .. } | Event::Token(_) => None,
         })
         .collect::<Vec<_>>();
@@ -909,10 +1037,11 @@ pub fn partition_definition_commands(
     Ok(commands)
 }
 
-/// Parse the bounded source facade's module header and partition its definitions.
+/// Parse the bounded source facade's module header and partition its commands.
 ///
 /// The supported header is the ordinary Lean spelling `import A.B C`, with one
-/// import command per physical line and all imports preceding the first `def`.
+/// import command per physical line and all imports preceding the first `def` or
+/// `#eval`.
 /// Comments and blank lines are trivia. Requiring the command to end at its line
 /// is deliberate for this first production slice: accepting a broader layout
 /// without the complete command parser would guess at module boundaries.
@@ -961,7 +1090,7 @@ pub fn partition_source_module(
             break None;
         };
         match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "def" => {
+            TokenKind::Symbol(symbol) if symbol == "def" || symbol == "#eval" => {
                 break Some(view.to_original(token.extent.start()).0);
             }
             TokenKind::Symbol(symbol) if symbol == "import" => {
@@ -993,7 +1122,7 @@ pub fn partition_source_module(
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: at(cursor),
-                    expected: NatDefinitionExpectation::ImportOrDefinition,
+                    expected: NatDefinitionExpectation::ImportOrCommand,
                 });
             }
         }
@@ -1005,9 +1134,9 @@ pub fn partition_source_module(
         (body_start, commands)
     } else {
         // The header loop already refuses every non-trivia token other than
-        // `import` or `def`. Reaching EOF without `def` is therefore a valid
-        // zero-definition module, not one empty command for the definition
-        // parser to reject.
+        // `import`, `def`, or `#eval`. Reaching EOF without a body command is
+        // therefore a valid header-only module, not one empty command for the
+        // command parser to reject.
         (source.len(), Vec::new())
     };
     for (offset, _) in &mut commands {
@@ -1074,6 +1203,55 @@ mod nat_definition_tests {
     }
 
     #[test]
+    fn bounded_evaluation_lowers_to_the_existing_definition_tree_and_keeps_positions() {
+        let parsed = parse_source_command(b"-- leading trivia\r\n#eval Nat.add 40 2\r\n")
+            .expect("the bounded evaluation command parses");
+        assert_eq!(parsed.kind(), SourceCommandKind::Evaluation);
+        assert_eq!(
+            parsed
+                .syntax()
+                .kind()
+                .map(Name::to_display_string)
+                .as_deref(),
+            Some("Lean.Parser.Command.declaration")
+        );
+
+        let refusal = parse_source_command(b"#eval 1 2")
+            .expect_err("a literal-headed application remains outside the bounded grammar");
+        assert!(matches!(
+            refusal,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(8),
+                expected: NatDefinitionExpectation::EndOfCommand,
+            }
+        ));
+    }
+
+    #[test]
+    fn command_partition_distinguishes_real_evaluations_from_comment_text() {
+        let source = b"def first := 40\n-- #eval hidden\n#eval Nat.add first 2\n";
+        let commands = partition_definition_commands(source)
+            .expect("the mixed bounded command file partitions");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0, BytePos(0));
+        assert!(commands[0].1.ends_with(b"-- #eval hidden\n"));
+        assert_eq!(commands[1].1, b"#eval Nat.add first 2\n");
+        assert_eq!(
+            parse_source_command(commands[0].1)
+                .expect("the definition command parses")
+                .kind(),
+            SourceCommandKind::Definition
+        );
+        assert_eq!(
+            parse_source_command(commands[1].1)
+                .expect("the evaluation command parses")
+                .kind(),
+            SourceCommandKind::Evaluation
+        );
+    }
+
+    #[test]
     fn source_module_header_retains_structural_imports_and_original_command_offsets() {
         let source = b"-- module header\r\nimport Foundation.Nat Text.Tools\r\n\r\ndef first := 1\r\ndef answer := first";
         let module = partition_source_module(source).expect("the bounded import header parses");
@@ -1096,6 +1274,20 @@ mod nat_definition_tests {
             &source[module.commands[1].0.0..module.commands[1].0.0 + module.commands[1].1.len()],
             module.commands[1].1
         );
+    }
+
+    #[test]
+    fn source_module_header_accepts_an_evaluation_as_its_entry_command() {
+        let source = b"import Foundation.Nat\n#eval Nat.add base 2\n";
+        let module = partition_source_module(source)
+            .expect("an imported bounded evaluation is a source-module command");
+
+        assert_eq!(
+            module.imports,
+            vec![Name::from_components(["Foundation", "Nat"])]
+        );
+        assert_eq!(module.commands.len(), 1);
+        assert_eq!(module.commands[0].1, b"#eval Nat.add base 2\n");
     }
 
     #[test]

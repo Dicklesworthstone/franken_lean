@@ -281,9 +281,14 @@ intrinsics. Nat literals and results use the Marrow ABI's canonical
 tagged-scalar-or-positive-mpz representation, including direct source literals larger
 than 64 bits; they cross dependent definitions and emitted FLBC products without
 narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceiling.
-The `fln.source-run/6` robot result binds that runtime value back to the checked
+The `fln.source-run/7` robot result binds that runtime value back to the checked
 source result type, so Bool results remain JSON booleans instead of being mislabeled
-as Nat. A standalone FLBC scalar remains type-erased and is reported only by its
+as Nat, and reports definition and evaluation counts separately. The ordinary
+`#eval <bounded-term>` spelling is live in terminal command position: it lowers
+to an unspellable generated declaration and crosses the same K1, independent-
+checker, compiler, canonical-FLBC, and Golem path as a bounded `def`. It is not
+yet general command elaboration or support for nonterminal/effectful `#eval`.
+A standalone FLBC scalar remains type-erased and is reported only by its
 runtime kind because the current artifact carries no source-result type witness.
 The facade also retains explicit
 budgets, immutable environment successors, K1 plus the independent checker,
@@ -296,8 +301,9 @@ duplicate, cyclic, or entry-unreachable modules before elaboration. It also
 checks every completed declaration against the graph's transitive visibility,
 so dependency order cannot let one sibling borrow definitions from another
 sibling it did not import. Import-only dependency modules remain valid graph
-rows, while the selected entry must contain a definition so a dependency's
-result can never be reported or published as the entry product. This is not
+rows, while the selected entry must contain a supported `def` or terminal
+`#eval` command so a dependency's result can never be reported or published as
+the entry product. This is not
 automatic project-root/`LEAN_PATH`
 discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
