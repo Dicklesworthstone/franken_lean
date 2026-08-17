@@ -7,9 +7,10 @@
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
 //! signatures followed by a matching literal, identifier, parenthesized first-order
 //! application, or non-recursive local let chain with optional exact scalar type
-//! ascriptions over those forms. [`parse_source_command`] also lowers a terminal
-//! bounded `#eval` through that exact definition tree so evaluation reaches the
-//! same elaborator and kernel authority. [`parse_nat_definition`]
+//! ascriptions over those forms. [`parse_source_command`] also builds the pin's
+//! canonical `Lean.Parser.Command.eval` tree for a bounded `#eval`, so expression
+//! commands reach elaboration without fabricating and reparsing definition bytes.
+//! [`parse_nat_definition`]
 //! retains the original Nat-only authority. Both use the same source view,
 //! lexer, attachment, and canonical `Syntax` shape as the general engine. Being
 //! outside these seed grammars is a typed refusal, not a claim that the source is
@@ -247,11 +248,7 @@ pub type ParsedNatDefinition = ParsedDefinition;
 /// Compatibility name for callers using the wider bounded source door.
 pub type DefinitionParseError = NatDefinitionParseError;
 
-/// Which supported source command produced a bounded definition tree.
-///
-/// Evaluation is represented by a generated definition only inside the
-/// execution pipeline. Callers must not publish its placeholder name: the
-/// engine replaces it with an unspellable numeric name before admission.
+/// Which supported source command produced a bounded command tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCommandKind {
     Definition,
@@ -262,7 +259,9 @@ pub enum SourceCommandKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSourceCommand {
     kind: SourceCommandKind,
-    definition: ParsedDefinition,
+    source_view: SourceView,
+    syntax: Syntax,
+    epilogue: ByteSpan,
 }
 
 impl ParsedSourceCommand {
@@ -271,7 +270,24 @@ impl ParsedSourceCommand {
     }
 
     pub fn syntax(&self) -> &Syntax {
-        self.definition.syntax()
+        &self.syntax
+    }
+
+    pub fn source_view(&self) -> &SourceView {
+        &self.source_view
+    }
+
+    pub const fn epilogue(&self) -> ByteSpan {
+        self.epilogue
+    }
+
+    pub fn reconstruct_normalized(&self) -> Option<Vec<u8>> {
+        self.syntax
+            .reconstruct(self.source_view.normalized(), self.epilogue)
+    }
+
+    pub fn reconstruct_original(&self) -> Vec<u8> {
+        self.source_view.reconstruct_original()
     }
 }
 
@@ -398,6 +414,129 @@ fn find_let_separator(tokens: &[LexedToken], from: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn bounded_let_bindings(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut body_start: usize,
+    grammar: DefinitionGrammar,
+) -> Result<(Vec<LetBindingTokens>, usize), NatDefinitionParseError> {
+    let mut let_bindings = Vec::new();
+    while matches!(
+        tokens.get(body_start).map(|token| &token.kind),
+        Some(TokenKind::Symbol(symbol)) if symbol == "let"
+    ) {
+        let keyword = body_start;
+        let name = keyword + 1;
+        if !matches!(
+            tokens.get(name).map(|token| &token.kind),
+            Some(TokenKind::Ident(_))
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, name),
+                expected: NatDefinitionExpectation::LocalIdentifier,
+            });
+        }
+        let mut declaration_cursor = name + 1;
+        let explicit_type = if matches!(
+            tokens.get(declaration_cursor).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":"
+        ) {
+            let colon = declaration_cursor;
+            declaration_cursor += 1;
+            if !matches!(
+                tokens.get(declaration_cursor).map(|token| &token.kind),
+                Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
+            ) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, declaration_cursor),
+                    expected: grammar.type_expectation(),
+                });
+            }
+            let type_name = declaration_cursor;
+            declaration_cursor += 1;
+            Some((colon, type_name))
+        } else {
+            None
+        };
+        let assignment = declaration_cursor;
+        if !matches!(
+            tokens.get(assignment).map(|token| &token.kind),
+            Some(TokenKind::Symbol(symbol)) if symbol == ":="
+        ) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, assignment),
+                expected: NatDefinitionExpectation::LocalAssignment,
+            });
+        }
+        let value_start = assignment + 1;
+        let Some(separator) = find_let_separator(tokens, value_start) else {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, tokens.len()),
+                expected: NatDefinitionExpectation::LetSeparator,
+            });
+        };
+        let_bindings.push(LetBindingTokens {
+            keyword,
+            name,
+            explicit_type,
+            assignment,
+            value: value_start..separator,
+            separator,
+        });
+        body_start = separator + 1;
+    }
+    Ok((let_bindings, body_start))
+}
+
+fn bounded_value_syntax(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    let_bindings: Vec<LetBindingTokens>,
+    body_start: usize,
+    grammar: DefinitionGrammar,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let mut value = bounded_term(leaves, view, tokens, body_start..tokens.len(), grammar)?;
+    for binding in let_bindings.into_iter().rev() {
+        let local_value = bounded_term(leaves, view, tokens, binding.value, grammar)?;
+        let explicit_type = match binding.explicit_type {
+            Some((colon, type_name)) => null_node(vec![Syntax::node(
+                parser_kind(&["Term", "typeSpec"]),
+                vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
+            )]),
+            None => null_node(Vec::new()),
+        };
+        let local_id = Syntax::node(
+            parser_kind(&["Term", "letId"]),
+            vec![leaves.leaf(binding.name)?],
+        );
+        let local_declaration = Syntax::node(
+            parser_kind(&["Term", "letIdDecl"]),
+            vec![
+                local_id,
+                null_node(Vec::new()),
+                explicit_type,
+                leaves.leaf(binding.assignment)?,
+                local_value,
+            ],
+        );
+        value = Syntax::node(
+            parser_kind(&["Term", "let"]),
+            vec![
+                leaves.leaf(binding.keyword)?,
+                Syntax::node(
+                    parser_kind(&["Term", "letConfig"]),
+                    vec![null_node(Vec::new())],
+                ),
+                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![local_declaration]),
+                leaves.leaf(binding.separator)?,
+                value,
+            ],
+        );
+    }
+    Ok(value)
 }
 
 fn finish_bounded_term(
@@ -552,48 +691,13 @@ pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionPar
     parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
 }
 
-const EVALUATION_DEFINITION_PREFIX: &[u8] = b"def __fln_eval := ";
-
-fn rebase_evaluation_error(
-    error: DefinitionParseError,
-    term_start: BytePos,
-) -> DefinitionParseError {
-    let mapped = |at: BytePos| {
-        BytePos(
-            term_start
-                .0
-                .saturating_add(at.0.saturating_sub(EVALUATION_DEFINITION_PREFIX.len())),
-        )
-    };
-    match error {
-        NatDefinitionParseError::Source(SourceError::NotUtf8 { at }) => {
-            NatDefinitionParseError::Source(SourceError::NotUtf8 { at: mapped(at) })
-        }
-        NatDefinitionParseError::Lexical { diagnostics } => NatDefinitionParseError::Lexical {
-            diagnostics: diagnostics
-                .into_iter()
-                .map(|diagnostic| ParseDiagnostic {
-                    message: diagnostic.message,
-                    at: mapped(diagnostic.at),
-                })
-                .collect(),
-        },
-        NatDefinitionParseError::OutsideSeedGrammar { at, expected } => {
-            NatDefinitionParseError::OutsideSeedGrammar {
-                at: mapped(at),
-                expected,
-            }
-        }
-        NatDefinitionParseError::Build(error) => NatDefinitionParseError::Build(error),
-    }
-}
-
 /// Parse one bounded `def` or `#eval` command.
 ///
-/// `#eval <term>` is lowered to the canonical definition tree already consumed
-/// by `fln-elab`. This is deliberately a terminal-command execution seam, not a
-/// second evaluator: the engine renames the generated declaration before K1
-/// admission and sends it through the ordinary compiler and Golem path.
+/// `#eval <term>` becomes the pin's canonical `Lean.Parser.Command.eval` tree.
+/// This is deliberately a terminal-command execution seam, not a second
+/// evaluator: `fln-elab` gives the expression an unspellable generated
+/// declaration identity before K1 admission, then the ordinary compiler and
+/// Golem path execute the checked artifact.
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -615,25 +719,44 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
     });
     match first {
         Some(token) => match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "def" => Ok(ParsedSourceCommand {
-                kind: SourceCommandKind::Definition,
-                definition: parse_definition(source)?,
-            }),
+            TokenKind::Symbol(symbol) if symbol == "def" => {
+                let parsed = parse_definition(source)?;
+                Ok(ParsedSourceCommand {
+                    kind: SourceCommandKind::Definition,
+                    source_view: parsed.source_view,
+                    syntax: parsed.syntax,
+                    epilogue: parsed.epilogue,
+                })
+            }
             TokenKind::Symbol(symbol) if symbol == "#eval" => {
-                let term_start = view.to_original(token.extent.end());
-                let term = &source[term_start.0..];
-                let mut lowered = Vec::with_capacity(
-                    EVALUATION_DEFINITION_PREFIX
-                        .len()
-                        .saturating_add(term.len()),
-                );
-                lowered.extend_from_slice(EVALUATION_DEFINITION_PREFIX);
-                lowered.extend_from_slice(term);
-                let definition = parse_definition(&lowered)
-                    .map_err(|error| rebase_evaluation_error(error, term_start))?;
+                let tokens = run
+                    .events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Token(token) => Some(token),
+                        Event::Trivia(_) | Event::Refused { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (let_bindings, body_start) =
+                    bounded_let_bindings(&view, &tokens, 1, DefinitionGrammar::Scalar)?;
+                let leaves = Leaves::build(view.normalized(), &tokens)?;
+                let epilogue = leaves.attachment().epilogue();
+                let value = bounded_value_syntax(
+                    &leaves,
+                    &view,
+                    &tokens,
+                    let_bindings,
+                    body_start,
+                    DefinitionGrammar::Scalar,
+                )?;
                 Ok(ParsedSourceCommand {
                     kind: SourceCommandKind::Evaluation,
-                    definition,
+                    source_view: view,
+                    syntax: Syntax::node(
+                        parser_kind(&["Command", "eval"]),
+                        vec![leaves.leaf(0)?, value],
+                    ),
+                    epilogue,
                 })
             }
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
@@ -791,72 +914,7 @@ fn parse_definition_with_grammar(
         });
     }
     let value_index = assignment_index + 1;
-    let mut let_bindings = Vec::new();
-    let mut body_start = value_index;
-    while matches!(
-        tokens.get(body_start).map(|token| &token.kind),
-        Some(TokenKind::Symbol(symbol)) if symbol == "let"
-    ) {
-        let keyword = body_start;
-        let name = keyword + 1;
-        if !matches!(
-            tokens.get(name).map(|token| &token.kind),
-            Some(TokenKind::Ident(_))
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, name),
-                expected: NatDefinitionExpectation::LocalIdentifier,
-            });
-        }
-        let mut declaration_cursor = name + 1;
-        let explicit_type = if matches!(
-            tokens.get(declaration_cursor).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == ":"
-        ) {
-            let colon = declaration_cursor;
-            declaration_cursor += 1;
-            if !matches!(
-                tokens.get(declaration_cursor).map(|token| &token.kind),
-                Some(TokenKind::Ident(name)) if grammar.accepts_type(name)
-            ) {
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: original_position(&view, &tokens, declaration_cursor),
-                    expected: grammar.type_expectation(),
-                });
-            }
-            let type_name = declaration_cursor;
-            declaration_cursor += 1;
-            Some((colon, type_name))
-        } else {
-            None
-        };
-        let assignment = declaration_cursor;
-        if !matches!(
-            tokens.get(assignment).map(|token| &token.kind),
-            Some(TokenKind::Symbol(symbol)) if symbol == ":="
-        ) {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, assignment),
-                expected: NatDefinitionExpectation::LocalAssignment,
-            });
-        }
-        let value_start = assignment + 1;
-        let Some(separator) = find_let_separator(&tokens, value_start) else {
-            return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(&view, &tokens, tokens.len()),
-                expected: NatDefinitionExpectation::LetSeparator,
-            });
-        };
-        let_bindings.push(LetBindingTokens {
-            keyword,
-            name,
-            explicit_type,
-            assignment,
-            value: value_start..separator,
-            separator,
-        });
-        body_start = separator + 1;
-    }
+    let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, value_index, grammar)?;
     let leaves = Leaves::build(view.normalized(), &tokens)?;
     let epilogue = leaves.attachment().epilogue();
     let definition_keyword = leaves.leaf(0)?;
@@ -911,44 +969,7 @@ fn parse_definition_with_grammar(
         parser_kind(&["Command", "optDeclSig"]),
         vec![null_node(parameters), result_type],
     );
-    let mut value = bounded_term(&leaves, &view, &tokens, body_start..tokens.len(), grammar)?;
-    for binding in let_bindings.into_iter().rev() {
-        let local_value = bounded_term(&leaves, &view, &tokens, binding.value, grammar)?;
-        let explicit_type = match binding.explicit_type {
-            Some((colon, type_name)) => null_node(vec![Syntax::node(
-                parser_kind(&["Term", "typeSpec"]),
-                vec![leaves.leaf(colon)?, leaves.leaf(type_name)?],
-            )]),
-            None => null_node(Vec::new()),
-        };
-        let local_id = Syntax::node(
-            parser_kind(&["Term", "letId"]),
-            vec![leaves.leaf(binding.name)?],
-        );
-        let local_declaration = Syntax::node(
-            parser_kind(&["Term", "letIdDecl"]),
-            vec![
-                local_id,
-                null_node(Vec::new()),
-                explicit_type,
-                leaves.leaf(binding.assignment)?,
-                local_value,
-            ],
-        );
-        value = Syntax::node(
-            parser_kind(&["Term", "let"]),
-            vec![
-                leaves.leaf(binding.keyword)?,
-                Syntax::node(
-                    parser_kind(&["Term", "letConfig"]),
-                    vec![null_node(Vec::new())],
-                ),
-                Syntax::node(parser_kind(&["Term", "letDecl"]), vec![local_declaration]),
-                leaves.leaf(binding.separator)?,
-                value,
-            ],
-        );
-    }
+    let value = bounded_value_syntax(&leaves, &view, &tokens, let_bindings, body_start, grammar)?;
     let termination = Syntax::node(
         parser_kind(&["Termination", "suffix"]),
         vec![null_node(Vec::new()), null_node(Vec::new())],
@@ -1203,9 +1224,9 @@ mod nat_definition_tests {
     }
 
     #[test]
-    fn bounded_evaluation_lowers_to_the_existing_definition_tree_and_keeps_positions() {
-        let parsed = parse_source_command(b"-- leading trivia\r\n#eval Nat.add 40 2\r\n")
-            .expect("the bounded evaluation command parses");
+    fn bounded_evaluation_builds_the_pinned_command_tree_and_keeps_positions() {
+        let source = b"-- leading trivia\r\n#eval let x : Nat := 40; Nat.add x 2\r\n";
+        let parsed = parse_source_command(source).expect("the bounded evaluation command parses");
         assert_eq!(parsed.kind(), SourceCommandKind::Evaluation);
         assert_eq!(
             parsed
@@ -1213,7 +1234,12 @@ mod nat_definition_tests {
                 .kind()
                 .map(Name::to_display_string)
                 .as_deref(),
-            Some("Lean.Parser.Command.declaration")
+            Some("Lean.Parser.Command.eval")
+        );
+        assert_eq!(parsed.reconstruct_original(), source);
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(b"-- leading trivia\n#eval let x : Nat := 40; Nat.add x 2\n".as_slice())
         );
 
         let refusal = parse_source_command(b"#eval 1 2")

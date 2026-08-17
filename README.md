@@ -284,10 +284,13 @@ narrowing, and stop as a typed non-answer at Golem's explicit mpz-magnitude ceil
 The `fln.source-run/7` robot result binds that runtime value back to the checked
 source result type, so Bool results remain JSON booleans instead of being mislabeled
 as Nat, and reports definition and evaluation counts separately. The ordinary
-`#eval <bounded-term>` spelling is live in terminal command position: it lowers
-to an unspellable generated declaration and crosses the same K1, independent-
-checker, compiler, canonical-FLBC, and Golem path as a bounded `def`. It is not
-yet general command elaboration or support for nonterminal/effectful `#eval`.
+`#eval <bounded-term>` spelling is live in terminal command position: the parser
+builds the pin's `Lean.Parser.Command.eval` tree, the bounded expression
+elaborator gives it an unspellable generated declaration identity, and it
+crosses the same K1, independent-checker, compiler, canonical-FLBC, and Golem
+path as a bounded `def`. No fabricated `def` source is reparsed, and there is no
+second evaluator. This is not yet general command elaboration or support for
+nonterminal/effectful `#eval`.
 A standalone FLBC scalar remains type-erased and is reported only by its
 runtime kind because the current artifact carries no source-result type witness.
 The facade also retains explicit

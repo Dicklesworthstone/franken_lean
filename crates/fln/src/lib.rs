@@ -1805,6 +1805,34 @@ fn bounded_source_module_name_depth(
     Ok(depth)
 }
 
+fn fresh_evaluation_name(
+    environment: &Environment,
+    command_index: usize,
+) -> Result<Name, EngineExecutionError> {
+    let start =
+        u64::try_from(command_index).map_err(|_| EngineExecutionError::AllocationFailure {
+            resource: "generated evaluation name space",
+            requested: command_index,
+        })?;
+    for offset in 0..=environment.len() {
+        let offset =
+            u64::try_from(offset).map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "generated evaluation name space",
+                requested: offset,
+            })?;
+        let Some(component) = start.checked_add(offset) else {
+            break;
+        };
+        let candidate = Name::num(Name::anonymous(), component);
+        if !environment.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(EngineExecutionError::UnexpectedPublication {
+        detail: "bounded evaluation could not derive a fresh generated name",
+    })
+}
+
 fn verify_source_module_visibility(
     modules: &[SourceModuleInput<'_>],
     dependencies: &[Vec<usize>],
@@ -3029,28 +3057,17 @@ impl Engine {
             {
                 return Err(EngineExecutionError::NonterminalEvaluation { index });
             }
-            let mut declaration =
+            let declaration = if parsed.kind() == fln_parse::SourceCommandKind::Evaluation {
+                let name = fresh_evaluation_name(engine.environment(), index)?;
+                evaluation_count = evaluation_count.saturating_add(1);
+                fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?
+            } else {
                 fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
                     .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?;
-            if parsed.kind() == fln_parse::SourceCommandKind::Evaluation {
-                evaluation_count = evaluation_count.saturating_add(1);
-                let Declaration::Defn(definition) = &mut declaration else {
-                    return Err(EngineExecutionError::UnexpectedPublication {
-                        detail: "bounded evaluation did not elaborate to a definition",
-                    });
-                };
-                let start = index as u64;
-                let name = (0..=engine.environment().len())
-                    .map(|offset| Name::num(Name::anonymous(), start.wrapping_add(offset as u64)))
-                    .find(|candidate| !engine.environment().contains(candidate))
-                    .ok_or(EngineExecutionError::UnexpectedPublication {
-                        detail: "bounded evaluation could not derive a fresh generated name",
-                    })?;
-                definition.base.name = name.clone();
-                definition.all.clear();
-                definition.all.push(name);
-            }
+                    .map_err(EngineExecutionError::Frontend)?
+            };
             engine.execute_definition(declaration, options, limits)
         })?;
         Ok(match outcome {
@@ -5274,7 +5291,7 @@ mod tests {
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
         ReducibilityHints, RejectClass, SourceModuleInput, TheoremVal, VmExecutionLimits,
         closed_vm_value, decode_olean_artifact, execute_flbc_artifact, execute_golem_with_options,
-        project_lsp_diagnostics, rebuild_olean_artifact,
+        fresh_evaluation_name, project_lsp_diagnostics, rebuild_olean_artifact,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -8523,7 +8540,7 @@ mod tests {
         let options = KVMap::new();
         let completed = engine
             .execute_source_definitions(
-                &[b"def first (x y : Nat) : Nat := x\n#eval first 42 9"],
+                &[b"def first (x y : Nat) : Nat := x\n#eval let chosen : Nat := first 42 9; Nat.add chosen 0"],
                 &options,
                 test_limits(),
             )
@@ -8620,6 +8637,35 @@ mod tests {
             panic!("evaluation was not a definition"); // ubs:ignore — test-only diagnostic.
         };
         assert_eq!(evaluation.base.name, Name::num(Name::anonymous(), 1));
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let last = Name::num(Name::anonymous(), u64::MAX);
+            let declaration = Declaration::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: last.clone(),
+                    level_params: Vec::new(),
+                    type_: nat_type(),
+                },
+                value: Expr::lit(Literal::Nat(NatLit::from_u64(9))),
+                hints: ReducibilityHints::Regular(1),
+                safety: DefinitionSafety::Safe,
+                all: vec![last],
+            });
+            let Outcome::Complete(last_seed) = seed
+                .engine
+                .execute_definition(declaration, &options, test_limits())
+                .expect("the numeric name boundary is a checked environment row")
+            else {
+                panic!("numeric name boundary admission was not complete"); // ubs:ignore — test-only diagnostic.
+            };
+            assert!(matches!(
+                fresh_evaluation_name(last_seed.engine.environment(), usize::MAX),
+                Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "bounded evaluation could not derive a fresh generated name"
+                })
+            ));
+        }
     }
 
     #[test]

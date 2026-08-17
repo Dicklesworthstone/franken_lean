@@ -5,9 +5,11 @@
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed bounded exact `Nat`/`String`/`Bool`
-//! definition, explicit first-order function, parenthesized application, or
-//! local let chain becomes a real [`Declaration::Defn`] and is handed to
-//! Crucible's sole check authority. The original Nat-only door remains strict.
+//! definition, explicit first-order function, parenthesized application, local
+//! let chain, or terminal bounded `Lean.Parser.Command.eval` expression becomes
+//! a real [`Declaration::Defn`] candidate and is handed to Crucible's sole check
+//! authority. Evaluation receives an unspellable generated identity directly;
+//! it is never reparsed as fabricated definition source. The original Nat-only door remains strict.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
@@ -19,7 +21,7 @@ pub mod seed;
 use fln_bignum::interop::literal_from_bignat;
 use fln_bignum::nat::BigNat;
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal};
-use fln_core::name::Name;
+use fln_core::name::{LeafView, Name};
 use fln_core::outcome::Outcome;
 use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
 use fln_env::environment::Environment;
@@ -36,6 +38,7 @@ use fln_syntax::tree::Syntax;
 pub enum NatDefinitionElabError {
     UnexpectedSyntax { expected: &'static str },
     AnonymousDeclarationName,
+    InvalidGeneratedEvaluationName,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
     InvalidStringLiteral,
@@ -49,6 +52,10 @@ impl std::fmt::Display for NatDefinitionElabError {
                 write!(formatter, "unexpected syntax; expected {expected}")
             }
             Self::AnonymousDeclarationName => write!(formatter, "declaration name is anonymous"),
+            Self::InvalidGeneratedEvaluationName => write!(
+                formatter,
+                "evaluation name must be one numeric component below the anonymous root"
+            ),
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidStringLiteral => write!(formatter, "string literal is invalid"),
@@ -415,6 +422,55 @@ pub fn elaborate_definition_in(
     environment: &Environment,
 ) -> Result<Declaration, NatDefinitionElabError> {
     elaborate_definition_with_types(syntax, true, Some(environment))
+}
+
+/// Elaborate one canonical bounded `Lean.Parser.Command.eval` tree.
+///
+/// Evaluation commands do not enter elaboration by pretending to be user
+/// definitions. The caller supplies an unspellable numeric identity, this
+/// function elaborates the expression directly against `environment`, and the
+/// engine then sends the resulting declaration through the ordinary kernel,
+/// independent-checker, compiler, and VM path. Only a one-component numeric
+/// name is accepted so this low-level door cannot publish an evaluation under a
+/// source-spellable declaration identity.
+pub fn elaborate_evaluation_in(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+) -> Result<Declaration, NatDefinitionElabError> {
+    if !generated_name.parent().is_anonymous()
+        || !matches!(generated_name.leaf_view(), LeafView::Num(_))
+    {
+        return Err(NatDefinitionElabError::InvalidGeneratedEvaluationName);
+    }
+    let evaluation = expect_node(
+        syntax,
+        &parser_kind(&["Command", "eval"]),
+        2,
+        "Lean.Parser.Command.eval",
+    )?;
+    let [keyword, term] = evaluation else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "Lean.Parser.Command.eval",
+        });
+    };
+    expect_atom(keyword, "#eval", "evaluation keyword")?;
+    let mut expression = elaborate_term(term, &[], &nat_const(), true, Some(environment))?;
+    let declaration_type = infer_expr_type(&expression, &[], Some(environment))
+        .filter(|type_| acceptable_inferred(type_, true))
+        .unwrap_or_else(nat_const);
+    expression = eta_expand_nondependent(expression, &declaration_type)?;
+    Ok(Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: generated_name.clone(),
+            level_params: Vec::new(),
+            type_: declaration_type,
+        },
+        value: expression,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![generated_name],
+    }))
 }
 
 fn elaborate_definition_with_types(
@@ -1697,6 +1753,56 @@ mod tests {
             without_env.base.type_,
             Expr::const_(Name::from_components(["Nat"]), Vec::new())
         );
+    }
+
+    #[test]
+    fn evaluation_command_elaborates_its_expression_without_a_fake_definition() {
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let nat_add = Expr::forall_e(
+            Name::from_components(["left"]),
+            nat.clone(),
+            Expr::forall_e(
+                Name::from_components(["right"]),
+                nat.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let environment = publish_test_axiom(&nat_environment(), "Nat.add", nat_add);
+        let parsed = fln_parse::parse_source_command(b"#eval let x : Nat := 40; Nat.add x 2")
+            .expect("the bounded evaluation command parses directly");
+        let generated = Name::num(Name::anonymous(), 7);
+        let Declaration::Defn(evaluation) =
+            elaborate_evaluation_in(parsed.syntax(), generated.clone(), &environment)
+                .expect("the canonical evaluation command elaborates")
+        else {
+            panic!("evaluation elaboration must produce a checked definition candidate"); // ubs:ignore — test-only diagnostic.
+        };
+
+        assert_eq!(evaluation.base.name, generated);
+        assert_eq!(evaluation.base.type_, nat);
+        assert_eq!(evaluation.all, vec![evaluation.base.name.clone()]);
+        assert!(matches!(evaluation.value.node(), ExprNode::LetE { .. }));
+
+        let source_name = Name::from_components(["pretendEval"]);
+        assert_eq!(
+            elaborate_evaluation_in(parsed.syntax(), source_name, &environment),
+            Err(NatDefinitionElabError::InvalidGeneratedEvaluationName)
+        );
+
+        let fake_definition = parse_definition(b"def pretendEval := 42")
+            .expect("the negative control is a valid definition tree");
+        assert!(matches!(
+            elaborate_evaluation_in(
+                fake_definition.syntax(),
+                Name::num(Name::anonymous(), 8),
+                &environment,
+            ),
+            Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "Lean.Parser.Command.eval"
+            })
+        ));
     }
 
     #[test]
