@@ -81,7 +81,7 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls,\n",
+    "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls. The exact scalar rows also accept pin-precedence |||, ^^^, &&&, +, -, ++, *, /, %, <<<, >>>, and ^ infix syntax; this is not general typeclass notation,\n",
     "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
     "import set. In the latter form the last path is the entry, `import A.B` binds\n",
     "only a supplied path ending in A/B.lean. Dependency order is derived, then\n",

@@ -6,8 +6,9 @@
 //! [`parse_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
 //! signatures followed by a matching literal, identifier, parenthesized first-order
-//! application, or non-recursive local let chain with optional exact scalar type
-//! ascriptions over those forms. [`parse_source_command`] also builds the pin's
+//! application, pin-precedence bounded scalar infix expression, or non-recursive
+//! local let chain with optional exact scalar type ascriptions over those forms.
+//! [`parse_source_command`] also builds the pin's
 //! canonical `Lean.Parser.Command.eval` tree for a bounded `#eval`, so expression
 //! commands reach elaboration without fabricating and reparsing definition bytes.
 //! [`parse_nat_definition`]
@@ -213,7 +214,70 @@ struct LetBindingTokens {
 
 struct BoundedTermFrame {
     open: Option<usize>,
-    terms: Vec<(Syntax, usize)>,
+    application: Vec<(Syntax, usize)>,
+    operands: Vec<(Syntax, usize)>,
+    operators: Vec<BoundedInfixToken>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedInfix {
+    NatLor,
+    NatXor,
+    NatLand,
+    NatAdd,
+    NatSub,
+    StringAppend,
+    NatMul,
+    NatDiv,
+    NatMod,
+    NatShiftLeft,
+    NatShiftRight,
+    NatPow,
+}
+
+impl BoundedInfix {
+    const fn symbol(self) -> &'static str {
+        match self {
+            Self::NatLor => "|||",
+            Self::NatXor => "^^^",
+            Self::NatLand => "&&&",
+            Self::NatAdd => "+",
+            Self::NatSub => "-",
+            Self::StringAppend => "++",
+            Self::NatMul => "*",
+            Self::NatDiv => "/",
+            Self::NatMod => "%",
+            Self::NatShiftLeft => "<<<",
+            Self::NatShiftRight => ">>>",
+            Self::NatPow => "^",
+        }
+    }
+
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::NatLor => 55,
+            Self::NatXor => 58,
+            Self::NatLand => 60,
+            Self::NatAdd | Self::NatSub | Self::StringAppend => 65,
+            Self::NatMul | Self::NatDiv | Self::NatMod => 70,
+            Self::NatShiftLeft | Self::NatShiftRight => 75,
+            Self::NatPow => 80,
+        }
+    }
+
+    const fn is_right_associative(self) -> bool {
+        matches!(self, Self::NatPow)
+    }
+
+    fn syntax_kind(self) -> Name {
+        Name::str(Name::anonymous(), format!("term_{}_", self.symbol()))
+    }
+}
+
+struct BoundedInfixToken {
+    operator: BoundedInfix,
+    syntax: Syntax,
+    at: usize,
 }
 
 impl ParsedDefinition {
@@ -345,11 +409,38 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 }
 
 fn nat_definition_token_table() -> TokenTable {
-    TokenTable::from_tokens(["def", "let", "(", ")", ":", ":=", ";"])
+    TokenTable::from_tokens([
+        "def", "let", "(", ")", ":", ":=", ";", "|||", "^^^", "&&&", "+", "-", "++", "*", "/", "%",
+        "<<<", ">>>", "^",
+    ])
 }
 
 fn source_module_token_table() -> TokenTable {
-    TokenTable::from_tokens(["import", "def", "#eval", "let", "(", ")", ":", ":=", ";"])
+    TokenTable::from_tokens([
+        "import", "def", "#eval", "let", "(", ")", ":", ":=", ";", "|||", "^^^", "&&&", "+", "-",
+        "++", "*", "/", "%", "<<<", ">>>", "^",
+    ])
+}
+
+fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option<BoundedInfix> {
+    let Some(TokenKind::Symbol(symbol)) = kind else {
+        return None;
+    };
+    match symbol.as_str() {
+        "|||" => Some(BoundedInfix::NatLor),
+        "^^^" => Some(BoundedInfix::NatXor),
+        "&&&" => Some(BoundedInfix::NatLand),
+        "+" => Some(BoundedInfix::NatAdd),
+        "-" => Some(BoundedInfix::NatSub),
+        "++" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::StringAppend),
+        "*" => Some(BoundedInfix::NatMul),
+        "/" => Some(BoundedInfix::NatDiv),
+        "%" => Some(BoundedInfix::NatMod),
+        "<<<" => Some(BoundedInfix::NatShiftLeft),
+        ">>>" => Some(BoundedInfix::NatShiftRight),
+        "^" => Some(BoundedInfix::NatPow),
+        _ => None,
+    }
 }
 
 fn original_position(view: &SourceView, tokens: &[LexedToken], index: usize) -> BytePos {
@@ -539,7 +630,7 @@ fn bounded_value_syntax(
     Ok(value)
 }
 
-fn finish_bounded_term(
+fn finish_bounded_application(
     view: &SourceView,
     tokens: &[LexedToken],
     mut terms: Vec<(Syntax, usize)>,
@@ -574,6 +665,103 @@ fn finish_bounded_term(
     ))
 }
 
+fn reduce_bounded_infix(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frame: &mut BoundedTermFrame,
+    grammar: DefinitionGrammar,
+) -> Result<(), NatDefinitionParseError> {
+    let Some(operator) = frame.operators.pop() else {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, tokens.len()),
+            expected: grammar.value_expectation(),
+        });
+    };
+    let Some((right, _)) = frame.operands.pop() else {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, operator.at),
+            expected: grammar.value_expectation(),
+        });
+    };
+    let Some((left, left_at)) = frame.operands.pop() else {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, operator.at),
+            expected: grammar.value_expectation(),
+        });
+    };
+    frame.operands.push((
+        Syntax::node(
+            operator.operator.syntax_kind(),
+            vec![left, operator.syntax, right],
+        ),
+        left_at,
+    ));
+    Ok(())
+}
+
+fn push_bounded_operand(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frame: &mut BoundedTermFrame,
+    grammar: DefinitionGrammar,
+    empty_at: usize,
+) -> Result<(), NatDefinitionParseError> {
+    let application = std::mem::take(&mut frame.application);
+    let first_at = application.first().map_or(empty_at, |(_, at)| *at);
+    let term = finish_bounded_application(view, tokens, application, grammar, empty_at)?;
+    frame.operands.push((term, first_at));
+    Ok(())
+}
+
+fn push_bounded_infix(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frame: &mut BoundedTermFrame,
+    grammar: DefinitionGrammar,
+    operator: BoundedInfix,
+    index: usize,
+    syntax: Syntax,
+) -> Result<(), NatDefinitionParseError> {
+    push_bounded_operand(view, tokens, frame, grammar, index)?;
+    while frame.operators.last().is_some_and(|previous| {
+        previous.operator.precedence() > operator.precedence()
+            || (previous.operator.precedence() == operator.precedence()
+                && !operator.is_right_associative())
+    }) {
+        reduce_bounded_infix(view, tokens, frame, grammar)?;
+    }
+    frame.operators.push(BoundedInfixToken {
+        operator,
+        syntax,
+        at: index,
+    });
+    Ok(())
+}
+
+fn finish_bounded_frame(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    mut frame: BoundedTermFrame,
+    grammar: DefinitionGrammar,
+    empty_at: usize,
+) -> Result<Syntax, NatDefinitionParseError> {
+    push_bounded_operand(view, tokens, &mut frame, grammar, empty_at)?;
+    while !frame.operators.is_empty() {
+        reduce_bounded_infix(view, tokens, &mut frame, grammar)?;
+    }
+    if frame.operands.len() != 1 {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, empty_at),
+            expected: grammar.value_expectation(),
+        });
+    }
+    Ok(frame
+        .operands
+        .pop()
+        .expect("the bounded frame has exactly one result")
+        .0)
+}
+
 fn hygiene_ident() -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
@@ -605,7 +793,9 @@ fn bounded_term(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let mut frames = vec![BoundedTermFrame {
         open: None,
-        terms: Vec::new(),
+        application: Vec::new(),
+        operands: Vec::new(),
+        operators: Vec::new(),
     }];
     for index in range.clone() {
         match tokens.get(index).map(|token| &token.kind) {
@@ -614,13 +804,15 @@ fn bounded_term(
                 frames
                     .last_mut()
                     .expect("the root term frame remains live")
-                    .terms
+                    .application
                     .push((term, index));
             }
             Some(TokenKind::Symbol(symbol)) if symbol == "(" => {
                 frames.push(BoundedTermFrame {
                     open: Some(index),
-                    terms: Vec::new(),
+                    application: Vec::new(),
+                    operands: Vec::new(),
+                    operators: Vec::new(),
                 });
             }
             Some(TokenKind::Symbol(symbol)) if symbol == ")" => {
@@ -634,7 +826,7 @@ fn bounded_term(
                     .pop()
                     .expect("a closing parenthesis has an inner frame");
                 let open = frame.open.expect("only the root frame lacks an opener");
-                let inner = finish_bounded_term(view, tokens, frame.terms, grammar, index)?;
+                let inner = finish_bounded_frame(view, tokens, frame, grammar, index)?;
                 let grouped = Syntax::node(
                     parser_kind(&["Term", "paren"]),
                     vec![
@@ -646,8 +838,15 @@ fn bounded_term(
                 frames
                     .last_mut()
                     .expect("the parent term frame remains live")
-                    .terms
+                    .application
                     .push((grouped, open));
+            }
+            kind if bounded_infix(kind, grammar).is_some() => {
+                let operator = bounded_infix(kind, grammar)
+                    .expect("the guarded bounded infix remains recognized");
+                let syntax = leaves.leaf(index)?;
+                let frame = frames.last_mut().expect("the root term frame remains live");
+                push_bounded_infix(view, tokens, frame, grammar, operator, index, syntax)?;
             }
             _ => {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -664,7 +863,7 @@ fn bounded_term(
         });
     }
     let frame = frames.pop().expect("the bounded term has a root frame");
-    finish_bounded_term(view, tokens, frame.terms, grammar, range.end)
+    finish_bounded_frame(view, tokens, frame, grammar, range.end)
 }
 
 /// Parse the first production command subset:
@@ -674,7 +873,8 @@ fn bounded_term(
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? := <identifier> <natural-literal-or-identifier>+
 /// def <identifier> (<identifier>+ : Nat)* (: Nat)? :=
 ///   (let <identifier> (: Nat)? := <bounded-term>;)+ <bounded-term>
-/// <bounded-term> ::= <atom> | <identifier> <bounded-atom>+ | `(` <bounded-term> `)`
+/// <bounded-term> ::= <application> | <bounded-term> <bounded-infix> <bounded-term>
+/// <application> ::= <atom> | <identifier> <bounded-atom>+ | `(` <bounded-term> `)`
 /// ```
 ///
 pub fn parse_nat_definition(source: &[u8]) -> Result<ParsedNatDefinition, NatDefinitionParseError> {
@@ -1178,6 +1378,30 @@ pub fn partition_nat_definition_commands(
 mod nat_definition_tests {
     use super::*;
 
+    fn definition_value(parsed: &ParsedDefinition) -> &Syntax {
+        let Syntax::Node { args, .. } = parsed.syntax() else {
+            panic!("the command root must be a node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &args[1]
+        else {
+            panic!("the declaration payload must be a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &definition[3] else {
+            panic!("the definition value must use declValSimple");
+        };
+        &value[1]
+    }
+
+    fn operator_args<'a>(syntax: &'a Syntax, expected: &str) -> &'a [Syntax] {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            panic!("expected bounded operator node {expected}");
+        };
+        assert_eq!(kind, &Name::str(Name::anonymous(), expected));
+        args
+    }
+
     #[test]
     fn command_slice_builds_the_canonical_tree_and_retains_both_source_views() {
         let source = b"def answer := 18446744073709551616\r\n";
@@ -1533,6 +1757,162 @@ mod nat_definition_tests {
     }
 
     #[test]
+    fn bounded_infix_terms_match_the_pins_precedence_and_associativity() {
+        let source = b"def answer := 2 + 3 * 4 ^ 2";
+        let parsed = parse_definition(source).expect("the bounded arithmetic notation parses");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+        let Syntax::Node {
+            kind: add_kind,
+            args: add,
+            ..
+        } = definition_value(&parsed)
+        else {
+            panic!("the outer addition must be a syntax node");
+        };
+        assert_eq!(add_kind, &Name::str(Name::anonymous(), "term_+_"));
+        assert!(matches!(&add[1], Syntax::Atom { val, .. } if val == "+"));
+        let Syntax::Node {
+            kind: mul_kind,
+            args: mul,
+            ..
+        } = &add[2]
+        else {
+            panic!("multiplication must bind inside addition");
+        };
+        assert_eq!(mul_kind, &Name::str(Name::anonymous(), "term_*_"));
+        assert!(matches!(
+            &mul[2],
+            Syntax::Node { kind, .. } if kind == &Name::str(Name::anonymous(), "term_^_")
+        ));
+
+        let parsed = parse_definition(b"def answer := 20 - 3 - 2")
+            .expect("subtraction notation parses left-associatively");
+        let Syntax::Node {
+            kind: outer_kind,
+            args: outer,
+            ..
+        } = definition_value(&parsed)
+        else {
+            panic!("the outer subtraction must be a syntax node");
+        };
+        assert_eq!(outer_kind, &Name::str(Name::anonymous(), "term_-_"));
+        assert!(matches!(
+            &outer[0],
+            Syntax::Node { kind, .. } if kind == &Name::str(Name::anonymous(), "term_-_")
+        ));
+
+        let parsed = parse_definition(b"def answer := 2 ^ 3 ^ 2")
+            .expect("power notation parses right-associatively");
+        let Syntax::Node {
+            kind: outer_kind,
+            args: outer,
+            ..
+        } = definition_value(&parsed)
+        else {
+            panic!("the outer power must be a syntax node");
+        };
+        assert_eq!(outer_kind, &Name::str(Name::anonymous(), "term_^_"));
+        assert!(matches!(
+            &outer[2],
+            Syntax::Node { kind, .. } if kind == &Name::str(Name::anonymous(), "term_^_")
+        ));
+
+        let parsed = parse_definition(b"def answer := (2 + 3) * 4")
+            .expect("parentheses override bounded infix precedence");
+        let Syntax::Node { kind, args, .. } = definition_value(&parsed) else {
+            panic!("the grouped multiplication must be a syntax node");
+        };
+        assert_eq!(kind, &Name::str(Name::anonymous(), "term_*_"));
+        assert!(matches!(
+            &args[0],
+            Syntax::Node { kind, args, .. }
+                if kind == &parser_kind(&["Term", "paren"])
+                    && matches!(&args[1], Syntax::Node { kind, .. }
+                        if kind == &Name::str(Name::anonymous(), "term_+_"))
+        ));
+
+        let parsed = parse_definition(b"def answer := 1 ||| 2 ^^^ 3 &&& 4 + 5 * 6 <<< 7 ^ 8")
+            .expect("every distinct bounded precedence level composes");
+        let lor = operator_args(definition_value(&parsed), "term_|||_");
+        let xor = operator_args(&lor[2], "term_^^^_");
+        let land = operator_args(&xor[2], "term_&&&_");
+        let add = operator_args(&land[2], "term_+_");
+        let mul = operator_args(&add[2], "term_*_");
+        let shift = operator_args(&mul[2], "term_<<<_");
+        operator_args(&shift[2], "term_^_");
+
+        let parsed = parse_definition(b"def answer := 1 * 2 / 3 % 4")
+            .expect("equal multiplicative precedences compose left-associatively");
+        let modulo = operator_args(definition_value(&parsed), "term_%_");
+        let divide = operator_args(&modulo[0], "term_/_");
+        operator_args(&divide[0], "term_*_");
+
+        let parsed = parse_definition(b"def answer := 1 <<< 2 >>> 3")
+            .expect("equal shift precedences compose left-associatively");
+        let shift_right = operator_args(definition_value(&parsed), "term_>>>_");
+        operator_args(&shift_right[0], "term_<<<_");
+
+        let parsed = parse_definition(b"def message := \"a\" ++ \"b\" ++ \"c\"")
+            .expect("String append composes left-associatively");
+        let outer_append = operator_args(definition_value(&parsed), "term_++_");
+        operator_args(&outer_append[0], "term_++_");
+    }
+
+    #[test]
+    fn bounded_infix_table_reconstructs_every_admitted_spelling() {
+        for expression in [
+            "1 ||| 2",
+            "1 ^^^ 2",
+            "1 &&& 2",
+            "1 + 2",
+            "1 - 2",
+            "1 * 2",
+            "1 / 2",
+            "1 % 2",
+            "1 <<< 2",
+            "1 >>> 2",
+            "1 ^ 2",
+            "\"franken\" ++ \"lean\"",
+        ] {
+            let source = format!("def answer := {expression}");
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{expression:?} must parse: {error}"));
+            assert_eq!(
+                parsed.reconstruct_normalized().as_deref(),
+                Some(source.as_bytes()),
+                "source spelling {expression:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_out_of_slice_infix_terms_remain_typed_refusals() {
+        for source in [
+            b"def answer := + 1".as_slice(),
+            b"def answer := 1 +".as_slice(),
+            b"def answer := 1 + * 2".as_slice(),
+        ] {
+            assert!(matches!(
+                parse_definition(source),
+                Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    expected: NatDefinitionExpectation::ScalarValue,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            parse_nat_definition(b"def answer := 1 ++ 2"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalValue,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn command_slice_builds_the_reference_parenthesized_application_shape() {
         let source = b"def answer := Nat.sub (Nat.mul 9 5) 3";
         let parsed = parse_definition(source).expect("the bounded nested application parses");
@@ -1628,6 +2008,21 @@ mod nat_definition_tests {
         source.extend(std::iter::repeat_n(b')', DEPTH));
         let parsed =
             parse_nat_definition(&source).expect("parenthesis handling uses explicit work stacks");
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(source.as_slice())
+        );
+    }
+
+    #[test]
+    fn long_left_associative_infix_chain_parses_without_host_stack_recursion() {
+        const TERMS: usize = 10_000;
+        let mut source = b"def answer := 1".to_vec();
+        for _ in 1..TERMS {
+            source.extend_from_slice(b" + 1");
+        }
+        let parsed = parse_nat_definition(&source)
+            .expect("bounded infix parsing uses explicit operand and operator stacks");
         assert_eq!(
             parsed.reconstruct_normalized().as_deref(),
             Some(source.as_slice())

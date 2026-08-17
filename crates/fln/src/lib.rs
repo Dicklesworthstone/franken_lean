@@ -2,7 +2,8 @@
 //!
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
-//! from a bounded exact Nat/String/Bool definition, checked scalar intrinsics, or first-order application
+//! from a bounded exact Nat/String/Bool definition, checked scalar intrinsics,
+//! pin-precedence scalar infix syntax, or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -8802,6 +8803,61 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_infix_source_reaches_checked_flbc_and_golem_with_pin_grouping() {
+        let options = KVMap::new();
+        let nat_only = seeded_engine();
+        let base_root = nat_only.logical_root(&options);
+        let missing = nat_only
+            .execute_source_definition(b"def answer := 40 + 2", &options, test_limits())
+            .expect_err("notation must not invent Nat.add authority");
+        assert!(matches!(
+            missing,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(nat_only.logical_root(&options), base_root);
+
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let completed = engine
+            .execute_source_definitions(
+                &[
+                    b"def precedence := 2 + 3 * 4",
+                    b"def subtraction := 20 - 3 - 2",
+                    b"def exponent := 2 ^ 3 ^ 2",
+                    b"def grouped := (2 + 3) * 4",
+                    b"def bits := 12 &&& 10 ||| 1",
+                    b"def text := \"franken\" ++ \"lean\"",
+                ],
+                &options,
+                test_limits(),
+            )
+            .expect("ordinary bounded infix source reaches checked execution");
+        let Outcome::Complete(completed) = completed else {
+            panic!("bounded infix execution must answer completely");
+        };
+        let expected = [
+            ClosedVmValue::Scalar(14),
+            ClosedVmValue::Scalar(15),
+            ClosedVmValue::Scalar(512),
+            ClosedVmValue::Scalar(20),
+            ClosedVmValue::Scalar(9),
+            ClosedVmValue::String("frankenlean".to_owned()),
+        ];
+        assert_eq!(completed.executions.len(), expected.len());
+        for (execution, expected) in completed.executions.iter().zip(expected) {
+            assert_eq!(closed_vm_value(&execution.exit), Ok(Some(expected)));
+            assert!(!execution.flbc_artifact.is_empty());
+            fln_comp::flbc::decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                .expect("every exact executed infix artifact decodes canonically");
+        }
+    }
+
+    #[test]
     fn checked_nat_mul_and_sub_source_reaches_golem() {
         let options = KVMap::new();
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
@@ -9521,7 +9577,7 @@ mod tests {
             .execute_source_definitions(
                 &[
                     b"def Nat.add (left right : Nat) : Nat := left",
-                    b"def answer := Nat.add 40 2",
+                    b"def answer := 40 + 2",
                 ],
                 &options,
                 test_limits(),
@@ -9665,7 +9721,7 @@ mod tests {
             .execute_source_definitions(
                 &[
                     b"def String.append (left right : String) : String := left",
-                    b"def message := String.append (String.append \"ordinary\" \"ignored\") \"intrinsic\"",
+                    b"def message := \"ordinary\" ++ \"ignored\" ++ \"intrinsic\"",
                 ],
                 &options,
                 test_limits(),

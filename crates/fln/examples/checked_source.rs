@@ -59,9 +59,9 @@ fn run_embedder() -> Result<EmbedderSummary, Box<dyn Error>> {
     let engine = seeded_engine()?;
     let options = KVMap::new();
     let sources: [&[u8]; 3] = [
-        b"def product : Nat := Nat.mul 6 7",
-        b"def incremented : Nat := Nat.add product 1",
-        b"def answer : Nat := Nat.gcd (Nat.mul product 2) (Nat.mul incremented 42)",
+        b"def product : Nat := 6 * 7",
+        b"def incremented : Nat := product + 1",
+        b"def answer : Nat := Nat.gcd (product * 2) (incremented * 42)",
     ];
     let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(KERNEL_STACK_BYTES));
     let completed = match engine.execute_source_definitions(&sources, &options, limits)? {

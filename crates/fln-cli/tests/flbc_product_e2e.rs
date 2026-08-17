@@ -55,7 +55,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
     )
     .expect("write middle module");
-    std::fs::write(&main, b"import Project.Middle\n#eval Nat.add middle 2\n")
+    std::fs::write(&main, b"import Project.Middle\n#eval middle + 2\n")
         .expect("write evaluating entry module");
 
     let produced = run_fln(&[
@@ -353,12 +353,12 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     let collision = root.join("Collision.flbc");
     std::fs::write(
         &source,
-        b"def product : Nat := Nat.mul 6 7\ndef incremented : Nat := Nat.add product 1\ndef answer : Nat := Nat.sub (Nat.add incremented 0) 1\n",
+        b"def product : Nat := 6 * 7\ndef incremented : Nat := product + 1\ndef answer : Nat := (incremented + 0) - 1\n",
     )
     .expect("write supported dependent source batch");
     std::fs::write(
         &string_source,
-        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := String.append (copy prefix) \"β\"; output\n"
+        "def copy (value : String) := value\ndef prefix := copy \"artifact\\n\"\ndef message := let output : String := copy prefix ++ \"β\"; output\n"
             .as_bytes(),
     )
     .expect("write supported String source");

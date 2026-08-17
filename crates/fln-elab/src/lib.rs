@@ -5,8 +5,9 @@
 //!
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed bounded exact `Nat`/`String`/`Bool`
-//! definition, explicit first-order function, parenthesized application, local
-//! let chain, or terminal bounded `Lean.Parser.Command.eval` expression becomes
+//! definition, explicit first-order function, parenthesized application,
+//! pin-precedence bounded scalar infix expression, local let chain, or terminal
+//! bounded `Lean.Parser.Command.eval` expression becomes
 //! a real [`Declaration::Defn`] candidate and is handed to Crucible's sole check
 //! authority. Evaluation receives an unspellable generated identity directly;
 //! it is never reparsed as fabricated definition source. The original Nat-only door remains strict.
@@ -763,6 +764,31 @@ fn parenthesized_inner(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinition
     Ok(Some(&parts[1]))
 }
 
+fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<(&'static str, Name)> {
+    let rows = [
+        ("term_|||_", "|||", ["Nat", "lor"]),
+        ("term_^^^_", "^^^", ["Nat", "xor"]),
+        ("term_&&&_", "&&&", ["Nat", "land"]),
+        ("term_+_", "+", ["Nat", "add"]),
+        ("term_-_", "-", ["Nat", "sub"]),
+        ("term_*_", "*", ["Nat", "mul"]),
+        ("term_/_", "/", ["Nat", "div"]),
+        ("term_%_", "%", ["Nat", "mod"]),
+        ("term_<<<_", "<<<", ["Nat", "shiftLeft"]),
+        ("term_>>>_", ">>>", ["Nat", "shiftRight"]),
+        ("term_^_", "^", ["Nat", "pow"]),
+    ];
+    for (syntax_kind, spelling, constant) in rows {
+        if kind == &Name::str(Name::anonymous(), syntax_kind) {
+            return Some((spelling, Name::from_components(constant)));
+        }
+    }
+    if allow_string && kind == &Name::str(Name::anonymous(), "term_++_") {
+        return Some(("++", Name::from_components(["String", "append"])));
+    }
+    None
+}
+
 fn elaborate_nonlet_term(
     syntax: &Syntax,
     locals: &[(Name, Expr)],
@@ -772,6 +798,10 @@ fn elaborate_nonlet_term(
     enum Task<'a> {
         Visit(&'a Syntax),
         Apply(usize),
+        ApplyInfix {
+            values_before: usize,
+            intrinsic: Name,
+        },
     }
 
     let mut tasks = vec![Task::Visit(syntax)];
@@ -787,6 +817,17 @@ fn elaborate_nonlet_term(
                     values.push(elaborate_atom(term, locals, allow_string, environment)?);
                     continue;
                 };
+                if let Some((spelling, intrinsic)) = bounded_infix_intrinsic(kind, allow_string) {
+                    let parts = expect_node(term, kind, 3, "bounded scalar infix expression")?;
+                    expect_atom(&parts[1], spelling, "bounded scalar infix operator")?;
+                    tasks.push(Task::ApplyInfix {
+                        values_before: values.len(),
+                        intrinsic,
+                    });
+                    tasks.push(Task::Visit(&parts[2]));
+                    tasks.push(Task::Visit(&parts[0]));
+                    continue;
+                }
                 if kind != &parser_kind(&["Term", "app"]) {
                     values.push(elaborate_atom(term, locals, allow_string, environment)?);
                     continue;
@@ -835,6 +876,30 @@ fn elaborate_nonlet_term(
                     expression = Expr::app(expression, argument);
                 }
                 values.push(expression);
+            }
+            Task::ApplyInfix {
+                values_before,
+                intrinsic,
+            } => {
+                if values.len() != values_before.saturating_add(2) {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "complete bounded infix operands",
+                    });
+                }
+                let right = values
+                    .pop()
+                    .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "bounded infix right operand",
+                    })?;
+                let left = values
+                    .pop()
+                    .ok_or(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "bounded infix left operand",
+                    })?;
+                values.push(Expr::app(
+                    Expr::app(Expr::const_(intrinsic, Vec::new()), left),
+                    right,
+                ));
             }
         }
     }
@@ -1202,6 +1267,24 @@ mod tests {
         publication.environment
     }
 
+    fn binary_intrinsic(expression: &Expr) -> (&Name, &Expr, &Expr) {
+        let ExprNode::App {
+            f: partial,
+            a: right,
+        } = expression.node()
+        else {
+            panic!("the bounded infix must lower to a saturated application");
+        };
+        let ExprNode::App { f: head, a: left } = partial.node() else {
+            panic!("the bounded infix must lower to a binary application");
+        };
+        let ExprNode::Const { name, levels } = head.node() else {
+            panic!("the bounded infix head must be a constant");
+        };
+        assert!(levels.is_empty());
+        (name, left, right)
+    }
+
     #[test]
     fn source_text_becomes_an_arbitrary_precision_kernel_accepted_constant() {
         let source = b"def answer := 18446744073709551616";
@@ -1227,6 +1310,137 @@ mod tests {
             } if value == &NatLit::from_limbs_le(vec![0, 1])
         ));
         assert_eq!(result.parsed.reconstruct_original(), source);
+    }
+
+    #[test]
+    fn bounded_infix_syntax_lowers_to_exact_checked_intrinsic_names() {
+        let parsed = parse_definition(b"def answer := 2 + 3 * 4 ^ 2")
+            .expect("the bounded infix expression parses");
+        let Declaration::Defn(definition) =
+            elaborate_definition(parsed.syntax()).expect("the bounded infix expression elaborates")
+        else {
+            panic!("the bounded infix command must elaborate to a definition");
+        };
+        let (add, left, multiplied) = binary_intrinsic(&definition.value);
+        assert_eq!(add, &Name::from_components(["Nat", "add"]));
+        assert!(matches!(
+            left.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(value)
+            } if value == &NatLit::from_u64(2)
+        ));
+        let (mul, three, powered) = binary_intrinsic(multiplied);
+        assert_eq!(mul, &Name::from_components(["Nat", "mul"]));
+        assert!(matches!(
+            three.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(value)
+            } if value == &NatLit::from_u64(3)
+        ));
+        let (pow, four, two) = binary_intrinsic(powered);
+        assert_eq!(pow, &Name::from_components(["Nat", "pow"]));
+        assert!(matches!(
+            (four.node(), two.node()),
+            (
+                ExprNode::Lit {
+                    literal: Literal::Nat(four)
+                },
+                ExprNode::Lit {
+                    literal: Literal::Nat(two)
+                }
+            ) if four == &NatLit::from_u64(4) && two == &NatLit::from_u64(2)
+        ));
+
+        let parsed = parse_definition(b"def answer := 20 - 3 - 2")
+            .expect("left-associated subtraction parses");
+        let Declaration::Defn(definition) =
+            elaborate_definition(parsed.syntax()).expect("left-associated subtraction elaborates")
+        else {
+            panic!("subtraction must elaborate to a definition");
+        };
+        let (outer_sub, inner_sub, _) = binary_intrinsic(&definition.value);
+        assert_eq!(outer_sub, &Name::from_components(["Nat", "sub"]));
+        assert_eq!(
+            binary_intrinsic(inner_sub).0,
+            &Name::from_components(["Nat", "sub"])
+        );
+
+        let parsed =
+            parse_definition(b"def answer := 2 ^ 3 ^ 2").expect("right-associated power parses");
+        let Declaration::Defn(definition) =
+            elaborate_definition(parsed.syntax()).expect("right-associated power elaborates")
+        else {
+            panic!("power must elaborate to a definition");
+        };
+        let (outer_pow, _, inner_pow) = binary_intrinsic(&definition.value);
+        assert_eq!(outer_pow, &Name::from_components(["Nat", "pow"]));
+        assert_eq!(
+            binary_intrinsic(inner_pow).0,
+            &Name::from_components(["Nat", "pow"])
+        );
+
+        let parsed = parse_definition(b"def message : String := \"franken\" ++ \"lean\"")
+            .expect("bounded String append notation parses");
+        let Declaration::Defn(definition) = elaborate_definition(parsed.syntax())
+            .expect("bounded String append notation elaborates")
+        else {
+            panic!("String append must elaborate to a definition");
+        };
+        assert_eq!(
+            binary_intrinsic(&definition.value).0,
+            &Name::from_components(["String", "append"])
+        );
+
+        let parsed = parse_definition(b"def answer := 1 + 2")
+            .expect("the negative control starts from a canonical infix tree");
+        let mut forged = parsed.syntax().clone();
+        let Syntax::Node { args, .. } = &mut forged else {
+            panic!("the command root must remain a syntax node");
+        };
+        let Syntax::Node {
+            args: definition, ..
+        } = &mut args[1]
+        else {
+            panic!("the declaration payload must remain a definition node");
+        };
+        let Syntax::Node { args: value, .. } = &mut definition[3] else {
+            panic!("the definition value must remain a simple value node");
+        };
+        let Syntax::Node {
+            args: infix_parts, ..
+        } = &mut value[1]
+        else {
+            panic!("the bounded infix must remain a syntax node");
+        };
+        let Syntax::Atom { val, .. } = &mut infix_parts[1] else {
+            panic!("the bounded infix token must remain an atom");
+        };
+        *val = "*".to_owned();
+        assert_eq!(
+            elaborate_definition(&forged),
+            Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "bounded scalar infix operator"
+            })
+        );
+    }
+
+    #[test]
+    fn long_infix_spine_elaborates_without_host_stack_recursion() {
+        const TERMS: usize = 4_000;
+        let mut source = b"def answer := 1".to_vec();
+        for _ in 1..TERMS {
+            source.extend_from_slice(b" + 1");
+        }
+        let parsed = parse_nat_definition(&source).expect("the long bounded expression parses");
+        let Declaration::Defn(definition) = elaborate_nat_definition(parsed.syntax())
+            .expect("bounded infix elaboration uses an explicit task stack")
+        else {
+            panic!("the long bounded expression must elaborate to a definition");
+        };
+        assert_eq!(
+            definition.base.type_,
+            Expr::const_(Name::from_components(["Nat"]), Vec::new())
+        );
     }
 
     #[test]

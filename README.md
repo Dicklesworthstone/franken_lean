@@ -243,9 +243,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         other => return Err(std::io::Error::other(format!("seed: {other:?}")).into()),
     };
     let sources: [&[u8]; 3] = [
-        b"def product : Nat := Nat.mul 6 7",
-        b"def incremented : Nat := Nat.add product 1",
-        b"def answer : Nat := Nat.sub (Nat.add incremented 0) 1",
+        b"def product : Nat := 6 * 7",
+        b"def incremented : Nat := product + 1",
+        b"def answer : Nat := (incremented + 0) - 1",
     ];
     let completed = match engine.execute_source_definitions(
         &sources,
@@ -277,7 +277,12 @@ checked `Nat.add`/`Nat.sub`/`Nat.mul` plus `Nat.div`/`Nat.mod`/`Nat.gcd`/
 `Nat.pred`/`Nat.pow`/`Nat.log2`/`Nat.shiftLeft`/`Nat.shiftRight`/`Nat.land`/
 `Nat.lor`/`Nat.xor`, `String.append`, `String.length`, and
 `String.utf8ByteSize`, plus the exact `true`/`false` Bool constructors and
-Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq` intrinsics. The source seed admits
+Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq` intrinsics. The facade accepts
+the pin-precedence infix spellings `|||`, `^^^`, `&&&`, `+`, `-`, `++`, `*`,
+`/`, `%`, `<<<`, `>>>`, and `^` for those exact checked Nat/String rows;
+application binds tighter, subtraction and the other `infixl` rows associate
+left, and power associates right. This is direct bounded scalar elaboration,
+not general `HAdd`/typeclass notation support. The source seed admits
 the pin-shaped `Bool` block through K1 and the independent checker, and the
 compiler derives its scalar `0`/`1` ABI binding from those exact checked
 constructor rows. This does not yet add source pattern matching, recursor
