@@ -6,7 +6,8 @@
 //! The full tower is not present yet. Bead `fln-5720` establishes its first
 //! end-to-end production seam: one parsed bounded exact `Nat`/`String`/`Bool`
 //! definition, explicit first-order function, parenthesized application,
-//! pin-precedence bounded scalar infix expression, local let chain, or terminal
+//! pin-precedence bounded scalar infix expression (including type-directed
+//! Nat/String `==`), local let chain, or terminal
 //! bounded `Lean.Parser.Command.eval` expression becomes
 //! a real [`Declaration::Defn`] candidate and is handed to Crucible's sole check
 //! authority. Evaluation receives an unspellable generated identity directly;
@@ -764,7 +765,27 @@ fn parenthesized_inner(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinition
     Ok(Some(&parts[1]))
 }
 
-fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<(&'static str, Name)> {
+enum BoundedInfixIntrinsic {
+    Fixed {
+        spelling: &'static str,
+        intrinsic: Name,
+    },
+    ScalarBeq,
+}
+
+impl BoundedInfixIntrinsic {
+    const fn spelling(&self) -> &'static str {
+        match self {
+            Self::Fixed { spelling, .. } => spelling,
+            Self::ScalarBeq => "==",
+        }
+    }
+}
+
+fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInfixIntrinsic> {
+    if allow_string && kind == &Name::str(Name::anonymous(), "term_==_") {
+        return Some(BoundedInfixIntrinsic::ScalarBeq);
+    }
     let rows = [
         ("term_|||_", "|||", ["Nat", "lor"]),
         ("term_^^^_", "^^^", ["Nat", "xor"]),
@@ -780,11 +801,17 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<(&'static 
     ];
     for (syntax_kind, spelling, constant) in rows {
         if kind == &Name::str(Name::anonymous(), syntax_kind) {
-            return Some((spelling, Name::from_components(constant)));
+            return Some(BoundedInfixIntrinsic::Fixed {
+                spelling,
+                intrinsic: Name::from_components(constant),
+            });
         }
     }
     if allow_string && kind == &Name::str(Name::anonymous(), "term_++_") {
-        return Some(("++", Name::from_components(["String", "append"])));
+        return Some(BoundedInfixIntrinsic::Fixed {
+            spelling: "++",
+            intrinsic: Name::from_components(["String", "append"]),
+        });
     }
     None
 }
@@ -800,7 +827,7 @@ fn elaborate_nonlet_term(
         Apply(usize),
         ApplyInfix {
             values_before: usize,
-            intrinsic: Name,
+            intrinsic: BoundedInfixIntrinsic,
         },
     }
 
@@ -817,9 +844,13 @@ fn elaborate_nonlet_term(
                     values.push(elaborate_atom(term, locals, allow_string, environment)?);
                     continue;
                 };
-                if let Some((spelling, intrinsic)) = bounded_infix_intrinsic(kind, allow_string) {
+                if let Some(intrinsic) = bounded_infix_intrinsic(kind, allow_string) {
                     let parts = expect_node(term, kind, 3, "bounded scalar infix expression")?;
-                    expect_atom(&parts[1], spelling, "bounded scalar infix operator")?;
+                    expect_atom(
+                        &parts[1],
+                        intrinsic.spelling(),
+                        "bounded scalar infix operator",
+                    )?;
                     tasks.push(Task::ApplyInfix {
                         values_before: values.len(),
                         intrinsic,
@@ -896,6 +927,21 @@ fn elaborate_nonlet_term(
                     .ok_or(NatDefinitionElabError::UnexpectedSyntax {
                         expected: "bounded infix left operand",
                     })?;
+                let intrinsic = match intrinsic {
+                    BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                    BoundedInfixIntrinsic::ScalarBeq => {
+                        let left_type = infer_expr_type(&left, locals, environment);
+                        let right_type = infer_expr_type(&right, locals, environment);
+                        let string = string_const();
+                        if left_type.as_ref() == Some(&string)
+                            && right_type.as_ref() == Some(&string)
+                        {
+                            Name::from_components(["String", "decEq"])
+                        } else {
+                            Name::from_components(["Nat", "beq"])
+                        }
+                    }
+                };
                 values.push(Expr::app(
                     Expr::app(Expr::const_(intrinsic, Vec::new()), left),
                     right,
@@ -1285,6 +1331,13 @@ mod tests {
         (name, left, right)
     }
 
+    fn lambda_body(expression: &Expr) -> &Expr {
+        let ExprNode::Lam { body, .. } = expression.node() else {
+            panic!("the bounded function must remain a lambda spine");
+        };
+        body
+    }
+
     #[test]
     fn source_text_becomes_an_arbitrary_precision_kernel_accepted_constant() {
         let source = b"def answer := 18446744073709551616";
@@ -1389,6 +1442,38 @@ mod tests {
         assert_eq!(
             binary_intrinsic(&definition.value).0,
             &Name::from_components(["String", "append"])
+        );
+
+        let parsed = parse_definition(b"def answer : Bool := 40 + 2 == 42")
+            .expect("bounded Nat equality notation parses");
+        let Declaration::Defn(definition) = elaborate_definition(parsed.syntax())
+            .expect("bounded Nat equality notation elaborates")
+        else {
+            panic!("Nat equality must elaborate to a definition");
+        };
+        let (beq, sum, expected) = binary_intrinsic(&definition.value);
+        assert_eq!(beq, &Name::from_components(["Nat", "beq"]));
+        assert_eq!(
+            binary_intrinsic(sum).0,
+            &Name::from_components(["Nat", "add"])
+        );
+        assert!(matches!(
+            expected.node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(value)
+            } if value == &NatLit::from_u64(42)
+        ));
+
+        let parsed = parse_definition(b"def same (left right : String) : Bool := left == right")
+            .expect("bounded String equality notation parses");
+        let Declaration::Defn(definition) = elaborate_definition(parsed.syntax())
+            .expect("bounded String equality notation elaborates")
+        else {
+            panic!("String equality must elaborate to a definition");
+        };
+        assert_eq!(
+            binary_intrinsic(lambda_body(lambda_body(&definition.value))).0,
+            &Name::from_components(["String", "decEq"])
         );
 
         let parsed = parse_definition(b"def answer := 1 + 2")

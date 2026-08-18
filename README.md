@@ -278,11 +278,13 @@ checked `Nat.add`/`Nat.sub`/`Nat.mul` plus `Nat.div`/`Nat.mod`/`Nat.gcd`/
 `Nat.lor`/`Nat.xor`, `String.append`, `String.length`, and
 `String.utf8ByteSize`, plus the exact `true`/`false` Bool constructors and
 Bool-valued `Nat.beq`/`Nat.ble`/`String.decEq` intrinsics. The facade accepts
-the pin-precedence infix spellings `|||`, `^^^`, `&&&`, `+`, `-`, `++`, `*`,
-`/`, `%`, `<<<`, `>>>`, and `^` for those exact checked Nat/String rows;
-application binds tighter, subtraction and the other `infixl` rows associate
-left, and power associates right. This is direct bounded scalar elaboration,
-not general `HAdd`/typeclass notation support. The source seed admits
+the pin-precedence infix spellings `==`, `|||`, `^^^`, `&&&`, `+`, `-`, `++`,
+`*`, `/`, `%`, `<<<`, `>>>`, and `^` for those exact checked Nat/String rows.
+`==` selects `Nat.beq` or `String.decEq` from the checked operand types and is
+non-associative at precedence 50; application binds tighter, subtraction and
+the other `infixl` rows associate left, and power associates right. This is
+direct bounded scalar elaboration, not general `BEq`, `HAdd`, or typeclass
+notation support. The source seed admits
 the pin-shaped `Bool` block through K1 and the independent checker, and the
 compiler derives its scalar `0`/`1` ABI binding from those exact checked
 constructor rows. This does not yet add source pattern matching, recursor

@@ -81,7 +81,7 @@ const USAGE: &str = concat!(
     "K2, or satisfy G1. Module-system inputs load complete .olean.server and\n",
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
-    "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls. The exact scalar rows also accept pin-precedence |||, ^^^, &&&, +, -, ++, *, /, %, <<<, >>>, and ^ infix syntax; this is not general typeclass notation,\n",
+    "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls. The exact scalar rows also accept pin-precedence ==, |||, ^^^, &&&, +, -, ++, *, /, %, <<<, >>>, and ^ infix syntax; == is bounded Nat/String equality, not general BEq or typeclass notation,\n",
     "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
     "import set. In the latter form the last path is the entry, `import A.B` binds\n",
     "only a supplied path ending in A/B.lean. Dependency order is derived, then\n",
@@ -5296,7 +5296,7 @@ mod tests {
     #[test]
     fn source_run_projects_checked_bool_results_as_json_booleans() {
         let output =
-            execute_source_bytes(vec![b"def answer : Bool := Nat.beq 42 42".to_vec()], true);
+            execute_source_bytes(vec![b"def answer : Bool := 40 + 2 == 42".to_vec()], true);
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
@@ -5308,7 +5308,9 @@ mod tests {
 
     #[test]
     fn source_run_reports_every_interleaved_evaluation_in_command_order() {
-        let source = b"#eval Nat.add 40 2\ndef keep : Nat := 7\n#eval Nat.beq keep 7\ndef answer : Nat := Nat.add keep 2".to_vec();
+        let source =
+            b"#eval 40 + 2\ndef keep : Nat := 7\n#eval keep == 7\ndef answer : Nat := keep + 2"
+                .to_vec();
         let robot = execute_source_bytes(vec![source.clone()], true);
 
         assert_eq!(robot.exit_code, 0, "{}", robot.stderr);

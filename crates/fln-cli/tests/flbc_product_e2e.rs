@@ -55,8 +55,11 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
     )
     .expect("write middle module");
-    std::fs::write(&main, b"import Project.Middle\n#eval middle + 2\n")
-        .expect("write evaluating entry module");
+    std::fs::write(
+        &main,
+        b"import Project.Middle\ndef verified : Bool := middle + 2 == 42\n#eval middle + 2\n",
+    )
+    .expect("write evaluating entry module");
 
     let produced = run_fln(&[
         Path::new("run"),
@@ -75,8 +78,8 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(produced.stderr.is_empty());
     let stdout = utf8(&produced.stdout);
     assert!(stdout.contains("\"schema\":\"fln.source-run/8\""));
-    assert!(stdout.contains("\"commands\":3"));
-    assert!(stdout.contains("\"definitions\":2"));
+    assert!(stdout.contains("\"commands\":4"));
+    assert!(stdout.contains("\"definitions\":3"));
     assert!(stdout.contains("\"evaluations\":1"));
     assert!(stdout.contains("\"finalValue\":42"));
 

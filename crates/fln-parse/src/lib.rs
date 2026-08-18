@@ -6,7 +6,8 @@
 //! [`parse_definition`] entry point is deliberately much smaller: it is the
 //! first production command seam for `fln-elab` and accepts exact `Nat`/`String`
 //! signatures followed by a matching literal, identifier, parenthesized first-order
-//! application, pin-precedence bounded scalar infix expression, or non-recursive
+//! application, pin-precedence bounded scalar infix expression (including
+//! non-associative Nat/String `==`), or non-recursive
 //! local let chain with optional exact scalar type ascriptions over those forms.
 //! [`parse_source_command`] also builds the pin's
 //! canonical `Lean.Parser.Command.eval` tree for a bounded `#eval`, so expression
@@ -221,6 +222,7 @@ struct BoundedTermFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedInfix {
+    ScalarBeq,
     NatLor,
     NatXor,
     NatLand,
@@ -238,6 +240,7 @@ enum BoundedInfix {
 impl BoundedInfix {
     const fn symbol(self) -> &'static str {
         match self {
+            Self::ScalarBeq => "==",
             Self::NatLor => "|||",
             Self::NatXor => "^^^",
             Self::NatLand => "&&&",
@@ -255,6 +258,7 @@ impl BoundedInfix {
 
     const fn precedence(self) -> u8 {
         match self {
+            Self::ScalarBeq => 50,
             Self::NatLor => 55,
             Self::NatXor => 58,
             Self::NatLand => 60,
@@ -267,6 +271,10 @@ impl BoundedInfix {
 
     const fn is_right_associative(self) -> bool {
         matches!(self, Self::NatPow)
+    }
+
+    const fn is_non_associative(self) -> bool {
+        matches!(self, Self::ScalarBeq)
     }
 
     fn syntax_kind(self) -> Name {
@@ -410,15 +418,15 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 
 fn nat_definition_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "def", "let", "(", ")", ":", ":=", ";", "|||", "^^^", "&&&", "+", "-", "++", "*", "/", "%",
-        "<<<", ">>>", "^",
+        "def", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+", "-", "++", "*",
+        "/", "%", "<<<", ">>>", "^",
     ])
 }
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "import", "def", "#eval", "let", "(", ")", ":", ":=", ";", "|||", "^^^", "&&&", "+", "-",
-        "++", "*", "/", "%", "<<<", ">>>", "^",
+        "import", "def", "#eval", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+",
+        "-", "++", "*", "/", "%", "<<<", ">>>", "^",
     ])
 }
 
@@ -427,6 +435,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         return None;
     };
     match symbol.as_str() {
+        "==" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::ScalarBeq),
         "|||" => Some(BoundedInfix::NatLor),
         "^^^" => Some(BoundedInfix::NatXor),
         "&&&" => Some(BoundedInfix::NatLand),
@@ -723,10 +732,24 @@ fn push_bounded_infix(
     syntax: Syntax,
 ) -> Result<(), NatDefinitionParseError> {
     push_bounded_operand(view, tokens, frame, grammar, index)?;
+    while frame
+        .operators
+        .last()
+        .is_some_and(|previous| previous.operator.precedence() > operator.precedence())
+    {
+        reduce_bounded_infix(view, tokens, frame, grammar)?;
+    }
+    if frame.operators.last().is_some_and(|previous| {
+        previous.operator.precedence() == operator.precedence()
+            && (previous.operator.is_non_associative() || operator.is_non_associative())
+    }) {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::EndOfCommand,
+        });
+    }
     while frame.operators.last().is_some_and(|previous| {
-        previous.operator.precedence() > operator.precedence()
-            || (previous.operator.precedence() == operator.precedence()
-                && !operator.is_right_associative())
+        previous.operator.precedence() == operator.precedence() && !operator.is_right_associative()
     }) {
         reduce_bounded_infix(view, tokens, frame, grammar)?;
     }
@@ -1758,6 +1781,11 @@ mod nat_definition_tests {
 
     #[test]
     fn bounded_infix_terms_match_the_pins_precedence_and_associativity() {
+        let parsed = parse_definition(b"def answer := 1 + 1 == 2")
+            .expect("bounded equality has the pin's lower precedence");
+        let equality = operator_args(definition_value(&parsed), "term_==_");
+        operator_args(&equality[0], "term_+_");
+
         let source = b"def answer := 2 + 3 * 4 ^ 2";
         let parsed = parse_definition(source).expect("the bounded arithmetic notation parses");
         assert_eq!(
@@ -1864,6 +1892,7 @@ mod nat_definition_tests {
     #[test]
     fn bounded_infix_table_reconstructs_every_admitted_spelling() {
         for expression in [
+            "1 == 2",
             "1 ||| 2",
             "1 ^^^ 2",
             "1 &&& 2",
@@ -1907,6 +1936,27 @@ mod nat_definition_tests {
             parse_nat_definition(b"def answer := 1 ++ 2"),
             Err(NatDefinitionParseError::OutsideSeedGrammar {
                 expected: NatDefinitionExpectation::NaturalValue,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_nat_definition(b"def answer := 1 == 2"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::NaturalValue,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_definition(b"def answer := 1 == 2 == 3"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::EndOfCommand,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_definition(b"def answer := 1 == 2 + 3 == 4"),
+            Err(NatDefinitionParseError::OutsideSeedGrammar {
+                expected: NatDefinitionExpectation::EndOfCommand,
                 ..
             })
         ));

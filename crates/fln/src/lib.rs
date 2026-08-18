@@ -3,7 +3,7 @@
 //! The first live surfaces are the typed diagnostic return adapter (bead
 //! `franken_lean-wlan`) and a bounded, real engine path (bead `franken_lean-7kc`)
 //! from a bounded exact Nat/String/Bool definition, checked scalar intrinsics,
-//! pin-precedence scalar infix syntax, or first-order application
+//! pin-precedence scalar infix syntax (including bounded Nat/String `==`), or first-order application
 //! source, or from an already-elaborated definition, through Crucible, the compiler's validated
 //! FIR and canonical FLBC, and Golem. The source path is deliberately the
 //! implemented grammar subset, not a claim of general Lean elaboration or
@@ -8818,6 +8818,17 @@ mod tests {
             }
         ));
         assert_eq!(nat_only.logical_root(&options), base_root);
+        let missing_equality = nat_only
+            .execute_source_definition(b"def equal : Bool := 40 == 42", &options, test_limits())
+            .expect_err("notation must not invent Nat.beq authority");
+        assert!(matches!(
+            missing_equality,
+            EngineExecutionError::KernelRejected {
+                class: RejectClass::UnknownConstant,
+                ..
+            }
+        ));
+        assert_eq!(nat_only.logical_root(&options), base_root);
 
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the source seed passes the dual-checker council")
@@ -8832,6 +8843,10 @@ mod tests {
                     b"def grouped := (2 + 3) * 4",
                     b"def bits := 12 &&& 10 ||| 1",
                     b"def text := \"franken\" ++ \"lean\"",
+                    b"def natEqual := 40 + 2 == 42",
+                    b"def natUnequal := 40 + 1 == 42",
+                    b"def stringEqual := text == \"frankenlean\"",
+                    b"def stringUnequal := text == \"franken_lean\"",
                 ],
                 &options,
                 test_limits(),
@@ -8847,6 +8862,10 @@ mod tests {
             ClosedVmValue::Scalar(20),
             ClosedVmValue::Scalar(9),
             ClosedVmValue::String("frankenlean".to_owned()),
+            ClosedVmValue::Scalar(1),
+            ClosedVmValue::Scalar(0),
+            ClosedVmValue::Scalar(1),
+            ClosedVmValue::Scalar(0),
         ];
         assert_eq!(completed.executions.len(), expected.len());
         for (execution, expected) in completed.executions.iter().zip(expected) {
