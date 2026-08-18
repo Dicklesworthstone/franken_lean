@@ -93,6 +93,50 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     assert_eq!(utf8(&features.stdout), "[]\n");
     assert!(features.stderr.is_empty());
 
+    for option in ["--print-prefix", "--print-libdir"] {
+        let uninstalled = run_lean(&[Path::new(option)]);
+        assert!(!uninstalled.status.success());
+        assert!(uninstalled.stdout.is_empty());
+        assert!(utf8(&uninstalled.stderr).starts_with("lean: installation: "));
+        assert!(utf8(&uninstalled.stderr).contains("<prefix>/bin/lean"));
+    }
+
+    let toolchain = root.join("toolchain");
+    let bin = toolchain.join("bin");
+    let libdir = toolchain.join("lib").join("lean");
+    std::fs::create_dir_all(&bin).expect("create the conventional toolchain bin directory");
+    std::fs::create_dir_all(&libdir).expect("create the conventional Lean library directory");
+    let installed_lean = bin.join("lean");
+    std::fs::copy(env!("CARGO_BIN_EXE_lean"), &installed_lean)
+        .expect("copy the real lean binary into the conventional installed layout");
+
+    let prefix = Command::new(&installed_lean)
+        .arg("--print-prefix")
+        .output()
+        .expect("query the copied installed lean binary for its prefix");
+    assert!(
+        prefix.status.success(),
+        "installed lean --print-prefix stderr: {}",
+        utf8(&prefix.stderr)
+    );
+    assert_eq!(utf8(&prefix.stdout), format!("{}\n", toolchain.display()));
+    assert!(prefix.stderr.is_empty());
+
+    let reported_libdir = Command::new(&installed_lean)
+        .arg("--print-libdir")
+        .output()
+        .expect("query the copied installed lean binary for its library directory");
+    assert!(
+        reported_libdir.status.success(),
+        "installed lean --print-libdir stderr: {}",
+        utf8(&reported_libdir.stderr)
+    );
+    assert_eq!(
+        utf8(&reported_libdir.stdout),
+        format!("{}\n", libdir.display())
+    );
+    assert!(reported_libdir.stderr.is_empty());
+
     std::fs::write(
         &source,
         b"def answer : Nat := 40 + 2\n#eval \"native\"\n#eval answer\n#eval answer == 42\ndef retained : Nat := 7\n",

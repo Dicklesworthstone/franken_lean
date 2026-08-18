@@ -377,6 +377,14 @@ The personality also answers `-g`/`--githash` from the exact pinned Reference
 commit and reports `[]` for `--features`, truthfully reflecting the absence of
 an LLVM backend. `-q`/`--quiet` is accepted on source operations; there are no
 verbose success messages in this bounded slice for it to suppress.
+When the running executable is placed at `<prefix>/bin/lean`,
+`lean --print-prefix` reports `<prefix>` and `lean --print-libdir` reports
+`<prefix>/lib/lean`, matching the pinned layout contract used by Lake's sysroot
+discovery. A development binary under Cargo's `target/debug` or `target/release`
+tree is refused instead of advertising that build directory as an installed
+toolchain. These two queries derive paths; they do not install or register an
+elan toolchain, prove that the reported library tree is populated, or add Lake,
+package, `LEAN_PATH`, or `.olean` discovery.
 The currently implemented binary is not yet the Reference CLI surface: it has
 no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
 implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.

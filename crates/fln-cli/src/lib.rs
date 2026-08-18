@@ -121,6 +121,8 @@ const LEAN_USAGE: &str = concat!(
     "  lean -V | --short-version\n",
     "  lean -g | --githash\n",
     "  lean --features\n",
+    "  lean --print-prefix\n",
+    "  lean --print-libdir\n",
     "\n",
     "This is FrankenLean's bounded native `lean` personality. It accepts exactly\n",
     "one source path and executes the currently supported Nat/String/Bool source\n",
@@ -139,7 +141,10 @@ const LEAN_USAGE: &str = concat!(
     "-q and --quiet are accepted on source operations; this bounded personality\n",
     "currently has no verbose success messages for them to suppress. --githash\n",
     "prints the exact pinned Reference commit, and --features reports [] because\n",
-    "this binary has no LLVM backend.\n",
+    "this binary has no LLVM backend. --print-prefix and --print-libdir derive\n",
+    "the conventional installation paths only when the running executable is\n",
+    "located at <prefix>/bin/lean; development binaries outside that layout are\n",
+    "refused instead of reporting a false toolchain root.\n",
     "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
     ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
     "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
@@ -226,6 +231,8 @@ enum LeanCommand {
     ShortVersion,
     GitHash,
     Features,
+    PrintPrefix,
+    PrintLibdir,
     Stdin { max_bytes: usize },
     SourceDependencies { path: PathBuf, max_bytes: usize },
     Source { path: PathBuf, max_bytes: usize },
@@ -871,6 +878,20 @@ fn parse_lean_command(
             Err(UsageError("--features must be used alone".to_owned()))
         };
     }
+    if first == "--print-prefix" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::PrintPrefix)
+        } else {
+            Err(UsageError("--print-prefix must be used alone".to_owned()))
+        };
+    }
+    if first == "--print-libdir" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::PrintLibdir)
+        } else {
+            Err(UsageError("--print-libdir must be used alone".to_owned()))
+        };
+    }
 
     let mut path = None;
     let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
@@ -948,6 +969,12 @@ fn parse_lean_command(
             if argument == "--features" {
                 return Err(UsageError("--features must be used alone".to_owned()));
             }
+            if argument == "--print-prefix" {
+                return Err(UsageError("--print-prefix must be used alone".to_owned()));
+            }
+            if argument == "--print-libdir" {
+                return Err(UsageError("--print-libdir must be used alone".to_owned()));
+            }
             return Err(UsageError(format!(
                 "unknown lean option {:?}",
                 argument.to_string_lossy()
@@ -983,6 +1010,80 @@ fn parse_lean_command(
     } else {
         Ok(LeanCommand::Source { path, max_bytes })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeanInstallationPaths {
+    prefix: PathBuf,
+    libdir: PathBuf,
+}
+
+fn derive_lean_installation_paths(executable: &Path) -> Result<LeanInstallationPaths, String> {
+    let bin = executable.parent().ok_or_else(|| {
+        format!(
+            "current executable {} has no parent directory",
+            executable.display()
+        )
+    })?;
+    if bin.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return Err(format!(
+            "current executable {} is not located at <prefix>/bin/lean",
+            executable.display()
+        ));
+    }
+    let prefix = bin.parent().ok_or_else(|| {
+        format!(
+            "current executable {} has no installation prefix",
+            executable.display()
+        )
+    })?;
+    if prefix.as_os_str().is_empty() {
+        return Err(format!(
+            "current executable {} has an empty installation prefix",
+            executable.display()
+        ));
+    }
+    Ok(LeanInstallationPaths {
+        prefix: prefix.to_path_buf(),
+        libdir: prefix.join("lib").join("lean"),
+    })
+}
+
+fn lean_installation_path_output(
+    select: impl FnOnce(LeanInstallationPaths) -> PathBuf,
+) -> MultiplexerOutput {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            return MultiplexerOutput::failure(
+                format!("lean: installation: cannot locate the running executable: {error}\n"),
+                1,
+            );
+        }
+    };
+    let paths = match derive_lean_installation_paths(&executable) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return MultiplexerOutput::failure(format!("lean: installation: {error}\n"), 1);
+        }
+    };
+    let path = select(paths);
+    let Some(path) = path.to_str() else {
+        return MultiplexerOutput::failure(
+            "lean: installation: derived path is not valid UTF-8\n".to_owned(),
+            1,
+        );
+    };
+    if path
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r'))
+    {
+        return MultiplexerOutput::failure(
+            "lean: installation: derived path contains a line break\n".to_owned(),
+            1,
+        );
+    }
+    MultiplexerOutput::success(format!("{path}\n"))
 }
 
 fn read_bounded_from<R: Read + ?Sized>(
@@ -5120,6 +5221,8 @@ fn run_lean_with_optional_input(
             MultiplexerOutput::success(format!("{}\n", fln::OLEAN_PIN_COMMIT))
         }
         Ok(LeanCommand::Features) => MultiplexerOutput::success("[]\n".to_owned()),
+        Ok(LeanCommand::PrintPrefix) => lean_installation_path_output(|paths| paths.prefix),
+        Ok(LeanCommand::PrintLibdir) => lean_installation_path_output(|paths| paths.libdir),
         Ok(LeanCommand::Stdin { max_bytes }) => match input {
             Some(input) => run_lean_stdin(input, max_bytes),
             None => MultiplexerOutput::failure(
@@ -5594,10 +5697,11 @@ mod tests {
         OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
         SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation, SourcePublication,
         SourceSidecarPublication, admission_error_disposition, check_olean_bytes,
-        check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
-        execute_source_bytes_with_publisher, execution_error_disposition, inspect_ilean_bytes,
-        inspect_olean_bytes, module_name_from_relative, olean_write_error_disposition,
-        parse_source_run, read_bounded_from, run, run_lean, run_lean_with_input, source_failure,
+        check_olean_module_bytes, derive_lean_installation_paths, diff_olean_bytes,
+        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
+        execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
+        module_name_from_relative, olean_write_error_disposition, parse_source_run,
+        read_bounded_from, run, run_lean, run_lean_with_input, source_failure,
         source_import_relative_path, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
@@ -6398,6 +6502,23 @@ mod tests {
     }
 
     #[test]
+    fn lean_installation_queries_require_the_conventional_bin_layout() {
+        let executable = PathBuf::from("toolchain").join("bin").join("lean");
+        let paths = derive_lean_installation_paths(&executable)
+            .expect("a conventional installed executable has a toolchain root");
+        assert_eq!(paths.prefix, PathBuf::from("toolchain"));
+        assert_eq!(
+            paths.libdir,
+            PathBuf::from("toolchain").join("lib").join("lean")
+        );
+
+        let development = PathBuf::from("target").join("debug").join("lean");
+        let error = derive_lean_installation_paths(&development)
+            .expect_err("a development binary must not report a false toolchain root");
+        assert!(error.contains("not located at <prefix>/bin/lean"));
+    }
+
+    #[test]
     fn lean_personality_help_version_and_usage_are_explicitly_bounded() {
         let help = run_lean(std::iter::empty());
         assert_eq!(help.exit_code, 0);
@@ -6415,6 +6536,8 @@ mod tests {
         assert!(help.stdout.contains("lean --stdin"));
         assert!(help.stdout.contains("bounded import-free source"));
         assert!(help.stdout.contains("lean --src-deps"));
+        assert!(help.stdout.contains("lean --print-prefix"));
+        assert!(help.stdout.contains("lean --print-libdir"));
         assert!(
             help.stdout
                 .contains("validated direct local source imports in source order")
@@ -6453,6 +6576,14 @@ mod tests {
         assert_eq!(features.exit_code, 0);
         assert_eq!(features.stdout, "[]\n");
         assert!(features.stderr.is_empty());
+
+        for option in ["--print-prefix", "--print-libdir"] {
+            let refused = run_lean([OsString::from(option)]);
+            assert_eq!(refused.exit_code, 1);
+            assert!(refused.stdout.is_empty());
+            assert!(refused.stderr.starts_with("lean: installation: "));
+            assert!(refused.stderr.contains("<prefix>/bin/lean"));
+        }
 
         let missing_input_handle = run_lean([OsString::from("--stdin")]);
         assert_eq!(missing_input_handle.exit_code, 2);
@@ -6504,6 +6635,8 @@ mod tests {
             vec![OsString::from("--stdin"), OsString::from("--src-deps")],
             vec![OsString::from("--githash"), OsString::from("One.lean")],
             vec![OsString::from("--features"), OsString::from("One.lean")],
+            vec![OsString::from("--print-prefix"), OsString::from("One.lean")],
+            vec![OsString::from("--print-libdir"), OsString::from("One.lean")],
             vec![OsString::from("--quiet")],
         ] {
             let refused = run_lean(arguments);
