@@ -366,6 +366,10 @@ and prints those paths in source order without elaborating or executing the
 body. Duplicate direct imports remain duplicate output rows. This is the
 pin-shaped direct-source dependency query for the selected local root, not
 `LEAN_PATH`, package, or transitive dependency discovery.
+`lean --stdin` also feeds one bounded, import-free source through that same
+native parser, elaborator, both-checker admission path, compiler, and Golem VM;
+evaluation output is published only after the complete input succeeds. Standard
+input imports are refused until the toolchain owns a real search-path resolver.
 The currently implemented binary is not yet the Reference CLI surface: it has
 no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
 implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.

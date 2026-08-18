@@ -8,8 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn run_fln(arguments: &[&Path]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
@@ -25,6 +26,28 @@ fn run_lean(arguments: &[&Path]) -> Output {
         command.arg(argument);
     }
     command.output().expect("run the real lean binary")
+}
+
+fn run_lean_stdin(arguments: &[&Path], input: &[u8]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lean"));
+    for argument in arguments {
+        command.arg(argument);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the real lean binary with a standard-input pipe");
+    child
+        .stdin
+        .take()
+        .expect("the standard-input pipe was requested")
+        .write_all(input)
+        .expect("write the bounded standard-input source");
+    child
+        .wait_with_output()
+        .expect("collect the real lean standard-input result")
 }
 
 fn utf8(bytes: &[u8]) -> &str {
@@ -70,6 +93,50 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     );
     assert_eq!(utf8(&evaluated.stdout), "\"native\"\n42\ntrue\n");
     assert!(evaluated.stderr.is_empty());
+
+    let piped = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"def piped : Nat := 40 + 2\n#eval \"stdin\"\n#eval piped\n#eval piped == 42\n",
+    );
+    assert!(
+        piped.status.success(),
+        "native lean --stdin stderr: {}",
+        utf8(&piped.stderr)
+    );
+    assert_eq!(utf8(&piped.stdout), "\"stdin\"\n42\ntrue\n");
+    assert!(piped.stderr.is_empty());
+
+    let piped_late_refusal = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"#eval 42\ndef broken : Nat := missing\n",
+    );
+    assert!(!piped_late_refusal.status.success());
+    assert!(piped_late_refusal.stdout.is_empty());
+    assert!(utf8(&piped_late_refusal.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&piped_late_refusal.stderr).contains("unknown constant"));
+
+    let piped_budget_stop = run_lean_stdin(
+        &[Path::new("--stdin"), Path::new("--max-bytes=1")],
+        b"#eval 42\n",
+    );
+    assert!(!piped_budget_stop.status.success());
+    assert!(piped_budget_stop.stdout.is_empty());
+    assert!(utf8(&piped_budget_stop.stderr).starts_with("lean: resource: "));
+    assert!(utf8(&piped_budget_stop.stderr).contains("standard input source exceeded"));
+
+    let piped_import = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"import Project.Missing\n#eval 42\n",
+    );
+    assert!(!piped_import.status.success());
+    assert!(piped_import.stdout.is_empty());
+    assert!(utf8(&piped_import.stderr).starts_with("lean: input: "));
+    assert!(utf8(&piped_import.stderr).contains("does not resolve imports"));
+
+    let piped_after_refusals = run_lean_stdin(&[Path::new("--stdin")], b"#eval 42\n");
+    assert!(piped_after_refusals.status.success());
+    assert_eq!(utf8(&piped_after_refusals.stdout), "42\n");
+    assert!(piped_after_refusals.stderr.is_empty());
 
     let definition_only = root.join("DefinitionOnly.lean");
     std::fs::write(&definition_only, b"def answer : Nat := 40 + 2\n")

@@ -114,6 +114,7 @@ const USAGE: &str = concat!(
 const LEAN_USAGE: &str = concat!(
     "Usage:\n",
     "  lean [--max-bytes BYTES] PATH\n",
+    "  lean --stdin [--max-bytes BYTES]\n",
     "  lean --src-deps [--max-bytes BYTES] PATH\n",
     "  lean --help\n",
     "  lean -v | --version\n",
@@ -129,6 +130,7 @@ const LEAN_USAGE: &str = concat!(
     "the first direct import must identify exactly one ancestor source root;\n",
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
     "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
+    "--stdin reads one bounded import-free source from standard input.\n",
     "--src-deps prints validated direct local source imports in source order\n",
     "without elaborating or executing the file.\n",
     "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
@@ -215,6 +217,7 @@ enum LeanCommand {
     Help,
     Version,
     ShortVersion,
+    Stdin { max_bytes: usize },
     SourceDependencies { path: PathBuf, max_bytes: usize },
     Source { path: PathBuf, max_bytes: usize },
 }
@@ -849,6 +852,7 @@ fn parse_lean_command(
     let mut path = None;
     let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
     let mut max_bytes_seen = false;
+    let mut stdin_source = false;
     let mut source_dependencies = false;
     let mut options = true;
     let mut arguments = std::iter::once(first).chain(arguments);
@@ -877,6 +881,15 @@ fn parse_lean_command(
                 ));
             }
             source_dependencies = true;
+            continue;
+        }
+        if options && argument == "--stdin" {
+            if stdin_source {
+                return Err(UsageError(
+                    "--stdin may be supplied at most once".to_owned(),
+                ));
+            }
+            stdin_source = true;
             continue;
         }
         if options
@@ -918,7 +931,21 @@ fn parse_lean_command(
         }
     }
 
-    let path = path.ok_or_else(|| UsageError("lean requires PATH".to_owned()))?;
+    if stdin_source {
+        if source_dependencies {
+            return Err(UsageError(
+                "--stdin and --src-deps cannot be combined in the bounded native personality"
+                    .to_owned(),
+            ));
+        }
+        if path.is_some() {
+            return Err(UsageError(
+                "--stdin does not accept a source path".to_owned(),
+            ));
+        }
+        return Ok(LeanCommand::Stdin { max_bytes });
+    }
+    let path = path.ok_or_else(|| UsageError("lean requires PATH or --stdin".to_owned()))?;
     if source_dependencies {
         Ok(LeanCommand::SourceDependencies { path, max_bytes })
     } else {
@@ -926,8 +953,8 @@ fn parse_lean_command(
     }
 }
 
-fn read_bounded_from(
-    reader: &mut impl Read,
+fn read_bounded_from<R: Read + ?Sized>(
+    reader: &mut R,
     max_bytes: usize,
     subject: &'static str,
 ) -> Result<Vec<u8>, BoundedReadFailure> {
@@ -4902,6 +4929,41 @@ fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
     )
 }
 
+fn run_lean_stdin(input: &mut dyn Read, max_bytes: usize) -> MultiplexerOutput {
+    let source = match read_bounded_from(input, max_bytes, "standard input source") {
+        Ok(source) => source,
+        Err(error) => {
+            return source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                SourcePresentation::Lean,
+                error.exit_code(),
+            );
+        }
+    };
+    if let Ok(module) = fln::partition_source_module(&source)
+        && !module.imports.is_empty()
+    {
+        return source_failure(
+            "input",
+            "bounded --stdin execution does not resolve imports; provide a local source path instead",
+            false,
+            SourcePresentation::Lean,
+            1,
+        );
+    }
+    let paths = [PathBuf::from("stdin.lean")];
+    run_loaded_sources_with_presentation(
+        &paths,
+        vec![source],
+        None,
+        None,
+        None,
+        SourcePresentation::Lean,
+    )
+}
+
 fn run_sources(
     paths: &[PathBuf],
     max_bytes: usize,
@@ -4979,13 +5041,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
     }
 }
 
-/// Run FrankenLean's bounded native `lean` personality without touching
-/// process-global arguments or streams.
-///
-/// This is intentionally a presentation adapter over the same source pipeline
-/// as [`run`]'s `fln run` command. It does not widen the supported source
-/// language, bypass either checker, or emulate unsupported Reference options.
-pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+fn run_lean_with_optional_input(
+    arguments: impl IntoIterator<Item = OsString>,
+    input: Option<&mut dyn Read>,
+) -> MultiplexerOutput {
     match parse_lean_command(arguments) {
         Ok(LeanCommand::Help) => MultiplexerOutput::success(LEAN_USAGE.to_owned()),
         Ok(LeanCommand::Version) => MultiplexerOutput::success(format!(
@@ -5001,12 +5060,42 @@ pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
                 .strip_prefix('v')
                 .unwrap_or(fln::OLEAN_PIN_TAG)
         )),
+        Ok(LeanCommand::Stdin { max_bytes }) => match input {
+            Some(input) => run_lean_stdin(input, max_bytes),
+            None => MultiplexerOutput::failure(
+                format!(
+                    "lean: --stdin requires an explicit input handle; use run_lean_with_input\n\n{LEAN_USAGE}"
+                ),
+                2,
+            ),
+        },
         Ok(LeanCommand::SourceDependencies { path, max_bytes }) => {
             run_lean_source_dependencies(&path, max_bytes)
         }
         Ok(LeanCommand::Source { path, max_bytes }) => run_lean_source(path, max_bytes),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
+}
+
+/// Run FrankenLean's bounded native `lean` personality without touching
+/// process-global arguments or streams.
+///
+/// This is intentionally a presentation adapter over the same source pipeline
+/// as [`run`]'s `fln run` command. It does not widen the supported source
+/// language, bypass either checker, or emulate unsupported Reference options.
+/// The `--stdin` mode is refused here because this entry point owns no input
+/// handle; callers using that mode must call [`run_lean_with_input`].
+pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+    run_lean_with_optional_input(arguments, None)
+}
+
+/// Run the bounded native `lean` personality with an explicit standard-input
+/// source. The reader is touched only when `arguments` selects `--stdin`.
+pub fn run_lean_with_input(
+    arguments: impl IntoIterator<Item = OsString>,
+    input: &mut dyn Read,
+) -> MultiplexerOutput {
+    run_lean_with_optional_input(arguments, Some(input))
 }
 
 /// Rendered C-family streams plus the exact structured value that authorized them.
@@ -5448,7 +5537,7 @@ mod tests {
         check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
         execute_source_bytes_with_publisher, execution_error_disposition, inspect_ilean_bytes,
         inspect_olean_bytes, module_name_from_relative, olean_write_error_disposition,
-        parse_source_run, read_bounded_from, run, run_lean, source_failure,
+        parse_source_run, read_bounded_from, run, run_lean, run_lean_with_input, source_failure,
         source_import_relative_path, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
@@ -6263,6 +6352,8 @@ mod tests {
                 .contains("does not implement the Reference CLI's option set")
         );
         assert!(help.stdout.contains("complete local A/B.lean closure"));
+        assert!(help.stdout.contains("lean --stdin"));
+        assert!(help.stdout.contains("bounded import-free source"));
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(
             help.stdout
@@ -6293,6 +6384,25 @@ mod tests {
             assert!(version.stderr.is_empty());
         }
 
+        let missing_input_handle = run_lean([OsString::from("--stdin")]);
+        assert_eq!(missing_input_handle.exit_code, 2);
+        assert!(missing_input_handle.stdout.is_empty());
+        assert!(
+            missing_input_handle
+                .stderr
+                .contains("requires an explicit input handle")
+        );
+        let mut input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let piped = run_lean_with_input([OsString::from("--stdin")], &mut input);
+        assert_eq!(piped.exit_code, 0);
+        assert_eq!(piped.stdout, "42\n");
+        assert!(piped.stderr.is_empty());
+        let mut unselected_input = std::io::Cursor::new(b"must remain unread".as_slice());
+        let short_version =
+            run_lean_with_input([OsString::from("--short-version")], &mut unselected_input);
+        assert_eq!(short_version.exit_code, 0);
+        assert_eq!(unselected_input.position(), 0);
+
         for arguments in [
             vec![OsString::from("--json")],
             vec![OsString::from("One.lean"), OsString::from("Two.lean")],
@@ -6307,6 +6417,9 @@ mod tests {
                 OsString::from("--src-deps"),
                 OsString::from("One.lean"),
             ],
+            vec![OsString::from("--stdin"), OsString::from("One.lean")],
+            vec![OsString::from("--stdin"), OsString::from("--stdin")],
+            vec![OsString::from("--stdin"), OsString::from("--src-deps")],
         ] {
             let refused = run_lean(arguments);
             assert_eq!(refused.exit_code, 2);

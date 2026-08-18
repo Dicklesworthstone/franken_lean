@@ -3,7 +3,9 @@
 use std::io::Write;
 
 fn main() -> std::process::ExitCode {
-    let output = fln_cli::run_lean(std::env::args_os().skip(1));
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let output = fln_cli::run_lean_with_input(std::env::args_os().skip(1), &mut stdin);
     if std::io::stdout()
         .lock()
         .write_all(output.stdout.as_bytes())
