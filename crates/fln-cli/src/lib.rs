@@ -42,7 +42,7 @@ const OLEAN_REBUILD_SCHEMA: &str = "fln.olean-rebuild/1";
 const ILEAN_INSPECT_SCHEMA: &str = "fln.ilean-inspect/1";
 const CHECK_OLEAN_SCHEMA: &str = "fln.check-olean/1";
 const FLBC_RUN_SCHEMA: &str = "fln.flbc-run/3";
-const SOURCE_RUN_SCHEMA: &str = "fln.source-run/8";
+const SOURCE_RUN_SCHEMA: &str = "fln.source-run/9";
 const PRODUCT_SIDECAR_MAX_BYTES: usize = 64 * 1024;
 const TOOLCHAIN_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const OLEAN_DIFF_MAX_RENDERED_CHANGES: usize = 256;
@@ -52,7 +52,7 @@ const OLEAN_DIFF_MAX_RENDERED_KINDS_PER_SIDE: usize = 16;
 const USAGE: &str = concat!(
     "Usage:\n",
     "  fln check-olean [--json] [--max-bytes BYTES] PATH\n",
-    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] PATH...\n",
+    "  fln run [--json] [--max-bytes BYTES] [--emit-flbc PATH] [--emit-sidecar PATH] [--emit-olean-snapshot PATH] PATH...\n",
     "  fln flbc run [--json] [--max-bytes BYTES] [--sidecar PATH] PATH\n",
     "  fln olean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln olean diff [--json] [--max-bytes BYTES] LEFT RIGHT\n",
@@ -92,8 +92,13 @@ const USAGE: &str = concat!(
     "only after the whole batch succeeds; any existing PATH is refused, never\n",
     "replaced. --emit-sidecar requires\n",
     "--emit-flbc and publishes a standard-profile closure manifest before the\n",
-    "product, so any interrupted pair fails closed by root mismatch. It is not\n",
-    "general Lean, automatic module discovery, implicit Prelude processing, a\n",
+    "product, so any interrupted pair fails closed by root mismatch.\n",
+    "With --emit-olean-snapshot (mutually exclusive with FLBC outputs), the exact\n",
+    "final checked environment is written as one import-free, non-module .olean\n",
+    "snapshot and published no-clobber after success. The snapshot is for the\n",
+    "bounded `check-olean` door; it is not `lean -o`, a module artifact, or a\n",
+    "Reference cross-load claim. The source runner is not general Lean, automatic\n",
+    "module discovery, implicit Prelude processing, a\n",
     "project build, a certified build product, or\n",
     "evidence that `check-olean` is complete.\n",
     "\n",
@@ -168,6 +173,7 @@ enum MultiplexerCommand {
         json: bool,
         emit_flbc: Option<PathBuf>,
         emit_sidecar: Option<PathBuf>,
+        emit_olean_snapshot: Option<PathBuf>,
     },
     FlbcRun {
         path: PathBuf,
@@ -411,6 +417,7 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut filtered = Vec::new();
     let mut emit_flbc = None;
     let mut emit_sidecar = None;
+    let mut emit_olean_snapshot = None;
     let mut options = true;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -470,6 +477,31 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             }
             continue;
         }
+        let snapshot = if options && argument == "--emit-olean-snapshot" {
+            Some(arguments.next().ok_or_else(|| {
+                UsageError("--emit-olean-snapshot requires a following output path".to_owned())
+            })?)
+        } else if options {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--emit-olean-snapshot="))
+                .map(OsString::from)
+        } else {
+            None
+        };
+        if let Some(path) = snapshot {
+            if path.is_empty() {
+                return Err(UsageError(
+                    "--emit-olean-snapshot path must not be empty".to_owned(),
+                ));
+            }
+            if emit_olean_snapshot.replace(PathBuf::from(path)).is_some() {
+                return Err(UsageError(
+                    "--emit-olean-snapshot may be supplied at most once".to_owned(),
+                ));
+            }
+            continue;
+        }
         filtered.push(argument);
     }
     let Some((paths, max_bytes, json)) =
@@ -483,6 +515,12 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
                 .to_owned(),
         ));
     }
+    if emit_olean_snapshot.is_some() && (emit_flbc.is_some() || emit_sidecar.is_some()) {
+        return Err(UsageError(
+            "--emit-olean-snapshot is mutually exclusive with --emit-flbc and --emit-sidecar"
+                .to_owned(),
+        ));
+    }
     if emit_sidecar
         .as_deref()
         .zip(emit_flbc.as_deref())
@@ -492,9 +530,13 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             "--emit-sidecar and --emit-flbc must name different paths".to_owned(),
         ));
     }
-    for output in [emit_flbc.as_deref(), emit_sidecar.as_deref()]
-        .into_iter()
-        .flatten()
+    for output in [
+        emit_flbc.as_deref(),
+        emit_sidecar.as_deref(),
+        emit_olean_snapshot.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(source) = paths
             .iter()
@@ -513,6 +555,7 @@ fn parse_source_run(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         json,
         emit_flbc,
         emit_sidecar,
+        emit_olean_snapshot,
     })
 }
 
@@ -2983,6 +3026,24 @@ impl SourcePresentation {
     }
 }
 
+#[derive(Debug)]
+enum SourcePublication {
+    None,
+    Flbc {
+        path: PathBuf,
+        sidecar: Option<SourceSidecarPublication>,
+    },
+    OleanSnapshot {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+struct SourceSidecarPublication {
+    path: PathBuf,
+    toolchain_image: Option<Vec<u8>>,
+}
+
 struct SourceSuccess<'a> {
     commands: usize,
     definitions: usize,
@@ -2997,6 +3058,7 @@ struct SourceSuccess<'a> {
     checker_ground: &'a str,
     emitted_flbc: Option<(&'a Path, usize)>,
     emitted_sidecar: Option<(&'a Path, usize, fln::ContentRoot, fln::ContentRoot)>,
+    emitted_olean_snapshot: Option<(&'a Path, usize, usize)>,
     steps: u64,
     system_polls: u64,
     peak_stack_depth: u64,
@@ -3114,6 +3176,15 @@ fn render_source_success(
             )
         },
     );
+    let emitted_olean_snapshot_json = result.emitted_olean_snapshot.map_or_else(
+        || "null".to_owned(),
+        |(path, bytes, constants)| {
+            format!(
+                "{{\"path\":{},\"bytes\":{bytes},\"constants\":{constants},\"module\":false}}",
+                json_string(&path.to_string_lossy())
+            )
+        },
+    );
     let stdout = if json {
         format!(
             concat!(
@@ -3122,6 +3193,7 @@ fn render_source_success(
                 "\"evaluationResults\":{},",
                 "\"sourceBytes\":{},\"finalKind\":{},\"finalValue\":{},",
                 "\"flbcBytes\":{},\"emittedFlbc\":{},\"emittedSidecar\":{},",
+                "\"emittedOleanSnapshot\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"checker\":{{\"admissions\":{},\"finalSchema\":{},",
                 "\"finalGround\":{}}},",
@@ -3139,6 +3211,7 @@ fn render_source_success(
             result.flbc_bytes,
             emitted_flbc_json,
             emitted_sidecar_json,
+            emitted_olean_snapshot_json,
             json_string(result.base_root),
             json_string(result.result_root),
             result.commands,
@@ -3170,6 +3243,15 @@ fn render_source_success(
                 )
             },
         );
+        let emitted_olean_snapshot = result.emitted_olean_snapshot.map_or_else(
+            String::new,
+            |(path, bytes, constants)| {
+                format!(
+                    "emitted standalone .olean snapshot: {bytes} bytes, {constants} constants to {}\n",
+                    path.display()
+                )
+            },
+        );
         format!(
             concat!(
                 "native source batch: complete\n",
@@ -3180,6 +3262,7 @@ fn render_source_success(
                 "final value: {}\n",
                 "source bytes: {}\n",
                 "canonical FLBC bytes: {} total\n",
+                "{}",
                 "{}",
                 "{}",
                 "base logical root: {}\n",
@@ -3196,6 +3279,7 @@ fn render_source_success(
             result.flbc_bytes,
             emitted_flbc,
             emitted_sidecar,
+            emitted_olean_snapshot,
             result.base_root,
             result.result_root,
             result.commands,
@@ -3357,12 +3441,19 @@ fn publication_failure_disposition(
     }
 }
 
+fn olean_write_error_disposition(error: &fln::OleanWriteError) -> (&'static str, bool, u8) {
+    match error {
+        fln::OleanWriteError::Budget { .. } => ("resource", false, 3),
+        fln::OleanWriteError::Unsupported { .. }
+        | fln::OleanWriteError::Contract { .. }
+        | fln::OleanWriteError::Region(_) => ("internal-fault", false, 4),
+    }
+}
+
 fn execute_source_bytes_with_publisher_and_presentation<P, E>(
     sources: Vec<Vec<u8>>,
     module_plan: Option<SourceModulePlan>,
-    emit_flbc: Option<PathBuf>,
-    emit_sidecar: Option<PathBuf>,
-    toolchain_image: Option<Vec<u8>>,
+    publication: SourcePublication,
     presentation: SourcePresentation,
     mut publish: P,
 ) -> MultiplexerOutput
@@ -3370,6 +3461,17 @@ where
     P: FnMut(&[u8], &Path) -> Result<(), E>,
     E: SourcePublicationFailure,
 {
+    let (emit_flbc, emit_sidecar, emit_olean_snapshot) = match &publication {
+        SourcePublication::None => (None, None, None),
+        SourcePublication::Flbc { path, sidecar } => (
+            Some(path.as_path()),
+            sidecar
+                .as_ref()
+                .map(|sidecar| (sidecar.path.as_path(), sidecar.toolchain_image.as_deref())),
+            None,
+        ),
+        SourcePublication::OleanSnapshot { path } => (None, None, Some(path.as_path())),
+    };
     let Some(source_bytes) = sources
         .iter()
         .try_fold(0_usize, |total, source| total.checked_add(source.len()))
@@ -3674,11 +3776,100 @@ where
                 );
             }
         };
-    let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
-        let toolchain_image = match toolchain_image {
+    let encoded_olean_snapshot = if emit_olean_snapshot.is_some() {
+        let environment = completed.engine.environment();
+        let constant_count = environment.len();
+        let mut constants = Vec::new();
+        if constants.try_reserve_exact(constant_count).is_err() {
+            return source_failure(
+                "resource",
+                &format!(
+                    "could not reserve {constant_count} checked constants for the standalone .olean snapshot"
+                ),
+                false,
+                presentation,
+                3,
+            );
+        }
+        constants.extend(
+            environment
+                .constants()
+                .map(|(_, constant)| constant.clone()),
+        );
+        let Some(version) = fln::OLEAN_ACCEPTED_VERSIONS.first().copied() else {
+            return source_failure(
+                "internal-fault",
+                "the pinned .olean contract exposes no accepted writer version",
+                false,
+                presentation,
+                4,
+            );
+        };
+        let Some(lean_version) = fln::OLEAN_PIN_TAG.strip_prefix('v') else {
+            return source_failure(
+                "internal-fault",
+                "the pinned Lean tag cannot become an .olean version string",
+                false,
+                presentation,
+                4,
+            );
+        };
+        let base_addr = match u64::try_from(fln::OLEAN_REGION_ALIGN)
+            .ok()
+            .and_then(|alignment| alignment.checked_mul(2))
+        {
+            Some(base_addr) => base_addr,
+            None => {
+                return source_failure(
+                    "internal-fault",
+                    "the pinned .olean region alignment cannot become a base address",
+                    false,
+                    presentation,
+                    4,
+                );
+            }
+        };
+        let encoded = match fln::encode_olean_module(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            fln::OleanWriteHeader {
+                version,
+                flags: 1,
+                lean_version,
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr,
+            },
+            fln::OleanWriteBudget::default(),
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let (class, authority, exit_code) = olean_write_error_disposition(&error);
+                return source_failure(
+                    class,
+                    &format!("could not encode the standalone .olean snapshot: {error}"),
+                    authority,
+                    presentation,
+                    exit_code,
+                );
+            }
+        };
+        Some((encoded.bytes, constant_count))
+    } else {
+        None
+    };
+    let emitted_sidecar = if let Some((path, configured_toolchain_image)) = emit_sidecar {
+        let loaded_toolchain_image;
+        let toolchain_image = match configured_toolchain_image {
             Some(image) => image,
             None => match read_current_toolchain_image() {
-                Ok(image) => image,
+                Ok(image) => {
+                    loaded_toolchain_image = image;
+                    &loaded_toolchain_image
+                }
                 Err(error) => {
                     return source_failure(
                         "internal-fault",
@@ -3693,7 +3884,7 @@ where
         let sidecar = match fln::build_source_run_flbc_sidecar(
             &source_refs,
             &options,
-            &toolchain_image,
+            toolchain_image,
             &completed,
         ) {
             Ok(sidecar) => sidecar,
@@ -3725,7 +3916,7 @@ where
     } else {
         None
     };
-    let emitted_flbc = if let Some(path) = emit_flbc.as_deref() {
+    let emitted_flbc = if let Some(path) = emit_flbc {
         if let Err(error) = publish(&final_execution.flbc_artifact, path) {
             let state = publication_state(&error);
             let (class, authority, exit_code) = publication_failure_disposition(&error);
@@ -3744,6 +3935,34 @@ where
     } else {
         None
     };
+    let emitted_olean_snapshot = if let Some(path) = emit_olean_snapshot {
+        let Some((bytes, constant_count)) = encoded_olean_snapshot.as_ref() else {
+            return source_failure(
+                "internal-fault",
+                "standalone .olean snapshot output had no encoded bytes",
+                false,
+                presentation,
+                4,
+            );
+        };
+        if let Err(error) = publish(bytes, path) {
+            let state = publication_state(&error);
+            let (class, authority, exit_code) = publication_failure_disposition(&error);
+            return source_failure(
+                class,
+                &format!(
+                    "could not complete durable standalone .olean snapshot publication to {}: {error}; {state}",
+                    path.display()
+                ),
+                authority,
+                presentation,
+                exit_code,
+            );
+        }
+        Some((path, bytes.len(), *constant_count))
+    } else {
+        None
+    };
     render_source_success(
         SourceSuccess {
             commands,
@@ -3759,6 +3978,7 @@ where
             checker_ground,
             emitted_flbc,
             emitted_sidecar,
+            emitted_olean_snapshot,
             steps: returned.usage.steps,
             system_polls: returned.usage.system_polls,
             peak_stack_depth: returned.usage.peak_stack_depth,
@@ -3771,9 +3991,7 @@ where
 fn execute_source_bytes_with_publisher<P, E>(
     sources: Vec<Vec<u8>>,
     module_plan: Option<SourceModulePlan>,
-    emit_flbc: Option<PathBuf>,
-    emit_sidecar: Option<PathBuf>,
-    toolchain_image: Option<Vec<u8>>,
+    publication: SourcePublication,
     json: bool,
     publish: P,
 ) -> MultiplexerOutput
@@ -3784,9 +4002,7 @@ where
     execute_source_bytes_with_publisher_and_presentation(
         sources,
         module_plan,
-        emit_flbc,
-        emit_sidecar,
-        toolchain_image,
+        publication,
         SourcePresentation::Fln { json },
         publish,
     )
@@ -3797,9 +4013,7 @@ fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput 
     execute_source_bytes_with_publisher(
         sources,
         None,
-        None,
-        None,
-        None,
+        SourcePublication::None,
         json,
         fln::publish_file_atomic,
     )
@@ -4329,8 +4543,29 @@ fn run_loaded_sources_with_presentation(
     sources: Vec<Vec<u8>>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
+    emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
 ) -> MultiplexerOutput {
+    let publication = match (emit_flbc, emit_sidecar, emit_olean_snapshot) {
+        (Some(path), sidecar, None) => SourcePublication::Flbc {
+            path,
+            sidecar: sidecar.map(|path| SourceSidecarPublication {
+                path,
+                toolchain_image: None,
+            }),
+        },
+        (None, None, Some(path)) => SourcePublication::OleanSnapshot { path },
+        (None, None, None) => SourcePublication::None,
+        _ => {
+            return source_failure(
+                "internal-fault",
+                "mutually exclusive source publication options reached execution together",
+                false,
+                presentation,
+                4,
+            );
+        }
+    };
     let module_plan = match derive_source_module_plan(paths, &sources) {
         Ok(plan) => plan,
         Err(error) => {
@@ -4345,9 +4580,7 @@ fn run_loaded_sources_with_presentation(
             execute_source_bytes_with_publisher_and_presentation(
                 sources,
                 module_plan,
-                emit_flbc,
-                emit_sidecar,
-                None,
+                publication,
                 presentation,
                 fln::publish_file_atomic_new,
             )
@@ -4380,6 +4613,7 @@ fn run_sources_with_presentation(
     max_bytes: usize,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
+    emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
 ) -> MultiplexerOutput {
     let sources = match read_source_batch(paths, max_bytes) {
@@ -4394,7 +4628,14 @@ fn run_sources_with_presentation(
             );
         }
     };
-    run_loaded_sources_with_presentation(paths, sources, emit_flbc, emit_sidecar, presentation)
+    run_loaded_sources_with_presentation(
+        paths,
+        sources,
+        emit_flbc,
+        emit_sidecar,
+        emit_olean_snapshot,
+        presentation,
+    )
 }
 
 fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
@@ -4415,6 +4656,7 @@ fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
         discovered.sources,
         None,
         None,
+        None,
         SourcePresentation::Lean,
     )
 }
@@ -4425,12 +4667,14 @@ fn run_sources(
     json: bool,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
+    emit_olean_snapshot: Option<PathBuf>,
 ) -> MultiplexerOutput {
     run_sources_with_presentation(
         paths,
         max_bytes,
         emit_flbc,
         emit_sidecar,
+        emit_olean_snapshot,
         SourcePresentation::Fln { json },
     )
 }
@@ -4454,7 +4698,15 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             json,
             emit_flbc,
             emit_sidecar,
-        }) => run_sources(&paths, max_bytes, json, emit_flbc, emit_sidecar),
+            emit_olean_snapshot,
+        }) => run_sources(
+            &paths,
+            max_bytes,
+            json,
+            emit_flbc,
+            emit_sidecar,
+            emit_olean_snapshot,
+        ),
         Ok(MultiplexerCommand::FlbcRun {
             path,
             max_bytes,
@@ -4938,12 +5190,13 @@ mod tests {
     use super::{
         CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, NamedOleanBytes,
         OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
-        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation,
-        admission_error_disposition, check_olean_bytes, check_olean_module_bytes, diff_olean_bytes,
-        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
-        execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
-        module_name_from_relative, parse_source_run, read_bounded_from, run, run_lean,
-        source_failure, source_import_relative_path, verify_olean_rebuild_bytes,
+        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation, SourcePublication,
+        SourceSidecarPublication, admission_error_disposition, check_olean_bytes,
+        check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes, execute_source_bytes,
+        execute_source_bytes_with_publisher, execution_error_disposition, inspect_ilean_bytes,
+        inspect_olean_bytes, module_name_from_relative, olean_write_error_disposition,
+        parse_source_run, read_bounded_from, run, run_lean, source_failure,
+        source_import_relative_path, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -5827,9 +6080,7 @@ mod tests {
                     .to_vec(),
             ],
             None,
-            None,
-            None,
-            None,
+            SourcePublication::None,
             SourcePresentation::Lean,
             |_, _| Ok::<(), std::io::Error>(()),
         );
@@ -5982,7 +6233,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/9\""));
         assert!(output.stdout.contains("\"finalKind\":\"bool\""));
         assert!(output.stdout.contains("\"finalValue\":true"));
         assert!(!output.stdout.contains("\"finalValue\":1"));
@@ -5997,7 +6248,7 @@ mod tests {
 
         assert_eq!(robot.exit_code, 0, "{}", robot.stderr);
         assert!(robot.stderr.is_empty());
-        assert!(robot.stdout.contains("\"schema\":\"fln.source-run/8\""));
+        assert!(robot.stdout.contains("\"schema\":\"fln.source-run/9\""));
         assert!(robot.stdout.contains("\"commands\":4"));
         assert!(robot.stdout.contains("\"definitions\":2"));
         assert!(robot.stdout.contains("\"evaluations\":2"));
@@ -6050,7 +6301,7 @@ mod tests {
 
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/9\""));
         assert!(output.stdout.contains("\"definitions\":2"));
         assert!(output.stdout.contains("\"finalKind\":\"string\""));
         assert!(output.stdout.contains("\"finalValue\":\"cli\\nconnected\""));
@@ -6061,9 +6312,10 @@ mod tests {
         let published = execute_source_bytes_with_publisher(
             vec![b"def message : String := \"published\\nstring\"".to_vec()],
             None,
-            Some(PathBuf::from("string.flbc")),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: PathBuf::from("string.flbc"),
+                sidecar: None,
+            },
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
@@ -6088,9 +6340,10 @@ mod tests {
         let refused = execute_source_bytes_with_publisher(
             vec![b"def open (value : String) : String := value".to_vec()],
             None,
-            Some(PathBuf::from("open.flbc")),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: PathBuf::from("open.flbc"),
+                sidecar: None,
+            },
             true,
             |_bytes, _path| {
                 failed_publications += 1;
@@ -6119,9 +6372,10 @@ mod tests {
                 b"def emitted : Nat := 17".to_vec(),
             ],
             None,
-            Some(target.clone()),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: target.clone(),
+                sidecar: None,
+            },
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
@@ -6132,7 +6386,7 @@ mod tests {
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert!(output.stderr.is_empty());
         assert_eq!(publications, vec![(target, expected.clone())]);
-        assert!(output.stdout.contains("\"schema\":\"fln.source-run/8\""));
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/9\""));
         assert!(
             output
                 .stdout
@@ -6147,9 +6401,10 @@ mod tests {
                 b"def open (x : Nat) : Nat := x".to_vec(),
             ],
             None,
-            Some(PathBuf::from("must-not-publish.flbc")),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: PathBuf::from("must-not-publish.flbc"),
+                sidecar: None,
+            },
             true,
             |_bytes, _path| {
                 failed_batch_publications += 1;
@@ -6162,9 +6417,10 @@ mod tests {
         let publication_failure = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 17".to_vec()],
             None,
-            Some(PathBuf::from("refused.flbc")),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: PathBuf::from("refused.flbc"),
+                sidecar: None,
+            },
             true,
             |_bytes, _path| Err(std::io::Error::other("injected output refusal")),
         );
@@ -6176,6 +6432,102 @@ mod tests {
             publication_failure
                 .stderr
                 .contains("injected output refusal")
+        );
+    }
+
+    #[test]
+    fn source_run_emits_one_checkable_standalone_olean_environment_after_success() {
+        let target = PathBuf::from("checked-environment.olean");
+        let mut publications = Vec::new();
+        let output = execute_source_bytes_with_publisher(
+            vec![
+                b"def base : Nat := 40\n#eval base + 2\ndef answer : Bool := base + 2 == 42"
+                    .to_vec(),
+            ],
+            None,
+            SourcePublication::OleanSnapshot {
+                path: target.clone(),
+            },
+            true,
+            |bytes, path| {
+                publications.push((path.to_path_buf(), bytes.to_vec()));
+                Ok::<(), std::io::Error>(())
+            },
+        );
+
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].0, target);
+        assert!(output.stdout.contains("\"schema\":\"fln.source-run/9\""));
+        assert!(output.stdout.contains("\"emittedOleanSnapshot\":{"));
+        assert!(output.stdout.contains("\"module\":false"));
+
+        let artifact = &publications[0].1;
+        let decoded =
+            fln::decode_olean_artifact(artifact, fln::OleanDecodeLimits::new(artifact.len()))
+                .expect("the emitted standalone snapshot decodes through the public door");
+        assert!(!decoded.module.is_module);
+        assert!(
+            decoded.constants.len() > 3,
+            "the checked seed is closed inside the snapshot"
+        );
+        let checked = check_olean_bytes(artifact.clone(), artifact.len(), true);
+        assert_eq!(checked.exit_code, 0, "{}", checked.stderr);
+        assert!(checked.stderr.is_empty());
+        assert!(checked.stdout.contains("\"outcome\":\"complete\""));
+        assert!(checked.stdout.contains("\"authority\":true"));
+
+        let mut late_publications = 0;
+        let late_failure = execute_source_bytes_with_publisher(
+            vec![b"#eval 40 + 2\ndef broken : Nat := missing".to_vec()],
+            None,
+            SourcePublication::OleanSnapshot {
+                path: PathBuf::from("must-not-exist.olean"),
+            },
+            true,
+            |_bytes, _path| {
+                late_publications += 1;
+                Ok::<(), std::io::Error>(())
+            },
+        );
+        assert_eq!(late_failure.exit_code, 1);
+        assert!(late_failure.stdout.is_empty());
+        assert_eq!(late_publications, 0);
+
+        let collision = execute_source_bytes_with_publisher(
+            vec![b"def answer : Nat := 42".to_vec()],
+            None,
+            SourcePublication::OleanSnapshot {
+                path: PathBuf::from("existing.olean"),
+            },
+            true,
+            |_bytes, _path| Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+        );
+        assert_eq!(collision.exit_code, 1);
+        assert!(collision.stdout.is_empty());
+        assert!(collision.stderr.contains("\"class\":\"output\""));
+        assert!(collision.stderr.contains("\"authority\":true"));
+    }
+
+    #[test]
+    fn olean_snapshot_writer_budget_is_a_nonanswer_and_contract_faults_are_internal() {
+        let budget = fln::OleanWriteError::Budget {
+            resource: fln::OleanWriteResource::Bytes,
+            limit: 1,
+            attempted: 2,
+        };
+        assert_eq!(
+            olean_write_error_disposition(&budget),
+            ("resource", false, 3)
+        );
+
+        let contract = fln::OleanWriteError::Contract {
+            what: "planted writer contract fault",
+        };
+        assert_eq!(
+            olean_write_error_disposition(&contract),
+            ("internal-fault", false, 4)
         );
     }
 
@@ -6202,9 +6554,10 @@ mod tests {
             let output = execute_source_bytes_with_publisher(
                 vec![b"def emitted : Nat := 17".to_vec()],
                 None,
-                Some(PathBuf::from("resource-exhausted.flbc")),
-                None,
-                None,
+                SourcePublication::Flbc {
+                    path: PathBuf::from("resource-exhausted.flbc"),
+                    sidecar: None,
+                },
                 true,
                 |_bytes, _path| {
                     Err::<(), _>(fln::AtomicCreateError::<std::convert::Infallible>::Io {
@@ -6226,9 +6579,10 @@ mod tests {
         let compound = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 17".to_vec()],
             None,
-            Some(PathBuf::from("resource-exhausted-compound.flbc")),
-            None,
-            None,
+            SourcePublication::Flbc {
+                path: PathBuf::from("resource-exhausted-compound.flbc"),
+                sidecar: None,
+            },
             true,
             |_bytes, _path| {
                 Err::<(), _>(
@@ -6270,9 +6624,13 @@ mod tests {
         let output = execute_source_bytes_with_publisher(
             vec![b"def emitted : Nat := 23".to_vec()],
             None,
-            Some(flbc_path.clone()),
-            Some(sidecar_path.clone()),
-            Some(b"injected toolchain image".to_vec()),
+            SourcePublication::Flbc {
+                path: flbc_path.clone(),
+                sidecar: Some(SourceSidecarPublication {
+                    path: sidecar_path.clone(),
+                    toolchain_image: Some(b"injected toolchain image".to_vec()),
+                }),
+            },
             true,
             |bytes, path| {
                 publications.push((path.to_path_buf(), bytes.to_vec()));
@@ -6305,9 +6663,13 @@ mod tests {
         let failed = execute_source_bytes_with_publisher(
             vec![b"def open (x : Nat) : Nat := x".to_vec()],
             None,
-            Some(PathBuf::from("not-published.flbc")),
-            Some(PathBuf::from("not-published.sidecar")),
-            Some(b"injected toolchain image".to_vec()),
+            SourcePublication::Flbc {
+                path: PathBuf::from("not-published.flbc"),
+                sidecar: Some(SourceSidecarPublication {
+                    path: PathBuf::from("not-published.sidecar"),
+                    toolchain_image: Some(b"injected toolchain image".to_vec()),
+                }),
+            },
             true,
             |_bytes, _path| {
                 failed_publications += 1;
@@ -6387,6 +6749,45 @@ mod tests {
             } if flbc == std::path::Path::new("product.flbc")
                 && sidecar == std::path::Path::new("product.sidecar")
         ));
+
+        let snapshot = parse_source_run(vec![
+            OsString::from("--emit-olean-snapshot=environment.olean"),
+            OsString::from("input.lean"),
+        ])
+        .expect("one standalone snapshot path is valid");
+        assert!(matches!(
+            snapshot,
+            super::MultiplexerCommand::SourceRun {
+                emit_flbc: None,
+                emit_sidecar: None,
+                emit_olean_snapshot: Some(path),
+                ..
+            } if path == std::path::Path::new("environment.olean")
+        ));
+
+        let duplicate_snapshot = parse_source_run(vec![
+            OsString::from("--emit-olean-snapshot=one.olean"),
+            OsString::from("--emit-olean-snapshot"),
+            OsString::from("two.olean"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("duplicate standalone snapshot paths are ambiguous");
+        assert!(duplicate_snapshot.to_string().contains("at most once"));
+
+        let mixed_products = parse_source_run(vec![
+            OsString::from("--emit-flbc=product.flbc"),
+            OsString::from("--emit-olean-snapshot=environment.olean"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("independently durable products cannot imply one transaction");
+        assert!(mixed_products.to_string().contains("mutually exclusive"));
+
+        let snapshot_alias = parse_source_run(vec![
+            OsString::from("--emit-olean-snapshot=./input.lean"),
+            OsString::from("input.lean"),
+        ])
+        .expect_err("a snapshot must not overwrite or alias its source");
+        assert!(snapshot_alias.to_string().contains("aliases source input"));
 
         let terminated = parse_source_run(vec![
             OsString::from("--"),

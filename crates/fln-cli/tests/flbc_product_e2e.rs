@@ -104,6 +104,109 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
 }
 
 #[test]
+fn checked_source_publishes_a_standalone_olean_snapshot_consumed_by_the_real_checker() {
+    let root = fresh_test_root("source-olean-snapshot-e2e")
+        .expect("allocate retained source-snapshot integration-test directory");
+    let source = root.join("Snapshot.lean");
+    let snapshot = root.join("Snapshot.olean");
+    std::fs::write(
+        &source,
+        b"def base : Nat := 40\n#eval base + 2\ndef answer : Bool := base + 2 == 42\n",
+    )
+    .expect("write the checked snapshot source");
+
+    let produced = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-olean-snapshot"),
+        &snapshot,
+        &source,
+    ]);
+    assert!(
+        produced.status.success(),
+        "snapshot producer stderr: {}",
+        utf8(&produced.stderr)
+    );
+    assert!(produced.stderr.is_empty());
+    let producer_stdout = utf8(&produced.stdout);
+    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/9\""));
+    assert!(producer_stdout.contains("\"emittedOleanSnapshot\":{"));
+    assert!(producer_stdout.contains("\"module\":false"));
+
+    let pristine = std::fs::read(&snapshot).expect("read the standalone snapshot product");
+    assert!(!pristine.is_empty());
+    let checked = run_fln(&[Path::new("check-olean"), Path::new("--json"), &snapshot]);
+    assert!(
+        checked.status.success(),
+        "snapshot checker stderr: {}",
+        utf8(&checked.stderr)
+    );
+    assert!(checked.stderr.is_empty());
+    assert!(utf8(&checked.stdout).contains("\"schema\":\"fln.check-olean/1\""));
+    assert!(utf8(&checked.stdout).contains("\"outcome\":\"complete\""));
+    assert!(utf8(&checked.stdout).contains("\"authority\":true"));
+
+    let failed_source = root.join("Failed.lean");
+    let failed_snapshot = root.join("Failed.olean");
+    std::fs::write(
+        &failed_source,
+        b"#eval 40 + 2\ndef broken : Nat := missing\n",
+    )
+    .expect("write a late failing snapshot source");
+    let refused = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-olean-snapshot"),
+        &failed_snapshot,
+        &failed_source,
+    ]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(utf8(&refused.stderr).contains("\"class\":\"execution\""));
+    assert!(matches!(
+        std::fs::symlink_metadata(&failed_snapshot),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+
+    let collision = root.join("Collision.olean");
+    let sentinel = b"preexisting snapshot sentinel";
+    std::fs::write(&collision, sentinel).expect("write a collision sentinel");
+    let collided = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-olean-snapshot"),
+        &collision,
+        &source,
+    ]);
+    assert!(!collided.status.success());
+    assert!(collided.stdout.is_empty());
+    assert!(utf8(&collided.stderr).contains("\"class\":\"output\""));
+    assert_eq!(
+        std::fs::read(&collision).expect("read the retained collision sentinel"),
+        sentinel
+    );
+
+    let mut corrupt = pristine.clone();
+    corrupt[0] ^= 0xff;
+    std::fs::write(&snapshot, &corrupt).expect("plant corrupted snapshot bytes");
+    let corrupted = run_fln(&[Path::new("check-olean"), Path::new("--json"), &snapshot]);
+    assert!(!corrupted.status.success());
+    assert!(corrupted.stdout.is_empty());
+    assert!(utf8(&corrupted.stderr).contains("\"class\":\"decode\""));
+    assert!(utf8(&corrupted.stderr).contains("\"authority\":false"));
+
+    std::fs::write(&snapshot, &pristine).expect("restore exact snapshot bytes");
+    let recovered = run_fln(&[Path::new("check-olean"), Path::new("--json"), &snapshot]);
+    assert!(
+        recovered.status.success(),
+        "restored snapshot checker stderr: {}",
+        utf8(&recovered.stderr)
+    );
+    assert!(recovered.stderr.is_empty());
+    assert!(utf8(&recovered.stdout).contains("\"outcome\":\"complete\""));
+}
+
+#[test]
 fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     let root = fresh_test_root("source-import-closure-e2e")
         .expect("allocate retained source-import integration-test directory");
@@ -141,7 +244,7 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     );
     assert!(produced.stderr.is_empty());
     let stdout = utf8(&produced.stdout);
-    assert!(stdout.contains("\"schema\":\"fln.source-run/8\""));
+    assert!(stdout.contains("\"schema\":\"fln.source-run/9\""));
     assert!(stdout.contains("\"commands\":4"));
     assert!(stdout.contains("\"definitions\":3"));
     assert!(stdout.contains("\"evaluations\":1"));
@@ -555,7 +658,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     ]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/8\""));
+    assert!(utf8(&failed.stderr).contains("\"schema\":\"fln.source-run/9\""));
     assert!(matches!(
         std::fs::symlink_metadata(&failed_product),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -575,7 +678,7 @@ fn source_product_crosses_the_filesystem_and_real_golem_consumer() {
     );
     assert!(produced.stderr.is_empty());
     let producer_stdout = utf8(&produced.stdout);
-    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/8\""));
+    assert!(producer_stdout.contains("\"schema\":\"fln.source-run/9\""));
     assert!(producer_stdout.contains("\"definitions\":3"));
     assert!(producer_stdout.contains("\"finalValue\":42"));
     assert!(producer_stdout.contains("\"emittedFlbc\":{"));
@@ -893,7 +996,7 @@ fn d18_sidecar_isolated_rebuilds_refuse_plants_and_recover() {
     );
     assert!(first.stderr.is_empty());
     let first_stdout = utf8(&first.stdout);
-    assert!(first_stdout.contains("\"schema\":\"fln.source-run/8\""));
+    assert!(first_stdout.contains("\"schema\":\"fln.source-run/9\""));
     assert!(first_stdout.contains("\"finalValue\":42"));
     assert!(first_stdout.contains("\"emittedSidecar\":{"));
     assert!(first_stdout.contains("\"profile\":\"standard\""));

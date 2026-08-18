@@ -293,7 +293,7 @@ ABI's canonical tagged-scalar-or-positive-mpz representation, including direct
 source literals larger than 64 bits; they cross dependent definitions and
 emitted FLBC products without narrowing, and stop as a typed non-answer at
 Golem's explicit mpz-magnitude ceiling.
-The `fln.source-run/8` robot result binds runtime values back to their checked
+The `fln.source-run/9` robot result binds runtime values back to their checked
 source result type, so Bool results remain JSON booleans instead of being mislabeled
 as Nat, reports definition and evaluation counts separately, and retains every
 ordered `#eval` command result even when later definitions or evaluations follow.
@@ -322,6 +322,19 @@ the entry product. This is not
 automatic project-root/`LEAN_PATH`
 discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
+
+`fln run --emit-olean-snapshot PATH ...` now connects that checked execution
+to the real pinned-format writer. After every command has passed K1, the
+independent checker, compilation, and Golem execution, it encodes the exact
+final environment—including the bounded checked source seed and generated
+evaluation declarations—as one import-free `isModule = false` `.olean`, then
+publishes it atomically without replacing an existing path. The output option
+is mutually exclusive with FLBC/sidecar emission so a successful publication
+cannot be followed by a different product failure. A produced snapshot can be
+fed directly to `fln check-olean`; corruption and output collisions fail closed.
+This is an environment snapshot, not `lean -o`: it has no `.olean.server`,
+`.olean.private`, or `.ir` companions, carries no extension payloads, and is
+not evidence of Reference cross-load compatibility or general module writing.
 
 The same bounded source path is also connected to a native `lean` executable:
 
