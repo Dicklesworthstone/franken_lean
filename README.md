@@ -310,17 +310,20 @@ budgets, immutable environment successors, K1 plus the independent checker,
 canonical FLBC, and Golem. The planned `Cx`
 builder and receipt API from §17.2 do not exist yet. A bounded import slice is
 now live: embedders can pass a caller-named closed `SourceModuleInput` set, while
-`fln run` binds `import A.B` only to an explicitly supplied path ending in
-`A/B.lean`, derives a deterministic dependency order, and rejects missing,
-duplicate, cyclic, or entry-unreachable modules before elaboration. It also
-checks every completed declaration against the graph's transitive visibility,
+`fln run ENTRY.lean` discovers the same bounded transitive local source closure
+as the native `lean` personality. The first direct `import A.B` selects exactly
+one ancestor root containing `A/B.lean`; every later import resolves below that
+same root. Callers may still supply a closed multi-path set explicitly, with the
+last path as entry. Both forms derive a deterministic dependency order and reject
+missing, ambiguous, duplicate, cyclic, or entry-unreachable modules before
+elaboration. They also
+check every completed declaration against the graph's transitive visibility,
 so dependency order cannot let one sibling borrow definitions from another
 sibling it did not import. Import-only dependency modules remain valid graph
 rows, while the selected entry must contain a supported `def` or terminal
 `#eval` command so a dependency's result can never be reported or published as
-the entry product. This is not
-automatic project-root/`LEAN_PATH`
-discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
+the entry product. This is not `LEAN_PATH` or package discovery, implicit Prelude
+ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 
 `fln run --emit-olean-snapshot PATH ...` now connects that checked execution

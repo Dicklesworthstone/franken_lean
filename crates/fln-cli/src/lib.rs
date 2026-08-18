@@ -82,9 +82,11 @@ const USAGE: &str = concat!(
     ".olean.private companion chains and refuse an incomplete chain.\n",
     "\n",
     "`run` executes supported Nat/String/Bool definitions and ordered bounded #eval commands, including parenthesized checked Nat.add/sub/mul/div/mod/gcd/pred/pow/log2/shiftLeft/shiftRight/land/lor/xor/beq/ble and String.append/length/utf8ByteSize/decEq calls. The exact scalar rows also accept pin-precedence ==, |||, ^^^, &&&, +, -, ++, *, /, %, <<<, >>>, and ^ infix syntax; == is bounded Nat/String equality, not general BEq or typeclass notation,\n",
-    "from an import-free caller-ordered path batch or an explicitly supplied closed\n",
-    "import set. In the latter form the last path is the entry, `import A.B` binds\n",
-    "only a supplied path ending in A/B.lean. Dependency order is derived, then\n",
+    "from an import-free caller-ordered path batch, one entry path with a bounded\n",
+    "local import closure, or an explicitly supplied closed import set. One entry\n",
+    "uses the same ancestor-root discovery as the native lean personality. In an\n",
+    "explicit set the last path is the entry, and `import A.B` binds only a supplied\n",
+    "path ending in A/B.lean. Dependency order is derived, then\n",
     "every command crosses the native parser, elaborator, K1, independent checker,\n",
     "compiler, and Golem. The final command must produce a closed Nat, String, or Bool result to report. The\n",
     "batch is atomic, and --max-bytes bounds all source inputs together. With\n",
@@ -97,8 +99,8 @@ const USAGE: &str = concat!(
     "final checked environment is written as one import-free, non-module .olean\n",
     "snapshot and published no-clobber after success. The snapshot is for the\n",
     "bounded `check-olean` door; it is not `lean -o`, a module artifact, or a\n",
-    "Reference cross-load claim. The source runner is not general Lean, automatic\n",
-    "module discovery, implicit Prelude processing, a\n",
+    "Reference cross-load claim. The source runner is not general Lean, LEAN_PATH\n",
+    "or package discovery, implicit Prelude processing, a\n",
     "project build, a certified build product, or\n",
     "evidence that `check-olean` is complete.\n",
     "\n",
@@ -4616,6 +4618,55 @@ fn run_sources_with_presentation(
     emit_olean_snapshot: Option<PathBuf>,
     presentation: SourcePresentation,
 ) -> MultiplexerOutput {
+    if let [entry] = paths {
+        let discovered = match discover_source_closure(entry.clone(), max_bytes) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                return source_failure(
+                    error.class(),
+                    &error.to_string(),
+                    false,
+                    presentation,
+                    error.exit_code(),
+                );
+            }
+        };
+        for output in [
+            emit_flbc.as_deref(),
+            emit_sidecar.as_deref(),
+            emit_olean_snapshot.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(source) = discovered
+                .paths
+                .iter()
+                .find(|source| output_paths_alias(output, source))
+            {
+                return source_failure(
+                    "output",
+                    &format!(
+                        "output path {} aliases discovered source input {}",
+                        output.display(),
+                        source.display()
+                    ),
+                    true,
+                    presentation,
+                    1,
+                );
+            }
+        }
+        let DiscoveredSourceClosure { paths, sources } = discovered;
+        return run_loaded_sources_with_presentation(
+            &paths,
+            sources,
+            emit_flbc,
+            emit_sidecar,
+            emit_olean_snapshot,
+            presentation,
+        );
+    }
     let sources = match read_source_batch(paths, max_bytes) {
         Ok(sources) => sources,
         Err(error) => {

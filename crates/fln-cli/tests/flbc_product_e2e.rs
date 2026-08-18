@@ -264,6 +264,56 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(consumed.stderr.is_empty());
     assert!(utf8(&consumed.stdout).contains("\"returnValue\":42"));
 
+    let discovered_product = root.join("Discovered.flbc");
+    let discovered = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &discovered_product,
+        &main,
+    ]);
+    assert!(
+        discovered.status.success(),
+        "fln run import discovery stderr: {}",
+        utf8(&discovered.stderr)
+    );
+    assert!(discovered.stderr.is_empty());
+    let discovered_stdout = utf8(&discovered.stdout);
+    assert!(discovered_stdout.contains("\"commands\":4"));
+    assert!(discovered_stdout.contains("\"definitions\":3"));
+    assert!(discovered_stdout.contains("\"evaluations\":1"));
+    assert!(discovered_stdout.contains("\"finalValue\":42"));
+    let consumed_discovered = run_fln(&[
+        Path::new("flbc"),
+        Path::new("run"),
+        Path::new("--json"),
+        &discovered_product,
+    ]);
+    assert!(
+        consumed_discovered.status.success(),
+        "discovered product consumer stderr: {}",
+        utf8(&consumed_discovered.stderr)
+    );
+    assert!(consumed_discovered.stderr.is_empty());
+    assert!(utf8(&consumed_discovered.stdout).contains("\"returnValue\":42"));
+
+    let base_before_alias = std::fs::read(&base).expect("read the imported source before aliasing");
+    let alias = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &base,
+        &main,
+    ]);
+    assert!(!alias.status.success());
+    assert!(alias.stdout.is_empty());
+    assert!(utf8(&alias.stderr).contains("\"class\":\"output\""));
+    assert!(utf8(&alias.stderr).contains("aliases discovered source input"));
+    assert_eq!(
+        std::fs::read(&base).expect("read the imported source after alias refusal"),
+        base_before_alias
+    );
+
     let native = run_lean(&[&main]);
     assert!(
         native.status.success(),
@@ -283,6 +333,22 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(late_refusal.stdout.is_empty());
     assert!(utf8(&late_refusal.stderr).starts_with("lean: execution: "));
     assert!(utf8(&late_refusal.stderr).contains("unknown constant"));
+
+    let late_product = root.join("LateFailure.flbc");
+    let late_fln = run_fln(&[
+        Path::new("run"),
+        Path::new("--json"),
+        Path::new("--emit-flbc"),
+        &late_product,
+        &main,
+    ]);
+    assert!(!late_fln.status.success());
+    assert!(late_fln.stdout.is_empty());
+    assert!(utf8(&late_fln.stderr).contains("\"class\":\"execution\""));
+    assert!(matches!(
+        std::fs::symlink_metadata(&late_product),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
 
     std::fs::write(
         &main,
@@ -506,9 +572,17 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
     let stderr = utf8(&refused.stderr);
-    assert!(stderr.contains("\"class\":\"module-graph\""));
+    assert!(stderr.contains("\"class\":\"input\""));
     assert!(stderr.contains("\"authority\":false"));
     assert!(stderr.contains("Project.Absent"));
+
+    let explicit_refused = run_fln(&[Path::new("run"), Path::new("--json"), &base, &missing]);
+    assert!(!explicit_refused.status.success());
+    assert!(explicit_refused.stdout.is_empty());
+    let explicit_stderr = utf8(&explicit_refused.stderr);
+    assert!(explicit_stderr.contains("\"class\":\"module-graph\""));
+    assert!(explicit_stderr.contains("\"authority\":false"));
+    assert!(explicit_stderr.contains("Project.Absent"));
 
     let cycle_dir = root.join("Cycle");
     std::fs::create_dir(&cycle_dir).expect("create cyclic module namespace");
