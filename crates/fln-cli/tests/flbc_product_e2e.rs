@@ -161,6 +161,97 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(consumed.stderr.is_empty());
     assert!(utf8(&consumed.stdout).contains("\"returnValue\":42"));
 
+    let native = run_lean(&[&main]);
+    assert!(
+        native.status.success(),
+        "native lean import discovery stderr: {}",
+        utf8(&native.stderr)
+    );
+    assert_eq!(utf8(&native.stdout), "42\n");
+    assert!(native.stderr.is_empty());
+
+    std::fs::write(
+        &main,
+        b"import Project.Middle\n#eval middle + 2\ndef broken : Nat := missing\n",
+    )
+    .expect("plant a late entry failure after a discovered evaluation");
+    let late_refusal = run_lean(&[&main]);
+    assert!(!late_refusal.status.success());
+    assert!(late_refusal.stdout.is_empty());
+    assert!(utf8(&late_refusal.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&late_refusal.stderr).contains("unknown constant"));
+
+    std::fs::write(
+        &main,
+        b"import Project.Middle\ndef verified : Bool := middle + 2 == 42\n#eval middle + 2\n",
+    )
+    .expect("restore the checked import entry");
+
+    let entry_only_limit = format!(
+        "--max-bytes={}",
+        std::fs::read(&main)
+            .expect("read the import entry for its exact byte length")
+            .len()
+    );
+    let exhausted = run_lean(&[Path::new(&entry_only_limit), &main]);
+    assert!(!exhausted.status.success());
+    assert!(exhausted.stdout.is_empty());
+    assert!(utf8(&exhausted.stderr).starts_with("lean: resource: "));
+    assert!(utf8(&exhausted.stderr).contains("source import closure"));
+
+    std::fs::write(&middle, b"import Project.Absent\ndef middle : Nat := 40\n")
+        .expect("plant a missing transitive import");
+    let open_native = run_lean(&[&main]);
+    assert!(!open_native.status.success());
+    assert!(open_native.stdout.is_empty());
+    assert!(utf8(&open_native.stderr).starts_with("lean: input: "));
+    assert!(utf8(&open_native.stderr).contains("Project.Absent"));
+
+    std::fs::write(
+        &middle,
+        b"import Project.Base\ndef middle : Nat := Nat.mul base 2\n",
+    )
+    .expect("restore the transitive import closure");
+    let recovered_native = run_lean(&[&main]);
+    assert!(
+        recovered_native.status.success(),
+        "recovered native lean import stderr: {}",
+        utf8(&recovered_native.stderr)
+    );
+    assert_eq!(utf8(&recovered_native.stdout), "42\n");
+    assert!(recovered_native.stderr.is_empty());
+
+    let nested = root.join("Nested");
+    let nested_project = nested.join("Project");
+    std::fs::create_dir_all(&nested_project).expect("create the nearer ambiguous import namespace");
+    let nested_base = nested_project.join("Base.lean");
+    let ambiguous_main = nested.join("Ambiguous.lean");
+    std::fs::write(&nested_base, b"def base : Nat := 99\n")
+        .expect("write the nearer ambiguous module");
+    std::fs::write(&ambiguous_main, b"import Project.Base\n#eval base\n")
+        .expect("write an entry with two possible source roots");
+    let ambiguous = run_lean(&[&ambiguous_main]);
+    assert!(!ambiguous.status.success());
+    assert!(ambiguous.stdout.is_empty());
+    assert!(utf8(&ambiguous.stderr).starts_with("lean: input: "));
+    assert!(utf8(&ambiguous.stderr).contains("is ambiguous"));
+    assert!(utf8(&ambiguous.stderr).contains(&nested_base.display().to_string()));
+    assert!(utf8(&ambiguous.stderr).contains(&base.display().to_string()));
+
+    #[cfg(unix)]
+    {
+        let linked = root.join("Linked.lean");
+        let linked_main = root.join("LinkedMain.lean");
+        std::os::unix::fs::symlink(&base, &linked).expect("plant a source-import symlink");
+        std::fs::write(&linked_main, b"import Linked\n#eval base\n")
+            .expect("write an entry naming the source-import symlink");
+        let refused_link = run_lean(&[&linked_main]);
+        assert!(!refused_link.status.success());
+        assert!(refused_link.stdout.is_empty());
+        assert!(utf8(&refused_link.stderr).starts_with("lean: input: "));
+        assert!(utf8(&refused_link.stderr).contains("refusing symlink source import"));
+    }
+
     let interleaved_eval = root.join("InterleavedEval.lean");
     let interleaved_product = root.join("InterleavedEval.flbc");
     std::fs::write(
@@ -330,6 +421,12 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     let stderr = utf8(&cycled.stderr);
     assert!(stderr.contains("\"class\":\"module-graph\""));
     assert!(stderr.contains("source import graph contains a cycle"));
+
+    let native_cycle = run_lean(&[&cycle_a]);
+    assert!(!native_cycle.status.success());
+    assert!(native_cycle.stdout.is_empty());
+    assert!(utf8(&native_cycle.stderr).starts_with("lean: module-graph: "));
+    assert!(utf8(&native_cycle.stderr).contains("source import graph contains a cycle"));
 
     let provider = root.join("A.lean");
     let consumer = root.join("B.lean");

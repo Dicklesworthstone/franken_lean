@@ -335,10 +335,18 @@ supported `#eval` result on its own line after the whole source succeeds. The
 batch remains atomic: a later failure leaves stdout empty. It is a presentation
 adapter over the same parser → K1 → independent checker → compiler → canonical
 FLBC → Golem execution used by `fln run`; it neither invokes nor falls back to
-the Reference.
+the Reference. Local source imports are connected to the existing closed-module
+engine: the first direct `import A.B` must identify exactly one ancestor source
+root containing `A/B.lean`, then every transitive import is loaded from that
+same root in deterministic module-name order under the aggregate byte, module,
+import, and name-depth ceilings. Missing, ambiguous, symlink, and non-file
+imports are refused before execution; discovered bytes are not reread between
+planning and checking. This bounded seam assumes a trusted filesystem namespace
+that remains stable for the invocation; directory-handle-relative path-race
+sealing is not implemented.
 The currently implemented binary is not yet the Reference CLI surface: it has
-no general option compatibility, automatic module discovery, implicit Prelude
-processing, general Lean elaboration, or diagnostic-text parity.
+no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
+implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.
 
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned

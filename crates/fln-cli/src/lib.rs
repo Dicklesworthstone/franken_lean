@@ -116,9 +116,15 @@ const LEAN_USAGE: &str = concat!(
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
     "definitions are silent and\n",
     "each supported #eval result is printed on its own line after the whole\n",
-    "source succeeds; a later failure leaves stdout empty. It does not yet\n",
-    "implement the Reference CLI's option set, automatic module discovery,\n",
-    "implicit Prelude processing, general Lean elaboration, or diagnostic parity.\n",
+    "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
+    "the first direct import must identify exactly one ancestor source root;\n",
+    "the complete local A/B.lean closure is then loaded under the same aggregate\n",
+    "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
+    "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
+    ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
+    "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
+    "does not change during the invocation; directory-handle race sealing is not\n",
+    "yet implemented.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -214,13 +220,23 @@ enum BoundedReadFailure {
         subject: &'static str,
         requested: usize,
     },
+    Resource {
+        detail: String,
+    },
 }
 
 impl BoundedReadFailure {
     const fn class(&self) -> &'static str {
         match self {
             Self::Input { .. } => "input",
-            Self::TooLarge { .. } | Self::Allocation { .. } => "resource",
+            Self::TooLarge { .. } | Self::Allocation { .. } | Self::Resource { .. } => "resource",
+        }
+    }
+
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Input { .. } => 1,
+            Self::TooLarge { .. } | Self::Allocation { .. } | Self::Resource { .. } => 3,
         }
     }
 }
@@ -241,6 +257,7 @@ impl fmt::Display for BoundedReadFailure {
                 f,
                 "could not reserve memory for {requested} bytes of bounded {subject} input"
             ),
+            Self::Resource { detail } => f.write_str(detail),
         }
     }
 }
@@ -844,7 +861,7 @@ fn read_bounded_from(
     loop {
         let read = match reader.read(&mut chunk) {
             Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted) => continue,
             Err(error) => {
                 return Err(BoundedReadFailure::Input {
                     subject,
@@ -2468,7 +2485,7 @@ fn read_optional_olean_companion(
 ) -> Result<Option<Vec<u8>>, BoundedReadFailure> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => return Ok(None),
         Err(error) => {
             return Err(BoundedReadFailure::Input {
                 subject: ".olean companion part",
@@ -3820,6 +3837,276 @@ fn read_source_batch(
 }
 
 #[derive(Debug)]
+struct DiscoveredSourceClosure {
+    paths: Vec<PathBuf>,
+    sources: Vec<Vec<u8>>,
+}
+
+fn source_import_relative_path(name: &fln::Name) -> Result<PathBuf, BoundedReadFailure> {
+    let components = source_module_components(name).ok_or_else(|| BoundedReadFailure::Input {
+        subject: "source import closure",
+        detail: format!(
+            "import `{}` is not a nonempty string-component module name",
+            name.to_display_string()
+        ),
+    })?;
+    let mut path = PathBuf::new();
+    for component in components {
+        let component_path = Path::new(&component);
+        let mut path_components = component_path.components();
+        let normalized = matches!(
+            (path_components.next(), path_components.next()),
+            (Some(std::path::Component::Normal(value)), None) if value == component.as_str()
+        );
+        if !normalized {
+            return Err(BoundedReadFailure::Input {
+                subject: "source import closure",
+                detail: format!(
+                    "import `{}` contains a component that is not one normalized path segment",
+                    name.to_display_string()
+                ),
+            });
+        }
+        path.push(component);
+    }
+    path.set_extension("lean");
+    Ok(path)
+}
+
+fn source_import_candidate_is_file(path: &Path) -> Result<bool, BoundedReadFailure> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => return Ok(false),
+        Err(error) => {
+            return Err(BoundedReadFailure::Input {
+                subject: "source import closure",
+                detail: format!("cannot inspect {}: {error}", path.display()),
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BoundedReadFailure::Input {
+            subject: "source import closure",
+            detail: format!("refusing symlink source import {}", path.display()),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(BoundedReadFailure::Input {
+            subject: "source import closure",
+            detail: format!("source import {} is not a regular file", path.display()),
+        });
+    }
+    Ok(true)
+}
+
+fn discover_source_root(
+    entry: &Path,
+    first_import: &fln::Name,
+    max_depth: usize,
+) -> Result<PathBuf, BoundedReadFailure> {
+    let relative = source_import_relative_path(first_import)?;
+    let mut selected: Option<PathBuf> = None;
+    let parent = entry.parent().unwrap_or_else(|| Path::new(""));
+    for root in parent.ancestors().take(max_depth) {
+        let candidate = root.join(&relative);
+        if source_import_candidate_is_file(&candidate)? {
+            if let Some(previous) = selected {
+                return Err(BoundedReadFailure::Input {
+                    subject: "source import closure",
+                    detail: format!(
+                        "import `{}` is ambiguous: both {} and {} exist above entry {}",
+                        first_import.to_display_string(),
+                        previous.join(&relative).display(),
+                        candidate.display(),
+                        entry.display()
+                    ),
+                });
+            }
+            selected = Some(root.to_path_buf());
+        }
+    }
+    selected.ok_or_else(|| BoundedReadFailure::Input {
+        subject: "source import closure",
+        detail: format!(
+            "cannot resolve import `{}` as {} below any bounded ancestor of entry {}",
+            first_import.to_display_string(),
+            relative.display(),
+            entry.display()
+        ),
+    })
+}
+
+fn read_source_closure_member(
+    path: &Path,
+    consumed: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadFailure> {
+    let remaining = max_bytes.saturating_sub(consumed);
+    match read_bounded(path, remaining, "source import closure") {
+        Ok(source) => Ok(source),
+        Err(BoundedReadFailure::TooLarge { observed, .. }) => Err(BoundedReadFailure::TooLarge {
+            subject: "source import closure",
+            observed: consumed.saturating_add(observed),
+            limit: max_bytes,
+        }),
+        Err(BoundedReadFailure::Allocation { requested, .. }) => {
+            Err(BoundedReadFailure::Allocation {
+                subject: "source import closure",
+                requested: consumed.saturating_add(requested),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn discover_source_closure(
+    entry: PathBuf,
+    max_bytes: usize,
+) -> Result<DiscoveredSourceClosure, BoundedReadFailure> {
+    let limits = fln::SourceModuleLimits::default();
+    let entry_source = read_source_closure_member(&entry, 0, max_bytes)?;
+    let entry_module = match fln::partition_source_module(&entry_source) {
+        Ok(module) => module,
+        Err(_) => {
+            return Ok(DiscoveredSourceClosure {
+                paths: vec![entry],
+                sources: vec![entry_source],
+            });
+        }
+    };
+    if entry_module.imports.is_empty() {
+        return Ok(DiscoveredSourceClosure {
+            paths: vec![entry],
+            sources: vec![entry_source],
+        });
+    }
+    if entry_module.imports.len() > limits.max_imports {
+        return Err(BoundedReadFailure::Resource {
+            detail: format!(
+                "source entry presents {} imports; planning limit is {}",
+                entry_module.imports.len(),
+                limits.max_imports
+            ),
+        });
+    }
+    let first_import = &entry_module.imports[0];
+    let first_components =
+        source_module_components(first_import).ok_or_else(|| BoundedReadFailure::Input {
+            subject: "source import closure",
+            detail: format!(
+                "import `{}` is not a nonempty string-component module name",
+                first_import.to_display_string()
+            ),
+        })?;
+    if first_components.len() > limits.max_name_depth {
+        return Err(BoundedReadFailure::Resource {
+            detail: format!(
+                "source import `{}` has {} components; planning limit is {}",
+                first_import.to_display_string(),
+                first_components.len(),
+                limits.max_name_depth
+            ),
+        });
+    }
+    let root = discover_source_root(&entry, first_import, limits.max_name_depth)?;
+    let mut pending = BTreeSet::new();
+    pending.extend(entry_module.imports.iter().cloned());
+    let mut discovered = BTreeMap::<fln::Name, (PathBuf, Vec<u8>)>::new();
+    let mut import_presentations = entry_module.imports.len();
+    let mut source_bytes = entry_source.len();
+
+    while let Some(name) = pending.pop_first() {
+        if discovered.contains_key(&name) {
+            continue;
+        }
+        let components =
+            source_module_components(&name).ok_or_else(|| BoundedReadFailure::Input {
+                subject: "source import closure",
+                detail: format!(
+                    "import `{}` is not a nonempty string-component module name",
+                    name.to_display_string()
+                ),
+            })?;
+        if components.len() > limits.max_name_depth {
+            return Err(BoundedReadFailure::Resource {
+                detail: format!(
+                    "source import `{}` has {} components; planning limit is {}",
+                    name.to_display_string(),
+                    components.len(),
+                    limits.max_name_depth
+                ),
+            });
+        }
+        if discovered.len().saturating_add(1) >= limits.max_modules {
+            return Err(BoundedReadFailure::Resource {
+                detail: format!(
+                    "source import closure contains at least {} modules; planning limit is {}",
+                    discovered.len().saturating_add(2),
+                    limits.max_modules
+                ),
+            });
+        }
+        let relative = source_import_relative_path(&name)?;
+        let path = root.join(relative);
+        if path == entry {
+            continue;
+        }
+        if !source_import_candidate_is_file(&path)? {
+            return Err(BoundedReadFailure::Input {
+                subject: "source import closure",
+                detail: format!(
+                    "cannot resolve import `{}` below source root {}",
+                    name.to_display_string(),
+                    root.display()
+                ),
+            });
+        }
+        let source = read_source_closure_member(&path, source_bytes, max_bytes)?;
+        source_bytes = source_bytes.saturating_add(source.len());
+        if let Ok(module) = fln::partition_source_module(&source) {
+            import_presentations = import_presentations
+                .checked_add(module.imports.len())
+                .ok_or_else(|| BoundedReadFailure::Resource {
+                    detail: "source import presentation count exceeded this platform".to_owned(),
+                })?;
+            if import_presentations > limits.max_imports {
+                return Err(BoundedReadFailure::Resource {
+                    detail: format!(
+                        "source import closure presents {import_presentations} imports; planning limit is {}",
+                        limits.max_imports
+                    ),
+                });
+            }
+            pending.extend(module.imports);
+        }
+        discovered.insert(name, (path, source));
+    }
+
+    let mut paths = Vec::new();
+    let mut sources = Vec::new();
+    let closure_len = discovered.len().saturating_add(1);
+    paths
+        .try_reserve_exact(closure_len)
+        .map_err(|_| BoundedReadFailure::Allocation {
+            subject: "source import path table",
+            requested: closure_len,
+        })?;
+    sources
+        .try_reserve_exact(closure_len)
+        .map_err(|_| BoundedReadFailure::Allocation {
+            subject: "source import byte table",
+            requested: closure_len,
+        })?;
+    for (_, (path, source)) in discovered {
+        paths.push(path);
+        sources.push(source);
+    }
+    paths.push(entry);
+    sources.push(entry_source);
+    Ok(DiscoveredSourceClosure { paths, sources })
+}
+
+#[derive(Debug)]
 struct SourceModulePlan {
     names: Vec<fln::Name>,
     entry: fln::Name,
@@ -4037,26 +4324,13 @@ fn derive_source_module_plan(
     Ok(Some(SourceModulePlan { names, entry }))
 }
 
-fn run_sources_with_presentation(
+fn run_loaded_sources_with_presentation(
     paths: &[PathBuf],
-    max_bytes: usize,
+    sources: Vec<Vec<u8>>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     presentation: SourcePresentation,
 ) -> MultiplexerOutput {
-    let sources = match read_source_batch(paths, max_bytes) {
-        Ok(sources) => sources,
-        Err(error) => {
-            let exit_code = if error.class() == "resource" { 3 } else { 1 };
-            return source_failure(
-                error.class(),
-                &error.to_string(),
-                false,
-                presentation,
-                exit_code,
-            );
-        }
-    };
     let module_plan = match derive_source_module_plan(paths, &sources) {
         Ok(plan) => plan,
         Err(error) => {
@@ -4099,6 +4373,50 @@ fn run_sources_with_presentation(
             4,
         ),
     }
+}
+
+fn run_sources_with_presentation(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
+    presentation: SourcePresentation,
+) -> MultiplexerOutput {
+    let sources = match read_source_batch(paths, max_bytes) {
+        Ok(sources) => sources,
+        Err(error) => {
+            return source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                presentation,
+                error.exit_code(),
+            );
+        }
+    };
+    run_loaded_sources_with_presentation(paths, sources, emit_flbc, emit_sidecar, presentation)
+}
+
+fn run_lean_source(path: PathBuf, max_bytes: usize) -> MultiplexerOutput {
+    let discovered = match discover_source_closure(path, max_bytes) {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            return source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                SourcePresentation::Lean,
+                error.exit_code(),
+            );
+        }
+    };
+    run_loaded_sources_with_presentation(
+        &discovered.paths,
+        discovered.sources,
+        None,
+        None,
+        SourcePresentation::Lean,
+    )
 }
 
 fn run_sources(
@@ -4181,9 +4499,7 @@ pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
             "lean (FrankenLean bounded native source personality) {}\n",
             env!("CARGO_PKG_VERSION")
         )),
-        Ok(LeanCommand::Source { path, max_bytes }) => {
-            run_sources_with_presentation(&[path], max_bytes, None, None, SourcePresentation::Lean)
-        }
+        Ok(LeanCommand::Source { path, max_bytes }) => run_lean_source(path, max_bytes),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }
@@ -4627,7 +4943,7 @@ mod tests {
         execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
         execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
         module_name_from_relative, parse_source_run, read_bounded_from, run, run_lean,
-        source_failure, verify_olean_rebuild_bytes,
+        source_failure, source_import_relative_path, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -5438,7 +5754,12 @@ mod tests {
         assert!(help.stdout.contains("bounded native `lean` personality"));
         assert!(
             help.stdout
-                .contains("does not yet\nimplement the Reference CLI's option set")
+                .contains("does not implement the Reference CLI's option set")
+        );
+        assert!(help.stdout.contains("complete local A/B.lean closure"));
+        assert!(
+            help.stdout
+                .contains("LEAN_PATH/package or\n.olean discovery")
         );
 
         let version = run_lean([OsString::from("--version")]);
@@ -5475,6 +5796,27 @@ mod tests {
         assert!(exhausted.stdout.is_empty());
         assert!(exhausted.stderr.starts_with("lean: resource: "));
         assert!(exhausted.stderr.contains("0-byte input limit"));
+    }
+
+    #[test]
+    fn lean_source_import_names_map_only_to_normalized_lean_paths() {
+        let name = fln::Name::from_components(["Project", "Foundation", "Nat"]);
+        assert_eq!(
+            source_import_relative_path(&name).expect("string components map to a source path"),
+            PathBuf::from("Project/Foundation/Nat.lean")
+        );
+
+        let numeric = fln::Name::num(fln::Name::anonymous(), 1);
+        let error = source_import_relative_path(&numeric)
+            .expect_err("numeric module components cannot become filesystem authority");
+        assert_eq!(error.class(), "input");
+        assert!(error.to_string().contains("nonempty string-component"));
+
+        let traversal = fln::Name::from_components(["..", "Secret"]);
+        let error = source_import_relative_path(&traversal)
+            .expect_err("a forged name cannot escape the selected source root");
+        assert_eq!(error.class(), "input");
+        assert!(error.to_string().contains("one normalized path segment"));
     }
 
     #[test]
