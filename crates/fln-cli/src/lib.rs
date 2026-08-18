@@ -130,12 +130,13 @@ const LEAN_USAGE: &str = concat!(
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
     "scalar and first-order function definitions are silent; unlike `fln run`,\n",
     "the final definition need not produce a closed scalar.\n",
-    "One standalone import-free #check command is inferred and admitted through\n",
+    "A standalone import-free #check, or one final #check after an import-free\n",
+    "definition-only prefix, is inferred and admitted through\n",
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
-    "This bounded query currently sees only the checked source seed: it cannot be\n",
-    "interleaved with definitions or evaluations, use imports, or pretty-print\n",
-    "dependent and other unsupported inferred type shapes.\n",
+    "The query sees the checked source seed plus that completed definition prefix;\n",
+    "it cannot use imports, follow or precede an evaluation, appear before a later\n",
+    "command, or pretty-print dependent and other unsupported inferred types.\n",
     "Each supported #eval result is printed on its own line after the whole\n",
     "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
@@ -3558,6 +3559,16 @@ fn render_lean_source_check(checked: &fln::SourceCheck) -> MultiplexerOutput {
     MultiplexerOutput::success(format!("{term} : {type_}\n"))
 }
 
+fn source_has_terminal_check(source: &[u8]) -> bool {
+    fln::partition_source_module(source)
+        .ok()
+        .and_then(|module| module.commands.last().copied())
+        .is_some_and(|(_, command)| {
+            fln::parse_source_command(command)
+                .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
+        })
+}
+
 fn source_failure(
     class: &'static str,
     detail: &str,
@@ -3812,10 +3823,9 @@ where
     if matches!(presentation, SourcePresentation::Lean)
         && module_plan.is_none()
         && let [source] = source_refs.as_slice()
-        && fln::parse_source_command(source)
-            .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
+        && source_has_terminal_check(source)
     {
-        let checked = match engine.check_source_command(source, &options, limits.admission()) {
+        let checked = match engine.check_terminal_source_command(source, &options, limits) {
             Ok(checked) => checked,
             Err(error) => {
                 let (class, authority, exit_code) = execution_error_disposition(&error);
@@ -3829,7 +3839,7 @@ where
             }
         };
         return match checked {
-            fln::Outcome::Complete(checked) => render_lean_source_check(&checked),
+            fln::Outcome::Complete(checked) => render_lean_source_check(&checked.check),
             fln::Outcome::Inconclusive(inconclusive) => source_failure(
                 "inconclusive",
                 &format!("{inconclusive:?}"),

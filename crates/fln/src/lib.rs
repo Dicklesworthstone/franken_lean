@@ -17,9 +17,10 @@
 //! Verdict's proof-producing `bv_decide` pipeline is also available through an
 //! atomic engine transition whose theorem must survive both Verdict's proof
 //! replay/K1 path and the facade's independent-checker council. A standalone
-//! bounded `#check` query can use those same two checker seats in a discarded
-//! scratch successor, returning its checked type without publishing, compiling,
-//! or executing the queried term. Lantern's typed
+//! bounded `#check`, or one terminal check after an import-free definition-only
+//! prefix, can use those same two checker seats in a discarded scratch
+//! successor, returning its checked type without publishing, compiling, or
+//! executing the queried term. Lantern's typed
 //! LSP diagnostic projection is reachable here as a pure protocol adapter; the
 //! long-lived server transport remains a separate, unfinished product surface.
 
@@ -2768,6 +2769,86 @@ impl Engine {
         )
     }
 
+    /// Execute a definition-only prefix, then dual-check one terminal `#check`.
+    ///
+    /// The prefix uses the ordinary checked definition pipeline and is retained
+    /// only when the terminal query also completes. The query observes that
+    /// successor but its generated declaration is admitted only in a discarded
+    /// scratch successor. Imports, evaluations, and earlier checks remain
+    /// outside this bounded command shape.
+    pub fn check_terminal_source_command(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<TerminalSourceCheck>, EngineExecutionError> {
+        let mut commands = fln_parse::partition_definition_commands(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        let terminal_index =
+            commands
+                .len()
+                .checked_sub(1)
+                .ok_or(EngineExecutionError::UnexpectedPublication {
+                    detail: "source command partition returned an empty command table",
+                })?;
+        let (terminal_offset, terminal_source) =
+            commands
+                .pop()
+                .ok_or(EngineExecutionError::UnexpectedPublication {
+                    detail: "source command partition lost its terminal command",
+                })?;
+        let terminal = fln_parse::parse_source_command(terminal_source)
+            .map_err(|error| error.with_original_offset(terminal_offset))
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: terminal_index,
+                error: Box::new(EngineExecutionError::Frontend(error)),
+            })?;
+        if terminal.kind() != fln_parse::SourceCommandKind::Check {
+            return Err(EngineExecutionError::TerminalCheckRequired);
+        }
+        for (index, (original_offset, command_source)) in commands.iter().enumerate() {
+            let parsed = fln_parse::parse_source_command(command_source)
+                .map_err(|error| error.with_original_offset(*original_offset))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index,
+                    error: Box::new(EngineExecutionError::Frontend(error)),
+                })?;
+            if parsed.kind() != fln_parse::SourceCommandKind::Definition {
+                return Err(EngineExecutionError::TerminalCheckDefinitionPrefix { index });
+            }
+        }
+
+        let definition_prefix = if commands.is_empty() {
+            None
+        } else {
+            match self.execute_source_commands(commands, options, limits)? {
+                Outcome::Complete(completed) => Some(completed),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        };
+        let query_engine = definition_prefix
+            .as_ref()
+            .map_or(self, |completed| &completed.engine);
+        let checked = query_engine
+            .check_source_command(terminal_source, options, limits.admission())
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: terminal_index,
+                error: Box::new(error),
+            })?;
+        Ok(match checked {
+            Outcome::Complete(check) => Outcome::Complete(TerminalSourceCheck {
+                definition_prefix,
+                check,
+            }),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        })
+    }
+
     fn execute_parsed_source_definition(
         &self,
         parsed: fln_parse::ParsedDefinition,
@@ -4745,7 +4826,7 @@ pub struct DefinitionExecution {
     pub checker: CheckerAgreement,
 }
 
-/// One standalone bounded `#check` query validated by both checker seats.
+/// One bounded `#check` query validated by both checker seats.
 ///
 /// The generated declaration is admitted only into a scratch successor. That
 /// successor is deliberately not retained here: a check query observes the
@@ -4763,6 +4844,19 @@ pub struct SourceCheck {
     pub environment_root: LogicalRoot,
     /// The independent checker observation that allowed the council to agree.
     pub checker: CheckerAgreement,
+}
+
+/// One completed definition-only source prefix followed by a terminal check.
+///
+/// A standalone check has no prefix. When present, the prefix successor is the
+/// exact environment recorded by [`SourceCheck`]; the query's own scratch
+/// successor is never exposed.
+#[derive(Debug)]
+pub struct TerminalSourceCheck {
+    /// The completed definition prefix, absent for a standalone query.
+    pub definition_prefix: Option<DefinitionBatchExecution>,
+    /// The terminal query checked against the prefix successor.
+    pub check: SourceCheck,
 }
 
 /// One exact source module in a caller-supplied closed import set.
@@ -5213,6 +5307,10 @@ pub enum EngineExecutionError {
         error: Box<EngineExecutionError>,
     },
     StandaloneCheckRequired,
+    TerminalCheckRequired,
+    TerminalCheckDefinitionPrefix {
+        index: usize,
+    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5333,7 +5431,15 @@ impl fmt::Display for EngineExecutionError {
             }
             Self::StandaloneCheckRequired => write!(
                 formatter,
-                "#check is currently a standalone import-free query, not an executable batch command"
+                "#check is currently a standalone import-free query or the terminal command after an import-free definition-only prefix, not an executable batch command"
+            ),
+            Self::TerminalCheckRequired => write!(
+                formatter,
+                "bounded terminal-check execution requires #check as the final source command"
+            ),
+            Self::TerminalCheckDefinitionPrefix { index } => write!(
+                formatter,
+                "bounded terminal #check permits only definitions before it; command {index} is not a definition"
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
@@ -8924,6 +9030,106 @@ mod tests {
                 .expect("the unchanged engine recovers after both refusals"),
             Outcome::Complete(_)
         ));
+    }
+
+    #[test]
+    fn terminal_source_check_observes_only_a_completed_definition_prefix() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+
+        let Outcome::Complete(terminal) = engine
+            .check_terminal_source_command(
+                b"def first (x : Nat) : Nat := x + 2\ndef answer : Nat := first 40\n#check answer",
+                &options,
+                test_limits(),
+            )
+            .expect("a terminal query observes its completed definition prefix")
+        else {
+            panic!("the terminal source check was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        let prefix = terminal
+            .definition_prefix
+            .as_ref()
+            .expect("the completed definition prefix is retained");
+        assert_eq!(prefix.executions.len(), 2);
+        assert!(
+            prefix
+                .engine
+                .environment()
+                .contains(&Name::from_components(["first"]))
+        );
+        assert!(
+            prefix
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+        assert_eq!(terminal.check.environment_root, prefix.result_logical_root);
+        assert_eq!(terminal.check.checked_type, nat_type());
+        let Declaration::Defn(query) = &terminal.check.declaration else {
+            panic!("the terminal query candidate must be a definition"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(
+            matches!(query.value.node(), ExprNode::Const { name, .. } if name == &Name::from_components(["answer"]))
+        );
+        assert!(
+            !prefix.engine.environment().contains(&query.base.name),
+            "the checked query row must not escape into the retained prefix successor"
+        );
+        assert_eq!(engine.logical_root(&options), before);
+
+        let Outcome::Complete(function) = engine
+            .check_terminal_source_command(
+                b"def add (x : Nat) : Nat := x + 1\n#check add",
+                &options,
+                test_limits(),
+            )
+            .expect("a terminal query can inspect a checked source function")
+        else {
+            panic!("the terminal function check was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(matches!(
+            function.check.checked_type.node(),
+            ExprNode::ForallE { .. }
+        ));
+
+        let unknown = engine
+            .check_terminal_source_command(
+                b"def retained : Nat := 7\n#check Missing",
+                &options,
+                test_limits(),
+            )
+            .expect_err("a failed terminal query exposes no prefix successor");
+        assert!(matches!(
+            unknown,
+            EngineExecutionError::BatchCommand {
+                index: 1,
+                error,
+            } if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        assert!(matches!(
+            engine
+                .check_terminal_source_command(b"#eval 1\n#check Nat", &options, test_limits(),)
+                .expect_err("evaluation output is not admitted before a terminal check"),
+            EngineExecutionError::TerminalCheckDefinitionPrefix { index: 0 }
+        ));
+        assert!(matches!(
+            engine
+                .check_terminal_source_command(
+                    b"#check Nat\ndef later : Nat := 1",
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("a nonterminal query stays outside this bounded command shape"),
+            EngineExecutionError::TerminalCheckRequired
+        ));
+        assert_eq!(engine.logical_root(&options), before);
     }
 
     #[test]

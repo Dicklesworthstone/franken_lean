@@ -364,17 +364,19 @@ planning and checking. This bounded seam assumes a trusted filesystem namespace
 that remains stable for the invocation; directory-handle-relative path-race
 sealing is not implemented.
 
-One standalone, import-free `#check` command is also live through the native
-`lean` personality. The bounded elaborator infers the term's real type, places
-an unspellable generated definition into a scratch successor, and requires both
-K1 and the retained independent checker to admit it. The successor is then
-discarded: the query does not publish a declaration, enter compiler ingress, or
-run on Golem. For example, `#check Nat` prints `Nat : Type`, while `#check
-Nat.add` prints `Nat.add : Nat → Nat → Nat`. This is intentionally narrower
-than general command elaboration: the query currently sees only the checked
-source seed, cannot be interleaved with other commands or use imports, and has a
-bounded type renderer rather than Reference pretty-printing or diagnostic-text
-parity.
+A standalone, import-free `#check`, or one terminal check after an import-free
+definition-only prefix, is also live through the native `lean` personality. The
+bounded elaborator infers the term's real type, places an unspellable generated
+definition into a scratch successor, and requires both K1 and the retained
+independent checker to admit it. The successor is then discarded: the query
+does not publish a declaration, enter compiler ingress, or run on Golem. For
+example, `#check Nat` prints `Nat : Type`, while a file containing
+`def answer := 42` followed by `#check answer` prints `answer : Nat`. This is
+intentionally narrower than general command elaboration: the query sees the
+checked source seed plus its completed definition prefix, cannot use imports or
+coexist with evaluations, must be the
+final command, and has a bounded type renderer rather than Reference
+pretty-printing or diagnostic-text parity.
 
 The same bounded local resolver is available through `lean --src-deps FILE`:
 it parses only the import header, validates every direct local source import,

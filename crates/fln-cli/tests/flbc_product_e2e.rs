@@ -209,20 +209,49 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(utf8(&imported_check.stderr).starts_with("lean: execution: "));
     assert!(utf8(&imported_check.stderr).contains("standalone import-free query"));
 
-    let unknown_check = run_lean_stdin(&[Path::new("--stdin")], b"#check Missing\n");
+    let unknown_check = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"def retained : Nat := 7\n#check Missing\n",
+    );
     assert!(!unknown_check.status.success());
     assert!(unknown_check.stdout.is_empty());
     assert!(utf8(&unknown_check.stderr).starts_with("lean: execution: "));
     assert!(utf8(&unknown_check.stderr).contains("no inferable type"));
 
-    let interleaved_check = run_lean_stdin(
+    let terminal_check = run_lean_stdin(
         &[Path::new("--stdin")],
-        b"def answer : Nat := 42\n#check answer\n",
+        b"def first (x : Nat) : Nat := x + 2\ndef answer : Nat := first 40\n#check answer\n",
     );
-    assert!(!interleaved_check.status.success());
-    assert!(interleaved_check.stdout.is_empty());
-    assert!(utf8(&interleaved_check.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&interleaved_check.stderr).contains("standalone import-free query"));
+    assert!(
+        terminal_check.status.success(),
+        "terminal native lean #check stderr: {}",
+        utf8(&terminal_check.stderr)
+    );
+    assert_eq!(utf8(&terminal_check.stdout), "answer : Nat\n");
+    assert!(terminal_check.stderr.is_empty());
+
+    let terminal_function_check = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"def add (x : Nat) : Nat := x + 1\n#check add\n",
+    );
+    assert!(terminal_function_check.status.success());
+    assert_eq!(utf8(&terminal_function_check.stdout), "add : Nat → Nat\n");
+    assert!(terminal_function_check.stderr.is_empty());
+
+    let evaluation_prefix = run_lean_stdin(&[Path::new("--stdin")], b"#eval 1\n#check Nat\n");
+    assert!(!evaluation_prefix.status.success());
+    assert!(evaluation_prefix.stdout.is_empty());
+    assert!(utf8(&evaluation_prefix.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&evaluation_prefix.stderr).contains("only definitions before it"));
+
+    let nonterminal_check = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"#check Nat\ndef later : Nat := 1\n",
+    );
+    assert!(!nonterminal_check.status.success());
+    assert!(nonterminal_check.stdout.is_empty());
+    assert!(utf8(&nonterminal_check.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&nonterminal_check.stderr).contains("standalone import-free query"));
 
     let piped_late_refusal = run_lean_stdin(
         &[Path::new("--stdin")],
