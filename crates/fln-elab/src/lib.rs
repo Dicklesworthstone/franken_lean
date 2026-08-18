@@ -7,11 +7,14 @@
 //! end-to-end production seam: one parsed bounded exact `Nat`/`String`/`Bool`
 //! definition, explicit first-order function, parenthesized application,
 //! pin-precedence bounded scalar infix expression (including type-directed
-//! Nat/String `==`), local let chain, or terminal
-//! bounded `Lean.Parser.Command.eval` expression becomes
+//! Nat/String `==`), local let chain, terminal bounded
+//! `Lean.Parser.Command.eval` expression, or standalone bounded
+//! `Lean.Parser.Command.check` query becomes
 //! a real [`Declaration::Defn`] candidate and is handed to Crucible's sole check
-//! authority. Evaluation receives an unspellable generated identity directly;
-//! it is never reparsed as fabricated definition source. The original Nat-only door remains strict.
+//! authority. Evaluation and checking receive unspellable generated identities
+//! directly; neither is reparsed as fabricated definition source, and checking
+//! never reaches compilation or execution. The original Nat-only door remains
+//! strict.
 //! This is a subset of the final abstraction, not a substitute for unification,
 //! expected-type propagation, transactions, macros, instances, or tactics.
 //! Unsupported source is refused by an explicit variant.
@@ -41,6 +44,8 @@ pub enum NatDefinitionElabError {
     UnexpectedSyntax { expected: &'static str },
     AnonymousDeclarationName,
     InvalidGeneratedEvaluationName,
+    InvalidGeneratedCheckName,
+    CannotInferCheckType,
     AnonymousReferenceName,
     InvalidNaturalLiteral,
     InvalidStringLiteral,
@@ -58,6 +63,13 @@ impl std::fmt::Display for NatDefinitionElabError {
                 formatter,
                 "evaluation name must be one numeric component below the anonymous root"
             ),
+            Self::InvalidGeneratedCheckName => write!(
+                formatter,
+                "check name must be one numeric component below the anonymous root"
+            ),
+            Self::CannotInferCheckType => {
+                write!(formatter, "bounded check term has no inferable type")
+            }
             Self::AnonymousReferenceName => write!(formatter, "reference name is anonymous"),
             Self::InvalidNaturalLiteral => write!(formatter, "natural literal is invalid"),
             Self::InvalidStringLiteral => write!(formatter, "string literal is invalid"),
@@ -462,6 +474,51 @@ pub fn elaborate_evaluation_in(
         .filter(|type_| acceptable_inferred(type_, true))
         .unwrap_or_else(nat_const);
     expression = eta_expand_nondependent(expression, &declaration_type)?;
+    Ok(Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: generated_name.clone(),
+            level_params: Vec::new(),
+            type_: declaration_type,
+        },
+        value: expression,
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![generated_name],
+    }))
+}
+
+/// Elaborate one canonical bounded `Lean.Parser.Command.check` tree into a
+/// definition candidate used only for dual-checker validation.
+///
+/// The generated identity is deliberately unspellable from source. The engine
+/// may admit this candidate in a scratch successor to prove the inferred type,
+/// but a `#check` query never executes the body and never exposes that successor
+/// environment to its caller.
+pub fn elaborate_check_in(
+    syntax: &Syntax,
+    generated_name: Name,
+    environment: &Environment,
+) -> Result<Declaration, NatDefinitionElabError> {
+    if !generated_name.parent().is_anonymous()
+        || !matches!(generated_name.leaf_view(), LeafView::Num(_))
+    {
+        return Err(NatDefinitionElabError::InvalidGeneratedCheckName);
+    }
+    let check = expect_node(
+        syntax,
+        &parser_kind(&["Command", "check"]),
+        2,
+        "Lean.Parser.Command.check",
+    )?;
+    let [keyword, term] = check else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "Lean.Parser.Command.check",
+        });
+    };
+    expect_atom(keyword, "#check", "check keyword")?;
+    let expression = elaborate_term(term, &[], &nat_const(), true, Some(environment))?;
+    let declaration_type = infer_expr_type(&expression, &[], Some(environment))
+        .ok_or(NatDefinitionElabError::CannotInferCheckType)?;
     Ok(Declaration::Defn(DefinitionVal {
         base: ConstantVal {
             name: generated_name.clone(),
@@ -2216,6 +2273,74 @@ mod tests {
             ),
             Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "Lean.Parser.Command.eval"
+            })
+        ));
+    }
+
+    #[test]
+    fn check_command_infers_a_type_without_executing_or_guessing() {
+        let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+        let nat_add = Expr::forall_e(
+            Name::from_components(["left"]),
+            nat.clone(),
+            Expr::forall_e(
+                Name::from_components(["right"]),
+                nat.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let environment = publish_test_axiom(&nat_environment(), "Nat.add", nat_add.clone());
+
+        let parsed = fln_parse::parse_source_command(b"#check Nat.add")
+            .expect("the bounded check command parses directly");
+        let generated = Name::num(Name::anonymous(), 9);
+        let Declaration::Defn(check) =
+            elaborate_check_in(parsed.syntax(), generated.clone(), &environment)
+                .expect("the canonical check command elaborates")
+        else {
+            panic!("check elaboration must produce a checker candidate"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(check.base.name, generated);
+        assert_eq!(check.base.type_, nat_add);
+        assert!(
+            matches!(check.value.node(), ExprNode::Const { name, .. } if name == &Name::from_components(["Nat", "add"]))
+        );
+
+        let type_query = fln_parse::parse_source_command(b"#check Nat")
+            .expect("the bounded type check parses directly");
+        let Declaration::Defn(type_check) = elaborate_check_in(
+            type_query.syntax(),
+            Name::num(Name::anonymous(), 10),
+            &environment,
+        )
+        .expect("checking a type infers its universe") else {
+            panic!("type check elaboration must produce a checker candidate"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(matches!(
+            type_check.base.type_.node(),
+            ExprNode::Sort { level } if level.to_nat() == Some(1)
+        ));
+
+        assert_eq!(
+            elaborate_check_in(
+                parsed.syntax(),
+                Name::from_components(["sourceVisible"]),
+                &environment,
+            ),
+            Err(NatDefinitionElabError::InvalidGeneratedCheckName)
+        );
+        let evaluation = fln_parse::parse_source_command(b"#eval 42")
+            .expect("the negative control is a valid evaluation tree");
+        assert!(matches!(
+            elaborate_check_in(
+                evaluation.syntax(),
+                Name::num(Name::anonymous(), 11),
+                &environment,
+            ),
+            Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "Lean.Parser.Command.check"
             })
         ));
     }

@@ -75,7 +75,7 @@ fn fresh_test_root(label: &str) -> std::io::Result<PathBuf> {
 }
 
 #[test]
-fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_refusal() {
+fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from_refusal() {
     let root = fresh_test_root("native-lean-personality-e2e")
         .expect("allocate retained native-lean integration-test directory");
     let source = root.join("Main.lean");
@@ -164,6 +164,66 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     assert_eq!(utf8(&piped.stdout), "\"stdin\"\n42\ntrue\n");
     assert!(piped.stderr.is_empty());
 
+    // `Nat` itself has type `Sort 1`: this positive cannot be implemented by
+    // delegating the query to the closed-scalar `#eval`/Golem path.
+    for (query, expected) in [
+        (b"#check Nat\n".as_slice(), "Nat : Type\n"),
+        (
+            b"#check Nat.add\n".as_slice(),
+            "Nat.add : Nat → Nat → Nat\n",
+        ),
+        (
+            b"#check let x : Nat := 40; x + 2\n".as_slice(),
+            "let x : Nat := 40; x + 2 : Nat\n",
+        ),
+    ] {
+        let checked = run_lean_stdin(&[Path::new("--stdin")], query);
+        assert!(
+            checked.status.success(),
+            "native lean #check stderr: {}",
+            utf8(&checked.stderr)
+        );
+        assert_eq!(utf8(&checked.stdout), expected);
+        assert!(checked.stderr.is_empty());
+    }
+
+    std::fs::write(&source, b"#check Nat.add\n").expect("write standalone checked query");
+    let checked_file = run_lean(&[&source]);
+    assert!(
+        checked_file.status.success(),
+        "file-backed native lean #check stderr: {}",
+        utf8(&checked_file.stderr)
+    );
+    assert_eq!(utf8(&checked_file.stdout), "Nat.add : Nat → Nat → Nat\n");
+    assert!(checked_file.stderr.is_empty());
+
+    let imported_dir = root.join("Project");
+    std::fs::create_dir_all(&imported_dir).expect("create the imported check fixture directory");
+    std::fs::write(imported_dir.join("Seed.lean"), b"def seed : Nat := 1\n")
+        .expect("write the imported check fixture dependency");
+    std::fs::write(&source, b"import Project.Seed\n#check Nat\n")
+        .expect("write an imported check query");
+    let imported_check = run_lean(&[&source]);
+    assert!(!imported_check.status.success());
+    assert!(imported_check.stdout.is_empty());
+    assert!(utf8(&imported_check.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&imported_check.stderr).contains("standalone import-free query"));
+
+    let unknown_check = run_lean_stdin(&[Path::new("--stdin")], b"#check Missing\n");
+    assert!(!unknown_check.status.success());
+    assert!(unknown_check.stdout.is_empty());
+    assert!(utf8(&unknown_check.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&unknown_check.stderr).contains("no inferable type"));
+
+    let interleaved_check = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"def answer : Nat := 42\n#check answer\n",
+    );
+    assert!(!interleaved_check.status.success());
+    assert!(interleaved_check.stdout.is_empty());
+    assert!(utf8(&interleaved_check.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&interleaved_check.stderr).contains("standalone import-free query"));
+
     let piped_late_refusal = run_lean_stdin(
         &[Path::new("--stdin")],
         b"#eval 42\ndef broken : Nat := missing\n",
@@ -195,6 +255,11 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     assert!(piped_after_refusals.status.success());
     assert_eq!(utf8(&piped_after_refusals.stdout), "42\n");
     assert!(piped_after_refusals.stderr.is_empty());
+
+    let checked_after_refusals = run_lean_stdin(&[Path::new("--stdin")], b"#check 40 + 2\n");
+    assert!(checked_after_refusals.status.success());
+    assert_eq!(utf8(&checked_after_refusals.stdout), "40 + 2 : Nat\n");
+    assert!(checked_after_refusals.stderr.is_empty());
 
     let definition_only = root.join("DefinitionOnly.lean");
     std::fs::write(&definition_only, b"def answer : Nat := 40 + 2\n")

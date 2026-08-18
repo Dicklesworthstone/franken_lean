@@ -130,6 +130,12 @@ const LEAN_USAGE: &str = concat!(
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
     "scalar and first-order function definitions are silent; unlike `fln run`,\n",
     "the final definition need not produce a closed scalar.\n",
+    "One standalone import-free #check command is inferred and admitted through\n",
+    "K1 plus the independent checker in a discarded scratch successor, then\n",
+    "printed as `term : type` without compilation, VM execution, or publication.\n",
+    "This bounded query currently sees only the checked source seed: it cannot be\n",
+    "interleaved with definitions or evaluations, use imports, or pretty-print\n",
+    "dependent and other unsupported inferred type shapes.\n",
     "Each supported #eval result is printed on its own line after the whole\n",
     "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
@@ -3490,6 +3496,68 @@ fn render_lean_evaluation_results(
     MultiplexerOutput::success(stdout)
 }
 
+fn render_bounded_source_type_atom(type_: &fln::Expr) -> Result<String, &'static str> {
+    match type_.node() {
+        fln::ExprNode::Const { name, levels } if levels.is_empty() => Ok(name.to_display_string()),
+        fln::ExprNode::Sort { level } => match level.to_nat() {
+            Some(0) => Ok("Prop".to_owned()),
+            Some(1) => Ok("Type".to_owned()),
+            Some(level) => Ok(format!("Type {}", level - 1)),
+            None => Err("bounded source check inferred a nonconcrete universe"),
+        },
+        _ => Err("bounded source check inferred an unsupported type shape"),
+    }
+}
+
+fn render_bounded_source_type(type_: &fln::Expr) -> Result<String, &'static str> {
+    let mut domains = Vec::new();
+    let mut current = type_;
+    while let fln::ExprNode::ForallE {
+        binder_type, body, ..
+    } = current.node()
+    {
+        if body.has_loose_bvars() {
+            return Err("bounded source check inferred a dependent function type");
+        }
+        domains.push(render_bounded_source_type_atom(binder_type)?);
+        current = body;
+    }
+    let mut rendered = render_bounded_source_type_atom(current)?;
+    for domain in domains.into_iter().rev() {
+        rendered = format!("{domain} → {rendered}");
+    }
+    Ok(rendered)
+}
+
+fn render_lean_source_check(checked: &fln::SourceCheck) -> MultiplexerOutput {
+    let Some(term) = checked.parsed.query_term_normalized() else {
+        return source_failure(
+            "internal-fault",
+            "completed source check did not retain its query term",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    };
+    let term = term.trim_ascii();
+    if term.is_empty() {
+        return source_failure(
+            "internal-fault",
+            "completed source check retained an empty query term",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    }
+    let type_ = match render_bounded_source_type(&checked.checked_type) {
+        Ok(type_) => type_,
+        Err(error) => {
+            return source_failure("execution", error, true, SourcePresentation::Lean, 1);
+        }
+    };
+    MultiplexerOutput::success(format!("{term} : {type_}\n"))
+}
+
 fn source_failure(
     class: &'static str,
     detail: &str,
@@ -3741,6 +3809,43 @@ where
     };
     let options = fln::KVMap::new();
     let limits = fln::EngineExecutionLimits::new(kernel_budget);
+    if matches!(presentation, SourcePresentation::Lean)
+        && module_plan.is_none()
+        && let [source] = source_refs.as_slice()
+        && fln::parse_source_command(source)
+            .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
+    {
+        let checked = match engine.check_source_command(source, &options, limits.admission()) {
+            Ok(checked) => checked,
+            Err(error) => {
+                let (class, authority, exit_code) = execution_error_disposition(&error);
+                return source_failure(
+                    class,
+                    &error.to_string(),
+                    authority,
+                    presentation,
+                    exit_code,
+                );
+            }
+        };
+        return match checked {
+            fln::Outcome::Complete(checked) => render_lean_source_check(&checked),
+            fln::Outcome::Inconclusive(inconclusive) => source_failure(
+                "inconclusive",
+                &format!("{inconclusive:?}"),
+                false,
+                presentation,
+                3,
+            ),
+            fln::Outcome::InternalFault(fault) => source_failure(
+                "internal-fault",
+                &format!("{fault:?}"),
+                false,
+                presentation,
+                4,
+            ),
+        };
+    }
     let execution = match module_plan.as_ref() {
         Some(plan) => {
             let modules = plan
@@ -6535,6 +6640,7 @@ mod tests {
         assert!(help.stdout.contains("complete local A/B.lean closure"));
         assert!(help.stdout.contains("lean --stdin"));
         assert!(help.stdout.contains("bounded import-free source"));
+        assert!(help.stdout.contains("standalone import-free #check"));
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
         assert!(help.stdout.contains("lean --print-libdir"));
@@ -6598,6 +6704,11 @@ mod tests {
         assert_eq!(piped.exit_code, 0);
         assert_eq!(piped.stdout, "42\n");
         assert!(piped.stderr.is_empty());
+        let mut check_input = std::io::Cursor::new(b"#check Nat\n".as_slice());
+        let checked = run_lean_with_input([OsString::from("--stdin")], &mut check_input);
+        assert_eq!(checked.exit_code, 0, "{}", checked.stderr);
+        assert_eq!(checked.stdout, "Nat : Type\n");
+        assert!(checked.stderr.is_empty());
         let mut quiet_input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
         let quiet_piped = run_lean_with_input(
             [
@@ -6737,6 +6848,12 @@ mod tests {
                 .stderr
                 .contains("final command did not produce a closed Nat, String, or Bool value")
         );
+
+        let fln_check = execute_source_bytes(vec![b"#check Nat".to_vec()], true);
+        assert_eq!(fln_check.exit_code, 1);
+        assert!(fln_check.stdout.is_empty());
+        assert!(fln_check.stderr.contains("\"class\":\"execution\""));
+        assert!(fln_check.stderr.contains("standalone import-free query"));
     }
 
     #[test]

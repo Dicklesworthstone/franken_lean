@@ -16,7 +16,10 @@
 //! re-derive a real pinned-format `.olean` through the codec's audited reader.
 //! Verdict's proof-producing `bv_decide` pipeline is also available through an
 //! atomic engine transition whose theorem must survive both Verdict's proof
-//! replay/K1 path and the facade's independent-checker council. Lantern's typed
+//! replay/K1 path and the facade's independent-checker council. A standalone
+//! bounded `#check` query can use those same two checker seats in a discarded
+//! scratch successor, returning its checked type without publishing, compiling,
+//! or executing the queried term. Lantern's typed
 //! LSP diagnostic projection is reachable here as a pure protocol adapter; the
 //! long-lived server transport remains a separate, unfinished product surface.
 
@@ -61,7 +64,7 @@ pub use fln_core::diag::{
     ProjectionRequest, ProjectionSnapshot, RelatedSpan, Severity, StructuredDiagnostic,
     StructuredInconclusive, StructuredInternalFault,
 };
-pub use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
+pub use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 pub use fln_core::level::Level;
 pub use fln_core::mode::{
     BuildProfileId, CgsePolicyId, ClosureComponent, ContentRoot, DeterminismClass, EpochId, Mode,
@@ -127,7 +130,10 @@ pub use fln_olean::write::{
     WriteError as OleanWriteError, WriteResource as OleanWriteResource,
     encode_expr_region as encode_olean_expr_region, encode_module as encode_olean_module,
 };
-pub use fln_parse::{DefinitionParseError, PartitionedSourceModule, partition_source_module};
+pub use fln_parse::{
+    DefinitionParseError, ParsedSourceCommand, PartitionedSourceModule, SourceCommandKind,
+    parse_source_command, partition_source_module,
+};
 pub use fln_server::LspProjection;
 pub use fln_verdict as verdict;
 pub use fln_verdict::{
@@ -1807,19 +1813,19 @@ fn bounded_source_module_name_depth(
     Ok(depth)
 }
 
-fn fresh_evaluation_name(
+fn fresh_generated_command_name(
     environment: &Environment,
     command_index: usize,
 ) -> Result<Name, EngineExecutionError> {
     let start =
         u64::try_from(command_index).map_err(|_| EngineExecutionError::AllocationFailure {
-            resource: "generated evaluation name space",
+            resource: "generated source command name space",
             requested: command_index,
         })?;
     for offset in 0..=environment.len() {
         let offset =
             u64::try_from(offset).map_err(|_| EngineExecutionError::AllocationFailure {
-                resource: "generated evaluation name space",
+                resource: "generated source command name space",
                 requested: offset,
             })?;
         let Some(component) = start.checked_add(offset) else {
@@ -1831,7 +1837,7 @@ fn fresh_evaluation_name(
         }
     }
     Err(EngineExecutionError::UnexpectedPublication {
-        detail: "bounded evaluation could not derive a fresh generated name",
+        detail: "bounded source command could not derive a fresh generated name",
     })
 }
 
@@ -2716,6 +2722,52 @@ impl Engine {
         self.execute_parsed_source_definition(parsed, options, limits)
     }
 
+    /// Elaborate and dual-check one standalone bounded `#check` command.
+    ///
+    /// The inferred type is validated by admitting an unspellable generated
+    /// definition into a scratch successor through K1 and the independent
+    /// checker. The successor is discarded before this method returns: the
+    /// queried engine remains unchanged, and neither compiler ingress nor Golem
+    /// executes the term.
+    pub fn check_source_command(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
+        let parsed = fln_parse::parse_source_command(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        if parsed.kind() != fln_parse::SourceCommandKind::Check {
+            return Err(EngineExecutionError::StandaloneCheckRequired);
+        }
+        let name = fresh_generated_command_name(self.environment(), 0)?;
+        let declaration = fln_elab::elaborate_check_in(parsed.syntax(), name, self.environment())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let checked_type = match &declaration {
+            Declaration::Defn(definition) => definition.base.type_.clone(),
+            _ => {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "source check elaboration returned a non-definition candidate",
+                });
+            }
+        };
+        Ok(
+            match self.admit_declaration(declaration, options, limits)? {
+                Outcome::Complete(admission) => Outcome::Complete(SourceCheck {
+                    parsed,
+                    declaration: admission.declaration,
+                    checked_type,
+                    environment_root: admission.base_logical_root,
+                    checker: admission.checker,
+                }),
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
+    }
+
     fn execute_parsed_source_definition(
         &self,
         parsed: fln_parse::ParsedDefinition,
@@ -3055,28 +3107,34 @@ impl Engine {
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
-            let declaration = if parsed.kind() == fln_parse::SourceCommandKind::Evaluation {
-                let requested = evaluation_indices.len().checked_add(1).ok_or(
-                    EngineExecutionError::AllocationFailure {
-                        resource: "source evaluation command index table",
-                        requested: usize::MAX,
-                    },
-                )?;
-                evaluation_indices.try_reserve(1).map_err(|_| {
-                    EngineExecutionError::AllocationFailure {
-                        resource: "source evaluation command index table",
-                        requested,
-                    }
-                })?;
-                evaluation_indices.push(index);
-                let name = fresh_evaluation_name(engine.environment(), index)?;
-                fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?
-            } else {
-                fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?
+            let declaration = match parsed.kind() {
+                fln_parse::SourceCommandKind::Evaluation => {
+                    let requested = evaluation_indices.len().checked_add(1).ok_or(
+                        EngineExecutionError::AllocationFailure {
+                            resource: "source evaluation command index table",
+                            requested: usize::MAX,
+                        },
+                    )?;
+                    evaluation_indices.try_reserve(1).map_err(|_| {
+                        EngineExecutionError::AllocationFailure {
+                            resource: "source evaluation command index table",
+                            requested,
+                        }
+                    })?;
+                    evaluation_indices.push(index);
+                    let name = fresh_generated_command_name(engine.environment(), index)?;
+                    fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                }
+                fln_parse::SourceCommandKind::Definition => {
+                    fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?
+                }
+                fln_parse::SourceCommandKind::Check => {
+                    return Err(EngineExecutionError::StandaloneCheckRequired);
+                }
             };
             engine.execute_definition(declaration, options, limits)
         })?;
@@ -4687,6 +4745,26 @@ pub struct DefinitionExecution {
     pub checker: CheckerAgreement,
 }
 
+/// One standalone bounded `#check` query validated by both checker seats.
+///
+/// The generated declaration is admitted only into a scratch successor. That
+/// successor is deliberately not retained here: a check query observes the
+/// current environment and cannot publish a source-visible or generated row.
+/// Its body is never compiled or executed.
+#[derive(Debug)]
+pub struct SourceCheck {
+    /// The canonical parsed check command and its source-covered term.
+    pub parsed: ParsedSourceCommand,
+    /// The exact generated definition candidate reviewed by both checkers.
+    pub declaration: Declaration,
+    /// The inferred type K1 and the independent checker accepted for the term.
+    pub checked_type: Expr,
+    /// The unchanged queried-environment identity under the caller's options.
+    pub environment_root: LogicalRoot,
+    /// The independent checker observation that allowed the council to agree.
+    pub checker: CheckerAgreement,
+}
+
 /// One exact source module in a caller-supplied closed import set.
 ///
 /// `name` is resolver authority supplied by the caller. The source header must
@@ -5134,6 +5212,7 @@ pub enum EngineExecutionError {
         index: usize,
         error: Box<EngineExecutionError>,
     },
+    StandaloneCheckRequired,
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5252,6 +5331,10 @@ impl fmt::Display for EngineExecutionError {
                     "definition batch command {index} failed: {error}"
                 )
             }
+            Self::StandaloneCheckRequired => write!(
+                formatter,
+                "#check is currently a standalone import-free query, not an executable batch command"
+            ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
                 write!(
@@ -5332,7 +5415,7 @@ mod tests {
         DiagnosticFormat, DiagnosticFrontend, DiagnosticOrderPolicy, DiagnosticPathPolicy, Engine,
         EngineAdmissionError, EngineAdmissionLimits, EngineBvDecideError,
         EngineBvDecideInconclusive, EngineBvDecideLimits, EngineBvDecideOutcome,
-        EngineExecutionError, EngineExecutionLimits, Environment, ExitClass, Expr,
+        EngineExecutionError, EngineExecutionLimits, Environment, ExitClass, Expr, ExprNode,
         FlbcExecutionLimits, InductiveVal, IngressError, IngressResource, KVMap, Level, Literal,
         Name, NatDefinitionFrontendError, NatLit, OleanCheckError, OleanCheckLimits,
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
@@ -5340,7 +5423,7 @@ mod tests {
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
         ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceModuleInput, TheoremVal,
         VmExecutionLimits, closed_vm_value, decode_olean_artifact, execute_flbc_artifact,
-        execute_golem_with_options, fresh_evaluation_name, project_lsp_diagnostics,
+        execute_golem_with_options, fresh_generated_command_name, project_lsp_diagnostics,
         rebuild_olean_artifact, source_scalar_constructor_binding,
     };
     use fln_comp::flbc::{
@@ -8739,12 +8822,108 @@ mod tests {
                 panic!("numeric name boundary admission was not complete"); // ubs:ignore — test-only diagnostic.
             };
             assert!(matches!(
-                fresh_evaluation_name(last_seed.engine.environment(), usize::MAX),
+                fresh_generated_command_name(last_seed.engine.environment(), usize::MAX),
                 Err(EngineExecutionError::UnexpectedPublication {
-                    detail: "bounded evaluation could not derive a fresh generated name"
+                    detail: "bounded source command could not derive a fresh generated name"
                 })
             ));
         }
+    }
+
+    #[test]
+    fn standalone_source_check_is_dual_checked_without_execution_or_publication() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+
+        let Outcome::Complete(checked_type) = engine
+            .check_source_command(b"#check Nat", &options, test_limits().admission())
+            .expect("a bounded type query reaches both checker seats")
+        else {
+            panic!("the bounded type query was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(checked_type.environment_root, before);
+        assert_eq!(
+            checked_type.checker.ground,
+            CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        assert!(matches!(
+            checked_type.checked_type.node(),
+            ExprNode::Sort { level } if level.to_nat() == Some(1)
+        ));
+        let Declaration::Defn(candidate) = &checked_type.declaration else {
+            panic!("the checked query candidate must be a definition"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(
+            matches!(candidate.value.node(), ExprNode::Const { name, .. } if name == &Name::from_components(["Nat"]))
+        );
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::num(Name::anonymous(), 0)),
+            "the scratch generated declaration must not escape the query"
+        );
+
+        let Outcome::Complete(function) = engine
+            .check_source_command(b"#check Nat.add", &options, test_limits().admission())
+            .expect("the seeded Nat.add signature is queryable")
+        else {
+            panic!("the bounded function query was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(matches!(
+            function.checked_type.node(),
+            ExprNode::ForallE { .. }
+        ));
+
+        let unknown = engine
+            .check_source_command(b"#check Missing", &options, test_limits().admission())
+            .expect_err("an unknown check term has no guessed type");
+        assert!(matches!(unknown, EngineExecutionError::Frontend(_)));
+        assert!(unknown.to_string().contains("no inferable type"));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let interleaved = engine
+            .execute_source_definitions(
+                &[b"def answer := 42\n#check answer"],
+                &options,
+                test_limits(),
+            )
+            .expect_err("checks cannot be smuggled into executable batches");
+        assert!(matches!(
+            interleaved,
+            EngineExecutionError::BatchCommand {
+                index: 1,
+                error,
+            } if matches!(*error, EngineExecutionError::StandaloneCheckRequired)
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+        let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+        let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+        let mut constrained = test_limits().admission();
+        constrained.checker.admission =
+            CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+        let stopped = engine
+            .check_source_command(b"#check Nat", &options, constrained)
+            .expect_err("an independent-checker non-answer vetoes a source check");
+        assert!(matches!(
+            stopped,
+            EngineExecutionError::CouncilHalted { ref summary }
+                if summary.contains("fln-checker") && summary.contains("no answer")
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        assert!(matches!(
+            engine
+                .check_source_command(b"#check 40 + 2", &options, test_limits().admission(),)
+                .expect("the unchanged engine recovers after both refusals"),
+            Outcome::Complete(_)
+        ));
     }
 
     #[test]

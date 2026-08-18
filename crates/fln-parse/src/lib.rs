@@ -9,9 +9,10 @@
 //! application, pin-precedence bounded scalar infix expression (including
 //! non-associative Nat/String `==`), or non-recursive
 //! local let chain with optional exact scalar type ascriptions over those forms.
-//! [`parse_source_command`] also builds the pin's
-//! canonical `Lean.Parser.Command.eval` tree for a bounded `#eval`, so expression
-//! commands reach elaboration without fabricating and reparsing definition bytes.
+//! [`parse_source_command`] also builds the pin's canonical
+//! `Lean.Parser.Command.eval` and `Lean.Parser.Command.check` trees for bounded
+//! `#eval` and `#check` commands, so expressions reach elaboration without
+//! fabricating and reparsing definition bytes.
 //! [`parse_nat_definition`]
 //! retains the original Nat-only authority. Both use the same source view,
 //! lexer, attachment, and canonical `Syntax` shape as the general engine. Being
@@ -325,6 +326,7 @@ pub type DefinitionParseError = NatDefinitionParseError;
 pub enum SourceCommandKind {
     Definition,
     Evaluation,
+    Check,
 }
 
 /// One command accepted by the bounded source facade.
@@ -334,6 +336,7 @@ pub struct ParsedSourceCommand {
     source_view: SourceView,
     syntax: Syntax,
     epilogue: ByteSpan,
+    query_term: Option<ByteSpan>,
 }
 
 impl ParsedSourceCommand {
@@ -360,6 +363,15 @@ impl ParsedSourceCommand {
 
     pub fn reconstruct_original(&self) -> Vec<u8> {
         self.source_view.reconstruct_original()
+    }
+
+    /// Reconstruct the source-covered query term for `#eval` or `#check`.
+    /// Definitions have no command-query payload and return `None`.
+    pub fn query_term_normalized(&self) -> Option<&str> {
+        if self.kind == SourceCommandKind::Definition {
+            return None;
+        }
+        self.source_view.normalized().span_str(self.query_term?)
     }
 }
 
@@ -425,8 +437,8 @@ fn nat_definition_token_table() -> TokenTable {
 
 fn source_module_token_table() -> TokenTable {
     TokenTable::from_tokens([
-        "import", "def", "#eval", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^", "&&&", "+",
-        "-", "++", "*", "/", "%", "<<<", ">>>", "^",
+        "import", "def", "#eval", "#check", "let", "(", ")", ":", ":=", ";", "==", "|||", "^^^",
+        "&&&", "+", "-", "++", "*", "/", "%", "<<<", ">>>", "^",
     ])
 }
 
@@ -914,13 +926,14 @@ pub fn parse_definition(source: &[u8]) -> Result<ParsedDefinition, DefinitionPar
     parse_definition_with_grammar(source, DefinitionGrammar::Scalar)
 }
 
-/// Parse one bounded `def` or `#eval` command.
+/// Parse one bounded `def`, `#eval`, or `#check` command.
 ///
-/// `#eval <term>` becomes the pin's canonical `Lean.Parser.Command.eval` tree.
-/// This is deliberately a terminal-command execution seam, not a second
+/// `#eval <term>` and `#check <term>` become the pin's canonical command trees.
+/// Evaluation is deliberately a terminal-command execution seam, not a second
 /// evaluator: `fln-elab` gives the expression an unspellable generated
 /// declaration identity before K1 admission, then the ordinary compiler and
-/// Golem path execute the checked artifact.
+/// Golem path execute the checked artifact. Checking retains the same source
+/// term span but neither compiles nor executes it.
 pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionParseError> {
     let original = SourceText::from_utf8(source).map_err(NatDefinitionParseError::Source)?;
     let view = SourceView::of(&original);
@@ -949,9 +962,15 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     source_view: parsed.source_view,
                     syntax: parsed.syntax,
                     epilogue: parsed.epilogue,
+                    query_term: None,
                 })
             }
-            TokenKind::Symbol(symbol) if symbol == "#eval" => {
+            TokenKind::Symbol(symbol) if symbol == "#eval" || symbol == "#check" => {
+                let (kind, command_kind) = if symbol == "#eval" {
+                    (SourceCommandKind::Evaluation, "eval")
+                } else {
+                    (SourceCommandKind::Check, "check")
+                };
                 let tokens = run
                     .events
                     .into_iter()
@@ -972,14 +991,25 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     body_start,
                     DefinitionGrammar::Scalar,
                 )?;
+                let query_term = tokens
+                    .get(1)
+                    .zip(tokens.last())
+                    .and_then(|(first, last)| {
+                        ByteSpan::new(first.extent.start(), last.extent.end())
+                    })
+                    .ok_or(NatDefinitionParseError::OutsideSeedGrammar {
+                        at: BytePos(source.len()),
+                        expected: NatDefinitionExpectation::ScalarValue,
+                    })?;
                 Ok(ParsedSourceCommand {
-                    kind: SourceCommandKind::Evaluation,
+                    kind,
                     source_view: view,
                     syntax: Syntax::node(
-                        parser_kind(&["Command", "eval"]),
+                        parser_kind(&["Command", command_kind]),
                         vec![leaves.leaf(0)?, value],
                     ),
                     epilogue,
+                    query_term: Some(query_term),
                 })
             }
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
@@ -1223,7 +1253,7 @@ fn parse_definition_with_grammar(
     })
 }
 
-/// Partition one source file into bounded `def`/`#eval` command slices.
+/// Partition one source file into bounded `def`/`#eval`/`#check` command slices.
 ///
 /// This is deliberately a lexical partition, not a second parser. In the seed
 /// grammar neither command introducer can occur inside a term, while occurrences
@@ -1263,7 +1293,9 @@ pub fn partition_definition_commands(
             Event::Token(LexedToken {
                 kind: TokenKind::Symbol(symbol),
                 extent,
-            }) if symbol == "def" || symbol == "#eval" => Some(view.to_original(extent.start()).0),
+            }) if symbol == "def" || symbol == "#eval" || symbol == "#check" => {
+                Some(view.to_original(extent.start()).0)
+            }
             Event::Trivia(_) | Event::Refused { .. } | Event::Token(_) => None,
         })
         .collect::<Vec<_>>();
@@ -1286,7 +1318,7 @@ pub fn partition_definition_commands(
 /// The supported header is the ordinary Lean spelling `import A.B C`, with one
 /// import command per physical line. The first non-import token starts the body;
 /// the body remains opaque to this header parser and is partitioned for the
-/// bounded command parser, which retains sole authority to accept `def`/`#eval`
+/// bounded command parser, which retains sole authority to accept `def`/`#eval`/`#check`
 /// or refuse every other command shape.
 /// Comments and blank lines are trivia. Requiring the command to end at its line
 /// is deliberate for this first production slice: accepting a broader layout
@@ -1492,6 +1524,60 @@ mod nat_definition_tests {
                 expected: NatDefinitionExpectation::EndOfCommand,
             }
         ));
+    }
+
+    #[test]
+    fn bounded_check_builds_the_pinned_command_tree_and_exposes_only_its_term() {
+        let source = b"-- leading trivia\r\n#check Nat.add\r\n";
+        let parsed = parse_source_command(source).expect("the bounded check command parses");
+        assert_eq!(parsed.kind(), SourceCommandKind::Check);
+        assert_eq!(
+            parsed
+                .syntax()
+                .kind()
+                .map(Name::to_display_string)
+                .as_deref(),
+            Some("Lean.Parser.Command.check")
+        );
+        assert_eq!(parsed.reconstruct_original(), source);
+        assert_eq!(
+            parsed
+                .query_term_normalized()
+                .expect("a check command carries a query term")
+                .trim_ascii(),
+            "Nat.add"
+        );
+
+        let refusal = parse_source_command(b"#check 1 2")
+            .expect_err("a literal-headed application remains outside the bounded grammar");
+        assert!(matches!(
+            refusal,
+            NatDefinitionParseError::OutsideSeedGrammar {
+                at: BytePos(9),
+                expected: NatDefinitionExpectation::EndOfCommand,
+            }
+        ));
+    }
+
+    #[test]
+    fn command_partition_treats_checks_as_real_boundaries_but_not_comment_text() {
+        let source = b"def first := 40\n-- #check hidden\n#check first\n#eval first\n";
+        let commands = partition_definition_commands(source)
+            .expect("the definition, check, and evaluation file partitions");
+        assert_eq!(commands.len(), 3);
+        assert!(commands[0].1.ends_with(b"-- #check hidden\n"));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|(_, command)| parse_source_command(command).map(|parsed| parsed.kind()))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("every partition remains a supported command"),
+            vec![
+                SourceCommandKind::Definition,
+                SourceCommandKind::Check,
+                SourceCommandKind::Evaluation,
+            ]
+        );
     }
 
     #[test]
