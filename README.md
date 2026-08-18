@@ -373,6 +373,10 @@ pin-shaped direct-source dependency query for the selected local root, not
 native parser, elaborator, both-checker admission path, compiler, and Golem VM;
 evaluation output is published only after the complete input succeeds. Standard
 input imports are refused until the toolchain owns a real search-path resolver.
+The personality also answers `-g`/`--githash` from the exact pinned Reference
+commit and reports `[]` for `--features`, truthfully reflecting the absence of
+an LLVM backend. `-q`/`--quiet` is accepted on source operations; there are no
+verbose success messages in this bounded slice for it to suppress.
 The currently implemented binary is not yet the Reference CLI surface: it has
 no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
 implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.

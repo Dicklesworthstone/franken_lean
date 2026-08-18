@@ -79,13 +79,27 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     let root = fresh_test_root("native-lean-personality-e2e")
         .expect("allocate retained native-lean integration-test directory");
     let source = root.join("Main.lean");
+
+    let githash = run_lean(&[Path::new("--githash")]);
+    assert!(githash.status.success());
+    assert_eq!(
+        utf8(&githash.stdout),
+        format!("{}\n", fln::OLEAN_PIN_COMMIT)
+    );
+    assert!(githash.stderr.is_empty());
+
+    let features = run_lean(&[Path::new("--features")]);
+    assert!(features.status.success());
+    assert_eq!(utf8(&features.stdout), "[]\n");
+    assert!(features.stderr.is_empty());
+
     std::fs::write(
         &source,
         b"def answer : Nat := 40 + 2\n#eval \"native\"\n#eval answer\n#eval answer == 42\ndef retained : Nat := 7\n",
     )
     .expect("write supported evaluating source");
 
-    let evaluated = run_lean(&[&source]);
+    let evaluated = run_lean(&[Path::new("-q"), Path::new("--quiet"), &source]);
     assert!(
         evaluated.status.success(),
         "native lean stderr: {}",
@@ -423,7 +437,11 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         b"import Project.Middle Project.Base Project.Middle\ntheorem bodyIsNotExecuted : Nat := missing\n",
     )
     .expect("write the direct source-dependency probe");
-    let dependencies = run_lean(&[Path::new("--src-deps"), &dependency_probe]);
+    let dependencies = run_lean(&[
+        Path::new("--quiet"),
+        Path::new("--src-deps"),
+        &dependency_probe,
+    ]);
     assert!(
         dependencies.status.success(),
         "native lean --src-deps stderr: {}",

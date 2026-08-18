@@ -119,6 +119,8 @@ const LEAN_USAGE: &str = concat!(
     "  lean --help\n",
     "  lean -v | --version\n",
     "  lean -V | --short-version\n",
+    "  lean -g | --githash\n",
+    "  lean --features\n",
     "\n",
     "This is FrankenLean's bounded native `lean` personality. It accepts exactly\n",
     "one source path and executes the currently supported Nat/String/Bool source\n",
@@ -134,6 +136,10 @@ const LEAN_USAGE: &str = concat!(
     "--stdin reads one bounded import-free source from standard input.\n",
     "--src-deps prints validated direct local source imports in source order\n",
     "without elaborating or executing the file.\n",
+    "-q and --quiet are accepted on source operations; this bounded personality\n",
+    "currently has no verbose success messages for them to suppress. --githash\n",
+    "prints the exact pinned Reference commit, and --features reports [] because\n",
+    "this binary has no LLVM backend.\n",
     "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
     ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
     "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
@@ -218,6 +224,8 @@ enum LeanCommand {
     Help,
     Version,
     ShortVersion,
+    GitHash,
+    Features,
     Stdin { max_bytes: usize },
     SourceDependencies { path: PathBuf, max_bytes: usize },
     Source { path: PathBuf, max_bytes: usize },
@@ -849,6 +857,20 @@ fn parse_lean_command(
             Err(UsageError("--short-version must be used alone".to_owned()))
         };
     }
+    if first == "--githash" || first == "-g" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::GitHash)
+        } else {
+            Err(UsageError("--githash must be used alone".to_owned()))
+        };
+    }
+    if first == "--features" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::Features)
+        } else {
+            Err(UsageError("--features must be used alone".to_owned()))
+        };
+    }
 
     let mut path = None;
     let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
@@ -893,6 +915,9 @@ fn parse_lean_command(
             stdin_source = true;
             continue;
         }
+        if options && (argument == "--quiet" || argument == "-q") {
+            continue;
+        }
         if options
             && let Some(value) = argument
                 .to_str()
@@ -916,6 +941,12 @@ fn parse_lean_command(
             }
             if argument == "--short-version" || argument == "-V" {
                 return Err(UsageError("--short-version must be used alone".to_owned()));
+            }
+            if argument == "--githash" || argument == "-g" {
+                return Err(UsageError("--githash must be used alone".to_owned()));
+            }
+            if argument == "--features" {
+                return Err(UsageError("--features must be used alone".to_owned()));
             }
             return Err(UsageError(format!(
                 "unknown lean option {:?}",
@@ -5085,6 +5116,10 @@ fn run_lean_with_optional_input(
                 .strip_prefix('v')
                 .unwrap_or(fln::OLEAN_PIN_TAG)
         )),
+        Ok(LeanCommand::GitHash) => {
+            MultiplexerOutput::success(format!("{}\n", fln::OLEAN_PIN_COMMIT))
+        }
+        Ok(LeanCommand::Features) => MultiplexerOutput::success("[]\n".to_owned()),
         Ok(LeanCommand::Stdin { max_bytes }) => match input {
             Some(input) => run_lean_stdin(input, max_bytes),
             None => MultiplexerOutput::failure(
@@ -6408,6 +6443,16 @@ mod tests {
             assert_eq!(version.stdout, format!("{pin_version}\n"));
             assert!(version.stderr.is_empty());
         }
+        for option in ["--githash", "-g"] {
+            let githash = run_lean([OsString::from(option)]);
+            assert_eq!(githash.exit_code, 0);
+            assert_eq!(githash.stdout, format!("{}\n", fln::OLEAN_PIN_COMMIT));
+            assert!(githash.stderr.is_empty());
+        }
+        let features = run_lean([OsString::from("--features")]);
+        assert_eq!(features.exit_code, 0);
+        assert_eq!(features.stdout, "[]\n");
+        assert!(features.stderr.is_empty());
 
         let missing_input_handle = run_lean([OsString::from("--stdin")]);
         assert_eq!(missing_input_handle.exit_code, 2);
@@ -6422,6 +6467,18 @@ mod tests {
         assert_eq!(piped.exit_code, 0);
         assert_eq!(piped.stdout, "42\n");
         assert!(piped.stderr.is_empty());
+        let mut quiet_input = std::io::Cursor::new(b"#eval 40 + 2\n".as_slice());
+        let quiet_piped = run_lean_with_input(
+            [
+                OsString::from("-q"),
+                OsString::from("--quiet"),
+                OsString::from("--stdin"),
+            ],
+            &mut quiet_input,
+        );
+        assert_eq!(quiet_piped.exit_code, 0);
+        assert_eq!(quiet_piped.stdout, "42\n");
+        assert!(quiet_piped.stderr.is_empty());
         let mut unselected_input = std::io::Cursor::new(b"must remain unread".as_slice());
         let short_version =
             run_lean_with_input([OsString::from("--short-version")], &mut unselected_input);
@@ -6445,6 +6502,9 @@ mod tests {
             vec![OsString::from("--stdin"), OsString::from("One.lean")],
             vec![OsString::from("--stdin"), OsString::from("--stdin")],
             vec![OsString::from("--stdin"), OsString::from("--src-deps")],
+            vec![OsString::from("--githash"), OsString::from("One.lean")],
+            vec![OsString::from("--features"), OsString::from("One.lean")],
+            vec![OsString::from("--quiet")],
         ] {
             let refused = run_lean(arguments);
             assert_eq!(refused.exit_code, 2);
