@@ -323,6 +323,23 @@ automatic project-root/`LEAN_PATH`
 discovery, implicit Prelude ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 
+The same bounded source path is also connected to a native `lean` executable:
+
+```bash
+cargo run -p fln-cli --bin lean -- Main.lean
+```
+
+This personality accepts exactly one source path (plus an optional
+`--max-bytes` ceiling), keeps successful definitions silent, and prints each
+supported `#eval` result on its own line after the whole source succeeds. The
+batch remains atomic: a later failure leaves stdout empty. It is a presentation
+adapter over the same parser → K1 → independent checker → compiler → canonical
+FLBC → Golem execution used by `fln run`; it neither invokes nor falls back to
+the Reference.
+The currently implemented binary is not yet the Reference CLI surface: it has
+no general option compatibility, automatic module discovery, implicit Prelude
+processing, general Lean elaboration, or diagnostic-text parity.
+
 The currently implemented `.olean` surface is likewise narrower than the target
 codec suite. `fln olean inspect` audits and decodes one artifact at the pinned
 epoch; `fln olean verify-rebuild` re-derives that artifact from decoded semantics

@@ -33,7 +33,7 @@ pub const OLEAN_INSPECT_DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Default aggregate source ceiling for the current bounded source runner.
 pub const SOURCE_RUN_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
 
-/// Native stack provided to the kernel worker used by `fln run`.
+/// Native stack provided to the kernel worker used by both source front doors.
 const SOURCE_RUN_KERNEL_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const OLEAN_INSPECT_SCHEMA: &str = "fln.olean-inspect/1";
@@ -102,6 +102,23 @@ const USAGE: &str = concat!(
     "mode, epoch, target, profile, and static closure inputs. The v1 sidecar is\n",
     "standard-profile provenance, not certified source reproducibility. It does\n",
     "not admit declarations or prove how the artifact was compiled.\n",
+);
+
+const LEAN_USAGE: &str = concat!(
+    "Usage:\n",
+    "  lean [--max-bytes BYTES] PATH\n",
+    "  lean --help\n",
+    "  lean --version\n",
+    "\n",
+    "This is FrankenLean's bounded native `lean` personality. It accepts exactly\n",
+    "one source path and executes the currently supported Nat/String/Bool source\n",
+    "slice through the same parser, elaborator, K1, independent checker,\n",
+    "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
+    "definitions are silent and\n",
+    "each supported #eval result is printed on its own line after the whole\n",
+    "source succeeds; a later failure leaves stdout empty. It does not yet\n",
+    "implement the Reference CLI's option set, automatic module discovery,\n",
+    "implicit Prelude processing, general Lean elaboration, or diagnostic parity.\n",
 );
 
 /// Complete process result produced by the `fln` multiplexer.
@@ -173,6 +190,13 @@ enum MultiplexerCommand {
         max_bytes: usize,
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeanCommand {
+    Help,
+    Version,
+    Source { path: PathBuf, max_bytes: usize },
 }
 
 #[derive(Debug)]
@@ -723,6 +747,91 @@ fn parse_command(
         "unknown olean subcommand {:?}",
         subcommand.to_string_lossy()
     )))
+}
+
+fn parse_lean_command(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<LeanCommand, UsageError> {
+    let mut arguments = arguments.into_iter();
+    let Some(first) = arguments.next() else {
+        return Ok(LeanCommand::Help);
+    };
+    if first == "--help" || first == "-h" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::Help)
+        } else {
+            Err(UsageError("--help must be used alone".to_owned()))
+        };
+    }
+    if first == "--version" || first == "-V" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::Version)
+        } else {
+            Err(UsageError("--version must be used alone".to_owned()))
+        };
+    }
+
+    let mut path = None;
+    let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
+    let mut max_bytes_seen = false;
+    let mut options = true;
+    let mut arguments = std::iter::once(first).chain(arguments);
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if options && argument == "--max-bytes" {
+            if max_bytes_seen {
+                return Err(UsageError(
+                    "--max-bytes may be supplied at most once".to_owned(),
+                ));
+            }
+            let value = arguments
+                .next()
+                .ok_or_else(|| UsageError("--max-bytes requires a following integer".to_owned()))?;
+            max_bytes = parse_byte_limit(&value)?;
+            max_bytes_seen = true;
+            continue;
+        }
+        if options
+            && let Some(value) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--max-bytes="))
+        {
+            if max_bytes_seen {
+                return Err(UsageError(
+                    "--max-bytes may be supplied at most once".to_owned(),
+                ));
+            }
+            max_bytes = parse_byte_limit(&OsString::from(value))?;
+            max_bytes_seen = true;
+            continue;
+        }
+        if options && argument.to_string_lossy().starts_with('-') {
+            if argument == "--help" || argument == "-h" {
+                return Err(UsageError("--help must be used alone".to_owned()));
+            }
+            if argument == "--version" || argument == "-V" {
+                return Err(UsageError("--version must be used alone".to_owned()));
+            }
+            return Err(UsageError(format!(
+                "unknown lean option {:?}",
+                argument.to_string_lossy()
+            )));
+        }
+        if argument.is_empty() {
+            return Err(UsageError("source path must not be empty".to_owned()));
+        }
+        if path.replace(PathBuf::from(argument)).is_some() {
+            return Err(UsageError(
+                "lean accepts exactly one source path".to_owned(),
+            ));
+        }
+    }
+
+    let path = path.ok_or_else(|| UsageError("lean requires PATH".to_owned()))?;
+    Ok(LeanCommand::Source { path, max_bytes })
 }
 
 fn read_bounded_from(
@@ -2845,6 +2954,18 @@ fn checker_ground_name(ground: fln::CheckerAdmissionGround) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SourcePresentation {
+    Fln { json: bool },
+    Lean,
+}
+
+impl SourcePresentation {
+    const fn json(self) -> bool {
+        matches!(self, Self::Fln { json: true })
+    }
+}
+
 struct SourceSuccess<'a> {
     commands: usize,
     definitions: usize,
@@ -2905,7 +3026,19 @@ impl std::fmt::Display for SourceFinalValue {
     }
 }
 
-fn render_source_success(result: SourceSuccess<'_>, json: bool) -> MultiplexerOutput {
+fn render_source_success(
+    result: SourceSuccess<'_>,
+    presentation: SourcePresentation,
+) -> MultiplexerOutput {
+    if matches!(presentation, SourcePresentation::Lean) {
+        let stdout = result
+            .evaluation_results
+            .iter()
+            .map(|evaluation| format!("{}\n", evaluation.value))
+            .collect::<String>();
+        return MultiplexerOutput::success(stdout);
+    }
+    let json = presentation.json();
     let evaluation_results_json = format!(
         "[{}]",
         result
@@ -3063,11 +3196,11 @@ fn source_failure(
     class: &'static str,
     detail: &str,
     authority: bool,
-    json: bool,
+    presentation: SourcePresentation,
     exit_code: u8,
 ) -> MultiplexerOutput {
     let detail = BoundedText::new(detail.to_owned());
-    let stderr = if json {
+    let stderr = if presentation.json() {
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"error\",\"authority\":{},",
@@ -3079,6 +3212,13 @@ fn source_failure(
             json_string(detail.text()),
             detail.truncated(),
         )
+    } else if matches!(presentation, SourcePresentation::Lean) {
+        let truncation = if detail.truncated() {
+            format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
+        } else {
+            String::new()
+        };
+        format!("lean: {class}: {}{truncation}\n", detail.text())
     } else {
         let truncation = if detail.truncated() {
             format!("\n[detail truncated after {} bytes]", BoundedText::LIMIT)
@@ -3096,13 +3236,13 @@ fn source_terminal(
     steps: u64,
     system_polls: u64,
     peak_stack_depth: u64,
-    json: bool,
+    presentation: SourcePresentation,
 ) -> MultiplexerOutput {
     let detail = format!(
         "{detail}; execution used {} steps, {} system polls, peak stack {}",
         steps, system_polls, peak_stack_depth
     );
-    source_failure(class, &detail, true, json, 1)
+    source_failure(class, &detail, true, presentation, 1)
 }
 
 fn execution_error_disposition(error: &fln::EngineExecutionError) -> (&'static str, bool, u8) {
@@ -3200,13 +3340,13 @@ fn publication_failure_disposition(
     }
 }
 
-fn execute_source_bytes_with_publisher<P, E>(
+fn execute_source_bytes_with_publisher_and_presentation<P, E>(
     sources: Vec<Vec<u8>>,
     module_plan: Option<SourceModulePlan>,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
     toolchain_image: Option<Vec<u8>>,
-    json: bool,
+    presentation: SourcePresentation,
     mut publish: P,
 ) -> MultiplexerOutput
 where
@@ -3221,7 +3361,7 @@ where
             "resource",
             "aggregate source byte count exceeded this platform",
             false,
-            json,
+            presentation,
             3,
         );
     };
@@ -3231,7 +3371,7 @@ where
             "resource",
             "could not reserve the bounded source batch table",
             false,
-            json,
+            presentation,
             3,
         );
     }
@@ -3241,17 +3381,35 @@ where
     {
         Ok(fln::Outcome::Complete(engine)) => engine,
         Ok(fln::Outcome::Inconclusive(inconclusive)) => {
-            return source_failure("inconclusive", &format!("{inconclusive:?}"), false, json, 3);
+            return source_failure(
+                "inconclusive",
+                &format!("{inconclusive:?}"),
+                false,
+                presentation,
+                3,
+            );
         }
         Ok(fln::Outcome::InternalFault(fault)) => {
-            return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
+            return source_failure(
+                "internal-fault",
+                &format!("{fault:?}"),
+                false,
+                presentation,
+                4,
+            );
         }
         Err(error) => {
             // Seed admission is ordinary declaration admission. A second
             // catch-all here used to promote AllocationFailure to an
             // authoritative `seed` rejection (FL-INV-07).
             let (class, authority, exit_code) = admission_error_disposition(&error);
-            return source_failure(class, &error.to_string(), authority, json, exit_code);
+            return source_failure(
+                class,
+                &error.to_string(),
+                authority,
+                presentation,
+                exit_code,
+            );
         }
     };
     let options = fln::KVMap::new();
@@ -3272,16 +3430,34 @@ where
         Ok(execution) => execution,
         Err(error) => {
             let (class, authority, exit_code) = execution_error_disposition(&error);
-            return source_failure(class, &error.to_string(), authority, json, exit_code);
+            return source_failure(
+                class,
+                &error.to_string(),
+                authority,
+                presentation,
+                exit_code,
+            );
         }
     };
     let completed = match execution {
         fln::Outcome::Complete(completed) => completed,
         fln::Outcome::Inconclusive(inconclusive) => {
-            return source_failure("inconclusive", &format!("{inconclusive:?}"), false, json, 3);
+            return source_failure(
+                "inconclusive",
+                &format!("{inconclusive:?}"),
+                false,
+                presentation,
+                3,
+            );
         }
         fln::Outcome::InternalFault(fault) => {
-            return source_failure("internal-fault", &format!("{fault:?}"), false, json, 4);
+            return source_failure(
+                "internal-fault",
+                &format!("{fault:?}"),
+                false,
+                presentation,
+                4,
+            );
         }
     };
     if let Some(plan) = module_plan.as_ref() {
@@ -3301,7 +3477,7 @@ where
                 "resource",
                 "could not reserve the canonical source module closure",
                 false,
-                json,
+                presentation,
                 3,
             );
         }
@@ -3311,7 +3487,7 @@ where
                     "internal-fault",
                     "engine returned a source module absent from the input plan",
                     false,
-                    json,
+                    presentation,
                     4,
                 );
             };
@@ -3322,7 +3498,7 @@ where
                 "internal-fault",
                 "engine returned an incomplete canonical source module order",
                 false,
-                json,
+                presentation,
                 4,
             );
         }
@@ -3335,7 +3511,7 @@ where
             "internal-fault",
             "source evaluation count exceeded completed command count",
             false,
-            json,
+            presentation,
             4,
         );
     };
@@ -3344,7 +3520,7 @@ where
             "internal-fault",
             "completed source batch contained no definition executions",
             false,
-            json,
+            presentation,
             4,
         );
     };
@@ -3359,7 +3535,7 @@ where
             "internal-fault",
             "completed source batch artifact byte count overflowed",
             false,
-            json,
+            presentation,
             4,
         );
     };
@@ -3373,7 +3549,7 @@ where
                     usage.steps,
                     usage.system_polls,
                     usage.peak_stack_depth,
-                    json,
+                    presentation,
                 );
             }
             fln::VmExit::Refused { refusal, usage } => {
@@ -3383,7 +3559,7 @@ where
                     usage.steps,
                     usage.system_polls,
                     usage.peak_stack_depth,
-                    json,
+                    presentation,
                 );
             }
         }
@@ -3394,7 +3570,7 @@ where
             "resource",
             "could not reserve the source evaluation result table",
             false,
-            json,
+            presentation,
             3,
         );
     }
@@ -3405,7 +3581,7 @@ where
                 "internal-fault",
                 "engine returned invalid source evaluation command indices",
                 false,
-                json,
+                presentation,
                 4,
             );
         }
@@ -3415,7 +3591,7 @@ where
                 "internal-fault",
                 "engine returned a source evaluation index outside the execution table",
                 false,
-                json,
+                presentation,
                 4,
             );
         };
@@ -3428,12 +3604,18 @@ where
                         "evaluation command {index} did not produce a closed Nat, String, or Bool value"
                     ),
                     true,
-                    json,
+                    presentation,
                     1,
                 );
             }
             Err(error) => {
-                return source_failure("internal-fault", &error.to_string(), false, json, 4);
+                return source_failure(
+                    "internal-fault",
+                    &error.to_string(),
+                    false,
+                    presentation,
+                    4,
+                );
             }
         };
         evaluation_results.push(SourceEvaluationResult {
@@ -3449,7 +3631,7 @@ where
             "internal-fault",
             "non-returning final execution escaped source batch refusal handling",
             false,
-            json,
+            presentation,
             4,
         );
     };
@@ -3461,12 +3643,18 @@ where
                     "execution",
                     "final command did not produce a closed Nat, String, or Bool value",
                     true,
-                    json,
+                    presentation,
                     1,
                 );
             }
             Err(error) => {
-                return source_failure("internal-fault", &error.to_string(), false, json, 4);
+                return source_failure(
+                    "internal-fault",
+                    &error.to_string(),
+                    false,
+                    presentation,
+                    4,
+                );
             }
         };
     let emitted_sidecar = if let Some(path) = emit_sidecar.as_deref() {
@@ -3475,7 +3663,13 @@ where
             None => match read_current_toolchain_image() {
                 Ok(image) => image,
                 Err(error) => {
-                    return source_failure("internal-fault", &error.to_string(), false, json, 4);
+                    return source_failure(
+                        "internal-fault",
+                        &error.to_string(),
+                        false,
+                        presentation,
+                        4,
+                    );
                 }
             },
         };
@@ -3487,7 +3681,7 @@ where
         ) {
             Ok(sidecar) => sidecar,
             Err(error) => {
-                return source_failure("sidecar", &error.to_string(), false, json, 1);
+                return source_failure("sidecar", &error.to_string(), false, presentation, 1);
             }
         };
         let bytes = fln::encode_flbc_product_sidecar(&sidecar);
@@ -3501,7 +3695,7 @@ where
                     path.display()
                 ),
                 authority,
-                json,
+                presentation,
                 exit_code,
             );
         }
@@ -3525,7 +3719,7 @@ where
                     path.display()
                 ),
                 authority,
-                json,
+                presentation,
                 exit_code,
             );
         }
@@ -3552,7 +3746,32 @@ where
             system_polls: returned.usage.system_polls,
             peak_stack_depth: returned.usage.peak_stack_depth,
         },
-        json,
+        presentation,
+    )
+}
+
+#[cfg(test)]
+fn execute_source_bytes_with_publisher<P, E>(
+    sources: Vec<Vec<u8>>,
+    module_plan: Option<SourceModulePlan>,
+    emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
+    toolchain_image: Option<Vec<u8>>,
+    json: bool,
+    publish: P,
+) -> MultiplexerOutput
+where
+    P: FnMut(&[u8], &Path) -> Result<(), E>,
+    E: SourcePublicationFailure,
+{
+    execute_source_bytes_with_publisher_and_presentation(
+        sources,
+        module_plan,
+        emit_flbc,
+        emit_sidecar,
+        toolchain_image,
+        SourcePresentation::Fln { json },
+        publish,
     )
 }
 
@@ -3566,24 +3785,6 @@ fn execute_source_bytes(sources: Vec<Vec<u8>>, json: bool) -> MultiplexerOutput 
         None,
         json,
         fln::publish_file_atomic,
-    )
-}
-
-fn execute_source_bytes_with_output(
-    sources: Vec<Vec<u8>>,
-    module_plan: Option<SourceModulePlan>,
-    emit_flbc: Option<PathBuf>,
-    emit_sidecar: Option<PathBuf>,
-    json: bool,
-) -> MultiplexerOutput {
-    execute_source_bytes_with_publisher(
-        sources,
-        module_plan,
-        emit_flbc,
-        emit_sidecar,
-        None,
-        json,
-        fln::publish_file_atomic_new,
     )
 }
 
@@ -3836,32 +4037,46 @@ fn derive_source_module_plan(
     Ok(Some(SourceModulePlan { names, entry }))
 }
 
-fn run_sources(
+fn run_sources_with_presentation(
     paths: &[PathBuf],
     max_bytes: usize,
-    json: bool,
     emit_flbc: Option<PathBuf>,
     emit_sidecar: Option<PathBuf>,
+    presentation: SourcePresentation,
 ) -> MultiplexerOutput {
     let sources = match read_source_batch(paths, max_bytes) {
         Ok(sources) => sources,
         Err(error) => {
             let exit_code = if error.class() == "resource" { 3 } else { 1 };
-            return source_failure(error.class(), &error.to_string(), false, json, exit_code);
+            return source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                presentation,
+                exit_code,
+            );
         }
     };
     let module_plan = match derive_source_module_plan(paths, &sources) {
         Ok(plan) => plan,
         Err(error) => {
             let (class, authority, exit_code) = error.disposition();
-            return source_failure(class, error.detail(), authority, json, exit_code);
+            return source_failure(class, error.detail(), authority, presentation, exit_code);
         }
     };
     let worker = match std::thread::Builder::new()
         .name("fln-source-run".to_owned())
         .stack_size(SOURCE_RUN_KERNEL_STACK_BYTES)
         .spawn(move || {
-            execute_source_bytes_with_output(sources, module_plan, emit_flbc, emit_sidecar, json)
+            execute_source_bytes_with_publisher_and_presentation(
+                sources,
+                module_plan,
+                emit_flbc,
+                emit_sidecar,
+                None,
+                presentation,
+                fln::publish_file_atomic_new,
+            )
         }) {
         Ok(worker) => worker,
         Err(error) => {
@@ -3869,7 +4084,7 @@ fn run_sources(
                 "internal-fault",
                 &format!("could not start bounded kernel worker: {error}"),
                 false,
-                json,
+                presentation,
                 4,
             );
         }
@@ -3880,10 +4095,26 @@ fn run_sources(
             "internal-fault",
             "bounded kernel worker panicked",
             false,
-            json,
+            presentation,
             4,
         ),
     }
+}
+
+fn run_sources(
+    paths: &[PathBuf],
+    max_bytes: usize,
+    json: bool,
+    emit_flbc: Option<PathBuf>,
+    emit_sidecar: Option<PathBuf>,
+) -> MultiplexerOutput {
+    run_sources_with_presentation(
+        paths,
+        max_bytes,
+        emit_flbc,
+        emit_sidecar,
+        SourcePresentation::Fln { json },
+    )
 }
 
 /// Run the native `fln` multiplexer without touching process-global arguments
@@ -3934,6 +4165,26 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             json,
         }) => inspect_ilean(&path, max_bytes, json),
         Err(error) => MultiplexerOutput::failure(format!("fln: {error}\n\n{USAGE}"), 2),
+    }
+}
+
+/// Run FrankenLean's bounded native `lean` personality without touching
+/// process-global arguments or streams.
+///
+/// This is intentionally a presentation adapter over the same source pipeline
+/// as [`run`]'s `fln run` command. It does not widen the supported source
+/// language, bypass either checker, or emulate unsupported Reference options.
+pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
+    match parse_lean_command(arguments) {
+        Ok(LeanCommand::Help) => MultiplexerOutput::success(LEAN_USAGE.to_owned()),
+        Ok(LeanCommand::Version) => MultiplexerOutput::success(format!(
+            "lean (FrankenLean bounded native source personality) {}\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        Ok(LeanCommand::Source { path, max_bytes }) => {
+            run_sources_with_presentation(&[path], max_bytes, None, None, SourcePresentation::Lean)
+        }
+        Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
 }
 
@@ -4371,11 +4622,12 @@ mod tests {
     use super::{
         CHECK_OLEAN_SCHEMA, FLBC_RUN_SCHEMA, ILEAN_INSPECT_SCHEMA, NamedOleanBytes,
         OLEAN_DIFF_SCHEMA, OLEAN_INSPECT_SCHEMA, OLEAN_REBUILD_SCHEMA,
-        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, admission_error_disposition,
-        check_olean_bytes, check_olean_module_bytes, diff_olean_bytes, execute_flbc_bytes,
-        execute_source_bytes, execute_source_bytes_with_publisher, execution_error_disposition,
-        inspect_ilean_bytes, inspect_olean_bytes, module_name_from_relative, parse_source_run,
-        read_bounded_from, run, source_failure, verify_olean_rebuild_bytes,
+        SOURCE_RUN_KERNEL_STACK_BYTES, SOURCE_RUN_SCHEMA, SourcePresentation,
+        admission_error_disposition, check_olean_bytes, check_olean_module_bytes, diff_olean_bytes,
+        execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
+        execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
+        module_name_from_relative, parse_source_run, read_bounded_from, run, run_lean,
+        source_failure, verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -5175,6 +5427,94 @@ mod tests {
     }
 
     #[test]
+    fn lean_personality_help_version_and_usage_are_explicitly_bounded() {
+        let help = run_lean(std::iter::empty());
+        assert_eq!(help.exit_code, 0);
+        assert!(help.stderr.is_empty());
+        assert!(
+            help.stdout
+                .starts_with("Usage:\n  lean [--max-bytes BYTES] PATH")
+        );
+        assert!(help.stdout.contains("bounded native `lean` personality"));
+        assert!(
+            help.stdout
+                .contains("does not yet\nimplement the Reference CLI's option set")
+        );
+
+        let version = run_lean([OsString::from("--version")]);
+        assert_eq!(version.exit_code, 0);
+        assert_eq!(
+            version.stdout,
+            format!(
+                "lean (FrankenLean bounded native source personality) {}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert!(version.stderr.is_empty());
+
+        for arguments in [
+            vec![OsString::from("--json")],
+            vec![OsString::from("One.lean"), OsString::from("Two.lean")],
+            vec![OsString::from("--help"), OsString::from("One.lean")],
+            vec![
+                OsString::from("--max-bytes=1"),
+                OsString::from("--max-bytes=2"),
+                OsString::from("One.lean"),
+            ],
+        ] {
+            let refused = run_lean(arguments);
+            assert_eq!(refused.exit_code, 2);
+            assert!(refused.stdout.is_empty());
+            assert!(refused.stderr.starts_with("lean: "));
+            assert!(refused.stderr.contains("\n\nUsage:\n  lean "));
+        }
+
+        let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
+        let exhausted = run_lean([OsString::from("--max-bytes=0"), source.into_os_string()]);
+        assert_eq!(exhausted.exit_code, 3);
+        assert!(exhausted.stdout.is_empty());
+        assert!(exhausted.stderr.starts_with("lean: resource: "));
+        assert!(exhausted.stderr.contains("0-byte input limit"));
+    }
+
+    #[test]
+    fn lean_personality_prints_only_evaluations_and_keeps_definitions_silent() {
+        let evaluated = super::execute_source_bytes_with_publisher_and_presentation(
+            vec![
+                b"#eval \"native\"\n#eval 40 + 2\ndef keep : Nat := 7\n#eval keep == 7\ndef answer : Nat := keep + 2"
+                    .to_vec(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            SourcePresentation::Lean,
+            |_, _| Ok::<(), std::io::Error>(()),
+        );
+        assert_eq!(evaluated.exit_code, 0, "{}", evaluated.stderr);
+        assert_eq!(evaluated.stdout, "\"native\"\n42\ntrue\n");
+        assert!(evaluated.stderr.is_empty());
+
+        let source = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
+        let definition_only = run_lean([source.into_os_string()]);
+        assert_eq!(definition_only.exit_code, 0, "{}", definition_only.stderr);
+        assert!(definition_only.stdout.is_empty());
+        assert!(definition_only.stderr.is_empty());
+    }
+
+    #[test]
+    fn lean_personality_preserves_typed_source_failures_without_fln_framing() {
+        let source = repository_path("crates/fln-conformance/fixtures/g04_reference_fixture.lean");
+        let refused = run_lean([source.into_os_string()]);
+        assert_eq!(refused.exit_code, 1);
+        assert!(refused.stdout.is_empty());
+        assert!(refused.stderr.starts_with("lean: execution: "));
+        assert!(refused.stderr.contains("frontend refused source"));
+        assert!(!refused.stderr.contains(SOURCE_RUN_SCHEMA));
+        assert!(!refused.stderr.contains("native source batch"));
+    }
+
+    #[test]
     fn source_run_executes_multiple_real_paths_in_order() {
         let root = repository_path("vendor/lean4-src/tests/lake/examples/deps/root/Root.lean");
         let same = repository_path("vendor/lean4-src/tests/pkg/mod_clash/depA/Same.lean");
@@ -5898,7 +6238,13 @@ mod tests {
 
     #[test]
     fn source_run_failure_details_are_bounded_and_marked() {
-        let output = source_failure("execution", &"x".repeat(5000), true, true, 1);
+        let output = source_failure(
+            "execution",
+            &"x".repeat(5000),
+            true,
+            SourcePresentation::Fln { json: true },
+            1,
+        );
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.contains("\"detailTruncated\":true"));

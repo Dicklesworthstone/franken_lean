@@ -19,11 +19,19 @@ fn run_fln(arguments: &[&Path]) -> Output {
     command.output().expect("run the real fln binary")
 }
 
+fn run_lean(arguments: &[&Path]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lean"));
+    for argument in arguments {
+        command.arg(argument);
+    }
+    command.output().expect("run the real lean binary")
+}
+
 fn utf8(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("CLI output is UTF-8")
 }
 
-fn fresh_test_root(label: &str) -> PathBuf {
+fn fresh_test_root(label: &str) -> std::io::Result<PathBuf> {
     let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     for attempt in 0..1_024_u32 {
         let candidate = parent.join(format!(
@@ -32,17 +40,73 @@ fn fresh_test_root(label: &str) -> PathBuf {
             std::thread::current().id()
         ));
         match std::fs::create_dir(&candidate) {
-            Ok(()) => return candidate,
+            Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => panic!("create retained integration-test directory: {error}"),
+            Err(error) => return Err(error),
         }
     }
-    panic!("could not allocate a retained integration-test directory");
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a retained integration-test directory after 1024 attempts",
+    ))
+}
+
+#[test]
+fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_refusal() {
+    let root = fresh_test_root("native-lean-personality-e2e")
+        .expect("allocate retained native-lean integration-test directory");
+    let source = root.join("Main.lean");
+    std::fs::write(
+        &source,
+        b"def answer : Nat := 40 + 2\n#eval \"native\"\n#eval answer\n#eval answer == 42\ndef retained : Nat := 7\n",
+    )
+    .expect("write supported evaluating source");
+
+    let evaluated = run_lean(&[&source]);
+    assert!(
+        evaluated.status.success(),
+        "native lean stderr: {}",
+        utf8(&evaluated.stderr)
+    );
+    assert_eq!(utf8(&evaluated.stdout), "\"native\"\n42\ntrue\n");
+    assert!(evaluated.stderr.is_empty());
+
+    let definition_only = root.join("DefinitionOnly.lean");
+    std::fs::write(&definition_only, b"def answer : Nat := 40 + 2\n")
+        .expect("write definition-only source");
+    let silent = run_lean(&[&definition_only]);
+    assert!(
+        silent.status.success(),
+        "definition-only native lean stderr: {}",
+        utf8(&silent.stderr)
+    );
+    assert!(silent.stdout.is_empty());
+    assert!(silent.stderr.is_empty());
+
+    std::fs::write(&source, b"#eval 40 + 2\ndef answer : Nat := missing\n")
+        .expect("plant an unsupported open definition");
+    let refused = run_lean(&[&source]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(utf8(&refused.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&refused.stderr).contains("unknown constant"));
+
+    std::fs::write(&source, b"def answer : Nat := 40 + 2\n#eval answer\n")
+        .expect("repair the refused source");
+    let recovered = run_lean(&[&source]);
+    assert!(
+        recovered.status.success(),
+        "recovered native lean stderr: {}",
+        utf8(&recovered.stderr)
+    );
+    assert_eq!(utf8(&recovered.stdout), "42\n");
+    assert!(recovered.stderr.is_empty());
 }
 
 #[test]
 fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
-    let root = fresh_test_root("source-import-closure-e2e");
+    let root = fresh_test_root("source-import-closure-e2e")
+        .expect("allocate retained source-import integration-test directory");
     let project = root.join("Project");
     std::fs::create_dir(&project).expect("create module namespace directory");
     let base = project.join("Base.lean");
