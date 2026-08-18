@@ -1284,8 +1284,10 @@ pub fn partition_definition_commands(
 /// Parse the bounded source facade's module header and partition its commands.
 ///
 /// The supported header is the ordinary Lean spelling `import A.B C`, with one
-/// import command per physical line and all imports preceding the first `def` or
-/// `#eval`.
+/// import command per physical line. The first non-import token starts the body;
+/// the body remains opaque to this header parser and is partitioned for the
+/// bounded command parser, which retains sole authority to accept `def`/`#eval`
+/// or refuse every other command shape.
 /// Comments and blank lines are trivia. Requiring the command to end at its line
 /// is deliberate for this first production slice: accepting a broader layout
 /// without the complete command parser would guess at module boundaries.
@@ -1334,9 +1336,6 @@ pub fn partition_source_module(
             break None;
         };
         match &token.kind {
-            TokenKind::Symbol(symbol) if symbol == "def" || symbol == "#eval" => {
-                break Some(view.to_original(token.extent.start()).0);
-            }
             TokenKind::Symbol(symbol) if symbol == "import" => {
                 let import_line = view.normalized().line_of(token.extent.start());
                 cursor += 1;
@@ -1364,10 +1363,7 @@ pub fn partition_source_module(
                 }
             }
             TokenKind::Ident(_) | TokenKind::Literal(_) | TokenKind::Symbol(_) => {
-                return Err(NatDefinitionParseError::OutsideSeedGrammar {
-                    at: at(cursor),
-                    expected: NatDefinitionExpectation::ImportOrCommand,
-                });
+                break Some(view.to_original(token.extent.start()).0);
             }
         }
     };
@@ -1377,10 +1373,8 @@ pub fn partition_source_module(
             .map_err(|error| error.with_original_offset(BytePos(body_start)))?;
         (body_start, commands)
     } else {
-        // The header loop already refuses every non-trivia token other than
-        // `import`, `def`, or `#eval`. Reaching EOF without a body command is
-        // therefore a valid header-only module, not one empty command for the
-        // command parser to reject.
+        // Reaching EOF after imports/trivia is a valid header-only module, not
+        // one empty command for the command parser to reject.
         (source.len(), Vec::new())
     };
     for (offset, _) in &mut commands {
@@ -1581,10 +1575,12 @@ mod nat_definition_tests {
         assert!(empty.commands.is_empty());
 
         let unsupported = partition_source_module(b"theorem answer : Nat := 42")
-            .expect_err("unsupported source without imports must still reach typed refusal");
+            .expect("the header parser leaves an unsupported body to the command parser");
+        assert!(unsupported.imports.is_empty());
+        assert_eq!(unsupported.commands.len(), 1);
         assert!(matches!(
-            unsupported,
-            NatDefinitionParseError::OutsideSeedGrammar { .. }
+            parse_source_command(unsupported.commands[0].1),
+            Err(NatDefinitionParseError::OutsideSeedGrammar { .. })
         ));
     }
 

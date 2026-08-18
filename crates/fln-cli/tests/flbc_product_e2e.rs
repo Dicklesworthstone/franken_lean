@@ -323,6 +323,61 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert_eq!(utf8(&native.stdout), "42\n");
     assert!(native.stderr.is_empty());
 
+    let dependency_probe = root.join("DependencyProbe.lean");
+    std::fs::write(
+        &dependency_probe,
+        b"import Project.Middle Project.Base Project.Middle\ntheorem bodyIsNotExecuted : Nat := missing\n",
+    )
+    .expect("write the direct source-dependency probe");
+    let dependencies = run_lean(&[Path::new("--src-deps"), &dependency_probe]);
+    assert!(
+        dependencies.status.success(),
+        "native lean --src-deps stderr: {}",
+        utf8(&dependencies.stderr)
+    );
+    assert!(dependencies.stderr.is_empty());
+    assert_eq!(
+        utf8(&dependencies.stdout),
+        format!(
+            "{}\n{}\n{}\n",
+            middle.display(),
+            base.display(),
+            middle.display()
+        )
+    );
+
+    let dependency_budget_stop = run_lean(&[
+        Path::new("--src-deps"),
+        Path::new("--max-bytes=1"),
+        &dependency_probe,
+    ]);
+    assert!(!dependency_budget_stop.status.success());
+    assert!(dependency_budget_stop.stdout.is_empty());
+    assert!(utf8(&dependency_budget_stop.stderr).starts_with("lean: resource: "));
+    assert!(
+        utf8(&dependency_budget_stop.stderr).contains("source import closure exceeded the 1-byte")
+    );
+
+    let missing_dependency_probe = root.join("MissingDependencyProbe.lean");
+    std::fs::write(
+        &missing_dependency_probe,
+        b"import Project.Middle Project.Absent\ntheorem bodyIsStillNotExecuted : Nat := missing\n",
+    )
+    .expect("write the missing direct source-dependency probe");
+    let missing_dependencies = run_lean(&[Path::new("--src-deps"), &missing_dependency_probe]);
+    assert!(!missing_dependencies.status.success());
+    assert!(missing_dependencies.stdout.is_empty());
+    assert!(utf8(&missing_dependencies.stderr).starts_with("lean: input: "));
+    assert!(utf8(&missing_dependencies.stderr).contains("Project.Absent"));
+
+    let dependencies_after_refusal = run_lean(&[Path::new("--src-deps"), &dependency_probe]);
+    assert!(dependencies_after_refusal.status.success());
+    assert_eq!(
+        dependencies_after_refusal.stdout, dependencies.stdout,
+        "a missing dependency refusal must not poison a later listing"
+    );
+    assert!(dependencies_after_refusal.stderr.is_empty());
+
     std::fs::write(
         &main,
         b"import Project.Middle\n#eval middle + 2\ndef broken : Nat := missing\n",
@@ -406,6 +461,11 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert!(utf8(&ambiguous.stderr).contains("is ambiguous"));
     assert!(utf8(&ambiguous.stderr).contains(&nested_base.display().to_string()));
     assert!(utf8(&ambiguous.stderr).contains(&base.display().to_string()));
+    let ambiguous_dependencies = run_lean(&[Path::new("--src-deps"), &ambiguous_main]);
+    assert!(!ambiguous_dependencies.status.success());
+    assert!(ambiguous_dependencies.stdout.is_empty());
+    assert!(utf8(&ambiguous_dependencies.stderr).starts_with("lean: input: "));
+    assert!(utf8(&ambiguous_dependencies.stderr).contains("is ambiguous"));
 
     #[cfg(unix)]
     {
@@ -419,6 +479,11 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
         assert!(refused_link.stdout.is_empty());
         assert!(utf8(&refused_link.stderr).starts_with("lean: input: "));
         assert!(utf8(&refused_link.stderr).contains("refusing symlink source import"));
+        let refused_link_dependencies = run_lean(&[Path::new("--src-deps"), &linked_main]);
+        assert!(!refused_link_dependencies.status.success());
+        assert!(refused_link_dependencies.stdout.is_empty());
+        assert!(utf8(&refused_link_dependencies.stderr).starts_with("lean: input: "));
+        assert!(utf8(&refused_link_dependencies.stderr).contains("refusing symlink source import"));
     }
 
     let interleaved_eval = root.join("InterleavedEval.lean");

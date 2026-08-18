@@ -114,8 +114,10 @@ const USAGE: &str = concat!(
 const LEAN_USAGE: &str = concat!(
     "Usage:\n",
     "  lean [--max-bytes BYTES] PATH\n",
+    "  lean --src-deps [--max-bytes BYTES] PATH\n",
     "  lean --help\n",
-    "  lean --version\n",
+    "  lean -v | --version\n",
+    "  lean -V | --short-version\n",
     "\n",
     "This is FrankenLean's bounded native `lean` personality. It accepts exactly\n",
     "one source path and executes the currently supported Nat/String/Bool source\n",
@@ -127,6 +129,8 @@ const LEAN_USAGE: &str = concat!(
     "the first direct import must identify exactly one ancestor source root;\n",
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
     "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
+    "--src-deps prints validated direct local source imports in source order\n",
+    "without elaborating or executing the file.\n",
     "This does not implement the Reference CLI's option set, LEAN_PATH/package or\n",
     ".olean discovery, implicit Prelude processing, general Lean elaboration, or\n",
     "diagnostic parity. Discovery assumes a trusted filesystem namespace that\n",
@@ -210,6 +214,8 @@ enum MultiplexerCommand {
 enum LeanCommand {
     Help,
     Version,
+    ShortVersion,
+    SourceDependencies { path: PathBuf, max_bytes: usize },
     Source { path: PathBuf, max_bytes: usize },
 }
 
@@ -825,17 +831,25 @@ fn parse_lean_command(
             Err(UsageError("--help must be used alone".to_owned()))
         };
     }
-    if first == "--version" || first == "-V" {
+    if first == "--version" || first == "-v" {
         return if arguments.next().is_none() {
             Ok(LeanCommand::Version)
         } else {
             Err(UsageError("--version must be used alone".to_owned()))
         };
     }
+    if first == "--short-version" || first == "-V" {
+        return if arguments.next().is_none() {
+            Ok(LeanCommand::ShortVersion)
+        } else {
+            Err(UsageError("--short-version must be used alone".to_owned()))
+        };
+    }
 
     let mut path = None;
     let mut max_bytes = SOURCE_RUN_DEFAULT_MAX_BYTES;
     let mut max_bytes_seen = false;
+    let mut source_dependencies = false;
     let mut options = true;
     let mut arguments = std::iter::once(first).chain(arguments);
     while let Some(argument) = arguments.next() {
@@ -856,6 +870,15 @@ fn parse_lean_command(
             max_bytes_seen = true;
             continue;
         }
+        if options && argument == "--src-deps" {
+            if source_dependencies {
+                return Err(UsageError(
+                    "--src-deps may be supplied at most once".to_owned(),
+                ));
+            }
+            source_dependencies = true;
+            continue;
+        }
         if options
             && let Some(value) = argument
                 .to_str()
@@ -874,8 +897,11 @@ fn parse_lean_command(
             if argument == "--help" || argument == "-h" {
                 return Err(UsageError("--help must be used alone".to_owned()));
             }
-            if argument == "--version" || argument == "-V" {
+            if argument == "--version" || argument == "-v" {
                 return Err(UsageError("--version must be used alone".to_owned()));
+            }
+            if argument == "--short-version" || argument == "-V" {
+                return Err(UsageError("--short-version must be used alone".to_owned()));
             }
             return Err(UsageError(format!(
                 "unknown lean option {:?}",
@@ -893,7 +919,11 @@ fn parse_lean_command(
     }
 
     let path = path.ok_or_else(|| UsageError("lean requires PATH".to_owned()))?;
-    Ok(LeanCommand::Source { path, max_bytes })
+    if source_dependencies {
+        Ok(LeanCommand::SourceDependencies { path, max_bytes })
+    } else {
+        Ok(LeanCommand::Source { path, max_bytes })
+    }
 }
 
 fn read_bounded_from(
@@ -4152,6 +4182,166 @@ fn discover_source_root(
     })
 }
 
+fn discover_direct_source_dependencies(
+    entry: &Path,
+    max_bytes: usize,
+) -> Result<Vec<PathBuf>, BoundedReadFailure> {
+    let limits = fln::SourceModuleLimits::default();
+    let source = read_source_closure_member(entry, 0, max_bytes)?;
+    let module =
+        fln::partition_source_module(&source).map_err(|error| BoundedReadFailure::Input {
+            subject: "source dependency header",
+            detail: format!("{}: {error}", entry.display()),
+        })?;
+    if module.imports.is_empty() {
+        return Ok(Vec::new());
+    }
+    if module.imports.len() > limits.max_imports {
+        return Err(BoundedReadFailure::Resource {
+            detail: format!(
+                "source entry presents {} imports; planning limit is {}",
+                module.imports.len(),
+                limits.max_imports
+            ),
+        });
+    }
+    let first_import = &module.imports[0];
+    let first_components =
+        source_module_components(first_import).ok_or_else(|| BoundedReadFailure::Input {
+            subject: "source dependency header",
+            detail: format!(
+                "import `{}` is not a nonempty string-component module name",
+                first_import.to_display_string()
+            ),
+        })?;
+    if first_components.len() > limits.max_name_depth {
+        return Err(BoundedReadFailure::Resource {
+            detail: format!(
+                "source import `{}` has {} components; planning limit is {}",
+                first_import.to_display_string(),
+                first_components.len(),
+                limits.max_name_depth
+            ),
+        });
+    }
+    let root = discover_source_root(entry, first_import, limits.max_name_depth)?;
+    let mut dependencies = Vec::new();
+    dependencies
+        .try_reserve_exact(module.imports.len())
+        .map_err(|_| BoundedReadFailure::Allocation {
+            subject: "source dependency path table",
+            requested: module.imports.len(),
+        })?;
+    for name in module.imports {
+        let components =
+            source_module_components(&name).ok_or_else(|| BoundedReadFailure::Input {
+                subject: "source dependency header",
+                detail: format!(
+                    "import `{}` is not a nonempty string-component module name",
+                    name.to_display_string()
+                ),
+            })?;
+        if components.len() > limits.max_name_depth {
+            return Err(BoundedReadFailure::Resource {
+                detail: format!(
+                    "source import `{}` has {} components; planning limit is {}",
+                    name.to_display_string(),
+                    components.len(),
+                    limits.max_name_depth
+                ),
+            });
+        }
+        let path = root.join(source_import_relative_path(&name)?);
+        if !source_import_candidate_is_file(&path)? {
+            return Err(BoundedReadFailure::Input {
+                subject: "source dependency header",
+                detail: format!(
+                    "cannot resolve import `{}` below source root {}",
+                    name.to_display_string(),
+                    root.display()
+                ),
+            });
+        }
+        dependencies.push(path);
+    }
+    Ok(dependencies)
+}
+
+fn run_lean_source_dependencies(path: &Path, max_bytes: usize) -> MultiplexerOutput {
+    let dependencies = match discover_direct_source_dependencies(path, max_bytes) {
+        Ok(dependencies) => dependencies,
+        Err(error) => {
+            return source_failure(
+                error.class(),
+                &error.to_string(),
+                false,
+                SourcePresentation::Lean,
+                error.exit_code(),
+            );
+        }
+    };
+    let mut rendered_dependencies = Vec::new();
+    if rendered_dependencies
+        .try_reserve_exact(dependencies.len())
+        .is_err()
+    {
+        return source_failure(
+            "resource",
+            &format!(
+                "could not reserve {} entries for source dependency output",
+                dependencies.len()
+            ),
+            false,
+            SourcePresentation::Lean,
+            3,
+        );
+    }
+    let mut requested = 0_usize;
+    for dependency in &dependencies {
+        let Some(rendered) = dependency.to_str() else {
+            return source_failure(
+                "input",
+                &format!(
+                    "source dependency path is not valid UTF-8: {}",
+                    dependency.display()
+                ),
+                false,
+                SourcePresentation::Lean,
+                1,
+            );
+        };
+        let Some(next_requested) = requested
+            .checked_add(rendered.len())
+            .and_then(|total| total.checked_add(1))
+        else {
+            return source_failure(
+                "resource",
+                "source dependency output size exceeded this platform",
+                false,
+                SourcePresentation::Lean,
+                3,
+            );
+        };
+        requested = next_requested;
+        rendered_dependencies.push(rendered);
+    }
+    let mut stdout = String::new();
+    if stdout.try_reserve_exact(requested).is_err() {
+        return source_failure(
+            "resource",
+            &format!("could not reserve {requested} bytes for source dependency output"),
+            false,
+            SourcePresentation::Lean,
+            3,
+        );
+    }
+    for dependency in rendered_dependencies {
+        stdout.push_str(dependency);
+        stdout.push('\n');
+    }
+    MultiplexerOutput::success(stdout)
+}
+
 fn read_source_closure_member(
     path: &Path,
     consumed: usize,
@@ -4799,9 +4989,21 @@ pub fn run_lean(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOut
     match parse_lean_command(arguments) {
         Ok(LeanCommand::Help) => MultiplexerOutput::success(LEAN_USAGE.to_owned()),
         Ok(LeanCommand::Version) => MultiplexerOutput::success(format!(
-            "lean (FrankenLean bounded native source personality) {}\n",
+            "Lean (version {}, FrankenLean bounded native source personality {})\n",
+            fln::OLEAN_PIN_TAG
+                .strip_prefix('v')
+                .unwrap_or(fln::OLEAN_PIN_TAG),
             env!("CARGO_PKG_VERSION")
         )),
+        Ok(LeanCommand::ShortVersion) => MultiplexerOutput::success(format!(
+            "{}\n",
+            fln::OLEAN_PIN_TAG
+                .strip_prefix('v')
+                .unwrap_or(fln::OLEAN_PIN_TAG)
+        )),
+        Ok(LeanCommand::SourceDependencies { path, max_bytes }) => {
+            run_lean_source_dependencies(&path, max_bytes)
+        }
         Ok(LeanCommand::Source { path, max_bytes }) => run_lean_source(path, max_bytes),
         Err(error) => MultiplexerOutput::failure(format!("lean: {error}\n\n{LEAN_USAGE}"), 2),
     }
@@ -6061,21 +6263,35 @@ mod tests {
                 .contains("does not implement the Reference CLI's option set")
         );
         assert!(help.stdout.contains("complete local A/B.lean closure"));
+        assert!(help.stdout.contains("lean --src-deps"));
+        assert!(
+            help.stdout
+                .contains("validated direct local source imports in source order")
+        );
         assert!(
             help.stdout
                 .contains("LEAN_PATH/package or\n.olean discovery")
         );
 
-        let version = run_lean([OsString::from("--version")]);
-        assert_eq!(version.exit_code, 0);
-        assert_eq!(
-            version.stdout,
-            format!(
-                "lean (FrankenLean bounded native source personality) {}\n",
-                env!("CARGO_PKG_VERSION")
-            )
+        let pin_version = fln::OLEAN_PIN_TAG
+            .strip_prefix('v')
+            .expect("the governed Lean tag carries the conventional v prefix");
+        let expected_version = format!(
+            "Lean (version {pin_version}, FrankenLean bounded native source personality {})\n",
+            env!("CARGO_PKG_VERSION")
         );
-        assert!(version.stderr.is_empty());
+        for option in ["--version", "-v"] {
+            let version = run_lean([OsString::from(option)]);
+            assert_eq!(version.exit_code, 0);
+            assert_eq!(version.stdout, expected_version);
+            assert!(version.stderr.is_empty());
+        }
+        for option in ["--short-version", "-V"] {
+            let version = run_lean([OsString::from(option)]);
+            assert_eq!(version.exit_code, 0);
+            assert_eq!(version.stdout, format!("{pin_version}\n"));
+            assert!(version.stderr.is_empty());
+        }
 
         for arguments in [
             vec![OsString::from("--json")],
@@ -6084,6 +6300,11 @@ mod tests {
             vec![
                 OsString::from("--max-bytes=1"),
                 OsString::from("--max-bytes=2"),
+                OsString::from("One.lean"),
+            ],
+            vec![
+                OsString::from("--src-deps"),
+                OsString::from("--src-deps"),
                 OsString::from("One.lean"),
             ],
         ] {

@@ -360,6 +360,12 @@ imports are refused before execution; discovered bytes are not reread between
 planning and checking. This bounded seam assumes a trusted filesystem namespace
 that remains stable for the invocation; directory-handle-relative path-race
 sealing is not implemented.
+The same bounded local resolver is available through `lean --src-deps FILE`:
+it parses only the import header, validates every direct local source import,
+and prints those paths in source order without elaborating or executing the
+body. Duplicate direct imports remain duplicate output rows. This is the
+pin-shaped direct-source dependency query for the selected local root, not
+`LEAN_PATH`, package, or transitive dependency discovery.
 The currently implemented binary is not yet the Reference CLI surface: it has
 no general option compatibility, `LEAN_PATH`/package or `.olean` discovery,
 implicit Prelude processing, general Lean elaboration, or diagnostic-text parity.
