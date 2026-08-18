@@ -346,9 +346,12 @@ cargo run -p fln-cli --bin lean -- Main.lean
 ```
 
 This personality accepts exactly one source path (plus an optional
-`--max-bytes` ceiling), keeps successful definitions silent, and prints each
-supported `#eval` result on its own line after the whole source succeeds. The
-batch remains atomic: a later failure leaves stdout empty. It is a presentation
+`--max-bytes` ceiling), keeps successful scalar and first-order function
+definitions silent, and prints each supported `#eval` result on its own line
+after the whole source succeeds. Unlike `fln run`, it does not require the last
+definition to project to a closed runtime scalar; a checked function naturally
+produces a VM closure and remains an ordinary silent declaration. The batch
+remains atomic: a later failure leaves stdout empty. It is a presentation
 adapter over the same parser → K1 → independent checker → compiler → canonical
 FLBC → Golem execution used by `fln run`; it neither invokes nor falls back to
 the Reference. Local source imports are connected to the existing closed-module

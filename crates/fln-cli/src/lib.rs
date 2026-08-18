@@ -124,8 +124,9 @@ const LEAN_USAGE: &str = concat!(
     "one source path and executes the currently supported Nat/String/Bool source\n",
     "slice through the same parser, elaborator, K1, independent checker,\n",
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
-    "definitions are silent and\n",
-    "each supported #eval result is printed on its own line after the whole\n",
+    "scalar and first-order function definitions are silent; unlike `fln run`,\n",
+    "the final definition need not produce a closed scalar.\n",
+    "Each supported #eval result is printed on its own line after the whole\n",
     "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
@@ -3169,12 +3170,7 @@ fn render_source_success(
     presentation: SourcePresentation,
 ) -> MultiplexerOutput {
     if matches!(presentation, SourcePresentation::Lean) {
-        let stdout = result
-            .evaluation_results
-            .iter()
-            .map(|evaluation| format!("{}\n", evaluation.value))
-            .collect::<String>();
-        return MultiplexerOutput::success(stdout);
+        return render_lean_evaluation_results(&result.evaluation_results);
     }
     let json = presentation.json();
     let evaluation_results_json = format!(
@@ -3352,6 +3348,16 @@ fn render_source_success(
     MultiplexerOutput::success(stdout)
 }
 
+fn render_lean_evaluation_results(
+    evaluation_results: &[SourceEvaluationResult],
+) -> MultiplexerOutput {
+    let stdout = evaluation_results
+        .iter()
+        .map(|evaluation| format!("{}\n", evaluation.value))
+        .collect::<String>();
+    MultiplexerOutput::success(stdout)
+}
+
 fn source_failure(
     class: &'static str,
     detail: &str,
@@ -3520,6 +3526,17 @@ where
     P: FnMut(&[u8], &Path) -> Result<(), E>,
     E: SourcePublicationFailure,
 {
+    if matches!(presentation, SourcePresentation::Lean)
+        && !matches!(&publication, SourcePublication::None)
+    {
+        return source_failure(
+            "internal-fault",
+            "the native lean presentation cannot publish fln-specific artifacts",
+            false,
+            presentation,
+            4,
+        );
+    }
     let (emit_flbc, emit_sidecar, emit_olean_snapshot) = match &publication {
         SourcePublication::None => (None, None, None),
         SourcePublication::Flbc { path, sidecar } => (
@@ -3800,6 +3817,14 @@ where
             command: index,
             value,
         });
+    }
+    if matches!(presentation, SourcePresentation::Lean) {
+        // Lean definitions are declarations, not requests to print or project
+        // their zero-argument runtime value. Requiring the final definition to
+        // be a closed scalar incorrectly rejects checked function declarations,
+        // whose faithful VM result is a closure. All commands have completed
+        // above, so evaluation output remains whole-batch atomic.
+        return render_lean_evaluation_results(&evaluation_results);
     }
     let base_root = completed.base_logical_root.to_string();
     let result_root = completed.result_logical_root.to_string();
@@ -6478,6 +6503,47 @@ mod tests {
         assert_eq!(definition_only.exit_code, 0, "{}", definition_only.stderr);
         assert!(definition_only.stdout.is_empty());
         assert!(definition_only.stderr.is_empty());
+
+        let function_only = super::execute_source_bytes_with_publisher_and_presentation(
+            vec![b"def add (x : Nat) : Nat := x + 1".to_vec()],
+            None,
+            SourcePublication::None,
+            SourcePresentation::Lean,
+            |_, _| Ok::<(), std::io::Error>(()),
+        );
+        assert_eq!(function_only.exit_code, 0, "{}", function_only.stderr);
+        assert!(function_only.stdout.is_empty());
+        assert!(function_only.stderr.is_empty());
+
+        let final_function_after_evaluation =
+            super::execute_source_bytes_with_publisher_and_presentation(
+                vec![
+                    b"def add (x : Nat) : Nat := x + 1\n#eval add 41\ndef keep (x : Nat) : Nat := x"
+                        .to_vec(),
+                ],
+                None,
+                SourcePublication::None,
+                SourcePresentation::Lean,
+                |_, _| Ok::<(), std::io::Error>(()),
+            );
+        assert_eq!(
+            final_function_after_evaluation.exit_code, 0,
+            "{}",
+            final_function_after_evaluation.stderr
+        );
+        assert_eq!(final_function_after_evaluation.stdout, "42\n");
+        assert!(final_function_after_evaluation.stderr.is_empty());
+
+        let fln_contract =
+            execute_source_bytes(vec![b"def add (x : Nat) : Nat := x + 1".to_vec()], true);
+        assert_eq!(fln_contract.exit_code, 1);
+        assert!(fln_contract.stdout.is_empty());
+        assert!(fln_contract.stderr.contains("\"class\":\"execution\""));
+        assert!(
+            fln_contract
+                .stderr
+                .contains("final command did not produce a closed Nat, String, or Bool value")
+        );
     }
 
     #[test]

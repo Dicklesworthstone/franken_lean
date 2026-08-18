@@ -150,6 +150,33 @@ fn bounded_native_lean_personality_runs_checked_evaluations_and_recovers_from_re
     assert!(silent.stdout.is_empty());
     assert!(silent.stderr.is_empty());
 
+    let function_only = root.join("FunctionOnly.lean");
+    std::fs::write(&function_only, b"def add (x : Nat) : Nat := x + 1\n")
+        .expect("write function-only source");
+    let silent_function = run_lean(&[&function_only]);
+    assert!(
+        silent_function.status.success(),
+        "function-only native lean stderr: {}",
+        utf8(&silent_function.stderr)
+    );
+    assert!(silent_function.stdout.is_empty());
+    assert!(silent_function.stderr.is_empty());
+
+    let final_function = root.join("FinalFunction.lean");
+    std::fs::write(
+        &final_function,
+        b"def add (x : Nat) : Nat := x + 1\n#eval add 41\ndef keep (x : Nat) : Nat := x\n",
+    )
+    .expect("write a function evaluation followed by another function declaration");
+    let evaluated_before_function = run_lean(&[&final_function]);
+    assert!(
+        evaluated_before_function.status.success(),
+        "final-function native lean stderr: {}",
+        utf8(&evaluated_before_function.stderr)
+    );
+    assert_eq!(utf8(&evaluated_before_function.stdout), "42\n");
+    assert!(evaluated_before_function.stderr.is_empty());
+
     std::fs::write(&source, b"#eval 40 + 2\ndef answer : Nat := missing\n")
         .expect("plant an unsupported open definition");
     let refused = run_lean(&[&source]);
