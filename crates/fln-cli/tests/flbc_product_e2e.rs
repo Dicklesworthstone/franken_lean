@@ -685,6 +685,17 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     assert_eq!(utf8(&noisy_dependency.stdout), "base : Nat\n");
     assert!(noisy_dependency.stderr.is_empty());
 
+    std::fs::write(&main, b"import Project.Base\n")
+        .expect("write an import-only native lean entry");
+    let import_only = run_lean(&[&main]);
+    assert!(
+        import_only.status.success(),
+        "import-only native lean stderr: {}",
+        utf8(&import_only.stderr)
+    );
+    assert!(import_only.stdout.is_empty());
+    assert!(import_only.stderr.is_empty());
+
     std::fs::write(&base, b"def base : Nat := 20\n").expect("restore the base dependency");
     std::fs::write(
         &main,

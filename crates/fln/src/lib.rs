@@ -3282,7 +3282,9 @@ impl Engine {
     /// source order against the exact completed dependency environment.
     /// Dependency execution and entry output are retained separately so a
     /// presentation can reject any non-returning VM exit before exposing the
-    /// entry's buffered output.
+    /// entry's buffered output. An import-only entry completes as an empty entry
+    /// stream after the dependency closure; no dependency result is promoted to
+    /// entry output.
     pub fn execute_source_modules_with_entry_checks(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -3327,18 +3329,16 @@ impl Engine {
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
             let source = if module.name == entry {
-                let (first_offset, _) = partitioned.commands.first().copied().ok_or_else(|| {
-                    EngineExecutionError::EmptySourceEntry {
-                        module: entry.clone(),
-                    }
-                })?;
-                let source = module.source.get(..first_offset.0).ok_or(
-                    EngineExecutionError::UnexpectedPublication {
-                        detail: "entry source command offset escaped its module bytes",
-                    },
-                )?;
+                let first_offset = partitioned.commands.first().map(|(offset, _)| *offset);
                 entry_commands = Some(partitioned.commands);
-                source
+                match first_offset {
+                    Some(first_offset) => module.source.get(..first_offset.0).ok_or(
+                        EngineExecutionError::UnexpectedPublication {
+                            detail: "entry source command offset escaped its module bytes",
+                        },
+                    )?,
+                    None => module.source,
+                }
             } else {
                 module.source
             };
@@ -3369,14 +3369,32 @@ impl Engine {
                 detail: "mixed dependency execution omitted its source command index table",
             })?;
         let mut dependency_prefix = dependency_plan.batch;
-        let entry_execution = match dependency_prefix.engine.execute_source_command_stream(
-            entry_commands,
-            options,
-            limits,
-        )? {
-            Outcome::Complete(completed) => completed,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        let entry_execution = if entry_commands.is_empty() {
+            let root = dependency_prefix.engine.logical_root(options);
+            SourceCommandBatchExecution {
+                batch: DefinitionBatchExecution {
+                    engine: dependency_prefix.engine.clone(),
+                    base_logical_root: root,
+                    result_logical_root: root,
+                    executions: Vec::new(),
+                    source_module_order: Vec::new(),
+                    source_evaluation_indices: Vec::new(),
+                },
+                command_count: 0,
+                execution_command_indices: Vec::new(),
+                outputs: Vec::new(),
+                checks: Vec::new(),
+            }
+        } else {
+            match dependency_prefix.engine.execute_source_command_stream(
+                entry_commands,
+                options,
+                limits,
+            )? {
+                Outcome::Complete(completed) => completed,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
         };
         let source_module_order = std::mem::take(&mut dependency_prefix.source_module_order);
         let dependency_prefix = if dependency_prefix.executions.is_empty() {
@@ -10414,6 +10432,62 @@ mod tests {
                 && referenced == &Name::from_components(["leaked"])
                 && owner == &provider
         ));
+        assert_eq!(engine.logical_root(&options), before);
+    }
+
+    #[test]
+    fn mixed_source_modules_allow_a_silent_import_only_entry() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let base = Name::from_components(["Base"]);
+        let main = Name::from_components(["Main"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"#check Nat\n#eval 7\ndef imported : Nat := 7",
+            },
+        ];
+
+        let Outcome::Complete(completed) = engine
+            .execute_source_modules_with_entry_checks(&modules, &main, &options, test_limits())
+            .expect("an import-only entry completes after its checked dependency closure")
+        else {
+            panic!("the import-only entry must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(completed.source_module_order, [base, main]);
+        assert_eq!(completed.dependency_command_count, 3);
+        assert_eq!(completed.dependency_execution_command_indices, [1, 2]);
+        let prefix = completed
+            .dependency_prefix
+            .as_ref()
+            .expect("the dependency executes without becoming entry output");
+        assert_eq!(prefix.executions.len(), 2);
+        assert_eq!(prefix.source_evaluation_indices, [0]);
+        assert_eq!(completed.entry.command_count, 0);
+        assert!(completed.entry.batch.executions.is_empty());
+        assert!(completed.entry.execution_command_indices.is_empty());
+        assert!(completed.entry.outputs.is_empty());
+        assert!(completed.entry.checks.is_empty());
+        assert_eq!(
+            completed.entry.batch.base_logical_root,
+            prefix.result_logical_root
+        );
+        assert_eq!(
+            completed.entry.batch.result_logical_root,
+            prefix.result_logical_root
+        );
+        assert_eq!(
+            completed.entry.batch.engine.environment().len(),
+            prefix.engine.environment().len()
+        );
         assert_eq!(engine.logical_root(&options), before);
     }
 

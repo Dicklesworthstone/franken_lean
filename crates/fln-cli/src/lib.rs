@@ -140,6 +140,7 @@ const LEAN_USAGE: &str = concat!(
     "same ordered command stream after its transitive dependency closure completes.\n",
     "Dependency definitions, #eval, and scratch-only #check run silently.\n",
     "Every dependency query is checked against that module's transitive imports.\n",
+    "An import-only entry succeeds silently after its checked dependency closure.\n",
     "The bounded renderer does not pretty-print dependent or other unsupported types.\n",
     "For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
@@ -6964,6 +6965,7 @@ mod tests {
         assert!(help.stdout.contains(
             "Every dependency query is checked against that module's transitive imports"
         ));
+        assert!(help.stdout.contains("import-only entry succeeds silently"));
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
         assert!(help.stdout.contains("lean --print-libdir"));

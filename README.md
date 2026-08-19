@@ -320,9 +320,12 @@ elaboration. They also
 check every completed declaration against the graph's transitive visibility,
 so dependency order cannot let one sibling borrow definitions from another
 sibling it did not import. Import-only dependency modules remain valid graph
-rows, while the selected entry must contain a supported `def` or terminal
-`#eval` command so a dependency's result can never be reported or published as
-the entry product. This is not `LEAN_PATH` or package discovery, implicit Prelude
+rows. The native `lean` personality also accepts an import-only selected entry
+and completes silently after checking and executing its dependency closure;
+dependency results never become entry output. The artifact-producing `fln run`
+path still requires a supported `def` or terminal `#eval` command in the selected
+entry so a dependency's result can never be reported or published as the entry
+product. This is not `LEAN_PATH` or package discovery, implicit Prelude
 ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 
