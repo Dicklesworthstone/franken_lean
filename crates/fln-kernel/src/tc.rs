@@ -372,7 +372,12 @@ impl ExprResultCache {
         None
     }
 
-    fn record_cross_scope(&mut self, key: &Expr, scope: usize) {
+    fn record_cross_scope_with_collision_policy(
+        &mut self,
+        key: &Expr,
+        scope: usize,
+        replace_collision: bool,
+    ) {
         let has_capacity = self.cross_scope_entries < self.max_entries;
         if let Some(bucket) = self.cross_scope.get_mut(&key.data().0) {
             if bucket
@@ -387,6 +392,11 @@ impl ExprResultCache {
                 self.cross_scope_entries += 1;
             } else if let Some(index) = oldest_same_key {
                 bucket[index] = (key.clone(), scope);
+            } else if replace_collision && !bucket.is_empty() {
+                // A termination-critical identity result must remain reachable
+                // after unrelated binder churn too. Retire the deterministic
+                // oldest collision pointer without widening either bound.
+                bucket[0] = (key.clone(), scope);
             }
         } else if has_capacity && self.max_bucket_entries > 0 {
             self.cross_scope
@@ -401,6 +411,37 @@ impl ExprResultCache {
         value: Expr,
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
+    ) {
+        self.insert_with_collision_policy(key, value, locals, local_positions, false);
+    }
+
+    /// Publish an already-computed result that is required to terminate an
+    /// explicit reduction continuation even when its Reference hash bucket is
+    /// full of distinct structural collisions. The oldest row is replaced as
+    /// one deterministic bounded unit; an eviction can only cause later
+    /// recomputation, while the ordinary insertion path remains miss-only.
+    fn insert_identity_replacing_collision(
+        &mut self,
+        identity: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) {
+        self.insert_with_collision_policy(
+            identity.clone(),
+            identity,
+            locals,
+            local_positions,
+            true,
+        );
+    }
+
+    fn insert_with_collision_policy(
+        &mut self,
+        key: Expr,
+        value: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+        replace_collision: bool,
     ) {
         let packed = (key.data().0, locals.len());
         let prior_scopes = self
@@ -468,9 +509,13 @@ impl ExprResultCache {
             return;
         }
         let replacement = self.buckets.get(&packed).and_then(|bucket| {
-            (bucket.len() >= self.max_bucket_entries)
-                .then(|| bucket.iter().position(|entry| entry.key == key))
-                .flatten()
+            if bucket.len() < self.max_bucket_entries {
+                return None;
+            }
+            bucket
+                .iter()
+                .position(|entry| entry.key == key)
+                .or_else(|| (replace_collision && !bucket.is_empty()).then_some(0))
         });
         if self
             .buckets
@@ -528,7 +573,7 @@ impl ExprResultCache {
             }
             return;
         }
-        self.record_cross_scope(&key, locals.len());
+        self.record_cross_scope_with_collision_policy(&key, locals.len(), replace_collision);
         if let Some(bucket) = self.buckets.get_mut(&packed) {
             if let Some(existing) = bucket
                 .iter_mut()
@@ -5283,16 +5328,15 @@ impl<'a> TypeChecker<'a> {
     /// outer recursor retries.  Without both entries, a safe definition such
     /// as `instDecidableNot p h` can unfold to the same stuck recursor on `h`
     /// on every retry and rebuild the continuation until the step budget is
-    /// exhausted.
+    /// exhausted. This identity result is termination-critical: a full bucket
+    /// of distinct 32-bit Reference-hash collisions must not suppress it.
     fn cache_stuck_recursor(&mut self, stuck: Expr) -> Expr {
-        self.whnf_cache.insert(
-            stuck.clone(),
+        self.whnf_cache.insert_identity_replacing_collision(
             stuck.clone(),
             &self.locals,
             &self.local_positions,
         );
-        self.whnf_core_cache.insert(
-            stuck.clone(),
+        self.whnf_core_cache.insert_identity_replacing_collision(
             stuck.clone(),
             &self.locals,
             &self.local_positions,
@@ -8931,6 +8975,60 @@ mod tests {
     }
 
     #[test]
+    fn stuck_recursor_identity_replaces_a_full_collision_bucket_without_growing_it() {
+        let env = Environment::new();
+        let (_, redex, _) = closed_cache_fixture();
+        let unrelated = Expr::sort(Level::one());
+        let seed_collision = || {
+            let mut cache = ExprResultCache::bounded(1, 1);
+            cache.buckets.insert(
+                (redex.data().0, 0),
+                vec![ExprResultCacheEntry {
+                    key: unrelated.clone(),
+                    value: unrelated.clone(),
+                    dependencies: Vec::new(),
+                }],
+            );
+            cache
+                .cross_scope
+                .insert(redex.data().0, vec![(unrelated.clone(), 0)]);
+            cache.entries = 1;
+            cache.cross_scope_entries = 1;
+            cache
+        };
+
+        let mut ordinary = seed_collision();
+        ordinary.insert(redex.clone(), redex.clone(), &[], &HashMap::new());
+        assert!(
+            ordinary.get(&redex, &[], &HashMap::new()).is_none()
+                && ordinary.entries == 1
+                && ordinary.cross_scope_entries == 1,
+            "ordinary collision saturation must remain a bounded cache miss"
+        );
+
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        tc.whnf_cache = seed_collision();
+        tc.whnf_core_cache = seed_collision();
+        assert!(tc.cache_stuck_recursor(redex.clone()) == redex);
+        for cache in [&tc.whnf_cache, &tc.whnf_core_cache] {
+            assert!(
+                cache.get(&redex, &tc.locals, &tc.local_positions) == Some(redex.clone())
+                    && cache.entries == 1
+                    && cache.cross_scope_entries == 1
+                    && cache
+                        .cross_scope
+                        .get(&redex.data().0)
+                        .is_some_and(|bucket| {
+                            bucket.len() == 1
+                                && bucket[0].0 == redex
+                                && bucket[0].1 == tc.locals.len()
+                        }),
+                "the termination-critical identity must replace both row and cross-scope collision pointers without widening either bound"
+            );
+        }
+    }
+
+    #[test]
     fn packed_collision_capacity_is_partitioned_by_telescope_length() {
         let env = Environment::new();
         let (pi, redex, sort) = closed_cache_fixture();
@@ -8980,8 +9078,8 @@ mod tests {
         );
 
         let mut bounded_index = ExprResultCache::bounded(1, 4);
-        bounded_index.record_cross_scope(&pi, 0);
-        bounded_index.record_cross_scope(&sort, 0);
+        bounded_index.record_cross_scope_with_collision_policy(&pi, 0, false);
+        bounded_index.record_cross_scope_with_collision_policy(&sort, 0, false);
         assert!(
             bounded_index.cross_scope_entries == 1 && bounded_index.cross_scope.len() == 1,
             "cross-scope acceleration must retain no more roots than the row bound"
