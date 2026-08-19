@@ -1842,29 +1842,55 @@ fn fresh_generated_command_name(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceModuleCommandPolicy {
+    ExecutableOnly,
+    DefinitionPrefix,
+    MixedPrefix,
+}
+
+impl SourceModuleCommandPolicy {
+    fn require_entry_command(self) -> bool {
+        matches!(self, Self::ExecutableOnly)
+    }
+
+    fn allow_empty_batch(self) -> bool {
+        !matches!(self, Self::ExecutableOnly)
+    }
+
+    fn allow_scratch_checks(self) -> bool {
+        matches!(self, Self::MixedPrefix)
+    }
+}
+
+struct SourceModuleVisibilitySubjects<'a> {
+    execution_owners: &'a [usize],
+    completed: &'a DefinitionBatchExecution,
+    check_owners: &'a [usize],
+    checks: &'a [SourceCheck],
+}
+
 fn verify_source_module_visibility(
     modules: &[SourceModuleInput<'_>],
     dependencies: &[Vec<usize>],
     order: &[usize],
-    execution_owners: &[usize],
-    completed: &DefinitionBatchExecution,
-    check_owners: &[usize],
-    checks: &[SourceCheck],
+    subjects: SourceModuleVisibilitySubjects<'_>,
     limit: usize,
 ) -> Result<(), EngineExecutionError> {
-    if execution_owners.len() != completed.executions.len() {
+    if subjects.execution_owners.len() != subjects.completed.executions.len() {
         return Err(EngineExecutionError::UnexpectedPublication {
             detail: "source command ownership does not cover every completed execution",
         });
     }
-    if check_owners.len() != checks.len() {
+    if subjects.check_owners.len() != subjects.checks.len() {
         return Err(EngineExecutionError::UnexpectedPublication {
             detail: "source command ownership does not cover every completed scratch check",
         });
     }
-    if execution_owners
+    if subjects
+        .execution_owners
         .iter()
-        .chain(check_owners)
+        .chain(subjects.check_owners)
         .any(|owner| *owner >= modules.len())
     {
         return Err(EngineExecutionError::UnexpectedPublication {
@@ -1909,7 +1935,12 @@ fn verify_source_module_visibility(
     }
 
     let mut declaration_owners = BTreeMap::new();
-    for (execution, &owner) in completed.executions.iter().zip(execution_owners) {
+    for (execution, &owner) in subjects
+        .completed
+        .executions
+        .iter()
+        .zip(subjects.execution_owners)
+    {
         let Declaration::Defn(definition) = &execution.declaration else {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "source execution published a non-definition declaration",
@@ -1926,18 +1957,20 @@ fn verify_source_module_visibility(
     }
 
     let mut presentations = 0_usize;
-    let subjects = completed
+    let declarations = subjects
+        .completed
         .executions
         .iter()
-        .zip(execution_owners)
+        .zip(subjects.execution_owners)
         .map(|(execution, owner)| (&execution.declaration, *owner))
         .chain(
-            checks
+            subjects
+                .checks
                 .iter()
-                .zip(check_owners)
+                .zip(subjects.check_owners)
                 .map(|(check, owner)| (&check.declaration, *owner)),
         );
-    for (declaration, owner) in subjects {
+    for (declaration, owner) in declarations {
         let Declaration::Defn(definition) = declaration else {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "source execution or scratch check produced a non-definition declaration",
@@ -3193,7 +3226,11 @@ impl Engine {
         }
         let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
         let completed = match self.execute_source_modules_internal(
-            &rewritten, entry, options, limits, false, true, false,
+            &rewritten,
+            entry,
+            options,
+            limits,
+            SourceModuleCommandPolicy::DefinitionPrefix,
         )? {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3309,7 +3346,11 @@ impl Engine {
                 module: entry.clone(),
             })?;
         let mut dependency_prefix = match self.execute_source_modules_internal(
-            &rewritten, entry, options, limits, false, true, true,
+            &rewritten,
+            entry,
+            options,
+            limits,
+            SourceModuleCommandPolicy::MixedPrefix,
         )? {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3459,7 +3500,13 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_source_modules_internal(modules, entry, options, limits, true, false, false)
+        self.execute_source_modules_internal(
+            modules,
+            entry,
+            options,
+            limits,
+            SourceModuleCommandPolicy::ExecutableOnly,
+        )
     }
 
     fn execute_source_modules_internal(
@@ -3468,9 +3515,7 @@ impl Engine {
         entry: &Name,
         options: &KVMap,
         limits: EngineExecutionLimits,
-        require_entry_command: bool,
-        allow_empty_batch: bool,
-        allow_scratch_checks: bool,
+        policy: SourceModuleCommandPolicy,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         if modules.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -3620,7 +3665,7 @@ impl Engine {
                     .collect(),
             });
         }
-        if require_entry_command && parsed[entry_index].commands.is_empty() {
+        if policy.require_entry_command() && parsed[entry_index].commands.is_empty() {
             return Err(EngineExecutionError::EmptySourceEntry {
                 module: entry.clone(),
             });
@@ -3657,7 +3702,7 @@ impl Engine {
             commands.extend(parsed[index].commands.iter().copied());
             command_owners.extend(std::iter::repeat_n(index, parsed[index].commands.len()));
         }
-        if allow_empty_batch && commands.is_empty() {
+        if policy.allow_empty_batch() && commands.is_empty() {
             let root = self.logical_root(options);
             return Ok(Outcome::Complete(DefinitionBatchExecution {
                 engine: self.clone(),
@@ -3668,7 +3713,7 @@ impl Engine {
                 source_evaluation_indices: Vec::new(),
             }));
         }
-        if allow_scratch_checks {
+        if policy.allow_scratch_checks() {
             let mixed = match self.execute_source_command_stream(commands, options, limits)? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -3734,10 +3779,12 @@ impl Engine {
                 modules,
                 &dependencies,
                 &order,
-                &execution_owners,
-                &mixed.batch,
-                &check_owners,
-                &mixed.checks,
+                SourceModuleVisibilitySubjects {
+                    execution_owners: &execution_owners,
+                    completed: &mixed.batch,
+                    check_owners: &check_owners,
+                    checks: &mixed.checks,
+                },
                 limits.source_modules.max_dependency_presentations,
             )?;
             let mut completed = mixed.batch;
@@ -3750,10 +3797,12 @@ impl Engine {
                     modules,
                     &dependencies,
                     &order,
-                    &command_owners,
-                    &completed,
-                    &[],
-                    &[],
+                    SourceModuleVisibilitySubjects {
+                        execution_owners: &command_owners,
+                        completed: &completed,
+                        check_owners: &[],
+                        checks: &[],
+                    },
                     limits.source_modules.max_dependency_presentations,
                 )?;
                 completed.source_module_order = module_order;
