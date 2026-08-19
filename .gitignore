@@ -148,3 +148,8 @@ __pycache__/
 /contracts/builtin_environment.001.tsv
 /contracts/builtin_environment.002.tsv
 /contracts/builtin_partition.tsv
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+
