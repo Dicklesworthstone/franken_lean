@@ -2842,8 +2842,159 @@ impl Engine {
         Ok(match checked {
             Outcome::Complete(check) => Outcome::Complete(TerminalSourceCheck {
                 definition_prefix,
+                source_module_order: Vec::new(),
                 check,
             }),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        })
+    }
+
+    /// Execute a closed definition-only module graph, then check the entry's
+    /// terminal query against its exact completed environment.
+    ///
+    /// Every nonterminal command in every module must be a definition. The
+    /// entry may contain no definition of its own: imported definitions still
+    /// form the query environment. Graph planning, dependency visibility, and
+    /// definition execution use the ordinary closed-module path. The terminal
+    /// query itself is admitted only in a discarded scratch successor.
+    pub fn check_terminal_source_modules(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<TerminalSourceCheck>, EngineExecutionError> {
+        if modules.is_empty() {
+            return Err(EngineExecutionError::EmptyBatch);
+        }
+        if modules.len() > limits.source_modules.max_modules {
+            return Err(EngineExecutionError::SourceModuleLimit {
+                observed: modules.len(),
+                limit: limits.source_modules.max_modules,
+            });
+        }
+        let entry_matches = modules
+            .iter()
+            .filter(|module| module.name == entry)
+            .count();
+        match entry_matches {
+            0 => {
+                return Err(EngineExecutionError::MissingSourceEntry {
+                    module: entry.clone(),
+                });
+            }
+            1 => {}
+            _ => {
+                return Err(EngineExecutionError::DuplicateSourceModule {
+                    module: entry.clone(),
+                });
+            }
+        }
+
+        let mut query_source = None;
+        let mut rewritten = Vec::new();
+        rewritten.try_reserve_exact(modules.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "terminal-check source module table",
+                requested: modules.len(),
+            }
+        })?;
+        for module in modules {
+            let partitioned = fln_parse::partition_source_module(module.source)
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend)?;
+            let prefix_len = if module.name == entry {
+                let terminal_index = partitioned.commands.len().checked_sub(1).ok_or(
+                    EngineExecutionError::TerminalCheckRequired,
+                )?;
+                let (terminal_offset, terminal_source) = partitioned.commands[terminal_index];
+                let terminal = fln_parse::parse_source_command(terminal_source)
+                    .map_err(|error| error.with_original_offset(terminal_offset))
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: terminal_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                    })?;
+                if terminal.kind() != fln_parse::SourceCommandKind::Check {
+                    return Err(EngineExecutionError::TerminalCheckRequired);
+                }
+                query_source = Some(terminal_source);
+                terminal_index
+            } else {
+                partitioned.commands.len()
+            };
+            for (index, (original_offset, command_source)) in
+                partitioned.commands.iter().take(prefix_len).enumerate()
+            {
+                let parsed = fln_parse::parse_source_command(command_source)
+                    .map_err(|error| error.with_original_offset(*original_offset))
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                    })?;
+                if parsed.kind() != fln_parse::SourceCommandKind::Definition {
+                    return Err(
+                        EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
+                            module: module.name.clone(),
+                            index,
+                        },
+                    );
+                }
+            }
+            let source = if module.name == entry {
+                let (terminal_offset, _) = partitioned
+                    .commands
+                    .get(prefix_len)
+                    .copied()
+                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                        detail: "terminal source command disappeared after preflight",
+                    })?;
+                module.source.get(..terminal_offset.0).ok_or(
+                    EngineExecutionError::UnexpectedPublication {
+                        detail: "terminal source command offset escaped its module bytes",
+                    },
+                )?
+            } else {
+                module.source
+            };
+            rewritten.push(SourceModuleInput {
+                name: module.name,
+                source,
+            });
+        }
+        let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
+        let completed = match self.execute_source_modules_internal(
+            &rewritten, entry, options, limits, false, true,
+        )? {
+            Outcome::Complete(completed) => completed,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let query_index = completed.executions.len();
+        let checked = completed
+            .engine
+            .check_source_command(query_source, options, limits.admission())
+            .map_err(|error| EngineExecutionError::BatchCommand {
+                index: query_index,
+                error: Box::new(error),
+            })?;
+        Ok(match checked {
+            Outcome::Complete(check) => {
+                let mut completed = completed;
+                let source_module_order = std::mem::take(&mut completed.source_module_order);
+                let definition_prefix = if completed.executions.is_empty() {
+                    None
+                } else {
+                    Some(completed)
+                };
+                Outcome::Complete(TerminalSourceCheck {
+                    definition_prefix,
+                    source_module_order,
+                    check,
+                })
+            }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         })
@@ -2970,6 +3121,18 @@ impl Engine {
         entry: &Name,
         options: &KVMap,
         limits: EngineExecutionLimits,
+    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+        self.execute_source_modules_internal(modules, entry, options, limits, true, false)
+    }
+
+    fn execute_source_modules_internal(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        require_entry_command: bool,
+        allow_empty_batch: bool,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         if modules.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -3119,7 +3282,7 @@ impl Engine {
                     .collect(),
             });
         }
-        if parsed[entry_index].commands.is_empty() {
+        if require_entry_command && parsed[entry_index].commands.is_empty() {
             return Err(EngineExecutionError::EmptySourceEntry {
                 module: entry.clone(),
             });
@@ -3155,6 +3318,17 @@ impl Engine {
         for &index in &order {
             commands.extend(parsed[index].commands.iter().copied());
             command_owners.extend(std::iter::repeat_n(index, parsed[index].commands.len()));
+        }
+        if allow_empty_batch && commands.is_empty() {
+            let root = self.logical_root(options);
+            return Ok(Outcome::Complete(DefinitionBatchExecution {
+                engine: self.clone(),
+                base_logical_root: root,
+                result_logical_root: root,
+                executions: Vec::new(),
+                source_module_order: module_order,
+                source_evaluation_indices: Vec::new(),
+            }));
         }
         match self.execute_source_commands(commands, options, limits)? {
             Outcome::Complete(mut completed) => {
