@@ -373,14 +373,12 @@ discarded: a query does not publish a declaration, enter compiler ingress, or
 run on Golem. For example, `#check Nat` prints `Nat : Type`, while `def answer :=
 42` followed by `#check answer` prints `answer : Nat`. Check and evaluation rows
 are buffered in source order until the entire command stream and every VM exit
-succeeds, so a later failure leaves stdout empty. A terminal query may also
-observe a completed definition-only local import closure resolved by the
-bounded source-module engine, including a transitive import when every module
-is supplied by that resolver. Imported command streams remain narrower:
-evaluations and earlier checks are refused anywhere in the query closure and
-the query must be the final entry command. The type renderer covers only
-bounded supported shapes rather than Reference pretty-printing or
-diagnostic-text parity.
+succeeds, so a later failure leaves stdout empty. A selected local-import entry
+gets that same ordered command stream after its complete transitive dependency
+environment is checked and executed. Imported dependency modules are
+definition-only and silent: their evaluations or checks are refused rather
+than replayed as entry output. The type renderer covers only bounded supported
+shapes rather than Reference pretty-printing or diagnostic-text parity.
 
 The same bounded local resolver is available through `lean --src-deps FILE`:
 it parses only the import header, validates every direct local source import,

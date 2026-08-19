@@ -226,7 +226,7 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(imported_evaluation.stdout.is_empty());
     assert!(utf8(&imported_evaluation.stderr).starts_with("lean: execution: "));
     assert!(utf8(&imported_evaluation.stderr).contains("module `Project.Seed`"));
-    assert!(utf8(&imported_evaluation.stderr).contains("only definitions"));
+    assert!(utf8(&imported_evaluation.stderr).contains("definition-only"));
 
     let unknown_check = run_lean_stdin(
         &[Path::new("--stdin")],
@@ -610,6 +610,51 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     );
     assert_eq!(utf8(&native.stdout), "42\n");
     assert!(native.stderr.is_empty());
+
+    std::fs::write(
+        &main,
+        b"import Project.Middle\n#check middle\n#eval middle + 2\ndef answer : Nat := middle + 3\n#check answer\n#eval answer\n",
+    )
+    .expect("write a mixed imported entry command stream");
+    let mixed_native = run_lean(&[&main]);
+    assert!(
+        mixed_native.status.success(),
+        "mixed imported native lean stderr: {}",
+        utf8(&mixed_native.stderr)
+    );
+    assert_eq!(
+        utf8(&mixed_native.stdout),
+        "middle : Nat\n42\nanswer : Nat\n43\n"
+    );
+    assert!(mixed_native.stderr.is_empty());
+
+    std::fs::write(
+        &main,
+        b"import Project.Middle\n#check later\ndef later : Nat := middle\n",
+    )
+    .expect("plant a future-definition imported entry query");
+    let future_entry = run_lean(&[&main]);
+    assert!(!future_entry.status.success());
+    assert!(future_entry.stdout.is_empty());
+    assert!(utf8(&future_entry.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&future_entry.stderr).contains("no inferable type"));
+
+    std::fs::write(&base, b"#eval 99\ndef base : Nat := 20\n")
+        .expect("plant an output-producing imported dependency");
+    std::fs::write(&main, b"import Project.Base\n#check base\n")
+        .expect("write an entry over the noisy dependency");
+    let noisy_dependency = run_lean(&[&main]);
+    assert!(!noisy_dependency.status.success());
+    assert!(noisy_dependency.stdout.is_empty());
+    assert!(utf8(&noisy_dependency.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&noisy_dependency.stderr).contains("definition-only"));
+
+    std::fs::write(&base, b"def base : Nat := 20\n").expect("restore the base dependency");
+    std::fs::write(
+        &main,
+        b"import Project.Middle\ndef verified : Bool := middle + 2 == 42\n#eval middle + 2\n",
+    )
+    .expect("restore the evaluating entry after mixed command controls");
 
     let dependency_probe = root.join("DependencyProbe.lean");
     std::fs::write(

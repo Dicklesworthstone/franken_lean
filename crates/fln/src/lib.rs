@@ -2805,11 +2805,20 @@ impl Engine {
                 imports: partitioned.imports,
             });
         }
-        if partitioned.commands.is_empty() {
+        self.execute_source_command_stream(partitioned.commands, options, limits)
+    }
+
+    fn execute_source_command_stream(
+        &self,
+        commands: Vec<(fln_parse::BytePos, &[u8])>,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
         }
 
-        let command_count = partitioned.commands.len();
+        let command_count = commands.len();
         let mut executions = Vec::new();
         executions.try_reserve_exact(command_count).map_err(|_| {
             EngineExecutionError::AllocationFailure {
@@ -2848,9 +2857,7 @@ impl Engine {
 
         let base_logical_root = self.logical_root(options);
         let mut engine = self.clone();
-        for (command_index, (original_offset, command_source)) in
-            partitioned.commands.into_iter().enumerate()
-        {
+        for (command_index, (original_offset, command_source)) in commands.into_iter().enumerate() {
             let parsed = fln_parse::parse_source_command(command_source)
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -3191,6 +3198,129 @@ impl Engine {
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
         })
+    }
+
+    /// Execute a closed local source-module graph with a mixed command stream
+    /// in the selected entry module.
+    ///
+    /// Every dependency module is definition-only and executes silently in the
+    /// ordinary deterministic dependency order. The entry then runs definitions,
+    /// evaluations, and scratch-only checks in source order against that exact
+    /// completed dependency environment. Dependency execution and entry output
+    /// are retained separately so a presentation can reject any non-returning VM
+    /// exit before exposing the entry's buffered output.
+    pub fn execute_source_modules_with_entry_checks(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<SourceModuleCommandBatchExecution>, EngineExecutionError> {
+        if modules.is_empty() {
+            return Err(EngineExecutionError::EmptyBatch);
+        }
+        if modules.len() > limits.source_modules.max_modules {
+            return Err(EngineExecutionError::SourceModuleLimit {
+                observed: modules.len(),
+                limit: limits.source_modules.max_modules,
+            });
+        }
+        let entry_matches = modules.iter().filter(|module| module.name == entry).count();
+        match entry_matches {
+            0 => {
+                return Err(EngineExecutionError::MissingSourceEntry {
+                    module: entry.clone(),
+                });
+            }
+            1 => {}
+            _ => {
+                return Err(EngineExecutionError::DuplicateSourceModule {
+                    module: entry.clone(),
+                });
+            }
+        }
+
+        let mut entry_commands = None;
+        let mut rewritten = Vec::new();
+        rewritten.try_reserve_exact(modules.len()).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "mixed-entry source module table",
+                requested: modules.len(),
+            }
+        })?;
+        for module in modules {
+            let partitioned = fln_parse::partition_source_module(module.source)
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(EngineExecutionError::Frontend)?;
+            let source = if module.name == entry {
+                let (first_offset, _) = partitioned.commands.first().copied().ok_or_else(|| {
+                    EngineExecutionError::EmptySourceEntry {
+                        module: entry.clone(),
+                    }
+                })?;
+                let source = module.source.get(..first_offset.0).ok_or(
+                    EngineExecutionError::UnexpectedPublication {
+                        detail: "entry source command offset escaped its module bytes",
+                    },
+                )?;
+                entry_commands = Some(partitioned.commands);
+                source
+            } else {
+                for (index, (original_offset, command_source)) in
+                    partitioned.commands.iter().enumerate()
+                {
+                    let parsed = fln_parse::parse_source_command(command_source)
+                        .map_err(|error| error.with_original_offset(*original_offset))
+                        .map_err(DefinitionFrontendError::Parse)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index,
+                            error: Box::new(EngineExecutionError::Frontend(error)),
+                        })?;
+                    if parsed.kind() != fln_parse::SourceCommandKind::Definition {
+                        return Err(EngineExecutionError::SourceDependencyDefinitionRequired {
+                            module: module.name.clone(),
+                            index,
+                        });
+                    }
+                }
+                module.source
+            };
+            rewritten.push(SourceModuleInput {
+                name: module.name,
+                source,
+            });
+        }
+        let entry_commands =
+            entry_commands.ok_or_else(|| EngineExecutionError::MissingSourceEntry {
+                module: entry.clone(),
+            })?;
+        let mut dependency_prefix = match self
+            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true)?
+        {
+            Outcome::Complete(completed) => completed,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let entry_execution = match dependency_prefix.engine.execute_source_command_stream(
+            entry_commands,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(completed) => completed,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let source_module_order = std::mem::take(&mut dependency_prefix.source_module_order);
+        let dependency_prefix = if dependency_prefix.executions.is_empty() {
+            None
+        } else {
+            Some(dependency_prefix)
+        };
+        Ok(Outcome::Complete(SourceModuleCommandBatchExecution {
+            dependency_prefix,
+            source_module_order,
+            entry: entry_execution,
+        }))
     }
 
     fn execute_parsed_source_definition(
@@ -5258,6 +5388,18 @@ pub struct SourceCommandBatchExecution {
     pub checks: Vec<SourceCheck>,
 }
 
+/// A closed dependency graph followed by its selected entry command stream.
+#[derive(Debug)]
+pub struct SourceModuleCommandBatchExecution {
+    /// Completed definition-only dependency execution, absent for an entry with
+    /// no executable dependency declarations.
+    pub dependency_prefix: Option<DefinitionBatchExecution>,
+    /// Canonical dependency-first module order, including the entry last.
+    pub source_module_order: Vec<Name>,
+    /// The selected entry's ordered definition/evaluation/check result.
+    pub entry: SourceCommandBatchExecution,
+}
+
 /// One exact source module in a caller-supplied closed import set.
 ///
 /// `name` is resolver authority supplied by the caller. The source header must
@@ -5714,6 +5856,10 @@ pub enum EngineExecutionError {
         module: Name,
         index: usize,
     },
+    SourceDependencyDefinitionRequired {
+        module: Name,
+        index: usize,
+    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5847,6 +5993,11 @@ impl fmt::Display for EngineExecutionError {
             Self::TerminalCheckModuleDefinitionPrefix { module, index } => write!(
                 formatter,
                 "bounded terminal #check permits only definitions in its import closure; command {index} in module `{}` is not a definition",
+                module.to_display_string(),
+            ),
+            Self::SourceDependencyDefinitionRequired { module, index } => write!(
+                formatter,
+                "native source entry execution requires imported module `{}` to be definition-only; command {index} is not a definition",
                 module.to_display_string(),
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
@@ -9845,6 +9996,141 @@ mod tests {
                 .expect("the unchanged engine recovers after imported-query refusals"),
             Outcome::Complete(_)
         ));
+    }
+
+    #[test]
+    fn mixed_entry_commands_observe_a_silent_definition_only_import_closure() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let base = Name::from_components(["Base"]);
+        let middle = Name::from_components(["Middle"]);
+        let main = Name::from_components(["Main"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Middle\n#check middle\n#eval middle\ndef answer : Nat := middle + 1\n#check answer\n#eval answer",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"def base : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &middle,
+                source: b"import Base\ndef middle : Nat := base + 2",
+            },
+        ];
+
+        let Outcome::Complete(completed) = engine
+            .execute_source_modules_with_entry_checks(&modules, &main, &options, test_limits())
+            .expect("the mixed entry observes its deterministic dependency environment")
+        else {
+            panic!("the mixed imported source stream must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(
+            completed.source_module_order,
+            [base.clone(), middle, main.clone()]
+        );
+        let dependency_prefix = completed
+            .dependency_prefix
+            .as_ref()
+            .expect("both imported definitions execute before the entry");
+        assert_eq!(dependency_prefix.executions.len(), 2);
+        assert_eq!(dependency_prefix.source_evaluation_indices, []);
+        assert_eq!(completed.entry.command_count, 5);
+        assert_eq!(completed.entry.execution_command_indices, [1, 2, 4]);
+        assert_eq!(completed.entry.batch.source_evaluation_indices, [0, 2]);
+        assert_eq!(completed.entry.outputs.len(), 4);
+        assert_eq!(completed.entry.checks.len(), 2);
+        assert_eq!(
+            completed.entry.batch.base_logical_root,
+            dependency_prefix.result_logical_root
+        );
+        assert_eq!(
+            closed_vm_value(&completed.entry.batch.executions[0].exit),
+            Ok(Some(ClosedVmValue::Scalar(42)))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.entry.batch.executions[2].exit),
+            Ok(Some(ClosedVmValue::Scalar(43)))
+        );
+        assert_eq!(
+            completed.entry.checks[0].environment_root,
+            dependency_prefix.result_logical_root
+        );
+        assert_eq!(
+            completed.entry.checks[1].environment_root,
+            completed.entry.batch.executions[1].result_logical_root
+        );
+        for check in &completed.entry.checks {
+            let Declaration::Defn(query) = &check.declaration else {
+                panic!("each imported-entry query candidate must be a definition"); // ubs:ignore — test-only diagnostic.
+            };
+            assert!(
+                !completed
+                    .entry
+                    .batch
+                    .engine
+                    .environment()
+                    .contains(&query.base.name)
+            );
+        }
+        assert_eq!(engine.logical_root(&options), before);
+
+        let future_modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check later\ndef later : Nat := base",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"def base : Nat := 40",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .execute_source_modules_with_entry_checks(
+                    &future_modules,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("an entry check cannot observe a later entry definition"),
+            EngineExecutionError::BatchCommand {
+                index: 0,
+                error,
+            } if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let noisy_dependency = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check base",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"#eval 40\ndef base : Nat := 40",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .execute_source_modules_with_entry_checks(
+                    &noisy_dependency,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("imported modules cannot leak evaluation output into the entry"),
+            EngineExecutionError::SourceDependencyDefinitionRequired {
+                ref module,
+                index: 0,
+            } if module == &base
+        ));
+        assert_eq!(engine.logical_root(&options), before);
     }
 
     #[test]

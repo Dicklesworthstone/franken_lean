@@ -136,9 +136,10 @@ const LEAN_USAGE: &str = concat!(
     "printed as `term : type` without compilation, VM execution, or publication.\n",
     "A query sees the checked source seed and every preceding command successor.\n",
     "Check and #eval output is buffered in source order until the whole source\n",
-    "succeeds; a later failure leaves stdout empty. Imported sources retain the\n",
-    "narrower definition-only closure plus one final entry #check. The bounded\n",
-    "renderer does not pretty-print dependent or other unsupported type shapes.\n",
+    "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
+    "same ordered command stream after its transitive definition-only dependency\n",
+    "closure completes; dependency checks and evaluations are refused, not replayed.\n",
+    "The bounded renderer does not pretty-print dependent or other unsupported types.\n",
     "For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
@@ -3566,13 +3567,6 @@ fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, M
     Ok(format!("{term} : {type_}\n"))
 }
 
-fn render_lean_source_check(checked: &fln::SourceCheck) -> MultiplexerOutput {
-    match render_lean_source_check_line(checked) {
-        Ok(line) => MultiplexerOutput::success(line),
-        Err(error) => error,
-    }
-}
-
 fn source_has_check(source: &[u8]) -> bool {
     fln::partition_source_module(source).is_ok_and(|module| {
         module.commands.iter().any(|(_, command)| {
@@ -3580,16 +3574,6 @@ fn source_has_check(source: &[u8]) -> bool {
                 .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
         })
     })
-}
-
-fn source_has_terminal_check(source: &[u8]) -> bool {
-    fln::partition_source_module(source)
-        .ok()
-        .and_then(|module| module.commands.last().copied())
-        .is_some_and(|(_, command)| {
-            fln::parse_source_command(command)
-                .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
-        })
 }
 
 fn source_execution_exit_failure(
@@ -3618,8 +3602,10 @@ fn source_execution_exit_failure(
     }
 }
 
-fn render_lean_terminal_source_check(checked: &fln::TerminalSourceCheck) -> MultiplexerOutput {
-    if let Some(prefix) = &checked.definition_prefix {
+fn render_lean_source_module_commands(
+    completed: &fln::SourceModuleCommandBatchExecution,
+) -> MultiplexerOutput {
+    if let Some(prefix) = &completed.dependency_prefix {
         for (command_index, execution) in prefix.executions.iter().enumerate() {
             if let Some(failure) = source_execution_exit_failure(
                 command_index,
@@ -3630,7 +3616,7 @@ fn render_lean_terminal_source_check(checked: &fln::TerminalSourceCheck) -> Mult
             }
         }
     }
-    render_lean_source_check(&checked.check)
+    render_lean_source_commands(&completed.entry)
 }
 
 fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
@@ -4088,24 +4074,21 @@ where
         };
     }
     if matches!(presentation, SourcePresentation::Lean)
-        && module_plan.is_some()
-        && let Some(source) = source_refs.last().copied()
-        && source_has_terminal_check(source)
+        && let Some(plan) = module_plan.as_ref()
     {
-        let checked = match module_plan.as_ref() {
-            Some(plan) => {
-                let modules = plan
-                    .names
-                    .iter()
-                    .zip(source_refs.iter().copied())
-                    .map(|(name, source)| fln::SourceModuleInput { name, source })
-                    .collect::<Vec<_>>();
-                engine.check_terminal_source_modules(&modules, &plan.entry, &options, limits)
-            }
-            None => engine.check_terminal_source_command(source, &options, limits),
-        };
-        let checked = match checked {
-            Ok(checked) => checked,
+        let modules = plan
+            .names
+            .iter()
+            .zip(source_refs.iter().copied())
+            .map(|(name, source)| fln::SourceModuleInput { name, source })
+            .collect::<Vec<_>>();
+        let completed = match engine.execute_source_modules_with_entry_checks(
+            &modules,
+            &plan.entry,
+            &options,
+            limits,
+        ) {
+            Ok(completed) => completed,
             Err(error) => {
                 let (class, authority, exit_code) = execution_error_disposition(&error);
                 return source_failure(
@@ -4117,8 +4100,8 @@ where
                 );
             }
         };
-        return match checked {
-            fln::Outcome::Complete(checked) => render_lean_terminal_source_check(&checked),
+        return match completed {
+            fln::Outcome::Complete(completed) => render_lean_source_module_commands(&completed),
             fln::Outcome::Inconclusive(inconclusive) => source_failure(
                 "inconclusive",
                 &format!("{inconclusive:?}"),
@@ -6095,7 +6078,7 @@ mod tests {
         execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
         execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
         module_name_from_relative, olean_write_error_disposition, parse_source_run,
-        read_bounded_from, render_lean_source_commands, render_lean_terminal_source_check, run,
+        read_bounded_from, render_lean_source_commands, render_lean_source_module_commands, run,
         run_lean, run_lean_with_input, source_failure, source_import_relative_path,
         verify_olean_rebuild_bytes,
     };
@@ -6936,7 +6919,7 @@ mod tests {
         );
         assert!(
             help.stdout
-                .contains("definition-only closure plus one final entry #check")
+                .contains("transitive definition-only dependency")
         );
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
@@ -8079,7 +8062,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_terminal_check_never_prints_after_a_module_prefix_vm_failure() {
+    fn imported_entry_never_prints_after_a_module_prefix_vm_failure() {
         let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
         let engine = fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel))
             .expect("the source seed reaches both checker seats")
@@ -8098,18 +8081,18 @@ mod tests {
             },
         ];
         let outcome = engine
-            .check_terminal_source_modules(
+            .execute_source_modules_with_entry_checks(
                 &modules,
                 &main,
                 &fln::KVMap::new(),
                 fln::EngineExecutionLimits::new(kernel),
             )
-            .expect("the imported terminal check completes before the planted VM exit");
+            .expect("the imported entry completes before the planted VM exit");
         let fln::Outcome::Complete(mut completed) = outcome else {
-            panic!("the imported terminal check must answer completely"); // ubs:ignore — test-only diagnostic.
+            panic!("the imported entry must answer completely"); // ubs:ignore — test-only diagnostic.
         };
         let prefix = completed
-            .definition_prefix
+            .dependency_prefix
             .as_mut()
             .expect("the imported definition is the real query prefix");
         let usage = match &prefix.executions[0].exit {
@@ -8123,7 +8106,7 @@ mod tests {
             usage,
         };
 
-        let output = render_lean_terminal_source_check(&completed);
+        let output = render_lean_source_module_commands(&completed);
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.starts_with("lean: program-panic: "));
