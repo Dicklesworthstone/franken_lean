@@ -4,9 +4,10 @@
 //! treats metadata as transparent, ignores binder presentation, and compares
 //! `Sort` levels with this checker's independent universe relation. Deferred
 //! pairs continue through a slow worklist that first takes a no-delta weak head,
-//! checks KR-308 Nat successor offsets, applies closed-pair KR-313 Nat reduction,
-//! then unfolds safe definition heads one step at a time in descending
-//! definitional-height order. At the exact `String.ofList` comparison gate,
+//! checks KR-308 Nat successor offsets, and applies KR-313 Nat reduction. Ordinary
+//! queries require a closed pair; the pin's exact eager query may first normalize
+//! open operands. It then unfolds safe definition heads one step at a time in
+//! descending definitional-height order. At the exact `String.ofList` comparison gate,
 //! Unicode String literals expand through the checker-owned KR-314 reducer.
 //! Once both heads are stable, the exact `fun x => f x` KR-312 subset contracts
 //! through a virtual binder when `f` does not depend on `x`. Pi-driven eta,
@@ -18,7 +19,8 @@ use std::collections::BTreeSet;
 
 use crate::nat_reduce::{
     NatReductionBudget, NatReductionFault, NatReductionOutcome, NatReductionProgress,
-    NatReductionRefusal, NatReductionStop, is_potential_nat_reduction, reduce_nat_at_with,
+    NatReductionQuery, NatReductionRefusal, NatReductionScope, NatReductionStop,
+    is_potential_nat_reduction, reduce_nat_at_with,
 };
 use crate::numeric::NatBudget;
 use crate::string_reduce::{
@@ -1880,6 +1882,7 @@ fn reduce_nat_candidate(
     companion_reference: DefEqTerm,
     sources: TermSources<'_>,
     context: &WhnfContext,
+    scope: NatReductionScope,
     control: &mut SlowControl,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Option<WireExpr>, SlowHalt> {
@@ -1890,12 +1893,15 @@ fn reduce_nat_candidate(
     let companion = sources.source(companion_reference)?;
     let budget = control.remaining_nat_budget();
     match reduce_nat_at_with(
-        candidate,
-        reference.root,
-        companion,
-        companion_reference.root,
-        context,
+        NatReductionQuery::new(
+            candidate,
+            reference.root,
+            companion,
+            companion_reference.root,
+            context,
+        ),
         budget,
+        scope,
         cancelled,
     ) {
         NatReductionOutcome::Reduced(result) => {
@@ -2447,6 +2453,7 @@ fn run_slow(
     context: &WhnfContext,
     budget: DefEqBudget,
     quick_comparisons: u64,
+    nat_scope: NatReductionScope,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DefEqOutcome, SlowHalt> {
     let mut control = SlowControl::new(budget, quick_comparisons);
@@ -2627,6 +2634,7 @@ fn run_slow(
                             right_reference,
                             TermSources::new(left, right, &generated),
                             context,
+                            nat_scope,
                             &mut control,
                             cancelled,
                         )?
@@ -2641,6 +2649,7 @@ fn run_slow(
                             left_reference,
                             TermSources::new(left, right, &generated),
                             context,
+                            nat_scope,
                             &mut control,
                             cancelled,
                         )?
@@ -2807,7 +2816,45 @@ pub fn def_eq_with(
     budget: DefEqBudget,
     mut cancelled: impl FnMut() -> bool,
 ) -> DefEqOutcome {
-    match quick_def_eq_with(left, right, budget.quick, &mut cancelled) {
+    def_eq_scoped_with(
+        left,
+        right,
+        context,
+        budget,
+        NatReductionScope::ClosedPair,
+        &mut cancelled,
+    )
+}
+
+/// The pin's query-local `m_eager_reduce` conversion. This differs from
+/// ordinary conversion only by allowing KR-313 to try WHNF on open Nat
+/// operands; unresolved free variables still leave the pair deferred.
+pub(crate) fn def_eq_eager_with(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+    mut cancelled: impl FnMut() -> bool,
+) -> DefEqOutcome {
+    def_eq_scoped_with(
+        left,
+        right,
+        context,
+        budget,
+        NatReductionScope::EagerOpenPair,
+        &mut cancelled,
+    )
+}
+
+fn def_eq_scoped_with(
+    left: &WireExpr,
+    right: &WireExpr,
+    context: &WhnfContext,
+    budget: DefEqBudget,
+    nat_scope: NatReductionScope,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> DefEqOutcome {
+    match quick_def_eq_with(left, right, budget.quick, &mut *cancelled) {
         QuickDefEqOutcome::Equal(result) => DefEqOutcome::Equal(DefEqProgress {
             quick_comparisons: result.comparisons,
             ..DefEqProgress::default()
@@ -2831,7 +2878,8 @@ pub fn def_eq_with(
             context,
             budget,
             completed_comparisons,
-            &mut cancelled,
+            nat_scope,
+            cancelled,
         )),
         QuickDefEqOutcome::Inconclusive(stop) => DefEqOutcome::Inconclusive(DefEqStop::Quick(stop)),
         QuickDefEqOutcome::InternalFault(fault) => {

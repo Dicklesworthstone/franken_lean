@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::defeq::{
     DefEqBudget, DefEqDeferred, DefEqFault, DefEqMismatch, DefEqOutcome, DefEqSide, DefEqStop,
-    QuickDefEqBudget, def_eq_with,
+    QuickDefEqBudget, def_eq_eager_with, def_eq_with,
 };
 use crate::environment::{ConstantEnvironment, ConstantKind, ConstantSafety, DefinitionSafety};
 use crate::instantiate::{
@@ -3804,12 +3804,15 @@ impl<'a> InferenceEngine<'a> {
             .step(self.cancelled, InferencePhase::DomainComparison, argument)
             .map_err(LeafHalt::stop)?;
         self.control.progress.defeq_queries = self.control.progress.defeq_queries.saturating_add(1);
-        // The current independent conversion engine has no eager-sensitive
-        // native or open-pair reduction rule. Carry the marker as query-local
-        // state so adding such a rule cannot require mutable context state or
-        // leak into the next conversion query.
         let outcome = match conversion {
-            ConversionMode::Ordinary | ConversionMode::EagerReduce => def_eq_with(
+            ConversionMode::Ordinary => def_eq_with(
+                actual,
+                expected,
+                self.context.reduction(),
+                self.control.budget.defeq,
+                &mut *self.cancelled,
+            ),
+            ConversionMode::EagerReduce => def_eq_eager_with(
                 actual,
                 expected,
                 self.context.reduction(),

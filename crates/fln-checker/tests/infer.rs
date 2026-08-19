@@ -2370,6 +2370,165 @@ fn eager_reduce_recognition_is_exact_and_query_local() {
 }
 
 #[test]
+fn eager_reduce_drives_open_nat_conversion_without_widening_ordinary_queries() {
+    let sort_zero = Expr::sort(Level::zero());
+    let sort_one = Expr::sort(Level::one());
+    let nat = Expr::const_(primary_name("Nat"), Vec::new());
+    let one = Expr::lit(Literal::Nat(NatLit::from_u64(1)));
+    let two = Expr::lit(Literal::Nat(NatLit::from_u64(2)));
+    let local_nat = Expr::fvar(FVarId(primary_name("n")));
+    let open_sum = Expr::app(
+        Expr::app(
+            Expr::const_(Name::str(primary_name("Nat"), "add"), Vec::new()),
+            local_nat,
+        ),
+        one.clone(),
+    );
+    let equality = |left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(primary_name("Eq"), Vec::new()), nat.clone()),
+                left,
+            ),
+            right,
+        )
+    };
+    let open_proposition = equality(open_sum, two.clone());
+    let reduced_proposition = equality(two.clone(), two);
+    let equality_type = Expr::forall_e(
+        primary_name("α"),
+        sort_one.clone(),
+        Expr::forall_e(
+            primary_name("left"),
+            Expr::bvar(0).expect("type binder"),
+            Expr::forall_e(
+                primary_name("right"),
+                Expr::bvar(1).expect("type binder under left"),
+                sort_zero.clone(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let nat_binary_type = Expr::forall_e(
+        primary_name("left"),
+        nat.clone(),
+        Expr::forall_e(
+            primary_name("right"),
+            nat.clone(),
+            nat.clone(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let identity_type = Expr::forall_e(
+        primary_name("A"),
+        sort_zero,
+        Expr::forall_e(
+            primary_name("value"),
+            Expr::bvar(0).expect("proposition binder"),
+            Expr::bvar(1).expect("proposition binder under value"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let accept_type = Expr::forall_e(
+        primary_name("proof"),
+        reduced_proposition,
+        nat.clone(),
+        BinderInfo::Default,
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::definition(checker_name("n"), decoded(&nat), decoded(&one)),
+            LocalDeclaration::assumption(checker_name("proof"), decoded(&open_proposition)),
+            LocalDeclaration::assumption(checker_name("accept"), decoded(&accept_type)),
+        ],
+        Vec::new(),
+        vec![
+            header(
+                "Nat",
+                Vec::new(),
+                decoded(&sort_one),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+            ConstantEntry::new(
+                checker_name_value(&Name::str(primary_name("Nat"), "add")),
+                ConstantDeclaration::header(
+                    Vec::new(),
+                    decoded(&nat_binary_type),
+                    ConstantKind::Axiom,
+                    ConstantSafety::Safe,
+                ),
+            ),
+            header(
+                "Eq",
+                Vec::new(),
+                decoded(&equality_type),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+            header(
+                "eagerReduce",
+                Vec::new(),
+                decoded(&identity_type),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+            header(
+                "ordinary",
+                Vec::new(),
+                decoded(&identity_type),
+                ConstantKind::Axiom,
+                ConstantSafety::Safe,
+            ),
+        ],
+    );
+    let mode = InferenceMode::Checking {
+        declaration_safety: ConstantSafety::Safe,
+    };
+    let wrapped = |head: &str| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(primary_name(head), Vec::new()),
+                open_proposition.clone(),
+            ),
+            Expr::fvar(FVarId(primary_name("proof"))),
+        )
+    };
+    let application = |head: &str| {
+        decoded(&Expr::app(
+            Expr::fvar(FVarId(primary_name("accept"))),
+            wrapped(head),
+        ))
+    };
+
+    let eager = complete(infer(
+        &application("eagerReduce"),
+        &context,
+        mode,
+        InferenceBudget::unlimited(),
+    ));
+    assert_eq!(eager.type_, decoded(&nat));
+    assert_eq!(eager.progress.eager_argument_checks, 1);
+
+    assert!(matches!(
+        infer(
+            &application("ordinary"),
+            &context,
+            mode,
+            InferenceBudget::unlimited(),
+        ),
+        InferenceOutcome::Deferred {
+            requirement: InferenceDeferred::ApplicationConversion { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
 fn nested_applications_use_heap_continuations() {
     let sort_zero = Expr::sort(Level::zero());
     let function_type = Expr::forall_e(

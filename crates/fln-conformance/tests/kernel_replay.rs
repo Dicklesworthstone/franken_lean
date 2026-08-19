@@ -821,7 +821,7 @@ fn first_divergence_across_widths(runs: &[MatrixRun]) -> Option<String> {
 // harness passes) needs, derived from the measured per-depth stack cost. Bound
 // to the constant rather than copied from it so the two cannot drift apart —
 // the previous hand-written 16 MiB was empirically adequate for today's corpus
-// but below the measured worst case for depth 4096.
+// but below the measured worst case for the default depth policy.
 const KERNEL_REPLAY_WORKER_STACK_BYTES: usize = Budget::MIN_STACK_BYTES;
 
 fn unit_outcome(item: &WorkItem, verdict: &Outcome<Verdict>) -> UnitOutcome {

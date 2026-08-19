@@ -731,7 +731,7 @@ impl Budget {
     /// Everything else is measured or derived from it. Its cost is
     /// [`Budget::MIN_STACK_BYTES`], which is what a caller must actually
     /// provide; the pairing is asserted at compile time below.
-    pub const DEFAULT_DEPTH: u32 = 4_096;
+    pub const DEFAULT_DEPTH: u32 = 4_160;
 
     /// The measured marginal native stack per unit of depth for THIS engine in
     /// THIS build's profile. See [`StackMeasurement::k1_here`].
@@ -750,7 +750,7 @@ impl Budget {
     /// discovered by aborting. Derived, not chosen: it is exactly the stack
     /// `DEFAULT_DEPTH` needs under the current profile's measurement, rounded
     /// up to the next power of two. In the `dev` profile that is
-    /// `4096 * 3567 * 2 + 64 KiB` = 27.9 MiB, rounded to **32 MiB** — far above
+    /// `4160 * 3567 * 2 + 64 KiB` = 28.4 MiB, rounded to **32 MiB** — far above
     /// Rust's default spawned thread (2 MiB) and above a typical main thread
     /// (8 MiB). Thread stacks are lazily committed, so this is address space,
     /// not resident memory.

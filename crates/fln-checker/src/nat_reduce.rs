@@ -1,10 +1,11 @@
 //! Checker-owned KR-313 natural-literal expression reduction.
 //!
 //! The reducer recognizes the pinned operation table directly over checker wire
-//! arenas, gates slow-conversion use on a closed candidate pair, normalizes
-//! operands with checker WHNF, and delegates arithmetic only to this crate's
-//! independent [`crate::numeric`] substrate. Nested arithmetic uses explicit heap
-//! frames; no operation depth is represented by the Rust call stack.
+//! arenas, keeps ordinary slow-conversion use closed-pair, admits the pin's
+//! query-local eager-open pair, normalizes operands with checker WHNF, and
+//! delegates arithmetic only to this crate's independent [`crate::numeric`]
+//! substrate. Nested arithmetic uses explicit heap frames; no operation depth is
+//! represented by the Rust call stack.
 //!
 //! This is not a general normalizer. Native and String reduction, recursors,
 //! typing, declaration admission, and consensus remain outside this module.
@@ -767,6 +768,42 @@ pub(crate) fn is_potential_nat_reduction(term: &WireExpr, root: ExprId) -> bool 
     parse_application_unmetered(term, root).is_some()
 }
 
+/// Whether the KR-313 reducer must refuse a free-variable pair before trying
+/// operand WHNF. The pin permits the open form only inside the domain
+/// comparison selected by an exact `eagerReduce _ _` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NatReductionScope {
+    ClosedPair,
+    EagerOpenPair,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NatReductionQuery<'a> {
+    candidate: &'a WireExpr,
+    candidate_root: ExprId,
+    companion: &'a WireExpr,
+    companion_root: ExprId,
+    context: &'a WhnfContext,
+}
+
+impl<'a> NatReductionQuery<'a> {
+    pub(crate) const fn new(
+        candidate: &'a WireExpr,
+        candidate_root: ExprId,
+        companion: &'a WireExpr,
+        companion_root: ExprId,
+        context: &'a WhnfContext,
+    ) -> NatReductionQuery<'a> {
+        NatReductionQuery {
+            candidate,
+            candidate_root,
+            companion,
+            companion_root,
+            context,
+        }
+    }
+}
+
 fn validate_child(input: NatReductionInput, parent: ExprId, child: ExprId) -> Result<(), Halt> {
     if child.index() >= parent.index() {
         return Err(Halt::Fault(
@@ -1237,14 +1274,18 @@ fn operand_identity(index: u8) -> NatReductionOperand {
 }
 
 fn reduce_inner(
-    candidate: &WireExpr,
-    candidate_root: ExprId,
-    companion: &WireExpr,
-    companion_root: ExprId,
-    context: &WhnfContext,
+    query: NatReductionQuery<'_>,
     budget: NatReductionBudget,
+    scope: NatReductionScope,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<NatReductionOutcome, Halt> {
+    let NatReductionQuery {
+        candidate,
+        candidate_root,
+        companion,
+        companion_root,
+        context,
+    } = query;
     let mut control = Control::new(budget, cancelled);
     let parsed = match parse_application(
         candidate,
@@ -1261,31 +1302,33 @@ fn reduce_inner(
         }
     };
 
-    if !is_closed(
-        candidate,
-        NatReductionInput::Candidate,
-        candidate_root,
-        &mut control,
-    )? {
-        return Ok(NatReductionOutcome::NotReduced {
-            reason: NatNotReduced::OpenPair {
-                input: NatReductionInput::Candidate,
-            },
-            progress: control.progress,
-        });
-    }
-    if !is_closed(
-        companion,
-        NatReductionInput::Companion,
-        companion_root,
-        &mut control,
-    )? {
-        return Ok(NatReductionOutcome::NotReduced {
-            reason: NatNotReduced::OpenPair {
-                input: NatReductionInput::Companion,
-            },
-            progress: control.progress,
-        });
+    if scope == NatReductionScope::ClosedPair {
+        if !is_closed(
+            candidate,
+            NatReductionInput::Candidate,
+            candidate_root,
+            &mut control,
+        )? {
+            return Ok(NatReductionOutcome::NotReduced {
+                reason: NatNotReduced::OpenPair {
+                    input: NatReductionInput::Candidate,
+                },
+                progress: control.progress,
+            });
+        }
+        if !is_closed(
+            companion,
+            NatReductionInput::Companion,
+            companion_root,
+            &mut control,
+        )? {
+            return Ok(NatReductionOutcome::NotReduced {
+                reason: NatNotReduced::OpenPair {
+                    input: NatReductionInput::Companion,
+                },
+                progress: control.progress,
+            });
+        }
     }
 
     let top_cursor = Cursor {
@@ -1474,34 +1517,26 @@ pub fn reduce_nat_with(
     mut cancelled: impl FnMut() -> bool,
 ) -> NatReductionOutcome {
     reduce_nat_at_with(
-        candidate,
-        candidate.root(),
-        companion,
-        companion.root(),
-        context,
+        NatReductionQuery::new(
+            candidate,
+            candidate.root(),
+            companion,
+            companion.root(),
+            context,
+        ),
         budget,
+        NatReductionScope::ClosedPair,
         &mut cancelled,
     )
 }
 
 pub(crate) fn reduce_nat_at_with(
-    candidate: &WireExpr,
-    candidate_root: ExprId,
-    companion: &WireExpr,
-    companion_root: ExprId,
-    context: &WhnfContext,
+    query: NatReductionQuery<'_>,
     budget: NatReductionBudget,
+    scope: NatReductionScope,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> NatReductionOutcome {
-    match reduce_inner(
-        candidate,
-        candidate_root,
-        companion,
-        companion_root,
-        context,
-        budget,
-        cancelled,
-    ) {
+    match reduce_inner(query, budget, scope, cancelled) {
         Ok(outcome) => outcome,
         Err(Halt::Refusal { refusal, progress }) => NatReductionOutcome::Refused {
             refusal: *refusal,

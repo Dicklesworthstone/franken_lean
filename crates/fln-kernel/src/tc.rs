@@ -1371,6 +1371,10 @@ pub(crate) struct TypeChecker<'a> {
     instantiate_lparams_cache: InstantiateLParamsCache,
     recursor_major_cache: RecursorMajorCache,
     defer_recursor_major: bool,
+    /// Query-local counterpart of the pin's `m_eager_reduce`. Only the
+    /// domain comparison for an `eagerReduce _ _` argument may reduce open
+    /// Nat applications; the previous value is restored after that query.
+    eager_reduction: bool,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -1405,6 +1409,7 @@ impl<'a> TypeChecker<'a> {
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: false,
+            eager_reduction: false,
         }
     }
 
@@ -3786,7 +3791,7 @@ impl<'a> TypeChecker<'a> {
             if let Some(decided) = self.is_def_eq_offset(&t, &s, depth)? {
                 return Ok(LazyDelta::Decided(decided));
             }
-            if !t.has_fvar() && !s.has_fvar() {
+            if self.eager_reduction || (!t.has_fvar() && !s.has_fvar()) {
                 if let Some(value) = self.reduce_nat(&t, depth)? {
                     return Ok(LazyDelta::Decided(self.is_def_eq(&value, &s, depth + 1)?));
                 }
@@ -4479,7 +4484,17 @@ impl<'a> TypeChecker<'a> {
         };
         let (binder_type, body) = (binder_type.clone(), body.clone());
         let argument = frame.args[frame.idx].clone();
-        if !self.is_def_eq(&argument_type, &binder_type, frame.depth)? {
+        // Pin `infer_app`: `eagerReduce` affects this argument's domain
+        // conversion only. It permits literal Nat reduction after open terms
+        // normalize to literals, then the old mode is restored even when the
+        // comparison returns a typed stop.
+        let previous_eager_reduction = self.eager_reduction;
+        if is_eager_reduce_argument(&argument) {
+            self.eager_reduction = true;
+        }
+        let domain_matches = self.is_def_eq(&argument_type, &binder_type, frame.depth);
+        self.eager_reduction = previous_eager_reduction;
+        if !domain_matches? {
             return reject(
                 RejectClass::TypeMismatch,
                 format!(
@@ -5730,6 +5745,27 @@ fn peels_to_app(e: &Expr) -> bool {
     matches!(current.node(), ExprNode::App { .. })
 }
 
+/// Pin `is_eager_reduce`: exactly an application with head `eagerReduce` and
+/// two explicit arguments (the inferred type and wrapped value).
+fn is_eager_reduce_argument(e: &Expr) -> bool {
+    let mut head = e;
+    let mut arity = 0u8;
+    while let ExprNode::App { f, .. } = head.node() {
+        arity += 1;
+        if arity > 2 {
+            return false;
+        }
+        head = f;
+    }
+    arity == 2
+        && matches!(
+            head.node(),
+            ExprNode::Const { name, .. }
+                if matches!(name.leaf_view(), LeafView::Str(s) if s == "eagerReduce")
+                    && name.parent().is_anonymous()
+        )
+}
+
 /// Prefix of `is_def_eq_core` through the cheap-proj full-WHNF restart.
 /// `Stuck` is ready for KR-311 / the eta tail.
 enum DefeqReduced {
@@ -6598,6 +6634,53 @@ mod tests {
     }
 
     #[test]
+    fn default_depth_covers_the_pinned_char_ordinal_congruence_band() {
+        // The pinned `Char.succ?_eq` proof reaches logical depth 4123. Keep a
+        // small structural witness at that same KR-311 boundary so the default
+        // policy cannot silently retreat below the real accepted declaration.
+        const REQUIRED_DEPTH: u32 = 4_123;
+        let env = Environment::new();
+        let head = Expr::sort(Level::zero());
+        let argument = Expr::sort(Level::zero());
+        let mut left = head.clone();
+        let mut right = head;
+        for index in 0..REQUIRED_DEPTH {
+            let left_argument = if index + 1 == REQUIRED_DEPTH {
+                Expr::mdata(fln_core::options::KVMap::default(), argument.clone())
+            } else {
+                argument.clone()
+            };
+            left = Expr::app(left, left_argument);
+            right = Expr::app(right, argument.clone());
+        }
+
+        let mut too_shallow = TypeChecker::new(
+            &env,
+            &[],
+            Budget::DEFAULT.narrowed(Budget::DEFAULT.steps, REQUIRED_DEPTH - 1),
+        );
+        assert!(
+            matches!(
+                too_shallow.def_eq_public(&left, &right, 0),
+                Err(Stop::Exhausted(ExhaustionReason::Depth))
+            ),
+            "one level below the observed corpus band must remain a typed depth stop"
+        );
+
+        let mut default = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            default
+                .def_eq_public(&left, &right, 0)
+                .expect("the default policy covers the pinned Char ordinal proof band"),
+            "metadata transparency makes the two wide spines definitionally equal"
+        );
+        assert!(
+            default.consumption().max_depth >= REQUIRED_DEPTH,
+            "the positive must actually cross the former 4096 boundary"
+        );
+    }
+
+    #[test]
     fn defeq_right_nested_app_congruence_walks_without_stack_fault() {
         // Left-spine peel does not reach `f (f (... a))`. The inner `mdata`
         // keeps the pair off the structural-eq fast path so KR-311 must walk
@@ -7005,6 +7088,111 @@ mod tests {
             fln_core::expr::BinderInfo::Default,
         );
         (pi, redex, sort)
+    }
+
+    #[test]
+    fn eager_reduce_opens_only_its_own_nat_domain_comparison() {
+        let env = Environment::new();
+        let nat = Expr::const_(Name::str(Name::anonymous(), "Nat"), Vec::new());
+        let one = Expr::lit(Literal::Nat(NatLit::from_u64(1)));
+        let two = Expr::lit(Literal::Nat(NatLit::from_u64(2)));
+        let local_id = FVarId(Name::str(Name::anonymous(), "eagerLet"));
+        let open_sum = Expr::app(
+            Expr::app(
+                Expr::const_(
+                    Name::str(Name::str(Name::anonymous(), "Nat"), "add"),
+                    Vec::new(),
+                ),
+                Expr::fvar(local_id.clone()),
+            ),
+            one.clone(),
+        );
+        let eager_argument = Expr::app(
+            Expr::app(
+                Expr::const_(
+                    Name::str(Name::anonymous(), "eagerReduce"),
+                    vec![Level::zero()],
+                ),
+                nat.clone(),
+            ),
+            one.clone(),
+        );
+        let near_miss_argument = Expr::app(
+            Expr::const_(
+                Name::str(Name::anonymous(), "eagerReduce"),
+                vec![Level::zero()],
+            ),
+            one.clone(),
+        );
+        let make_frame = |argument: Expr| CheckedAppFrame {
+            args: vec![argument],
+            idx: 0,
+            prefix: Expr::const_(Name::str(Name::anonymous(), "consume"), Vec::new()),
+            function_type: Expr::forall_e(
+                Name::str(Name::anonymous(), "value"),
+                two.clone(),
+                nat.clone(),
+                BinderInfo::Default,
+            ),
+            depth: 0,
+            cache_key: Expr::const_(Name::str(Name::anonymous(), "consume"), Vec::new()),
+        };
+
+        let mut eager = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        eager.push_local(local_id.clone(), nat.clone(), Some(one.clone()));
+        eager
+            .finish_checked_app_argument(&mut make_frame(eager_argument.clone()), open_sum.clone())
+            .expect("eagerReduce may normalize an open Nat pair during this domain comparison");
+        assert!(
+            !eager.eager_reduction,
+            "the eager marker must not leak into the next conversion query"
+        );
+
+        let mut ordinary = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        ordinary.push_local(local_id.clone(), nat.clone(), Some(one.clone()));
+        assert!(
+            matches!(
+                ordinary.finish_checked_app_argument(
+                    &mut make_frame(Expr::app(
+                        Expr::app(
+                            Expr::const_(Name::str(Name::anonymous(), "ordinary"), Vec::new()),
+                            nat.clone(),
+                        ),
+                        one.clone(),
+                    )),
+                    open_sum.clone(),
+                ),
+                Err(Stop::Reject(RejectClass::TypeMismatch, _))
+            ),
+            "ordinary open Nat conversion must not inherit eager reduction"
+        );
+
+        let mut wrong_arity = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        wrong_arity.push_local(local_id.clone(), nat.clone(), Some(one.clone()));
+        assert!(
+            matches!(
+                wrong_arity.finish_checked_app_argument(
+                    &mut make_frame(near_miss_argument),
+                    open_sum.clone(),
+                ),
+                Err(Stop::Reject(RejectClass::TypeMismatch, _))
+            ),
+            "the eagerReduce head without its exact two-argument shape is ordinary"
+        );
+
+        let mut stopped = TypeChecker::new(
+            &env,
+            &[],
+            Budget::DEFAULT.narrowed(0, Budget::DEFAULT.depth),
+        );
+        stopped.push_local(local_id, nat.clone(), Some(one));
+        assert!(
+            matches!(
+                stopped.finish_checked_app_argument(&mut make_frame(eager_argument), open_sum,),
+                Err(Stop::Exhausted(ExhaustionReason::Steps))
+            ) && !stopped.eager_reduction,
+            "a typed stop must restore the query-local eager mode"
+        );
     }
 
     #[test]
