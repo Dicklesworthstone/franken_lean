@@ -3607,7 +3607,34 @@ fn render_lean_source_module_commands(
     completed: &fln::SourceModuleCommandBatchExecution,
 ) -> MultiplexerOutput {
     if let Some(prefix) = &completed.dependency_prefix {
-        for (command_index, execution) in prefix.executions.iter().enumerate() {
+        if completed.dependency_execution_command_indices.len() != prefix.executions.len() {
+            return source_failure(
+                "internal-fault",
+                "dependency source execution index table did not cover every execution",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        }
+        let mut previous_command = None;
+        for (command_index, execution) in completed
+            .dependency_execution_command_indices
+            .iter()
+            .copied()
+            .zip(&prefix.executions)
+        {
+            if command_index >= completed.dependency_command_count
+                || previous_command.is_some_and(|previous| previous >= command_index)
+            {
+                return source_failure(
+                    "internal-fault",
+                    "dependency source execution command indices were not strictly increasing in range",
+                    false,
+                    SourcePresentation::Lean,
+                    4,
+                );
+            }
+            previous_command = Some(command_index);
             if let Some(failure) = source_execution_exit_failure(
                 command_index,
                 &execution.exit,
@@ -8078,7 +8105,7 @@ mod tests {
         let modules = [
             fln::SourceModuleInput {
                 name: &base,
-                source: b"#eval 7\ndef imported : Nat := 7",
+                source: b"#check Nat\n#eval 7\ndef imported : Nat := 7",
             },
             fln::SourceModuleInput {
                 name: &main,
@@ -8096,6 +8123,22 @@ mod tests {
         let fln::Outcome::Complete(mut completed) = outcome else {
             panic!("the imported entry must answer completely"); // ubs:ignore — test-only diagnostic.
         };
+        assert_eq!(completed.dependency_command_count, 3);
+        assert_eq!(completed.dependency_execution_command_indices, [1, 2]);
+
+        let exact_indices = completed.dependency_execution_command_indices.clone();
+        completed.dependency_execution_command_indices.pop();
+        let mismatch = render_lean_source_module_commands(&completed);
+        assert_eq!(mismatch.exit_code, 4);
+        assert!(mismatch.stdout.is_empty());
+        assert!(mismatch.stderr.starts_with("lean: internal-fault: "));
+        assert!(
+            mismatch
+                .stderr
+                .contains("index table did not cover every execution")
+        );
+        completed.dependency_execution_command_indices = exact_indices;
+
         let prefix = completed
             .dependency_prefix
             .as_mut()
@@ -8115,7 +8158,8 @@ mod tests {
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.is_empty());
         assert!(output.stderr.starts_with("lean: program-panic: "));
-        assert!(output.stderr.contains("source command 0 panicked"));
+        assert!(output.stderr.contains("source command 1 panicked"));
+        assert!(!output.stderr.contains("source command 0 panicked"));
         assert!(output.stderr.contains("planted imported panic"));
         assert!(!output.stderr.contains("imported : Nat"));
     }

@@ -1863,6 +1863,12 @@ impl SourceModuleCommandPolicy {
     }
 }
 
+struct PlannedSourceModuleExecution {
+    batch: DefinitionBatchExecution,
+    command_count: usize,
+    execution_command_indices: Option<Vec<usize>>,
+}
+
 struct SourceModuleVisibilitySubjects<'a> {
     execution_owners: &'a [usize],
     completed: &'a DefinitionBatchExecution,
@@ -3232,7 +3238,7 @@ impl Engine {
             limits,
             SourceModuleCommandPolicy::DefinitionPrefix,
         )? {
-            Outcome::Complete(completed) => completed,
+            Outcome::Complete(completed) => completed.batch,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
@@ -3345,7 +3351,7 @@ impl Engine {
             entry_commands.ok_or_else(|| EngineExecutionError::MissingSourceEntry {
                 module: entry.clone(),
             })?;
-        let mut dependency_prefix = match self.execute_source_modules_internal(
+        let dependency_plan = match self.execute_source_modules_internal(
             &rewritten,
             entry,
             options,
@@ -3356,6 +3362,13 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let dependency_command_count = dependency_plan.command_count;
+        let dependency_execution_command_indices = dependency_plan
+            .execution_command_indices
+            .ok_or(EngineExecutionError::UnexpectedPublication {
+                detail: "mixed dependency execution omitted its source command index table",
+            })?;
+        let mut dependency_prefix = dependency_plan.batch;
         let entry_execution = match dependency_prefix.engine.execute_source_command_stream(
             entry_commands,
             options,
@@ -3373,6 +3386,8 @@ impl Engine {
         };
         Ok(Outcome::Complete(SourceModuleCommandBatchExecution {
             dependency_prefix,
+            dependency_command_count,
+            dependency_execution_command_indices,
             source_module_order,
             entry: entry_execution,
         }))
@@ -3500,13 +3515,15 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_source_modules_internal(
-            modules,
-            entry,
-            options,
-            limits,
-            SourceModuleCommandPolicy::ExecutableOnly,
-        )
+        Ok(self
+            .execute_source_modules_internal(
+                modules,
+                entry,
+                options,
+                limits,
+                SourceModuleCommandPolicy::ExecutableOnly,
+            )?
+            .map_complete(|completed| completed.batch))
     }
 
     fn execute_source_modules_internal(
@@ -3516,7 +3533,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
         policy: SourceModuleCommandPolicy,
-    ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
+    ) -> Result<Outcome<PlannedSourceModuleExecution>, EngineExecutionError> {
         if modules.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
         }
@@ -3704,13 +3721,17 @@ impl Engine {
         }
         if policy.allow_empty_batch() && commands.is_empty() {
             let root = self.logical_root(options);
-            return Ok(Outcome::Complete(DefinitionBatchExecution {
-                engine: self.clone(),
-                base_logical_root: root,
-                result_logical_root: root,
-                executions: Vec::new(),
-                source_module_order: module_order,
-                source_evaluation_indices: Vec::new(),
+            return Ok(Outcome::Complete(PlannedSourceModuleExecution {
+                batch: DefinitionBatchExecution {
+                    engine: self.clone(),
+                    base_logical_root: root,
+                    result_logical_root: root,
+                    executions: Vec::new(),
+                    source_module_order: module_order,
+                    source_evaluation_indices: Vec::new(),
+                },
+                command_count,
+                execution_command_indices: policy.allow_scratch_checks().then(Vec::new),
             }));
         }
         if policy.allow_scratch_checks() {
@@ -3787,9 +3808,18 @@ impl Engine {
                 },
                 limits.source_modules.max_dependency_presentations,
             )?;
-            let mut completed = mixed.batch;
-            completed.source_module_order = module_order;
-            return Ok(Outcome::Complete(completed));
+            let SourceCommandBatchExecution {
+                mut batch,
+                command_count,
+                execution_command_indices,
+                ..
+            } = mixed;
+            batch.source_module_order = module_order;
+            return Ok(Outcome::Complete(PlannedSourceModuleExecution {
+                batch,
+                command_count,
+                execution_command_indices: Some(execution_command_indices),
+            }));
         }
         match self.execute_source_commands(commands, options, limits)? {
             Outcome::Complete(mut completed) => {
@@ -3806,7 +3836,11 @@ impl Engine {
                     limits.source_modules.max_dependency_presentations,
                 )?;
                 completed.source_module_order = module_order;
-                Ok(Outcome::Complete(completed))
+                Ok(Outcome::Complete(PlannedSourceModuleExecution {
+                    batch: completed,
+                    command_count,
+                    execution_command_indices: None,
+                }))
             }
             Outcome::Inconclusive(inconclusive) => Ok(Outcome::Inconclusive(inconclusive)),
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
@@ -5536,6 +5570,12 @@ pub struct SourceModuleCommandBatchExecution {
     /// Completed silent dependency definition/evaluation execution, absent for
     /// an entry with no executable dependency commands.
     pub dependency_prefix: Option<DefinitionBatchExecution>,
+    /// Number of source commands in the flattened dependency prefix, including
+    /// silent scratch checks that do not enter `dependency_prefix`.
+    pub dependency_command_count: usize,
+    /// Original flattened dependency command index for every retained prefix
+    /// execution. This table includes gaps for scratch-only checks.
+    pub dependency_execution_command_indices: Vec<usize>,
     /// Canonical dependency-first module order, including the entry last.
     pub source_module_order: Vec<Name>,
     /// The selected entry's ordered definition/evaluation/check result.
@@ -10173,6 +10213,8 @@ mod tests {
             .dependency_prefix
             .as_ref()
             .expect("the imported commands execute before the entry");
+        assert_eq!(completed.dependency_command_count, 3);
+        assert_eq!(completed.dependency_execution_command_indices, [0, 1, 2]);
         assert_eq!(dependency_prefix.executions.len(), 3);
         assert_eq!(dependency_prefix.source_evaluation_indices, [0]);
         assert_eq!(
@@ -10301,6 +10343,8 @@ mod tests {
             .dependency_prefix
             .as_ref()
             .expect("the definition after the dependency check is published");
+        assert_eq!(checked_dependency.dependency_command_count, 2);
+        assert_eq!(checked_dependency.dependency_execution_command_indices, [1]);
         assert_eq!(checked_prefix.executions.len(), 1);
         assert_eq!(
             checked_prefix.engine.environment().len(),
