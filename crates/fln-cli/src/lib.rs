@@ -6921,8 +6921,11 @@ mod tests {
         assert!(help.stdout.contains("transitive dependency closure"));
         assert!(
             help.stdout
-                .contains("Dependency definitions and #eval run silently")
+                .contains("Dependency definitions, #eval, and scratch-only #check run silently")
         );
+        assert!(help.stdout.contains(
+            "Every dependency query is checked against that module's transitive imports"
+        ));
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
         assert!(help.stdout.contains("lean --print-libdir"));
