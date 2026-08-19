@@ -3192,9 +3192,9 @@ impl Engine {
             });
         }
         let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
-        let completed = match self
-            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true, false)?
-        {
+        let completed = match self.execute_source_modules_internal(
+            &rewritten, entry, options, limits, false, true, false,
+        )? {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -3308,9 +3308,9 @@ impl Engine {
             entry_commands.ok_or_else(|| EngineExecutionError::MissingSourceEntry {
                 module: entry.clone(),
             })?;
-        let mut dependency_prefix = match self
-            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true, true)?
-        {
+        let mut dependency_prefix = match self.execute_source_modules_internal(
+            &rewritten, entry, options, limits, false, true, true,
+        )? {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),

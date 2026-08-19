@@ -237,13 +237,28 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
         imported_dir.join("Seed.lean"),
         b"import Project.Base\n#check base\ndef seed : Nat := base + 2\n",
     )
-    .expect("plant a dependency check outside the bounded module path");
+    .expect("plant a scratch-only dependency check");
     let imported_dependency_check = run_lean(&[&source]);
-    assert!(!imported_dependency_check.status.success());
-    assert!(imported_dependency_check.stdout.is_empty());
     assert!(
+        imported_dependency_check.status.success(),
+        "dependency-check native lean stderr: {}",
         utf8(&imported_dependency_check.stderr)
-            .contains("does not yet support #check in imported module `Project.Seed`")
+    );
+    assert_eq!(utf8(&imported_dependency_check.stdout), "seed : Nat\n");
+    assert!(imported_dependency_check.stderr.is_empty());
+
+    std::fs::write(
+        imported_dir.join("Seed.lean"),
+        b"import Project.Base\n#check later\ndef later : Nat := base + 2\n",
+    )
+    .expect("plant a dependency check before its definition");
+    let future_dependency_check = run_lean(&[&source]);
+    assert!(!future_dependency_check.status.success());
+    assert!(future_dependency_check.stdout.is_empty());
+    assert!(
+        utf8(&future_dependency_check.stderr).contains("no inferable type"),
+        "future dependency check stderr: {}",
+        utf8(&future_dependency_check.stderr)
     );
 
     let unknown_check = run_lean_stdin(

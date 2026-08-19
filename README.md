@@ -378,8 +378,10 @@ gets that same ordered command stream after its complete transitive dependency
 environment is checked and executed. Dependency definitions and `#eval`
 commands execute silently through the same checked VM path, so their output is
 not replayed as entry output; a non-returning dependency evaluation still fails
-the whole invocation before stdout is exposed. Dependency `#check` remains a
-typed unsupported case until scratch-query visibility is checked per module.
+the whole invocation before stdout is exposed. Dependency `#check` commands are
+also silent and scratch-only. Each is dual-checked in source order, attributed
+to its owning module, and subjected to the same transitive-import visibility
+proof as published dependency declarations; its scratch successor is discarded.
 The type renderer covers only bounded supported shapes rather than Reference
 pretty-printing or diagnostic-text parity.
 
