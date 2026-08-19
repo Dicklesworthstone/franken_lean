@@ -258,19 +258,42 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert!(terminal_function_check.stderr.is_empty());
 
     let evaluation_prefix = run_lean_stdin(&[Path::new("--stdin")], b"#eval 1\n#check Nat\n");
-    assert!(!evaluation_prefix.status.success());
-    assert!(evaluation_prefix.stdout.is_empty());
-    assert!(utf8(&evaluation_prefix.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&evaluation_prefix.stderr).contains("only definitions before it"));
+    assert!(evaluation_prefix.status.success());
+    assert_eq!(utf8(&evaluation_prefix.stdout), "1\nNat : Type\n");
+    assert!(evaluation_prefix.stderr.is_empty());
 
-    let nonterminal_check = run_lean_stdin(
+    let mixed_checks = run_lean_stdin(
         &[Path::new("--stdin")],
-        b"#check Nat\ndef later : Nat := 1\n",
+        b"#check Nat\n#eval 40 + 2\ndef later : Nat := 1\n#check later\n#eval later + 1\n#check Nat.add\n",
     );
-    assert!(!nonterminal_check.status.success());
-    assert!(nonterminal_check.stdout.is_empty());
-    assert!(utf8(&nonterminal_check.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&nonterminal_check.stderr).contains("standalone import-free query"));
+    assert!(
+        mixed_checks.status.success(),
+        "mixed native lean command stderr: {}",
+        utf8(&mixed_checks.stderr)
+    );
+    assert_eq!(
+        utf8(&mixed_checks.stdout),
+        "Nat : Type\n42\nlater : Nat\n2\nNat.add : Nat → Nat → Nat\n"
+    );
+    assert!(mixed_checks.stderr.is_empty());
+
+    let late_check_refusal = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"#check Nat\n#eval 42\ndef retained : Nat := 7\n#check Missing\n",
+    );
+    assert!(!late_check_refusal.status.success());
+    assert!(late_check_refusal.stdout.is_empty());
+    assert!(utf8(&late_check_refusal.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&late_check_refusal.stderr).contains("no inferable type"));
+
+    let future_definition = run_lean_stdin(
+        &[Path::new("--stdin")],
+        b"#check later\ndef later : Nat := 1\n",
+    );
+    assert!(!future_definition.status.success());
+    assert!(future_definition.stdout.is_empty());
+    assert!(utf8(&future_definition.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&future_definition.stderr).contains("no inferable type"));
 
     let piped_late_refusal = run_lean_stdin(
         &[Path::new("--stdin")],

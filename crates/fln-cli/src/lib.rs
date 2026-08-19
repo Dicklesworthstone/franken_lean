@@ -130,15 +130,16 @@ const LEAN_USAGE: &str = concat!(
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
     "scalar and first-order function definitions are silent; unlike `fln run`,\n",
     "the final definition need not produce a closed scalar.\n",
-    "A standalone #check, or one final #check after a definition-only prefix,\n",
-    "is inferred and admitted through\n",
+    "Import-free #check commands may appear anywhere among supported definitions\n",
+    "and #eval commands. Each is inferred and admitted through\n",
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
-    "The query sees the checked source seed plus its completed local import closure\n",
-    "and definition prefix. It cannot follow or precede an evaluation, appear before\n",
-    "a later command, or pretty-print dependent and other unsupported inferred types.\n",
-    "Each supported #eval result is printed on its own line after the whole\n",
-    "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
+    "A query sees the checked source seed and every preceding command successor.\n",
+    "Check and #eval output is buffered in source order until the whole source\n",
+    "succeeds; a later failure leaves stdout empty. Imported sources retain the\n",
+    "narrower definition-only closure plus one final entry #check. The bounded\n",
+    "renderer does not pretty-print dependent or other unsupported type shapes.\n",
+    "For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
     "the complete local A/B.lean closure is then loaded under the same aggregate\n",
     "limits before execution. Symlink, missing, and ambiguous imports are refused.\n",
@@ -3530,33 +3531,55 @@ fn render_bounded_source_type(type_: &fln::Expr) -> Result<String, &'static str>
     Ok(rendered)
 }
 
-fn render_lean_source_check(checked: &fln::SourceCheck) -> MultiplexerOutput {
+fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, MultiplexerOutput> {
     let Some(term) = checked.parsed.query_term_normalized() else {
-        return source_failure(
+        return Err(source_failure(
             "internal-fault",
             "completed source check did not retain its query term",
             false,
             SourcePresentation::Lean,
             4,
-        );
+        ));
     };
     let term = term.trim_ascii();
     if term.is_empty() {
-        return source_failure(
+        return Err(source_failure(
             "internal-fault",
             "completed source check retained an empty query term",
             false,
             SourcePresentation::Lean,
             4,
-        );
+        ));
     }
     let type_ = match render_bounded_source_type(&checked.checked_type) {
         Ok(type_) => type_,
         Err(error) => {
-            return source_failure("execution", error, true, SourcePresentation::Lean, 1);
+            return Err(source_failure(
+                "execution",
+                error,
+                true,
+                SourcePresentation::Lean,
+                1,
+            ));
         }
     };
-    MultiplexerOutput::success(format!("{term} : {type_}\n"))
+    Ok(format!("{term} : {type_}\n"))
+}
+
+fn render_lean_source_check(checked: &fln::SourceCheck) -> MultiplexerOutput {
+    match render_lean_source_check_line(checked) {
+        Ok(line) => MultiplexerOutput::success(line),
+        Err(error) => error,
+    }
+}
+
+fn source_has_check(source: &[u8]) -> bool {
+    fln::partition_source_module(source).is_ok_and(|module| {
+        module.commands.iter().any(|(_, command)| {
+            fln::parse_source_command(command)
+                .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
+        })
+    })
 }
 
 fn source_has_terminal_check(source: &[u8]) -> bool {
@@ -3567,6 +3590,213 @@ fn source_has_terminal_check(source: &[u8]) -> bool {
             fln::parse_source_command(command)
                 .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
         })
+}
+
+fn source_execution_exit_failure(
+    command_index: usize,
+    exit: &fln::VmExit,
+    presentation: SourcePresentation,
+) -> Option<MultiplexerOutput> {
+    match exit {
+        fln::VmExit::Returned(_) => None,
+        fln::VmExit::Panicked { message, usage } => Some(source_terminal(
+            "program-panic",
+            &format!("source command {command_index} panicked: {message}"),
+            usage.steps,
+            usage.system_polls,
+            usage.peak_stack_depth,
+            presentation,
+        )),
+        fln::VmExit::Refused { refusal, usage } => Some(source_terminal(
+            "vm-refusal",
+            &format!("source command {command_index} was refused: {refusal}"),
+            usage.steps,
+            usage.system_polls,
+            usage.peak_stack_depth,
+            presentation,
+        )),
+    }
+}
+
+fn render_lean_terminal_source_check(checked: &fln::TerminalSourceCheck) -> MultiplexerOutput {
+    if let Some(prefix) = &checked.definition_prefix {
+        for (command_index, execution) in prefix.executions.iter().enumerate() {
+            if let Some(failure) = source_execution_exit_failure(
+                command_index,
+                &execution.exit,
+                SourcePresentation::Lean,
+            ) {
+                return failure;
+            }
+        }
+    }
+    render_lean_source_check(&checked.check)
+}
+
+fn render_lean_source_commands(completed: &fln::SourceCommandBatchExecution) -> MultiplexerOutput {
+    if completed.execution_command_indices.len() != completed.batch.executions.len() {
+        return source_failure(
+            "internal-fault",
+            "mixed source execution index table did not cover every execution",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    }
+    let mut previous_execution_command = None;
+    for (command_index, execution) in completed
+        .execution_command_indices
+        .iter()
+        .copied()
+        .zip(&completed.batch.executions)
+    {
+        if command_index >= completed.command_count
+            || previous_execution_command.is_some_and(|previous| previous >= command_index)
+        {
+            return source_failure(
+                "internal-fault",
+                "mixed source execution command indices were not strictly increasing in range",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        }
+        previous_execution_command = Some(command_index);
+        if let Some(failure) =
+            source_execution_exit_failure(command_index, &execution.exit, SourcePresentation::Lean)
+        {
+            return failure;
+        }
+    }
+
+    let mut stdout = String::new();
+    let mut previous_output_command = None;
+    let mut evaluation_output_position = 0_usize;
+    let mut check_output_position = 0_usize;
+    for output in &completed.outputs {
+        let command_index = match output {
+            fln::SourceCommandOutput::Evaluation { command_index, .. }
+            | fln::SourceCommandOutput::Check { command_index, .. } => *command_index,
+        };
+        if command_index >= completed.command_count
+            || previous_output_command.is_some_and(|previous| previous >= command_index)
+        {
+            return source_failure(
+                "internal-fault",
+                "mixed source output command indices were not strictly increasing in range",
+                false,
+                SourcePresentation::Lean,
+                4,
+            );
+        }
+        previous_output_command = Some(command_index);
+        match output {
+            fln::SourceCommandOutput::Evaluation {
+                execution_index, ..
+            } => {
+                let Some(execution) = completed.batch.executions.get(*execution_index) else {
+                    return source_failure(
+                        "internal-fault",
+                        "mixed source evaluation index escaped the execution table",
+                        false,
+                        SourcePresentation::Lean,
+                        4,
+                    );
+                };
+                if completed
+                    .execution_command_indices
+                    .get(*execution_index)
+                    .copied()
+                    != Some(command_index)
+                    || completed
+                        .batch
+                        .source_evaluation_indices
+                        .get(evaluation_output_position)
+                        .copied()
+                        != Some(*execution_index)
+                {
+                    return source_failure(
+                        "internal-fault",
+                        "mixed source evaluation output disagreed with its command index",
+                        false,
+                        SourcePresentation::Lean,
+                        4,
+                    );
+                }
+                evaluation_output_position += 1;
+                let value = match closed_source_cli_value(&execution.declaration, &execution.exit) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return source_failure(
+                            "execution",
+                            &format!(
+                                "evaluation command {command_index} did not produce a closed Nat, String, or Bool value"
+                            ),
+                            true,
+                            SourcePresentation::Lean,
+                            1,
+                        );
+                    }
+                    Err(error) => {
+                        return source_failure(
+                            "internal-fault",
+                            &error.to_string(),
+                            false,
+                            SourcePresentation::Lean,
+                            4,
+                        );
+                    }
+                };
+                stdout.push_str(&value.to_string());
+                stdout.push('\n');
+            }
+            fln::SourceCommandOutput::Check { check_index, .. } => {
+                if *check_index != check_output_position {
+                    return source_failure(
+                        "internal-fault",
+                        "mixed source check outputs did not cover the check table in order",
+                        false,
+                        SourcePresentation::Lean,
+                        4,
+                    );
+                }
+                let Some(check) = completed.checks.get(*check_index) else {
+                    return source_failure(
+                        "internal-fault",
+                        "mixed source check index escaped the check table",
+                        false,
+                        SourcePresentation::Lean,
+                        4,
+                    );
+                };
+                check_output_position += 1;
+                let line = match render_lean_source_check_line(check) {
+                    Ok(line) => line,
+                    Err(error) => return error,
+                };
+                stdout.push_str(&line);
+            }
+        }
+    }
+    if evaluation_output_position != completed.batch.source_evaluation_indices.len() {
+        return source_failure(
+            "internal-fault",
+            "mixed source evaluation index had no output row",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    }
+    if check_output_position != completed.checks.len() {
+        return source_failure(
+            "internal-fault",
+            "mixed source check table had no output row",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    }
+    MultiplexerOutput::success(stdout)
 }
 
 fn source_failure(
@@ -3821,7 +4051,44 @@ where
     let options = fln::KVMap::new();
     let limits = fln::EngineExecutionLimits::new(kernel_budget);
     if matches!(presentation, SourcePresentation::Lean)
-        && (module_plan.is_some() || source_refs.len() == 1)
+        && module_plan.is_none()
+        && source_refs.len() == 1
+        && let Some(source) = source_refs.last().copied()
+        && source_has_check(source)
+    {
+        let completed = match engine.execute_source_commands_with_checks(source, &options, limits) {
+            Ok(completed) => completed,
+            Err(error) => {
+                let (class, authority, exit_code) = execution_error_disposition(&error);
+                return source_failure(
+                    class,
+                    &error.to_string(),
+                    authority,
+                    presentation,
+                    exit_code,
+                );
+            }
+        };
+        return match completed {
+            fln::Outcome::Complete(completed) => render_lean_source_commands(&completed),
+            fln::Outcome::Inconclusive(inconclusive) => source_failure(
+                "inconclusive",
+                &format!("{inconclusive:?}"),
+                false,
+                presentation,
+                3,
+            ),
+            fln::Outcome::InternalFault(fault) => source_failure(
+                "internal-fault",
+                &format!("{fault:?}"),
+                false,
+                presentation,
+                4,
+            ),
+        };
+    }
+    if matches!(presentation, SourcePresentation::Lean)
+        && module_plan.is_some()
         && let Some(source) = source_refs.last().copied()
         && source_has_terminal_check(source)
     {
@@ -3851,7 +4118,7 @@ where
             }
         };
         return match checked {
-            fln::Outcome::Complete(checked) => render_lean_source_check(&checked.check),
+            fln::Outcome::Complete(checked) => render_lean_terminal_source_check(&checked),
             fln::Outcome::Inconclusive(inconclusive) => source_failure(
                 "inconclusive",
                 &format!("{inconclusive:?}"),
@@ -5828,8 +6095,9 @@ mod tests {
         execute_flbc_bytes, execute_source_bytes, execute_source_bytes_with_publisher,
         execution_error_disposition, inspect_ilean_bytes, inspect_olean_bytes,
         module_name_from_relative, olean_write_error_disposition, parse_source_run,
-        read_bounded_from, run, run_lean, run_lean_with_input, source_failure,
-        source_import_relative_path, verify_olean_rebuild_bytes,
+        read_bounded_from, render_lean_source_commands, render_lean_terminal_source_check, run,
+        run_lean, run_lean_with_input, source_failure, source_import_relative_path,
+        verify_olean_rebuild_bytes,
     };
     use std::ffi::OsString;
     use std::io::Cursor;
@@ -6662,8 +6930,14 @@ mod tests {
         assert!(help.stdout.contains("complete local A/B.lean closure"));
         assert!(help.stdout.contains("lean --stdin"));
         assert!(help.stdout.contains("bounded import-free source"));
-        assert!(help.stdout.contains("A standalone #check"));
-        assert!(help.stdout.contains("completed local import closure"));
+        assert!(
+            help.stdout
+                .contains("Import-free #check commands may appear anywhere")
+        );
+        assert!(
+            help.stdout
+                .contains("definition-only closure plus one final entry #check")
+        );
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
         assert!(help.stdout.contains("lean --print-libdir"));
@@ -6876,7 +7150,11 @@ mod tests {
         assert_eq!(fln_check.exit_code, 1);
         assert!(fln_check.stdout.is_empty());
         assert!(fln_check.stderr.contains("\"class\":\"execution\""));
-        assert!(fln_check.stderr.contains("standalone import-free query"));
+        assert!(
+            fln_check
+                .stderr
+                .contains("ordered import-free native lean command stream")
+        );
     }
 
     #[test]
@@ -7761,6 +8039,97 @@ mod tests {
         assert!(output.stderr.contains("frontend refused source"));
         assert!(output.stderr.contains("lexical analysis reported"));
         assert!(output.stderr.contains("\"detailTruncated\":false"));
+    }
+
+    #[test]
+    fn mixed_lean_source_never_prints_checks_before_a_prefix_vm_failure() {
+        let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+        let engine = fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel))
+            .expect("the source seed reaches both checker seats")
+            .into_complete()
+            .expect("the source seed answers completely");
+        let outcome = engine
+            .execute_source_commands_with_checks(
+                b"def prefix : Nat := 7\n#check prefix",
+                &fln::KVMap::new(),
+                fln::EngineExecutionLimits::new(kernel),
+            )
+            .expect("the real mixed source pipeline completes before the planted VM exit");
+        let fln::Outcome::Complete(mut completed) = outcome else {
+            panic!("the real mixed source pipeline must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        let usage = match &completed.batch.executions[0].exit {
+            fln::VmExit::Returned(returned) => returned.usage,
+            fln::VmExit::Panicked { .. } | fln::VmExit::Refused { .. } => {
+                panic!("the planted prefix begins as a normal return"); // ubs:ignore — test-only diagnostic.
+            }
+        };
+        completed.batch.executions[0].exit = fln::VmExit::Panicked {
+            message: "planted prefix panic".to_owned(),
+            usage,
+        };
+
+        let output = render_lean_source_commands(&completed);
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.starts_with("lean: program-panic: "));
+        assert!(output.stderr.contains("source command 0 panicked"));
+        assert!(output.stderr.contains("planted prefix panic"));
+        assert!(!output.stderr.contains("prefix : Nat"));
+    }
+
+    #[test]
+    fn imported_terminal_check_never_prints_after_a_module_prefix_vm_failure() {
+        let kernel = fln::Budget::for_stack_bytes(SOURCE_RUN_KERNEL_STACK_BYTES);
+        let engine = fln::Engine::with_source_seed(fln::EngineAdmissionLimits::new(kernel))
+            .expect("the source seed reaches both checker seats")
+            .into_complete()
+            .expect("the source seed answers completely");
+        let base = fln::Name::from_components(["Base"]);
+        let main = fln::Name::from_components(["Main"]);
+        let modules = [
+            fln::SourceModuleInput {
+                name: &base,
+                source: b"def imported : Nat := 7",
+            },
+            fln::SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check imported",
+            },
+        ];
+        let outcome = engine
+            .check_terminal_source_modules(
+                &modules,
+                &main,
+                &fln::KVMap::new(),
+                fln::EngineExecutionLimits::new(kernel),
+            )
+            .expect("the imported terminal check completes before the planted VM exit");
+        let fln::Outcome::Complete(mut completed) = outcome else {
+            panic!("the imported terminal check must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        let prefix = completed
+            .definition_prefix
+            .as_mut()
+            .expect("the imported definition is the real query prefix");
+        let usage = match &prefix.executions[0].exit {
+            fln::VmExit::Returned(returned) => returned.usage,
+            fln::VmExit::Panicked { .. } | fln::VmExit::Refused { .. } => {
+                panic!("the planted imported prefix begins as a normal return"); // ubs:ignore — test-only diagnostic.
+            }
+        };
+        prefix.executions[0].exit = fln::VmExit::Panicked {
+            message: "planted imported panic".to_owned(),
+            usage,
+        };
+
+        let output = render_lean_terminal_source_check(&completed);
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.starts_with("lean: program-panic: "));
+        assert!(output.stderr.contains("source command 0 panicked"));
+        assert!(output.stderr.contains("planted imported panic"));
+        assert!(!output.stderr.contains("imported : Nat"));
     }
 
     #[test]

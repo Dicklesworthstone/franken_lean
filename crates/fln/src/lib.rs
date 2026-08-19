@@ -2742,7 +2742,17 @@ impl Engine {
         if parsed.kind() != fln_parse::SourceCommandKind::Check {
             return Err(EngineExecutionError::StandaloneCheckRequired);
         }
-        let name = fresh_generated_command_name(self.environment(), 0)?;
+        self.check_parsed_source_command(parsed, options, limits, 0)
+    }
+
+    fn check_parsed_source_command(
+        &self,
+        parsed: ParsedSourceCommand,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        command_index: usize,
+    ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
+        let name = fresh_generated_command_name(self.environment(), command_index)?;
         let declaration = fln_elab::elaborate_check_in(parsed.syntax(), name, self.environment())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -2767,6 +2777,189 @@ impl Engine {
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
             },
         )
+    }
+
+    /// Execute one import-free source command stream containing definitions,
+    /// evaluations, and scratch-only `#check` queries in source order.
+    ///
+    /// Definitions and evaluations use the ordinary dual-check, publication,
+    /// compiler, codec, and Golem path. Each query observes the exact immutable
+    /// successor produced by the preceding executable commands, but its
+    /// generated candidate is admitted only into a discarded scratch successor.
+    /// A later frontend/admission/compiler refusal or non-answer returns no
+    /// result, so callers cannot expose a partial output stream or retain a
+    /// partially advanced engine. Completed non-returning VM exits remain
+    /// explicit in the execution batch; a presentation must inspect all of them
+    /// before exposing its buffered output.
+    pub fn execute_source_commands_with_checks(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+    ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        let partitioned = fln_parse::partition_source_module(source)
+            .map_err(DefinitionFrontendError::Parse)
+            .map_err(EngineExecutionError::Frontend)?;
+        if !partitioned.imports.is_empty() {
+            return Err(EngineExecutionError::ImportsRequireResolver {
+                imports: partitioned.imports,
+            });
+        }
+        if partitioned.commands.is_empty() {
+            return Err(EngineExecutionError::EmptyBatch);
+        }
+
+        let command_count = partitioned.commands.len();
+        let mut executions = Vec::new();
+        executions.try_reserve_exact(command_count).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source command execution results",
+                requested: command_count,
+            }
+        })?;
+        let mut execution_command_indices = Vec::new();
+        execution_command_indices
+            .try_reserve_exact(command_count)
+            .map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "source command execution index table",
+                requested: command_count,
+            })?;
+        let mut outputs = Vec::new();
+        outputs.try_reserve_exact(command_count).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source command output table",
+                requested: command_count,
+            }
+        })?;
+        let mut checks = Vec::new();
+        checks.try_reserve_exact(command_count).map_err(|_| {
+            EngineExecutionError::AllocationFailure {
+                resource: "source command check table",
+                requested: command_count,
+            }
+        })?;
+        let mut evaluation_indices = Vec::new();
+        evaluation_indices
+            .try_reserve_exact(command_count)
+            .map_err(|_| EngineExecutionError::AllocationFailure {
+                resource: "source evaluation command index table",
+                requested: command_count,
+            })?;
+
+        let base_logical_root = self.logical_root(options);
+        let mut engine = self.clone();
+        for (command_index, (original_offset, command_source)) in
+            partitioned.commands.into_iter().enumerate()
+        {
+            let parsed = fln_parse::parse_source_command(command_source)
+                .map_err(|error| error.with_original_offset(original_offset))
+                .map_err(DefinitionFrontendError::Parse)
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(error)),
+                })?;
+            if parsed.kind() == fln_parse::SourceCommandKind::Check {
+                let checked = match engine.check_parsed_source_command(
+                    parsed,
+                    options,
+                    limits.admission(),
+                    command_index,
+                ) {
+                    Ok(Outcome::Complete(checked)) => checked,
+                    Ok(Outcome::Inconclusive(reason)) => {
+                        return Ok(Outcome::Inconclusive(reason));
+                    }
+                    Ok(Outcome::InternalFault(fault)) => {
+                        return Ok(Outcome::InternalFault(fault));
+                    }
+                    Err(error) => {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                        });
+                    }
+                };
+                let check_index = checks.len();
+                checks.push(checked);
+                outputs.push(SourceCommandOutput::Check {
+                    command_index,
+                    check_index,
+                });
+                continue;
+            }
+
+            let is_evaluation = parsed.kind() == fln_parse::SourceCommandKind::Evaluation;
+            let declaration = match parsed.kind() {
+                fln_parse::SourceCommandKind::Evaluation => {
+                    let name = fresh_generated_command_name(engine.environment(), command_index)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                        })?;
+                    fln_elab::elaborate_evaluation_in(parsed.syntax(), name, engine.environment())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                        })?
+                }
+                fln_parse::SourceCommandKind::Definition => {
+                    fln_elab::elaborate_definition_in(parsed.syntax(), engine.environment())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                        })?
+                }
+                fln_parse::SourceCommandKind::Check => {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "source check escaped its scratch-only command branch",
+                    });
+                }
+            };
+            let execution = match engine.execute_definition(declaration, options, limits) {
+                Ok(Outcome::Complete(execution)) => execution,
+                Ok(Outcome::Inconclusive(reason)) => return Ok(Outcome::Inconclusive(reason)),
+                Ok(Outcome::InternalFault(fault)) => {
+                    return Ok(Outcome::InternalFault(fault));
+                }
+                Err(error) => {
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                    });
+                }
+            };
+            let execution_index = executions.len();
+            engine = execution.engine.clone();
+            executions.push(execution);
+            execution_command_indices.push(command_index);
+            if is_evaluation {
+                evaluation_indices.push(execution_index);
+                outputs.push(SourceCommandOutput::Evaluation {
+                    command_index,
+                    execution_index,
+                });
+            }
+        }
+
+        let result_logical_root = engine.logical_root(options);
+        Ok(Outcome::Complete(SourceCommandBatchExecution {
+            batch: DefinitionBatchExecution {
+                engine,
+                base_logical_root,
+                result_logical_root,
+                executions,
+                source_module_order: Vec::new(),
+                source_evaluation_indices: evaluation_indices,
+            },
+            command_count,
+            execution_command_indices,
+            outputs,
+            checks,
+        }))
     }
 
     /// Execute a definition-only prefix, then dual-check one terminal `#check`.
@@ -5035,6 +5228,36 @@ pub struct TerminalSourceCheck {
     pub check: SourceCheck,
 }
 
+/// One user-visible output produced by an ordered import-free source stream.
+///
+/// Definitions have no output row. Evaluation rows point into the retained
+/// execution batch; check rows point into the batch's scratch-only check table.
+#[derive(Debug)]
+pub enum SourceCommandOutput {
+    Evaluation {
+        command_index: usize,
+        execution_index: usize,
+    },
+    Check {
+        command_index: usize,
+        check_index: usize,
+    },
+}
+
+/// The completed result of an import-free mixed source command stream.
+///
+/// `execution_command_indices` maps every retained definition/evaluation
+/// execution back to its original source command. Query candidates never enter
+/// that batch or its final engine.
+#[derive(Debug)]
+pub struct SourceCommandBatchExecution {
+    pub batch: DefinitionBatchExecution,
+    pub command_count: usize,
+    pub execution_command_indices: Vec<usize>,
+    pub outputs: Vec<SourceCommandOutput>,
+    pub checks: Vec<SourceCheck>,
+}
+
 /// One exact source module in a caller-supplied closed import set.
 ///
 /// `name` is resolver authority supplied by the caller. The source header must
@@ -5611,7 +5834,7 @@ impl fmt::Display for EngineExecutionError {
             }
             Self::StandaloneCheckRequired => write!(
                 formatter,
-                "#check is currently a standalone import-free query or the terminal command after an import-free definition-only prefix, not an executable batch command"
+                "#check requires the ordered import-free native lean command stream or one terminal entry query over a definition-only import closure, not this executable batch"
             ),
             Self::TerminalCheckRequired => write!(
                 formatter,
@@ -5712,10 +5935,10 @@ mod tests {
         OleanDeclarationError, OleanDecodeError, OleanDecodeLimits, OleanModuleImport,
         OleanModuleInput, OleanRebuildError, OleanRegionError, OleanWalkBudget, OpaqueVal, Outcome,
         ProjectionRefusal, ProjectionRequest, ProjectionSnapshot, RecursorRule, RecursorVal,
-        ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceModuleInput, TheoremVal,
-        VmExecutionLimits, closed_vm_value, decode_olean_artifact, execute_flbc_artifact,
-        execute_golem_with_options, fresh_generated_command_name, project_lsp_diagnostics,
-        rebuild_olean_artifact, source_scalar_constructor_binding,
+        ReducibilityHints, RejectClass, ScalarConstructorBinding, SourceCommandOutput,
+        SourceModuleInput, TheoremVal, VmExecutionLimits, closed_vm_value, decode_olean_artifact,
+        execute_flbc_artifact, execute_golem_with_options, fresh_generated_command_name,
+        project_lsp_diagnostics, rebuild_olean_artifact, source_scalar_constructor_binding,
     };
     use fln_comp::flbc::{
         ArgumentOwnership, CallableResultOwnership, CodecError, CodecLimits, Function, FunctionId,
@@ -9315,6 +9538,149 @@ mod tests {
             EngineExecutionError::TerminalCheckRequired
         ));
         assert_eq!(engine.logical_root(&options), before);
+    }
+
+    #[test]
+    fn mixed_source_commands_preserve_output_order_and_never_publish_check_rows() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+
+        let Outcome::Complete(completed) = engine
+            .execute_source_commands_with_checks(
+                b"#check Nat\n#eval 40 + 2\ndef answer : Nat := 42\n#check answer\n#eval answer + 1\n#check Nat.add",
+                &options,
+                test_limits(),
+            )
+            .expect("definitions, evaluations, and checks share one ordered source stream")
+        else {
+            panic!("the mixed source command stream must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(completed.command_count, 6);
+        assert_eq!(completed.execution_command_indices, [1, 2, 4]);
+        assert_eq!(completed.batch.executions.len(), 3);
+        assert_eq!(completed.batch.source_evaluation_indices, [0, 2]);
+        assert_eq!(completed.outputs.len(), 5);
+        assert_eq!(completed.checks.len(), 3);
+        assert_eq!(completed.batch.base_logical_root, before);
+        assert_eq!(
+            completed.batch.result_logical_root,
+            completed.batch.executions[2].result_logical_root
+        );
+        assert!(
+            completed
+                .batch
+                .engine
+                .environment()
+                .contains(&Name::from_components(["answer"]))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.batch.executions[0].exit),
+            Ok(Some(ClosedVmValue::Scalar(42)))
+        );
+        assert_eq!(
+            closed_vm_value(&completed.batch.executions[2].exit),
+            Ok(Some(ClosedVmValue::Scalar(43)))
+        );
+
+        let expected_commands = [0, 1, 3, 4, 5];
+        for (output, expected) in completed.outputs.iter().zip(expected_commands) {
+            let actual = match output {
+                SourceCommandOutput::Evaluation { command_index, .. }
+                | SourceCommandOutput::Check { command_index, .. } => *command_index,
+            };
+            assert_eq!(actual, expected);
+        }
+        let SourceCommandOutput::Check {
+            check_index: first_check_index,
+            ..
+        } = &completed.outputs[0]
+        else {
+            panic!("command zero must retain its checked query"); // ubs:ignore — test-only diagnostic.
+        };
+        let first_check = &completed.checks[*first_check_index];
+        assert_eq!(first_check.environment_root, before);
+        let SourceCommandOutput::Check {
+            check_index: answer_check_index,
+            ..
+        } = &completed.outputs[2]
+        else {
+            panic!("command three must retain its checked query"); // ubs:ignore — test-only diagnostic.
+        };
+        let answer_check = &completed.checks[*answer_check_index];
+        assert_eq!(
+            answer_check.environment_root,
+            completed.batch.executions[1].result_logical_root
+        );
+        for output in &completed.outputs {
+            let SourceCommandOutput::Check { check_index, .. } = output else {
+                continue;
+            };
+            let check = &completed.checks[*check_index];
+            let Declaration::Defn(query) = &check.declaration else {
+                panic!("every source check candidate must be a definition"); // ubs:ignore — test-only diagnostic.
+            };
+            assert!(
+                !completed
+                    .batch
+                    .engine
+                    .environment()
+                    .contains(&query.base.name),
+                "scratch query rows must not escape into the final engine"
+            );
+        }
+        assert_eq!(engine.logical_root(&options), before);
+
+        let future = engine
+            .execute_source_commands_with_checks(
+                b"#check later\ndef later : Nat := 1",
+                &options,
+                test_limits(),
+            )
+            .expect_err("a query cannot observe a definition from a later command");
+        assert!(matches!(
+            future,
+            EngineExecutionError::BatchCommand {
+                index: 0,
+                error,
+            } if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let failed = engine
+            .execute_source_commands_with_checks(
+                b"#check Nat\n#eval 42\ndef retained : Nat := 7\n#check Missing",
+                &options,
+                test_limits(),
+            )
+            .expect_err("a late failed check exposes neither earlier output nor a successor");
+        assert!(matches!(
+            failed,
+            EngineExecutionError::BatchCommand {
+                index: 3,
+                error,
+            } if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["retained"]))
+        );
+
+        assert!(matches!(
+            engine
+                .execute_source_commands_with_checks(
+                    b"#check Nat\ndef recovered : Nat := 9\n#eval recovered",
+                    &options,
+                    test_limits(),
+                )
+                .expect("the unchanged engine recovers after the late query refusal"),
+            Outcome::Complete(_)
+        ));
     }
 
     #[test]
