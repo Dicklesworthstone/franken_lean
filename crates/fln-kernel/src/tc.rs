@@ -4592,6 +4592,40 @@ impl<'a> TypeChecker<'a> {
         self.instantiate_rev(&function_type, &args[pending_start..], 0, depth)
     }
 
+    /// Pin `cheap_beta_reduce`: after lambda/let inference, discard a beta
+    /// redex only when peeling its head lambdas exposes either a closed term
+    /// or one of the consumed binders directly. The general open-body case is
+    /// deliberately left unchanged; reducing it would require substitution
+    /// and turn this dependency-pruning fast path into a second beta engine.
+    fn cheap_beta_reduce(&self, e: &Expr) -> Expr {
+        let (mut head, args) = app_spine(e);
+        if args.is_empty() || !matches!(head.node(), ExprNode::Lam { .. }) {
+            return e.clone();
+        }
+        let mut consumed = 0usize;
+        while consumed < args.len() {
+            let ExprNode::Lam { body, .. } = head.node() else {
+                break;
+            };
+            head = body.clone();
+            consumed += 1;
+        }
+        let mut reduced = if !head.has_loose_bvars() {
+            head
+        } else if let ExprNode::BVar { idx } = head.node()
+            && let Ok(index) = usize::try_from(*idx)
+            && index < consumed
+        {
+            args[consumed - index - 1].clone()
+        } else {
+            return e.clone();
+        };
+        for argument in args.into_iter().skip(consumed) {
+            reduced = Expr::app(reduced, argument);
+        }
+        reduced
+    }
+
     /// Pin `infer_lambda`: peel a consecutive lambda telescope iteratively,
     /// open its domains/body simultaneously, infer the body once, and close
     /// the resulting Π telescope in one abstraction traversal.
@@ -4629,6 +4663,7 @@ impl<'a> TypeChecker<'a> {
             }
             let body = self.instantiate_rev(&current, &opened_fvars, 0, depth)?;
             let body_type = self.infer_core_mode(&body, depth, mode)?;
+            let body_type = self.cheap_beta_reduce(&body_type);
             let active = u32::try_from(opened_fvars.len())
                 .map_err(|_| Stop::Exhausted(ExhaustionReason::Depth))?;
             let mut result = self.abstract_fvar_set(&body_type, &ordinals, active, 0, depth)?;
@@ -4717,6 +4752,7 @@ impl<'a> TypeChecker<'a> {
             }
             let body = self.instantiate_rev(&current, &opened_fvars, 0, depth)?;
             let mut result = self.infer_core_mode(&body, depth, mode)?;
+            result = self.cheap_beta_reduce(&result);
             for (id, value) in replacements.into_iter().rev() {
                 result = self.replace_fvar(&result, &id, &value, depth)?;
             }
@@ -7821,6 +7857,67 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= budget.depth,
             "projection nests must consume loop steps, not native-stack depth"
+        );
+    }
+
+    #[test]
+    fn lambda_and_let_inference_cheap_beta_reduce_their_returned_body_types() {
+        let env = Environment::new();
+        let sort_zero = Expr::sort(Level::zero());
+        let sort_one = Expr::sort(Level::one());
+        let beta_type = Expr::app(
+            Expr::lam(
+                Name::str(Name::anonymous(), "ignored"),
+                sort_one.clone(),
+                sort_one.clone(),
+                BinderInfo::Default,
+            ),
+            sort_zero,
+        );
+        let term = Expr::lam(
+            Name::str(Name::anonymous(), "x"),
+            beta_type.clone(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let inferred = tc.infer(&term, 0).expect("the lambda is well typed");
+        assert!(
+            inferred
+                == Expr::forall_e(
+                    Name::str(Name::anonymous(), "x"),
+                    beta_type.clone(),
+                    sort_one.clone(),
+                    BinderInfo::Default,
+                ),
+            "infer_lambda must run the pin's cheap beta pass before closing the body type"
+        );
+
+        let let_term = Expr::let_e(
+            Name::str(Name::anonymous(), "x"),
+            beta_type.clone(),
+            Expr::sort(Level::zero()),
+            Expr::bvar(0).expect("packs"),
+            false,
+        );
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        assert!(
+            tc.infer(&let_term, 0).expect("the let is well typed") == sort_one,
+            "infer_let must run the pin's cheap beta pass before zeta-closing the body type"
+        );
+
+        let guarded_open_body = Expr::app(
+            Expr::lam(
+                Name::str(Name::anonymous(), "x"),
+                Expr::sort(Level::one()),
+                Expr::app(Expr::bvar(0).expect("packs"), Expr::sort(Level::zero())),
+                BinderInfo::Default,
+            ),
+            Expr::sort(Level::zero()),
+        );
+        assert!(
+            tc.cheap_beta_reduce(&guarded_open_body) == guarded_open_body,
+            "the cheap pass must not grow into general open-body substitution"
         );
     }
 
