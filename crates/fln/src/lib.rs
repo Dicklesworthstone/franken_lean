@@ -2856,7 +2856,8 @@ impl Engine {
     /// result, so callers cannot expose a partial output stream or retain a
     /// partially advanced engine. Completed non-returning VM exits remain
     /// explicit in the execution batch; a presentation must inspect all of them
-    /// before exposing its buffered output.
+    /// before exposing its buffered output. A parsed empty stream completes with
+    /// an identity engine/root transition and no output rows.
     pub fn execute_source_commands_with_checks(
         &self,
         source: &[u8],
@@ -2871,7 +2872,30 @@ impl Engine {
                 imports: partitioned.imports,
             });
         }
+        if partitioned.commands.is_empty() {
+            return Ok(Outcome::Complete(
+                self.empty_source_command_execution(options),
+            ));
+        }
         self.execute_source_command_stream(partitioned.commands, options, limits)
+    }
+
+    fn empty_source_command_execution(&self, options: &KVMap) -> SourceCommandBatchExecution {
+        let root = self.logical_root(options);
+        SourceCommandBatchExecution {
+            batch: DefinitionBatchExecution {
+                engine: self.clone(),
+                base_logical_root: root,
+                result_logical_root: root,
+                executions: Vec::new(),
+                source_module_order: Vec::new(),
+                source_evaluation_indices: Vec::new(),
+            },
+            command_count: 0,
+            execution_command_indices: Vec::new(),
+            outputs: Vec::new(),
+            checks: Vec::new(),
+        }
     }
 
     fn execute_source_command_stream(
@@ -3370,21 +3394,9 @@ impl Engine {
             })?;
         let mut dependency_prefix = dependency_plan.batch;
         let entry_execution = if entry_commands.is_empty() {
-            let root = dependency_prefix.engine.logical_root(options);
-            SourceCommandBatchExecution {
-                batch: DefinitionBatchExecution {
-                    engine: dependency_prefix.engine.clone(),
-                    base_logical_root: root,
-                    result_logical_root: root,
-                    executions: Vec::new(),
-                    source_module_order: Vec::new(),
-                    source_evaluation_indices: Vec::new(),
-                },
-                command_count: 0,
-                execution_command_indices: Vec::new(),
-                outputs: Vec::new(),
-                checks: Vec::new(),
-            }
+            dependency_prefix
+                .engine
+                .empty_source_command_execution(options)
         } else {
             match dependency_prefix.engine.execute_source_command_stream(
                 entry_commands,
@@ -9890,6 +9902,24 @@ mod tests {
             .expect("the bounded source seed answers completely");
         let options = KVMap::new();
         let before = engine.logical_root(&options);
+
+        let Outcome::Complete(empty) = engine
+            .execute_source_commands_with_checks(b"\n-- no commands\n", &options, test_limits())
+            .expect("a parsed empty mixed stream is an identity transition")
+        else {
+            panic!("the empty mixed stream must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(empty.command_count, 0);
+        assert!(empty.batch.executions.is_empty());
+        assert!(empty.execution_command_indices.is_empty());
+        assert!(empty.outputs.is_empty());
+        assert!(empty.checks.is_empty());
+        assert_eq!(empty.batch.base_logical_root, before);
+        assert_eq!(empty.batch.result_logical_root, before);
+        assert_eq!(
+            empty.batch.engine.environment().len(),
+            engine.environment().len()
+        );
 
         let Outcome::Complete(completed) = engine
             .execute_source_commands_with_checks(

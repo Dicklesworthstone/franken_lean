@@ -137,6 +137,32 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     );
     assert!(reported_libdir.stderr.is_empty());
 
+    std::fs::write(&source, b"-- intentionally empty native Lean module\n")
+        .expect("write an empty native Lean source");
+    let empty_file = run_lean(&[&source]);
+    assert!(
+        empty_file.status.success(),
+        "empty native Lean file stderr: {}",
+        utf8(&empty_file.stderr)
+    );
+    assert!(empty_file.stdout.is_empty());
+    assert!(empty_file.stderr.is_empty());
+
+    let empty_product_run = run_fln(&[Path::new("run"), Path::new("--json"), &source]);
+    assert!(!empty_product_run.status.success());
+    assert!(empty_product_run.stdout.is_empty());
+    assert!(utf8(&empty_product_run.stderr).contains("\"class\":\"execution\""));
+    assert!(utf8(&empty_product_run.stderr).contains("definition batch must not be empty"));
+
+    let empty_stdin = run_lean_stdin(&[Path::new("--stdin")], b"");
+    assert!(
+        empty_stdin.status.success(),
+        "empty native Lean stdin stderr: {}",
+        utf8(&empty_stdin.stderr)
+    );
+    assert!(empty_stdin.stdout.is_empty());
+    assert!(empty_stdin.stderr.is_empty());
+
     std::fs::write(
         &source,
         b"def answer : Nat := 40 + 2\n#eval \"native\"\n#eval answer\n#eval answer == 42\ndef retained : Nat := 7\n",

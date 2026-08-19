@@ -138,6 +138,7 @@ const LEAN_USAGE: &str = concat!(
     "Check and #eval output is buffered in source order until the whole source\n",
     "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
     "same ordered command stream after its transitive dependency closure completes.\n",
+    "An empty source file or empty --stdin stream succeeds silently.\n",
     "Dependency definitions, #eval, and scratch-only #check run silently.\n",
     "Every dependency query is checked against that module's transitive imports.\n",
     "An import-only entry succeeds silently after its checked dependency closure.\n",
@@ -3569,12 +3570,13 @@ fn render_lean_source_check_line(checked: &fln::SourceCheck) -> Result<String, M
     Ok(format!("{term} : {type_}\n"))
 }
 
-fn source_has_check(source: &[u8]) -> bool {
+fn source_uses_mixed_lean_commands(source: &[u8]) -> bool {
     fln::partition_source_module(source).is_ok_and(|module| {
-        module.commands.iter().any(|(_, command)| {
-            fln::parse_source_command(command)
-                .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
-        })
+        module.commands.is_empty()
+            || module.commands.iter().any(|(_, command)| {
+                fln::parse_source_command(command)
+                    .is_ok_and(|parsed| parsed.kind() == fln::SourceCommandKind::Check)
+            })
     })
 }
 
@@ -4080,7 +4082,7 @@ where
         && module_plan.is_none()
         && source_refs.len() == 1
         && let Some(source) = source_refs.last().copied()
-        && source_has_check(source)
+        && source_uses_mixed_lean_commands(source)
     {
         let completed = match engine.execute_source_commands_with_checks(source, &options, limits) {
             Ok(completed) => completed,
@@ -6958,6 +6960,10 @@ mod tests {
                 .contains("Import-free #check commands may appear anywhere")
         );
         assert!(help.stdout.contains("transitive dependency closure"));
+        assert!(
+            help.stdout
+                .contains("empty --stdin stream succeeds silently")
+        );
         assert!(
             help.stdout
                 .contains("Dependency definitions, #eval, and scratch-only #check run silently")

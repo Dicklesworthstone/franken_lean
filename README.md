@@ -329,6 +329,11 @@ product. This is not `LEAN_PATH` or package discovery, implicit Prelude
 ingestion, Lake, or general Lean module elaboration;
 the example deliberately does not pretend otherwise.
 
+An empty or comment-only import-free file, and an empty `lean --stdin` stream,
+also complete successfully with no output. This is an identity source
+transition after the same checked seed initialization; it does not relax the
+nonempty final-product requirement of `fln run`.
+
 `fln run --emit-olean-snapshot PATH ...` now connects that checked execution
 to the real pinned-format writer. After every command has passed K1, the
 independent checker, compilation, and Golem execution, it encodes the exact
