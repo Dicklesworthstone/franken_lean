@@ -364,19 +364,20 @@ planning and checking. This bounded seam assumes a trusted filesystem namespace
 that remains stable for the invocation; directory-handle-relative path-race
 sealing is not implemented.
 
-A standalone, import-free `#check`, or one terminal check after an import-free
-definition-only prefix, is also live through the native `lean` personality. The
-bounded elaborator infers the term's real type, places an unspellable generated
-definition into a scratch successor, and requires both K1 and the retained
-independent checker to admit it. The successor is then discarded: the query
-does not publish a declaration, enter compiler ingress, or run on Golem. For
-example, `#check Nat` prints `Nat : Type`, while a file containing
-`def answer := 42` followed by `#check answer` prints `answer : Nat`. This is
-intentionally narrower than general command elaboration: the query sees the
-checked source seed plus its completed definition prefix, cannot use imports or
-coexist with evaluations, must be the
-final command, and has a bounded type renderer rather than Reference
-pretty-printing or diagnostic-text parity.
+A standalone `#check`, or one terminal check after a definition-only prefix, is
+also live through the native `lean` personality. The bounded elaborator infers
+the term's real type, places an unspellable generated definition into a scratch
+successor, and requires both K1 and the retained independent checker to admit
+it. The successor is then discarded: the query does not publish a declaration,
+enter compiler ingress, or run on Golem. For example, `#check Nat` prints
+`Nat : Type`, while a file containing `def answer := 42` followed by `#check answer`
+prints `answer : Nat`. The same query may observe the completed definition-only
+local import closure resolved by the bounded source-module engine, including a
+transitive import when every module is supplied by that resolver. This is
+intentionally narrower than general command elaboration: evaluations and
+earlier checks are refused anywhere in the query closure, the query must be the
+final entry command, and the type renderer covers only bounded supported shapes
+rather than Reference pretty-printing or diagnostic-text parity.
 
 The same bounded local resolver is available through `lean --src-deps FILE`:
 it parses only the import header, validates every direct local source import,

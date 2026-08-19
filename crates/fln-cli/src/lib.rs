@@ -130,13 +130,13 @@ const LEAN_USAGE: &str = concat!(
     "compiler, canonical FLBC, and Golem path as `fln run`. Successful\n",
     "scalar and first-order function definitions are silent; unlike `fln run`,\n",
     "the final definition need not produce a closed scalar.\n",
-    "A standalone import-free #check, or one final #check after an import-free\n",
-    "definition-only prefix, is inferred and admitted through\n",
+    "A standalone #check, or one final #check after a definition-only prefix,\n",
+    "is inferred and admitted through\n",
     "K1 plus the independent checker in a discarded scratch successor, then\n",
     "printed as `term : type` without compilation, VM execution, or publication.\n",
-    "The query sees the checked source seed plus that completed definition prefix;\n",
-    "it cannot use imports, follow or precede an evaluation, appear before a later\n",
-    "command, or pretty-print dependent and other unsupported inferred types.\n",
+    "The query sees the checked source seed plus its completed local import closure\n",
+    "and definition prefix. It cannot follow or precede an evaluation, appear before\n",
+    "a later command, or pretty-print dependent and other unsupported inferred types.\n",
     "Each supported #eval result is printed on its own line after the whole\n",
     "source succeeds; a later failure leaves stdout empty. For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
@@ -6662,7 +6662,8 @@ mod tests {
         assert!(help.stdout.contains("complete local A/B.lean closure"));
         assert!(help.stdout.contains("lean --stdin"));
         assert!(help.stdout.contains("bounded import-free source"));
-        assert!(help.stdout.contains("standalone import-free #check"));
+        assert!(help.stdout.contains("A standalone #check"));
+        assert!(help.stdout.contains("completed local import closure"));
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
         assert!(help.stdout.contains("lean --print-libdir"));

@@ -199,15 +199,34 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
 
     let imported_dir = root.join("Project");
     std::fs::create_dir_all(&imported_dir).expect("create the imported check fixture directory");
-    std::fs::write(imported_dir.join("Seed.lean"), b"def seed : Nat := 1\n")
-        .expect("write the imported check fixture dependency");
-    std::fs::write(&source, b"import Project.Seed\n#check Nat\n")
+    std::fs::write(imported_dir.join("Base.lean"), b"def base : Nat := 40\n")
+        .expect("write the transitive imported check fixture dependency");
+    std::fs::write(
+        imported_dir.join("Seed.lean"),
+        b"import Project.Base\ndef seed : Nat := base + 2\n",
+    )
+    .expect("write the imported check fixture dependency");
+    std::fs::write(&source, b"import Project.Seed\n#check seed\n")
         .expect("write an imported check query");
     let imported_check = run_lean(&[&source]);
-    assert!(!imported_check.status.success());
-    assert!(imported_check.stdout.is_empty());
-    assert!(utf8(&imported_check.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&imported_check.stderr).contains("standalone import-free query"));
+    assert!(
+        imported_check.status.success(),
+        "imported native lean #check stderr: {}",
+        utf8(&imported_check.stderr)
+    );
+    assert_eq!(utf8(&imported_check.stdout), "seed : Nat\n");
+    assert!(imported_check.stderr.is_empty());
+
+    std::fs::write(imported_dir.join("Seed.lean"), b"#eval 1\n")
+        .expect("plant an evaluation in the imported query closure");
+    std::fs::write(&source, b"import Project.Seed\n#check Nat\n")
+        .expect("write the evaluation-bearing imported check query");
+    let imported_evaluation = run_lean(&[&source]);
+    assert!(!imported_evaluation.status.success());
+    assert!(imported_evaluation.stdout.is_empty());
+    assert!(utf8(&imported_evaluation.stderr).starts_with("lean: execution: "));
+    assert!(utf8(&imported_evaluation.stderr).contains("module `Project.Seed`"));
+    assert!(utf8(&imported_evaluation.stderr).contains("only definitions"));
 
     let unknown_check = run_lean_stdin(
         &[Path::new("--stdin")],

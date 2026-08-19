@@ -17,10 +17,10 @@
 //! Verdict's proof-producing `bv_decide` pipeline is also available through an
 //! atomic engine transition whose theorem must survive both Verdict's proof
 //! replay/K1 path and the facade's independent-checker council. A standalone
-//! bounded `#check`, or one terminal check after an import-free definition-only
-//! prefix, can use those same two checker seats in a discarded scratch
-//! successor, returning its checked type without publishing, compiling, or
-//! executing the queried term. Lantern's typed
+//! bounded `#check`, or one terminal check after a closed definition-only source
+//! graph, can use those same two checker seats in a discarded scratch successor,
+//! returning its checked type without publishing, compiling, or executing the
+//! queried term. Lantern's typed
 //! LSP diagnostic projection is reachable here as a pure protocol adapter; the
 //! long-lived server transport remains a separate, unfinished product surface.
 
@@ -2907,13 +2907,12 @@ impl Engine {
                     .len()
                     .checked_sub(1)
                     .ok_or(EngineExecutionError::TerminalCheckRequired)?;
-                let (terminal_offset, terminal_source) = partitioned
-                    .commands
-                    .last()
-                    .copied()
-                    .ok_or(EngineExecutionError::UnexpectedPublication {
-                        detail: "terminal source command disappeared after indexing",
-                    })?;
+                let (terminal_offset, terminal_source) =
+                    partitioned.commands.last().copied().ok_or(
+                        EngineExecutionError::UnexpectedPublication {
+                            detail: "terminal source command disappeared after indexing",
+                        },
+                    )?;
                 let terminal = fln_parse::parse_source_command(terminal_source)
                     .map_err(|error| error.with_original_offset(terminal_offset))
                     .map_err(DefinitionFrontendError::Parse)
@@ -9316,6 +9315,170 @@ mod tests {
             EngineExecutionError::TerminalCheckRequired
         ));
         assert_eq!(engine.logical_root(&options), before);
+    }
+
+    #[test]
+    fn terminal_source_check_observes_a_closed_definition_only_import_graph() {
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the bounded source seed reaches both council seats")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let base = Name::from_components(["Base"]);
+        let middle = Name::from_components(["Middle"]);
+        let main = Name::from_components(["Main"]);
+        let modules = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Middle\n#check middle",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"def base : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &middle,
+                source: b"import Base\ndef middle : Nat := base + 2",
+            },
+        ];
+
+        let Outcome::Complete(checked) = engine
+            .check_terminal_source_modules(&modules, &main, &options, test_limits())
+            .expect("a terminal query observes its transitive checked import closure")
+        else {
+            panic!("the imported terminal source check was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        assert_eq!(
+            checked.source_module_order,
+            [base.clone(), middle, main.clone()]
+        );
+        let prefix = checked
+            .definition_prefix
+            .as_ref()
+            .expect("the dependency definitions are retained as the query prefix");
+        assert_eq!(prefix.executions.len(), 2);
+        assert_eq!(checked.check.environment_root, prefix.result_logical_root);
+        assert_eq!(checked.check.checked_type, nat_type());
+        assert!(
+            prefix
+                .engine
+                .environment()
+                .contains(&Name::from_components(["base"]))
+        );
+        assert!(
+            prefix
+                .engine
+                .environment()
+                .contains(&Name::from_components(["middle"]))
+        );
+        let Declaration::Defn(query) = &checked.check.declaration else {
+            panic!("the imported query candidate must be a definition"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(
+            !prefix.engine.environment().contains(&query.base.name),
+            "the imported query row must remain in its discarded successor"
+        );
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["base"]))
+        );
+
+        let empty = Name::from_components(["Empty"]);
+        let empty_graph = [
+            SourceModuleInput {
+                name: &empty,
+                source: b"",
+            },
+            SourceModuleInput {
+                name: &main,
+                source: b"import Empty\n#check Nat",
+            },
+        ];
+        let Outcome::Complete(empty_check) = engine
+            .check_terminal_source_modules(&empty_graph, &main, &options, test_limits())
+            .expect("an import graph with no definitions can still query the checked seed")
+        else {
+            panic!("the definition-free imported query was not complete"); // ubs:ignore — test-only diagnostic.
+        };
+        assert!(empty_check.definition_prefix.is_none());
+        assert_eq!(
+            empty_check.source_module_order,
+            [empty.clone(), main.clone()]
+        );
+        assert_eq!(empty_check.check.environment_root, before);
+
+        let evaluation_dependency = [
+            SourceModuleInput {
+                name: &base,
+                source: b"#eval 1",
+            },
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check Nat",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .check_terminal_source_modules(
+                    &evaluation_dependency,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("an imported query cannot execute dependency evaluations"),
+            EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
+                module,
+                index: 0,
+            } if module == base
+        ));
+
+        let unknown_modules = [
+            SourceModuleInput {
+                name: &base,
+                source: b"def base : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check Missing",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .check_terminal_source_modules(
+                    &unknown_modules,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("a refused query exposes no completed dependency engine"),
+            EngineExecutionError::BatchCommand { index: 1, error }
+                if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+        let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+        let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+        let mut constrained = test_limits();
+        constrained.checker.admission =
+            CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+        assert!(matches!(
+            engine
+                .check_terminal_source_modules(&empty_graph, &main, &options, constrained)
+                .expect_err("an independent-checker non-answer vetoes an imported query"),
+            EngineExecutionError::BatchCommand { index: 0, error }
+                if matches!(*error, EngineExecutionError::CouncilHalted { .. })
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(matches!(
+            engine
+                .check_terminal_source_modules(&empty_graph, &main, &options, test_limits())
+                .expect("the unchanged engine recovers after imported-query refusals"),
+            Outcome::Complete(_)
+        ));
     }
 
     #[test]
