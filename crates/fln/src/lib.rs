@@ -2874,10 +2874,7 @@ impl Engine {
                 limit: limits.source_modules.max_modules,
             });
         }
-        let entry_matches = modules
-            .iter()
-            .filter(|module| module.name == entry)
-            .count();
+        let entry_matches = modules.iter().filter(|module| module.name == entry).count();
         match entry_matches {
             0 => {
                 return Err(EngineExecutionError::MissingSourceEntry {
@@ -2905,10 +2902,18 @@ impl Engine {
                 .map_err(DefinitionFrontendError::Parse)
                 .map_err(EngineExecutionError::Frontend)?;
             let prefix_len = if module.name == entry {
-                let terminal_index = partitioned.commands.len().checked_sub(1).ok_or(
-                    EngineExecutionError::TerminalCheckRequired,
-                )?;
-                let (terminal_offset, terminal_source) = partitioned.commands[terminal_index];
+                let terminal_index = partitioned
+                    .commands
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(EngineExecutionError::TerminalCheckRequired)?;
+                let (terminal_offset, terminal_source) = partitioned
+                    .commands
+                    .last()
+                    .copied()
+                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                        detail: "terminal source command disappeared after indexing",
+                    })?;
                 let terminal = fln_parse::parse_source_command(terminal_source)
                     .map_err(|error| error.with_original_offset(terminal_offset))
                     .map_err(DefinitionFrontendError::Parse)
@@ -2935,22 +2940,18 @@ impl Engine {
                         error: Box::new(EngineExecutionError::Frontend(error)),
                     })?;
                 if parsed.kind() != fln_parse::SourceCommandKind::Definition {
-                    return Err(
-                        EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
-                            module: module.name.clone(),
-                            index,
-                        },
-                    );
+                    return Err(EngineExecutionError::TerminalCheckModuleDefinitionPrefix {
+                        module: module.name.clone(),
+                        index,
+                    });
                 }
             }
             let source = if module.name == entry {
-                let (terminal_offset, _) = partitioned
-                    .commands
-                    .get(prefix_len)
-                    .copied()
-                    .ok_or(EngineExecutionError::UnexpectedPublication {
+                let (terminal_offset, _) = partitioned.commands.get(prefix_len).copied().ok_or(
+                    EngineExecutionError::UnexpectedPublication {
                         detail: "terminal source command disappeared after preflight",
-                    })?;
+                    },
+                )?;
                 module.source.get(..terminal_offset.0).ok_or(
                     EngineExecutionError::UnexpectedPublication {
                         detail: "terminal source command offset escaped its module bytes",
@@ -2965,9 +2966,9 @@ impl Engine {
             });
         }
         let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
-        let completed = match self.execute_source_modules_internal(
-            &rewritten, entry, options, limits, false, true,
-        )? {
+        let completed = match self
+            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true)?
+        {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -5029,6 +5030,8 @@ pub struct SourceCheck {
 pub struct TerminalSourceCheck {
     /// The completed definition prefix, absent for a standalone query.
     pub definition_prefix: Option<DefinitionBatchExecution>,
+    /// Canonical dependency-first module order, empty for an import-free query.
+    pub source_module_order: Vec<Name>,
     /// The terminal query checked against the prefix successor.
     pub check: SourceCheck,
 }
@@ -5485,6 +5488,10 @@ pub enum EngineExecutionError {
     TerminalCheckDefinitionPrefix {
         index: usize,
     },
+    TerminalCheckModuleDefinitionPrefix {
+        module: Name,
+        index: usize,
+    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5614,6 +5621,11 @@ impl fmt::Display for EngineExecutionError {
             Self::TerminalCheckDefinitionPrefix { index } => write!(
                 formatter,
                 "bounded terminal #check permits only definitions before it; command {index} is not a definition"
+            ),
+            Self::TerminalCheckModuleDefinitionPrefix { module, index } => write!(
+                formatter,
+                "bounded terminal #check permits only definitions in its import closure; command {index} in module `{}` is not a definition",
+                module.to_display_string(),
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
             Self::KernelRejected { class, message } => {
