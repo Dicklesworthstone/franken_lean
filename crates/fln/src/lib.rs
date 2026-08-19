@@ -3203,11 +3203,13 @@ impl Engine {
     /// Execute a closed local source-module graph with a mixed command stream
     /// in the selected entry module.
     ///
-    /// Every dependency module is definition-only and executes silently in the
-    /// ordinary deterministic dependency order. The entry then runs definitions,
-    /// evaluations, and scratch-only checks in source order against that exact
-    /// completed dependency environment. Dependency execution and entry output
-    /// are retained separately so a presentation can reject any non-returning VM
+    /// Every dependency module executes definitions and evaluations silently in
+    /// the ordinary deterministic dependency order. Dependency `#check` remains
+    /// outside this bounded module path because a scratch query needs its own
+    /// module-visibility proof. The entry then runs definitions, evaluations,
+    /// and scratch-only checks in source order against the exact completed
+    /// dependency environment. Dependency execution and entry output are
+    /// retained separately so a presentation can reject any non-returning VM
     /// exit before exposing the entry's buffered output.
     pub fn execute_source_modules_with_entry_checks(
         &self,
@@ -3276,8 +3278,8 @@ impl Engine {
                             index,
                             error: Box::new(EngineExecutionError::Frontend(error)),
                         })?;
-                    if parsed.kind() != fln_parse::SourceCommandKind::Definition {
-                        return Err(EngineExecutionError::SourceDependencyDefinitionRequired {
+                    if parsed.kind() == fln_parse::SourceCommandKind::Check {
+                        return Err(EngineExecutionError::SourceDependencyCheckUnsupported {
                             module: module.name.clone(),
                             index,
                         });
@@ -5391,8 +5393,8 @@ pub struct SourceCommandBatchExecution {
 /// A closed dependency graph followed by its selected entry command stream.
 #[derive(Debug)]
 pub struct SourceModuleCommandBatchExecution {
-    /// Completed definition-only dependency execution, absent for an entry with
-    /// no executable dependency declarations.
+    /// Completed silent dependency definition/evaluation execution, absent for
+    /// an entry with no executable dependency commands.
     pub dependency_prefix: Option<DefinitionBatchExecution>,
     /// Canonical dependency-first module order, including the entry last.
     pub source_module_order: Vec<Name>,
@@ -5856,7 +5858,7 @@ pub enum EngineExecutionError {
         module: Name,
         index: usize,
     },
-    SourceDependencyDefinitionRequired {
+    SourceDependencyCheckUnsupported {
         module: Name,
         index: usize,
     },
@@ -5995,9 +5997,9 @@ impl fmt::Display for EngineExecutionError {
                 "bounded terminal #check permits only definitions in its import closure; command {index} in module `{}` is not a definition",
                 module.to_display_string(),
             ),
-            Self::SourceDependencyDefinitionRequired { module, index } => write!(
+            Self::SourceDependencyCheckUnsupported { module, index } => write!(
                 formatter,
-                "native source entry execution requires imported module `{}` to be definition-only; command {index} is not a definition",
+                "native source entry execution does not yet support #check in imported module `{}`; dependency command {index} is a check",
                 module.to_display_string(),
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
@@ -9999,7 +10001,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_entry_commands_observe_a_silent_definition_only_import_closure() {
+    fn mixed_entry_commands_observe_silent_dependency_evaluations() {
         let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
             .expect("the bounded source seed reaches both council seats")
             .into_complete()
@@ -10009,6 +10011,8 @@ mod tests {
         let base = Name::from_components(["Base"]);
         let middle = Name::from_components(["Middle"]);
         let main = Name::from_components(["Main"]);
+        let provider = Name::from_components(["A"]);
+        let consumer = Name::from_components(["B"]);
         let modules = [
             SourceModuleInput {
                 name: &main,
@@ -10016,7 +10020,7 @@ mod tests {
             },
             SourceModuleInput {
                 name: &base,
-                source: b"def base : Nat := 40",
+                source: b"#eval 99\ndef base : Nat := 40",
             },
             SourceModuleInput {
                 name: &middle,
@@ -10037,9 +10041,13 @@ mod tests {
         let dependency_prefix = completed
             .dependency_prefix
             .as_ref()
-            .expect("both imported definitions execute before the entry");
-        assert_eq!(dependency_prefix.executions.len(), 2);
-        assert_eq!(dependency_prefix.source_evaluation_indices, []);
+            .expect("the imported commands execute before the entry");
+        assert_eq!(dependency_prefix.executions.len(), 3);
+        assert_eq!(dependency_prefix.source_evaluation_indices, [0]);
+        assert_eq!(
+            closed_vm_value(&dependency_prefix.executions[0].exit),
+            Ok(Some(ClosedVmValue::Scalar(99)))
+        );
         assert_eq!(completed.entry.command_count, 5);
         assert_eq!(completed.entry.execution_command_indices, [1, 2, 4]);
         assert_eq!(completed.entry.batch.source_evaluation_indices, [0, 2]);
@@ -10065,18 +10073,15 @@ mod tests {
             completed.entry.checks[1].environment_root,
             completed.entry.batch.executions[1].result_logical_root
         );
+        assert_eq!(
+            completed.entry.batch.engine.environment().len(),
+            dependency_prefix.engine.environment().len() + completed.entry.batch.executions.len(),
+            "scratch checks cannot add rows to the retained entry successor"
+        );
         for check in &completed.entry.checks {
-            let Declaration::Defn(query) = &check.declaration else {
+            let Declaration::Defn(_) = &check.declaration else {
                 panic!("each imported-entry query candidate must be a definition"); // ubs:ignore — test-only diagnostic.
             };
-            assert!(
-                !completed
-                    .entry
-                    .batch
-                    .engine
-                    .environment()
-                    .contains(&query.base.name)
-            );
         }
         assert_eq!(engine.logical_root(&options), before);
 
@@ -10106,26 +10111,60 @@ mod tests {
         ));
         assert_eq!(engine.logical_root(&options), before);
 
-        let noisy_dependency = [
+        let leaking_evaluation = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import A\nimport B\n#check visible",
+            },
+            SourceModuleInput {
+                name: &provider,
+                source: b"def leaked : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &consumer,
+                source: b"#eval leaked\ndef visible : Nat := 42",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .execute_source_modules_with_entry_checks(
+                    &leaking_evaluation,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("a dependency evaluation cannot borrow an unimported sibling"),
+            EngineExecutionError::SourceModuleVisibility {
+                ref module,
+                ref referenced,
+                ref owner,
+                ..
+            } if module == &consumer
+                && referenced == &Name::from_components(["leaked"])
+                && owner == &provider
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let checked_dependency = [
             SourceModuleInput {
                 name: &main,
                 source: b"import Base\n#check base",
             },
             SourceModuleInput {
                 name: &base,
-                source: b"#eval 40\ndef base : Nat := 40",
+                source: b"#check Nat\ndef base : Nat := 40",
             },
         ];
         assert!(matches!(
             engine
                 .execute_source_modules_with_entry_checks(
-                    &noisy_dependency,
+                    &checked_dependency,
                     &main,
                     &options,
                     test_limits(),
                 )
-                .expect_err("imported modules cannot leak evaluation output into the entry"),
-            EngineExecutionError::SourceDependencyDefinitionRequired {
+                .expect_err("dependency checks remain outside the bounded module path"),
+            EngineExecutionError::SourceDependencyCheckUnsupported {
                 ref module,
                 index: 0,
             } if module == &base

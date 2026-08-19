@@ -217,16 +217,34 @@ fn bounded_native_lean_personality_runs_checks_and_evaluations_and_recovers_from
     assert_eq!(utf8(&imported_check.stdout), "seed : Nat\n");
     assert!(imported_check.stderr.is_empty());
 
-    std::fs::write(imported_dir.join("Seed.lean"), b"#eval 1\n")
-        .expect("plant an evaluation in the imported query closure");
-    std::fs::write(&source, b"import Project.Seed\n#check Nat\n")
+    std::fs::write(
+        imported_dir.join("Seed.lean"),
+        b"import Project.Base\n#eval base + 1\ndef seed : Nat := base + 2\n",
+    )
+    .expect("plant a checked evaluation in the imported query closure");
+    std::fs::write(&source, b"import Project.Seed\n#check seed\n")
         .expect("write the evaluation-bearing imported check query");
     let imported_evaluation = run_lean(&[&source]);
-    assert!(!imported_evaluation.status.success());
-    assert!(imported_evaluation.stdout.is_empty());
-    assert!(utf8(&imported_evaluation.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&imported_evaluation.stderr).contains("module `Project.Seed`"));
-    assert!(utf8(&imported_evaluation.stderr).contains("definition-only"));
+    assert!(
+        imported_evaluation.status.success(),
+        "evaluation-bearing imported check stderr: {}",
+        utf8(&imported_evaluation.stderr)
+    );
+    assert_eq!(utf8(&imported_evaluation.stdout), "seed : Nat\n");
+    assert!(imported_evaluation.stderr.is_empty());
+
+    std::fs::write(
+        imported_dir.join("Seed.lean"),
+        b"import Project.Base\n#check base\ndef seed : Nat := base + 2\n",
+    )
+    .expect("plant a dependency check outside the bounded module path");
+    let imported_dependency_check = run_lean(&[&source]);
+    assert!(!imported_dependency_check.status.success());
+    assert!(imported_dependency_check.stdout.is_empty());
+    assert!(
+        utf8(&imported_dependency_check.stderr)
+            .contains("does not yet support #check in imported module `Project.Seed`")
+    );
 
     let unknown_check = run_lean_stdin(
         &[Path::new("--stdin")],
@@ -644,10 +662,13 @@ fn source_import_closure_reaches_the_real_binary_and_refuses_open_graphs() {
     std::fs::write(&main, b"import Project.Base\n#check base\n")
         .expect("write an entry over the noisy dependency");
     let noisy_dependency = run_lean(&[&main]);
-    assert!(!noisy_dependency.status.success());
-    assert!(noisy_dependency.stdout.is_empty());
-    assert!(utf8(&noisy_dependency.stderr).starts_with("lean: execution: "));
-    assert!(utf8(&noisy_dependency.stderr).contains("definition-only"));
+    assert!(
+        noisy_dependency.status.success(),
+        "silent dependency evaluation stderr: {}",
+        utf8(&noisy_dependency.stderr)
+    );
+    assert_eq!(utf8(&noisy_dependency.stdout), "base : Nat\n");
+    assert!(noisy_dependency.stderr.is_empty());
 
     std::fs::write(&base, b"def base : Nat := 20\n").expect("restore the base dependency");
     std::fs::write(

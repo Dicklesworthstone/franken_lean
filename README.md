@@ -375,10 +375,13 @@ run on Golem. For example, `#check Nat` prints `Nat : Type`, while `def answer :
 are buffered in source order until the entire command stream and every VM exit
 succeeds, so a later failure leaves stdout empty. A selected local-import entry
 gets that same ordered command stream after its complete transitive dependency
-environment is checked and executed. Imported dependency modules are
-definition-only and silent: their evaluations or checks are refused rather
-than replayed as entry output. The type renderer covers only bounded supported
-shapes rather than Reference pretty-printing or diagnostic-text parity.
+environment is checked and executed. Dependency definitions and `#eval`
+commands execute silently through the same checked VM path, so their output is
+not replayed as entry output; a non-returning dependency evaluation still fails
+the whole invocation before stdout is exposed. Dependency `#check` remains a
+typed unsupported case until scratch-query visibility is checked per module.
+The type renderer covers only bounded supported shapes rather than Reference
+pretty-printing or diagnostic-text parity.
 
 The same bounded local resolver is available through `lean --src-deps FILE`:
 it parses only the import header, validates every direct local source import,

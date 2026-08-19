@@ -137,8 +137,8 @@ const LEAN_USAGE: &str = concat!(
     "A query sees the checked source seed and every preceding command successor.\n",
     "Check and #eval output is buffered in source order until the whole source\n",
     "succeeds; a later failure leaves stdout empty. A local-import entry gets the\n",
-    "same ordered command stream after its transitive definition-only dependency\n",
-    "closure completes; dependency checks and evaluations are refused, not replayed.\n",
+    "same ordered command stream after its transitive dependency closure completes.\n",
+    "Dependency definitions and #eval run silently; dependency #check is refused.\n",
     "The bounded renderer does not pretty-print dependent or other unsupported types.\n",
     "For `import A.B`,\n",
     "the first direct import must identify exactly one ancestor source root;\n",
@@ -6917,9 +6917,10 @@ mod tests {
             help.stdout
                 .contains("Import-free #check commands may appear anywhere")
         );
+        assert!(help.stdout.contains("transitive dependency closure"));
         assert!(
             help.stdout
-                .contains("transitive definition-only dependency")
+                .contains("Dependency definitions and #eval run silently")
         );
         assert!(help.stdout.contains("lean --src-deps"));
         assert!(help.stdout.contains("lean --print-prefix"));
@@ -8073,7 +8074,7 @@ mod tests {
         let modules = [
             fln::SourceModuleInput {
                 name: &base,
-                source: b"def imported : Nat := 7",
+                source: b"#eval 7\ndef imported : Nat := 7",
             },
             fln::SourceModuleInput {
                 name: &main,
@@ -8094,11 +8095,11 @@ mod tests {
         let prefix = completed
             .dependency_prefix
             .as_mut()
-            .expect("the imported definition is the real query prefix");
+            .expect("the imported evaluation is the real query prefix");
         let usage = match &prefix.executions[0].exit {
             fln::VmExit::Returned(returned) => returned.usage,
             fln::VmExit::Panicked { .. } | fln::VmExit::Refused { .. } => {
-                panic!("the planted imported prefix begins as a normal return"); // ubs:ignore — test-only diagnostic.
+                panic!("the planted imported evaluation begins as a normal return"); // ubs:ignore — test-only diagnostic.
             }
         };
         prefix.executions[0].exit = fln::VmExit::Panicked {
