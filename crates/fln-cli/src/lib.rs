@@ -3606,6 +3606,17 @@ fn source_execution_exit_failure(
 fn render_lean_source_module_commands(
     completed: &fln::SourceModuleCommandBatchExecution,
 ) -> MultiplexerOutput {
+    if completed.dependency_prefix.is_none()
+        && !completed.dependency_execution_command_indices.is_empty()
+    {
+        return source_failure(
+            "internal-fault",
+            "dependency source execution indices existed without a retained prefix",
+            false,
+            SourcePresentation::Lean,
+            4,
+        );
+    }
     if let Some(prefix) = &completed.dependency_prefix {
         if completed.dependency_execution_command_indices.len() != prefix.executions.len() {
             return source_failure(
@@ -8138,6 +8149,18 @@ mod tests {
                 .contains("index table did not cover every execution")
         );
         completed.dependency_execution_command_indices = exact_indices;
+
+        completed.dependency_execution_command_indices[0] = completed.dependency_command_count;
+        let out_of_range = render_lean_source_module_commands(&completed);
+        assert_eq!(out_of_range.exit_code, 4);
+        assert!(out_of_range.stdout.is_empty());
+        assert!(out_of_range.stderr.starts_with("lean: internal-fault: "));
+        assert!(
+            out_of_range
+                .stderr
+                .contains("not strictly increasing in range")
+        );
+        completed.dependency_execution_command_indices[0] = 1;
 
         let prefix = completed
             .dependency_prefix
