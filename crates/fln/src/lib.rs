@@ -1846,13 +1846,29 @@ fn verify_source_module_visibility(
     modules: &[SourceModuleInput<'_>],
     dependencies: &[Vec<usize>],
     order: &[usize],
-    command_owners: &[usize],
+    execution_owners: &[usize],
     completed: &DefinitionBatchExecution,
+    check_owners: &[usize],
+    checks: &[SourceCheck],
     limit: usize,
 ) -> Result<(), EngineExecutionError> {
-    if command_owners.len() != completed.executions.len() {
+    if execution_owners.len() != completed.executions.len() {
         return Err(EngineExecutionError::UnexpectedPublication {
             detail: "source command ownership does not cover every completed execution",
+        });
+    }
+    if check_owners.len() != checks.len() {
+        return Err(EngineExecutionError::UnexpectedPublication {
+            detail: "source command ownership does not cover every completed scratch check",
+        });
+    }
+    if execution_owners
+        .iter()
+        .chain(check_owners)
+        .any(|owner| *owner >= modules.len())
+    {
+        return Err(EngineExecutionError::UnexpectedPublication {
+            detail: "source command ownership names an unknown module",
         });
     }
 
@@ -1893,7 +1909,7 @@ fn verify_source_module_visibility(
     }
 
     let mut declaration_owners = BTreeMap::new();
-    for (execution, &owner) in completed.executions.iter().zip(command_owners) {
+    for (execution, &owner) in completed.executions.iter().zip(execution_owners) {
         let Declaration::Defn(definition) = &execution.declaration else {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "source execution published a non-definition declaration",
@@ -1910,10 +1926,21 @@ fn verify_source_module_visibility(
     }
 
     let mut presentations = 0_usize;
-    for (execution, &owner) in completed.executions.iter().zip(command_owners) {
-        let Declaration::Defn(definition) = &execution.declaration else {
+    let subjects = completed
+        .executions
+        .iter()
+        .zip(execution_owners)
+        .map(|(execution, owner)| (&execution.declaration, *owner))
+        .chain(
+            checks
+                .iter()
+                .zip(check_owners)
+                .map(|(check, owner)| (&check.declaration, *owner)),
+        );
+    for (declaration, owner) in subjects {
+        let Declaration::Defn(definition) = declaration else {
             return Err(EngineExecutionError::UnexpectedPublication {
-                detail: "source execution published a non-definition declaration",
+                detail: "source execution or scratch check produced a non-definition declaration",
             });
         };
         let mut references = BTreeSet::new();
@@ -3166,7 +3193,7 @@ impl Engine {
         }
         let query_source = query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
         let completed = match self
-            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true)?
+            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true, false)?
         {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3204,13 +3231,15 @@ impl Engine {
     /// in the selected entry module.
     ///
     /// Every dependency module executes definitions and evaluations silently in
-    /// the ordinary deterministic dependency order. Dependency `#check` remains
-    /// outside this bounded module path because a scratch query needs its own
-    /// module-visibility proof. The entry then runs definitions, evaluations,
-    /// and scratch-only checks in source order against the exact completed
-    /// dependency environment. Dependency execution and entry output are
-    /// retained separately so a presentation can reject any non-returning VM
-    /// exit before exposing the entry's buffered output.
+    /// the ordinary deterministic dependency order. Dependency `#check` queries
+    /// are likewise silent and scratch-only: each candidate is dual-checked,
+    /// attributed to its source module, and included in the same transitive
+    /// visibility proof as published declarations before its scratch successor
+    /// is discarded. The entry then runs definitions, evaluations, and checks in
+    /// source order against the exact completed dependency environment.
+    /// Dependency execution and entry output are retained separately so a
+    /// presentation can reject any non-returning VM exit before exposing the
+    /// entry's buffered output.
     pub fn execute_source_modules_with_entry_checks(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -3268,23 +3297,6 @@ impl Engine {
                 entry_commands = Some(partitioned.commands);
                 source
             } else {
-                for (index, (original_offset, command_source)) in
-                    partitioned.commands.iter().enumerate()
-                {
-                    let parsed = fln_parse::parse_source_command(command_source)
-                        .map_err(|error| error.with_original_offset(*original_offset))
-                        .map_err(DefinitionFrontendError::Parse)
-                        .map_err(|error| EngineExecutionError::BatchCommand {
-                            index,
-                            error: Box::new(EngineExecutionError::Frontend(error)),
-                        })?;
-                    if parsed.kind() == fln_parse::SourceCommandKind::Check {
-                        return Err(EngineExecutionError::SourceDependencyCheckUnsupported {
-                            module: module.name.clone(),
-                            index,
-                        });
-                    }
-                }
                 module.source
             };
             rewritten.push(SourceModuleInput {
@@ -3297,7 +3309,7 @@ impl Engine {
                 module: entry.clone(),
             })?;
         let mut dependency_prefix = match self
-            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true)?
+            .execute_source_modules_internal(&rewritten, entry, options, limits, false, true, true)?
         {
             Outcome::Complete(completed) => completed,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -3447,7 +3459,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
-        self.execute_source_modules_internal(modules, entry, options, limits, true, false)
+        self.execute_source_modules_internal(modules, entry, options, limits, true, false, false)
     }
 
     fn execute_source_modules_internal(
@@ -3458,6 +3470,7 @@ impl Engine {
         limits: EngineExecutionLimits,
         require_entry_command: bool,
         allow_empty_batch: bool,
+        allow_scratch_checks: bool,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         if modules.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
@@ -3655,6 +3668,82 @@ impl Engine {
                 source_evaluation_indices: Vec::new(),
             }));
         }
+        if allow_scratch_checks {
+            let mixed = match self.execute_source_command_stream(commands, options, limits)? {
+                Outcome::Complete(completed) => completed,
+                Outcome::Inconclusive(inconclusive) => {
+                    return Ok(Outcome::Inconclusive(inconclusive));
+                }
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            let mut execution_owners = Vec::new();
+            execution_owners
+                .try_reserve_exact(mixed.execution_command_indices.len())
+                .map_err(|_| EngineExecutionError::AllocationFailure {
+                    resource: "source execution ownership table",
+                    requested: mixed.execution_command_indices.len(),
+                })?;
+            for &command_index in &mixed.execution_command_indices {
+                let Some(&owner) = command_owners.get(command_index) else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "source execution index escaped its command ownership table",
+                    });
+                };
+                execution_owners.push(owner);
+            }
+
+            let mut check_owners = Vec::new();
+            check_owners
+                .try_reserve_exact(mixed.checks.len())
+                .map_err(|_| EngineExecutionError::AllocationFailure {
+                    resource: "source scratch-check ownership table",
+                    requested: mixed.checks.len(),
+                })?;
+            check_owners.resize(mixed.checks.len(), usize::MAX);
+            for output in &mixed.outputs {
+                let SourceCommandOutput::Check {
+                    command_index,
+                    check_index,
+                } = output
+                else {
+                    continue;
+                };
+                let Some(&owner) = command_owners.get(*command_index) else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "source check index escaped its command ownership table",
+                    });
+                };
+                let Some(slot) = check_owners.get_mut(*check_index) else {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "source check output escaped its retained check table",
+                    });
+                };
+                if *slot != usize::MAX {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "source check output repeated a retained check index",
+                    });
+                }
+                *slot = owner;
+            }
+            if check_owners.contains(&usize::MAX) {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "source check ownership omitted a retained scratch check",
+                });
+            }
+            verify_source_module_visibility(
+                modules,
+                &dependencies,
+                &order,
+                &execution_owners,
+                &mixed.batch,
+                &check_owners,
+                &mixed.checks,
+                limits.source_modules.max_dependency_presentations,
+            )?;
+            let mut completed = mixed.batch;
+            completed.source_module_order = module_order;
+            return Ok(Outcome::Complete(completed));
+        }
         match self.execute_source_commands(commands, options, limits)? {
             Outcome::Complete(mut completed) => {
                 verify_source_module_visibility(
@@ -3663,6 +3752,8 @@ impl Engine {
                     &order,
                     &command_owners,
                     &completed,
+                    &[],
+                    &[],
                     limits.source_modules.max_dependency_presentations,
                 )?;
                 completed.source_module_order = module_order;
@@ -5858,10 +5949,6 @@ pub enum EngineExecutionError {
         module: Name,
         index: usize,
     },
-    SourceDependencyCheckUnsupported {
-        module: Name,
-        index: usize,
-    },
     Frontend(NatDefinitionFrontendError),
     KernelRejected {
         class: RejectClass,
@@ -5995,11 +6082,6 @@ impl fmt::Display for EngineExecutionError {
             Self::TerminalCheckModuleDefinitionPrefix { module, index } => write!(
                 formatter,
                 "bounded terminal #check permits only definitions in its import closure; command {index} in module `{}` is not a definition",
-                module.to_display_string(),
-            ),
-            Self::SourceDependencyCheckUnsupported { module, index } => write!(
-                formatter,
-                "native source entry execution does not yet support #check in imported module `{}`; dependency command {index} is a check",
                 module.to_display_string(),
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
@@ -10155,19 +10237,89 @@ mod tests {
                 source: b"#check Nat\ndef base : Nat := 40",
             },
         ];
+        let Outcome::Complete(checked_dependency) = engine
+            .execute_source_modules_with_entry_checks(
+                &checked_dependency,
+                &main,
+                &options,
+                test_limits(),
+            )
+            .expect("the imported scratch check uses the module visibility path")
+        else {
+            panic!("the imported scratch check must answer completely"); // ubs:ignore — test-only diagnostic.
+        };
+        let checked_prefix = checked_dependency
+            .dependency_prefix
+            .as_ref()
+            .expect("the definition after the dependency check is published");
+        assert_eq!(checked_prefix.executions.len(), 1);
+        assert_eq!(
+            checked_prefix.engine.environment().len(),
+            engine.environment().len() + 1,
+            "the imported scratch check cannot add a retained environment row"
+        );
+        assert_eq!(checked_dependency.entry.checks.len(), 1);
+        assert_eq!(
+            checked_dependency.entry.checks[0].environment_root,
+            checked_prefix.result_logical_root
+        );
+        assert_eq!(engine.logical_root(&options), before);
+
+        let future_dependency = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import Base\n#check later",
+            },
+            SourceModuleInput {
+                name: &base,
+                source: b"#check later\ndef later : Nat := 40",
+            },
+        ];
         assert!(matches!(
             engine
                 .execute_source_modules_with_entry_checks(
-                    &checked_dependency,
+                    &future_dependency,
                     &main,
                     &options,
                     test_limits(),
                 )
-                .expect_err("dependency checks remain outside the bounded module path"),
-            EngineExecutionError::SourceDependencyCheckUnsupported {
+                .expect_err("a dependency check cannot observe its later definition"),
+            EngineExecutionError::BatchCommand { index: 0, error }
+                if matches!(*error, EngineExecutionError::Frontend(_))
+        ));
+        assert_eq!(engine.logical_root(&options), before);
+
+        let leaking_check = [
+            SourceModuleInput {
+                name: &main,
+                source: b"import A\nimport B\n#check leaked",
+            },
+            SourceModuleInput {
+                name: &provider,
+                source: b"def leaked : Nat := 40",
+            },
+            SourceModuleInput {
+                name: &consumer,
+                source: b"#check leaked\ndef visible : Nat := 42",
+            },
+        ];
+        assert!(matches!(
+            engine
+                .execute_source_modules_with_entry_checks(
+                    &leaking_check,
+                    &main,
+                    &options,
+                    test_limits(),
+                )
+                .expect_err("a dependency check cannot borrow an unimported sibling"),
+            EngineExecutionError::SourceModuleVisibility {
                 ref module,
-                index: 0,
-            } if module == &base
+                ref referenced,
+                ref owner,
+                ..
+            } if module == &consumer
+                && referenced == &Name::from_components(["leaked"])
+                && owner == &provider
         ));
         assert_eq!(engine.logical_root(&options), before);
     }
