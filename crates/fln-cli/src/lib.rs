@@ -3821,11 +3821,23 @@ where
     let options = fln::KVMap::new();
     let limits = fln::EngineExecutionLimits::new(kernel_budget);
     if matches!(presentation, SourcePresentation::Lean)
-        && module_plan.is_none()
-        && let [source] = source_refs.as_slice()
+        && (module_plan.is_some() || source_refs.len() == 1)
+        && let Some(source) = source_refs.last().copied()
         && source_has_terminal_check(source)
     {
-        let checked = match engine.check_terminal_source_command(source, &options, limits) {
+        let checked = match module_plan.as_ref() {
+            Some(plan) => {
+                let modules = plan
+                    .names
+                    .iter()
+                    .zip(source_refs.iter().copied())
+                    .map(|(name, source)| fln::SourceModuleInput { name, source })
+                    .collect::<Vec<_>>();
+                engine.check_terminal_source_modules(&modules, &plan.entry, &options, limits)
+            }
+            None => engine.check_terminal_source_command(source, &options, limits),
+        };
+        let checked = match checked {
             Ok(checked) => checked,
             Err(error) => {
                 let (class, authority, exit_code) = execution_error_disposition(&error);
