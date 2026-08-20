@@ -1189,83 +1189,6 @@ impl InstantiateRevCache {
     }
 }
 
-struct BetaPrefixCacheEntry {
-    head: Expr,
-    body: Expr,
-    consumed: usize,
-}
-
-/// Completed lambda-prefix peeling for KR-202 batched beta reduction.
-///
-/// The result depends only on the exact immutable head and requested argument
-/// count. Binder values, local declarations, and the environment are not
-/// consulted. Packed hashes select a bounded bucket; structural equality is
-/// the authority, and saturation is an ordinary cache miss.
-struct BetaPrefixCache {
-    buckets: HashMap<(u64, usize), Vec<BetaPrefixCacheEntry>>,
-    entries: usize,
-    max_entries: usize,
-    max_bucket_entries: usize,
-}
-
-impl BetaPrefixCache {
-    fn new() -> Self {
-        Self::bounded(
-            TYPE_CHECKER_CACHE_MAX_ENTRIES,
-            TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES,
-        )
-    }
-
-    fn bounded(max_entries: usize, max_bucket_entries: usize) -> Self {
-        Self {
-            buckets: HashMap::new(),
-            entries: 0,
-            max_entries,
-            max_bucket_entries,
-        }
-    }
-
-    fn get(&self, head: &Expr, argument_count: usize) -> Option<(Expr, usize)> {
-        self.buckets
-            .get(&(head.data().0, argument_count))?
-            .iter()
-            .find_map(|entry| (entry.head == *head).then(|| (entry.body.clone(), entry.consumed)))
-    }
-
-    fn insert(&mut self, head: Expr, argument_count: usize, body: Expr, consumed: usize) {
-        let packed = (head.data().0, argument_count);
-        if let Some(bucket) = self.buckets.get_mut(&packed) {
-            if let Some(entry) = bucket.iter_mut().find(|entry| entry.head == head) {
-                entry.body = body;
-                entry.consumed = consumed;
-                return;
-            }
-            if self.entries >= self.max_entries || bucket.len() >= self.max_bucket_entries {
-                return;
-            }
-            bucket.push(BetaPrefixCacheEntry {
-                head,
-                body,
-                consumed,
-            });
-            self.entries += 1;
-            return;
-        }
-        if self.entries >= self.max_entries || self.max_bucket_entries == 0 {
-            return;
-        }
-        self.buckets.insert(
-            packed,
-            vec![BetaPrefixCacheEntry {
-                head,
-                body,
-                consumed,
-            }],
-        );
-        self.entries += 1;
-    }
-}
-
 struct InstantiateRevContext {
     values: Vec<Expr>,
     id: u32,
@@ -1275,15 +1198,9 @@ struct InstantiateRevContext {
 /// the complete argument vector once, then all recursive source subgraphs can
 /// reuse results reached from a different top-level body under that vector.
 /// Full structural equality is the authority after every packed prefilter.
-/// A full context table retires its oldest context and all rows carrying that
-/// context id as one deterministic unit before reusing the slot. Retired facts
-/// become misses; an id is never visible with rows from its previous context.
 struct InstantiateRevContextCache {
     contexts: HashMap<(u64, usize), Vec<InstantiateRevContext>>,
-    context_keys: Vec<(u64, usize)>,
-    result_keys: Vec<Vec<(u64, u32)>>,
     context_count: usize,
-    next_victim: usize,
     results: HashMap<(u32, u64, u32), Vec<(Expr, Expr)>>,
     entries: usize,
     argument_cells: usize,
@@ -1305,10 +1222,7 @@ impl InstantiateRevContextCache {
     fn bounded(max_entries: usize, max_bucket_entries: usize, max_argument_cells: usize) -> Self {
         Self {
             contexts: HashMap::new(),
-            context_keys: Vec::new(),
-            result_keys: Vec::new(),
             context_count: 0,
-            next_victim: 0,
             results: HashMap::new(),
             entries: 0,
             argument_cells: 0,
@@ -1340,51 +1254,20 @@ impl InstantiateRevContextCache {
         }) {
             return Some(id);
         }
-        if self.max_contexts == 0 || self.max_bucket_entries == 0 {
-            return None;
-        }
-        let victim = (self.context_count >= self.max_contexts).then_some(self.next_victim);
-        let reclaimed_arguments = victim
-            .and_then(|index| self.context_keys.get(index).copied())
-            .and_then(|victim_key| self.contexts.get(&victim_key))
-            .and_then(|bucket| {
-                bucket
-                    .iter()
-                    .find(|context| usize::try_from(context.id).ok() == victim)
-            })
-            .map_or(0, |context| context.values.len());
-        let victim_is_in_bucket = victim
-            .and_then(|index| self.context_keys.get(index))
-            .is_some_and(|victim_key| *victim_key == key);
-        let bucket_after_eviction = self
-            .contexts
-            .get(&key)
-            .map_or(0, Vec::len)
-            .checked_sub(usize::from(victim_is_in_bucket))?;
-        let argument_cells_after_eviction = self
-            .argument_cells
-            .checked_sub(reclaimed_arguments)?
-            .checked_add(values.len())?;
-        if bucket_after_eviction >= self.max_bucket_entries
-            || argument_cells_after_eviction > self.max_argument_cells
+        if self.context_count >= self.max_contexts
+            || self.max_bucket_entries == 0
+            || self
+                .contexts
+                .get(&key)
+                .is_some_and(|bucket| bucket.len() >= self.max_bucket_entries)
+            || self
+                .argument_cells
+                .checked_add(values.len())
+                .is_none_or(|cells| cells > self.max_argument_cells)
         {
             return None;
         }
-        let id = if let Some(victim) = victim {
-            let id = u32::try_from(victim).ok()?;
-            if !self.evict_context(id) {
-                return None;
-            }
-            self.context_keys[victim] = key;
-            self.next_victim = (victim + 1) % self.max_contexts;
-            id
-        } else {
-            let id = u32::try_from(self.context_count).ok()?;
-            self.context_keys.push(key);
-            self.result_keys.push(Vec::new());
-            self.context_count += 1;
-            id
-        };
+        let id = u32::try_from(self.context_count).ok()?;
         self.contexts
             .entry(key)
             .or_default()
@@ -1392,67 +1275,9 @@ impl InstantiateRevContextCache {
                 values: values.to_vec(),
                 id,
             });
+        self.context_count += 1;
         self.argument_cells += values.len();
         Some(id)
-    }
-
-    fn evict_context(&mut self, id: u32) -> bool {
-        let Ok(index) = usize::try_from(id) else {
-            return false;
-        };
-        let Some(key) = self.context_keys.get(index).copied() else {
-            return false;
-        };
-        let Some(removed_arguments) = self.contexts.get(&key).and_then(|bucket| {
-            bucket
-                .iter()
-                .find(|context| context.id == id)
-                .map(|context| context.values.len())
-        }) else {
-            return false;
-        };
-        let Some(result_keys) = self.result_keys.get(index) else {
-            return false;
-        };
-        let mut removed_entries = 0usize;
-        for (source, bound) in result_keys {
-            let Some(bucket) = self.results.get(&(id, *source, *bound)) else {
-                return false;
-            };
-            let Some(next) = removed_entries.checked_add(bucket.len()) else {
-                return false;
-            };
-            removed_entries = next;
-        }
-        let Some(argument_cells) = self.argument_cells.checked_sub(removed_arguments) else {
-            return false;
-        };
-        let Some(entries) = self.entries.checked_sub(removed_entries) else {
-            return false;
-        };
-
-        let Some(bucket) = self.contexts.get_mut(&key) else {
-            return false;
-        };
-        let Some(position) = bucket.iter().position(|context| context.id == id) else {
-            return false;
-        };
-        let removed = bucket.swap_remove(position);
-        let bucket_is_empty = bucket.is_empty();
-        if bucket_is_empty {
-            self.contexts.remove(&key);
-        }
-        debug_assert!(removed.values.len() == removed_arguments);
-        self.argument_cells = argument_cells;
-
-        let Some(result_keys) = self.result_keys.get_mut(index) else {
-            return false;
-        };
-        for (source, bound) in std::mem::take(result_keys) {
-            self.results.remove(&(id, source, bound));
-        }
-        self.entries = entries;
-        true
     }
 
     fn get(&self, context: u32, source: &Expr, bound: u32) -> Option<Expr> {
@@ -1463,12 +1288,6 @@ impl InstantiateRevContextCache {
     }
 
     fn insert(&mut self, context: u32, source: Expr, bound: u32, result: Expr) {
-        let Ok(context_index) = usize::try_from(context) else {
-            return;
-        };
-        if context_index >= self.result_keys.len() {
-            return;
-        }
         let packed = (context, source.data().0, bound);
         if let Some(bucket) = self.results.get_mut(&packed) {
             if let Some((_, existing)) = bucket
@@ -1488,7 +1307,6 @@ impl InstantiateRevContextCache {
         if self.entries >= self.max_entries || self.max_bucket_entries == 0 {
             return;
         }
-        self.result_keys[context_index].push((source.data().0, bound));
         self.results.insert(packed, vec![(source, result)]);
         self.entries += 1;
     }
@@ -1722,7 +1540,6 @@ pub(crate) struct TypeChecker<'a> {
     regular_app_def_eq_failure_cache: PositiveDefEqCache,
     instantiate_cache: InstantiateCache,
     instantiate_rev_context_cache: InstantiateRevContextCache,
-    beta_prefix_cache: BetaPrefixCache,
     instantiate_lparams_cache: InstantiateLParamsCache,
     recursor_major_cache: RecursorMajorCache,
     defer_recursor_major: bool,
@@ -1761,7 +1578,6 @@ impl<'a> TypeChecker<'a> {
             regular_app_def_eq_failure_cache: PositiveDefEqCache::new(),
             instantiate_cache: InstantiateCache::new(),
             instantiate_rev_context_cache: InstantiateRevContextCache::new(),
-            beta_prefix_cache: BetaPrefixCache::new(),
             instantiate_lparams_cache: InstantiateLParamsCache::new(),
             recursor_major_cache: RecursorMajorCache::new(),
             defer_recursor_major: false,
@@ -2134,12 +1950,6 @@ impl<'a> TypeChecker<'a> {
         bound: u32,
         depth: u32,
     ) -> KResult<Expr> {
-        // One public substitution query always consumes one step. The heap
-        // walker below charges only nodes it actually rebuilds: revisiting a
-        // completed DAG node, reusing an established row, or proving from the
-        // cached loose-bvar range that a subtree is unchanged is not a second
-        // type-theory operation.
-        self.step(depth)?;
         let context = self.instantiate_rev_context_cache.context_id(fvars);
         let mut cache = InstantiateRevCache::new();
         self.instantiate_rev_cached(e, fvars, bound, depth, &mut cache, context)
@@ -2176,10 +1986,10 @@ impl<'a> TypeChecker<'a> {
             bound,
             depth,
         }];
-        let root_key = (e.allocation_identity(), bound);
         while let Some(op) = stack.pop() {
             match op {
                 Op::Enter { e, bound, depth } => {
+                    self.step(depth)?;
                     let key = (e.allocation_identity(), bound);
                     if done.contains_key(&key) {
                         continue;
@@ -2195,9 +2005,6 @@ impl<'a> TypeChecker<'a> {
                     if e.loose_bvar_range() <= bound || fvars.is_empty() {
                         done.insert(key, e);
                         continue;
-                    }
-                    if key != root_key {
-                        self.step(depth)?;
                     }
                     match e.node() {
                         ExprNode::BVar { idx } if *idx >= bound => {
@@ -2727,28 +2534,19 @@ impl<'a> TypeChecker<'a> {
                     let (head0, args) = app_spine_skipping_mdata(&current);
                     let head = self.whnf_core_mode(&head0, depth + 1, cheap_proj)?;
                     if matches!(head.node(), ExprNode::Lam { .. }) {
-                        let (body, consumed) = if let Some(prefix) =
-                            self.beta_prefix_cache.get(&head, args.len())
-                        {
-                            prefix
-                        } else {
-                            let mut body = head.clone();
-                            let mut consumed = 0usize;
-                            while consumed < args.len() {
-                                self.step(depth)?;
-                                let ExprNode::Lam {
-                                    body: next_body, ..
-                                } = body.node()
-                                else {
-                                    break;
-                                };
-                                body = next_body.clone();
-                                consumed += 1;
-                            }
-                            self.beta_prefix_cache
-                                .insert(head, args.len(), body.clone(), consumed);
-                            (body, consumed)
-                        };
+                        let mut body = head;
+                        let mut consumed = 0usize;
+                        while consumed < args.len() {
+                            self.step(depth)?;
+                            let ExprNode::Lam {
+                                body: next_body, ..
+                            } = body.node()
+                            else {
+                                break;
+                            };
+                            body = next_body.clone();
+                            consumed += 1;
+                        }
                         let mut reduced =
                             self.instantiate_rev(&body, &args[..consumed], 0, depth + 1)?;
                         for arg in &args[consumed..] {
@@ -6753,50 +6551,6 @@ mod tests {
     }
 
     #[test]
-    fn rolling_instantiate_rev_contexts_delete_reused_ids_before_substitution() {
-        let env = Environment::new();
-        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
-        tc.instantiate_rev_context_cache = InstantiateRevContextCache::bounded(2, 4, 2);
-        let bvar = Expr::bvar(0).expect("packs");
-        let body = Expr::app(bvar.clone(), bvar);
-        let zero = Expr::sort(Level::zero());
-        let one = Expr::sort(Level::one());
-        let two = Expr::sort(Level::succ(Level::one()).expect("packs"));
-        let substituted = |value: &Expr| Expr::app(value.clone(), value.clone());
-
-        assert!(
-            tc.instantiate_rev(&body, std::slice::from_ref(&zero), 0, 0)
-                .expect("first context")
-                == substituted(&zero)
-        );
-        assert!(
-            tc.instantiate_rev(&body, std::slice::from_ref(&one), 0, 0)
-                .expect("second context")
-                == substituted(&one)
-        );
-        assert!(
-            tc.instantiate_rev(&body, std::slice::from_ref(&two), 0, 0)
-                .expect("rolled context")
-                == substituted(&two),
-            "reusing context id zero must not expose the first context's cached result"
-        );
-        let steps_after_roll = tc.consumption().steps_used;
-        assert!(
-            tc.instantiate_rev(&body, std::slice::from_ref(&two), 0, 0)
-                .expect("repeated rolled context")
-                == substituted(&two)
-                && tc.consumption().steps_used - steps_after_roll == 1,
-            "the newest context must retain its exact completed substitution"
-        );
-        assert!(
-            tc.instantiate_rev_context_cache.context_count == 2
-                && tc.instantiate_rev_context_cache.entries <= 2
-                && tc.instantiate_rev_context_cache.argument_cells == 2,
-            "rolling must keep every live cardinality bound unchanged"
-        );
-    }
-
-    #[test]
     fn instantiate_rev_walks_a_deep_app_nest_without_stack_fault() {
         let env = Environment::new();
         let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
@@ -8028,97 +7782,6 @@ mod tests {
         assert!(
             tc.consumption().max_depth <= budget.depth,
             "lambda arity must consume loop steps rather than native-stack depth"
-        );
-    }
-
-    #[test]
-    fn repeated_beta_prefixes_reuse_only_the_exact_lambda_head() {
-        const ARITY: usize = 8;
-        let domain = Expr::sort(Level::one());
-        let first = Expr::sort(Level::zero());
-        let second = Expr::sort(Level::one());
-        let mut head = Expr::bvar((ARITY - 1) as u32).expect("packs");
-        for index in 0..ARITY {
-            head = Expr::lam(
-                Name::num(Name::str(Name::anonymous(), "prefix"), index as u64),
-                domain.clone(),
-                head,
-                BinderInfo::Default,
-            );
-        }
-        let application = |leading: Expr| {
-            let mut result = head.clone();
-            for index in 0..ARITY {
-                result = Expr::app(
-                    result,
-                    if index == 0 {
-                        leading.clone()
-                    } else {
-                        first.clone()
-                    },
-                );
-            }
-            result
-        };
-        let first_application = application(first.clone());
-        let second_application = application(second.clone());
-        let env = Environment::new();
-
-        let mut cached = TypeChecker::new(&env, &[], Budget::DEFAULT);
-        assert!(
-            cached
-                .whnf_public(&first_application, 0)
-                .expect("seed prefix")
-                == first
-        );
-        let cached_before = cached.consumption().steps_used;
-        assert!(
-            cached
-                .whnf_public(&second_application, 0)
-                .expect("reuse prefix")
-                == second
-        );
-        let cached_steps = cached.consumption().steps_used - cached_before;
-
-        let mut uncached = TypeChecker::new(&env, &[], Budget::DEFAULT);
-        uncached.beta_prefix_cache = BetaPrefixCache::bounded(0, 0);
-        assert!(
-            uncached
-                .whnf_public(&first_application, 0)
-                .expect("uncached seed")
-                == first
-        );
-        let uncached_before = uncached.consumption().steps_used;
-        assert!(
-            uncached
-                .whnf_public(&second_application, 0)
-                .expect("uncached repeat")
-                == second
-        );
-        let uncached_steps = uncached.consumption().steps_used - uncached_before;
-        assert!(
-            cached_steps + ARITY as u64 == uncached_steps,
-            "an exact prefix hit must avoid precisely the repeated lambda peel ({cached_steps} + {ARITY} != {uncached_steps})"
-        );
-
-        let left = Expr::lam(
-            Name::str(Name::anonymous(), "left"),
-            domain.clone(),
-            first.clone(),
-            BinderInfo::Default,
-        );
-        let right = Expr::lam(
-            Name::str(Name::anonymous(), "right"),
-            domain,
-            first.clone(),
-            BinderInfo::Default,
-        );
-        assert!(left != right && left.data() == right.data());
-        let mut collision = BetaPrefixCache::bounded(1, 1);
-        collision.insert(left, 1, first, 1);
-        assert!(
-            collision.get(&right, 1).is_none(),
-            "a packed lambda collision must suppress reuse, never alias a prefix"
         );
     }
 
