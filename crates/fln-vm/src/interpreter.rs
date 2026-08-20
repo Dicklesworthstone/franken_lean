@@ -17,8 +17,9 @@
 //! thunks, and finished tasks are Marrow objects all the way through their
 //! intrinsic rows. A delayed thunk claims its closure once and completes only
 //! through the ordinary return continuation. The manager-absent
-//! `BaseIO.asTask`, `Task.spawn`, `Task.map`, and `Task.bind` fallbacks use that
-//! same continuation machinery and produce only finished tasks. The
+//! `BaseIO.asTask`, `BaseIO.mapTask`, `BaseIO.bindTask`, `Task.spawn`,
+//! `Task.map`, and `Task.bind` fallbacks use that same continuation machinery
+//! and produce only finished tasks. The
 //! allocation-linked `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share
 //! Marrow's runtime counter and preserve arbitrary-`Nat` low-64 semantics. In
 //! this managerless state, `IO.getTaskState` reports finished, `IO.wait`
@@ -519,6 +520,8 @@ struct IntrinsicPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
     BaseIoAsTask,
+    BaseIoBindTask,
+    BaseIoMapTask,
     NatAdd,
     NatBeq,
     NatBle,
@@ -571,6 +574,8 @@ impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
             "extern:BaseIO.asTask" => Self::BaseIoAsTask,
+            "extern:BaseIO.bindTask" => Self::BaseIoBindTask,
+            "extern:BaseIO.mapTask" => Self::BaseIoMapTask,
             "extern:Nat.add" => Self::NatAdd,
             "extern:Nat.beq" => Self::NatBeq,
             "extern:Nat.ble" => Self::NatBle,
@@ -623,7 +628,12 @@ impl IntrinsicImplementation {
     const fn is_managerless_task(self) -> bool {
         matches!(
             self,
-            Self::BaseIoAsTask | Self::TaskSpawn | Self::TaskMap | Self::TaskBind
+            Self::BaseIoAsTask
+                | Self::BaseIoBindTask
+                | Self::BaseIoMapTask
+                | Self::TaskSpawn
+                | Self::TaskMap
+                | Self::TaskBind
         )
     }
 }
@@ -1113,8 +1123,8 @@ enum ManagerlessTaskCompletion {
 struct ManagerlessTaskApplication {
     row: &'static str,
     closure: Obj,
-    argument: Obj,
-    argument_ownership: ArgumentOwnership,
+    arguments: Vec<Obj>,
+    argument_ownership: Vec<ArgumentOwnership>,
     completion: ManagerlessTaskCompletion,
 }
 
@@ -1730,10 +1740,10 @@ fn run(
                                 });
                             }
                         };
-                    match prepare_internal_apply(
+                    match prepare_internal_apply_many(
                         program,
                         &application.closure,
-                        application.argument,
+                        application.arguments,
                         application.argument_ownership,
                     ) {
                         Ok(PreparedApply::Partial { function, captures }) => {
@@ -1773,7 +1783,7 @@ fn run(
                             if !remainder.is_empty() {
                                 return Err(Stop::InternalFault(InternalFault::new(
                                     "FLBC-TASK-APPLY",
-                                    "one managerless task argument over-applied a validated closure",
+                                    "managerless task arguments over-applied a validated closure",
                                 )));
                             }
                             advance(current_frame_mut(&mut stack)?)?;
@@ -2275,9 +2285,23 @@ fn prepare_internal_apply(
     argument: Obj,
     argument_ownership: ArgumentOwnership,
 ) -> Result<PreparedApply, VmRefusal> {
-    let ownership = [argument_ownership];
-    let plan = plan_apply(program, closure, 1, Some(&ownership), None)?;
-    Ok(finish_apply(plan, vec![argument], Some(ownership.into())))
+    prepare_internal_apply_many(program, closure, vec![argument], vec![argument_ownership])
+}
+
+fn prepare_internal_apply_many(
+    program: &ValidatedProgram,
+    closure: &Obj,
+    arguments: Vec<Obj>,
+    argument_ownership: Vec<ArgumentOwnership>,
+) -> Result<PreparedApply, VmRefusal> {
+    let plan = plan_apply(
+        program,
+        closure,
+        arguments.len(),
+        Some(&argument_ownership),
+        None,
+    )?;
+    Ok(finish_apply(plan, arguments, Some(argument_ownership)))
 }
 
 fn prepare_owned_apply(
@@ -3440,6 +3464,8 @@ fn invoke_intrinsic(
                 .ok_or_else(|| VmRefusal::UnsupportedTaskState.into())
         }
         IntrinsicImplementation::BaseIoAsTask
+        | IntrinsicImplementation::BaseIoBindTask
+        | IntrinsicImplementation::BaseIoMapTask
         | IntrinsicImplementation::ThunkGet
         | IntrinsicImplementation::TaskSpawn
         | IntrinsicImplementation::TaskMap
@@ -3498,9 +3524,49 @@ fn managerless_task_application(
             Ok(ManagerlessTaskApplication {
                 row,
                 closure,
-                argument: Obj::mk_nat(0),
-                argument_ownership: ArgumentOwnership::Scalar,
+                arguments: vec![Obj::mk_nat(0)],
+                argument_ownership: vec![ArgumentOwnership::Scalar],
                 completion: ManagerlessTaskCompletion::WrapPure,
+            })
+        }
+        IntrinsicImplementation::BaseIoMapTask => {
+            let [closure, task, priority, sync] = exact_owned_args(row, args)?;
+            expect_golem_task_closure(&closure, "BaseIO.mapTask", 0)?;
+            expect_value_kind(&task, "BaseIO.mapTask", 1, "finished Task", ValueKind::Task)?;
+            with_nat_view(&priority, "BaseIO.mapTask", 2, |_| ())?;
+            bool_value(&sync, "BaseIO.mapTask", 3)?;
+            let argument = task
+                .finished_task_value()
+                .ok_or(VmRefusal::UnsupportedTaskState)?;
+            Ok(ManagerlessTaskApplication {
+                row,
+                closure,
+                arguments: vec![argument, Obj::mk_nat(0)],
+                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                completion: ManagerlessTaskCompletion::WrapPure,
+            })
+        }
+        IntrinsicImplementation::BaseIoBindTask => {
+            let [task, closure, priority, sync] = exact_owned_args(row, args)?;
+            expect_value_kind(
+                &task,
+                "BaseIO.bindTask",
+                0,
+                "finished Task",
+                ValueKind::Task,
+            )?;
+            expect_golem_task_closure(&closure, "BaseIO.bindTask", 1)?;
+            with_nat_view(&priority, "BaseIO.bindTask", 2, |_| ())?;
+            bool_value(&sync, "BaseIO.bindTask", 3)?;
+            let argument = task
+                .finished_task_value()
+                .ok_or(VmRefusal::UnsupportedTaskState)?;
+            Ok(ManagerlessTaskApplication {
+                row,
+                closure,
+                arguments: vec![argument, Obj::mk_nat(0)],
+                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                completion: ManagerlessTaskCompletion::RequireFinishedTask,
             })
         }
         IntrinsicImplementation::TaskMap => {
@@ -3515,8 +3581,8 @@ fn managerless_task_application(
             Ok(ManagerlessTaskApplication {
                 row,
                 closure,
-                argument,
-                argument_ownership: ArgumentOwnership::Owned,
+                arguments: vec![argument],
+                argument_ownership: vec![ArgumentOwnership::Owned],
                 completion: ManagerlessTaskCompletion::WrapPure,
             })
         }
@@ -3532,8 +3598,8 @@ fn managerless_task_application(
             Ok(ManagerlessTaskApplication {
                 row,
                 closure,
-                argument,
-                argument_ownership: ArgumentOwnership::Owned,
+                arguments: vec![argument],
+                argument_ownership: vec![ArgumentOwnership::Owned],
                 completion: ManagerlessTaskCompletion::RequireFinishedTask,
             })
         }

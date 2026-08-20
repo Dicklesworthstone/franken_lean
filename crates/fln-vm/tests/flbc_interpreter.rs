@@ -6957,6 +6957,189 @@ fn managerless_base_io_as_task_runs_the_action_and_preserves_borrowed_arguments(
 }
 
 #[test]
+fn managerless_base_io_map_and_bind_apply_real_world_and_compose_finished_tasks() {
+    let _guard = lock();
+    let program = validated(vec![
+        function(
+            0,
+            0,
+            11,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "seed".to_string(),
+                },
+                intrinsic(r(1), "extern:Task.pure", vec![r(0)]),
+                Instruction::Closure {
+                    dst: r(2),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+                Instruction::Nat {
+                    dst: r(3),
+                    value: 0,
+                },
+                Instruction::Nat {
+                    dst: r(4),
+                    value: 0,
+                },
+                intrinsic(r(5), "extern:BaseIO.mapTask", vec![r(2), r(1), r(3), r(4)]),
+                Instruction::Closure {
+                    dst: r(6),
+                    function: fid(2),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+                intrinsic(r(7), "extern:BaseIO.bindTask", vec![r(5), r(6), r(3), r(4)]),
+                Instruction::Copy {
+                    dst: r(8),
+                    src: r(7),
+                },
+                intrinsic(r(9), "extern:Task.get", vec![r(8)]),
+                Instruction::Array {
+                    dst: r(10),
+                    items: vec![r(1), r(5), r(7), r(9)],
+                },
+                Instruction::Return { src: r(10) },
+            ],
+        ),
+        function_with_ownership(
+            1,
+            vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+            3,
+            vec![
+                Instruction::Array {
+                    dst: r(2),
+                    items: vec![r(0), r(1)],
+                },
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+        function_with_ownership(
+            2,
+            vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+            4,
+            vec![
+                Instruction::Array {
+                    dst: r(2),
+                    items: vec![r(0), r(1)],
+                },
+                intrinsic(r(3), "extern:Task.pure", vec![r(2)]),
+                Instruction::Return { src: r(3) },
+            ],
+        ),
+    ]);
+
+    shadow::enable();
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(completed.value.array_view(), (4, 4));
+    assert_eq!(completed.usage.peak_stack_depth, 2);
+    assert_eq!(value_kind(&completed.value.array_child(0)), ValueKind::Task);
+    assert_eq!(value_kind(&completed.value.array_child(1)), ValueKind::Task);
+    assert_eq!(value_kind(&completed.value.array_child(2)), ValueKind::Task);
+
+    let mapped = completed
+        .value
+        .array_child(1)
+        .finished_task_value()
+        .expect("BaseIO.mapTask returns a finished task");
+    assert_eq!(mapped.array_view(), (2, 2));
+    assert_eq!(string_contents(&mapped.array_child(0)), "seed");
+    assert_eq!(
+        mapped.array_child(1).unbox(),
+        0,
+        "BaseIO.mapTask supplies RealWorld as Unit"
+    );
+
+    let bound = completed.value.array_child(3);
+    assert_eq!(bound.array_view(), (2, 2));
+    assert_eq!(
+        bound.array_child(0).identity_token(),
+        mapped.identity_token(),
+        "BaseIO.bindTask receives the mapped task's exact retained value"
+    );
+    assert_eq!(
+        bound.array_child(1).unbox(),
+        0,
+        "BaseIO.bindTask supplies RealWorld as Unit"
+    );
+    drop(bound);
+    drop(mapped);
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "BaseIO task composition releases every ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "BaseIO task composition preserves the Marrow ownership graph"
+    );
+
+    let wrong_first_argument = |row: &str| {
+        validated(vec![function(
+            0,
+            0,
+            4,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "wrong kind".to_string(),
+                },
+                Instruction::String {
+                    dst: r(1),
+                    value: "also wrong".to_string(),
+                },
+                Instruction::Nat {
+                    dst: r(2),
+                    value: 0,
+                },
+                intrinsic(r(3), row, vec![r(0), r(1), r(2), r(2)]),
+                Instruction::Return { src: r(3) },
+            ],
+        )])
+    };
+    let wrong_map_action = wrong_first_argument("extern:BaseIO.mapTask");
+    let wrong_bind_task = wrong_first_argument("extern:BaseIO.bindTask");
+
+    shadow::enable();
+    assert!(matches!(
+        execute(&wrong_map_action, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "BaseIO.mapTask",
+                argument: 0,
+                expected: "Golem closure",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        execute(&wrong_bind_task, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "BaseIO.bindTask",
+                argument: 0,
+                expected: "finished Task",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "BaseIO map/bind refusals retain no ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "BaseIO map/bind refusals preserve the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn managerless_task_bind_returns_the_continuation_task_without_rewrapping() {
     let _guard = lock();
     let program = validated(vec![
