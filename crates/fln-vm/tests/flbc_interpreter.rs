@@ -6268,6 +6268,74 @@ fn managerless_io_task_state_and_cancellation_match_the_finished_task_runtime_su
 }
 
 #[test]
+fn managerless_io_wait_any_selects_the_first_finished_task_in_list_order() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        9,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "first".to_string(),
+            },
+            intrinsic(r(1), "extern:Task.pure", vec![r(0)]),
+            Instruction::String {
+                dst: r(2),
+                value: "second".to_string(),
+            },
+            intrinsic(r(3), "extern:Task.pure", vec![r(2)]),
+            Instruction::Nat {
+                dst: r(4),
+                value: 0,
+            },
+            Instruction::Ctor {
+                dst: r(5),
+                tag: 1,
+                fields: vec![r(3), r(4)],
+                scalar_bytes: Vec::new(),
+            },
+            Instruction::Ctor {
+                dst: r(6),
+                tag: 1,
+                fields: vec![r(1), r(5)],
+                scalar_bytes: Vec::new(),
+            },
+            intrinsic(r(7), "extern:IO.waitAny", vec![r(6)]),
+            Instruction::Array {
+                dst: r(8),
+                items: vec![r(6), r(7)],
+            },
+            Instruction::Return { src: r(8) },
+        ],
+    )]);
+
+    shadow::enable();
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(completed.value.array_view(), (2, 2));
+    assert_eq!(
+        value_kind(&completed.value.array_child(0)),
+        ValueKind::Ctor(1),
+        "the borrowed task list remains live after selection"
+    );
+    assert_eq!(
+        string_contents(&completed.value.array_child(1)),
+        "first",
+        "the pin selects the first already-finished task in list order"
+    );
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "waitAny retains no ABI object after the result drops");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "waitAny preserves the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn delayed_thunk_forces_once_and_caches_the_same_abi_value() {
     let _guard = lock();
     let program = validated(vec![
@@ -7217,6 +7285,11 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
         ("extern:IO.cancel", "IO.cancel", "Task"),
         ("extern:IO.getTaskState", "IO.getTaskState", "Task"),
         ("extern:IO.wait", "IO.wait", "finished Task"),
+        (
+            "extern:IO.waitAny",
+            "IO.waitAny",
+            "non-empty List (Task _)",
+        ),
     ];
 
     shadow::enable();
