@@ -8033,6 +8033,122 @@ fn platform_and_runtime_phase_intrinsics_execute_from_canonical_flbc_without_lea
 }
 
 #[test]
+fn generated_array_read_family_preserves_values_ownership_and_hostile_refusals() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        8,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "zero".to_string(),
+            },
+            Instruction::String {
+                dst: r(1),
+                value: "one".to_string(),
+            },
+            Instruction::Array {
+                dst: r(2),
+                items: vec![r(0), r(1)],
+            },
+            Instruction::Nat {
+                dst: r(3),
+                value: 1,
+            },
+            intrinsic(r(4), "extern:Array.uget", vec![r(2), r(3)]),
+            intrinsic(r(5), "extern:Array.usize", vec![r(2)]),
+            intrinsic(r(6), "extern:Array.ugetBorrowed", vec![r(2), r(3)]),
+            Instruction::Array {
+                dst: r(7),
+                items: vec![r(2), r(4), r(5), r(6)],
+            },
+            Instruction::Return { src: r(7) },
+        ],
+    )]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode array reads");
+    let decoded = decode_canonical(&bytes, CodecLimits::default()).expect("decode array reads");
+
+    shadow::enable();
+    let completed = returned(execute(&decoded, ExecutionLimits::default(), None));
+    assert_eq!(completed.usage.steps, 9);
+    assert_eq!(completed.usage.system_polls, 9);
+    let source = completed.value.array_child(0);
+    assert_eq!(string_contents(&source.array_child(0)), "zero");
+    assert_eq!(string_contents(&source.array_child(1)), "one");
+    assert_eq!(string_contents(&completed.value.array_child(1)), "one");
+    assert_eq!(completed.value.array_child(2).unbox(), 2);
+    assert_eq!(string_contents(&completed.value.array_child(3)), "one");
+    drop(source);
+    drop(completed);
+
+    let wrong_array = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:Array.usize", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&wrong_array, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "Array.usize",
+                argument: 0,
+                expected: "Array",
+                actual: ValueKind::Scalar,
+            },
+            ..
+        })
+    ));
+
+    let out_of_bounds = validated(vec![function(
+        0,
+        0,
+        4,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "only".to_string(),
+            },
+            Instruction::Array {
+                dst: r(1),
+                items: vec![r(0)],
+            },
+            Instruction::Nat {
+                dst: r(2),
+                value: 1,
+            },
+            intrinsic(r(3), "extern:Array.uget", vec![r(1), r(2)]),
+            Instruction::Return { src: r(3) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&out_of_bounds, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::ArrayIndexOutOfBounds { index: 1, size: 1 },
+            ..
+        })
+    ));
+
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "array read paths retain no ABI value");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "array read paths preserve the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn command_execution_context_captures_options_for_cached_and_uncached_runs() {
     fn assert_heartbeat_stop(outcome: Outcome<VmExit>) {
         assert_eq!(outcome.authority(), Authority::NonAuthoritative);

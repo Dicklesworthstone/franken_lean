@@ -548,7 +548,9 @@ enum IntrinsicImplementation {
     StringUtf8ByteSize,
     ArraySize,
     ArrayGetInternal,
+    ArrayUGet,
     ArrayGetBorrowed,
+    ArrayUSize,
     ArrayPush,
     PlatformNumBits,
     PlatformIsWindows,
@@ -607,7 +609,9 @@ impl IntrinsicImplementation {
             "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
             "extern:Array.size" => Self::ArraySize,
             "extern:Array.getInternal" => Self::ArrayGetInternal,
+            "extern:Array.uget" => Self::ArrayUGet,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
+            "extern:Array.usize" => Self::ArrayUSize,
             "extern:Array.push" => Self::ArrayPush,
             "extern:System.Platform.getNumBits" => Self::PlatformNumBits,
             "extern:System.Platform.getIsWindows" => Self::PlatformIsWindows,
@@ -3320,6 +3324,12 @@ fn invoke_intrinsic(
             let index = array_index(&args[1], "Array.getInternal", size)?;
             Ok(IntrinsicResult::owned(args[0].array_child(index)))
         }
+        IntrinsicImplementation::ArrayUGet => {
+            expect_arity(row, args, 2)?;
+            let (size, _) = array_value(&args[0], "Array.uget", 0)?;
+            let index = array_index(&args[1], "Array.uget", size)?;
+            Ok(IntrinsicResult::raw_object(args[0].array_child(index)))
+        }
         IntrinsicImplementation::ArrayGetBorrowed => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.ugetBorrowed", 0)?;
@@ -3327,6 +3337,11 @@ fn invoke_intrinsic(
             Ok(IntrinsicResult::borrowed_promoted(
                 args[0].array_child(index),
             ))
+        }
+        IntrinsicImplementation::ArrayUSize => {
+            expect_arity(row, args, 1)?;
+            let (size, _) = array_value(&args[0], "Array.usize", 0)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(size)))
         }
         IntrinsicImplementation::ArrayPush => {
             expect_arity(row, args, 2)?;
@@ -3674,7 +3689,9 @@ fn managerless_task_application(
         | IntrinsicImplementation::StringUtf8ByteSize
         | IntrinsicImplementation::ArraySize
         | IntrinsicImplementation::ArrayGetInternal
+        | IntrinsicImplementation::ArrayUGet
         | IntrinsicImplementation::ArrayGetBorrowed
+        | IntrinsicImplementation::ArrayUSize
         | IntrinsicImplementation::ArrayPush
         | IntrinsicImplementation::PlatformNumBits
         | IntrinsicImplementation::PlatformIsWindows
