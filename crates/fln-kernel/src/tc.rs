@@ -83,11 +83,13 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // bounded cross-scope index retains reuse across unrelated binder churn.
 // Fvar-bearing rows may retain at most 262,144
 // local-generation snapshots per cache, with no one row retaining more than
-// 256 or scanning more than 65,536 distinct expression allocations to discover
-// them. Each cache may spend at most 33,554,432 node visits on dependency
-// discovery in total. A bounded packed-key refusal set prevents an expression
-// beyond those limits from repeatedly consuming that allowance; a hash
-// collision can therefore suppress reuse, never manufacture a result.
+// 256 or scanning more than 65,536 distinct structural expression subterms to
+// discover them. Structural scan deduplication retains at most four exact
+// candidates per attacker-controlled packed hash. Each cache may spend at most
+// 33,554,432 such visits on dependency discovery in total. A bounded packed-key
+// refusal set prevents an expression beyond those limits from repeatedly
+// consuming that allowance; a hash collision can therefore suppress reuse,
+// never manufacture a result.
 // Dead-generation rows are reclaimed from a touched bucket before its collision
 // cap is applied. These are shallow cardinality bounds: retained Expr DAG weight,
 // allocator failure, cancellation, and Consumption-accounted cache bookkeeping
@@ -152,7 +154,7 @@ fn collect_fvar_ids(
     expr: &Expr,
     ids: &mut Vec<FVarId>,
     seen_ids: &mut HashMap<FVarId, ()>,
-    seen_nodes: &mut HashMap<usize, ()>,
+    seen_nodes: &mut HashMap<u64, [Option<Expr>; TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES]>,
     nodes_left: &mut usize,
 ) -> bool {
     if !expr.has_fvar() {
@@ -160,12 +162,23 @@ fn collect_fvar_ids(
     }
     let mut pending = vec![expr.clone()];
     while let Some(current) = pending.pop() {
-        if seen_nodes
-            .insert(current.allocation_identity(), ())
-            .is_some()
+        let collision_bucket = seen_nodes
+            .entry(current.data().0)
+            .or_insert_with(|| std::array::from_fn(|_| None));
+        if collision_bucket
+            .iter()
+            .flatten()
+            .any(|candidate| candidate == &current)
         {
             continue;
         }
+        let Some(vacant) = collision_bucket
+            .iter_mut()
+            .find(|candidate| candidate.is_none())
+        else {
+            return false;
+        };
+        *vacant = Some(current.clone());
         let Some(remaining) = nodes_left.checked_sub(1) else {
             return false;
         };
@@ -8836,7 +8849,7 @@ mod tests {
         let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
         let dependencies =
             local_dependencies(&[&shared], &tc.locals, &tc.local_positions, &mut nodes_left)
-                .expect("shared nodes are scanned by allocation, not expanded as a tree");
+                .expect("shared nodes are scanned once, not expanded as a tree");
 
         assert!(
             dependencies
@@ -8849,7 +8862,75 @@ mod tests {
         );
         assert!(
             TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - nodes_left == 18,
-            "the dependency walk must charge each immutable allocation exactly once"
+            "the dependency walk must charge each distinct structural subterm exactly once"
+        );
+    }
+
+    #[test]
+    fn dependency_discovery_is_independent_of_expression_allocation_sharing() {
+        fn independent_tree(local: &Expr, depth: usize) -> Expr {
+            if depth == 0 {
+                return local.clone();
+            }
+            Expr::app(
+                independent_tree(local, depth - 1),
+                independent_tree(local, depth - 1),
+            )
+        }
+
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let id = FVarId(Name::str(Name::anonymous(), "sharingIndependent"));
+        let local = Expr::fvar(id.clone());
+        tc.adopt_local(id.clone(), Expr::sort(Level::zero()));
+
+        let mut shared = local.clone();
+        for _ in 0..8 {
+            shared = Expr::app(shared.clone(), shared);
+        }
+        let independent = independent_tree(&local, 8);
+        assert_eq!(shared, independent);
+        assert_ne!(
+            shared.allocation_identity(),
+            independent.allocation_identity(),
+            "the negative control needs separately allocated equal roots"
+        );
+
+        let scan = |expression: &Expr| {
+            let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+            let dependencies = local_dependencies(
+                &[expression],
+                &tc.locals,
+                &tc.local_positions,
+                &mut nodes_left,
+            )
+            .expect("sharing cannot change dependency-scan admission");
+            (dependencies, nodes_left)
+        };
+        let (shared_dependencies, shared_nodes_left) = scan(&shared);
+        let (independent_dependencies, independent_nodes_left) = scan(&independent);
+
+        assert!(
+            shared_dependencies == independent_dependencies,
+            "sharing variants must discover the same live generations"
+        );
+        assert!(
+            shared_dependencies
+                == vec![LocalDependency {
+                    id,
+                    generation: tc.locals[0].generation.expect("live generation"),
+                    position: 0,
+                }],
+            "the one real local dependency must survive structural deduplication"
+        );
+        assert_eq!(
+            shared_nodes_left, independent_nodes_left,
+            "structurally equal inputs must consume the same dependency-scan allowance"
+        );
+        assert_eq!(
+            TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY - shared_nodes_left,
+            9,
+            "the scan charges distinct structural subterms, independent of Arc sharing"
         );
     }
 
@@ -8889,6 +8970,43 @@ mod tests {
             dependencies
                 .iter()
                 .any(|dependency| dependency.id == right_id)
+        );
+    }
+
+    #[test]
+    fn dependency_discovery_refuses_an_overfull_structural_hash_collision_bucket() {
+        let env = Environment::new();
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        let mut expression = Expr::sort(Level::zero());
+        let mut packed = None;
+        for offset in 0..=TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES {
+            let id = FVarId(Name::num_overflowing(
+                Name::anonymous(),
+                u64::MAX - offset as u64,
+            ));
+            let local = Expr::fvar(id.clone());
+            if let Some(expected) = packed {
+                assert!(
+                    local.data().0 == expected,
+                    "the negative control needs a real packed-hash collision bucket"
+                );
+            } else {
+                packed = Some(local.data().0);
+            }
+            tc.adopt_local(id, Expr::sort(Level::zero()));
+            expression = Expr::app(expression, local);
+        }
+
+        let mut nodes_left = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY;
+        assert!(
+            local_dependencies(
+                &[&expression],
+                &tc.locals,
+                &tc.local_positions,
+                &mut nodes_left,
+            )
+            .is_none(),
+            "a fifth exact candidate must refuse cache reuse instead of aliasing a dependency"
         );
     }
 
