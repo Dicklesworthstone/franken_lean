@@ -543,7 +543,10 @@ enum IntrinsicImplementation {
     NatShiftRight,
     NatXor,
     StringAppend,
+    StringAtEnd,
+    StringCompare,
     StringDecEq,
+    StringDecLt,
     StringLength,
     StringUtf8ByteSize,
     ArraySize,
@@ -603,8 +606,14 @@ impl IntrinsicImplementation {
             "extern:Nat.shiftLeft" => Self::NatShiftLeft,
             "extern:Nat.shiftRight" => Self::NatShiftRight,
             "extern:Nat.xor" => Self::NatXor,
+            "extern:String.Internal.append" => Self::StringAppend,
+            "extern:String.Internal.atEnd" => Self::StringAtEnd,
+            "extern:String.Internal.length" => Self::StringLength,
             "extern:String.append" => Self::StringAppend,
+            "extern:String.atEnd" | "extern:String.Pos.Raw.atEnd" => Self::StringAtEnd,
+            "extern:String.compare" => Self::StringCompare,
             "extern:String.decEq" => Self::StringDecEq,
+            "extern:String.decidableLT" => Self::StringDecLt,
             "extern:String.length" => Self::StringLength,
             "extern:String.utf8ByteSize" => Self::StringUtf8ByteSize,
             "extern:Array.size" => Self::ArraySize,
@@ -3263,6 +3272,26 @@ fn invoke_intrinsic(
             lhs.push_str(&string_value(&args[1], "String.append", 1)?);
             Ok(IntrinsicResult::owned(Obj::mk_string(&lhs)))
         }
+        IntrinsicImplementation::StringAtEnd => {
+            expect_arity(row, args, 2)?;
+            let byte_len = string_bytes(&args[0], "String.atEnd", 0)?.len();
+            let at_end = match nat_as_usize(&args[1], "String.atEnd", 1)? {
+                Some(index) => index >= byte_len,
+                None => true,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(at_end))))
+        }
+        IntrinsicImplementation::StringCompare => {
+            expect_arity(row, args, 2)?;
+            let left = string_bytes(&args[0], "String.compare", 0)?;
+            let right = string_bytes(&args[1], "String.compare", 1)?;
+            let ordering = match left.cmp(&right) {
+                std::cmp::Ordering::Less => 0,
+                std::cmp::Ordering::Equal => 1,
+                std::cmp::Ordering::Greater => 2,
+            };
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(ordering)))
+        }
         IntrinsicImplementation::StringDecEq => {
             expect_arity(row, args, 2)?;
             let left = string_value(&args[0], "String.decEq", 0)?;
@@ -3272,6 +3301,14 @@ fn invoke_intrinsic(
             } else {
                 0
             })))
+        }
+        IntrinsicImplementation::StringDecLt => {
+            expect_arity(row, args, 2)?;
+            let left = string_bytes(&args[0], "String.decidableLT", 0)?;
+            let right = string_bytes(&args[1], "String.decidableLT", 1)?;
+            Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                left < right,
+            ))))
         }
         IntrinsicImplementation::StringLength => {
             expect_arity(row, args, 1)?;
@@ -3298,7 +3335,7 @@ fn invoke_intrinsic(
         }
         IntrinsicImplementation::StringUtf8ByteSize => {
             expect_arity(row, args, 1)?;
-            let length = string_value(&args[0], "String.utf8ByteSize", 0)?.len();
+            let length = string_bytes(&args[0], "String.utf8ByteSize", 0)?.len();
             if length > usize::MAX >> 1 {
                 return Err(VmRefusal::NatOverflow {
                     operation: "String.utf8ByteSize",
@@ -3684,7 +3721,10 @@ fn managerless_task_application(
         | IntrinsicImplementation::NatShiftRight
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
+        | IntrinsicImplementation::StringAtEnd
+        | IntrinsicImplementation::StringCompare
         | IntrinsicImplementation::StringDecEq
+        | IntrinsicImplementation::StringDecLt
         | IntrinsicImplementation::StringLength
         | IntrinsicImplementation::StringUtf8ByteSize
         | IntrinsicImplementation::ArraySize
@@ -3965,15 +4005,26 @@ fn string_value(
     operation: &'static str,
     argument: usize,
 ) -> Result<String, VmRefusal> {
+    String::from_utf8(string_bytes(value, operation, argument)?)
+        .map_err(|_| VmRefusal::InvalidStringObject)
+}
+
+fn string_bytes(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<Vec<u8>, VmRefusal> {
     if value_kind(value) != ValueKind::String {
         return Err(type_mismatch(operation, argument, "String", value));
     }
-    let Some((size, _, _, bytes)) = value.try_string_view() else {
+    let Some((size, _, _, mut bytes)) = value.try_string_view() else {
         return Err(VmRefusal::InvalidStringObject);
     };
-    std::str::from_utf8(&bytes[..size - 1])
-        .map(str::to_string)
-        .map_err(|_| VmRefusal::InvalidStringObject)
+    if std::str::from_utf8(&bytes[..size - 1]).is_err() {
+        return Err(VmRefusal::InvalidStringObject);
+    }
+    bytes.truncate(size - 1);
+    Ok(bytes)
 }
 
 fn type_mismatch(

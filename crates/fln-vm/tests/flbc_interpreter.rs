@@ -8149,6 +8149,116 @@ fn generated_array_read_family_preserves_values_ownership_and_hostile_refusals()
 }
 
 #[test]
+fn generated_string_bootstrap_aliases_and_comparisons_execute_with_utf8_positions() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        17,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "ab".to_string(),
+            },
+            Instruction::String {
+                dst: r(1),
+                value: "β".to_string(),
+            },
+            intrinsic(r(2), "extern:String.Internal.append", vec![r(0), r(1)]),
+            intrinsic(r(3), "extern:String.Internal.length", vec![r(2)]),
+            Instruction::Nat {
+                dst: r(4),
+                value: 4,
+            },
+            intrinsic(r(5), "extern:String.Internal.atEnd", vec![r(2), r(4)]),
+            Instruction::Nat {
+                dst: r(6),
+                value: 3,
+            },
+            intrinsic(r(7), "extern:String.atEnd", vec![r(2), r(6)]),
+            Instruction::Nat {
+                dst: r(8),
+                value: 1,
+            },
+            Instruction::Nat {
+                dst: r(9),
+                value: 64,
+            },
+            intrinsic(r(10), "extern:Nat.shiftLeft", vec![r(8), r(9)]),
+            intrinsic(r(11), "extern:String.Pos.Raw.atEnd", vec![r(2), r(10)]),
+            Instruction::String {
+                dst: r(12),
+                value: "ab".to_string(),
+            },
+            intrinsic(r(13), "extern:String.compare", vec![r(12), r(1)]),
+            intrinsic(r(14), "extern:String.decidableLT", vec![r(12), r(1)]),
+            intrinsic(r(15), "extern:String.compare", vec![r(1), r(12)]),
+            Instruction::Array {
+                dst: r(16),
+                items: vec![r(2), r(3), r(5), r(7), r(11), r(13), r(14), r(15)],
+            },
+            Instruction::Return { src: r(16) },
+        ],
+    )]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode string aliases");
+    let decoded = decode_canonical(&bytes, CodecLimits::default()).expect("decode string aliases");
+
+    shadow::enable();
+    let completed = returned(execute(&decoded, ExecutionLimits::default(), None));
+    assert_eq!(completed.usage.steps, 18);
+    assert_eq!(completed.usage.system_polls, 18);
+    assert_eq!(string_contents(&completed.value.array_child(0)), "abβ");
+    assert_eq!(completed.value.array_child(1).unbox(), 3);
+    assert_eq!(completed.value.array_child(2).unbox(), 1);
+    assert_eq!(completed.value.array_child(3).unbox(), 0);
+    assert_eq!(completed.value.array_child(4).unbox(), 1);
+    assert_eq!(completed.value.array_child(5).unbox(), 0);
+    assert_eq!(completed.value.array_child(6).unbox(), 1);
+    assert_eq!(completed.value.array_child(7).unbox(), 2);
+    drop(completed);
+
+    let wrong_position = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "x".to_string(),
+            },
+            Instruction::String {
+                dst: r(1),
+                value: "not a position".to_string(),
+            },
+            intrinsic(r(2), "extern:String.atEnd", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&wrong_position, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "String.atEnd",
+                argument: 1,
+                expected: "Nat",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "string alias paths retain no ABI value");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "string alias paths preserve the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn command_execution_context_captures_options_for_cached_and_uncached_runs() {
     fn assert_heartbeat_stop(outcome: Outcome<VmExit>) {
         assert_eq!(outcome.authority(), Authority::NonAuthoritative);
