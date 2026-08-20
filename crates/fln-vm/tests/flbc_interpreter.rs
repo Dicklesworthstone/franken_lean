@@ -7925,6 +7925,114 @@ fn heartbeat_io_intrinsics_share_marrow_state_through_the_u64_boundary() {
 }
 
 #[test]
+fn platform_and_runtime_phase_intrinsics_execute_from_canonical_flbc_without_leaks() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        7,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:System.Platform.getNumBits", vec![r(0)]),
+            intrinsic(r(2), "extern:System.Platform.getIsWindows", vec![r(0)]),
+            intrinsic(r(3), "extern:System.Platform.getIsOSX", vec![r(0)]),
+            intrinsic(r(4), "extern:System.Platform.getIsEmscripten", vec![r(0)]),
+            intrinsic(r(5), "extern:IO.initializing", Vec::new()),
+            Instruction::Array {
+                dst: r(6),
+                items: vec![r(1), r(2), r(3), r(4), r(5)],
+            },
+            Instruction::Return { src: r(6) },
+        ],
+    )]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode platform FLBC");
+    let decoded = decode_canonical(&bytes, CodecLimits::default()).expect("decode platform FLBC");
+
+    shadow::enable();
+    let completed = returned(execute(&decoded, ExecutionLimits::default(), None));
+    assert_eq!(completed.usage.steps, 8);
+    assert_eq!(completed.usage.system_polls, 8);
+    assert_eq!(completed.value.array_child(0).unbox(), 64);
+    assert_eq!(
+        completed.value.array_child(1).unbox(),
+        usize::from(cfg!(target_os = "windows"))
+    );
+    assert_eq!(
+        completed.value.array_child(2).unbox(),
+        usize::from(cfg!(target_os = "macos"))
+    );
+    assert_eq!(
+        completed.value.array_child(3).unbox(),
+        usize::from(cfg!(target_os = "emscripten"))
+    );
+    assert_eq!(
+        completed.value.array_child(4).unbox(),
+        0,
+        "definition execution is post-initialization"
+    );
+    drop(completed);
+
+    let missing_unit = validated(vec![function(
+        0,
+        0,
+        1,
+        vec![
+            intrinsic(r(0), "extern:System.Platform.getNumBits", Vec::new()),
+            Instruction::Return { src: r(0) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&missing_unit, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::IntrinsicArity {
+                ref row,
+                expected: 1,
+                actual: 0,
+            },
+            ..
+        }) if row == "extern:System.Platform.getNumBits"
+    ));
+
+    let initializing_argument = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:IO.initializing", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    assert!(matches!(
+        execute(&initializing_argument, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::IntrinsicArity {
+                ref row,
+                expected: 0,
+                actual: 1,
+            },
+            ..
+        }) if row == "extern:IO.initializing"
+    ));
+
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "platform and phase probes retain no ABI value");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "platform and phase probes preserve the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn command_execution_context_captures_options_for_cached_and_uncached_runs() {
     fn assert_heartbeat_stop(outcome: Outcome<VmExit>) {
         assert_eq!(outcome.authority(), Authority::NonAuthoritative);

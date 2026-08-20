@@ -22,7 +22,11 @@
 //! and produce only finished tasks. The
 //! allocation-linked `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share
 //! Marrow's runtime counter and preserve arbitrary-`Nat` low-64 semantics. In
-//! this managerless state, `IO.getTaskState` reports finished, `IO.wait`
+//! the certified 64-bit runtime, the pure `System.Platform` word-size and
+//! OS-family probes report the build target directly. Definition execution is
+//! post-initialization, so `IO.initializing` observes false; module initializer
+//! execution remains outside this slice. In this managerless state,
+//! `IO.getTaskState` reports finished, `IO.wait`
 //! returns the finished value, `IO.waitAny` selects the first finished task,
 //! `IO.checkCanceled`
 //! observes false, and `IO.cancel` is the pinned no-op on a finished task;
@@ -546,8 +550,13 @@ enum IntrinsicImplementation {
     ArrayGetInternal,
     ArrayGetBorrowed,
     ArrayPush,
+    PlatformNumBits,
+    PlatformIsWindows,
+    PlatformIsOsx,
+    PlatformIsEmscripten,
     IoCancel,
     IoCheckCancelled,
+    IoInitializing,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -600,8 +609,13 @@ impl IntrinsicImplementation {
             "extern:Array.getInternal" => Self::ArrayGetInternal,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
             "extern:Array.push" => Self::ArrayPush,
+            "extern:System.Platform.getNumBits" => Self::PlatformNumBits,
+            "extern:System.Platform.getIsWindows" => Self::PlatformIsWindows,
+            "extern:System.Platform.getIsOSX" => Self::PlatformIsOsx,
+            "extern:System.Platform.getIsEmscripten" => Self::PlatformIsEmscripten,
             "extern:IO.cancel" => Self::IoCancel,
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
+            "extern:IO.initializing" => Self::IoInitializing,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -3324,6 +3338,33 @@ fn invoke_intrinsic(
             items.push(args[1].clone_ref());
             Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
         }
+        IntrinsicImplementation::PlatformNumBits => {
+            expect_arity(row, args, 1)?;
+            // Marrow refuses non-64-bit targets at compile time because its
+            // ABI layout twin is certified only for 64-bit little-endian
+            // hosts. The erased subtype proof has no runtime field.
+            Ok(IntrinsicResult::owned(Obj::mk_nat(
+                std::mem::size_of::<usize>() * 8,
+            )))
+        }
+        IntrinsicImplementation::PlatformIsWindows => {
+            expect_arity(row, args, 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(cfg!(
+                target_os = "windows"
+            )))))
+        }
+        IntrinsicImplementation::PlatformIsOsx => {
+            expect_arity(row, args, 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(cfg!(
+                target_os = "macos"
+            )))))
+        }
+        IntrinsicImplementation::PlatformIsEmscripten => {
+            expect_arity(row, args, 1)?;
+            Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(cfg!(
+                target_os = "emscripten"
+            )))))
+        }
         IntrinsicImplementation::IoCancel => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.cancel", 0, "Task", ValueKind::Task)?;
@@ -3338,6 +3379,14 @@ fn invoke_intrinsic(
             // task. This is the pin's exact non-task-manager observation;
             // host execution cancellation remains the separate scheduler
             // probe sampled before every instruction.
+            Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
+        }
+        IntrinsicImplementation::IoInitializing => {
+            expect_arity(row, args, 0)?;
+            // The only Golem entry point currently executes an admitted
+            // definition after environment construction. It does not execute
+            // module `initialize` blocks, so this is the complete reachable
+            // phase observation rather than a process-global approximation.
             Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
         }
         IntrinsicImplementation::IoGetTaskState => {
@@ -3627,8 +3676,13 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayGetInternal
         | IntrinsicImplementation::ArrayGetBorrowed
         | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::PlatformNumBits
+        | IntrinsicImplementation::PlatformIsWindows
+        | IntrinsicImplementation::PlatformIsOsx
+        | IntrinsicImplementation::PlatformIsEmscripten
         | IntrinsicImplementation::IoCancel
         | IntrinsicImplementation::IoCheckCancelled
+        | IntrinsicImplementation::IoInitializing
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny
