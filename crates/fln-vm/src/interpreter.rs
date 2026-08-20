@@ -21,10 +21,11 @@
 //! and produce only finished tasks. The allocation-linked
 //! `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share Marrow's runtime
 //! counter and preserve arbitrary-`Nat` low-64 semantics. In this managerless
-//! state, `IO.checkCanceled` observes false and `IO.cancel` is the pinned no-op
-//! on a finished task; host execution cancellation remains a distinct
-//! non-authoritative stop. Scheduled tasks, concurrent thunk forcing, ambient
-//! IO, and capability effects remain outside this slice.
+//! state, `IO.getTaskState` reports finished, `IO.checkCanceled` observes false,
+//! and `IO.cancel` is the pinned no-op on a finished task; host execution
+//! cancellation remains a distinct non-authoritative stop. Scheduled tasks,
+//! concurrent thunk forcing, ambient IO, and capability effects remain outside
+//! this slice.
 
 use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
@@ -541,6 +542,7 @@ enum IntrinsicImplementation {
     ArrayPush,
     IoCancel,
     IoCheckCancelled,
+    IoGetTaskState,
     IoGetNumHeartbeats,
     IoSetNumHeartbeats,
     RefNew,
@@ -589,6 +591,7 @@ impl IntrinsicImplementation {
             "extern:Array.push" => Self::ArrayPush,
             "extern:IO.cancel" => Self::IoCancel,
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
+            "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.getNumHeartbeats" => Self::IoGetNumHeartbeats,
             "extern:IO.setNumHeartbeats" => Self::IoSetNumHeartbeats,
             "extern:ST.Prim.mkRef" => Self::RefNew,
@@ -3302,6 +3305,18 @@ fn invoke_intrinsic(
             // probe sampled before every instruction.
             Ok(IntrinsicResult::owned(Obj::mk_nat(0)))
         }
+        IntrinsicImplementation::IoGetTaskState => {
+            expect_arity(row, args, 1)?;
+            expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
+            if args[0].finished_task_value().is_none() {
+                return Err(VmRefusal::UnsupportedTaskState.into());
+            }
+            // The pin returns state 2 for a finished task before consulting
+            // the task manager. Golem creates only finished tasks in its
+            // managerless execution slice, so this is the complete reachable
+            // arm; scheduled and waiting states remain typed unsupported.
+            Ok(IntrinsicResult::owned(Obj::mk_nat(2)))
+        }
         IntrinsicImplementation::IoGetNumHeartbeats => {
             expect_arity(row, args, 0)?;
             Ok(IntrinsicResult::owned(nat_from_u64(
@@ -3505,6 +3520,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::ArrayPush
         | IntrinsicImplementation::IoCancel
         | IntrinsicImplementation::IoCheckCancelled
+        | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoGetNumHeartbeats
         | IntrinsicImplementation::IoSetNumHeartbeats
         | IntrinsicImplementation::RefNew

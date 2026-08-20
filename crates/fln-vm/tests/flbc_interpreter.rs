@@ -6176,12 +6176,12 @@ fn evaluated_thunks_and_finished_tasks_round_trip_abi_values() {
 }
 
 #[test]
-fn managerless_io_cancellation_matches_the_finished_task_runtime_subset() {
+fn managerless_io_task_state_and_cancellation_match_the_finished_task_runtime_subset() {
     let _guard = lock();
     let program = validated(vec![function(
         0,
         0,
-        6,
+        8,
         vec![
             intrinsic(r(0), "extern:IO.checkCanceled", Vec::new()),
             Instruction::String {
@@ -6189,19 +6189,21 @@ fn managerless_io_cancellation_matches_the_finished_task_runtime_subset() {
                 value: "finished".to_string(),
             },
             intrinsic(r(2), "extern:Task.pure", vec![r(1)]),
-            intrinsic(r(3), "extern:IO.cancel", vec![r(2)]),
-            intrinsic(r(4), "extern:IO.checkCanceled", Vec::new()),
+            intrinsic(r(3), "extern:IO.getTaskState", vec![r(2)]),
+            intrinsic(r(4), "extern:IO.cancel", vec![r(2)]),
+            intrinsic(r(5), "extern:IO.getTaskState", vec![r(2)]),
+            intrinsic(r(6), "extern:IO.checkCanceled", Vec::new()),
             Instruction::Array {
-                dst: r(5),
-                items: vec![r(0), r(2), r(3), r(4)],
+                dst: r(7),
+                items: vec![r(0), r(2), r(3), r(4), r(5), r(6)],
             },
-            Instruction::Return { src: r(5) },
+            Instruction::Return { src: r(7) },
         ],
     )]);
 
     shadow::enable();
     let completed = returned(execute(&program, ExecutionLimits::default(), None));
-    assert_eq!(completed.value.array_view(), (4, 4));
+    assert_eq!(completed.value.array_view(), (6, 6));
     assert_eq!(
         completed.value.array_child(0).unbox(),
         0,
@@ -6210,10 +6212,20 @@ fn managerless_io_cancellation_matches_the_finished_task_runtime_subset() {
     assert_eq!(value_kind(&completed.value.array_child(1)), ValueKind::Task);
     assert_eq!(
         completed.value.array_child(2).unbox(),
+        2,
+        "a finished task reports the pin's finished state"
+    );
+    assert_eq!(
+        completed.value.array_child(3).unbox(),
         0,
         "cancelling an already-finished task is a Unit no-op"
     );
-    assert_eq!(completed.value.array_child(3).unbox(), 0);
+    assert_eq!(
+        completed.value.array_child(4).unbox(),
+        2,
+        "the no-op cancellation cannot move a finished task out of state 2"
+    );
+    assert_eq!(completed.value.array_child(5).unbox(), 0);
     drop(completed);
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0, "managerless cancellation retains no ABI object");
@@ -7197,6 +7209,7 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
         ("extern:Thunk.get", "Thunk.get", "Thunk"),
         ("extern:Task.get", "Task.get", "finished Task"),
         ("extern:IO.cancel", "IO.cancel", "Task"),
+        ("extern:IO.getTaskState", "IO.getTaskState", "Task"),
     ];
 
     shadow::enable();
