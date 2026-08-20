@@ -98,12 +98,21 @@ fn reject<T>(class: RejectClass, message: impl Into<String>) -> KResult<T> {
 // the next row. The live row/cell bounds stay unchanged, and retiring reusable
 // facts can only cause recomputation -- never manufacture a result or turn an
 // interrupted computation into a completed one.
+// Completed recursor continuations additionally have sixteen reserved result
+// rows. A continuation retries its original term only after publishing the
+// completed reduction; letting dependency-cell saturation refuse that one row
+// turns the retry into unbounded recomputation. Reserved rows use the same
+// exact-key and live-generation checks, a separate bounded scan allowance,
+// and deterministic ring replacement. They are unavailable to ordinary cache
+// insertions, so general saturation remains a miss.
 const TYPE_CHECKER_CACHE_MAX_ENTRIES: usize = 65_536;
 const TYPE_CHECKER_CACHE_MAX_BUCKET_ENTRIES: usize = 4;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS: usize = 262_144;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCIES_PER_ENTRY: usize = 256;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES: usize = 33_554_432;
 const TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY: usize = 65_536;
+const TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS: usize = 16;
+const TYPE_CHECKER_CACHE_MAX_PRIORITY_SCAN_NODES: usize = 4_194_304;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InferMode {
@@ -296,11 +305,16 @@ type ExprResultCrossScopeEntry = (Expr, usize);
 struct ExprResultCache {
     buckets: HashMap<(u64, usize), Vec<ExprResultCacheEntry>>,
     cross_scope: HashMap<u64, Vec<ExprResultCrossScopeEntry>>,
+    priority_results: Vec<ExprResultCacheEntry>,
+    priority_scan_refusals: HashMap<(u64, usize), ()>,
     cross_scope_entries: usize,
     dependency_scan_refusals: HashMap<(u64, usize), ()>,
     entries: usize,
     local_dependency_cells: usize,
     local_dependency_scan_nodes: usize,
+    priority_dependency_cells: usize,
+    priority_scan_nodes: usize,
+    priority_next_replacement: usize,
     max_entries: usize,
     max_bucket_entries: usize,
     rollover_on_saturation: bool,
@@ -324,11 +338,16 @@ impl ExprResultCache {
         Self {
             buckets: HashMap::new(),
             cross_scope: HashMap::new(),
+            priority_results: Vec::new(),
+            priority_scan_refusals: HashMap::new(),
             cross_scope_entries: 0,
             dependency_scan_refusals: HashMap::new(),
             entries: 0,
             local_dependency_cells: 0,
             local_dependency_scan_nodes: 0,
+            priority_dependency_cells: 0,
+            priority_scan_nodes: 0,
+            priority_next_replacement: 0,
             max_entries,
             max_bucket_entries,
             rollover_on_saturation: false,
@@ -341,6 +360,13 @@ impl ExprResultCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) -> Option<Expr> {
+        if let Some(value) = self.priority_results.iter().find_map(|entry| {
+            (entry.key == *key
+                && dependencies_are_live(&entry.dependencies, locals, local_positions))
+            .then(|| entry.value.clone())
+        }) {
+            return Some(value);
+        }
         let packed = (key.data().0, locals.len());
         if let Some(value) = self.buckets.get(&packed).and_then(|bucket| {
             bucket.iter().find_map(|entry| {
@@ -426,6 +452,7 @@ impl ExprResultCache {
         locals: &[LocalDecl],
         local_positions: &HashMap<FVarId, usize>,
     ) {
+        let lookup = identity.clone();
         self.insert_with_collision_policy(
             identity.clone(),
             identity,
@@ -433,6 +460,93 @@ impl ExprResultCache {
             local_positions,
             true,
         );
+        if self.get(&lookup, locals, local_positions).is_none() {
+            self.insert_priority_result(lookup.clone(), lookup, locals, local_positions);
+        }
+    }
+
+    /// Publish a completed explicit-recursor continuation. The ordinary cache
+    /// remains the first choice; its existing bounds and rollover policy apply
+    /// unchanged. A refused publication uses one reserved row because the
+    /// continuation will immediately retry this exact key.
+    fn insert_reduction_result(
+        &mut self,
+        key: Expr,
+        value: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) {
+        self.insert(key.clone(), value.clone(), locals, local_positions);
+        if self.get(&key, locals, local_positions).is_none() {
+            self.insert_priority_result(key, value, locals, local_positions);
+        }
+    }
+
+    fn insert_priority_result(
+        &mut self,
+        key: Expr,
+        value: Expr,
+        locals: &[LocalDecl],
+        local_positions: &HashMap<FVarId, usize>,
+    ) {
+        let mut removed_cells = 0_usize;
+        self.priority_results.retain(|entry| {
+            let live = dependencies_are_live(&entry.dependencies, locals, local_positions);
+            if !live {
+                removed_cells += entry.dependencies.len();
+            }
+            live
+        });
+        self.priority_dependency_cells =
+            self.priority_dependency_cells.saturating_sub(removed_cells);
+        if self.priority_results.iter().any(|entry| {
+            entry.key == key
+                && entry.value == value
+                && dependencies_are_live(&entry.dependencies, locals, local_positions)
+        }) {
+            return;
+        }
+
+        let packed = (key.data().0, locals.len());
+        if self.priority_scan_refusals.contains_key(&packed)
+            || self.priority_scan_refusals.len() >= TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS
+        {
+            return;
+        }
+        let scan_limit = TYPE_CHECKER_CACHE_MAX_PRIORITY_SCAN_NODES
+            .saturating_sub(self.priority_scan_nodes)
+            .min(TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_SCAN_NODES_PER_ENTRY);
+        let mut nodes_left = scan_limit;
+        let dependencies =
+            local_dependencies(&[&key, &value], locals, local_positions, &mut nodes_left);
+        self.priority_scan_nodes += scan_limit - nodes_left;
+        let Some(dependencies) = dependencies else {
+            if self.priority_scan_refusals.len() < TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS {
+                self.priority_scan_refusals.insert(packed, ());
+            }
+            return;
+        };
+        let dependency_count = dependencies.len();
+        let entry = ExprResultCacheEntry {
+            key,
+            value,
+            dependencies,
+        };
+        if self.priority_results.len() < TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS {
+            self.priority_results.push(entry);
+            self.priority_dependency_cells += dependency_count;
+            return;
+        }
+        let index = self.priority_next_replacement % TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS;
+        let Some(slot) = self.priority_results.get_mut(index) else {
+            return;
+        };
+        let replaced = std::mem::replace(slot, entry);
+        self.priority_dependency_cells = self
+            .priority_dependency_cells
+            .saturating_sub(replaced.dependencies.len())
+            .saturating_add(dependency_count);
+        self.priority_next_replacement = (index + 1) % TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS;
     }
 
     fn insert_with_collision_policy(
@@ -2974,7 +3088,7 @@ impl<'a> TypeChecker<'a> {
             loop {
                 match continuations.pop() {
                     Some(WhnfRecursorContinuation::Cache(origin)) => {
-                        self.whnf_cache.insert(
+                        self.whnf_cache.insert_reduction_result(
                             origin.clone(),
                             normalized.clone(),
                             &self.locals,
@@ -2985,8 +3099,9 @@ impl<'a> TypeChecker<'a> {
                         // re-enters through that same layer rather than through
                         // full `whnf`; publish the completed continuation to
                         // both tables or the predecessor reduction repeats
-                        // indefinitely.
-                        self.whnf_core_cache.insert(
+                        // indefinitely. A saturated ordinary cache uses its
+                        // reserved continuation lane for exactly this seam.
+                        self.whnf_core_cache.insert_reduction_result(
                             origin,
                             normalized.clone(),
                             &self.locals,
@@ -9123,6 +9238,87 @@ mod tests {
                 "the termination-critical identity must replace both row and cross-scope collision pointers without widening either bound"
             );
         }
+    }
+
+    #[test]
+    fn completed_recursor_result_uses_a_generation_checked_priority_row_after_saturation() {
+        let env = Environment::new();
+        let id = FVarId(Name::str(Name::anonymous(), "priorityRecursor"));
+        let local = Expr::fvar(id.clone());
+        let key = Expr::app(local, Expr::sort(Level::zero()));
+        let value = Expr::sort(Level::one());
+        let mut tc = TypeChecker::new(&env, &[], Budget::DEFAULT);
+        tc.adopt_local(id.clone(), Expr::sort(Level::zero()));
+
+        tc.whnf_core_cache.local_dependency_cells = TYPE_CHECKER_CACHE_MAX_LOCAL_DEPENDENCY_CELLS;
+        tc.whnf_core_cache
+            .insert(key.clone(), value.clone(), &tc.locals, &tc.local_positions);
+        assert!(
+            tc.whnf_core_cache
+                .get(&key, &tc.locals, &tc.local_positions)
+                .is_none()
+                && tc.whnf_core_cache.priority_results.is_empty(),
+            "ordinary saturation must remain a cache miss and cannot consume a priority row"
+        );
+
+        tc.whnf_core_cache.insert_reduction_result(
+            key.clone(),
+            value.clone(),
+            &tc.locals,
+            &tc.local_positions,
+        );
+        assert!(
+            tc.whnf_core_cache
+                .get(&key, &tc.locals, &tc.local_positions)
+                == Some(value.clone())
+                && tc.whnf_core_cache.entries == 0
+                && tc.whnf_core_cache.priority_results.len() == 1
+                && tc.whnf_core_cache.priority_dependency_cells == 1,
+            "a completed continuation must survive ordinary dependency-cell saturation in its reserved row"
+        );
+
+        tc.adopt_local(id, Expr::sort(Level::one()));
+        assert!(
+            tc.whnf_core_cache
+                .get(&key, &tc.locals, &tc.local_positions)
+                .is_none(),
+            "a priority result must miss while its fvar identifier names a different generation"
+        );
+        tc.drop_local();
+        assert_eq!(
+            tc.whnf_core_cache
+                .get(&key, &tc.locals, &tc.local_positions),
+            Some(value),
+            "dropping a shadow must reveal the generation for which the result was checked"
+        );
+    }
+
+    #[test]
+    fn completed_recursor_priority_rows_replace_in_deterministic_ring_order() {
+        let mut cache = ExprResultCache::bounded(0, 0);
+        let value = Expr::sort(Level::zero());
+        let keys = (0..=TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS)
+            .map(|index| {
+                Expr::const_(
+                    Name::num(Name::str(Name::anonymous(), "priorityResult"), index as u64),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.insert_reduction_result(key.clone(), value.clone(), &[], &HashMap::new());
+        }
+
+        assert!(
+            cache.entries == 0
+                && cache.priority_results.len() == TYPE_CHECKER_CACHE_MAX_PRIORITY_RESULTS
+                && cache.get(&keys[0], &[], &HashMap::new()).is_none()
+                && cache.get(&keys[1], &[], &HashMap::new()) == Some(value.clone())
+                && cache.get(keys.last().expect("one overflow row"), &[], &HashMap::new())
+                    == Some(value)
+                && cache.priority_next_replacement == 1,
+            "the first overflow must replace exactly the oldest reserved row without widening the bound"
+        );
     }
 
     #[test]
