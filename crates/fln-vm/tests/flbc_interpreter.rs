@@ -6325,13 +6325,110 @@ fn managerless_io_wait_any_selects_the_first_finished_task_in_list_order() {
     );
     drop(completed);
     let (events, live) = shadow::disable_and_drain();
-    assert_eq!(live, 0, "waitAny retains no ABI object after the result drops");
+    assert_eq!(
+        live, 0,
+        "waitAny retains no ABI object after the result drops"
+    );
     assert!(
         events.iter().all(|event| {
             event.kind != shadow::EventKind::DoubleRelease
                 && event.kind != shadow::EventKind::ForeignPointer
         }),
         "waitAny preserves the Marrow ownership graph"
+    );
+
+    let empty = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            intrinsic(r(1), "extern:IO.waitAny", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+    let wrong_head = validated(vec![function(
+        0,
+        0,
+        4,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "not a task".to_string(),
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 0,
+            },
+            Instruction::Ctor {
+                dst: r(2),
+                tag: 1,
+                fields: vec![r(0), r(1)],
+                scalar_bytes: Vec::new(),
+            },
+            intrinsic(r(3), "extern:IO.waitAny", vec![r(2)]),
+            Instruction::Return { src: r(3) },
+        ],
+    )]);
+    let malformed_cons = validated(vec![function(
+        0,
+        0,
+        2,
+        vec![
+            Instruction::Ctor {
+                dst: r(0),
+                tag: 1,
+                fields: Vec::new(),
+                scalar_bytes: Vec::new(),
+            },
+            intrinsic(r(1), "extern:IO.waitAny", vec![r(0)]),
+            Instruction::Return { src: r(1) },
+        ],
+    )]);
+
+    shadow::enable();
+    assert!(matches!(
+        execute(&empty, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "IO.waitAny",
+                argument: 0,
+                expected: "non-empty List (Task _)",
+                actual: ValueKind::Scalar,
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        execute(&wrong_head, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "IO.waitAny",
+                argument: 0,
+                expected: "finished Task",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        execute(&malformed_cons, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::InvalidCtorObject,
+            ..
+        })
+    ));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "waitAny refusals retain no ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "waitAny refusals preserve the Marrow ownership graph"
     );
 }
 
@@ -7285,11 +7382,7 @@ fn pure_effect_intrinsics_refuse_wrong_abi_kinds_without_leaks() {
         ("extern:IO.cancel", "IO.cancel", "Task"),
         ("extern:IO.getTaskState", "IO.getTaskState", "Task"),
         ("extern:IO.wait", "IO.wait", "finished Task"),
-        (
-            "extern:IO.waitAny",
-            "IO.waitAny",
-            "non-empty List (Task _)",
-        ),
+        ("extern:IO.waitAny", "IO.waitAny", "non-empty List (Task _)"),
     ];
 
     shadow::enable();
