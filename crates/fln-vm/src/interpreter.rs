@@ -21,11 +21,11 @@
 //! and produce only finished tasks. The allocation-linked
 //! `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share Marrow's runtime
 //! counter and preserve arbitrary-`Nat` low-64 semantics. In this managerless
-//! state, `IO.getTaskState` reports finished, `IO.checkCanceled` observes false,
-//! and `IO.cancel` is the pinned no-op on a finished task; host execution
-//! cancellation remains a distinct non-authoritative stop. Scheduled tasks,
-//! concurrent thunk forcing, ambient IO, and capability effects remain outside
-//! this slice.
+//! state, `IO.getTaskState` reports finished, `IO.wait` returns the finished
+//! value, `IO.checkCanceled` observes false, and `IO.cancel` is the pinned
+//! no-op on a finished task; host execution cancellation remains a distinct
+//! non-authoritative stop. Scheduled tasks, concurrent thunk forcing, ambient
+//! IO, and capability effects remain outside this slice.
 
 use crate::extern_row::{
     ArgumentOwnership as ContractArgumentOwnership, Ownership as ExternOwnership,
@@ -543,6 +543,7 @@ enum IntrinsicImplementation {
     IoCancel,
     IoCheckCancelled,
     IoGetTaskState,
+    IoWait,
     IoGetNumHeartbeats,
     IoSetNumHeartbeats,
     RefNew,
@@ -592,6 +593,7 @@ impl IntrinsicImplementation {
             "extern:IO.cancel" => Self::IoCancel,
             "extern:IO.checkCanceled" => Self::IoCheckCancelled,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
+            "extern:IO.wait" => Self::IoWait,
             "extern:IO.getNumHeartbeats" => Self::IoGetNumHeartbeats,
             "extern:IO.setNumHeartbeats" => Self::IoSetNumHeartbeats,
             "extern:ST.Prim.mkRef" => Self::RefNew,
@@ -3317,6 +3319,14 @@ fn invoke_intrinsic(
             // arm; scheduled and waiting states remain typed unsupported.
             Ok(IntrinsicResult::owned(Obj::mk_nat(2)))
         }
+        IntrinsicImplementation::IoWait => {
+            expect_arity(row, args, 1)?;
+            expect_value_kind(&args[0], "IO.wait", 0, "finished Task", ValueKind::Task)?;
+            args[0]
+                .finished_task_value()
+                .map(IntrinsicResult::owned)
+                .ok_or_else(|| VmRefusal::UnsupportedTaskState.into())
+        }
         IntrinsicImplementation::IoGetNumHeartbeats => {
             expect_arity(row, args, 0)?;
             Ok(IntrinsicResult::owned(nat_from_u64(
@@ -3521,6 +3531,7 @@ fn managerless_task_application(
         | IntrinsicImplementation::IoCancel
         | IntrinsicImplementation::IoCheckCancelled
         | IntrinsicImplementation::IoGetTaskState
+        | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoGetNumHeartbeats
         | IntrinsicImplementation::IoSetNumHeartbeats
         | IntrinsicImplementation::RefNew
