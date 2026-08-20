@@ -6800,6 +6800,163 @@ fn managerless_task_spawn_map_and_bind_share_the_closure_continuation_stack() {
 }
 
 #[test]
+fn managerless_base_io_as_task_runs_the_action_and_preserves_borrowed_arguments() {
+    let _guard = lock();
+    let program = validated(vec![
+        function(
+            0,
+            0,
+            6,
+            vec![
+                Instruction::Closure {
+                    dst: r(0),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: 0,
+                },
+                intrinsic(r(2), "extern:BaseIO.asTask", vec![r(0), r(1)]),
+                Instruction::Copy {
+                    dst: r(3),
+                    src: r(2),
+                },
+                intrinsic(r(4), "extern:Task.get", vec![r(3)]),
+                Instruction::Array {
+                    dst: r(5),
+                    items: vec![r(0), r(1), r(2), r(4)],
+                },
+                Instruction::Return { src: r(5) },
+            ],
+        ),
+        function_with_ownership(
+            1,
+            vec![ArgumentOwnership::Scalar],
+            2,
+            vec![
+                Instruction::String {
+                    dst: r(1),
+                    value: "base-io-finished".to_string(),
+                },
+                Instruction::Return { src: r(1) },
+            ],
+        ),
+    ]);
+
+    shadow::enable();
+    let completed = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(completed.value.array_view(), (4, 4));
+    assert_eq!(completed.usage.peak_stack_depth, 2);
+    assert_eq!(
+        value_kind(&completed.value.array_child(0)),
+        ValueKind::Closure,
+        "the borrowed BaseIO action remains live"
+    );
+    assert_eq!(
+        completed.value.array_child(1).unbox(),
+        0,
+        "the borrowed priority remains live"
+    );
+    assert_eq!(value_kind(&completed.value.array_child(2)), ValueKind::Task);
+    assert_eq!(
+        string_contents(&completed.value.array_child(3)),
+        "base-io-finished"
+    );
+    drop(completed);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "BaseIO.asTask releases every ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "BaseIO.asTask preserves the Marrow ownership graph"
+    );
+
+    let wrong_action = validated(vec![function(
+        0,
+        0,
+        3,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "not an action".to_string(),
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 0,
+            },
+            intrinsic(r(2), "extern:BaseIO.asTask", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let wrong_priority = validated(vec![
+        function(
+            0,
+            0,
+            3,
+            vec![
+                Instruction::Closure {
+                    dst: r(0),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+                Instruction::String {
+                    dst: r(1),
+                    value: "not a priority".to_string(),
+                },
+                intrinsic(r(2), "extern:BaseIO.asTask", vec![r(0), r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+        function_with_ownership(
+            1,
+            vec![ArgumentOwnership::Scalar],
+            1,
+            vec![Instruction::Return { src: r(0) }],
+        ),
+    ]);
+
+    shadow::enable();
+    assert!(matches!(
+        execute(&wrong_action, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "BaseIO.asTask",
+                argument: 0,
+                expected: "Golem closure",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        execute(&wrong_priority, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "BaseIO.asTask",
+                argument: 1,
+                expected: "Nat",
+                actual: ValueKind::String,
+            },
+            ..
+        })
+    ));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0, "BaseIO.asTask refusals retain no ABI object");
+    assert!(
+        events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }),
+        "BaseIO.asTask refusals preserve the Marrow ownership graph"
+    );
+}
+
+#[test]
 fn managerless_task_bind_returns_the_continuation_task_without_rewrapping() {
     let _guard = lock();
     let program = validated(vec![

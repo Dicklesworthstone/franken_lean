@@ -16,13 +16,14 @@
 //! The pure effect nucleus uses the same identity: `ST.Ref` cells, evaluated
 //! thunks, and finished tasks are Marrow objects all the way through their
 //! intrinsic rows. A delayed thunk claims its closure once and completes only
-//! through the ordinary return continuation. The manager-absent `Task.spawn`,
-//! `Task.map`, and `Task.bind` fallbacks use that same continuation machinery
-//! and produce only finished tasks. The allocation-linked
-//! `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share Marrow's runtime
-//! counter and preserve arbitrary-`Nat` low-64 semantics. In this managerless
-//! state, `IO.getTaskState` reports finished, `IO.wait` returns the finished
-//! value, `IO.waitAny` selects the first finished task, `IO.checkCanceled`
+//! through the ordinary return continuation. The manager-absent
+//! `BaseIO.asTask`, `Task.spawn`, `Task.map`, and `Task.bind` fallbacks use that
+//! same continuation machinery and produce only finished tasks. The
+//! allocation-linked `IO.getNumHeartbeats` / `IO.setNumHeartbeats` rows share
+//! Marrow's runtime counter and preserve arbitrary-`Nat` low-64 semantics. In
+//! this managerless state, `IO.getTaskState` reports finished, `IO.wait`
+//! returns the finished value, `IO.waitAny` selects the first finished task,
+//! `IO.checkCanceled`
 //! observes false, and `IO.cancel` is the pinned no-op on a finished task;
 //! host execution cancellation remains a distinct non-authoritative stop.
 //! Scheduled tasks, concurrent thunk forcing, ambient IO, and capability
@@ -517,6 +518,7 @@ struct IntrinsicPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
+    BaseIoAsTask,
     NatAdd,
     NatBeq,
     NatBle,
@@ -568,6 +570,7 @@ enum IntrinsicImplementation {
 impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
         match row {
+            "extern:BaseIO.asTask" => Self::BaseIoAsTask,
             "extern:Nat.add" => Self::NatAdd,
             "extern:Nat.beq" => Self::NatBeq,
             "extern:Nat.ble" => Self::NatBle,
@@ -618,7 +621,10 @@ impl IntrinsicImplementation {
     }
 
     const fn is_managerless_task(self) -> bool {
-        matches!(self, Self::TaskSpawn | Self::TaskMap | Self::TaskBind)
+        matches!(
+            self,
+            Self::BaseIoAsTask | Self::TaskSpawn | Self::TaskMap | Self::TaskBind
+        )
     }
 }
 
@@ -3433,7 +3439,8 @@ fn invoke_intrinsic(
                 .map(IntrinsicResult::owned)
                 .ok_or_else(|| VmRefusal::UnsupportedTaskState.into())
         }
-        IntrinsicImplementation::ThunkGet
+        IntrinsicImplementation::BaseIoAsTask
+        | IntrinsicImplementation::ThunkGet
         | IntrinsicImplementation::TaskSpawn
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
@@ -3475,14 +3482,19 @@ fn managerless_task_application(
     args: Vec<Obj>,
 ) -> Result<ManagerlessTaskApplication, VmRefusal> {
     match implementation {
-        IntrinsicImplementation::TaskSpawn => {
+        IntrinsicImplementation::BaseIoAsTask | IntrinsicImplementation::TaskSpawn => {
             let [closure, priority] = exact_owned_args(row, args)?;
-            expect_golem_task_closure(&closure, "Task.spawn", 0)?;
+            let operation = if implementation == IntrinsicImplementation::BaseIoAsTask {
+                "BaseIO.asTask"
+            } else {
+                "Task.spawn"
+            };
+            expect_golem_task_closure(&closure, operation, 0)?;
             // Priority is a Nat; the managerless path ignores the number.
             // An mpz priority is still a Nat — refusing it as a type
             // mismatch would treat 2^64 as ill-typed rather than a valid
             // (and here unused) priority.
-            with_nat_view(&priority, "Task.spawn", 1, |_| ())?;
+            with_nat_view(&priority, operation, 1, |_| ())?;
             Ok(ManagerlessTaskApplication {
                 row,
                 closure,
