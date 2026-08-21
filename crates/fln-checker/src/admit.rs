@@ -373,10 +373,11 @@ pub enum AdmissionGround {
     /// KR-950..954 — the fixed quotient primitive rows and their required
     /// equality prelude were reconstructed and compared independently.
     QuotientPrimitiveChecked,
-    /// KR-600..803, bounded ground — one safe, nonrecursive, non-nested,
+    /// KR-600..803, bounded ground — one safe, single, non-nested,
     /// parameter-free `Type` inductive and its bounded constructor telescopes,
     /// recursor, and computation rules were reconstructed from checker-owned
-    /// rows. Other inductive shapes remain deferred, never accepted under this
+    /// rows. The current ground permits only direct self-recursive fields;
+    /// other inductive shapes remain deferred, never accepted under this
     /// ground.
     InductiveNonrecursiveChecked,
     /// KR-975 — admitted INTO THE UNSAFE QUARANTINE. Everything the ordinary
@@ -2085,6 +2086,7 @@ struct ConstructorField<'a> {
 struct CheckedConstructor<'a> {
     name: &'a WireName,
     fields: Vec<ConstructorField<'a>>,
+    direct_recursive_fields: Vec<bool>,
 }
 
 fn constructor_shape<'a>(
@@ -2129,15 +2131,50 @@ fn expected_minor_type(
     prior_minors: usize,
 ) -> Option<ExprId> {
     let field_count = constructor.fields.len();
-    let motive_index = u32::try_from(field_count.checked_add(prior_minors)?).ok()?;
+    let recursive_fields: Vec<usize> = constructor
+        .direct_recursive_fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, direct)| direct.then_some(index))
+        .collect();
+    let recursive_count = recursive_fields.len();
+    let motive_index = u32::try_from(
+        field_count
+            .checked_add(recursive_count)?
+            .checked_add(prior_minors)?,
+    )
+    .ok()?;
     let motive = builder.bvar(motive_index);
     let mut constructor_application = builder.constant(constructor.name, &[]);
     for index in 0..field_count {
-        let field =
-            builder.bvar(u32::try_from(field_count.checked_sub(index.checked_add(1)?)?).ok()?);
+        let field = builder.bvar(
+            u32::try_from(
+                recursive_count.checked_add(field_count.checked_sub(index.checked_add(1)?)?)?,
+            )
+            .ok()?,
+        );
         constructor_application = builder.apply(constructor_application, field);
     }
     let mut result = builder.apply(motive, constructor_application);
+    for (induction_hypothesis_index, field_index) in recursive_fields.iter().enumerate().rev() {
+        let motive = builder.bvar(
+            u32::try_from(
+                field_count
+                    .checked_add(induction_hypothesis_index)?
+                    .checked_add(prior_minors)?,
+            )
+            .ok()?,
+        );
+        let field = builder.bvar(
+            u32::try_from(
+                induction_hypothesis_index
+                    .checked_add(field_count.checked_sub(field_index.checked_add(1)?)?)?,
+            )
+            .ok()?,
+        );
+        let induction_hypothesis = builder.apply(motive, field);
+        result = builder.forall("ih", BinderStyle::Default, induction_hypothesis, result);
+    }
     for field in constructor.fields.iter().rev() {
         let field_type = builder.import(field.source, field.type_root)?;
         result = builder.forall_name(field.name, field.style, field_type, result);
@@ -2185,6 +2222,38 @@ fn nonrecursive_rule_rhs(
         let field =
             builder.bvar(u32::try_from(field_count.checked_sub(index.checked_add(1)?)?).ok()?);
         result = builder.apply(result, field);
+    }
+    for (field_index, direct_recursive) in selected_constructor
+        .direct_recursive_fields
+        .iter()
+        .enumerate()
+    {
+        if !direct_recursive {
+            continue;
+        }
+        let recursor_name = checker_child(inductive, "rec");
+        let mut recursive_call =
+            builder.constant(&recursor_name, std::slice::from_ref(level_parameter));
+        let motive =
+            builder.bvar(u32::try_from(field_count.checked_add(constructors.len())?).ok()?);
+        recursive_call = builder.apply(recursive_call, motive);
+        for minor_index in 0..constructors.len() {
+            let minor = builder.bvar(
+                u32::try_from(
+                    field_count.checked_add(
+                        constructors
+                            .len()
+                            .checked_sub(minor_index.checked_add(1)?)?,
+                    )?,
+                )
+                .ok()?,
+            );
+            recursive_call = builder.apply(recursive_call, minor);
+        }
+        let field = builder
+            .bvar(u32::try_from(field_count.checked_sub(field_index.checked_add(1)?)?).ok()?);
+        recursive_call = builder.apply(recursive_call, field);
+        result = builder.apply(result, recursive_call);
     }
     for field in selected_constructor.fields.iter().rev() {
         let field_type = builder.import(field.source, field.type_root)?;
@@ -2357,8 +2426,33 @@ fn field_mentions_inductive(
     Ok(false)
 }
 
-/// Independently reconstruct one bounded, field-bearing, nonrecursive `Type`
-/// inductive block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldRecursion {
+    Absent,
+    DirectSelf,
+    Unsupported,
+}
+
+fn classify_field_recursion(
+    field: &ConstructorField<'_>,
+    inductive: &WireName,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<FieldRecursion, InductiveVerdict> {
+    if matches!(
+        field.source.node(field.type_root),
+        Some(ExprNode::Constant { name, levels }) if name == inductive && levels.is_empty()
+    ) {
+        return Ok(FieldRecursion::DirectSelf);
+    }
+    match field_mentions_inductive(field, inductive, comparison, cancelled)? {
+        true => Ok(FieldRecursion::Unsupported),
+        false => Ok(FieldRecursion::Absent),
+    }
+}
+
+/// Independently reconstruct one bounded, field-bearing, single `Type`
+/// inductive block, including direct self-recursive fields.
 pub fn admit_inductive(
     environment: &ConstantEnvironment,
     declarations: &[ConstantEntry],
@@ -2435,9 +2529,6 @@ pub fn admit_inductive_with(
         return InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
             observed: metadata.num_nested(),
         });
-    }
-    if metadata.is_recursive() {
-        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
     }
     if metadata.is_reflexive() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
@@ -2560,10 +2651,22 @@ pub fn admit_inductive_with(
                 name: constructor_name.clone(),
             });
         };
+        let mut direct_recursive_fields = Vec::new();
         for field in &fields {
-            match field_mentions_inductive(field, name, &mut comparison, &mut cancelled) {
-                Ok(false) => {}
-                Ok(true) => {
+            match classify_field_recursion(field, name, &mut comparison, &mut cancelled) {
+                Ok(FieldRecursion::Absent) => direct_recursive_fields.push(false),
+                Ok(FieldRecursion::DirectSelf) if metadata.is_recursive() => {
+                    direct_recursive_fields.push(true);
+                }
+                Ok(FieldRecursion::DirectSelf) => {
+                    return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                        name: constructor_name.clone(),
+                    });
+                }
+                Ok(FieldRecursion::Unsupported) if metadata.is_recursive() => {
+                    return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
+                }
+                Ok(FieldRecursion::Unsupported) => {
                     return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
                         name: constructor_name.clone(),
                     });
@@ -2595,6 +2698,7 @@ pub fn admit_inductive_with(
         checked_constructors.push(CheckedConstructor {
             name: constructor_name,
             fields,
+            direct_recursive_fields,
         });
         members.push(constructor_name.clone());
     }
@@ -2611,6 +2715,16 @@ pub fn admit_inductive_with(
         return InductiveVerdict::Deferred(InductiveSupportLimit::ExpectedArenaUnits {
             observed: expected_arena_units,
             limit: MAX_INDUCTIVE_EXPECTED_ARENA_UNITS,
+        });
+    }
+    if metadata.is_recursive()
+        && !checked_constructors
+            .iter()
+            .flat_map(|constructor| constructor.direct_recursive_fields.iter())
+            .any(|direct| *direct)
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
         });
     }
 

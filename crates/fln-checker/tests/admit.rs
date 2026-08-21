@@ -640,6 +640,163 @@ fn dependent_field_inductive_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// The bounded Init.Nat shape: one nullary constructor and one constructor
+/// carrying a direct self field. Its recursor's successor minor contains the
+/// induction hypothesis, and its successor rule re-enters `Nat.rec`.
+fn nat_entries() -> Vec<ConstantEntry> {
+    let nat = checker_name("Nat");
+    let zero = checker_qualified(&["Nat", "zero"]);
+    let succ = checker_qualified(&["Nat", "succ"]);
+    let rec = checker_qualified(&["Nat", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
+    let nat_expr = || Expr::const_(primary_name("Nat"), Vec::new());
+    let zero_expr = || Expr::const_(Name::from_components(["Nat", "zero"]), Vec::new());
+    let succ_expr = || Expr::const_(Name::from_components(["Nat", "succ"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = primary_pi("t", BinderInfo::Default, nat_expr(), Expr::sort(u.clone()));
+    let succ_minor_type = |motive_index| {
+        primary_pi(
+            "n",
+            BinderInfo::Default,
+            nat_expr(),
+            primary_pi(
+                "n_ih",
+                BinderInfo::Default,
+                Expr::app(bv(motive_index + 1), bv(0)),
+                Expr::app(bv(motive_index + 2), Expr::app(succ_expr(), bv(1))),
+            ),
+        )
+    };
+    let zero_minor_type = Expr::app(bv(0), zero_expr());
+    let recursor_type = primary_pi(
+        "motive",
+        BinderInfo::Implicit,
+        motive_type.clone(),
+        primary_pi(
+            "zero",
+            BinderInfo::Default,
+            zero_minor_type.clone(),
+            primary_pi(
+                "succ",
+                BinderInfo::Default,
+                succ_minor_type(1),
+                primary_pi(
+                    "t",
+                    BinderInfo::Default,
+                    nat_expr(),
+                    Expr::app(bv(3), bv(0)),
+                ),
+            ),
+        ),
+    );
+    let zero_rule_rhs = Expr::lam(
+        primary_name("motive"),
+        motive_type.clone(),
+        Expr::lam(
+            primary_name("zero"),
+            zero_minor_type,
+            Expr::lam(
+                primary_name("succ"),
+                succ_minor_type(1),
+                bv(1),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let successor_rule_rhs = {
+        let mut recursive_call = Expr::const_(Name::from_components(["Nat", "rec"]), vec![u]);
+        for argument in [bv(3), bv(2), bv(1), bv(0)] {
+            recursive_call = Expr::app(recursive_call, argument);
+        }
+        Expr::lam(
+            primary_name("motive"),
+            motive_type.clone(),
+            Expr::lam(
+                primary_name("zero"),
+                Expr::app(bv(0), zero_expr()),
+                Expr::lam(
+                    primary_name("succ"),
+                    succ_minor_type(1),
+                    Expr::lam(
+                        primary_name("n"),
+                        nat_expr(),
+                        Expr::app(Expr::app(bv(1), bv(0)), recursive_call),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    vec![
+        ConstantEntry::new(
+            nat.clone(),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![nat.clone()],
+                    vec![zero.clone(), succ.clone()],
+                    0,
+                    true,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            zero.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&nat_expr()),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(nat.clone(), 0, 0, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            succ.clone(),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&primary_pi(
+                    "n",
+                    BinderInfo::Default,
+                    nat_expr(),
+                    nat_expr(),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(nat.clone(), 1, 0, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![nat],
+                    0,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(zero, 0, decoded(&zero_rule_rhs)),
+                        RecursorRule::new(succ, 1, decoded(&successor_rule_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -678,6 +835,99 @@ fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
         admission.ground(),
         AdmissionGround::InductiveNonrecursiveChecked
     );
+}
+
+#[test]
+fn kr600_803_direct_self_recursion_is_reconstructed_independently() {
+    let entries = nat_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Nat block: {verdict:?}");
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+}
+
+#[test]
+fn kr600_803_direct_recursion_reconstructs_iota_and_defers_indirect_fields() {
+    let mut forged_rule = nat_entries();
+    let recursor = forged_rule[3].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    forged_rule[3] = ConstantEntry::new(
+        checker_qualified(&["Nat", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["Nat", "succ"]),
+                        1,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &forged_rule,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+
+    let mut indirect = nat_entries();
+    let indirect_field = primary_pi(
+        "f",
+        BinderInfo::Default,
+        Expr::const_(primary_name("Nat"), Vec::new()),
+        Expr::const_(primary_name("Nat"), Vec::new()),
+    );
+    indirect[2] = ConstantEntry::new(
+        checker_qualified(&["Nat", "succ"]),
+        ConstantDeclaration::constructor(
+            Vec::new(),
+            decoded(&primary_pi(
+                "step",
+                BinderInfo::Default,
+                indirect_field,
+                Expr::const_(primary_name("Nat"), Vec::new()),
+            )),
+            ConstantSafety::Safe,
+            ConstructorDeclaration::new(checker_name("Nat"), 1, 0, 1),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &indirect,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Deferred(
+            fln_checker::admit::InductiveSupportLimit::Recursive
+        )
+    ));
 }
 
 #[test]
