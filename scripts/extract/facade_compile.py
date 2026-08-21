@@ -261,6 +261,10 @@ the toolchain would report a perfect facade:
     Init-substrate row to carry the pinned manifest schema. A trusted summary
     cannot make mixed-epoch data rows appear compatible by itself.
 
+  * A MANIFEST-ROW-KIND JOIN requires every non-summary row to be either a
+    declaration or an Init-substrate row. A schema-valid but unknown row cannot
+    be silently ignored by the compile-rig joins.
+
   * A MANIFEST-FORM-TOTALITY JOIN requires every non-Init declaration row to
     use a recognized generator form, and every Init-substrate declaration to
     remain intentionally formless. A form classification cannot disappear
@@ -1389,6 +1393,26 @@ def main():
             "REFUSE: facade manifest schema-row join disagrees with the pinned "
             f"summary ({json.dumps(manifest_schema_join, sort_keys=True)})"
         )
+    unexpected_manifest_kinds = sorted({
+        row.get("kind") for row in manifest_contract_rows
+        if row.get("kind") not in {"decl", "init-substrate"}
+    }, key=repr)
+    manifest_row_kind_join = {
+        "contract_rows": len(manifest_contract_rows),
+        "declaration_rows": len(manifest_rows),
+        "init_substrate_rows": len(manifest_init_substrate),
+        "unexpected_kinds": len(unexpected_manifest_kinds),
+    }
+    if (manifest_row_kind_join["contract_rows"] == 0
+            or manifest_row_kind_join["declaration_rows"]
+            + manifest_row_kind_join["init_substrate_rows"]
+            != manifest_row_kind_join["contract_rows"]
+            or manifest_row_kind_join["unexpected_kinds"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest row-kind join failed "
+            f"({json.dumps(manifest_row_kind_join, sort_keys=True)}, "
+            f"unexpected={unexpected_manifest_kinds!r})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2445,6 +2469,7 @@ def main():
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_schema_row_join": manifest_schema_join,
+        "manifest_row_kind_join": manifest_row_kind_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
