@@ -7963,6 +7963,20 @@ fn the_categorical_zeros_have_denominators() {
 /// missing is that a negative result is only as strong as the test's ability to
 /// have come out positive, and I asserted four of them without once asking
 /// whether the test could.
+///
+/// THE MULTIPLICITIES BELOW WERE WRONG UNTIL w165, AND THE FINDING WAS NOT.
+/// This cell's walk deduplicates elements into a `BTreeSet`, so its counts are
+/// DISTINCT OBJECTS pooled across both populations. The first version pinned
+/// occurrence counts instead - 70 where the walk computes 23, and 19 + 6 where
+/// it computes 10 + 5 - taken from the measurement script rather than from the
+/// walk. The corrected numbers reconcile with `243053f8`'s pooled totals, which
+/// the wrong ones did not.
+///
+/// The conclusion is untouched, because it rests on how many DISTINCT VALUES
+/// each property takes and not on how often each occurs: one value for
+/// `ddfa2317`'s inner either way, two for `75a1373c`'s either way. A
+/// discriminating-power audit is insensitive to multiplicity by construction,
+/// which is why a wrong count could sit inside a right finding.
 #[test]
 fn the_not_special_findings_needed_discriminating_power() {
     let mut modules: Vec<(String, Vec<u8>)> = [
@@ -8120,8 +8134,8 @@ fn the_not_special_findings_needed_discriminating_power() {
             ("1cc74dd0 length/3".to_owned(), 5),
             ("1cc74dd0 length/4".to_owned(), 4),
             ("1cc74dd0 length/5".to_owned(), 8),
-            ("75a1373c inner/tag 1 arity 1".to_owned(), 19),
-            ("75a1373c inner/tag 4 arity 2".to_owned(), 6),
+            ("75a1373c inner/tag 1 arity 1".to_owned(), 10),
+            ("75a1373c inner/tag 4 arity 2".to_owned(), 5),
             ("c726dec5 slot 0/tag 2 arity 2".to_owned(), 69),
             ("c726dec5 slot 1/tag 2 arity 2".to_owned(), 69),
             ("c726dec5 slot 2/tag 246 arity 0".to_owned(), 69),
@@ -8129,9 +8143,19 @@ fn the_not_special_findings_needed_discriminating_power() {
             ("c726dec5 slot 4/tag 0 arity 2".to_owned(), 57),
             ("c726dec5 slot 4/tag 1 arity 2".to_owned(), 8),
             ("c726dec5 slot 4/tag 5 arity 1".to_owned(), 4),
-            ("ddfa2317 inner/tag 2 arity 2".to_owned(), 70),
+            ("ddfa2317 inner/tag 2 arity 2".to_owned(), 23),
         ],
-        "every property, as the values it takes over its whole population"
+        "every property, as the values it takes over its whole population. \
+         \
+         THE BASIS IS DISTINCT OBJECTS, POOLED across both populations - the \
+         walk above collects elements into a `BTreeSet` before reading them, so \
+         each object contributes once however many arrays hold it. The 23 is \
+         `243053f8`'s pooled `tag 1` element count and the 10 + 5 is its pooled \
+         `tag 2` count of 15, so this row reconciles with two landed totals. \
+         \
+         It first pinned 70 and 19 + 6, which are OCCURRENCE counts from the \
+         measurement script rather than anything this walk computes, and w165 \
+         caught it"
     );
 
     // The vacuous ones: a property with a single value cannot distinguish.
