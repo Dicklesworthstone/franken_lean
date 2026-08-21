@@ -4886,6 +4886,104 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// A ONE-MODULE set cannot have a cross-module conflict, so the two check-olean
+/// paths must diverge -- and the divergence is a property of SET SIZE, not of the
+/// module.
+///
+/// **What is actually new here.** After `134defc3` the directory case expects
+/// `declaration-closure` with the set-wide conflict, and the single-module case
+/// twenty lines up expects `unresolved-imports`. Both are asserted positively and
+/// separately, and nothing states the thing that makes them consistent: the
+/// conflict scan compares declarations across DISTINCT modules, so a set of one
+/// has nothing to conflict with. That is not a style preference, it is the only
+/// reason the two paths are allowed to differ.
+///
+/// **The negative is the load-bearing half.** If a single-module invocation ever
+/// reported `ConflictingModuleDeclaration`, the module would have been counted as
+/// more than one member of the set -- which is exactly the companion parts being
+/// treated as separate modules, the regression this whole test family exists to
+/// catch. That failure would otherwise be invisible: the run would still exit 1,
+/// still refuse the input, and still look like a healthy rejection. So the
+/// conflict's own rendering is asserted ABSENT here, against the same string the
+/// directory case asserts PRESENT.
+///
+/// **Evidence status, stated because it differs from the previous commit's.** The
+/// positive half is backed by an observation rather than a reading: w4 ran this
+/// pinned module through the single-module path and the `unresolved-imports`
+/// assertion passed, while only the directory assertion failed. The negative half
+/// is not observed and is a genuine prediction -- if it is wrong, this test fails
+/// and names a companion-association defect rather than passing quietly.
+#[test]
+fn a_one_module_set_reports_unresolved_imports_and_never_a_conflict() {
+    let Some(reference_lib) = reference_lib() else {
+        // A TYPED skip, unlike the bare `return` the neighbouring test uses. A
+        // silent early return is a green that asserted nothing, and nothing in
+        // its output distinguishes "the pin is missing" from "the property
+        // holds".
+        println!(
+            "{{\"schema\":\"fln-t6r7-check-olean-paths/1\",\"status\":\"skipped_absent_host_input\",\
+             \"required_path\":{},\"override_env\":\"FLN_REFERENCE_LIB\",\
+             \"claims\":\"NOTHING. The pinned Reference library is not on this host, so neither \
+             check-olean path was exercised.\"}}",
+            json_string(
+                "~/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean (or $FLN_REFERENCE_LIB)"
+            ),
+        );
+        return;
+    };
+    let module = reference_lib.join("Init/Data/List/ToArrayImpl.olean");
+    assert!(
+        module.is_file(),
+        "the pinned module this property is stated over is missing: {}",
+        module.display()
+    );
+
+    // ONE MODULE. Its imports are outside the set, so the set is not closed and
+    // the run is refused for that -- the outcome the pin has always produced.
+    let single = fln_cli::run([
+        std::ffi::OsString::from("check-olean"),
+        std::ffi::OsString::from("--json"),
+        module.clone().into_os_string(),
+    ]);
+    assert_eq!(single.exit_code, 1, "{}", single.stderr);
+    assert!(
+        single.stderr.contains("\"class\":\"unresolved-imports\""),
+        "a single module's imports are outside its own set, so the refusal must still be the \
+         unresolved-imports one: {}",
+        single.stderr
+    );
+    assert!(
+        !single
+            .stderr
+            .contains("decode to different declarations both named"),
+        "a ONE-MODULE set reported a cross-module declaration conflict. The scan compares \
+         declarations between DISTINCT modules, so this can only mean the module was counted as \
+         several members -- its companion parts treated as separate modules, which is the \
+         association defect this test family guards. The run would still exit 1 and still look \
+         like a healthy refusal, which is why this is asserted rather than assumed: {}",
+        single.stderr
+    );
+
+    // THE SAME MODULE, in a set large enough to conflict. The input did not
+    // change; only how many modules are being planned together did.
+    let directory = module
+        .parent()
+        .expect("the pinned module has a library directory")
+        .to_path_buf();
+    let many = fln_cli::run([
+        std::ffi::OsString::from("check-olean"),
+        std::ffi::OsString::from("--json"),
+        directory.into_os_string(),
+    ]);
+    assert_eq!(many.exit_code, 1, "{}", many.stderr);
+    assert_ne!(
+        single.stderr, many.stderr,
+        "the one-module and many-module paths produced identical output. They are refused for \
+         different reasons at different stages, and if they ever agree then either the set-wide \
+         scan stopped running or the single-module path started being treated as a set"
+    );
+}
+
 /// Namespace qualification is a UNIFORM prefix, at every depth.
 ///
 /// **What depends on this.** The names this projection produces are matched
