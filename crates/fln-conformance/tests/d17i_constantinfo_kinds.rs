@@ -4002,3 +4002,105 @@ fn quotient_types_place_their_arguments_where_the_kernel_reduces() {
         "every quotient kind must be present, or a shape above is never exercised"
     );
 }
+
+/// The mutual definition groups at the pin — and every one is this bead's
+/// `.loop` family.
+const MUTUAL_DEFINITION_GROUPS: &[[&str; 2]] = &[
+    [
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop",
+        "Lean.Syntax.getHeadInfo?",
+    ],
+    [
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        "Lean.Syntax.getHeadInfo?._unsafe_rec",
+    ],
+    [
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop",
+        "Lean.Syntax.getTailPos?",
+    ],
+    [
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        "Lean.Syntax.getTailPos?._unsafe_rec",
+    ],
+];
+
+/// `all` on the VALUE-carrying declarations — the surface the block-list cell
+/// did not cover, and the one where mutual groups actually exist.
+///
+/// `15252a2f` checked `all` on inductives, recursors and constructors, and had
+/// to disclose that every block in the corpus is a singleton, so its coherence
+/// law was unexercised. Definitions, theorems and opaques carry an `all` too,
+/// for mutual recursion, and nothing here read it.
+///
+/// That surface is NOT degenerate. `Init/Prelude` carries 1,887 value-carrying
+/// declarations, 8 of them in 4 groups of two — so the same coherence law is
+/// genuinely exercised on multi-member groups here, which is exactly what the
+/// inductive side could not do.
+///
+/// AND ALL FOUR GROUPS ARE THIS BEAD'S OWN FAMILY. Every one pairs a `.loop`
+/// auxiliary with the function it implements — the `.loop` family the filing
+/// text named alongside `match_N` and `_proof_N`. Two of the four contain
+/// `Lean.Syntax.getHeadInfo?._unsafe_rec` and `getTailPos?._unsafe_rec`, which
+/// are two of the six `ArtifactIncomplete` rows pinned above; those rows report
+/// a missing `.match_1`, and the declarations reporting them turn out to be
+/// mutually recursive with the very `.loop` auxiliaries the private part
+/// restores.
+#[test]
+fn value_carrying_declarations_agree_on_their_mutual_groups() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for info in &infos {
+        let all = match info {
+            ConstantInfo::Defn(v) => &v.all,
+            ConstantInfo::Thm(v) => &v.all,
+            ConstantInfo::Opaque(v) => &v.all,
+            _ => continue,
+        };
+        groups.insert(
+            info.name().to_display_string(),
+            all.iter().map(Name::to_display_string).collect(),
+        );
+    }
+    assert!(
+        groups.len() > 1_500,
+        "the value-carrying census must be reached, got {}",
+        groups.len()
+    );
+
+    for (name, all) in &groups {
+        assert!(
+            all.contains(name),
+            "{name}: a declaration must be a member of its own mutual group"
+        );
+        for member in all {
+            assert_eq!(
+                groups.get(member),
+                Some(all),
+                "{name}: group member {member} declares a different group, so the kernel would \
+                 admit the two under different blocks"
+            );
+        }
+    }
+
+    // The multi-member population, which is what makes the law above more than
+    // a restatement of `all == [self]`. The inductive side of this check has no
+    // such population anywhere in the corpus.
+    let mut mutual: Vec<Vec<String>> = groups
+        .values()
+        .filter(|all| all.len() > 1)
+        .cloned()
+        .collect();
+    mutual.sort();
+    mutual.dedup();
+    let expected: Vec<Vec<String>> = MUTUAL_DEFINITION_GROUPS
+        .iter()
+        .map(|group| group.iter().map(|n| (*n).to_string()).collect())
+        .collect();
+    assert_eq!(
+        mutual, expected,
+        "the mutual definition groups at the pin; every one pairs a `.loop` auxiliary with the \
+         function it implements, and a new group is a new member of that family"
+    );
+}
