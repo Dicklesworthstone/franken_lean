@@ -2554,6 +2554,17 @@ fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
 }
 
 #[test]
+fn kr600_803_witness_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = dependent_field_inductive_entries();
+    let metadata = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("Witness")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_direct_self_recursion_is_reconstructed_independently() {
     let entries = nat_entries();
     let verdict = admit_inductive(
