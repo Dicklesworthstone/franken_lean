@@ -4886,6 +4886,103 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// `oleans` and `modules` are PARALLEL: `modules[i]` is the projection of
+/// `oleans[i]`, and the extension match is exact.
+///
+/// **Two enumerations, joined by a length check.** `walk_olean_inventory` walks
+/// the tree with `collect_present_oleans`, and then `module_names_below` walks
+/// it AGAIN internally. The two results are returned side by side in one struct,
+/// whose shape invites a caller to zip them -- and the only thing relating them
+/// is that their lengths match. Equal lengths are not correspondence: two
+/// same-sized vectors in different orders satisfy that check perfectly, and a
+/// consumer zipping them would attribute every module to the wrong file while
+/// every count stayed right.
+///
+/// **It cannot diverge today, and that is exactly why it is worth pinning.** Both
+/// vectors come out in path order, so the correspondence holds -- by coincidence
+/// of construction, not because anything requires it. `module_names_below` sorts
+/// PATHS and maps; the day it sorts or dedupes NAMES instead, which is an
+/// entirely reasonable-looking change to make, the vectors silently stop
+/// corresponding and nothing else in the file would notice. The assertion
+/// recomputes each name from its own path rather than comparing against a
+/// hardcoded list, so it states the RELATION rather than today's answer.
+///
+/// **The extension match is exact, checked from both sides.** `Ignored.OLEAN`
+/// differs only in case and `NoExtension` has none at all; both must be absent.
+/// A filter written with `eq_ignore_ascii_case`, or one testing "contains a dot",
+/// would pull unrelated files into the corpus and inflate every count taken from
+/// it.
+#[test]
+fn the_inventory_vectors_are_parallel_and_the_extension_match_is_exact() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-parallel-v1",
+        &[
+            "Zeta.olean",
+            "Alpha/Beta.olean",
+            "Alpha/Alpha.olean",
+            "Mid.dotted/Leaf.olean",
+            "Ignored.OLEAN",
+            "NoExtension",
+        ],
+    );
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the parallel fixture must be walkable: {reason}"));
+
+    assert_eq!(
+        oleans.len(),
+        4,
+        "only the four lowercase `.olean` FILES are oleans; `Ignored.OLEAN` differs in case and \
+         `NoExtension` has none. Found: {oleans:?}"
+    );
+    for rejected in ["Ignored.OLEAN", "NoExtension"] {
+        assert!(
+            !oleans.iter().any(|path| path.ends_with(rejected)),
+            "`{rejected}` was collected. The extension test must be exact equality on `olean`, \
+             not a case-insensitive or substring match, or unrelated files join the corpus and \
+             inflate every count taken from it: {oleans:?}"
+        );
+    }
+
+    // ANTI-VACUITY. Correspondence over one element, or over elements whose
+    // order cannot differ, states almost nothing. The tree must hold siblings
+    // under one parent and a directory carrying a dot before the relation below
+    // is worth checking.
+    assert!(
+        modules
+            .iter()
+            .filter(|name| name.starts_with("Fixture.Alpha."))
+            .count()
+            >= 2,
+        "the fixture must hold two modules under one parent: {modules:?}"
+    );
+    assert!(
+        modules.iter().any(|name| name.contains("Mid.dotted")),
+        "the fixture must hold a dotted directory: {modules:?}"
+    );
+
+    // THE RELATION, recomputed per element from the path it is supposed to come
+    // from -- not compared against a list somebody typed.
+    assert_eq!(modules.len(), oleans.len());
+    for (index, path) in oleans.iter().enumerate() {
+        let expected = qualify_module_name(
+            Some("Fixture"),
+            module_name_from_path(&library, path)
+                .unwrap_or_else(|reason| panic!("project {}: {reason}", path.display())),
+        );
+        assert_eq!(
+            modules[index],
+            expected,
+            "modules[{index}] is `{}` but oleans[{index}] is {}, which projects to `{expected}`. \
+             The two vectors are returned side by side and callers zip them; equal LENGTHS do not \
+             make them correspond, and a reordering here would attribute every module to the \
+             wrong file while every count stayed correct",
+            modules[index],
+            path.display()
+        );
+    }
+}
+
 /// A tree with NO oleans walks clean, so "the walk succeeded" carries no
 /// information about whether anything was found -- and the receipt floor is the
 /// only thing that notices.
