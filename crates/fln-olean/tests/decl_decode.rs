@@ -11720,6 +11720,241 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The walk is closed - and the fixtures have no `mpz`, but the corpus does.
+///
+/// `7a0a90fa` said the two scalar predicates could have been separated by "an
+/// unresolvable non-boxed word". That was offered as the reason its agreement
+/// was worth measuring, and I did not check that such a word exists. It does
+/// not: across all four modules, EVERY non-boxed slot word resolves to a walked
+/// object. Zero dangling, over 215,995 resolving pointers in Prelude alone. So
+/// the predicates agree on every slot rather than merely per shape, and the
+/// reason I gave for the agreement was not a reason. That aside is corrected.
+///
+/// A ZERO NEEDS A CONTROL, and this one especially: the walk DEFINES
+/// resolvability by adding whatever it can follow, so "everything resolves"
+/// risks being the walk agreeing with itself. It is not quite that - a word is
+/// unresolvable when it is misaligned, below the header, or past end-of-file,
+/// and those are real conditions a malformed pointer would meet. But the
+/// stronger control is what the pointers LAND ON: every one of Prelude's 88,880
+/// walked objects carries a ZERO reference count in its header. A pointer into
+/// arbitrary bytes would have to find a zero rc and one of a dozen-odd tags to
+/// pass unnoticed. That is evidence the closure is real, not a proof of it, and
+/// it is stated at that strength.
+///
+/// THE TAG INVENTORY, and the thing it turned up. Pinning the non-constructor
+/// tags present per module gives `[246, 249]` for all three C3 fixtures and
+/// `[246, 249, 250]` for Prelude. `abi::TAG_MPZ` IS 250, and Prelude holds TWO
+/// of them - each reachable from `constants`, each held by exactly one
+/// single-field object.
+///
+/// THAT RETIRES A BLOCK I HAVE DECLARED REPEATEDLY. Across many comments on
+/// this bead I recorded the `mpz` rules as needing "an object no fixture
+/// builds". The fixture half is still true and is asserted here - all three C3
+/// fixtures have none. What was never true is the conclusion I drew from it:
+/// the corpus these cells ALREADY READ contains two, in the declaration graph,
+/// so a corpus-based `mpz` pin needs no hand-built object. A block is a claim
+/// and it expires; this one expired without my noticing because I kept
+/// restating it instead of re-testing it.
+///
+/// This cell does not write that pin - it is a different decoder path and
+/// belongs in its own increment. It records that the obstacle named for it is
+/// gone.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; the object and
+/// pointer counts are per module, not pooled into a total that could hide a
+/// zero.
+#[test]
+fn the_walk_is_closed_and_the_fixtures_have_no_mpz() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut closure: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut headers: Vec<(String, usize, usize)> = Vec::new();
+    let mut foreign_tags: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut mpz_facts: Vec<(String, usize, usize, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut boxed = 0usize;
+        let mut resolving = 0usize;
+        let mut dangling = 0usize;
+        let mut nonzero_rc = 0usize;
+        let mut tags: BTreeSet<u8> = BTreeSet::new();
+
+        for object in &objects {
+            // Low 32 bits of the header word are the reference count, which a
+            // compacted region stores as zero.
+            if word_at(bytes, object.off) & 0xFFFF_FFFF != 0 {
+                nonzero_rc += 1;
+            }
+            if object.tag > abi::TAG_MAX_CTOR_TAG {
+                tags.insert(object.tag);
+            }
+
+            let words: Vec<u64> = if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(object.other))
+                    .map(|slot| word_at(bytes, object.off + 8 + 8 * slot))
+                    .collect()
+            } else if object.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, object.off + 8))
+                    .map(|i| word_at(bytes, object.off + 24 + 8 * i as usize))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for word in words {
+                if word & 1 == 1 {
+                    boxed += 1;
+                } else if resolve(word).is_some() {
+                    resolving += 1;
+                } else {
+                    dangling += 1;
+                }
+            }
+        }
+        closure.push((module.clone(), boxed, resolving, dangling));
+        headers.push((module.clone(), objects.len(), nonzero_rc));
+        foreign_tags.push((module.clone(), tags.into_iter().collect()));
+
+        // The `mpz` objects, per node.
+        let mpz: Vec<usize> = objects
+            .iter()
+            .filter(|o| o.tag == abi::TAG_MPZ)
+            .map(|o| o.off)
+            .collect();
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let constants = reachable_from(bytes, base, word_at(bytes, root + 24));
+        let in_constants = mpz.iter().filter(|off| constants.contains(off)).count();
+        let single_holder = mpz
+            .iter()
+            .filter(|&&target| {
+                objects
+                    .iter()
+                    .filter(|holder| {
+                        holder.tag <= abi::TAG_MAX_CTOR_TAG
+                            && (0..usize::from(holder.other)).any(|slot| {
+                                resolve(word_at(bytes, holder.off + 8 + 8 * slot)) == Some(target)
+                            })
+                    })
+                    .count()
+                    == 1
+            })
+            .count();
+        mpz_facts.push((module.clone(), mpz.len(), in_constants, single_holder));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize)>| -> Vec<(String, usize, usize, usize)> {
+        all.into_iter()
+            .filter(|(m, _, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c)| (m.to_owned(), a, b, c))
+            .collect()
+    };
+
+    // Nothing dangles.
+    assert_eq!(
+        closure,
+        keep(vec![
+            ("Init.olean", 8, 205, 0),
+            ("Init.BinderNameHint.olean", 87, 431, 0),
+            ("Init.SizeOfLemmas.olean", 314, 1332, 0),
+            ("Init/Prelude.olean", 17058, 215995, 0),
+        ]),
+        "boxed slots, resolving pointers, and NON-BOXED UNRESOLVABLE words - \
+         zero of the last in every module. `7a0a90fa` offered such a word as \
+         the reason its two predicates might disagree; there are none, so the \
+         predicates agree on every slot and that reason was not a reason"
+    );
+
+    // The control on the zero.
+    assert_eq!(
+        headers
+            .iter()
+            .map(|(m, n, bad)| (m.as_str(), *n, *bad))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 158, 0),
+            ("Init.BinderNameHint.olean", 267, 0),
+            ("Init.SizeOfLemmas.olean", 795, 0),
+            ("Init/Prelude.olean", 88880, 0),
+        ]
+        .into_iter()
+        .filter(|(m, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "walked objects, and those whose header carries a NON-ZERO reference \
+         count: none. The walk defines resolvability, so `everything resolves` \
+         needs a control; a pointer into arbitrary bytes would have to land on \
+         a zero rc to pass unnoticed. Evidence that the closure is real, not a \
+         proof of it"
+    );
+
+    // The inventory, and what it turned up.
+    assert_eq!(
+        foreign_tags
+            .iter()
+            .map(|(m, t)| (m.as_str(), t.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", vec![abi::TAG_ARRAY, abi::TAG_STRING]),
+            (
+                "Init.BinderNameHint.olean",
+                vec![abi::TAG_ARRAY, abi::TAG_STRING]
+            ),
+            (
+                "Init.SizeOfLemmas.olean",
+                vec![abi::TAG_ARRAY, abi::TAG_STRING]
+            ),
+            (
+                "Init/Prelude.olean",
+                vec![abi::TAG_ARRAY, abi::TAG_STRING, abi::TAG_MPZ]
+            ),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "the non-constructor tags present in each module. Only Prelude has \
+         `TAG_MPZ`"
+    );
+    assert_eq!(
+        mpz_facts,
+        keep(vec![
+            ("Init.olean", 0, 0, 0),
+            ("Init.BinderNameHint.olean", 0, 0, 0),
+            ("Init.SizeOfLemmas.olean", 0, 0, 0),
+            ("Init/Prelude.olean", 2, 2, 2),
+        ]),
+        "`mpz` objects, those reachable from `constants`, and those held by \
+         exactly one object. THE FIXTURES HAVE NONE - which is the half of my \
+         standing block that was true - but the corpus these cells already read \
+         holds TWO, both in the declaration graph. The conclusion I drew from \
+         the fixture half, that an `mpz` pin needs an object nothing builds, \
+         does not follow and has not for as long as this file has read Prelude"
+    );
+}
+
 /// The coarsening merges ten shapes - measuring `ebfa87eb`'s own aside.
 ///
 /// `ebfa87eb` closed with "split implies more than one field signature and not
@@ -11750,10 +11985,17 @@ fn the_other_references_to_that_name() {
 ///
 /// AND `ebfa87eb`'S 15 IS NOT A PREDICATE ARTEFACT. That cell called a slot
 /// scalar when its low bit was set; the signature audit calls a slot scalar
-/// when it does not resolve to a walked object. Those are different tests - an
-/// unresolvable non-boxed word would separate them - and they select the SAME
-/// 15 shapes here. Measured rather than assumed, because I used one predicate
-/// and quoted a number computed with the other.
+/// when it does not resolve to a walked object. They select the SAME 15 shapes
+/// here. Measured rather than assumed, because I used one predicate and quoted
+/// a number computed with the other.
+///
+/// This paragraph used to add "an unresolvable non-boxed word would separate
+/// them", offered as the reason the agreement was worth measuring.
+/// `the_walk_is_closed_and_the_fixtures_have_no_mpz` measures that case at
+/// ZERO instances in all four modules, so the two predicates do not merely
+/// agree per shape - they agree on every slot, and nothing could have
+/// separated them. The agreement is still worth pinning; the reason I gave for
+/// it was not a reason.
 ///
 /// POPULATION SCOPE: all four modules pooled, which is the signature audit's
 /// population, so the 25 is comparable with its per-shape counts. The
