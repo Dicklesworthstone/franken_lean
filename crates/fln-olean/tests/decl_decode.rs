@@ -10915,9 +10915,21 @@ fn the_eight_terminate_the_descent() {
 /// reddened `f2da5b0e` and `c998a3f8`, here in a description rather than a pin,
 /// which is why nothing caught it.
 ///
-/// `2baabd20` measured this shape carrying two sizes corpus-wide, 220 at 24 and
-/// 2,235 at 32, so the shape alone identifies nothing; the size and the field
-/// types do the work, exactly as that cell concluded.
+/// `2baabd20` measured this shape carrying two sizes, so the shape alone
+/// identifies nothing; the size and the field types do the work, exactly as
+/// that cell concluded.
+///
+/// TWO POPULATIONS APPEAR IN THIS CELL AND THEY ARE NOT THE SAME ONE. The node
+/// and the eight live only in `Init/Prelude.olean`; the size histogram spans
+/// all four modules, because the loop that tallies it runs over every module.
+/// The first version pinned the Prelude-only figures - 220 and 2,235 - against
+/// a walk that counts all four, and w186 caught it. Both numbers are correct
+/// for what they count, which is exactly why the basis is now named in the
+/// assertion rather than left to be inferred.
+///
+/// The corrected pair sums to the corpus-wide total `2baabd20` already holds,
+/// and that sum is asserted. The wrong pair summed to 2,455 and reconciled with
+/// nothing, so the tie is the thing that was missing rather than the care.
 #[test]
 fn the_one_tag_four_node_in_the_closure() {
     let mut modules: Vec<(String, Vec<u8>)> = [
@@ -11135,11 +11147,22 @@ fn the_one_tag_four_node_in_the_closure() {
     );
 
     // The shape identifies nothing on its own.
+    let corpus: Vec<(u16, usize)> = corpus_by_size.into_iter().collect();
     assert_eq!(
-        corpus_by_size.into_iter().collect::<Vec<_>>(),
-        vec![(24, 220), (32, 2235)],
-        "this shape carries two sizes corpus-wide, so `2baabd20` again: the \
-         size and the field types do the work, not the tag and arity"
+        corpus,
+        vec![(24, 231), (32, 2306)],
+        "this shape carries two sizes ACROSS ALL FOUR MODULES, which is the \
+         population this loop walks. The first version pinned 220 and 2,235 - \
+         `Init/Prelude.olean` alone - because that is where I measured it, and \
+         w186 caught the difference. The other three fixtures contribute 11 and \
+         71"
+    );
+    assert_eq!(
+        corpus.iter().map(|(_, count)| count).sum::<usize>(),
+        2537,
+        "and the two sizes sum to the corpus-wide total `2baabd20` pins for \
+         this shape. The wrong values summed to 2,455 and reconciled with \
+         nothing - this assertion is the tie that would have caught them"
     );
 }
 
