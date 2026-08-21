@@ -11430,9 +11430,15 @@ impl WholeMathlibReceipt {
                 .find(']')
                 .ok_or_else(|| format!("unterminated array field `{key}`"))?;
             assert_array_terminator(key, rest, end)?;
-            Ok(rest[..end]
+            let items = rest[..end]
                 .split(',')
                 .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            for item in &items {
+                assert_whole_quoted_element(key, item)?;
+            }
+            Ok(items
+                .iter()
                 .map(|item| item.trim_matches('"').to_string())
                 .collect())
         }
@@ -12703,6 +12709,36 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // A COMMA INSIDE ONE ELEMENT. The extractor splits the array on commas
+    // before it looks at quotes, so one element containing a comma is read as
+    // two. Measured before this commit: a census listing ONE family named
+    // `inconclusive:Steps=1,inconclusive:Depth=2` was read as two families with
+    // the same total a genuine two-element array gives -- byte-for-byte the same
+    // result, so no count, sum or token rule could tell them apart. Last wave a
+    // bracket HID families the row listed; this invents families it does not.
+    let invented = row.replace(
+        "\"no_answer_families\":[]",
+        "\"no_answer_families\":[\"inconclusive:Steps=1,inconclusive:Depth=2\"]",
+    );
+    assert!(
+        invented.contains("[\"inconclusive:Steps=1,inconclusive:Depth=2\"]"),
+        "the forged census must be ONE quoted element carrying a comma, or it is an ordinary \
+         two-element array and invents nothing: {invented}"
+    );
+    let invented_reason = match WholeMathlibReceipt::from_row(&invented) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a row listing 1 no-answer family was read as {}; the reader split an element on its \
+             own comma",
+            read.no_answer_families.len()
+        ),
+    };
+    assert!(
+        invented_reason.contains("no_answer_families")
+            && invented_reason.contains("whole quoted element"),
+        "the refusal must name the array and say the element is not whole: {invented_reason}"
+    );
+
     // AN ARRAY ELEMENT CARRYING THE ARRAY'S TERMINATOR. `strings` stops at the
     // first `]`, and JSON allows that character inside an element. Measured
     // before this commit: a census listing two families, with the bracket inside
@@ -13604,6 +13640,26 @@ fn assert_array_terminator(key: &str, rest: &str, end: usize) -> Result<(), Stri
              it was dropped"
         )),
     }
+}
+
+/// An array element must be a whole quoted string.
+///
+/// `strings` splits the array on commas BEFORE it looks at quotes, so a comma
+/// inside one element is read as two. Measured: a census listing ONE family
+/// named `rejected:A=5,rejected:B=3` is read as two families totalling 8 --
+/// byte-for-byte the same result this reader gives for a genuine two-element
+/// array, so no count, sum or token rule can tell them apart. The census would
+/// name families the row does not contain, which is the mirror of a bracket
+/// hiding families it does.
+fn assert_whole_quoted_element(key: &str, item: &str) -> Result<(), String> {
+    if item.len() < 2 || !item.starts_with('"') || !item.ends_with('"') {
+        return Err(format!(
+            "array field `{key}` holds `{item}`, which is not a whole quoted element. This reader \
+             splits on commas before it looks at quotes, so a comma inside one element is read as \
+             two families the row never listed"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
