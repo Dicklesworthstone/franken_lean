@@ -293,7 +293,7 @@ def renderable_name(name):
     return ".".join(out)
 
 
-def close_over_types(lean, env, work, demand, census, max_rounds=8):
+def close_over_types(lean, env, work, demand, census, max_rounds=24):
     """Fixpoint: a facade that mentions a type it does not declare is not
     standalone. Round after round, every constant appearing in a declared type is
     itself declared, unless `Init` provides it — `import Init` is implicit in every
@@ -712,8 +712,7 @@ def main():
                      else "class-projection" if name in provided else "axiom"),
             "provided_by": provided.get(name),
             "structural_refused_reason": structural_refused.get(name),
-            "emitted": name not in quarantine and (
-                name in provided or name in structural or True),
+            "emitted": name not in quarantine,
             "quarantine_reason": quarantine.get(name),
             "printer": "pp.explicit" if name in explicit_for else "pp.fullNames",
             "signature": (d["typex"] if name in explicit_for else d["type"]),
