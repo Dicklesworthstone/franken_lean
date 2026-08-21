@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
-use fln_env::constants::{ConstantInfo, InductiveVal, RecursorVal};
+use fln_env::constants::{ConstantInfo, ConstructorVal, InductiveVal, RecursorVal};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -1643,5 +1643,149 @@ fn decoded_block_relations_agree_with_each_other() {
         "the set of recursors whose rules differ from their block's constructors must be \
          exactly the named nested auxiliaries; a new member is a decode defect wearing their \
          clothes"
+    );
+}
+
+/// The `Lean.Syntax` recursors, whose NUMERIC observables count the
+/// nested-expanded block rather than the `all` list.
+///
+/// `Lean.Syntax` nests `Array` and `List`, so its recursors carry three motives
+/// — one per type in the expanded block — while `all` names one. `Lean.Syntax.rec`
+/// additionally carries seven minor premises for the expanded block's seven
+/// constructors, even though its own `rules` list holds only `Syntax`'s four;
+/// the auxiliary types' rules live on `rec_1` and `rec_2`. Named, not excluded
+/// by shape, for the same reason as `NESTED_AUXILIARY_RECURSORS`.
+const NESTED_NUMERIC_EXCEPTIONS: &[&str] =
+    &["Lean.Syntax.rec", "Lean.Syntax.rec_1", "Lean.Syntax.rec_2"];
+
+/// Recursors carrying the K flag at the pin, and the control that shows why.
+const K_RECURSORS: &[&str] = &["Eq.rec", "HEq.rec", "True.rec"];
+
+/// The NUMERIC half of the block-observable surface.
+///
+/// `71f8e0fa` checked the NAME relations — which constructor belongs to which
+/// inductive, which rules a recursor carries. Block admission also regenerates
+/// and compares `num_params`, `num_indices`, `num_motives`, `num_minors` and
+/// `k`, and a decode that got any of those wrong is a `BlockMismatch` with every
+/// name still agreeing. Nothing was on that surface.
+///
+/// Measured over `Init/Prelude` at private level: every constructor's
+/// `num_params` equals its inductive's, and every recursor's `num_params`,
+/// `num_indices`, `num_motives` and `num_minors` agree with its block, except
+/// the three `Lean.Syntax` recursors above.
+///
+/// THE K FLAG IS THE SHARPER RESULT. It is set for exactly three recursors —
+/// `Eq`, `HEq`, `True` — and `PUnit` is the control: `PUnit` is also a
+/// single-constructor zero-field inductive and its recursor has `k` CLEAR,
+/// because K conversion additionally requires the type to be a Prop. That
+/// asymmetry is why `Acc` cannot be K-reduced either (a Prop, single
+/// constructor, but its constructor has a field), which is the fact the
+/// theorem-unfold repair at `e7cdcbbc` turns on. Asserting the K population as
+/// an equality keeps that reasoning anchored to the artifact rather than to a
+/// comment.
+#[test]
+fn numeric_block_observables_agree_and_the_k_population_is_exact() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, &ConstructorVal> = BTreeMap::new();
+    let mut recursors: Vec<(String, &RecursorVal)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => drop(constructors.insert(name, v)),
+            ConstantInfo::Rec(v) => recursors.push((name, v)),
+            _ => {}
+        }
+    }
+
+    for (name, ctor) in &constructors {
+        let induct = inductives
+            .get(&ctor.induct.to_display_string())
+            .expect("constructor's inductive decodes");
+        assert_eq!(
+            ctor.num_params, induct.num_params,
+            "{name} disagrees with its inductive on the parameter count"
+        );
+    }
+
+    let mut numeric_exceptions: Vec<String> = Vec::new();
+    for (name, rec) in &recursors {
+        let types: Vec<&InductiveVal> = rec
+            .all
+            .iter()
+            .map(|t| {
+                *inductives
+                    .get(&t.to_display_string())
+                    .expect("recursor's block type decodes")
+            })
+            .collect();
+        let head = types[0];
+        let block_ctors: BTreeSet<String> = types
+            .iter()
+            .flat_map(|t| t.ctors.iter().map(Name::to_display_string))
+            .collect();
+        // These two hold for every recursor including the nested ones.
+        assert_eq!(rec.num_params, head.num_params, "{name}: num_params");
+        assert_eq!(rec.num_indices, head.num_indices, "{name}: num_indices");
+
+        let motives_agree = rec.num_motives as usize == types.len();
+        let minors_agree = rec.num_minors as usize == block_ctors.len();
+        if !(motives_agree && minors_agree) {
+            numeric_exceptions.push(name.clone());
+            assert!(
+                types.iter().any(|t| t.num_nested > 0),
+                "{name}'s motive or minor count does not match its block, and the block is not \
+                 nested — that is a BlockMismatch, not a nesting artifact"
+            );
+        }
+    }
+    assert_eq!(
+        numeric_exceptions, NESTED_NUMERIC_EXCEPTIONS,
+        "the recursors whose numeric observables count an expanded block must be exactly the \
+         named nested ones"
+    );
+
+    let k_set: Vec<String> = recursors
+        .iter()
+        .filter(|(_, rec)| rec.k)
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(
+        k_set, K_RECURSORS,
+        "K conversion is available for exactly these recursors at the pin"
+    );
+    // The control. Single constructor, zero fields, and K is still CLEAR —
+    // because the type is not a Prop. Without this the K assertion above reads
+    // as "single ctor with no fields", which is the wrong rule and the reason
+    // `Acc` is not K-reducible.
+    let punit = inductives.get("PUnit").expect("PUnit decodes");
+    assert_eq!(punit.ctors.len(), 1);
+    assert_eq!(
+        constructors
+            .get(&punit.ctors[0].to_display_string())
+            .expect("PUnit.unit decodes")
+            .num_fields,
+        0
+    );
+    let (_, punit_rec) = recursors
+        .iter()
+        .find(|(name, _)| name == "PUnit.rec")
+        .expect("PUnit.rec decodes");
+    assert!(
+        !punit_rec.k,
+        "PUnit is single-constructor and zero-field yet must NOT carry K, because it is not a \
+         Prop; if this ever flips, the rule being tested above has been misread"
     );
 }
