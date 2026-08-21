@@ -1160,6 +1160,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths keep private loop unsafe-rec residuals beside private loop eq-def residuals",
     );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
+                    == r##""\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep private loop eq-def residuals beside private insertIdx loop-unary residuals",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
