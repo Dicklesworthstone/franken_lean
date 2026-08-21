@@ -2870,6 +2870,10 @@ fn is_list_to_array_aux_match_residual(display: &str) -> bool {
         .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+fn is_private_init_data_list_residual(display: &str) -> bool {
+    display.starts_with("_private.Init.Data.List.")
+}
+
 fn is_core_observables_syntax_match_residual(display: &str) -> bool {
     CORE_OBSERVABLES_SYNTAX_MATCH_RESIDUAL_PREFIXES
         .iter()
@@ -3234,6 +3238,12 @@ fn render_check_olean_success(
     };
     list_to_array_aux_match_residuals
         .observe_matching(&checked.decoded.constants, is_list_to_array_aux_match_residual);
+    let mut private_init_data_list_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_init_data_list_residuals
+        .observe_matching(&checked.decoded.constants, is_private_init_data_list_residual);
     let mut core_observables_syntax_match_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3528,6 +3538,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut list_to_array_aux_match_residuals)
     };
+    let private_init_data_list_observed = private_init_data_list_residuals.observed;
+    let private_init_data_list_omitted = private_init_data_list_residuals.omitted();
+    let private_init_data_list_names = if json {
+        render_named_residuals_json(&mut private_init_data_list_residuals)
+    } else {
+        render_named_residuals_human(&mut private_init_data_list_residuals)
+    };
     let core_observables_syntax_match_observed = core_observables_syntax_match_residuals.observed;
     let core_observables_syntax_match_omitted = core_observables_syntax_match_residuals.omitted();
     let core_observables_syntax_match_names = if json {
@@ -3703,6 +3720,7 @@ fn render_check_olean_success(
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInitDataListResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanSyntaxResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3799,6 +3817,9 @@ fn render_check_olean_success(
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
+            private_init_data_list_observed,
+            private_init_data_list_names,
+            private_init_data_list_omitted,
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
@@ -3939,6 +3960,9 @@ fn render_check_olean_success(
                 "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.toArrayAux.match_N residual names: {}\n",
                 "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
+                "decoded _private Init.Data.List residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Init.Data.List residual names: {}\n",
+                "decoded _private Init.Data.List residual names omitted: {}\n",
                 "core-observables Lean.Syntax match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax match_N residual names: {}\n",
                 "core-observables Lean.Syntax match_N residual names omitted: {}\n",
@@ -4076,6 +4100,9 @@ fn render_check_olean_success(
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
+            private_init_data_list_observed,
+            private_init_data_list_names,
+            private_init_data_list_omitted,
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
@@ -4659,6 +4686,14 @@ fn render_check_olean_set_success(
         list_to_array_aux_match_residuals
             .observe_matching(&module.decoded.constants, is_list_to_array_aux_match_residual);
     }
+    let mut private_init_data_list_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_init_data_list_residuals
+            .observe_matching(&module.decoded.constants, is_private_init_data_list_residual);
+    }
     let mut core_observables_syntax_match_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4995,6 +5030,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut list_to_array_aux_match_residuals)
     };
+    let private_init_data_list_observed = private_init_data_list_residuals.observed;
+    let private_init_data_list_omitted = private_init_data_list_residuals.omitted();
+    let private_init_data_list_names = if json {
+        render_named_residuals_json(&mut private_init_data_list_residuals)
+    } else {
+        render_named_residuals_human(&mut private_init_data_list_residuals)
+    };
     let core_observables_syntax_match_observed = core_observables_syntax_match_residuals.observed;
     let core_observables_syntax_match_omitted = core_observables_syntax_match_residuals.omitted();
     let core_observables_syntax_match_names = if json {
@@ -5176,6 +5218,7 @@ fn render_check_olean_set_success(
                 "\"leanNameBeqMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanNameResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateInitDataListResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLeanSyntaxResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -5274,6 +5317,9 @@ fn render_check_olean_set_success(
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
+            private_init_data_list_observed,
+            private_init_data_list_names,
+            private_init_data_list_omitted,
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
@@ -5416,6 +5462,9 @@ fn render_check_olean_set_success(
                 "decoded _private List.toArrayAux.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private List.toArrayAux.match_N residual names: {}\n",
                 "decoded _private List.toArrayAux.match_N residual names omitted: {}\n",
+                "decoded _private Init.Data.List residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private Init.Data.List residual names: {}\n",
+                "decoded _private Init.Data.List residual names omitted: {}\n",
                 "core-observables Lean.Syntax match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables Lean.Syntax match_N residual names: {}\n",
                 "core-observables Lean.Syntax match_N residual names omitted: {}\n",
@@ -5555,6 +5604,9 @@ fn render_check_olean_set_success(
             list_to_array_aux_match_observed,
             list_to_array_aux_match_names,
             list_to_array_aux_match_omitted,
+            private_init_data_list_observed,
+            private_init_data_list_names,
+            private_init_data_list_omitted,
             core_observables_syntax_match_observed,
             core_observables_syntax_match_names,
             core_observables_syntax_match_omitted,
