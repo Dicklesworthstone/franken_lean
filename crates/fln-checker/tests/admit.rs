@@ -7249,6 +7249,36 @@ fn kr600_803_init_option_none_refuses_a_forged_constructor_inductive_owner() {
 }
 
 #[test]
+fn kr600_803_init_option_none_refuses_a_forged_constructor_parameter_count() {
+    let mut entries = init_option_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Option", "none"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Option"), 0, 2, 0),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Init.Option.none constructor parameter-count verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_option_some_refuses_a_forged_constructor_field_count() {
     let mut entries = init_option_entries();
     let constructor = entries[2].declaration();
