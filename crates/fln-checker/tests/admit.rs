@@ -1751,6 +1751,41 @@ fn init_punit_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_unit_entries() -> Vec<ConstantEntry> {
+    let unit = checker_name("Unit");
+    let unit_ctor = checker_qualified(&["Unit", "unit"]);
+    let rec = checker_qualified(&["Unit", "rec"]);
+    let v_name = checker_name("v");
+    let v = Level::param(primary_name("v"));
+    let unit_expr = || Expr::const_(primary_name("Unit"), Vec::new());
+    let unit_ctor_expr = || Expr::const_(Name::from_components(["Unit", "unit"]), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, unit_expr(), Expr::sort(v.clone()));
+    let minor = || Expr::app(bv(0), unit_ctor_expr());
+    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive(), primary_pi(
+        "unit", BinderInfo::Default, minor(), primary_pi(
+            "t", BinderInfo::Default, unit_expr(), Expr::app(bv(2), bv(0)),
+        ),
+    ));
+    let rhs = Expr::lam(primary_name("motive"), motive(), Expr::lam(
+        primary_name("unit"), minor(), bv(0), BinderInfo::Default,
+    ), BinderInfo::Default);
+    vec![
+        ConstantEntry::new(unit.clone(), ConstantDeclaration::inductive(
+            Vec::new(), decoded(&Expr::sort(Level::one())), ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 0, vec![unit.clone()], vec![unit_ctor.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(unit_ctor.clone(), ConstantDeclaration::constructor(
+            Vec::new(), decoded(&unit_expr()), ConstantSafety::Safe,
+            ConstructorDeclaration::new(unit.clone(), 0, 0, 0),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            vec![v_name], decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![unit], 0, 0, 1, 1, vec![RecursorRule::new(unit_ctor, 0, decoded(&rhs))], false),
+        )),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -1876,6 +1911,40 @@ fn kr600_803_init_punit_fixture_pins_recursor_levels_motives_minors_and_rules() 
     assert_eq!(metadata.rules().len(), 1);
     assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["PUnit", "unit"]));
     assert_eq!(metadata.rules()[0].num_fields(), 0);
+}
+
+#[test]
+fn kr600_803_init_unit_constructor_recursor_and_iota_are_reconstructed() {
+    let entries = init_unit_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.Unit block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_unit_refuses_a_forged_iota_rule() {
+    let mut entries = init_unit_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(checker_qualified(&["Unit", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Unit", "unit"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
 }
 
 #[test]
