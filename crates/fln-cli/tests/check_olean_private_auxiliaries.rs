@@ -513,6 +513,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"privateLoopMatchNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"privateLoopUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"privateLoopEqDefResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
@@ -732,6 +735,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private .loop.match_N residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private .loop._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human.stdout.contains(
+        "decoded _private .loop._unsafe_rec residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private .loop._unsafe_rec residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop.eq_def residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));

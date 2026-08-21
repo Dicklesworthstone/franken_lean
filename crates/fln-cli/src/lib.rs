@@ -2877,6 +2877,20 @@ fn is_private_loop_match_n_residual(display: &str) -> bool {
     false
 }
 
+fn is_private_loop_unsafe_rec_residual(display: &str) -> bool {
+    if !display.starts_with("_private.") {
+        return false;
+    }
+
+    let mut components = display.split('.');
+    while let Some(component) = components.next() {
+        if component == "loop" && components.next() == Some("_unsafe_rec") {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_private_loop_eq_def_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -3108,6 +3122,12 @@ fn render_check_olean_success(
     };
     private_loop_match_n_residuals
         .observe_matching(&checked.decoded.constants, is_private_loop_match_n_residual);
+    let mut private_loop_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_loop_unsafe_rec_residuals
+        .observe_matching(&checked.decoded.constants, is_private_loop_unsafe_rec_residual);
     let mut private_loop_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3294,6 +3314,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_loop_match_n_residuals)
     };
+    let private_loop_unsafe_rec_observed = private_loop_unsafe_rec_residuals.observed;
+    let private_loop_unsafe_rec_omitted = private_loop_unsafe_rec_residuals.omitted();
+    let private_loop_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_loop_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_loop_unsafe_rec_residuals)
+    };
     let private_loop_eq_def_observed = private_loop_eq_def_residuals.observed;
     let private_loop_eq_def_omitted = private_loop_eq_def_residuals.omitted();
     let private_loop_eq_def_names = if json {
@@ -3353,6 +3380,7 @@ fn render_check_olean_success(
                 "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMergeSortTRUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3433,6 +3461,9 @@ fn render_check_olean_success(
             private_loop_match_n_observed,
             private_loop_match_n_names,
             private_loop_match_n_omitted,
+            private_loop_unsafe_rec_observed,
+            private_loop_unsafe_rec_names,
+            private_loop_unsafe_rec_omitted,
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
@@ -3525,6 +3556,9 @@ fn render_check_olean_success(
                 "decoded _private .loop.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_N residual names: {}\n",
                 "decoded _private .loop.match_N residual names omitted: {}\n",
+                "decoded _private .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private .loop._unsafe_rec residual names: {}\n",
+                "decoded _private .loop._unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.eq_def residual names: {}\n",
                 "decoded _private .loop.eq_def residual names omitted: {}\n",
@@ -3614,6 +3648,9 @@ fn render_check_olean_success(
             private_loop_match_n_observed,
             private_loop_match_n_names,
             private_loop_match_n_omitted,
+            private_loop_unsafe_rec_observed,
+            private_loop_unsafe_rec_names,
+            private_loop_unsafe_rec_omitted,
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
@@ -4143,6 +4180,14 @@ fn render_check_olean_set_success(
         private_loop_match_n_residuals
             .observe_matching(&module.decoded.constants, is_private_loop_match_n_residual);
     }
+    let mut private_loop_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_loop_unsafe_rec_residuals
+            .observe_matching(&module.decoded.constants, is_private_loop_unsafe_rec_residual);
+    }
     let mut private_loop_eq_def_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4337,6 +4382,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_loop_match_n_residuals)
     };
+    let private_loop_unsafe_rec_observed = private_loop_unsafe_rec_residuals.observed;
+    let private_loop_unsafe_rec_omitted = private_loop_unsafe_rec_residuals.omitted();
+    let private_loop_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut private_loop_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut private_loop_unsafe_rec_residuals)
+    };
     let private_loop_eq_def_observed = private_loop_eq_def_residuals.observed;
     let private_loop_eq_def_omitted = private_loop_eq_def_residuals.omitted();
     let private_loop_eq_def_names = if json {
@@ -4402,6 +4454,7 @@ fn render_check_olean_set_success(
                 "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMergeSortTRUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4484,6 +4537,9 @@ fn render_check_olean_set_success(
             private_loop_match_n_observed,
             private_loop_match_n_names,
             private_loop_match_n_omitted,
+            private_loop_unsafe_rec_observed,
+            private_loop_unsafe_rec_names,
+            private_loop_unsafe_rec_omitted,
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
@@ -4578,6 +4634,9 @@ fn render_check_olean_set_success(
                 "decoded _private .loop.match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_N residual names: {}\n",
                 "decoded _private .loop.match_N residual names omitted: {}\n",
+                "decoded _private .loop._unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private .loop._unsafe_rec residual names: {}\n",
+                "decoded _private .loop._unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.eq_def residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.eq_def residual names: {}\n",
                 "decoded _private .loop.eq_def residual names omitted: {}\n",
@@ -4669,6 +4728,9 @@ fn render_check_olean_set_success(
             private_loop_match_n_observed,
             private_loop_match_n_names,
             private_loop_match_n_omitted,
+            private_loop_unsafe_rec_observed,
+            private_loop_unsafe_rec_names,
+            private_loop_unsafe_rec_omitted,
             private_loop_eq_def_observed,
             private_loop_eq_def_names,
             private_loop_eq_def_omitted,
