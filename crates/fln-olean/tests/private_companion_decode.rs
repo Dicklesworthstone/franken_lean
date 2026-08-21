@@ -266,6 +266,8 @@ const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX: &str = "_private.Init.Data.Array.Bas
 const PSIGMA_CASES_ON_ARG_PUSHER_BASIC_AUX_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_ALL_DIFF_AUX_EQ_DEF: &str = "_private.Init.Data.Array.Basic.0.Array.allDiffAux.eq_def";
 const ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE: &str = "Init/Data/Array/Basic";
+const ARRAY_FIND_FIN_IDX_EQ_1: &str = "_private.Init.Data.Array.Basic.0.Array.findFinIdx?.eq_1";
+const ARRAY_FIND_FIN_IDX_EQ_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2073,6 +2075,9 @@ fn psigma_cases_on_arg_pusher_basic_aux_is_decoded_from_its_private_storage_modu
 
 #[test]
 fn array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_all_diff_aux_defining_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_ALL_DIFF_AUX_EQ_DEF_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_ALL_DIFF_AUX_EQ_DEF.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_ALL_DIFF_AUX_EQ_DEF).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
+
+#[test]
+fn array_find_fin_idx_equation_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_fin_idx_equation_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_FIN_IDX_EQ_1_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_FIN_IDX_EQ_1.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_FIN_IDX_EQ_1).unwrap(); assert!(matches!(r, ConstantInfo::Thm(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
