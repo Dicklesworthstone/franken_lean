@@ -6627,17 +6627,21 @@ fn kr600_803_init_nat_succ_refuses_a_forged_constructor_field_count() {
             ConstructorDeclaration::new(checker_name("Nat"), 1, 0, 2),
         ),
     );
-    assert!(matches!(
-        admit_inductive(
-            &ConstantEnvironment::empty(),
-            &entries,
-            AdmissionBudget::unlimited(),
-            EnvironmentBudget::unlimited(),
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
         ),
-        fln_checker::admit::InductiveVerdict::Rejected(
-            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
-        )
-    ));
+        "forged Nat.succ constructor field-count verdict: {verdict:?}"
+    );
 }
 
 #[test]
