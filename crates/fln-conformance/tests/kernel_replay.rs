@@ -14272,6 +14272,19 @@ fn states_thread_matrix_claim(line: &str) -> bool {
     thread_matrix_claim_count(line) > 0
 }
 
+/// Whether a document's unqualified claim sites stay inside what the ledger forgives.
+///
+/// Named so the boundary can be planted. The comparison used to sit inline, and the only
+/// thing exercising it was the plan itself: three unqualified sites against an allowance of
+/// three, so `<=` narrowed to `<` was refused by the real document and the mutant died. That
+/// is the coincidence this file has now met twice -- repair ONE of those three sites and the
+/// count drops to two, the boundary stops being touched, and the mutant survives with every
+/// plant still passing. The ledger is one-way precisely so that repair is welcome, which
+/// means the repair that ends the coverage is the outcome this cell is hoping for.
+fn within_allowance(unqualified: usize, allowed: usize) -> bool {
+    unqualified <= allowed
+}
+
 /// A qualifier belongs to the sentence stating the claim, not to the paragraph.
 ///
 /// Named once, at module scope, because the two tiers of this guard read it. The
@@ -17832,6 +17845,31 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
              gets; a row that forgives nothing records nothing"
         );
     }
+    // THE ALLOWANCE IS INCLUSIVE, AND ONLY THE PLAN WAS SAYING SO. Exactly at
+    // the allowance must pass; one over must not; and a document with no
+    // allowance may carry no sites at all. Planted because the live boundary is
+    // an accident of the plan carrying exactly three sites against an allowance
+    // of three -- and the whole point of a one-way ledger is that someone
+    // repairs one of them.
+    assert!(
+        within_allowance(3, 3),
+        "a document sitting exactly at its allowance must pass: the ledger forgives that many \
+         sites, and refusing the last one forgives one fewer than it says"
+    );
+    assert!(
+        !within_allowance(4, 3),
+        "one site more than the ledger forgives must fail, or the allowance is not a bound"
+    );
+    assert!(
+        within_allowance(0, 0),
+        "an unlisted document with no sites must pass; every document in scope takes this path"
+    );
+    assert!(
+        !within_allowance(1, 0),
+        "and one site in an unlisted document must fail, or the default allowance forgives \
+         everything"
+    );
+
     // AND THE PREDICATE MUST BE ABLE TO SAY NO. A lookup that answered true for
     // everything would pass the loop above without reading the ledger at all.
     assert!(
@@ -17899,7 +17937,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
             .find(|(doc, _)| *doc == name)
             .map_or(0, |(_, count)| *count);
         assert!(
-            unqualified <= allowed,
+            within_allowance(unqualified, allowed),
             "{name} states the {{1, 8, 32}} determinism claim {unqualified} time(s) without \
              naming its scope, and this guard does not read that file. Allowance is {allowed}. \
              Either qualify the claim there or add the document to the list below so it is \
