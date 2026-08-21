@@ -9011,20 +9011,24 @@ fn the_other_histograms_checked_for_inversion() {
 /// the opposite direction, since that cell pinned uses and this one pinned
 /// objects. Four of the slots take more than one value, so four can be checked:
 ///
-///   seed / tag 3 / slot 1     use  tag 1 x5, boxed 0 x4
-///                             obj  boxed 0 x4, tag 1 x2      INVERTS
-///   seed / tag 2 / slot 1     use  30, 2, 2   obj 29, 2, 2   does not
+///   seed / tag 3 / slot 1     use  boxed 0 x5, tag 1 x5   (tied)
+///                             obj  boxed 0 x4, tag 1 x2
+///   seed / tag 2 / slot 1     use  30, 2, 2   obj 29, 2, 2
 ///   interior / tag 2 / slot 1 use  5, 3, 1, 1, 1
-///                             obj  5, 2, 1, 1, 1             does not
-///   interior / tag 3 / slot 1 use  5, 4        obj 5, 4       does not
+///                             obj  5, 2, 1, 1, 1
+///   interior / tag 3 / slot 1 use  5, 4        obj 5, 4
 ///
-/// THE ONE THAT INVERTS IS THE MIXED FIELD. `6a4dba87` singled that slot out as
-/// the first field in this file that is not uniformly a pointer or uniformly a
-/// scalar, and pinned it as boxed four times against a pointer twice. Per use
-/// it is the other way round: a pointer five times against boxed four. So the
-/// majority answer to "what does this field usually hold" depends entirely on
-/// which basis is asked, and the cell that introduced the field as remarkable
-/// reported only one of them.
+/// NO SLOT INVERTS ON THIS BASIS, AND THE FIRST VERSION OF THIS CELL SAID ONE
+/// DID. It claimed the mixed field flipped its majority - a pointer five times
+/// against boxed four per use, boxed four against a pointer twice per object.
+/// The 5 and 4 is the per-RECORD count. This walk counts per NODE, and there
+/// the field TIES at five and five, so there is no majority to flip. w173
+/// caught the carrier totals; the slot rows were wrong for the same reason and
+/// the headline rested on them.
+///
+/// What survives is weaker and is what the corpus supports: per object boxed
+/// leads four to two, per node the two are tied, so the bases DISAGREE ABOUT
+/// WHETHER THERE IS A LEADER. That is worth recording and is not an inversion.
 ///
 /// Every row reconciles with `6a4dba87`'s own reference-and-object totals - 9
 /// and 6 for the seed `tag 3`, 34 and 33 for the seed `tag 2`, 11 and 10 for
@@ -9173,11 +9177,15 @@ fn the_slot_three_slots_on_both_bases() {
             ("interior/tag 3 arity 3".to_owned(), (9, 9)),
             ("interior/tag 4 arity 2".to_owned(), (26, 24)),
             ("seed/tag 2 arity 3".to_owned(), (34, 33)),
-            ("seed/tag 3 arity 3".to_owned(), (9, 6)),
-            ("seed/tag 4 arity 2".to_owned(), (11, 11)),
+            ("seed/tag 3 arity 3".to_owned(), (10, 6)),
+            ("seed/tag 4 arity 2".to_owned(), (12, 11)),
         ],
-        "references and objects per shape - `6a4dba87`'s pin, so every row \
-         below is tied to a landed total rather than standing alone"
+        "references PER SPINE NODE, and objects. The object column is \
+         `6a4dba87`'s exactly; the reference column is NOT, because that cell \
+         counts one carrier per four-field RECORD and this walk counts one per \
+         NODE. Two seed nodes share a record, so the seed references are 56 and \
+         not 54, and they reconcile with the ledger's 102 spine nodes rather \
+         than with a record count"
     );
 
     // The mixed field, on both bases.
@@ -9189,8 +9197,11 @@ fn the_slot_three_slots_on_both_bases() {
             use_of("seed/tag 3 arity 3/slot 1/tag 1 arity 2"),
             use_of("seed/tag 3 arity 3/slot 1/boxed 0"),
         ),
-        (5, 4),
-        "per USE the mixed field is a pointer five times against boxed four"
+        (5, 5),
+        "per NODE the mixed field TIES - a pointer five times and boxed five \
+         times. This cell first pinned 5 and 4, which is the per-RECORD count, \
+         and claimed the majority flipped between the bases. On the basis this \
+         walk uses there is no majority to flip"
     );
     assert_eq!(
         (
@@ -9198,9 +9209,10 @@ fn the_slot_three_slots_on_both_bases() {
             object_of("seed/tag 3 arity 3/slot 1/tag 1 arity 2"),
         ),
         (4, 2),
-        "per OBJECT it is boxed four times against a pointer twice - the \
-         majority flips, and `6a4dba87` introduced this slot as the file's \
-         first non-uniform field while reporting only this basis"
+        "per OBJECT it is boxed four times against a pointer twice. Boxed \
+         leads here and ties there, so the two bases DISAGREE about whether \
+         there is a leader - which is weaker than an inversion and is what the \
+         corpus supports"
     );
 
     // The three that do not invert, which is what makes the check meaningful.
