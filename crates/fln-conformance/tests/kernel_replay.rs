@@ -18597,6 +18597,48 @@ fn a_receipt_that_compared_nothing_is_refused() {
     // POSITIVE CONTROL, FIRST. A refusal test that refuses everything proves nothing, and
     // this is the direction that actually breaks: a floor set one too high reddens the real
     // receipt while every mutant below still dies, which reads as a clean campaign.
+    // AND THE FLOORS ARE MINIMUMS, WHICH IS TRUE TODAY ONLY BY COINCIDENCE.
+    // Both floors are planted from BELOW and nowhere from ON, so a `<` widened to
+    // `<=` would refuse a receipt sitting exactly at a floor. Measured, that
+    // mutant dies right now -- and for a reason that will not last: the committed
+    // row records modules 2,433 and decoded 158,608, which are EXACTLY the two
+    // floors, so the green control above is doing the boundary's work by
+    // coincidence. Re-run the lane on a corpus with one more module and the row
+    // lifts off both floors, the coincidence ends, and the mutant survives with
+    // every existing plant still passing.
+    //
+    // `units_compared` is pulled down with `decoded` because the plant has to
+    // stay legal in every OTHER respect as the real row grows: comparing more
+    // units than were decoded is a contradiction this validator already refuses,
+    // and a plant that trips a different rule would pass for the wrong reason.
+    for (label, at_floor) in [
+        (
+            "exactly at the present-module floor",
+            CorpusMatrixReceipt {
+                modules: PINNED_PRESENT_OLEAN_FLOOR,
+                ..real.clone()
+            },
+        ),
+        (
+            "exactly at the decoded-declaration floor",
+            CorpusMatrixReceipt {
+                decoded: RETAINED_MATRIX_V1_DECODED_DECL_FLOOR,
+                units_compared: real
+                    .units_compared
+                    .min(RETAINED_MATRIX_V1_DECODED_DECL_FLOOR),
+                ..real.clone()
+            },
+        ),
+    ] {
+        at_floor.validate(&pin).unwrap_or_else(|reason| {
+            panic!(
+                "a receipt sitting {label} must validate: these are minimums, not thresholds \
+                 to exceed, and refusing the boundary would refuse the corpus the floor was \
+                 measured from. {reason}"
+            )
+        });
+    }
+
     real.validate(&pin).unwrap_or_else(|reason| {
         panic!("the committed receipt must satisfy its own guard, but: {reason}")
     });
