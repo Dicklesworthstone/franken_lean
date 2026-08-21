@@ -108,6 +108,20 @@ fn json_name_set(object: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expected_names: &[&str]) {
+    let residuals = json_object_field(json, field);
+    assert_eq!(json_usize_field(residuals, "observed"), observed, "{json}");
+    assert_eq!(json_usize_field(residuals, "omitted"), 0, "{json}");
+    assert_eq!(
+        json_name_set(residuals),
+        expected_names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<BTreeSet<_>>(),
+        "{json}",
+    );
+}
+
 #[test]
 fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part() {
     let proposition = fln::Name::from_components(["CliPrivateReport", "P"]);
@@ -515,55 +529,68 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
-    assert!(json.stdout.contains(
-        "\"coreObservablesLoopResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    let private_eq_def_match = json_object_field(&json.stdout, "privateEqDefMatchResiduals");
-    assert_eq!(json_usize_field(private_eq_def_match, "observed"), 8, "{}", json.stdout);
-    assert_eq!(json_usize_field(private_eq_def_match, "omitted"), 0, "{}", json.stdout);
-    assert_eq!(
-        json_name_set(private_eq_def_match),
-        BTreeSet::from([
-            "_private.CliPrivateReport.0.eq_def".to_owned(),
-            "_private.CliPrivateReport.0.loop.eq_def".to_owned(),
-            "_private.CliPrivateReport.0.match_1".to_owned(),
-            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Name.beq.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1".to_owned(),
-        ]),
-        "{}",
-        json.stdout,
+    assert_json_named_residuals(
+        &json.stdout,
+        "coreObservablesLoopResiduals",
+        3,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
     );
-    let private_match_n = json_object_field(&json.stdout, "privateMatchNResiduals");
-    assert_eq!(json_usize_field(private_match_n, "observed"), 6, "{}", json.stdout);
-    assert_eq!(json_usize_field(private_match_n, "omitted"), 0, "{}", json.stdout);
-    assert_eq!(
-        json_name_set(private_match_n),
-        BTreeSet::from([
-            "_private.CliPrivateReport.0.match_1".to_owned(),
-            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Name.beq.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1".to_owned(),
-            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1".to_owned(),
-        ]),
-        "{}",
-        json.stdout,
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateEqDefMatchResiduals",
+        8,
+        &[
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.match_1",
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
     );
-    assert!(json.stdout.contains(
-        "\"privateEqDefResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateMatchNResiduals",
+        6,
+        &[
+            "_private.CliPrivateReport.0.match_1",
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateEqDefResiduals",
+        2,
+        &[
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop.eq_def",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"privateEqNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateUnsafeRecSunfoldResiduals\":{\"observed\":10,"
     ));
-    assert!(json.stdout.contains(
-        "\"privateSunfoldFResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.CliPrivateReport.0._f\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateSunfoldFResiduals",
+        2,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._sunfold",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"privateSunfoldResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
@@ -573,45 +600,98 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"privateStandaloneProofNResiduals\":{\"observed\":5,\"names\":[{\"name\":\"_private.CliPrivateReport.0._proof_2\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"leanNameHashProofResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.hash._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateStandaloneProofNResiduals",
+        5,
+        &[
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "leanNameHashProofResiduals",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"leanNameBeqMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"listToArrayAuxMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"coreObservablesSyntaxMatchResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"arrayMapMProofResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "coreObservablesSyntaxMatchResiduals",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "arrayMapMProofResiduals",
+        2,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"arrayMapMGoResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"privateGoResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"stringExtraUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"mergeSortCompanionOnlyUnsafeRecResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateGoResiduals",
+        3,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "stringExtraUnsafeRecResiduals",
+        2,
+        &[
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "mergeSortCompanionOnlyUnsafeRecResiduals",
+        3,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
         "\"privateLoopMatchNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"privateLoopUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateLoopUnsafeRecResiduals",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
     assert!(json.stdout.contains(
         "\"privateLoopEqDefResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
@@ -627,9 +707,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"privateRunUnsafeRecResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"coreObservablesLoopUnsafeRecResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "coreObservablesLoopUnsafeRecResiduals",
+        2,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
     assert!(json.stdout.contains("\"g1Satisfied\":false"));
 
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
