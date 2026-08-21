@@ -11721,6 +11721,297 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The other half - and why `963ab2d0`'s answer does not transfer to it.
+///
+/// `963ab2d0` closed the array-only half by keying on the holding array, and
+/// named the 1,174 whose every CONSTRUCTOR arrival is mixed as the half it did
+/// not touch. This takes them.
+///
+/// THE OBVIOUS MOVE IS VACUOUS HERE, and measuring that is the first thing this
+/// cell does. Array identity was a real constraint because an array holds MANY
+/// elements of a shape - the at-risk pairs averaged eleven and the largest held
+/// 2,204 - so "all of them share one size" could fail and did not. A
+/// constructor slot holds exactly ONE child: across 183,664 `(parent, slot)`
+/// pairs the maximum number of children in any one of them is 1. Keying on the
+/// parent OBJECT therefore decides every child trivially, and would be a rule
+/// that cannot be wrong because it cannot say anything. The array result does
+/// not transfer, and the reason is a property of slots rather than an accident
+/// of this corpus.
+///
+/// THE REAL REFINEMENT IS THE PARENT'S OWN ARRIVAL CONTEXT - the same one-level
+/// climb that worked for arrays, made on the constructor side. It decides 618
+/// of the 1,174 and leaves 556.
+///
+/// AND IT IS WILDLY UNEVEN, which the pooled 618 hides. `(2, 2)` is fully
+/// decided, 74 of 74. `(0, 2)` gets 469 of 572 and `(1, 2)` 75 of 97. `(0, 1)`,
+/// `(0, 3)` and `(1, 1)` get NOTHING - 0 of 277, 0 of 148, 0 of 6. So the climb
+/// is not a weak version of the array rule; it works completely for some shapes
+/// and not at all for others, and a single percentage would have read as
+/// "helps a bit everywhere".
+///
+/// THREE PARTITIONS, EACH SUMMING TO THE 1,174: by shape, by stored size, and
+/// by decided-against-undecided. All three are asserted as sums so a member
+/// moving between classes cannot leave a total looking right.
+///
+/// The minority side - what a majority guess would get wrong across the whole
+/// 1,174 - is 35 objects, 3.0%. Unlike the remainder in `bcf39e12`, it is NOT
+/// concentrated in one stored size: the four sizes present split 14 / 997 / 21
+/// / 142, and the minority is drawn from three of them.
+///
+/// POPULATION SCOPE: all four modules pooled, the six shapes `03c853b1` left
+/// unseparated. The measurement script mirrors this cell field for field.
+#[test]
+fn the_constructor_arrival_half_does_not_transfer() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    type Context = (u8, u8, u16, usize);
+    type Handle = (usize, usize);
+    const SURVIVORS: [(u8, u8); 6] = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2)];
+
+    let mut profile_of: std::collections::BTreeMap<Handle, (u8, u8, u16)> =
+        std::collections::BTreeMap::new();
+    let mut context_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut arrivals: std::collections::BTreeMap<Handle, BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+    let mut parents_of: std::collections::BTreeMap<Handle, BTreeSet<(Handle, usize)>> =
+        std::collections::BTreeMap::new();
+    let mut slot_children: std::collections::BTreeMap<(Handle, usize), usize> =
+        std::collections::BTreeMap::new();
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                profile_of.insert(
+                    (index, object.off),
+                    (object.tag, object.other, object.cs_sz),
+                );
+            }
+        }
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let Some((off, child)) = resolve(word_at(bytes, parent.off + 8 + 8 * slot))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let key = (parent.tag, parent.other, parent.cs_sz, slot);
+                context_sizes
+                    .entry(((child.tag, child.other), key))
+                    .or_default()
+                    .insert(child.cs_sz);
+                arrivals.entry((index, off)).or_default().insert(key);
+                parents_of
+                    .entry((index, off))
+                    .or_default()
+                    .insert(((index, parent.off), slot));
+                *slot_children
+                    .entry(((index, parent.off), slot))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    // The vacuity control, first, because it is what stops the array answer
+    // being copied over.
+    assert_eq!(
+        (
+            slot_children.len(),
+            slot_children.values().copied().max().expect("non-empty")
+        ),
+        (183664, 1),
+        "constructor `(parent, slot)` pairs, and the most children any one of \
+         them holds. A slot holds exactly ONE child, so keying on the parent \
+         OBJECT decides every child trivially - a rule that cannot be wrong \
+         because it cannot say anything. `963ab2d0`'s array rule was not \
+         trivial because an array holds many elements of a shape and could have \
+         disagreed with itself"
+    );
+
+    // The group, and what the one-level climb buys.
+    let mut refined: std::collections::BTreeMap<
+        ((u8, u8), Option<Context>, Context),
+        BTreeSet<u16>,
+    > = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<(u8, u8), Vec<(Handle, u16)>> =
+        std::collections::BTreeMap::new();
+    for shape in SURVIVORS {
+        let group: Vec<(Handle, u16)> = profile_of
+            .iter()
+            .filter(|(key, profile)| {
+                (profile.0, profile.1) == shape
+                    && arrivals.get(*key).is_some_and(|keys| {
+                        !keys.iter().any(|context| {
+                            context_sizes
+                                .get(&(shape, *context))
+                                .is_some_and(|seen| seen.len() == 1)
+                        })
+                    })
+            })
+            .map(|(key, profile)| (*key, profile.2))
+            .collect();
+        for (key, size) in &group {
+            for (parent, slot) in &parents_of[key] {
+                let profile = profile_of[parent];
+                let inner = (profile.0, profile.1, profile.2, *slot);
+                match arrivals.get(parent) {
+                    None => {
+                        refined
+                            .entry((shape, None, inner))
+                            .or_default()
+                            .insert(*size);
+                    }
+                    Some(above) => {
+                        for context in above {
+                            refined
+                                .entry((shape, Some(*context), inner))
+                                .or_default()
+                                .insert(*size);
+                        }
+                    }
+                }
+            }
+        }
+        groups.insert(shape, group);
+    }
+
+    let mut rows: Vec<(u8, u8, usize, Vec<(u16, usize)>, usize, usize, usize, usize)> = Vec::new();
+    let mut pooled_sizes: std::collections::BTreeMap<u16, usize> =
+        std::collections::BTreeMap::new();
+    let mut pooled_contexts: BTreeSet<((u8, u8), Context)> = BTreeSet::new();
+    let mut pooled_parents: BTreeSet<Handle> = BTreeSet::new();
+    let mut minority = 0usize;
+    for shape in SURVIVORS {
+        let group = &groups[&shape];
+        let mut sizes: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+        let mut contexts: BTreeSet<((u8, u8), Context)> = BTreeSet::new();
+        let mut parents: BTreeSet<Handle> = BTreeSet::new();
+        let mut decided = 0usize;
+        for (key, size) in group {
+            *sizes.entry(*size).or_default() += 1;
+            *pooled_sizes.entry(*size).or_default() += 1;
+            contexts.extend(arrivals[key].iter().map(|context| (shape, *context)));
+            parents.extend(parents_of[key].iter().map(|(parent, _)| *parent));
+            let resolved = parents_of[key].iter().any(|(parent, slot)| {
+                let profile = profile_of[parent];
+                let inner = (profile.0, profile.1, profile.2, *slot);
+                match arrivals.get(parent) {
+                    None => refined
+                        .get(&(shape, None, inner))
+                        .is_some_and(|seen| seen.len() == 1),
+                    Some(above) => above.iter().any(|context| {
+                        refined
+                            .get(&(shape, Some(*context), inner))
+                            .is_some_and(|seen| seen.len() == 1)
+                    }),
+                }
+            });
+            if resolved {
+                decided += 1;
+            }
+        }
+        if !group.is_empty() {
+            minority += group.len() - sizes.values().copied().max().expect("non-empty");
+        }
+        pooled_contexts.extend(contexts.iter().copied());
+        pooled_parents.extend(parents.iter().copied());
+        rows.push((
+            shape.0,
+            shape.1,
+            group.len(),
+            sizes.into_iter().collect(),
+            contexts.len(),
+            parents.len(),
+            decided,
+            group.len() - decided,
+        ));
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (0, 1, 277, vec![(16, 11), (24, 266)], 1, 277, 0, 277),
+            (0, 2, 572, vec![(24, 571), (32, 1)], 1, 609, 469, 103),
+            (0, 3, 148, vec![(32, 6), (40, 142)], 1, 258, 0, 148),
+            (1, 1, 6, vec![(16, 3), (24, 3)], 1, 14, 0, 6),
+            (1, 2, 97, vec![(24, 93), (32, 4)], 4, 769, 75, 22),
+            (2, 2, 74, vec![(24, 64), (32, 10)], 1, 75, 74, 0),
+        ],
+        "per shape: the count, its stored-size split, the mixed contexts it \
+         arrives through, the distinct parent objects, and the split into \
+         DECIDED by the parent's own arrival context and not. The climb works \
+         COMPLETELY for `(2, 2)` and NOT AT ALL for `(0, 1)`, `(0, 3)` and \
+         `(1, 1)` - it is not a weak rule that helps a bit everywhere"
+    );
+    assert_eq!(
+        (
+            rows.iter().map(|row| row.2).sum::<usize>(),
+            pooled_contexts.len(),
+            pooled_parents.len(),
+            rows.iter().map(|row| row.6).sum::<usize>(),
+            rows.iter().map(|row| row.7).sum::<usize>()
+        ),
+        (1174, 9, 2002, 618, 556),
+        "the half `963ab2d0` did not touch: 1,174 objects through 9 mixed \
+         contexts from 2,002 parents, of which the one-level climb decides 618 \
+         and leaves 556"
+    );
+
+    // Three partitions, each summing to the whole.
+    assert_eq!(
+        (
+            pooled_sizes.iter().map(|(_, n)| *n).sum::<usize>(),
+            rows.iter().map(|row| row.6 + row.7).sum::<usize>(),
+            rows.iter().map(|row| row.2).sum::<usize>()
+        ),
+        (1174, 1174, 1174),
+        "by stored size, by decided-against-undecided, and by shape - three \
+         partitions of the same 1,174, asserted as sums so a member changing \
+         class cannot leave a total looking right"
+    );
+    assert_eq!(
+        (pooled_sizes.into_iter().collect::<Vec<_>>(), minority),
+        (vec![(16, 14), (24, 997), (32, 21), (40, 142)], 35),
+        "and unlike `bcf39e12`'s remainder, the minority is NOT one stored \
+         size: four sizes are present and the 35 a majority guess would miss \
+         are drawn from three of them"
+    );
+}
+
 /// What the three contexts decide: nothing. What the array decides: all of it.
 ///
 /// `bcf39e12` found the 6,163-object remainder carried by three mixed
