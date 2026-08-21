@@ -14080,7 +14080,28 @@ fn assert_string_terminator(key: &str, rest: &str, end: usize) -> Result<(), Str
 /// claim twice is there because of it.
 fn claim_sites_hidden_by_a_line_break(text: &str) -> usize {
     let per_line: usize = text.lines().map(thread_matrix_claim_count).sum();
-    thread_matrix_claim_count(text).saturating_sub(per_line)
+    let whole = thread_matrix_claim_count(text);
+    // THE SATURATION WAS HIDING THE INVARIANT IT ASSUMED. This read
+    // `whole.saturating_sub(per_line)`, and the whole point of the subtraction
+    // is that `whole >= per_line`: the collapsed text contains every line's
+    // characters, so a claim visible on one line is visible in the whole. The
+    // saturating form turns a violation of that into ZERO -- the same answer as
+    // "nothing is hidden", which is the answer this rule gives on a clean
+    // document.
+    //
+    // It holds today by construction, and construction is exactly what changes.
+    // The prose spelling counts only where "thread" sits within a window of the
+    // numerals: widening the window can only ever ADD matches in the collapsed
+    // text, so the inequality survives. A future bound that SHRINKS with context
+    // -- a per-sentence window, a line-anchored one -- inverts it, and the only
+    // symptom would be hidden sites quietly reading zero.
+    assert!(
+        whole >= per_line,
+        "the collapsed text states {whole} claim(s) while its lines state {per_line}: a claim \
+         visible line by line has stopped being visible in the whole, so the subtraction below \
+         no longer measures what is hidden"
+    );
+    whole - per_line
 }
 
 /// Where a stale claim about the matrix straddles a line break.
