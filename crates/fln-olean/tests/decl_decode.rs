@@ -4713,3 +4713,236 @@ fn the_forty_six_interior_spine_nodes_are_disjoint() {
          rather than a difference of proportion"
     );
 }
+
+/// The four-field records - both populations, kept apart.
+///
+/// The order says "the four-field record at field 0 of the `(0, 2)` objects",
+/// and `d8906952` is why that phrase now needs a qualifier: there are TWO
+/// disjoint sets of them, 54 reached from the seeds and 46 from the interior,
+/// sharing not one object. A cell that merged them would report histograms over
+/// a population nobody named. So both are measured and neither is folded into
+/// the other.
+///
+/// THEY SHARE A LAYOUT. Slot 0 is a numbered name link in all 100. Slot 1 is a
+/// name link in all 100. Slot 2 is an expression in all 100. Slots 0, 1 and 2
+/// therefore go to the production `decode_name` and `decode_expr` - 200 names
+/// and 100 expressions - rather than being matched by shape.
+///
+/// SLOT 3 IS NOT DECODED, and saying why is the point. It carries three shapes,
+/// two of arity three and one of arity two, and none of them is a name link or
+/// an expression constructor. I have no decoder that accepts it and no basis
+/// for naming its type, so it is pinned as shapes and counts and left there.
+/// Running `decode_expr` on it to see what happens would be a guess with a
+/// pass/fail dressed as evidence.
+///
+/// THE TWO POPULATIONS DIFFER IN THEIR DISTRIBUTIONS, and this cell reports the
+/// difference without characterising it. Slot 1 admits both name constructors
+/// among the seeds - 52 and 2 - and only one among the interior's 46. Slots 2
+/// and 3 differ in proportion. Two of those are small numbers, so they are two
+/// histograms side by side and no sentence about a tendency, the discipline
+/// `d8906952` settled after `3575962c`.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_four_field_records_share_a_layout() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts = [0usize; 2];
+    let mut names_decoded = 0usize;
+    let mut exprs_decoded = 0usize;
+    let mut first = [(); 2].map(|()| std::collections::BTreeMap::<String, usize>::new());
+    let mut second = [(); 2].map(|()| std::collections::BTreeMap::<String, usize>::new());
+    let mut third = [(); 2].map(|()| std::collections::BTreeMap::<String, usize>::new());
+    let mut fourth = [(); 2].map(|()| std::collections::BTreeMap::<String, usize>::new());
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        // Two disjoint record sets, deduplicated within each.
+        let mut records: [BTreeSet<usize>; 2] = [BTreeSet::new(), BTreeSet::new()];
+        for node in &all {
+            let which = usize::from(!seeds.contains(node));
+            if let Some(record) = resolve(word_at(bytes, node + 8)) {
+                records[which].insert(record);
+            }
+        }
+
+        for (which, set) in records.iter().enumerate() {
+            for &record in set {
+                counts[which] += 1;
+                for slot in 0..2usize {
+                    let field = word_at(bytes, record + 8 + 8 * slot);
+                    DeclDecoder::new(&view, WalkBudget::default())
+                        .decode_name(field)
+                        .unwrap_or_else(|e| panic!("{module}: slot {slot} must be a Name: {e}"));
+                    names_decoded += 1;
+                    let off = resolve(field).expect("a name link");
+                    let target = if slot == 0 { &mut first } else { &mut second };
+                    *target[which].entry(shape_of(off)).or_default() += 1;
+                }
+                let expression = word_at(bytes, record + 8 + 8 * 2);
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_expr(expression)
+                    .unwrap_or_else(|e| panic!("{module}: slot 2 must be an Expr: {e}"));
+                exprs_decoded += 1;
+                *third[which]
+                    .entry(shape_of(resolve(expression).expect("an expression")))
+                    .or_default() += 1;
+                // Slot 3: shapes only. No decoder accepts it and none is tried.
+                *fourth[which]
+                    .entry(shape_of(
+                        resolve(word_at(bytes, record + 8 + 8 * 3)).expect("slot 3 is a pointer"),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(counts, [0, 0], "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(
+        counts,
+        [54, 46],
+        "the two disjoint record populations `d8906952` established"
+    );
+    assert_eq!(
+        names_decoded, 200,
+        "two names per record, through `decode_name`"
+    );
+    assert_eq!(
+        exprs_decoded, 100,
+        "one expression per record, through `decode_expr`"
+    );
+
+    // Shared layout.
+    assert_eq!(
+        first[0]
+            .iter()
+            .chain(first[1].iter())
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tag 2 arity 2".to_owned(), 54),
+            ("tag 2 arity 2".to_owned(), 46)
+        ],
+        "slot 0 is the numbered name link in all 100"
+    );
+
+    // Distributions, reported side by side and not characterised.
+    assert_eq!(
+        second[0].clone().into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 2".to_owned(), 2),
+            ("tag 2 arity 2".to_owned(), 52)
+        ],
+        "the seeds' slot 1 admits both name constructors"
+    );
+    assert_eq!(
+        second[1].clone().into_iter().collect::<Vec<_>>(),
+        vec![("tag 2 arity 2".to_owned(), 46)],
+        "the interior's admits one"
+    );
+    assert_eq!(
+        third[0].clone().into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 4),
+            ("tag 4 arity 2".to_owned(), 9),
+            ("tag 5 arity 2".to_owned(), 12),
+            ("tag 7 arity 3".to_owned(), 29),
+        ],
+        "the seeds' expressions"
+    );
+    assert_eq!(
+        third[1].clone().into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 1 arity 1".to_owned(), 4),
+            ("tag 4 arity 2".to_owned(), 10),
+            ("tag 5 arity 2".to_owned(), 27),
+            ("tag 7 arity 3".to_owned(), 5),
+        ],
+        "and the interior's, over the same four shapes"
+    );
+    assert_eq!(
+        fourth[0].clone().into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 2 arity 3".to_owned(), 34),
+            ("tag 3 arity 3".to_owned(), 9),
+            ("tag 4 arity 2".to_owned(), 11),
+        ],
+        "slot 3 is none of the types this file can decode: three shapes, pinned \
+         as shapes and left there rather than guessed at"
+    );
+    assert_eq!(
+        fourth[1].clone().into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 2 arity 3".to_owned(), 11),
+            ("tag 3 arity 3".to_owned(), 9),
+            ("tag 4 arity 2".to_owned(), 26),
+        ],
+        "the same three shapes on the interior side"
+    );
+}
