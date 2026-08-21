@@ -11721,6 +11721,227 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The extraConstNames root - disjoint from `constNames` three ways.
+///
+/// `58238f1b` opened `imports`, the last root this file had never looked
+/// inside. `extraConstNames` was the second-to-last, counted by `5e57207b` at
+/// 1,117 objects in Prelude and never read.
+///
+/// IT HOLDS 424 NAMES IN PRELUDE and shares NONE of them with `constNames`.
+/// That is the interesting part, and it is checked three ways because the first
+/// two could each hide the third:
+///
+///   by OBJECT identity          0 of 424 shared
+///   by `(prefix, string)` pair  0 of 424 shared
+///   by decoded SPELLING         0 of 424 shared
+///
+/// Object-disjointness alone would prove nothing here - this bead has spent
+/// twenty waves on cases where two objects mean one thing - so the structural
+/// pair and the production decoder's rendering are both compared as well. All
+/// three agree, which is what makes "disjoint" a statement about the module
+/// rather than about the heap.
+///
+/// TWO OF THE FOUR MODULES HAVE NONE, and their `extraConstNames` root is again
+/// `03f23abe`'s single interned empty array - the same object that serves as
+/// their `constNames` and `constants`. So "this root is empty" and "this root
+/// is the shared empty array" are the same fact here, and the cell asserts the
+/// second.
+///
+/// THE 1,117 RECONCILES: one array, 816 name links and 300 strings for 424
+/// entries. More links than entries because prefixes are chained, and far fewer
+/// strings than links because the components are interned - 300 distinct
+/// strings serving 816 links, which is `8cc7474c`'s interning seen from inside
+/// one root.
+///
+/// POPULATION SCOPE: all four modules, the `extraConstNames` root and
+/// everything under it, each asserted by name.
+#[test]
+fn the_extra_const_names_root() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut reach_rows: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+    let mut empty_is_shared: Vec<(String, bool)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let names_array = resolve(word_at(bytes, root + 16)).expect("constNames");
+        let extra_array = resolve(word_at(bytes, root + 32)).expect("extraConstNames");
+        let constants_array = resolve(word_at(bytes, root + 24)).expect("constants");
+
+        let declared: Vec<usize> = (0..word_at(bytes, names_array + 8))
+            .filter_map(|i| resolve(word_at(bytes, names_array + 24 + 8 * i as usize)))
+            .collect();
+        let extra: Vec<usize> = (0..word_at(bytes, extra_array + 8))
+            .filter_map(|i| resolve(word_at(bytes, extra_array + 24 + 8 * i as usize)))
+            .collect();
+
+        // Three independent notions of "the same name".
+        let declared_objects: BTreeSet<usize> = declared.iter().copied().collect();
+        let pair_of = |off: usize| {
+            (
+                resolve(word_at(bytes, off + 8)),
+                resolve(word_at(bytes, off + 16)),
+            )
+        };
+        let declared_pairs: BTreeSet<(Option<usize>, Option<usize>)> =
+            declared.iter().map(|off| pair_of(*off)).collect();
+        let view = OleanView::parse(bytes).expect("header");
+        let spell = |off: usize| -> String {
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(base + u64::try_from(off).expect("in range"))
+                .expect("a name in a name array decodes")
+                .to_display_string()
+        };
+        let declared_spellings: BTreeSet<String> = declared.iter().map(|off| spell(*off)).collect();
+
+        let by_object = extra
+            .iter()
+            .filter(|off| declared_objects.contains(off))
+            .count();
+        let by_pair = extra
+            .iter()
+            .filter(|off| declared_pairs.contains(&pair_of(**off)))
+            .count();
+        let by_spelling = extra
+            .iter()
+            .filter(|off| declared_spellings.contains(&spell(**off)))
+            .count();
+
+        let distinct: BTreeSet<usize> = extra.iter().copied().collect();
+        rows.push((
+            module.clone(),
+            extra.len(),
+            distinct.len(),
+            by_object,
+            by_pair,
+            by_spelling,
+        ));
+
+        // Everything under the root.
+        let under = reachable_from(bytes, base, word_at(bytes, root + 32));
+        let mut arrays = 0usize;
+        let mut links = 0usize;
+        let mut strings = 0usize;
+        for off in &under {
+            match at.get(off).expect("walked").tag {
+                abi::TAG_ARRAY => arrays += 1,
+                abi::TAG_STRING => strings += 1,
+                _ => links += 1,
+            }
+        }
+        reach_rows.push((module.clone(), under.len(), arrays, links, strings));
+
+        // When it is empty, is it the shared empty array?
+        empty_is_shared.push((
+            module.clone(),
+            extra.is_empty() && extra_array == names_array && extra_array == constants_array,
+        ));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e)| (m.to_owned(), a, b, c, d, e))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 0, 0, 0, 0, 0),
+            ("Init.BinderNameHint.olean", 1, 1, 0, 0, 0),
+            ("Init.SizeOfLemmas.olean", 0, 0, 0, 0, 0),
+            ("Init/Prelude.olean", 424, 424, 0, 0, 0),
+        ]),
+        "per module: `extraConstNames` entries, distinct objects among them, \
+         then how many are shared with `constNames` by OBJECT identity, by \
+         `(prefix, string)` pair, and by decoded SPELLING. All zero. Object \
+         disjointness alone would prove nothing - this bead has spent twenty \
+         waves on cases where two objects mean one thing - so the structural \
+         pair and the production decoder's rendering are compared as well, and \
+         all three agree"
+    );
+
+    assert_eq!(
+        reach_rows
+            .iter()
+            .map(|(m, a, b, c, d)| (m.as_str(), *a, *b, *c, *d))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 1, 1, 0, 0),
+            ("Init.BinderNameHint.olean", 5, 1, 2, 2),
+            ("Init.SizeOfLemmas.olean", 1, 1, 0, 0),
+            ("Init/Prelude.olean", 1117, 1, 816, 300),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "everything under the root: total, arrays, name links, strings. \
+         Prelude's 1,117 is one array, 816 links and 300 strings for 424 \
+         entries - more links than entries because prefixes chain, and far \
+         fewer strings than links because components are interned, which is \
+         `8cc7474c`'s result seen from inside one root"
+    );
+    for ((module, total, arrays, links, strings), _) in reach_rows.iter().zip(&rows) {
+        assert_eq!(
+            arrays + links + strings,
+            *total,
+            "{module}: the three kinds must account for every object under the \
+             root"
+        );
+    }
+
+    assert_eq!(
+        empty_is_shared
+            .iter()
+            .map(|(m, shared)| (m.as_str(), *shared))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", true),
+            ("Init.BinderNameHint.olean", false),
+            ("Init.SizeOfLemmas.olean", false),
+            ("Init/Prelude.olean", false),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "whether an empty `extraConstNames` is the very object that also serves \
+         as `constNames` and `constants`. `Init.olean` declares nothing so all \
+         three are `03f23abe`'s single interned empty array; \
+         `Init.SizeOfLemmas.olean` is also empty here but declares 16 \
+         constants, so its `constNames` is a different array and the answer is \
+         FALSE. Empty and shared are not the same fact, and only one module has \
+         both"
+    );
+}
+
 /// The imports root - two modules import the same module twice.
 ///
 /// `imports` is the one `ModuleData` slot this file has never opened.
