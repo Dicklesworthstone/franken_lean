@@ -8036,13 +8036,31 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             },
             "is a `rejected:` token",
         ),
+        // BOTH DELIMITERS, not just the one that came to mind. The rule loops
+        // over `[',', '=']` and only the comma had a cell. The two fail
+        // differently and the comma cell cannot stand in for the equals one: a
+        // comma splits an entry into two, while an `=` makes the split AMBIGUOUS
+        // -- `context:a=b=40000` can be read as family `context:a` with the
+        // nonsense count `b=40000`, or as family `context:a=b` with count 40000,
+        // and `rsplit_once` silently picks the second. Two readers of the same
+        // retained row would disagree about which family was counted. The
+        // expectations name the offending character so neither cell can pass in
+        // the other's place.
         (
-            "a family name carrying a delimiter",
+            "a family name carrying the entry separator",
             WholeMathlibReceipt {
                 no_answer_families: vec!["context:a,b=40000".to_string()],
                 ..sample_whole_mathlib_receipt()
             },
-            "as a delimiter",
+            "`,` this format",
+        ),
+        (
+            "a family name carrying the count separator",
+            WholeMathlibReceipt {
+                no_answer_families: vec!["context:a=b=40000".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "`=` this format",
         ),
         (
             "a family counted twice",
