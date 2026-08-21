@@ -1147,6 +1147,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
+                lines[0].trim() == r##""format version: {}\n","##
+                    && lines[1].trim() == r##""lean version: {}\n","##
+            })
+            .count(),
+        1,
+        "the human olean audit renderer keeps format version beside Lean version",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
                 lines[0].trim()
                     == r##""\"decodedPrivateAuxiliaries\":{},","##
                     && lines[1].trim()
