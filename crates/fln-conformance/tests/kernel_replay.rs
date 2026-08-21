@@ -8617,6 +8617,72 @@ fn truncate_after(row: &str, needle: &str) -> String {
     row[..start + needle.len()].to_string()
 }
 
+/// The floors carry the receipt's whole anti-vacuity argument, and their VALUES
+/// rested on nothing.
+///
+/// **Every use reads the constant.** The driver asserts against them before it
+/// compares anything, the receipt guard refuses rows beneath them, the green
+/// control sits exactly on them, and the below-floor probes are derived from
+/// them. Lower one and all of that moves together: the lane accepts a smaller
+/// corpus, the receipt accepts the row describing it, and every test in this
+/// file still passes. The values appear exactly three times in the file -- their
+/// own definitions.
+///
+/// **This is not the green-control boundary test.** That one pins where the
+/// control sits RELATIVE to the floors and that one unit below is refused, which
+/// holds for any values whatsoever. This pins the values themselves, and the
+/// relationships that make them coherent.
+///
+/// **What anchors them.** The bead records a measured preflight over the
+/// provisioned corpus (comments 2135/2136, 2026-08-11): 8,264 Mathlib oleans,
+/// and a resurrection sweep decoding 567,030 declarations from those seeds. The
+/// seed floor sits just below the first, so a truncated checkout fails while the
+/// real one passes. The closure floor is higher because the closure adds every
+/// `Init`, `Std`, `Lean` and package module Mathlib imports, and the decoded
+/// floor higher still because those modules carry declarations, not just names.
+/// Those are OBSERVATIONS FROM ANOTHER PANE's run, cited rather than re-measured
+/// -- this host has no corpus -- which is exactly why the numbers deserve to be
+/// written down where a change has to argue with them.
+#[test]
+fn the_whole_mathlib_floors_are_anchored_and_coherent() {
+    assert_eq!(
+        (
+            WHOLE_MATHLIB_SEED_FLOOR,
+            WHOLE_MATHLIB_MODULE_FLOOR,
+            WHOLE_MATHLIB_DECODED_FLOOR
+        ),
+        (8_000, 10_000, 700_000),
+        "these floors are what stop a small tree qualifying as a whole-Mathlib observation. \
+         Changing one is a claim about the corpus, not a tuning knob: say which measurement \
+         supports the new value"
+    );
+
+    // THE RELATIONSHIPS OUTLIVE THE VALUES. Whatever the numbers become, a
+    // closure strictly contains its seed set plus everything those seeds import,
+    // and modules carry many declarations each. A floor set where declarations
+    // were fewer than modules would be describing something that is not a
+    // corpus.
+    assert!(
+        WHOLE_MATHLIB_SEED_FLOOR < WHOLE_MATHLIB_MODULE_FLOOR,
+        "the closure contains the seeds and their imports, so its floor cannot be the lower one"
+    );
+    assert!(
+        WHOLE_MATHLIB_DECODED_FLOOR > WHOLE_MATHLIB_MODULE_FLOOR,
+        "each module carries many declarations; a decoded floor at or below the module floor \
+         would admit a corpus averaging one declaration per module"
+    );
+
+    // AND NO FIXTURE IN THIS FILE CAN EVER SATISFY THEM. That is the property
+    // the floors exist for, stated directly rather than left implicit in three
+    // magnitudes: the largest fixture here holds a handful of files, so the
+    // margin is what keeps a receipt built from one refusable.
+    assert!(
+        WHOLE_MATHLIB_SEED_FLOOR > 100,
+        "the floors must sit far above any fixture, or a receipt built from a handful of empty \
+         files could pass the guard that exists to refuse exactly that"
+    );
+}
+
 /// The schema NAME is the retained contract, and its value was pinned nowhere.
 ///
 /// **Producer and reader both read the constant, so the value is unconstrained.**
