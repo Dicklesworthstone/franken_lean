@@ -5504,6 +5504,36 @@ fn kr600_803_witness_mk_two_declared_fields_are_admitted() {
 }
 
 #[test]
+fn kr600_803_witness_mk_refuses_a_forged_constructor_field_count() {
+    let mut entries = dependent_field_inductive_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Witness", "mk"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Witness"), 0, 0, 3),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Witness.mk constructor field-count verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_witness_refuses_a_forged_num_indices_count() {
     let mut entries = dependent_field_inductive_entries();
     let declaration = entries[2].declaration();
