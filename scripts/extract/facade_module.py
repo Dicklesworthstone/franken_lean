@@ -36,6 +36,7 @@ row per declaration with its role, partition, census facts and printed signature
 """
 
 import argparse
+import ast
 import hashlib
 import io
 import json
@@ -1911,6 +1912,24 @@ def unencodable_text_error(text, what="the facade"):
 
 
 @checked_by_self_test
+def publication_floor(artifact_bytes):
+    """Room for an artifact published through a temporary twin.
+
+    Both artifacts here are replaced atomically, and atomically means the
+    replacement exists ALONGSIDE the original until the rename: the candidate is
+    written while args.out still holds the previous facade, and the manifest's
+    .tmp while the manifest still holds the previous rows. Peak usage is therefore
+    twice the artifact, not once, and 10799472 asked for once -- so free space
+    between the two passes the pre-flight and then runs out during the write,
+    which is the same error add1a831 repaired one level up.
+
+    Stated as a rule rather than a literal 2 so the reason travels with the
+    number. Nothing to size against means nothing to claim.
+    """
+    return 2 * artifact_bytes if artifact_bytes else 0
+
+
+@checked_by_self_test
 def insufficient_space_error(targets):
     """Refuse before the work, not ten minutes into it.
 
@@ -2784,6 +2803,26 @@ def self_test():
     _surrogate = "axiom X : Type\n" + chr(0xD800)
     case("bytes/text-encodable", unencodable_text_error(text), False)
     case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
+    case("space/floor-doubles-for-the-twin",
+         None if publication_floor(1000) == 2000
+         else f"got {publication_floor(1000)}", False)
+    case("space/floor-is-zero-with-nothing-to-size",
+         None if publication_floor(0) == 0 else "claimed room for nothing", False)
+    # ONE CALL PER DECLARED OUTPUT, counted rather than merely referenced.
+    # co_names is a SET: dropping one of the two call sites leaves the name still
+    # present, and a case that only asks "is it referenced" passes a main that
+    # sizes the facade correctly and the manifest not at all. The expected count
+    # is derived from OUTPUT_ARGS, so adding a third artifact raises the bar by
+    # itself.
+    _floor_calls = sum(
+        1 for _n in ast.walk(next(
+            _f for _f in ast.parse(builtins.open(__file__, encoding="utf-8").read()).body
+            if isinstance(_f, ast.FunctionDef) and _f.name == "main"))
+        if isinstance(_n, ast.Call) and getattr(_n.func, "id", "") == "publication_floor")
+    case("space/main-sizes-every-declared-output",
+         None if _floor_calls >= len(OUTPUT_ARGS)
+         else f"main calls publication_floor {_floor_calls} times for "
+              f"{len(OUTPUT_ARGS)} declared outputs", False)
     case("space/room-available", insufficient_space_error(((work, 1, "a byte"),)),
          False)
     case("space/floor-above-free",
@@ -3255,8 +3294,11 @@ def main():
             return 0
 
     _space = insufficient_space_error((
-        (os.path.dirname(args.out) or ".", _prior(args.out) + _prior(args.manifest),
-         "the published artifacts"),
+        (os.path.dirname(args.out) or ".", publication_floor(_prior(args.out)),
+         "the facade and the candidate it is replaced through"),
+        (os.path.dirname(args.manifest) or ".",
+         publication_floor(_prior(args.manifest)),
+         "the manifest and the temporary it is replaced through"),
         (work, _prior(args.out), "the probe scratch"),
     ))
     if _space:
