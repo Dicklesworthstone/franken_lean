@@ -4615,3 +4615,92 @@ fn the_constant_array_is_not_in_dependency_order() {
          with UnknownConstant"
     );
 }
+
+/// The private part re-serialises the module; it is not the exported array with
+/// additions.
+///
+/// The containment cell established that no name is lost between the levels, and
+/// several cells compare the two parts. All of them compare by NAME. Nothing
+/// said why that is the only option — and "the private part is the exported one
+/// plus the private extras" is the natural mental model, under which a positional
+/// shortcut would work: take the tail, or diff by index.
+///
+/// It is wrong. Measured over `Init/Prelude` and `Init/Meta/Defs` at both
+/// levels:
+///
+///   the exported array is NOT a prefix of the private array
+///   the exported names do NOT appear in the private array in their exported
+///     order — the positions are not even monotonically increasing
+///   the private-only declarations are INTERLEAVED throughout, starting near the
+///     top: Prelude's first extra sits at private index 13, Meta.Defs' at index 1
+///
+/// In `Init/Prelude` the 2,204 exported names land across private indices 1157
+/// to 2312, so the two arrays share no positional structure at all. The private
+/// part is a fresh serialisation of the whole module.
+///
+/// Like the dependency-order cell, this asserts a NEGATIVE on purpose. Every
+/// exported/private comparison in this file is name-keyed; if the arrays ever
+/// did line up positionally, someone could reasonably simplify those comparisons
+/// to index arithmetic, and this fails first so that change is made knowingly
+/// rather than because it happened to work on one module.
+#[test]
+fn the_private_part_reserialises_rather_than_extends_the_exported_array() {
+    let lib = lib_or_skip!();
+
+    for module in ["Init.Prelude", "Init.Meta.Defs"] {
+        let (exported_infos, _) = decode_at(&lib, module, Level::Exported);
+        let (private_infos, _) = decode_at(&lib, module, Level::Private);
+        let exported: Vec<String> = exported_infos
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+        let private: Vec<String> = private_infos
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+        assert!(
+            exported.len() > 100 && private.len() > exported.len(),
+            "{module}: both arrays must be substantial ({} exported, {} private)",
+            exported.len(),
+            private.len()
+        );
+
+        assert_ne!(
+            private[..exported.len()],
+            exported[..],
+            "{module}: the private array is not the exported one with extras appended"
+        );
+
+        let position: BTreeMap<&String, usize> = private
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect();
+        let positions: Vec<usize> = exported
+            .iter()
+            .map(|name| {
+                *position
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{module}: {name} is absent from the private array"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).any(|pair| pair[0] > pair[1]),
+            "{module}: the exported order is not preserved in the private array, so no \
+             positional comparison between the two levels is valid"
+        );
+
+        // The extras are interleaved, not tacked on: at least one private-only
+        // declaration precedes at least one exported one.
+        let exported_set: BTreeSet<&String> = exported.iter().collect();
+        let first_extra = private
+            .iter()
+            .position(|name| !exported_set.contains(name))
+            .expect("the private part adds declarations");
+        assert!(
+            positions.iter().any(|index| *index > first_extra),
+            "{module}: private-only declarations are interleaved with exported ones, so the \
+             private set cannot be recovered as a suffix"
+        );
+    }
+}
