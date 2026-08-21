@@ -222,6 +222,16 @@ open Lean in
           | DefinitionSafety.partial => "partial"
         | _ => if info.isUnsafe then "unsafe" else "safe"
       IO.println s!"SAFE\t{n}\t{sf}"
+      -- NOT the reducing telescope: it unfolds the monad abbreviations, so
+      -- CoreM / AttrM / CommandElabM all come back as EST.Out and 81 rows look
+      -- like census drift when the census simply recorded the un-reduced head —
+      -- which is the head the effect classification is about.
+      let rh <- Meta.MetaM.run' (Meta.forallTelescope info.type
+        (fun _ body => do
+          match body.getAppFn.constName? with
+          | some c => pure (toString c)
+          | none => pure "-"))
+      IO.println s!"RESHEAD\t{n}\t{rh}"
       match env.getModuleIdxFor? n with
       | some idx => IO.println s!"MOD\t{n}\t{env.header.moduleNames[idx.toNat]!}"
       | none => pure ()
@@ -373,6 +383,7 @@ def probe(lean, env, work, names):
     reducibility = {}
     safety_status = {}
     module_of = {}
+    res_head = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -396,6 +407,10 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("RESHEAD\t"):
+            _, name, head = line.split("\t", 2)
+            res_head[name] = head.strip()
             current = None
         elif line.startswith("MOD\t"):
             _, name, mod = line.split("\t", 2)
@@ -435,7 +450,7 @@ def probe(lean, env, work, names):
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
-            module_of, struct_fields)
+            module_of, struct_fields, res_head)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -773,6 +788,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_safety = {}
     pin_module = {}
     pin_fields = {}
+    pin_res_head = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -791,7 +807,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds) = probe(lean, env, work, frontier)
+         rd, sfy, mod, flds, rh) = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
@@ -799,6 +815,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_safety.update(sfy)
         pin_module.update(mod)
         pin_fields.update(flds)
+        pin_res_head.update(rh)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -830,7 +847,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         frontier = nxt
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
-            pin_reducibility, pin_safety, pin_module, pin_fields)
+            pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head)
 
 
 def order(names, deps):
@@ -1151,7 +1168,8 @@ def main():
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
-     pin_fields) = close_over_types(lean, env, work, facade_demand, census)
+     pin_fields, pin_res_head) = close_over_types(
+        lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -1194,6 +1212,15 @@ def main():
     # direction is covered by the Init-substrate probe, which #checks all 224 of
     # them with no imports; between the two, both directions are measured.
     module_disagreements = []
+    # THE LAST INHERITED COLUMN. `effect` is the one row fact this manifest still
+    # repeats from the census, and it is not a raw pin fact — it is a
+    # CLASSIFICATION the census derived, whose input is the constant's RESULT HEAD
+    # (Lean.Meta.inferType's result head is Lean.Meta.MetaM, which is what makes it
+    # toolchain-monad, which is what puts it in R-EFFECT). Re-deriving the
+    # classification here would just be a second opinion; checking its INPUT is the
+    # honest move, so the pin is asked for the result head and the census's column
+    # is compared against it.
+    res_head_disagreements = []
 
     def is_reducible(n):
         pin = pin_reducibility.get(n)
@@ -1203,6 +1230,15 @@ def main():
                 in ((census.get(n) or {}).get("attrs") or ""))
 
     for n in sorted(types):
+        pin_rh = pin_res_head.get(n)
+        crow = census.get(n) or {}
+        census_rh_raw = crow.get("res_head")
+        census_rh = (dotted(census_rh_raw)
+                     if census_rh_raw and census_rh_raw != "-" else "-")
+        if pin_rh and census_rh_raw is not None:
+            if (census_rh or "-") != pin_rh:
+                res_head_disagreements.append(
+                    {"name": n, "census": census_rh or "-", "pin": pin_rh})
         pin_m = pin_module.get(n)
         census_row = census.get(n) or {}
         census_m = dotted(census_row["module"]) if census_row.get("module") else None
@@ -1250,7 +1286,7 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2, rd2, sfy2, mod2, flds2) = close_over_types(
+         pb2, rd2, sfy2, mod2, flds2, rh2) = close_over_types(
             lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
@@ -1260,6 +1296,7 @@ def main():
         pin_safety.update(sfy2)
         pin_module.update(mod2)
         pin_fields.update(flds2)
+        pin_res_head.update(rh2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1928,6 +1965,13 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "result_head_probed": len(pin_res_head),
+        "result_head_census_disagreements": res_head_disagreements,
+        "result_head_note": "the effect class is a census CLASSIFICATION, not a raw "
+            "pin fact, so its INPUT is checked instead: the pin's result head for "
+            "each constant is compared against the census's res_head column. That "
+            "is what decides toolchain-monad versus pure, and therefore which rows "
+            "land in R-EFFECT.",
         "module_source": "the pin (getModuleIdxFor? into the header module names), "
             "with the census column kept as the pre-probe filter and as a fallback",
         "module_probed": len(pin_module),
@@ -2082,6 +2126,7 @@ def main():
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
           f"values={values_checked} "
+          f"rh_probed={len(pin_res_head)} rh_drift={len(res_head_disagreements)} "
           f"mod_probed={len(pin_module)} mod_drift={len(module_disagreements)} "
           f"safe_probed={len(pin_safety)} "
           f"safe_drift={len(safety_disagreements)} "
