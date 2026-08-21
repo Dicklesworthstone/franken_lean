@@ -96,6 +96,9 @@ the toolchain would report a perfect facade:
   * A MANIFEST-PIN JOIN requires the facade manifest's schema and extraction pin
     to match this rig before demanded rows are consumed. Demand and facade rows
     cannot be joined across generated-contract epochs.
+  * A MANIFEST-TOTALITY JOIN requires the facade generator to report zero
+    uncensused closure/emitted rows and no Reference import. The compile rig may
+    not turn a manifest's known classification gap into availability evidence.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -782,6 +785,18 @@ def main():
             f"pin={None if manifest_summary is None else manifest_summary.get('pin')!r}, "
             f"compiler={tag!r})"
         )
+    totality = {
+        "uncensused_closure": manifest_summary.get("uncensused_closure"),
+        "uncensused_emitted": manifest_summary.get("uncensused_emitted"),
+        "imports_reference": manifest_summary.get("imports_reference"),
+    }
+    if (totality["uncensused_closure"] != 0
+            or totality["uncensused_emitted"] != 0
+            or totality["imports_reference"] is not False):
+        raise SystemExit(
+            "REFUSE: facade manifest totality join failed "
+            f"({json.dumps(totality, sort_keys=True)})"
+        )
 
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
@@ -913,6 +928,7 @@ def main():
         "curated_module_join": module_join,
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
+        "manifest_totality_join": totality,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
