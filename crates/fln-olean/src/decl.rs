@@ -3068,6 +3068,100 @@ mod tests {
         .bytes
     }
 
+    /// A `Nat` slot holding a pointer to something that is not an mpz is
+    /// refused.
+    ///
+    /// A boxed `Nat` is either a small scalar or an mpz OBJECT, and the
+    /// decoder splits on exactly that. The fixture's literal is `natVal 7`,
+    /// which is small and therefore SCALAR-boxed, so the mpz branch is not
+    /// reached by the fixture as it stands — the boxing hazard again, in its
+    /// fourth distinct form: here the legal value is boxed and the rule guards
+    /// the *other* branch.
+    ///
+    /// Rather than add a bignum fixture, the plant turns the scalar into a
+    /// POINTER at an object that exists and is well formed but is not an mpz —
+    /// the `Literal` object itself. That is the shape a real misread produces:
+    /// a slot that should hold a number holding a structure.
+    ///
+    /// SHADOWING CHECKED. `decode_literal` reads the literal's own header
+    /// before this, and the plant leaves it alone, so "Literal ctor"
+    /// (e4624913) cannot fire; the enclosing `Expr.lit` is untouched too. Both
+    /// are re-asserted after the plant.
+    #[test]
+    fn a_nat_slot_pointing_at_a_non_mpz_object_is_refused() {
+        let mut bytes = literal_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified literal fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let lit_expr_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("lit expression");
+        let lit_expr_header = view.obj_header(lit_expr_off).expect("Expr.lit header");
+
+        // The pointer VALUE addressing the Literal object, reused as the plant
+        // so the target is a real, well-formed object rather than a guess.
+        let lit_ptr = view.read_u64(lit_expr_off + 8).expect("literal pointer");
+        let lit_off = view.deref(lit_ptr).expect("Literal object");
+        let lit_header = view.obj_header(lit_off).expect("Literal header");
+        assert_eq!(lit_header.0, 0, "Literal.natVal");
+        assert_ne!(
+            lit_header.0,
+            fln_rt::abi::TAG_MPZ,
+            "and it is emphatically not an mpz, which is what makes it a valid \
+             wrong target"
+        );
+
+        // The payload is currently the scalar box of 7.
+        let slot = lit_off as usize + 8;
+        let payload = view.read_u64(lit_off + 8).expect("nat payload");
+        assert_eq!(payload & 1, 1, "a small Nat is scalar-boxed");
+        assert_eq!(payload >> 1, 7, "and the fixture's value is 7");
+
+        bytes[slot..slot + 8].copy_from_slice(&lit_ptr.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(lit_off).expect("literal after plant"),
+            lit_header,
+            "the Literal header is untouched, so its ctor rule cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(lit_expr_off).expect("expr after plant"),
+            lit_expr_header,
+            "and the enclosing Expr.lit is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a Nat pointing at a non-mpz object must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Nat: neither scalar nor mpz",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `Literal` that is neither `natVal` nor `strVal` is refused.
     ///
     /// This completes `Literal`, whose decode has exactly one rule, the way
