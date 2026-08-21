@@ -9455,3 +9455,108 @@ fn a_recursors_self_reference_carries_its_own_universe_parameters_in_order() {
         );
     }
 }
+
+/// `num_motives` is `|all| + num_nested` — the formula behind a carve-out.
+///
+/// The block-relations cell compares a recursor's `num_motives` against the
+/// number of inductives in its block and CARVES OUT the nested ones, because
+/// there the equality fails. The carve-out is correct and it hides a formula:
+/// a nested block generates one motive per nesting container on top of the one
+/// per inductive, so
+///
+///   `num_motives == all.len() + num_nested`
+///
+/// holds for every one of the 129 recursors in `Init/Prelude`, nested included,
+/// with no exception. Only two shapes occur: 126 recursors at
+/// `(1 inductive, 0 nested, 1 motive)` and 3 at `(1, 2, 3)`. The three are the
+/// `Lean.Syntax` family, the same three that form the recursor cycle above.
+///
+/// WHAT THIS CELL CANNOT CHECK, stated because the formula has two terms and
+/// only one of them varies at the pin. Every recursor here has `all.len() == 1`
+/// — `Init/Prelude` contains no mutual inductive block, and neither does the
+/// rest of the corpus, which is a standing disclosure on this bead. So the
+/// `all.len()` term is pinned at 1 throughout and the formula is really being
+/// tested as `1 + num_nested`. A mutual inductive block would exercise the
+/// other term and none exists to try it on. The cell asserts that limitation
+/// rather than leaving it implicit, so the day a mutual block appears the
+/// assertion fails and someone re-derives the formula instead of trusting it.
+#[test]
+fn a_recursors_motive_count_is_its_block_size_plus_its_nesting() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut nesting: BTreeMap<String, u32> = BTreeMap::new();
+    let mut recursors: BTreeMap<String, &RecursorVal> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(nesting.insert(name, v.num_nested)),
+            ConstantInfo::Rec(v) => drop(recursors.insert(name, v)),
+            _ => {}
+        }
+    }
+    assert_eq!(recursors.len(), 129, "the recursor census must be reached");
+
+    let mut shapes: BTreeMap<(usize, u32, u32), usize> = BTreeMap::new();
+    let mut departures: Vec<(&String, usize, u32, u32)> = Vec::new();
+    let mut multi_motive: Vec<&String> = Vec::new();
+    for (name, rec) in &recursors {
+        let head = rec
+            .all
+            .first()
+            .map(Name::to_display_string)
+            .expect("a recursor names its block");
+        let nested = *nesting
+            .get(&head)
+            .unwrap_or_else(|| panic!("{name}: its block head {head} must be a decoded inductive"));
+        let shape = (rec.all.len(), nested, rec.num_motives);
+        *shapes.entry(shape).or_default() += 1;
+        if rec.num_motives as usize != rec.all.len() + nested as usize {
+            departures.push((name, rec.all.len(), nested, rec.num_motives));
+        }
+        if rec.num_motives > 1 {
+            multi_motive.push(name);
+        }
+    }
+
+    assert!(
+        departures.is_empty(),
+        "num_motives must be the block size plus the nesting: {departures:?}"
+    );
+    assert_eq!(
+        shapes
+            .iter()
+            .map(|(shape, count)| (*shape, *count))
+            .collect::<Vec<((usize, u32, u32), usize)>>(),
+        vec![((1, 0, 1), 126), ((1, 2, 3), 3)],
+        "only two shapes occur, and the formula must be exercised by both"
+    );
+    assert_eq!(
+        shapes.values().sum::<usize>(),
+        recursors.len(),
+        "the shape table must account for every recursor"
+    );
+
+    // The multi-motive recursors are the nested family the cycle cell names.
+    assert_eq!(
+        multi_motive
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<&str>>(),
+        NESTED_RECURSOR_CHAIN
+            .iter()
+            .map(|(from, _)| *from)
+            .collect::<Vec<&str>>(),
+        "more than one motive occurs exactly for the nested recursor family"
+    );
+
+    // The limitation, asserted rather than left implicit: the block-size term
+    // never varies at the pin, so only the nesting term is under test.
+    let block_sizes: BTreeSet<usize> = recursors.values().map(|rec| rec.all.len()).collect();
+    assert_eq!(
+        block_sizes,
+        BTreeSet::from([1]),
+        "every block here holds one inductive, so `all.len()` contributes a constant 1 and a \
+         mutual inductive block would be needed to test the other half of the formula"
+    );
+}
