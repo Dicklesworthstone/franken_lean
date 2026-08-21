@@ -6042,3 +6042,117 @@ fn the_axioms_extension_counts_exported_declarations_at_both_levels() {
         );
     }
 }
+
+/// The extension blocks the SERVER part contributes over the exported one.
+const SERVER_ONLY_EXTENSIONS: &[&str] = &[
+    "Lean.declRangeExt",
+    "Lean.docStringExt",
+    "_private.Lean.DocString.Extension.0.Lean.inheritDocStringExt",
+    "_private.Lean.DocString.Extension.0.Lean.moduleDocExt",
+];
+
+/// Read the middle part of the companion chain.
+fn server_module_view(lib: &Path, module: &str) -> ModuleDataView {
+    let base = lib.join(format!("{}.olean", module.replace('.', "/")));
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    OleanView::parse_with_dependencies(&server, &[&exported])
+        .expect("parse server part")
+        .module_data(WalkBudget::default())
+        .expect("server module data")
+}
+
+/// The MIDDLE part of the companion chain, which nothing here had opened.
+///
+/// A module ships THREE parts and this file has read two. `.olean.server` is
+/// handed to `parse_with_dependencies` as a byte buffer by every cell here and
+/// then never examined, so what the middle of the chain contains has been an
+/// open question on a bead whose entire repair was part SELECTION.
+///
+/// Measured over three modules, and the answer is uniform: the server part adds
+/// no declarations at all.
+///
+///   `constNames` at server equals the exported array as a SEQUENCE, not merely
+///     in length — 2,204 / 379 / 791, the same names in the same order
+///   `extraConstNames` likewise, and the import array is identical at all three
+///   the extension names NEST, exported ⊆ server ⊆ private, strictly at each
+///     step — 56 < 60 < 62 for `Init/Prelude`
+///   what the server adds is the same FOUR blocks in every module, and all four
+///     are documentation extensions: `declRangeExt`, `docStringExt`,
+///     `inheritDocStringExt`, `moduleDocExt`
+///
+/// So reading the server part instead of the private one would have recovered
+/// ZERO of the declarations this bead is about. The private part is the only
+/// one that adds any, which is the fact the part-selection repair rests on and
+/// which nothing had checked from the middle part's own bytes.
+///
+/// This also DECOMPOSES a fact already recorded here. The extension cell lists
+/// six blocks as private-only and calls them "the documentation and
+/// compiler-cache extensions". That is true against the exported part, but it
+/// attributes all six to the private level; four of the six are contributed by
+/// the SERVER part, and only the two compiler-cache ones are genuinely private.
+/// Both statements are consistent — the parts nest — but only this one says
+/// which part supplies what.
+#[test]
+fn the_server_part_adds_documentation_extensions_and_no_declarations() {
+    let lib = lib_or_skip!();
+
+    for module in ["Init.Prelude", "Init.Meta.Defs", "Init.Data.List.Basic"] {
+        let exported = module_view(&lib, module, Level::Exported);
+        let server = server_module_view(&lib, module);
+        let private = module_view(&lib, module, Level::Private);
+
+        assert_eq!(
+            server.const_names, exported.const_names,
+            "{module}: the server part carries the exported constant array unchanged, name for \
+             name and in order"
+        );
+        assert_eq!(
+            (server.constants, server.extra_const_names),
+            (exported.constants, exported.extra_const_names),
+            "{module}: and the same auxiliary array"
+        );
+        assert_eq!(
+            server.imports, exported.imports,
+            "{module}: the import array is a property of the module, not of the part"
+        );
+        assert!(
+            private.const_names.len() > exported.const_names.len(),
+            "{module}: the private part is the only one that adds declarations, so it must be \
+             the only one that grows"
+        );
+
+        let names = |view: &ModuleDataView| -> BTreeSet<String> {
+            view.extensions
+                .iter()
+                .map(|block| block.name.clone())
+                .collect()
+        };
+        let (exported_names, server_names, private_names) =
+            (names(&exported), names(&server), names(&private));
+        assert!(
+            exported_names.is_subset(&server_names) && server_names.is_subset(&private_names),
+            "{module}: the three parts' extension tables must nest"
+        );
+        assert!(
+            exported_names.len() < server_names.len() && server_names.len() < private_names.len(),
+            "{module}: and each step must actually add something ({} < {} < {})",
+            exported_names.len(),
+            server_names.len(),
+            private_names.len()
+        );
+
+        let added: Vec<&String> = server_names.difference(&exported_names).collect();
+        assert_eq!(
+            added, SERVER_ONLY_EXTENSIONS,
+            "{module}: the server part contributes exactly the documentation extensions"
+        );
+        assert!(
+            private_names
+                .difference(&server_names)
+                .all(|name| !SERVER_ONLY_EXTENSIONS.contains(&name.as_str())),
+            "{module}: nothing the server supplies may be counted again as a private addition"
+        );
+    }
+}
