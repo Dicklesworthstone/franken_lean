@@ -2540,10 +2540,6 @@ fn prod_constructor_type(prod: &WireName, constructor: &WireName, left_universe:
     let left = builder.bvar(3);
     let right = builder.bvar(2);
     let result = prod_application(&mut builder, prod, left_universe, right_universe, left, right);
-    let first = builder.bvar(1);
-    let second = builder.bvar(0);
-    let result = builder.apply(result, first);
-    let result = builder.apply(result, second);
     let second_type = builder.bvar(1);
     let result = builder.forall("snd", BinderStyle::Default, second_type, result);
     let first_type = builder.bvar(1);
