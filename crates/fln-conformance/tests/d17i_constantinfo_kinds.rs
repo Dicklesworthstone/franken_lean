@@ -14697,3 +14697,143 @@ fn name_collisions_cross_namespace_boundaries_at_library_scope() {
         "the deepest collision, declared under a namespace its name does not name"
     );
 }
+
+/// The library's namespaces are a LAYERING, and the whole graph is acyclic.
+///
+/// `the_init_import_graph_is_closed_acyclic_and_rooted_at_prelude` establishes
+/// those properties for the 600-module `Init` closure. Acyclicity of a subgraph
+/// proves nothing about the graph: `Init` could be internally acyclic and still
+/// sit in a cycle with `Std`, and every cell in this file would stay green. The
+/// library is 2,433 modules and 10,298 edges, four times the census.
+///
+/// It is acyclic there too, every import target resolves to a module that
+/// exists, and the four libraries form a strict order:
+///
+///   Init       imports NOTHING outside `Init`
+///   Std        imports `Init`
+///   Lean       imports `Init` and `Std`
+///   Lake       imports `Init`, `Std` and `Lean`
+///
+/// with the four leaf executables — `LakeMain`, `LeanChecker`, `LeanIR`,
+/// `Leanc` — importing from these and imported by nobody. No edge ever runs
+/// backwards, so `Init` cannot come to depend on `Std` without this failing.
+/// That is the property the Oracle-Only reading of the pin rests on: the
+/// foundation library is self-contained.
+///
+/// THE INTRA-INIT COUNT BINDS TWO PINNED FIGURES. `Init` to `Init` is 3,196
+/// edges here, while the import-graph cell pins 3,153 over the census, and the
+/// aggregator cell pins the 43 edges of `Init.olean`, which the census omits.
+/// 3,153 + 43 = 3,196, so this walk agrees with both cells at once and the
+/// difference is explained rather than noted.
+///
+/// Anti-vacuity: every cross-layer edge class is non-empty — 567 `Std` → `Init`,
+/// 599 and 66 out of `Lean`, 135, 4 and 58 out of `Lake` — so the layering is a
+/// constraint on real edges and not a description of a graph with no crossings.
+///
+/// Conservation first: the namespace matrix must reproduce the edge total, and
+/// every target must resolve, before the layering is stated — an unresolvable
+/// import would otherwise drop out of the matrix unnoticed.
+#[test]
+fn the_library_import_graph_is_acyclic_and_its_namespaces_are_layered() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let module_name = |path: &String| -> String {
+        path.strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".")
+    };
+    let namespace =
+        |module: &str| -> String { module.split('.').next().expect("a module name").to_owned() };
+
+    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in &all.exported {
+        let module = module_name(path);
+        let imports = module_view(&lib, &module, Level::Exported)
+            .imports
+            .iter()
+            .map(|import| import.module.to_display_string())
+            .collect();
+        graph.insert(module, imports);
+    }
+
+    let mut matrix: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut edges = 0usize;
+    for (module, imports) in &graph {
+        for target in imports {
+            assert!(
+                graph.contains_key(target),
+                "{module} imports {target}, which is not a module in this library"
+            );
+            edges += 1;
+            *matrix
+                .entry((namespace(module), namespace(target)))
+                .or_default() += 1;
+        }
+    }
+
+    // Conservation first: the matrix accounts for every edge.
+    assert_eq!(
+        matrix.values().sum::<usize>(),
+        edges,
+        "every edge must fall in exactly one namespace pair"
+    );
+    assert_eq!(
+        (graph.len(), edges),
+        (2_433, 10_298),
+        "the library graph this row is stated against"
+    );
+
+    // Acyclicity, by peeling modules whose imports are all already peeled.
+    let mut peeled: BTreeSet<&String> = BTreeSet::new();
+    loop {
+        let ready: Vec<&String> = graph
+            .iter()
+            .filter(|(module, imports)| {
+                !peeled.contains(module) && imports.iter().all(|t| peeled.contains(t))
+            })
+            .map(|(module, _)| module)
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        peeled.extend(ready);
+    }
+    assert_eq!(
+        peeled.len(),
+        graph.len(),
+        "every module must peel; whatever remains is inside a cycle"
+    );
+
+    // The layering: which namespaces each may import.
+    let mut layers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (source, target) in matrix.keys() {
+        layers
+            .entry(source.clone())
+            .or_default()
+            .insert(target.clone());
+    }
+    let expect =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| (*n).to_string()).collect() };
+    assert_eq!(
+        layers,
+        BTreeMap::from([
+            ("Init".to_owned(), expect(&["Init"])),
+            ("Std".to_owned(), expect(&["Init", "Std"])),
+            ("Lean".to_owned(), expect(&["Init", "Lean", "Std"])),
+            ("Lake".to_owned(), expect(&["Init", "Lake", "Lean", "Std"])),
+            ("LakeMain".to_owned(), expect(&["Init", "Lake"])),
+            ("LeanChecker".to_owned(), expect(&["Init", "Lake", "Lean"])),
+            ("LeanIR".to_owned(), expect(&["Init", "Lean"])),
+            ("Leanc".to_owned(), expect(&["Init", "Lean"])),
+        ]),
+        "no edge may run backwards through the layering"
+    );
+
+    // Binds the census edge count and the aggregator's own edges.
+    assert_eq!(
+        matrix[&("Init".to_owned(), "Init".to_owned())],
+        3_153 + 43,
+        "intra-Init edges are the census graph plus the aggregator the census omits"
+    );
+}
