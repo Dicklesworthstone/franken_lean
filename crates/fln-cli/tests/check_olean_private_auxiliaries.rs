@@ -359,6 +359,12 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     let private_companion_names = json_array_field(private_companion_residuals, "names");
     let private_companion_name_count = json_array_len(private_companion_names);
     let private_companion_name_strings = json_non_empty_name_strings(private_companion_names);
+    assert!(
+        private_companion_name_strings
+            .iter()
+            .all(|name| name.starts_with("_private.")),
+        "{json}",
+    );
     let private_companion_name_set = private_companion_name_strings
         .iter()
         .cloned()
