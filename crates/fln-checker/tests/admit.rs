@@ -2092,6 +2092,22 @@ fn kr600_803_init_bool_fixture_pins_constructor_indices_parameters_and_fields() 
 }
 
 #[test]
+fn kr600_803_init_bool_fixture_pins_iota_rule_constructors_and_fields() {
+    let entries = init_bool_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for (rule, constructor) in [
+        (&metadata.rules()[0], entries[1].name()),
+        (&metadata.rules()[1], entries[2].name()),
+    ] {
+        assert_eq!(rule.constructor(), constructor);
+        assert_eq!(rule.num_fields(), 0);
+    }
+}
+
+#[test]
 fn kr600_803_init_punit_universes_constructor_and_iota_are_reconstructed() {
     let entries = init_punit_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
