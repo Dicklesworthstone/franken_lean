@@ -3096,6 +3096,32 @@ fn kr600_803_init_unit_refuses_a_forged_constructor_field_count() {
 }
 
 #[test]
+fn kr600_803_init_unit_refuses_a_forged_constructor_index() {
+    let mut entries = init_unit_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Unit", "unit"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Unit"), 1, 0, 0),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_init_unit_refuses_a_forged_num_rules_count() {
     let mut entries = init_unit_entries();
     let declaration = entries[2].declaration();
