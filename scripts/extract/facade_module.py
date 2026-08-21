@@ -3707,6 +3707,19 @@ def main():
 
 
 
+def _report_divergence():
+    """The pair-inconsistency note, said once however the run is ending.
+
+    Defined here rather than repeated in each arm below: three copies of this
+    would be three chances for one of them to drift, which is the defect this
+    file already refuses under the name "one word, two definitions".
+    """
+    for published in _PUBLISHED_VIEW:
+        note = artifact_divergence_note(published, _FACADE_REPLACED)
+        if note:
+            print("NOTE: " + note, file=sys.stderr)
+
+
 if __name__ == "__main__":
     try:
         main()
@@ -3714,8 +3727,35 @@ if __name__ == "__main__":
         # A refusal must stay a refusal: this reports and re-raises, and the
         # reporting is deliberately last so a fault in it cannot mask the cause.
         if exc.code not in (0, None):
-            for _published in _PUBLISHED_VIEW:
-                _note = artifact_divergence_note(_published, _FACADE_REPLACED)
-                if _note:
-                    print("NOTE: " + _note, file=sys.stderr)
+            _report_divergence()
         raise
+    except subprocess.TimeoutExpired as exc:
+        # FOURTEEN CALL SITES ASK THE REFERENCE A QUESTION with timeout=1800 and
+        # not one of them handles the answer never coming. The pin is invoked
+        # dozens of times per run on a box several panes are building on, so a
+        # thirty-minute overrun is a scheduling accident rather than an exotic
+        # one -- and it arrived as a bare TimeoutExpired traceback: no artifact
+        # named, no verdict, and the pair-inconsistency note skipped entirely,
+        # because the handler above only ever caught SystemExit. A run that dies
+        # this way has usually already replaced the facade.
+        _report_divergence()
+        _cmd = exc.cmd if isinstance(exc.cmd, (list, tuple)) else [str(exc.cmd)]
+        _src = next((str(a) for a in reversed(_cmd) if str(a).endswith(".lean")),
+                    " ".join(str(a) for a in _cmd)[:120])
+        raise SystemExit(
+            f"REFUSE: a Reference invocation did not finish within {exc.timeout} "
+            f"seconds, asking about {_src}. The run has no answer from the pin "
+            "for that probe, so every count that depends on it would be a guess, "
+            "and a guess is what this extractor exists not to publish") from exc
+    except OSError as exc:
+        # The same shape one layer down: a write that cannot complete -- a full
+        # disk on a box whose free space these waves keep reporting, a path that
+        # went away under a concurrent pane -- left the process on a traceback
+        # rather than a verdict, and skipped the note for the same reason.
+        _report_divergence()
+        raise SystemExit(
+            f"REFUSE: the run could not complete a filesystem operation: "
+            f"{exc.__class__.__name__} {exc.errno} on {exc.filename!r} "
+            f"({exc.strerror}). Whatever it was writing is not what it "
+            "intended to write, and no artifact should be read as this run's "
+            "until it is regenerated") from exc
