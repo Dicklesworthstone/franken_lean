@@ -4498,6 +4498,47 @@ fn kr600_803_color_fixture_pins_recursor_mutual_family_and_k() {
 }
 
 #[test]
+fn kr600_803_color_refuses_a_forged_k() {
+    let mut entries = enumeration_entries(BinderInfo::Implicit);
+    let declaration = entries[3].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Color", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                metadata.rules().to_vec(),
+                true,
+            ),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::RecursorShape { .. }
+            )
+        ),
+        "forged Color recursor k verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_color_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = enumeration_entries(BinderInfo::Implicit);
     let recursor = entries[3].declaration();
