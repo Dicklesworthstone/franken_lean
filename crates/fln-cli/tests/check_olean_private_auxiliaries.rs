@@ -220,6 +220,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "mapM'",
         "_proof_2",
     ]);
+    let array_map_m_go_residual = fln::Name::from_components([
+        "_private",
+        "Init",
+        "Data",
+        "Array",
+        "BasicAux",
+        "0",
+        "Array",
+        "mapM'",
+        "go",
+    ]);
     let core_observables_head_loop_unsafe_rec_residual = fln::Name::from_components([
         "_private",
         "Init",
@@ -331,6 +342,10 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
     private_constants.push(axiom(
+        array_map_m_go_residual,
+        fln::Expr::const_(proposition.clone(), Vec::new()),
+    ));
+    private_constants.push(axiom(
         core_observables_head_loop_unsafe_rec_residual,
         fln::Expr::const_(proposition.clone(), Vec::new()),
     ));
@@ -374,7 +389,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_eq!(json.exit_code, 0, "{}", json.stderr);
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":23"));
+    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":24"));
     assert!(json.stdout.contains(
         "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
     ));
@@ -427,6 +442,9 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "\"arrayMapMProofResiduals\":{\"observed\":2,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
+        "\"arrayMapMGoResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false}],\"omitted\":0}"
+    ));
+    assert!(json.stdout.contains(
         "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
     assert!(json.stdout.contains(
@@ -449,7 +467,7 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(
         human
             .stdout
-            .contains("decoded _private auxiliaries: 23 (reporting only; not a G1 claim)")
+            .contains("decoded _private auxiliaries: 24 (reporting only; not a G1 claim)")
     );
     assert!(human.stdout.contains(
         "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
@@ -604,6 +622,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(human
         .stdout
         .contains("decoded _private Array.mapM'._proof_N residual names omitted: 0"));
+    assert!(human.stdout.contains(
+        "decoded _private Array.mapM'.go residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
+    ));
+    assert!(human
+        .stdout
+        .contains("decoded _private Array.mapM'.go residual names: _private.Init.Data.Array.BasicAux.0.Array.mapM'.go"));
+    assert!(human
+        .stdout
+        .contains("decoded _private Array.mapM'.go residual names omitted: 0"));
     assert!(human.stdout.contains(
         "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
     ));
