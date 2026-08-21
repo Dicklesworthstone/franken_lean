@@ -2193,6 +2193,42 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     return "\n".join(body) + "\n", line_map, emitted, attrs, provided
 
 
+def process_state():
+    """The process-global state a case must not leave changed behind it."""
+    umask = os.umask(0o022)
+    os.umask(umask)
+    return (os.getcwd(), umask, dict(os.environ))
+
+
+def process_state_drift(before, after):
+    """What a case changed and did not put back.
+
+    The sandbox restores the calls it patched, in a finally, and nothing ever
+    looked at the process itself. Measured: a case calling os.chdir, or setting an
+    environment variable, or calling os.umask, left every one of those changed
+    after the sandbox exited. None of them is a write, so none of the guards can
+    see them, and each one quietly changes what the REST of the run does -- the
+    guards resolve relative paths through the cwd, the umask decides the mode of
+    every file written afterwards, and TMPDIR or the toolchain path decide where
+    the real extractor looks.
+
+    Returns a list of descriptions, empty when the process came back as it went in.
+    """
+    drift = []
+    if before[0] != after[0]:
+        drift.append(f"the working directory was left at {after[0]} "
+                     f"instead of {before[0]}")
+    if before[1] != after[1]:
+        drift.append(f"the umask was left at {oct(after[1])} instead of "
+                     f"{oct(before[1])}")
+    changed = sorted(
+        set(before[2]) ^ set(after[2])
+        | {k for k in set(before[2]) & set(after[2]) if before[2][k] != after[2][k]})
+    if changed:
+        drift.append(f"the environment was left changed: {changed[:6]}")
+    return drift
+
+
 class SelfTestViolation(RuntimeError):
     """The self-test reached outside its own sandbox."""
 
@@ -2257,7 +2293,10 @@ def self_test_sandbox(work):
                 ("truncate", (0,)), ("symlink", (1,)), ("link", (1,)),
                 ("chmod", (0,)), ("chown", (0,)), ("utime", (0,)),
                 ("mkdir", (0,)), ("makedirs", (0,)),
-                ("mkfifo", (0,)), ("mknod", (0,)))
+                ("mkfifo", (0,)), ("mknod", (0,)),
+                # extended attributes are neither bytes nor a mode, and went
+                # through every version of this sandbox until now
+                ("setxattr", (0,)), ("removexattr", (0,)))
     # ...and subprocess is not the only way to start one. os.posix_spawn went
     # through, and so did os.fork -- visibly, because the forked child carried on
     # through the rest of the probe and printed its output a second time. A
@@ -2361,8 +2400,25 @@ def self_test_sandbox(work):
     for module, opname in PROC_OPS:
         saved[(module, opname)] = getattr(module, opname)
         setattr(module, opname, guard_proc(f"{module.__name__}.{opname}"))
+    before = process_state()
     try:
         yield
+    except BaseException:
+        raise
+    else:
+        # Only when the block finished cleanly: raising here while another
+        # exception is in flight would replace a real failure with this one.
+        drift = process_state_drift(before, process_state())
+        if drift:
+            os.chdir(before[0])
+            os.umask(before[1])
+            os.environ.clear()
+            os.environ.update(before[2])
+            raise SelfTestViolation(
+                "the self-test left the process changed behind it: "
+                + "; ".join(drift)
+                + ". It has been put back, but a case that does this changes what "
+                "every later case and every later run sees")
     finally:
         builtins.open, io.open, subprocess.run = real_open, real_open, real_run
         for (module, opname), original in saved.items():
@@ -2518,6 +2574,27 @@ def self_test():
     case("sandbox/allows-temp-replace",
          blocked(lambda: os.replace(os.path.join(work, "never-created"),
                                     os.path.join(work, "nor-this"))), False)
+    case("sandbox/blocks-setxattr",
+         blocked(lambda: os.setxattr(outside, "user.fln", b"x"))
+         if hasattr(os, "setxattr") else "no setxattr on this platform", True)
+    # The drift detector is exercised directly rather than by nesting a sandbox
+    # inside this one, which would double-apply every patch and restore them to
+    # the guarded versions.
+    _st = (("/a", 0o022, {"X": "1"}), ("/a", 0o022, {"X": "1"}))
+    case("state/no-drift-when-unchanged",
+         "; ".join(process_state_drift(*_st)) or None, False)
+    case("state/cwd-left-changed",
+         "; ".join(process_state_drift(_st[0], ("/b", 0o022, {"X": "1"}))) or None,
+         True)
+    case("state/umask-left-changed",
+         "; ".join(process_state_drift(_st[0], ("/a", 0o077, {"X": "1"}))) or None,
+         True)
+    case("state/env-left-changed",
+         "; ".join(process_state_drift(_st[0], ("/a", 0o022, {"X": "2"}))) or None,
+         True)
+    case("state/env-key-added",
+         "; ".join(process_state_drift(_st[0], ("/a", 0o022, {"X": "1", "Y": "1"})))
+         or None, True)
     case("sandbox/blocks-mkfifo",
          blocked(lambda: os.mkfifo(outside + ".fifo")), True)
     case("sandbox/blocks-kill",
