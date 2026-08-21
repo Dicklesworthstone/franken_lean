@@ -47,6 +47,9 @@ the toolchain would report a perfect facade:
   * A REFERENCE-IMPORT CONTROL rejects `import Lean` (or `Lean.*`) in the facade
     source itself. Keeping Reference artifacts out of the temporary root is not
     sufficient if the source can ask the compiler to find them elsewhere.
+  * A DEMANDED-ROLE JOIN makes the manifest's role agree with its disposition:
+    emitted and quarantined rows must be explicitly demanded, while Init rows
+    must be explicitly substrate. A closure row cannot impersonate a demand.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -280,6 +283,8 @@ def join_demanded_rows(names, manifest_rows):
     dispositions = {}
     unclassified = []
     signatureless = []
+    role_mismatches = []
+    roles = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -292,18 +297,27 @@ def join_demanded_rows(names, manifest_rows):
         if outcome != "init-substrate" and not row.get("signature"):
             signatureless.append(name)
             continue
+        expected_role = "init-substrate" if outcome == "init-substrate" else "demanded"
+        if row.get("role") != expected_role:
+            role_mismatches.append(
+                f"{name}(outcome={outcome}, role={row.get('role')!r})"
+            )
+            continue
         dispositions[name] = outcome
-    if unclassified or signatureless:
+        roles[expected_role] += 1
+    if unclassified or signatureless or role_mismatches:
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
         if signatureless:
             details.append("signatureless=" + ", ".join(signatureless[:8]))
+        if role_mismatches:
+            details.append("role-mismatch=" + ", ".join(role_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
-    return dispositions
+    return dispositions, dict(sorted(roles.items()))
 
 
 def choose_quarantine_control(dispositions):
@@ -463,7 +477,7 @@ def main():
                          "run would silently degrade to a name-only check")
 
     demand_names = {name for names in by_module.values() for name in names}
-    demand_dispositions = join_demanded_rows(demand_names, manifest_rows)
+    demand_dispositions, demand_roles = join_demanded_rows(demand_names, manifest_rows)
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
@@ -566,6 +580,7 @@ def main():
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
+        "demanded_role_join": demand_roles,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
