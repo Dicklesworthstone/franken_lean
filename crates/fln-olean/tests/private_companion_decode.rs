@@ -370,6 +370,11 @@ mod family {
     pub fn sunfold(name: &str) -> bool {
         last_component_suffix(name, "_sunfold").is_some_and(str::is_empty)
     }
+
+    /// `._f` — compiler-generated local helper retained in private parts.
+    pub fn private_f(name: &str) -> bool {
+        last_component_suffix(name, "_f").is_some_and(str::is_empty)
+    }
 }
 
 /// Enumerate every module under `Init` that has a complete companion chain.
@@ -475,7 +480,7 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 11] = [
+    let families: [(&str, fn(&str) -> bool); 12] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -487,9 +492,10 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
         ("_unsafe_rec", family::unsafe_rec),
         ("_unary", family::unary),
         ("_sunfold", family::sunfold),
+        ("_f", family::private_f),
     ];
-    let mut representatives: [Option<(String, String)>; 11] = [
-        None, None, None, None, None, None, None, None, None, None, None,
+    let mut representatives: [Option<(String, String)>; 12] = [
+        None, None, None, None, None, None, None, None, None, None, None, None,
     ];
 
     for relative in init_chain_modules(&lib) {
@@ -549,7 +555,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 11] = [
+    let families: [(&str, fn(&str) -> bool); 12] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -561,6 +567,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
         ("_unsafe_rec", family::unsafe_rec),
         ("_unary", family::unary),
         ("_sunfold", family::sunfold),
+        ("_f", family::private_f),
     ];
 
     for (family, belongs_to_family) in families {
