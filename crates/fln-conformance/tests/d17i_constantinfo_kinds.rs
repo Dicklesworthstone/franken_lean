@@ -15693,3 +15693,86 @@ fn the_region_layout_holds_library_wide_and_the_payload_model_has_two_witnesses(
          header's width past a 64 KiB boundary"
     );
 }
+
+/// Every part of every olean in the library identifies itself as the pin.
+///
+/// `the_library_under_test_identifies_itself_as_the_pinned_toolchain` reads the
+/// three parts of ONE chain and the exported part of each census module — 603
+/// reads — and concludes that `lean_version` and `githash` are properties of the
+/// toolchain. The library holds 7,295 parts. The 6,692 it never opens include
+/// every companion outside `Init`, which is exactly where a mixed build would
+/// hide: a stale `.olean.private` left behind by an earlier toolchain is
+/// readable, structurally valid, and identifiable only by these two fields.
+///
+/// All 7,295 carry ONE identity, and it is the pin: `4.32.0` at githash
+/// `8c9756b2…`. Nothing in the library was built by a different toolchain.
+///
+/// This is the Oracle-Only premise stated over the whole artifact rather than a
+/// sample. Every measurement in this file is reported "at the pin"; that phrase
+/// means something only if the bytes agree, and until now the bytes had been
+/// asked in 603 places out of 7,295.
+///
+/// SCOPE, SO THE NEXT READER DOES NOT OVER-READ IT. This cell pins the toolchain
+/// identity — `lean_version` and `githash` — across every part. The `version`
+/// and `flags` bytes are a separate claim, pinned over `Init`'s 1,800 parts by
+/// `no_header_field_names_which_part_of_the_chain_it_is`, and deliberately not
+/// re-read here: doing so would double the file reads for a field that cell
+/// already shows is constant and role-blind.
+///
+/// Anti-vacuity: the three roles are counted separately and are NOT equal —
+/// 2,433 exported against 2,431 of each companion — so the walk demonstrably
+/// reaches all three, including the two exported parts that have no companions.
+/// A walk that silently visited only exported parts would give 2,433 and fail
+/// here.
+///
+/// Conservation first: the role classes must account for every part before the
+/// identity is named, and the identity classes must too — one class of 7,295 is
+/// only meaningful if 7,295 is the whole population.
+#[test]
+fn every_part_in_the_library_identifies_itself_as_the_pin() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut identities: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut roles: BTreeMap<&str, usize> = BTreeMap::new();
+    for path in &all.exported {
+        let stem = lib.join(
+            path.strip_suffix(".olean")
+                .expect("an exported part ends in .olean"),
+        );
+        let has_chain = all.private.contains(path);
+        for part in ["olean", "olean.server", "olean.private"] {
+            if part != "olean" && !has_chain {
+                continue;
+            }
+            let (version, githash, _) = header_identity(&stem.with_extension(part));
+            *identities.entry((version, githash)).or_default() += 1;
+            *roles.entry(part).or_default() += 1;
+        }
+    }
+
+    // Conservation first: both classifications cover the same population.
+    let parts: usize = roles.values().sum();
+    assert_eq!(
+        identities.values().sum::<usize>(),
+        parts,
+        "every part read must be classified by its identity"
+    );
+    assert_eq!(
+        roles,
+        BTreeMap::from([
+            ("olean", 2_433),
+            ("olean.server", 2_431),
+            ("olean.private", 2_431)
+        ]),
+        "the three roles, unequal because two oleans have no companions"
+    );
+    assert_eq!(parts, 7_295, "the library part census");
+
+    // One identity, and it is the pin.
+    assert_eq!(
+        identities,
+        BTreeMap::from([((PIN_LEAN_VERSION.to_owned(), PIN_GITHASH.to_owned()), 7_295)]),
+        "a single toolchain built every part of this library, and it is the pinned one"
+    );
+}
