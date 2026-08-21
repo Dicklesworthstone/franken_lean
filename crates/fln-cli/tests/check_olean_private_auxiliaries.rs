@@ -814,6 +814,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateArrayMapMResiduals",
+        3,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateGoResiduals",
         3,
         &[
@@ -1090,6 +1100,17 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &["_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2"],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private Array.mapM'.go residuals", "decoded _private Array.mapM'.go residual names", 1, &["_private.Init.Data.Array.BasicAux.0.Array.mapM'.go"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Array.mapM' residuals",
+        "decoded _private Array.mapM' residual names",
+        3,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go",
+        ],
+    );
     assert_human_named_residuals(
         &human.stdout, "decoded _private .go residuals", "decoded _private .go residual names", 3,
         &[
