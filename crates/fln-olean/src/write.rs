@@ -1324,7 +1324,13 @@ mod tests {
             ConstantInfo::Ctor(ConstructorVal {
                 base: base("Demo.ind.mk", &type_),
                 induct: name("Demo.ind"),
-                cidx: u32::MAX,
+                // PAIRWISE DISTINCT. `cidx` was also u32::MAX, which is the
+                // same value `num_fields` carries, and the two sit at adjacent
+                // payload slots 2 and 4 - so a decoder that read one for the
+                // other round-tripped clean. The boundary value is kept on one
+                // of the three. See
+                // `the_constructor_indices_are_read_from_their_own_slots`.
+                cidx: 7,
                 num_params: 1,
                 num_fields: u32::MAX,
                 is_unsafe: true,
@@ -1680,6 +1686,123 @@ mod tests {
             constructor.induct.to_display_string(),
             "Demo.ind",
             "and `induct` was read as a name, not consumed as a list"
+        );
+    }
+
+    /// A constructor's three indices each come from their OWN slot.
+    ///
+    /// `cidx`, `numParams` and `numFields` are three `Nat`s at ADJACENT payload
+    /// slots 2, 3 and 4, all read by the same `decode_nat_u32`. Nothing about
+    /// their shapes distinguishes them: a decoder that crossed any two produces
+    /// three well-formed naturals, and no arity, size or constructor rule can
+    /// object. The only thing that can catch it is their VALUES, which makes a
+    /// repeated value in the fixture fatal to the whole property.
+    ///
+    /// The round-trip fixture had exactly that. `cidx` and `numFields` both
+    /// held `u32::MAX` until this commit, so slots 2 and 4 were
+    /// indistinguishable and a swap of them decoded identically - the same
+    /// duplicate-value vacuity as the recursor's two identical rule
+    /// right-hand sides at `c39d9c15`, arriving in scalar fields rather than in
+    /// a list. Note that this is NOT the empty-or-zero placeholder shape: the
+    /// values were deliberate boundary values, and being deliberate is what
+    /// stopped anyone reading them as a default.
+    ///
+    /// `cidx` is the sharpest of the three, because it is the constructor's
+    /// POSITION in its inductive's constructor list. Give it another
+    /// constructor's index and the declaration still checks, still round-trips,
+    /// and denotes a different constructor.
+    #[test]
+    fn the_constructor_indices_are_read_from_their_own_slots() {
+        let type_ = Expr::sort(Level::param(name("u")));
+        let (cidx, num_params, num_fields) = (3_u32, 5_u32, 9_u32);
+
+        // The guard: with any two equal, a swap of their slots would decode
+        // identically and every assertion below would still pass.
+        let indices = [cidx, num_params, num_fields];
+        assert_eq!(
+            indices.len(),
+            indices
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "the three indices must stay PAIRWISE DISTINCT, or a crossed pair \
+             would decode identically and this cell would prove nothing: \
+             {indices:?}"
+        );
+
+        // One constant, so the constants array's element 0 is unambiguous.
+        let constants = vec![ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: name("Demo.ind.mk"),
+                level_params: vec![name("u")],
+                type_: type_.clone(),
+            },
+            induct: name("Demo.ind"),
+            cidx,
+            num_params,
+            num_fields,
+            is_unsafe: false,
+        })];
+
+        let encoded = encode_module(
+            ModuleWriteInput {
+                is_module: true,
+                imports: &[],
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            header(),
+            WriteBudget::default(),
+        )
+        .expect("encode module");
+
+        let view = OleanView::parse(&encoded.bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("ConstantInfo header").0,
+            6,
+            "ConstantInfo.ctorInfo"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("ConstructorVal pointer"))
+            .expect("ConstructorVal object");
+
+        // Each index, read from its own slot on the wire.
+        let index_at = |slot: u64| -> u64 {
+            let word = view.read_u64(val_off + 8 + 8 * slot).expect("index slot");
+            assert_eq!(
+                word & 1,
+                1,
+                "a Nat this small is stored BOXED, not as a heap object; a \
+                 pointer here would mean the writer emitted an mpz and the \
+                 comparison below would be reading a heap address"
+            );
+            word >> 1
+        };
+        assert_eq!(index_at(2), u64::from(cidx), "cidx is slot 2");
+        assert_eq!(index_at(3), u64::from(num_params), "numParams is slot 3");
+        assert_eq!(index_at(4), u64::from(num_fields), "numFields is slot 4");
+
+        // And the decoder agrees with the bytes rather than with the encoder.
+        let mut decoder = DeclDecoder::new(&view, WalkBudget::default());
+        let decoded = decoder.decode_module_constants().expect("constants");
+        let ConstantInfo::Ctor(constructor) = &decoded[0] else {
+            panic!("the fixture declares one constructor")
+        };
+        assert_eq!(
+            (
+                constructor.cidx,
+                constructor.num_params,
+                constructor.num_fields
+            ),
+            (cidx, num_params, num_fields),
+            "each index as stored in its own slot"
         );
     }
 
