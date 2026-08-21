@@ -435,12 +435,7 @@ mod family {
 
     /// `Array.shrink.loop._f` — nested helper from the array shrink loop.
     pub fn array_shrink_loop_f(name: &str) -> bool {
-        let parts = components(name);
-        parts.len() >= 5
-            && parts.last() == Some(&"_f")
-            && parts
-                .windows(3)
-                .any(|window| window == ["Array", "shrink", "loop"])
+        name.ends_with(".Array.shrink.loop._f")
     }
 }
 
@@ -905,6 +900,11 @@ fn array_shrink_loop_f_requires_the_companion_and_keeps_its_real_kind() {
         })
         .expect("the pinned Init private companions contain an Array.shrink.loop._f witness");
     let chain = chain_bytes(&lib, &relative);
+
+    assert!(
+        name.ends_with(".Array.shrink.loop._f"),
+        "the selected _f witness must be the exact reported Array.shrink.loop._f shape"
+    );
 
     let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
         panic!("Array.shrink.loop._f {name}: parse exported {relative}: {error}")
