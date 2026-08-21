@@ -250,6 +250,8 @@ const ARRAY_MAP_M_GO_PROOF_2: &str = "_private.Init.Data.Array.BasicAux.0.Array.
 const ARRAY_MAP_M_GO_PROOF_2_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_MAP_M_GO_UNARY: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary";
 const ARRAY_MAP_M_GO_UNARY_MODULE: &str = "Init/Data/Array/BasicAux";
+const MAP_MONO_M_IMP_GO: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp.go";
+const MAP_MONO_M_IMP_GO_MODULE: &str = "Init/Data/Array/BasicAux";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -2033,6 +2035,9 @@ fn array_map_m_go_second_proof_is_decoded_from_its_private_storage_module() { le
 
 #[test]
 fn array_map_m_go_unary_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_map_m_go_unary_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_MAP_M_GO_UNARY.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_MAP_M_GO_UNARY).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+
+#[test]
+fn map_mono_m_imp_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("map_mono_m_imp_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, MAP_MONO_M_IMP_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&MAP_MONO_M_IMP_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == MAP_MONO_M_IMP_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
