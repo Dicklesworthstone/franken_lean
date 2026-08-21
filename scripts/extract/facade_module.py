@@ -1433,6 +1433,43 @@ def probe_generated_ctor_types(lean, env, work, text, decl, deps, owners):
     return owners_bad
 
 
+# Functions the self-test must exercise. A DECLARATION rather than a naming
+# convention: 4dbc3d32 collected this population with `name.endswith("_error")`,
+# which quietly meant that artifact_divergence_note, work_scratch_report,
+# kept_candidate, process_state_drift and restore_process_state were exercised but
+# never DEMANDED -- delete their cases and the coverage check still passed. The
+# suffix was doing the job of a declaration, and it drew the boundary in the wrong
+# place because it was never asked to draw one.
+SELF_TEST_REGISTRY = []
+# Names that look like a verdict producer. Not the population -- the population is
+# the registry above -- but the tripwire for someone adding one of these and
+# forgetting to mark it.
+VERDICT_NAME_PARTS = ("_error", "_note", "_report", "_drift")
+
+
+def checked_by_self_test(fn):
+    """Mark a verdict-producing function as one the self-test must exercise."""
+    SELF_TEST_REGISTRY.append(fn.__name__)
+    return fn
+
+
+def unmarked_verdict_functions(namespace):
+    """Verdict-shaped functions nobody marked, which the registry cannot see.
+
+    A registry is only as good as the discipline of adding to it, and the failure
+    it invites is precise: write a new guard, forget the decorator, and the
+    coverage check is satisfied because it never heard of the function. This is
+    the tripwire -- anything whose name carries a verdict-producing part and is
+    not in the registry is reported, so the omission is loud instead of silent.
+    """
+    return sorted(
+        name for name, value in namespace.items()
+        if callable(value) and getattr(value, "__module__", None) == "__main__"
+        and any(part in name for part in VERDICT_NAME_PARTS)
+        and name not in SELF_TEST_REGISTRY)
+
+
+@checked_by_self_test
 def refusal_conservation_error(refused, reproduced, unreproduced):
     """Every recorded refusal must come back either reproduced or not reproduced.
 
@@ -1461,6 +1498,7 @@ def refusal_conservation_error(refused, reproduced, unreproduced):
     return None
 
 
+@checked_by_self_test
 def unreproduced_axiom_error(text, line_map, decl, unreproduced):
     """Pin the claim that a not-reproduced refusal actually COSTS something.
 
@@ -1499,6 +1537,7 @@ def unreproduced_axiom_error(text, line_map, decl, unreproduced):
     return None
 
 
+@checked_by_self_test
 def unreproduced_declared_error(unreproduced, inductive_decls):
     """A row cannot be BOTH declared as an inductive and reported as one the
     artifact only publishes as an axiom.
@@ -1524,6 +1563,7 @@ def unreproduced_declared_error(unreproduced, inductive_decls):
     return None
 
 
+@checked_by_self_test
 def unreproduced_family_error(decl, provided, line_map, unreproduced,
                               pin_inductives):
     """The COST of a not-reproduced refusal is the whole family, not just the head.
@@ -1593,6 +1633,7 @@ MANIFEST_TMP_SUFFIX = ".tmp"
 MANIFEST_SCRATCH_SUFFIXES = (MANIFEST_TMP_SUFFIX,)
 
 
+@checked_by_self_test
 def pin_acceptance_error(text, accepted):
     """The text about to be published is one the pin actually accepted.
 
@@ -1638,6 +1679,7 @@ _FACADE_REPLACED = []
 _DECLARED_VIEW = []
 
 
+@checked_by_self_test
 def artifact_divergence_note(published, replaced, declared=()):
     """Did this run replace the facade and then refuse before the manifest?
 
@@ -1696,6 +1738,7 @@ def artifact_divergence_note(published, replaced, declared=()):
             "do not commit the set as it stands")
 
 
+@checked_by_self_test
 def work_scratch_report(work):
     """How much this run leaves in its probe directory, and whether it is there.
 
@@ -1740,6 +1783,7 @@ def work_scratch_report(work):
     return None, len(entries), total
 
 
+@checked_by_self_test
 def scratch_coverage_error(created, published):
     """Every scratch file this run actually made is one the leak check looks for.
 
@@ -1795,6 +1839,7 @@ def declared_outputs(args):
     return tuple(getattr(args, dest) for dest, _ in OUTPUT_ARGS)
 
 
+@checked_by_self_test
 def publication_registry_error(published, declared):
     """Every artifact this tool declares it produces was published THROUGH the
     checks, and nothing else was.
@@ -1830,6 +1875,7 @@ def publication_registry_error(published, declared):
     return None
 
 
+@checked_by_self_test
 def published_bytes_error(out, text, what="the facade"):
     """The file that ships is byte-for-byte the text this run built.
 
@@ -1887,6 +1933,7 @@ def published_bytes_error(out, text, what="the facade"):
             "of nothing that shipped")
 
 
+@checked_by_self_test
 def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
     """A finished run must leave none of its scratch files beside the artifact.
 
@@ -1922,6 +1969,7 @@ def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
     return None
 
 
+@checked_by_self_test
 def kept_candidate(path):
     """Say what is ACTUALLY at the candidate path, at the moment of saying it.
 
@@ -1947,6 +1995,7 @@ def kept_candidate(path):
     return f"candidate kept at {path}, {size} bytes"
 
 
+@checked_by_self_test
 def declared_written_error(line_map, inductive_decls):
     """Everything the manifest calls a declared inductive was actually written as
     one, and nothing else was.
@@ -2238,6 +2287,7 @@ def process_state():
     }
 
 
+@checked_by_self_test
 def restore_process_state(before):
     """Put back everything in STATE_FIELDS that can be put back.
 
@@ -2258,6 +2308,7 @@ def restore_process_state(before):
         signal.signal(sig, handler)
 
 
+@checked_by_self_test
 def process_state_drift(before, after):
     """What a case changed and did not put back.
 
@@ -2518,9 +2569,7 @@ def unexercised_guards(namespace, entry):
                 walk(const)
 
     walk(entry.__code__)
-    defined = {name for name, value in namespace.items()
-               if name.endswith("_error") and callable(value)}
-    return sorted(defined - seen)
+    return sorted(set(SELF_TEST_REGISTRY) - seen)
 
 
 def self_test():
@@ -2543,6 +2592,17 @@ def self_test():
     """
     work = tempfile.mkdtemp(prefix="fln-l8f-selftest-")
     failures, checked = [], []
+
+    def _report_divergence_says(_work):
+        """Run the real reporter and capture whether it said anything."""
+        buffered = io.StringIO()
+        real = sys.stderr
+        sys.stderr = buffered
+        try:
+            _report_divergence()
+        finally:
+            sys.stderr = real
+        return buffered.getvalue().strip() or None
 
     def blocked(thunk):
         """The sandbox's own verdict, as an error string the way a guard reports.
@@ -2834,6 +2894,18 @@ def self_test():
     _missing = unexercised_guards(globals(), self_test)
     case("coverage/every-guard-has-a-case",
          f"never exercised: {_missing}" if _missing else None, False)
+    _unmarked = unmarked_verdict_functions(globals())
+    case("coverage/every-verdict-function-is-marked",
+         f"verdict-shaped but unregistered: {_unmarked}" if _unmarked else None,
+         False)
+    case("coverage/registry-is-not-empty",
+         None if len(SELF_TEST_REGISTRY) >= 10
+         else f"only {len(SELF_TEST_REGISTRY)} marked", False)
+    # _report_divergence is what actually prints the out-of-step note on every
+    # abnormal termination, and it had no case at all. With nothing published and
+    # nothing replaced it must stay silent.
+    case("divergence/reporter-silent-when-nothing-happened",
+         _report_divergence_says(work), False)
 
     # A PLANTED FAILURE, BECAUSE THE HARNESS HAS NEVER BEEN CHECKED EITHER. Every
     # case above routes its verdict through `case`, and `case` had nothing
@@ -2873,8 +2945,7 @@ def self_test():
     # The guard count is COUNTED, not typed. It read "7 guards" while the file
     # defined ten `*_error` predicates, five of which this self-test had never
     # called -- the number was written down once and then stopped being true.
-    _guards = sum(1 for name, value in globals().items()
-                  if name.endswith("_error") and callable(value))
+    _guards = len(SELF_TEST_REGISTRY)
     print(f"facade-module: SELF-TEST OK — {len(checked)} cases across {_guards} guards "
           f"and its own sandbox: "
           + " ".join(checked), file=sys.stderr)
@@ -4437,6 +4508,7 @@ def main():
 
 
 
+@checked_by_self_test
 def _report_divergence():
     """The pair-inconsistency note, said once however the run is ending.
 
