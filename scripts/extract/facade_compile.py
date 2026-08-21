@@ -3694,6 +3694,9 @@ def main():
     kernel_special_quarantine_inequality_join = {"summary_kernel_special_population": manifest_summary.get("kernel_special_population"), "summary_quarantined": manifest_summary.get("quarantined")}
     if (not isinstance(kernel_special_quarantine_inequality_join["summary_kernel_special_population"], int) or isinstance(kernel_special_quarantine_inequality_join["summary_kernel_special_population"], bool) or not isinstance(kernel_special_quarantine_inequality_join["summary_quarantined"], int) or isinstance(kernel_special_quarantine_inequality_join["summary_quarantined"], bool) or kernel_special_quarantine_inequality_join["summary_kernel_special_population"] <= kernel_special_quarantine_inequality_join["summary_quarantined"]):
         raise SystemExit("REFUSE: facade manifest kernel-special population must exceed quarantine count " + json.dumps(kernel_special_quarantine_inequality_join, sort_keys=True))
+    init_substrate_quarantine_inequality_join = {"summary_init_substrate_checked": manifest_summary.get("init_substrate_checked"), "summary_quarantined": manifest_summary.get("quarantined")}
+    if (not isinstance(init_substrate_quarantine_inequality_join["summary_init_substrate_checked"], int) or isinstance(init_substrate_quarantine_inequality_join["summary_init_substrate_checked"], bool) or not isinstance(init_substrate_quarantine_inequality_join["summary_quarantined"], int) or isinstance(init_substrate_quarantine_inequality_join["summary_quarantined"], bool) or init_substrate_quarantine_inequality_join["summary_init_substrate_checked"] <= init_substrate_quarantine_inequality_join["summary_quarantined"]):
+        raise SystemExit("REFUSE: facade manifest Init-substrate count must exceed quarantine count " + json.dumps(init_substrate_quarantine_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5889,6 +5892,9 @@ def main():
         ),
         "manifest_kernel_special_quarantine_inequality_join": (
             kernel_special_quarantine_inequality_join
+        ),
+        "manifest_init_substrate_quarantine_inequality_join": (
+            init_substrate_quarantine_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
