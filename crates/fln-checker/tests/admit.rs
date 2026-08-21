@@ -2190,6 +2190,36 @@ fn kr600_803_init_prod_refuses_a_forged_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_sum_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = init_sum_entries();
+    for (entry, expected_index) in [(&entries[1], 0), (&entries[2], 1)] {
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Sum"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 2);
+        assert_eq!(metadata.num_fields(), 1);
+        assert_eq!(entry.declaration().level_parameters().len(), 2);
+    }
+}
+
+#[test]
+fn kr600_803_init_prod_fixture_pins_constructor_index_parameters_and_fields() {
+    let entries = init_prod_entries();
+    let constructor = entries[1].declaration();
+    let metadata = constructor
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
+    assert_eq!(metadata.inductive(), &checker_name("Prod"));
+    assert_eq!(metadata.index(), 0);
+    assert_eq!(metadata.num_parameters(), 2);
+    assert_eq!(metadata.num_fields(), 2);
+    assert_eq!(constructor.level_parameters().len(), 2);
+}
+
+#[test]
 fn kr600_803_sum_and_prod_recursor_major_premises_close_the_bvar_span() {
     for recursor in [init_sum_entries().remove(3), init_prod_entries().remove(2)] {
         let facts = match inspect(recursor.declaration().type_(), TermBudget::unlimited()) {
