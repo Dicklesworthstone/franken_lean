@@ -2586,6 +2586,114 @@ mod tests {
         .bytes
     }
 
+    /// One universe-polymorphic axiom, so the region contains a `Level.param`
+    /// object — tag 4, the arity-sensitive constructor.
+    fn param_level_module() -> Vec<u8> {
+        let u = Name::from_components(["u"]);
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "poly"]),
+                        level_params: vec![u.clone()],
+                        type_: Expr::sort(Level::param(u)),
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `Level.param` claiming an arity other than one is refused.
+    ///
+    /// The source comment on this rule records why it matters: both the eager
+    /// `Name` decode and the stored `Data` read are indexed by `other`, so a
+    /// wrong arity makes BOTH run past the object. That is a misread, and left
+    /// unchecked it would surface as a `Level.Data` cross-check divergence or a
+    /// nonsense universe name rather than as a shape error.
+    ///
+    /// The mutant has to move the size WITH the arity. `other` and `cs_sz` are
+    /// bound to each other by the Level size law (7498bf87), so raising the
+    /// arity alone trips that check first and never reaches this one — the two
+    /// rules are independent and this cell proves it by satisfying the first
+    /// deliberately.
+    #[test]
+    fn a_level_param_claiming_the_wrong_arity_is_refused() {
+        let mut bytes = param_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified universe-polymorphic fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let sort_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("Sort expression");
+        let level_off = view
+            .deref(view.read_u64(sort_off + 8).expect("level pointer"))
+            .expect("Level object");
+
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("Level header");
+        assert_eq!(tag, 4, "Level.param");
+        assert_eq!(other, 1, "one slot: the universe name");
+        assert_eq!(cs_sz, 24, "plus the stored Data word");
+
+        // Claim two slots AND the 32-byte size that arity implies, so the size
+        // law is satisfied and only the param/mvar arity rule can object.
+        let header = view.read_u64(level_off).expect("header word");
+        let planted = (header & !0x0000_ffff_ffff_0000) | (2_u64 << 48) | (32_u64 << 32);
+        bytes[level_off as usize..level_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("planted header");
+        assert_eq!(
+            (tag, other, cs_sz),
+            (4, 2, 32),
+            "the plant landed as intended"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a param level with the wrong arity must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Level param/mvar arity",
+                    ..
+                }
+            ),
+            "expected the arity refusal rather than the size law or a Data \
+             cross-check: {error:?}"
+        );
+    }
+
     /// One axiom whose type is `Sort (0+1+1)`, so the outer `Level.succ` has a
     /// heap child rather than a scalar one.
     ///
