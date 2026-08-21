@@ -2315,6 +2315,23 @@ def main():
             "REFUSE: facade manifest distinct-pin count diverges "
             f"({json.dumps(distinct_pin_presence_count_join, sort_keys=True)})"
         )
+    safety_implementation_probe_join = {
+        "summary_safety_probed": manifest_summary.get("safety_probed"),
+        "summary_implemented_by_probed": manifest_summary.get(
+            "implemented_by_probed"
+        ),
+        "pinned_safety_implementation_count": 2042,
+    }
+    if (safety_implementation_probe_join["summary_safety_probed"]
+            != safety_implementation_probe_join[
+                "pinned_safety_implementation_count"]
+            or safety_implementation_probe_join["summary_implemented_by_probed"]
+            != safety_implementation_probe_join[
+                "pinned_safety_implementation_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest safety-implementation probe diverges "
+            f"({json.dumps(safety_implementation_probe_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3463,6 +3480,9 @@ def main():
         ),
         "manifest_distinct_pin_presence_count_join": (
             distinct_pin_presence_count_join
+        ),
+        "manifest_safety_implementation_probe_join": (
+            safety_implementation_probe_join
         ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
