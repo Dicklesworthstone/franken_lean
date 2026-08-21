@@ -1278,6 +1278,29 @@ fn init_empty_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_false_entries() -> Vec<ConstantEntry> {
+    let false_name = checker_name("False");
+    let rec = checker_qualified(&["False", "rec"]);
+    let u_name = checker_name("u");
+    let u = Level::param(primary_name("u"));
+    let false_expr = || Expr::const_(primary_name("False"), Vec::new());
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = primary_pi("t", BinderInfo::Default, false_expr(), Expr::sort(u));
+    let rec_type = primary_pi("motive", BinderInfo::Implicit, motive, primary_pi(
+        "t", BinderInfo::Default, false_expr(), Expr::app(bv(1), bv(0)),
+    ));
+    vec![
+        ConstantEntry::new(false_name.clone(), ConstantDeclaration::inductive(
+            Vec::new(), decoded(&Expr::sort(Level::zero())), ConstantSafety::Safe,
+            InductiveDeclaration::new(0, 0, vec![false_name.clone()], Vec::new(), 0, false, false),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            vec![u_name], decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![false_name], 0, 0, 1, 0, Vec::new(), false),
+        )),
+    ]
+}
+
 /// `Init.PEmpty.{u}` keeps its family universe and eliminator universe
 /// separate. The exact recursor is what prevents an empty row set from being a
 /// vacuous admission.
@@ -2020,6 +2043,25 @@ fn kr600_803_init_empty_refuses_a_forged_recursor_rule() {
             fln_checker::admit::InductiveRejection::RecursorShape { .. }
         )
     ));
+}
+
+#[test]
+fn kr600_803_init_false_eliminator_is_reconstructed_independently() {
+    let entries = init_false_entries();
+    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    assert!(verdict.is_admitted(), "exact Init.False block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_false_refuses_a_forged_recursor_rule() {
+    let mut entries = init_false_entries();
+    let declaration = entries[1].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[1] = ConstantEntry::new(checker_qualified(&["False", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["False", "forged"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
