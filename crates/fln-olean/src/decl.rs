@@ -1172,6 +1172,12 @@ pub struct ChainConstants {
     pub constants: Vec<ConstantInfo>,
     /// `origins[i]` is the origin of `constants[i]`.
     pub origins: Vec<ConstantOrigin>,
+    /// Declaration name to its position in `constants`.
+    ///
+    /// Private, because it only means anything while it agrees with
+    /// `constants`; it is built once at construction and the struct is only
+    /// ever built here, so the two cannot drift apart.
+    index: HashMap<Name, usize>,
 }
 
 impl ChainConstants {
@@ -1203,10 +1209,17 @@ impl ChainConstants {
     /// `constants` against `origins` by hand, which is the plumbing that has
     /// made guessing from the name look like the easier option.
     pub fn origin_of(&self, name: &Name) -> Option<ConstantOrigin> {
-        self.constants
-            .iter()
-            .position(|info| info.name() == name)
+        self.position_of(name)
             .and_then(|index| self.origins.get(index).copied())
+    }
+
+    /// The position of one declaration in `constants`, by name.
+    ///
+    /// Answers from the name index rather than scanning, so a caller checking
+    /// many names over a large module is linear rather than quadratic —
+    /// `Init.Prelude` alone carries 2,314 declarations.
+    pub fn position_of(&self, name: &Name) -> Option<usize> {
+        self.index.get(name).copied()
     }
 }
 
@@ -1409,9 +1422,20 @@ pub fn decode_chain_constants_with_origin(
         });
     }
 
+    // First occurrence wins, which is what the linear scan this replaces did.
+    // The mirror law in `decode_module_constants` and the pin itself both make
+    // a repeat within one module's array impossible — zero across all 2,431
+    // chained modules — but the tie-break is pinned rather than left to
+    // whichever entry a later insert happened to overwrite.
+    let mut index: HashMap<Name, usize> = HashMap::with_capacity(private_constants.len());
+    for (position, info) in private_constants.iter().enumerate() {
+        index.entry(info.name().clone()).or_insert(position);
+    }
+
     Ok(ChainConstants {
         constants: private_constants,
         origins,
+        index,
     })
 }
 
@@ -1564,6 +1588,65 @@ mod tests {
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ),
     ];
+
+    /// The name index must answer exactly what the linear scan it replaced did,
+    /// for every declaration of a real module.
+    ///
+    /// An index is only worth having if it is indistinguishable from the scan;
+    /// a faster wrong answer is worse than a slow right one. This checks the
+    /// two agree on every name in `Init.Prelude` — 2,314 declarations, the
+    /// largest chain in Init — rather than on a sample.
+    #[test]
+    fn the_name_index_agrees_with_a_linear_scan_on_every_declaration() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_name_index_agrees_with_a_linear_scan_on_every_declaration: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |suffix: &str| {
+            std::fs::read(lib.join(format!("Init/Prelude.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read Init/Prelude{suffix}: {error}"))
+        };
+        let exported = read("");
+        let server = read(".server");
+        let private = read(".private");
+        let chained =
+            decode_chain_constants_from_parts(&exported, &server, &private, ChainLimits::default())
+                .expect("Init.Prelude's chain decodes");
+        assert_eq!(chained.constants.len(), 2_314, "Init.Prelude at the pin");
+
+        for (expected_position, info) in chained.constants.iter().enumerate() {
+            // The scan this replaced: first occurrence wins.
+            let scanned = chained
+                .constants
+                .iter()
+                .position(|other| other.name() == info.name());
+            assert_eq!(
+                chained.position_of(info.name()),
+                scanned,
+                "index and scan disagree for {}",
+                info.name().to_display_string()
+            );
+            assert_eq!(
+                chained.position_of(info.name()),
+                Some(expected_position),
+                "{} is at {expected_position} and the pin has no repeats",
+                info.name().to_display_string()
+            );
+            assert_eq!(
+                chained.origin_of(info.name()),
+                chained.origins.get(expected_position).copied(),
+                "origin_of disagrees with origins[{expected_position}]"
+            );
+        }
+
+        // A name the chain does not declare must be absent from both.
+        let absent = Name::from_components(["fln", "not", "a", "declaration"]);
+        assert_eq!(chained.position_of(&absent), None);
+        assert_eq!(chained.origin_of(&absent), None);
+    }
 
     /// The VIEW door must refuse a mismatched pair on its own.
     ///
