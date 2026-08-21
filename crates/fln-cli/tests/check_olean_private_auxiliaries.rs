@@ -596,6 +596,24 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportResiduals",
+        11,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.CliPrivateReport.0._sunfold",
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.eq_1",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.CliPrivateReport.0.match_1",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "coreObservablesLoopResiduals",
         3,
         &[
@@ -1016,6 +1034,25 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0.loop",
             "_private.CliPrivateReport.0.loop.eq_def",
             "_private.CliPrivateReport.0.loop._proof_1",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport residuals",
+        "decoded _private CliPrivateReport residual names",
+        11,
+        &[
+            "_private.CliPrivateReport.0._f",
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.CliPrivateReport.0._sunfold",
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.eq_1",
+            "_private.CliPrivateReport.0.eq_def",
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.CliPrivateReport.0.match_1",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
         ],
     );
     assert_human_named_residuals(

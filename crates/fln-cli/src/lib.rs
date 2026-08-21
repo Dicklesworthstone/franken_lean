@@ -2701,6 +2701,10 @@ fn is_private_cli_private_report_loop_residual(display: &str) -> bool {
         && display.split('.').any(|component| component == "loop")
 }
 
+fn is_private_cli_private_report_residual(display: &str) -> bool {
+    display.starts_with("_private.CliPrivateReport.")
+}
+
 fn is_core_observables_loop_residual(display: &str) -> bool {
     CORE_OBSERVABLES_LOOP_RESIDUAL_PREFIXES
         .iter()
@@ -3113,6 +3117,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_cli_private_report_loop_residual,
     );
+    let mut private_cli_private_report_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_cli_private_report_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_cli_private_report_residual,
+    );
     let mut core_observables_loop_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3411,6 +3423,13 @@ fn render_check_olean_success(
         render_named_residuals_json(&mut private_cli_private_report_loop_residuals)
     } else {
         render_named_residuals_human(&mut private_cli_private_report_loop_residuals)
+    };
+    let private_cli_private_report_observed = private_cli_private_report_residuals.observed;
+    let private_cli_private_report_omitted = private_cli_private_report_residuals.omitted();
+    let private_cli_private_report_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_residuals)
     };
     let core_observables_loop_observed = core_observables_loop_residuals.observed;
     let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
@@ -3734,6 +3753,7 @@ fn render_check_olean_success(
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3793,6 +3813,9 @@ fn render_check_olean_success(
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
+            private_cli_private_report_observed,
+            private_cli_private_report_names,
+            private_cli_private_report_omitted,
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
@@ -3942,6 +3965,9 @@ fn render_check_olean_success(
                 "decoded _private CliPrivateReport.loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport.loop residual names: {}\n",
                 "decoded _private CliPrivateReport.loop residual names omitted: {}\n",
+                "decoded _private CliPrivateReport residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport residual names: {}\n",
+                "decoded _private CliPrivateReport residual names omitted: {}\n",
                 "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables .loop residual names: {}\n",
                 "core-observables .loop residual names omitted: {}\n",
@@ -4088,6 +4114,9 @@ fn render_check_olean_success(
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
+            private_cli_private_report_observed,
+            private_cli_private_report_names,
+            private_cli_private_report_omitted,
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
@@ -4566,6 +4595,16 @@ fn render_check_olean_set_success(
             is_private_cli_private_report_loop_residual,
         );
     }
+    let mut private_cli_private_report_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_cli_private_report_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_cli_private_report_residual,
+        );
+    }
     let mut core_observables_loop_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4954,6 +4993,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_loop_residuals)
     };
+    let private_cli_private_report_observed = private_cli_private_report_residuals.observed;
+    let private_cli_private_report_omitted = private_cli_private_report_residuals.omitted();
+    let private_cli_private_report_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_residuals)
+    };
     let core_observables_loop_observed = core_observables_loop_residuals.observed;
     let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
     let core_observables_loop_names = if json {
@@ -5282,6 +5328,7 @@ fn render_check_olean_set_success(
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateMatchNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -5343,6 +5390,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
+            private_cli_private_report_observed,
+            private_cli_private_report_names,
+            private_cli_private_report_omitted,
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
@@ -5494,6 +5544,9 @@ fn render_check_olean_set_success(
                 "decoded _private CliPrivateReport.loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport.loop residual names: {}\n",
                 "decoded _private CliPrivateReport.loop residual names omitted: {}\n",
+                "decoded _private CliPrivateReport residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport residual names: {}\n",
+                "decoded _private CliPrivateReport residual names omitted: {}\n",
                 "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables .loop residual names: {}\n",
                 "core-observables .loop residual names omitted: {}\n",
@@ -5642,6 +5695,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_loop_observed,
             private_cli_private_report_loop_names,
             private_cli_private_report_loop_omitted,
+            private_cli_private_report_observed,
+            private_cli_private_report_names,
+            private_cli_private_report_omitted,
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
