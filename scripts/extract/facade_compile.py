@@ -3225,6 +3225,30 @@ def main():
             "REFUSE: facade manifest type-roundtrip count must exceed "
             f"inductive-declaration count ({json.dumps(roundtrip_inductive_inequality_join, sort_keys=True)})"
         )
+    declaration_kernel_special_inequality_join = {
+        "summary_declarations_emitted": manifest_summary.get(
+            "declarations_emitted"
+        ),
+        "summary_kernel_special_population": manifest_summary.get(
+            "kernel_special_population"
+        ),
+    }
+    if (not isinstance(declaration_kernel_special_inequality_join[
+            "summary_declarations_emitted"], int)
+            or isinstance(declaration_kernel_special_inequality_join[
+                "summary_declarations_emitted"], bool)
+            or not isinstance(declaration_kernel_special_inequality_join[
+                "summary_kernel_special_population"], int)
+            or isinstance(declaration_kernel_special_inequality_join[
+                "summary_kernel_special_population"], bool)
+            or declaration_kernel_special_inequality_join[
+                "summary_declarations_emitted"]
+            <= declaration_kernel_special_inequality_join[
+                "summary_kernel_special_population"]):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration count must exceed kernel "
+            f"special population ({json.dumps(declaration_kernel_special_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5321,6 +5345,9 @@ def main():
         ),
         "manifest_roundtrip_inductive_inequality_join": (
             roundtrip_inductive_inequality_join
+        ),
+        "manifest_declaration_kernel_special_inequality_join": (
+            declaration_kernel_special_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
