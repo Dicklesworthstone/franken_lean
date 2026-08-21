@@ -1426,6 +1426,64 @@ def probe_generated_ctor_types(lean, env, work, text, decl, deps, owners):
     return owners_bad
 
 
+def probe_refused_inductives(lean, env, work, text, line_map, decl, deps, blocks):
+    """Does a refused inductive still fail against the FINISHED facade?
+
+    A refusal is recorded the moment some attempt's pin run blames the block, and
+    the facade at that moment is not the facade that ships: the repair loop is
+    still demoting structures, promoting transparents and re-admitting quarantine
+    around it. The same non-monotonicity is already recorded for quarantine one
+    loop up -- 8 of 16 quarantined rows elaborate cleanly against the finished
+    facade -- and nothing was applying it to inductives, so a row could be
+    published as "pin rejected the inductive block" when the published artifact
+    accepts it.
+
+    Each refused block is spliced in place of the `axiom` line the row actually
+    got, so ORDER is tested as it ships rather than by appending at the end, and
+    the pin decides. Returns {name: None} when the refusal no longer reproduces
+    and {name: reason} when it does.
+    """
+    lines = text.rstrip("\n").split("\n")
+    axiom_line = {}
+    for ln, hit in line_map.items():
+        if isinstance(hit, tuple) and hit[0] == "axiom":
+            axiom_line[hit[1]] = ln
+    verdict = {}
+    for name in sorted(blocks):
+        block, generated = blocks[name]
+        ln = axiom_line.get(name)
+        if not block or ln is None or ln > len(lines):
+            continue
+        # DECLARING THE BLOCK MAKES THE KERNEL WRITE ITS CONSTRUCTORS, so the
+        # `axiom` lines this facade emitted for those same constants have to come
+        # OUT -- that is what `provided` does during real emission. Splicing the
+        # block in without removing them made the pin report
+        # "`Std.DHashMap.Raw.WF.alter₀` has already been declared", which is a
+        # collision this probe created and not a property of the row.
+        drop = {axiom_line[g] for g in generated if g in axiom_line}
+        variant = []
+        for i, line in enumerate(lines, start=1):
+            if i in drop:
+                continue
+            variant.extend(block if i == ln else [line])
+        path = os.path.join(work, "flnri.lean")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(variant) + "\n")
+        proc = subprocess.run(
+            [lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false", path],
+            capture_output=True, text=True, env=env, timeout=1800)
+        out = proc.stdout + proc.stderr
+        base = os.path.basename(path)
+        errs = [m for m in re.finditer(
+            rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out)]
+        if not errs:
+            verdict[name] = None
+        else:
+            first = errs[0]
+            verdict[name] = ((first.group(2) or "-") + ": " + first.group(3))[:200]
+    return verdict
+
+
 def structural_refusal(name, st, bs):
     """Why a structure may not be emitted structurally, decided BEFORE the pin is
     asked, so the reason is a fact rather than a diagnostic."""
@@ -2224,6 +2282,30 @@ def main():
     (_, text, line_map, emitted, attr_count, provided, quarantine, explicit_for,
      maxexp_for, dropped_attrs, structural, transparent) = best
 
+    # A REFUSAL RECORDED MID-REPAIR IS NOT A REFUSAL BY THE PUBLISHED ARTIFACT.
+    # Rebuild each refused block against the facade that actually ships and let
+    # the pin say whether the reason still holds; a reason that does not
+    # reproduce describes some intermediate state and must not be published as a
+    # fact about the row.
+    refused_blocks = {}
+    for nm in sorted(inductive_refused):
+        dd, ivv = decl.get(nm), pin_inductives.get(nm)
+        if not dd or not ivv:
+            continue
+        blk = inductive_block(nm, dd, ivv, types, deps.get(nm, ()),
+                              pbinders.get(nm, {}), binders.get(nm, {}), deps,
+                              pin_ind_params.get(nm, {}), pin_ctor_bodies,
+                              pin_ind_result)
+        if blk:
+            gen = set(ivv["ctors"])
+            gen |= {f"{nm}.{suf}" for suf in ind_companions}
+            gen |= {(f"{c}.{suf}" if suf else c)
+                    for c in ivv["ctors"] for suf in ctor_companions}
+            refused_blocks[nm] = (blk, gen)
+    refusal_verdict = probe_refused_inductives(
+        lean, env, work, text, line_map, decl, deps, refused_blocks)
+    unreproduced = sorted(n for n, v in refusal_verdict.items() if v is None)
+
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
 
@@ -2734,6 +2816,19 @@ def main():
         "inductive_refused": len(inductive_refused),
         "inductive_refused_reasons": {k: inductive_refused[k]
                                       for k in sorted(inductive_refused)},
+        "inductive_refusal_reproduced": {
+            k: v for k, v in sorted(refusal_verdict.items()) if v is not None},
+        "inductive_refusal_not_reproduced": unreproduced,
+        "inductive_refusal_note": "each refused block was rebuilt against the "
+            "PUBLISHED facade and spliced in place of the `axiom` line the row "
+            "actually got, so its emission ORDER is tested as it ships rather "
+            "than by appending it where everything it names is already declared. "
+            "A refusal is recorded the moment some attempt's pin run blames the "
+            "block, and the facade at that moment is still being repaired around "
+            "it -- the same non-monotonicity already recorded for quarantine, "
+            "where 8 of 16 rows elaborate cleanly against the finished facade. A "
+            "row under not_reproduced is one the published artifact ACCEPTS as an "
+            "inductive and that is published as an axiom anyway.",
         "inductive_refused_demanded": sorted(
             n for n in inductive_refused if n in facade_demand),
         "inductive_companions_measured": ind_companions,
@@ -2990,6 +3085,7 @@ def main():
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)}/{len(maxexp_type_checked)}maxexp roundtrip={roundtrip_checked} "
           f"values={values_checked} "
+          f"refusal_unreproduced={len(unreproduced)} "
           f"inductives={len(inductive_decls)}/{len(inductive_refused)}refused "
           f"kind={len(pin_kind)} kind_drift={len(kind_disagreements)} "
           f"implby={len(pin_impl_by)} implby_drift={len(impl_by_disagreements)} "
