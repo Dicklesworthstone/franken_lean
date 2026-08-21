@@ -4824,3 +4824,176 @@ fn the_generated_eliminator_family_follows_from_fields_already_read() {
         inductives.len()
     );
 }
+
+/// Members of the generated eliminator family that are not stored as
+/// definitions, with the kind each is stored as instead.
+const NON_DEFINITION_ELIMINATORS: &[(&str, &str)] =
+    &[("Nat.le.below", "Induct"), ("Nat.le.brecOn", "Thm")];
+
+/// What a generated eliminator's VALUE contains and how it unfolds — two stored
+/// fields nothing had read for this family.
+///
+/// The cell above asserts only that these declarations EXIST. A `casesOn` whose
+/// body had been replaced by an unrelated constant satisfies it, and satisfies
+/// the reference-closure cells too: those require every referenced name to
+/// resolve and say nothing about WHICH names appear. Three exact relations over
+/// `Init/Prelude` at private level:
+///
+///   Every member stored as a definition carries `ReducibilityHints::Abbrev` —
+///     127 `casesOn`, 125 `recOn`, 115 `noConfusion`, 115 `noConfusionType`, 5
+///     `below`, 5 `brecOn`; 492 declarations, no exception. Not vacuous: of the
+///     module's 1,720 definitions 549 are `Regular` or `Opaque`.
+///
+///   Every `casesOn` and `recOn` value references EXACTLY ONE recursor, and it
+///     is its own inductive's. The claim is deliberately not "the set contains
+///     `X.rec`", which a walk returning too much would also satisfy; pinning the
+///     count to one makes the walk's precision part of what is asserted.
+///
+///   `noConfusion` delegates to `noConfusionType`, and `brecOn` to `below` —
+///     0 missing of 115 and of 6.
+///
+/// The family is also NOT kind-uniform, and that is the fact underneath the
+/// exception in the cell above: `Nat.le.below` is an INDUCTIVE and
+/// `Nat.le.brecOn` a THEOREM. `Nat.le` is a Prop, so its `below` is generated as
+/// an inductive family rather than a definition and its `brecOn` proves a
+/// proposition rather than computing one. `Nat.le.below` being an inductive is
+/// exactly why it is itself an inductive needing no `below`, which is the shape
+/// the `below` iff carves out by name.
+#[test]
+fn generated_eliminators_are_abbreviations_that_delegate_to_their_recursor() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+    let all_kinds = kinds(&infos);
+
+    let mut inductives: BTreeSet<String> = BTreeSet::new();
+    let mut recursors: BTreeSet<String> = BTreeSet::new();
+    let mut definitions: BTreeMap<String, (&ReducibilityHints, &Expr)> = BTreeMap::new();
+    let mut values: BTreeMap<String, &Expr> = BTreeMap::new();
+    let mut not_abbrev_elsewhere = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(_) => drop(inductives.insert(name)),
+            ConstantInfo::Rec(_) => drop(recursors.insert(name)),
+            ConstantInfo::Thm(v) => drop(values.insert(name, &v.value)),
+            ConstantInfo::Defn(v) => {
+                if !matches!(v.hints, ReducibilityHints::Abbrev) {
+                    not_abbrev_elsewhere += 1;
+                }
+                values.insert(name.clone(), &v.value);
+                definitions.insert(name, (&v.hints, &v.value));
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        inductives.len() > 100 && recursors.len() > 100,
+        "the inductive and recursor censuses must be reached, got {} and {}",
+        inductives.len(),
+        recursors.len()
+    );
+
+    const SUFFIXES: [&str; 6] = [
+        "casesOn",
+        "recOn",
+        "noConfusion",
+        "noConfusionType",
+        "below",
+        "brecOn",
+    ];
+    let mut abbrev: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut not_abbrev: Vec<String> = Vec::new();
+    let mut non_definition: Vec<(String, &'static str)> = Vec::new();
+    let mut wrong_recursor_count: Vec<(String, usize)> = Vec::new();
+    let mut foreign_recursor: Vec<String> = Vec::new();
+    let mut missing_delegate: Vec<String> = Vec::new();
+    let mut delegated = 0usize;
+
+    for inductive in &inductives {
+        for suffix in SUFFIXES {
+            let member = format!("{inductive}.{suffix}");
+            let Some(kind) = all_kinds.get(&member) else {
+                continue;
+            };
+            match definitions.get(&member) {
+                Some((hints, _)) => {
+                    if matches!(hints, ReducibilityHints::Abbrev) {
+                        *abbrev.entry(suffix).or_default() += 1;
+                    } else {
+                        not_abbrev.push(member.clone());
+                    }
+                }
+                None => non_definition.push((member.clone(), kind)),
+            }
+
+            // The delegation each generated member owes to the declaration it
+            // is built from. `below` is generated from the inductive's own
+            // constructors and owes nothing, so it is not listed here.
+            let delegate = match suffix {
+                "casesOn" | "recOn" => format!("{inductive}.rec"),
+                "noConfusion" => format!("{inductive}.noConfusionType"),
+                "brecOn" => format!("{inductive}.below"),
+                _ => continue,
+            };
+            let Some(value) = values.get(&member) else {
+                continue;
+            };
+            let referenced = referenced_constants(value);
+            if !referenced.contains(&delegate) {
+                missing_delegate.push(member.clone());
+            } else {
+                delegated += 1;
+            }
+            if matches!(suffix, "casesOn" | "recOn") {
+                let seen: Vec<&String> = referenced.intersection(&recursors).collect();
+                if seen.len() != 1 {
+                    wrong_recursor_count.push((member.clone(), seen.len()));
+                } else if *seen[0] != delegate {
+                    foreign_recursor.push(member);
+                }
+            }
+        }
+    }
+
+    assert!(
+        not_abbrev.is_empty(),
+        "every generated eliminator stored as a definition is an abbreviation; these are not: {not_abbrev:?}"
+    );
+    let counted: usize = abbrev.values().sum();
+    assert_eq!(
+        counted, 492,
+        "the abbreviation census must be complete, got {abbrev:?}"
+    );
+    // Non-vacuity: `Abbrev` is a minority verdict over the module, so a decoder
+    // answering `Abbrev` for everything would be caught here rather than
+    // silently satisfying the assertion above.
+    assert!(
+        not_abbrev_elsewhere > 400,
+        "abbreviation must not be the universal hint, got {not_abbrev_elsewhere} others"
+    );
+
+    assert!(
+        wrong_recursor_count.is_empty() && foreign_recursor.is_empty(),
+        "a casesOn/recOn value names exactly one recursor, its own: {wrong_recursor_count:?} \
+         {foreign_recursor:?}"
+    );
+    assert!(
+        missing_delegate.is_empty(),
+        "these generated eliminators do not reference the declaration they are built from: \
+         {missing_delegate:?}"
+    );
+    assert_eq!(
+        delegated, 373,
+        "the delegation census must be complete (127 casesOn, 125 recOn, 115 noConfusion, \
+         6 brecOn)"
+    );
+
+    let observed: Vec<(&str, &str)> = non_definition
+        .iter()
+        .map(|(name, kind)| (name.as_str(), *kind))
+        .collect();
+    assert_eq!(
+        observed, NON_DEFINITION_ELIMINATORS,
+        "the generated family is not kind-uniform, and these are the members that depart"
+    );
+}
