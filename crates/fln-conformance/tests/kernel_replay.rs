@@ -4858,6 +4858,66 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// Write an olean whose FILE NAME is not valid UTF-8.
+///
+/// Only the stem is invalid: the extension stays `olean` so the entry is
+/// genuinely collected by the walk's filter and reaches the projection. A name
+/// that failed the extension test would be skipped for the wrong reason and
+/// would prove nothing about the branch under test.
+#[cfg(unix)]
+fn write_non_utf8_olean(dir: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let path = dir.join(std::ffi::OsStr::from_bytes(b"Bad\xFF.olean"));
+    fs::write(&path, b"").unwrap_or_else(|error| panic!("create non-UTF-8 fixture entry: {error}"));
+    path
+}
+
+/// An entry whose name is not UTF-8 is REFUSED, never quietly dropped.
+///
+/// **The two ways this could go, and why only one is acceptable.** The name has
+/// to become a module name, and it cannot. A projection that skipped what it
+/// could not decode would return a smaller inventory and no error -- and a
+/// smaller number is invisible here, because it looks exactly like a smaller
+/// corpus rather than like a file the walk gave up on. That is the
+/// filter-that-continues-is-a-sampler defect: the denominator silently changes
+/// and every count downstream is quietly about a different population. The only
+/// honest outcome is a typed refusal naming the entry.
+///
+/// **It is collected before it is refused, which is the point.** The extension
+/// is valid UTF-8 (`olean`), so the walk's filter accepts the entry and the
+/// failure happens in the projection, where it belongs. A fixture whose name
+/// failed the extension test would be skipped for an unrelated reason and would
+/// witness nothing.
+///
+/// **A good file sits beside it**, so the refusal cannot be "this walk fails on
+/// any tree", and so the test also says that ONE bad entry poisons the whole
+/// inventory rather than yielding a partial one. A partial inventory is the
+/// under-count above, wearing a success.
+///
+/// Unix only: a non-UTF-8 filename cannot be constructed portably. Stated rather
+/// than hidden -- elsewhere the behaviour is unverified, not verified.
+#[cfg(unix)]
+#[test]
+fn the_inventory_walk_refuses_an_entry_whose_name_is_not_utf8() {
+    let library = write_inventory_fixture("t6r7-inventory-non-utf8-v1", &["Good.olean"]);
+    write_non_utf8_olean(&library);
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(OleanInventory { oleans, modules }) => panic!(
+            "the walk ACCEPTED a tree holding an entry it cannot name: {} olean(s) became \
+             {modules:?}. If the unnameable entry was dropped, the inventory is short by exactly \
+             the files it gave up on and nothing downstream can tell that from a smaller corpus.",
+            oleans.len()
+        ),
+    };
+    assert!(
+        reason.contains("non-UTF-8"),
+        "the refusal must name the undecodable path rather than fail for something incidental: \
+         {reason}"
+    );
+}
+
 /// A symlinked FILE is refused, so the inventory cannot include something that
 /// is not in the pinned tree.
 ///
