@@ -8617,6 +8617,53 @@ fn truncate_after(row: &str, needle: &str) -> String {
     row[..start + needle.len()].to_string()
 }
 
+/// The schema NAME is the retained contract, and its value was pinned nowhere.
+///
+/// **Producer and reader both read the constant, so the value is unconstrained.**
+/// `to_row` writes `WHOLE_MATHLIB_RECEIPT_SCHEMA` and `from_row` compares
+/// against it. Change the constant and both move together: every test in this
+/// file still passes, and every receipt already retained under the old name
+/// becomes unreadable. The round-trip cell that mutates `receipt/1` into
+/// `receipt/2` tests that the CHECK works; it says nothing about which name the
+/// check is for.
+///
+/// **The failure is loud but wrong, which is its own hazard.** Unlike the
+/// retention directory -- where a change makes the guard report nothing retained
+/// -- a changed schema makes it REFUSE every retained row, with a message
+/// blaming the row rather than the rename. Whoever sees it is looking at
+/// evidence that was valid when it was written and is now being called
+/// malformed.
+///
+/// **So the name is written out here as a literal.** One side is the constant
+/// the code uses, the other is the name the retained rows were filed under.
+/// Changing the format is then a deliberate act: advance the version suffix,
+/// and decide what happens to rows carrying the old one -- rather than a rename
+/// that passes CI and quietly invalidates an archive.
+#[test]
+fn the_receipt_schema_name_is_part_of_the_retained_contract() {
+    assert_eq!(
+        WHOLE_MATHLIB_RECEIPT_SCHEMA, "fln.whole-mathlib-differential-receipt/1",
+        "retained receipts were filed under this exact name. If the format genuinely changed, \
+         advance the version suffix and say what becomes of rows carrying the old one; if it did \
+         not, this rename would make a valid archive unreadable"
+    );
+    assert!(
+        WHOLE_MATHLIB_RECEIPT_SCHEMA.ends_with("/1"),
+        "the trailing version is what a format change advances; without it there is nothing to \
+         distinguish an old row from a malformed one"
+    );
+
+    // AND A REAL ROW CARRIES IT, FIRST. Checking the constant alone would leave
+    // a producer that wrote some other name -- or wrote the schema somewhere in
+    // the middle -- entirely unexamined. A reader scanning a mixed NDJSON file
+    // identifies a row by the schema it leads with.
+    let row = sample_whole_mathlib_receipt().to_row();
+    assert!(
+        row.starts_with("{\"schema\":\"fln.whole-mathlib-differential-receipt/1\","),
+        "a produced row must lead with its schema: {row}"
+    );
+}
+
 /// The format is strict: a row must re-serialize to the bytes it was read from,
 /// and a reader that cannot reproduce a row must refuse it rather than repair it.
 #[test]
