@@ -2605,6 +2605,117 @@ mod tests {
         );
     }
 
+    /// One safe DEFINITION, so the region contains a `DefinitionVal` — the only
+    /// payload with a `safety` byte, and the first non-axiom in these fixtures.
+    fn definition_module() -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "def"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: Vec::new(),
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `safety` byte outside `0..=2` is refused rather than read as one of
+    /// the three definition kinds.
+    ///
+    /// Nothing shadows it. The byte is the FIRST scalar of the payload, at
+    /// `voff + 8 + 8*other`, so the plant leaves the header — and therefore the
+    /// arity and size rules — untouched, and it is not in the padding the
+    /// ConstantInfo padding rule guards. Both are asserted below rather than
+    /// argued: the header is re-read after the plant, and the padding bytes
+    /// after the safety byte are checked to be still zero.
+    #[test]
+    fn a_non_canonical_definition_safety_byte_is_refused() {
+        let mut bytes = definition_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified definition fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("DefinitionVal pointer"))
+            .expect("DefinitionVal object");
+
+        // DefinitionVal: base, value, hints, all — four slots — then the
+        // safety byte. 8 + 32 + 1 = 41, padded to 48.
+        let (tag, other, cs_sz) = view.obj_header(val_off).expect("DefinitionVal header");
+        assert_eq!(tag, 1, "Defn");
+        assert_eq!(other, 4, "base, value, hints, all");
+        assert_eq!(cs_sz, 48, "plus the safety byte, padded");
+
+        let safety = val_off as usize + 8 + 8 * 4;
+        assert_eq!(
+            bytes[safety], 1,
+            "the fixture is Safe, so the plant is a change"
+        );
+        assert!(
+            bytes[safety + 1..val_off as usize + 48]
+                .iter()
+                .all(|b| *b == 0),
+            "and its padding starts clean"
+        );
+
+        bytes[safety] = 3;
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(val_off).expect("header after plant"),
+            (1, 4, 48),
+            "the header is untouched, so the arity and size rules cannot fire"
+        );
+        assert!(
+            bytes[safety + 1..val_off as usize + 48]
+                .iter()
+                .all(|b| *b == 0),
+            "and the padding is untouched, so the padding rule cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a safety byte outside 0..=2 must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "safety byte",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// One axiom whose type is `forall (_ : Sort 0), Sort 0`, so the region
     /// contains a `forallE` — the branch of the Expr size table that carries a
     /// trailing binder byte after the `Data` word.
