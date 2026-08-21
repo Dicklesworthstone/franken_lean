@@ -1760,3 +1760,157 @@ fn the_third_shape_is_reached_only_through_module_entries() {
          one from the declaration graph: {examples:?}"
     );
 }
+
+/// A LOCATABLE witness per module, so the finding can be opened rather than
+/// only counted.
+///
+/// `1dd7c288` pins the aggregate: 99 third-shape objects, all reached through
+/// `entries`, none through `constants`. Aggregates are checkable and not
+/// openable - nothing in the file tells a reader where to put a debugger. This
+/// pins the per-module table and, for each module that has one, the address of
+/// a real instance.
+///
+/// THE ADDRESS IS THE LOWEST, NOT THE FIRST, and the distinction is a
+/// correction. w115 reported "first at `Init/Prelude.olean` `0x32e7d0`", and
+/// two of my commits repeated it. That is the first object in TRAVERSAL order -
+/// the order a stack-based walk happens to pop - which is reproducible only for
+/// a walker that pushes exactly as this one does. Change the traversal to a
+/// queue and the same corpus reports a different "first". The lowest address is
+/// a property of the data, so that is what this pins: `0x25ba60`. `0x32e7d0` is
+/// not wrong, it is just not an identifier.
+///
+/// THE GUARD IS AT THE PINNED ADDRESS. A pinned constant that nothing
+/// re-derives is a number that rots quietly; a stale offset would still be a
+/// valid `usize` and the test would still pass if all it did was compare
+/// counts. So the cell goes TO the address it pins and re-establishes, from the
+/// bytes, that the object there is `(1, 2)` at 24 bytes, that its tail is
+/// neither a cell nor nil, and that it is reachable from `entries` and not from
+/// `constants`. The pin and its meaning move together or the cell fails.
+///
+/// The three C3 modules are pinned at zero. That is not padding: it is what
+/// makes the Prelude row a contrast rather than the only observation, and it is
+/// why the sibling cells gate on the pin at all.
+#[test]
+fn the_third_shape_has_a_locatable_witness_per_module() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    // Per module: third-shape count, how many of those `entries` reaches, and
+    // the LOWEST address among them.
+    let mut table: Vec<(String, usize, usize, Option<usize>)> = Vec::new();
+    let mut total_third = 0usize;
+    let mut cons_reached_by_declarations = 0usize;
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root in range");
+        let declarations = reachable_from(bytes, base, word_at(bytes, root + 24));
+        let entries = reachable_from(bytes, base, word_at(bytes, root + 40));
+
+        let mut third: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            if (second & 1 == 1 && second >> 1 == 0)
+                || target.is_some_and(|t| (t.tag, t.other) == (1, 2))
+            {
+                if declarations.contains(&object.off) {
+                    cons_reached_by_declarations += 1;
+                }
+                continue;
+            }
+            third.push(object.off);
+        }
+
+        let via_entries: Vec<usize> = third
+            .iter()
+            .copied()
+            .filter(|off| entries.contains(off))
+            .collect();
+        total_third += third.len();
+        table.push((
+            module.clone(),
+            third.len(),
+            via_entries.len(),
+            via_entries.iter().copied().min(),
+        ));
+
+        // The guard, at the address this module contributes to the pin.
+        if let Some(witness) = via_entries.iter().copied().min() {
+            let object = at.get(&witness).expect("the witness is a walked object");
+            assert_eq!(
+                (object.tag, object.other, object.cs_sz),
+                (1, 2, 24),
+                "{module}: the pinned witness must still be a cons-cell-shaped \
+                 object"
+            );
+            let second = word_at(bytes, witness + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            assert!(
+                !((second & 1 == 1 && second >> 1 == 0)
+                    || target.is_some_and(|t| (t.tag, t.other) == (1, 2))),
+                "{module}: the pinned witness must still have a tail that is \
+                 neither a cell nor nil, or the address has drifted onto an \
+                 ordinary cons cell"
+            );
+            assert!(
+                entries.contains(&witness) && !declarations.contains(&witness),
+                "{module}: the pinned witness must still be reachable from \
+                 `entries` and not from `constants`"
+            );
+        }
+    }
+
+    // Anti-vacuity for every "not in constants" above: the declaration walk has
+    // to reach cons cells, or its silence is failure rather than exclusion.
+    assert!(
+        cons_reached_by_declarations > 0,
+        "the `constants` walk reached no cons cells, so it has excluded nothing"
+    );
+
+    // The remainder, pinned two-way here as well.
+    let expected_total = if prelude_loaded { 99 } else { 0 };
+    assert_eq!(
+        total_third, expected_total,
+        "the same third-shape population the remainder cell pins"
+    );
+
+    let mut expected: Vec<(String, usize, usize, Option<usize>)> = vec![
+        ("Init.olean".to_owned(), 0, 0, None),
+        ("Init.BinderNameHint.olean".to_owned(), 0, 0, None),
+        ("Init.SizeOfLemmas.olean".to_owned(), 0, 0, None),
+    ];
+    if prelude_loaded {
+        expected.push(("Init/Prelude.olean".to_owned(), 99, 99, Some(0x25ba60)));
+    }
+    assert_eq!(
+        table, expected,
+        "per-module third-shape count, how many `entries` reaches, and the \
+         LOWEST such address - a witness a reader can open"
+    );
+}
