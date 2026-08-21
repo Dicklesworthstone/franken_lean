@@ -3661,6 +3661,9 @@ def main():
     class_projection_inductive_refusal_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_inductive_refused": manifest_summary.get("inductive_refused")}
     if (not isinstance(class_projection_inductive_refusal_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projection_inductive_refusal_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projection_inductive_refusal_inequality_join["summary_inductive_refused"], int) or isinstance(class_projection_inductive_refusal_inequality_join["summary_inductive_refused"], bool) or class_projection_inductive_refusal_inequality_join["summary_class_provided_projections"] <= class_projection_inductive_refusal_inequality_join["summary_inductive_refused"]):
         raise SystemExit("REFUSE: facade manifest class-projection count must exceed inductive-refusal count " + json.dumps(class_projection_inductive_refusal_inequality_join, sort_keys=True))
+    class_projection_field_set_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_field_sets_checked": manifest_summary.get("field_sets_checked")}
+    if (not isinstance(class_projection_field_set_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projection_field_set_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projection_field_set_inequality_join["summary_field_sets_checked"], int) or isinstance(class_projection_field_set_inequality_join["summary_field_sets_checked"], bool) or class_projection_field_set_inequality_join["summary_class_provided_projections"] <= class_projection_field_set_inequality_join["summary_field_sets_checked"]):
+        raise SystemExit("REFUSE: facade manifest class-projection count must exceed field-set count " + json.dumps(class_projection_field_set_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5823,6 +5826,9 @@ def main():
         ),
         "manifest_class_projection_inductive_refusal_inequality_join": (
             class_projection_inductive_refusal_inequality_join
+        ),
+        "manifest_class_projection_field_set_inequality_join": (
+            class_projection_field_set_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
