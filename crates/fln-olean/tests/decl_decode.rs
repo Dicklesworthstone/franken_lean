@@ -9678,3 +9678,240 @@ fn the_six_tag_four_tails() {
          this cell's own walk"
     );
 }
+
+/// The six inner records are a THIRD population - and size does not separate
+/// them either.
+///
+/// I closed `19eef9ff` by calling these "distinct from every record population
+/// already characterised". What that cell MEASURED was only that each differs
+/// from its own node's record, which is a much weaker fact. The claim was
+/// written ahead of its evidence; this is the measurement, and it happens to
+/// hold - none of the six is among the 54 seed records or the 46 interior ones.
+/// Being right does not make the order of those two steps right.
+///
+/// THEY ARE NOT THE SAME KIND OF RECORD AT ALL, which is more than disjointness:
+///
+///              the six                 the known 100
+///   slot 0     tag 1 arity 2, all      tag 2 arity 2, ALL
+///   slot 2     tag 2 arity 2, all      -
+///   slot 3     an ARRAY, all           tag 2/3, tag 3/3, tag 4/2 - never an array
+///
+/// Both contrasts are categorical and both survive a base rate. The known
+/// hundred are `tag 2` at slot 0 at a rate of ONE, so zero of six is impossible
+/// by chance; they hold an array at slot 3 at a rate of ZERO, so six of six is
+/// equally so. This is not the population-of-one case `1006bd18` found.
+///
+/// AND THE SIZES ARE IDENTICAL - forty bytes on both sides. `2baabd20`
+/// concluded that two sizes at one tag and arity mean two layouts and that size
+/// is the strong characteriser where tag and arity are weak. That stands, and
+/// this qualifies it: HERE THE TAG, THE ARITY AND THE SIZE ALL AGREE and the
+/// types still differ. Size is stronger than tag-with-arity and it is not
+/// sufficient either. Only reading the fields separated these.
+///
+/// So the file now knows three disjoint four-field-record populations sharing
+/// one header triple, where `2baabd20` had shown five shapes carrying two
+/// layouts apiece. Nothing here proposes a rule.
+#[test]
+fn the_six_inner_records_are_a_third_population() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut inner_total = 0usize;
+    let mut in_seed = 0usize;
+    let mut in_interior = 0usize;
+    let mut in_neither = 0usize;
+    let mut known_total = 0usize;
+    let mut inner_slots: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut known_slots: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut inner_sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut known_sizes: BTreeSet<u16> = BTreeSet::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |word: u64| -> String {
+            match resolve(word) {
+                Some(child) => {
+                    let child = at.get(&child).expect("resolved above");
+                    format!("tag {} arity {}", child.tag, child.other)
+                }
+                None => format!("boxed {}", word >> 1),
+            }
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        // The two known record populations.
+        let mut seed_records: BTreeSet<usize> = BTreeSet::new();
+        let mut interior_records: BTreeSet<usize> = BTreeSet::new();
+        for &node in &all {
+            if let Some(record) = resolve(word_at(bytes, node + 8)) {
+                if seeds.contains(&node) {
+                    seed_records.insert(record);
+                } else {
+                    interior_records.insert(record);
+                }
+            }
+        }
+        for &record in seed_records.iter().chain(interior_records.iter()) {
+            known_total += 1;
+            known_sizes.insert(at.get(&record).expect("resolved").cs_sz);
+            for slot in 0..4usize {
+                *known_slots
+                    .entry(format!(
+                        "slot {slot}/{}",
+                        described(word_at(bytes, record + 8 + 8 * slot))
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        // The six the `tag 4` wrappers point at.
+        let mut inner: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            if let Some(tail) = resolve(word_at(bytes, node + 16))
+                && shape(tail) == Some((4, 1))
+                && let Some(record) = resolve(word_at(bytes, tail + 8))
+            {
+                inner.insert(record);
+            }
+        }
+        for &record in &inner {
+            inner_total += 1;
+            inner_sizes.insert(at.get(&record).expect("resolved").cs_sz);
+            if seed_records.contains(&record) {
+                in_seed += 1;
+            } else if interior_records.contains(&record) {
+                in_interior += 1;
+            } else {
+                in_neither += 1;
+            }
+            for slot in 0..4usize {
+                *inner_slots
+                    .entry(format!(
+                        "slot {slot}/{}",
+                        described(word_at(bytes, record + 8 + 8 * slot))
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(inner_total, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // A third population, measured rather than asserted.
+    assert_eq!(
+        (inner_total, in_seed, in_interior, in_neither),
+        (6, 0, 0, 6),
+        "none of the six is among the 54 seed records or the 46 interior ones - \
+         the claim `19eef9ff` closed with, now actually measured"
+    );
+    assert_eq!(
+        known_total, 100,
+        "the two known populations it is disjoint from"
+    );
+
+    // Not the same kind of record: two categorical contrasts.
+    assert_eq!(
+        inner_slots.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("slot 0/tag 1 arity 2".to_owned(), 6),
+            ("slot 1/tag 1 arity 1".to_owned(), 2),
+            ("slot 1/tag 4 arity 2".to_owned(), 3),
+            ("slot 1/tag 5 arity 2".to_owned(), 1),
+            ("slot 2/tag 2 arity 2".to_owned(), 6),
+            ("slot 3/tag 246 arity 0".to_owned(), 6),
+        ],
+        "the six: a string-link name, a varying field, a numbered name, and an \
+         ARRAY"
+    );
+    assert_eq!(
+        known_slots
+            .iter()
+            .filter(|(key, _)| key.starts_with("slot 0/") || key.starts_with("slot 3/"))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect::<Vec<_>>(),
+        vec![
+            ("slot 0/tag 2 arity 2".to_owned(), 100),
+            ("slot 3/tag 2 arity 3".to_owned(), 45),
+            ("slot 3/tag 3 arity 3".to_owned(), 18),
+            ("slot 3/tag 4 arity 2".to_owned(), 37),
+        ],
+        "against the known hundred, which are `tag 2` at slot 0 at a rate of \
+         ONE and hold an array at slot 3 at a rate of ZERO. So zero of six and \
+         six of six are both impossible by chance - not the population-of-one \
+         case `1006bd18` found"
+    );
+
+    // The qualification to `2baabd20`.
+    assert_eq!(
+        (
+            inner_sizes.iter().copied().collect::<Vec<_>>(),
+            known_sizes.iter().copied().collect::<Vec<_>>(),
+        ),
+        (vec![40], vec![40]),
+        "the sizes are IDENTICAL. `2baabd20` showed size is the strong \
+         characteriser where tag and arity are weak; here tag, arity and size \
+         all agree and the types still differ, so size is not sufficient \
+         either. Only reading the fields separated these"
+    );
+}
