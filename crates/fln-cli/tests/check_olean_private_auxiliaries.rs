@@ -515,6 +515,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .windows(2)
             .filter(|lines| {
                 lines[0].trim()
+                    == r##""\"privateCompanionResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{},\"missing\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep private-companion residuals beside CliPrivateReport loop residuals",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
                     == r##""\"privateCliPrivateReportLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
                     && lines[1].trim()
                         == r##""\"privateCliPrivateReportResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
