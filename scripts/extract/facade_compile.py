@@ -32,6 +32,10 @@ the toolchain would report a perfect facade:
     requires the matching probe row to become unavailable. This proves the rig
     can detect a missing generated row rather than merely a completely empty
     module.
+  * A DEMANDED-ROW JOIN requires every real toolchain-api demand to have exactly
+    one classified facade-manifest row. Each emitted check carries that row's
+    disposition, so an unclassified name cannot disappear behind a name-only
+    probe or a misleading aggregate.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -50,6 +54,7 @@ from collections import Counter, defaultdict
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PARTITION = os.path.join(REPO, "contracts", "builtin_partition.tsv")
 SCHEMA = "fln-facade-compile/1"
+DEMANDED_OUTCOMES = frozenset(("emitted", "init-substrate", "quarantined"))
 
 
 def input_digest(path):
@@ -203,6 +208,62 @@ def write_row_removed_facade(source, destination, name):
         fh.write(candidate)
 
 
+def join_demanded_rows(names, manifest_rows):
+    """Bind every demanded name to one classified manifest row.
+
+    The exact-demand extractor sets the denominator while the facade generator
+    records how it treated each demanded symbol. Neither artifact alone proves
+    they cover the same names. Refuse missing, duplicate, or unclassified rows
+    before compiling: otherwise a demand with no Reference signature degrades to
+    a name-only probe and can be hidden in aggregate availability counts.
+    """
+    rows_by_name = defaultdict(list)
+    for row in manifest_rows:
+        rows_by_name[row["name"]].append(row)
+
+    missing = sorted(name for name in names if name not in rows_by_name)
+    duplicate = sorted(name for name in names if len(rows_by_name[name]) != 1)
+    if missing or duplicate:
+        details = []
+        if missing:
+            details.append("missing=" + ", ".join(missing[:8]))
+        if duplicate:
+            details.append("duplicate=" + ", ".join(duplicate[:8]))
+        raise SystemExit(
+            "REFUSE: demanded-row join is not one-to-one (" + "; ".join(details)
+            + ") — a compile result without a classified facade disposition is "
+            "not publishable"
+        )
+
+    dispositions = {}
+    unclassified = []
+    signatureless = []
+    for name in sorted(names):
+        row = rows_by_name[name][0]
+        outcome = row.get("demanded_outcome")
+        if outcome not in DEMANDED_OUTCOMES:
+            unclassified.append(name)
+            continue
+        # Init substrate names are deliberately absent from the generated facade;
+        # their availability is separated by the empty-facade control. Every other
+        # classified row must carry the Reference signature used for the type probe.
+        if outcome != "init-substrate" and not row.get("signature"):
+            signatureless.append(name)
+            continue
+        dispositions[name] = outcome
+    if unclassified or signatureless:
+        details = []
+        if unclassified:
+            details.append("unclassified=" + ", ".join(unclassified[:8]))
+        if signatureless:
+            details.append("signatureless=" + ", ".join(signatureless[:8]))
+        raise SystemExit(
+            "REFUSE: demanded-row join cannot support a typed disposition ("
+            + "; ".join(details) + ")"
+        )
+    return dispositions
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -321,6 +382,9 @@ def main():
         raise SystemExit("REFUSE: the module manifest carries no signatures — the "
                          "run would silently degrade to a name-only check")
 
+    demand_names = {name for names in by_module.values() for name in names}
+    demand_dispositions = join_demanded_rows(demand_names, manifest_rows)
+
     root = build_facade(lean, env, os.path.join(work, "facade"), args.facade, "generated")
     empty_src = os.path.join(work, "empty.lean")
     with open(empty_src, "w", encoding="utf-8") as fh:
@@ -332,7 +396,7 @@ def main():
     # will not resolve zero: part of the demanded toolchain-api surface is defined
     # under Init, which every non-prelude module imports implicitly — so the honest
     # control is "the facade adds resolutions", not "nothing resolves without it".
-    control_names = sorted({n for names in by_module.values() for n in names})
+    control_names = sorted(demand_names)
     v_facade, _, _ = run_probe(lean, root, work, "control_facade", control_names, sigs)
     v_empty, _, _ = run_probe(lean, empty_root, work, "control_empty", control_names, sigs)
     ok_facade = sum(1 for v in v_facade.values() if v == "available")
@@ -381,6 +445,7 @@ def main():
                 "schema": SCHEMA, "kind": "check", "module": module, "name": name,
                 "verdict": verdict[name],
                 "diagnostic": detail.get(name),
+                "demanded_disposition": demand_dispositions[name],
                 "substrate_only": v_empty.get(name) == "available",
             })
 
@@ -397,6 +462,7 @@ def main():
         "curated_modules": sorted(modules),
         "checked": checked,
         "distinct_symbols": len(control_names),
+        "demanded_dispositions": dict(sorted(Counter(demand_dispositions.values()).items())),
         "available": verdict_counts["available"],
         "unresolved": verdict_counts["unresolved"],
         "resolved_but_rejected": verdict_counts["resolved-but-rejected"],
