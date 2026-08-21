@@ -3685,6 +3685,9 @@ def main():
     substrate_quarantine_inequality_join = {"summary_substrate_emitted": manifest_summary.get("substrate_emitted"), "summary_quarantined": manifest_summary.get("quarantined")}
     if (not isinstance(substrate_quarantine_inequality_join["summary_substrate_emitted"], int) or isinstance(substrate_quarantine_inequality_join["summary_substrate_emitted"], bool) or not isinstance(substrate_quarantine_inequality_join["summary_quarantined"], int) or isinstance(substrate_quarantine_inequality_join["summary_quarantined"], bool) or substrate_quarantine_inequality_join["summary_substrate_emitted"] <= substrate_quarantine_inequality_join["summary_quarantined"]):
         raise SystemExit("REFUSE: facade manifest substrate-emission count must exceed quarantine count " + json.dumps(substrate_quarantine_inequality_join, sort_keys=True))
+    field_set_quarantine_inequality_join = {"summary_field_sets_checked": manifest_summary.get("field_sets_checked"), "summary_quarantined": manifest_summary.get("quarantined")}
+    if (not isinstance(field_set_quarantine_inequality_join["summary_field_sets_checked"], int) or isinstance(field_set_quarantine_inequality_join["summary_field_sets_checked"], bool) or not isinstance(field_set_quarantine_inequality_join["summary_quarantined"], int) or isinstance(field_set_quarantine_inequality_join["summary_quarantined"], bool) or field_set_quarantine_inequality_join["summary_field_sets_checked"] <= field_set_quarantine_inequality_join["summary_quarantined"]):
+        raise SystemExit("REFUSE: facade manifest field-set count must exceed quarantine count " + json.dumps(field_set_quarantine_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5871,6 +5874,9 @@ def main():
         ),
         "manifest_substrate_quarantine_inequality_join": (
             substrate_quarantine_inequality_join
+        ),
+        "manifest_field_set_quarantine_inequality_join": (
+            field_set_quarantine_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
