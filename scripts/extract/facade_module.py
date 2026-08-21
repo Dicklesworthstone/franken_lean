@@ -1580,6 +1580,10 @@ CANDIDATE_SUFFIX = ".candidate.lean"
 VERIFY_SUFFIX = ".verify.lean"
 VERIFY2_SUFFIX = ".verify2.lean"
 SCRATCH_SUFFIXES = (CANDIDATE_SUFFIX, VERIFY_SUFFIX, VERIFY2_SUFFIX)
+# The manifest is written through a sibling and moved into place, exactly as the
+# facade is, so it has a scratch file of its own and the same way of leaking it.
+MANIFEST_TMP_SUFFIX = ".tmp"
+MANIFEST_SCRATCH_SUFFIXES = (MANIFEST_TMP_SUFFIX,)
 
 
 def pin_acceptance_error(text, accepted):
@@ -1615,8 +1619,8 @@ def pin_acceptance_error(text, accepted):
     return None
 
 
-def published_bytes_error(out, text):
-    """The file that ships is byte-for-byte the text this run validated.
+def published_bytes_error(out, text, what="the facade"):
+    """The file that ships is byte-for-byte the text this run built.
 
     `os.replace(candidate, args.out)` is NOT the only success-path write of the
     output, which is the assumption worth retiring: the best-of selection writes
@@ -1641,19 +1645,19 @@ def published_bytes_error(out, text):
         with open(out, encoding="utf-8") as fh:
             on_disk = fh.read()
     except OSError as exc:
-        return (f"the artifact this run reported on is not readable at {out}: "
-                f"{exc.__class__.__name__}. Every number in the manifest "
-                "describes a file that is not there")
+        return (f"{what} this run reported on is not readable at {out}: "
+                f"{exc.__class__.__name__}. Every claim this run makes describes a "
+                "file that is not there")
     if on_disk != text:
-        return (f"{out} holds {len(on_disk)} bytes but this run validated and "
-                f"reported on {len(text)}. The manifest, the refusal verdicts and "
-                "the axiom-line pin all describe the text this run built, so if "
-                "the published file is a different one they are true of nothing "
-                "that shipped")
+        return (f"{out} holds {len(on_disk)} bytes but this run built and reported "
+                f"on {len(text)} for {what}. The refusal verdicts, the axiom-line "
+                "pin and every count this run publishes describe the text it "
+                "built, so if the published file is a different one they are true "
+                "of nothing that shipped")
     return None
 
 
-def leftover_scratch_error(out):
+def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
     """A finished run must leave none of its scratch files beside the artifact.
 
     The candidate is not a copy of the facade, it is a MOVE: the success path
@@ -1672,7 +1676,7 @@ def leftover_scratch_error(out):
     Returns an error string, or None.
     """
     leaked = []
-    for suffix in SCRATCH_SUFFIXES:
+    for suffix in suffixes:
         path = out + suffix
         try:
             size = os.path.getsize(path)
@@ -3417,10 +3421,14 @@ def main():
             f"declarations while {row_emitted} rows carry the flag — one word, two "
             "definitions, and every downstream count picks whichever it read first")
 
-    tmp = args.manifest + ".tmp"
+    # Serialized once and used for both the write and the check below. Building
+    # it twice would be the "one word, two definitions" defect this file already
+    # refuses elsewhere: the comparison would then be against a second rendering
+    # rather than against what was actually written.
+    manifest_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    tmp = args.manifest + MANIFEST_TMP_SUFFIX
     with open(tmp, "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, sort_keys=True) + "\n")
+        fh.write(manifest_text)
     os.replace(tmp, args.manifest)
     print(f"facade-module: demanded={len(demand)} init_substrate={len(init_demanded)} "
           f"facade_demand={len(facade_demand)} emitted={len(emitted)} "
@@ -3463,6 +3471,17 @@ def main():
     _leak = leftover_scratch_error(args.out)
     if _leak:
         raise SystemExit("REFUSE: " + _leak)
+    # THE MANIFEST CARRIES THE EVIDENCE, and had neither protection. Every number
+    # the last several waves pinned -- the refusal verdicts, the family counts,
+    # form_counts, the declared-vs-written join -- lives in this file and not in
+    # the .lean, so a manifest replaced after this run wrote it leaves all of them
+    # passing while the published evidence belongs to somebody else.
+    _mpub = published_bytes_error(args.manifest, manifest_text, "the manifest")
+    if _mpub:
+        raise SystemExit("REFUSE: " + _mpub)
+    _mleak = leftover_scratch_error(args.manifest, MANIFEST_SCRATCH_SUFFIXES)
+    if _mleak:
+        raise SystemExit("REFUSE: " + _mleak)
 
 
 if __name__ == "__main__":
