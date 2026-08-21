@@ -1862,6 +1862,28 @@ def main():
             "REFUSE: facade manifest transparent-declaration count must exceed "
             f"value-check count ({json.dumps(transparent_declaration_value_inequality_join, sort_keys=True)})"
         )
+    declaration_substrate_inequality_join = {
+        "summary_declarations_emitted": manifest_summary.get(
+            "declarations_emitted"
+        ),
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+    }
+    if (not isinstance(declaration_substrate_inequality_join[
+            "summary_declarations_emitted"], int)
+            or isinstance(declaration_substrate_inequality_join[
+                "summary_declarations_emitted"], bool)
+            or not isinstance(declaration_substrate_inequality_join[
+                "summary_substrate_emitted"], int)
+            or isinstance(declaration_substrate_inequality_join[
+                "summary_substrate_emitted"], bool)
+            or declaration_substrate_inequality_join[
+                "summary_declarations_emitted"]
+            <= declaration_substrate_inequality_join[
+                "summary_substrate_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration count must exceed substrate "
+            f"emission count ({json.dumps(declaration_substrate_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3778,6 +3800,9 @@ def main():
         ),
         "manifest_transparent_declaration_value_inequality_join": (
             transparent_declaration_value_inequality_join
+        ),
+        "manifest_declaration_substrate_inequality_join": (
+            declaration_substrate_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
