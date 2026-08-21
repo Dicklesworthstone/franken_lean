@@ -1724,6 +1724,26 @@ def main():
             "REFUSE: facade manifest kernel-special population must exceed "
             f"the as-axiom count ({json.dumps(kernel_special_axiom_inequality_join, sort_keys=True)})"
         )
+    field_set_structural_class_inequality_join = {
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+        "summary_structural_class": manifest_summary.get("structural_class"),
+    }
+    if (not isinstance(field_set_structural_class_inequality_join[
+            "summary_field_sets_checked"], int)
+            or isinstance(field_set_structural_class_inequality_join[
+                "summary_field_sets_checked"], bool)
+            or not isinstance(field_set_structural_class_inequality_join[
+                "summary_structural_class"], int)
+            or isinstance(field_set_structural_class_inequality_join[
+                "summary_structural_class"], bool)
+            or field_set_structural_class_inequality_join[
+                "summary_field_sets_checked"]
+            <= field_set_structural_class_inequality_join[
+                "summary_structural_class"]):
+        raise SystemExit(
+            "REFUSE: facade manifest field-set count must exceed structural "
+            f"class count ({json.dumps(field_set_structural_class_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3622,6 +3642,9 @@ def main():
         "manifest_kernel_special_as_axiom_pin_join": kernel_special_as_axiom_pin_join,
         "manifest_kernel_special_axiom_inequality_join": (
             kernel_special_axiom_inequality_join
+        ),
+        "manifest_field_set_structural_class_inequality_join": (
+            field_set_structural_class_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
