@@ -5865,3 +5865,208 @@ fn the_wrapped_tag_four_objects_are_not_the_slot_three_ones() {
          deeper, and why nothing here is handed to a decoder"
     );
 }
+
+/// The nesting TERMINATES - and "interlock" was the wrong word.
+///
+/// The other option this wave offers is already pinned: `7e65ed09` asserts the
+/// five wrapped objects' second field as `boxed 0` four times and a pointer
+/// once, which is boxed-versus-pointer with counts. So this takes the
+/// traversal.
+///
+/// `fffc0e71` said the two element shapes "interlock, the same way the two
+/// slot-4 shapes did at `241893a7`". That word implies mutual reference and the
+/// traversal does not support it. `tag 2` wraps `tag 1`; `tag 1` points at a
+/// numbered name link and NEVER at a `tag 1` or a `tag 2`, in all 46 of them.
+/// The nesting is one-way and two deep, and it stops. Same shape of error as
+/// `3575962c`: a relation observed in one direction, described as if it went
+/// both ways, without the walk that would have said so.
+///
+/// AND THE POPULATION IS BIGGER THAN `fffc0e71` COUNTED. The `tag 1` objects
+/// wrapped by `tag 2` are DISJOINT from the `tag 1` objects that appear as
+/// array elements - zero overlap in both populations - so there are 15 and 31
+/// of them, not the 14 and 21 that cell pinned. Its 35 was the array elements,
+/// which is what it measured and said; the 11 wrapped ones are a separate set
+/// that no cell had reached.
+///
+/// The decode is reported for what it is, per `7e65ed09`. All 46 fields are
+/// accepted by the production `decode_name`, which establishes they are
+/// well-formed names. It does not establish they are the same TYPE as anything
+/// else so decoded, because a passing decode is not an identification where
+/// shapes collide - and that cell found `(4, 2)` doing exactly that.
+#[test]
+fn the_element_nesting_terminates() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut populations: std::collections::BTreeMap<String, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
+    let mut points_at: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut names_decoded = 0usize;
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for population in ["seed", "interior"] {
+            let mut carriers: BTreeSet<usize> = BTreeSet::new();
+            for node in &all {
+                if (population == "seed") == seeds.contains(node)
+                    && let Some(record) = resolve(word_at(bytes, node + 8))
+                    && let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 3))
+                {
+                    carriers.insert(target);
+                }
+            }
+            let mut arrays: BTreeSet<usize> = BTreeSet::new();
+            for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                for &carrier in &carriers {
+                    if at.get(&carrier).map(|o| (o.tag, o.other)) == Some((tag, arity))
+                        && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                    {
+                        arrays.insert(array);
+                    }
+                }
+            }
+
+            let mut as_elements: BTreeSet<usize> = BTreeSet::new();
+            let mut wrappers: BTreeSet<usize> = BTreeSet::new();
+            for array in arrays {
+                for i in 0..word_at(bytes, array + 8) {
+                    let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                        continue;
+                    };
+                    match at.get(&element).map(|o| (o.tag, o.other)) {
+                        Some((1, 1)) => {
+                            as_elements.insert(element);
+                        }
+                        Some((2, 1)) => {
+                            wrappers.insert(element);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // The `tag 1` objects reached only through a `tag 2`.
+            let mut wrapped: BTreeSet<usize> = BTreeSet::new();
+            for wrapper in wrappers {
+                if let Some(target) = resolve(word_at(bytes, wrapper + 8))
+                    && at.get(&target).map(|o| (o.tag, o.other)) == Some((1, 1))
+                {
+                    wrapped.insert(target);
+                }
+            }
+            let overlap = as_elements.intersection(&wrapped).count();
+            let entry = populations.entry(population.to_owned()).or_default();
+            entry.0 += as_elements.len();
+            entry.1 += wrapped.len();
+            entry.2 += overlap;
+
+            // Where every `tag 1` points, from both sources.
+            for object in as_elements.union(&wrapped) {
+                let field = word_at(bytes, object + 8);
+                let target = resolve(field).expect("the single field is a pointer");
+                *points_at.entry(shape_of(target)).or_default() += 1;
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(field)
+                    .unwrap_or_else(|e| panic!("{module}: must be a Name: {e}"));
+                names_decoded += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            populations.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        populations.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("interior".to_owned(), (21, 10, 0)),
+            ("seed".to_owned(), (14, 1, 0)),
+        ],
+        "`tag 1` objects as array elements, as wrapped by a `tag 2`, and the \
+         overlap. The overlap is ZERO in both, so the wrapped ones are a \
+         separate set: 15 and 31 objects, not the 14 and 21 `fffc0e71` pinned \
+         for the array elements it measured"
+    );
+
+    // The termination.
+    assert_eq!(
+        points_at.into_iter().collect::<Vec<_>>(),
+        vec![("tag 2 arity 2".to_owned(), 46)],
+        "every `tag 1` points at a numbered name link and NEVER at a `tag 1` or \
+         a `tag 2`. The nesting is one-way and two deep and it stops - so \
+         `fffc0e71`'s \"interlock\", which implies mutual reference, was wrong"
+    );
+    assert_eq!(
+        names_decoded, 46,
+        "all 46 accepted by the production `decode_name`, which establishes \
+         they are well-formed names and NOT that they are the same type as \
+         anything else so decoded - per `7e65ed09`, a passing decode is not an \
+         identification where shapes collide"
+    );
+}
