@@ -9694,3 +9694,116 @@ fn only_props_carry_indices_and_only_four_inductives_carry_any() {
         "exactly four recursors consume a nonzero index term"
     );
 }
+
+/// A constructor's result applies its inductive's PARAMETERS as its own leading
+/// binders, in order — not merely the right number of arguments.
+///
+/// The result cell above strips the telescope, walks the application spine, and
+/// checks two things: the head is the constructor's own inductive, and the
+/// argument count is `num_params + num_indices`. It never looks at WHICH
+/// arguments. A constructor whose result passed `BVar(0)` for every parameter —
+/// the same binder repeated — has the right head and the right count and is
+/// wrong, and would surface only as a regenerated recursor whose motive and
+/// minor premises do not match.
+///
+/// The relation is exact de Bruijn arithmetic. Inside a constructor type with a
+/// telescope of `depth` binders, the parameter bound at position `i` counting
+/// from the outside is `BVar(depth - 1 - i)` at the result. Measured over all
+/// 157 constructors in `Init/Prelude`: every one passes its parameters that
+/// way, no exception.
+///
+/// This is the law that makes a parameter a parameter. Parameters are fixed
+/// across the whole block — that is what lets the recursor abstract them once,
+/// ahead of the motive — and being fixed is expressed in the artifact as the
+/// result naming its own binders rather than any other term.
+///
+/// SCOPE, stated because half the population cannot exercise it: 50 of the 157
+/// constructors belong to inductives with no parameters at all, so for them the
+/// check is vacuously true. 107 have at least one and the widths run 1, 2, 3
+/// and 6, so the ordering is tested where order can be wrong. Both numbers are
+/// asserted.
+///
+/// The trailing `num_indices` arguments are deliberately NOT constrained here.
+/// An index may be any term — `Eq.refl` applies its parameter twice, once as a
+/// parameter and once as the index — and requiring a binder there would be
+/// false.
+#[test]
+fn a_constructor_result_passes_its_parameters_as_its_own_binders() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut parameterless = 0usize;
+    let mut widths: BTreeSet<u32> = BTreeSet::new();
+    let mut departures: Vec<(String, usize, Option<u32>)> = Vec::new();
+    for info in &infos {
+        let ConstantInfo::Ctor(ctor) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let induct = inductives
+            .get(&ctor.induct.to_display_string())
+            .unwrap_or_else(|| panic!("{name}: its inductive must decode"));
+        checked += 1;
+        if induct.num_params == 0 {
+            parameterless += 1;
+        } else {
+            widths.insert(induct.num_params);
+        }
+
+        let mut depth = 0usize;
+        let mut current = &ctor.base.type_;
+        while let ExprNode::ForallE { body, .. } = current.node() {
+            depth += 1;
+            current = body;
+        }
+        let mut arguments: Vec<&Expr> = Vec::new();
+        while let ExprNode::App { f, a } = current.node() {
+            arguments.push(a);
+            current = f;
+        }
+        arguments.reverse();
+        assert_eq!(
+            arguments.len(),
+            (induct.num_params + induct.num_indices) as usize,
+            "{name}: the result must apply parameters and indices"
+        );
+
+        for position in 0..induct.num_params as usize {
+            let expected = depth - 1 - position;
+            match arguments[position].node() {
+                ExprNode::BVar { idx } if *idx as usize == expected => {}
+                ExprNode::BVar { idx } => departures.push((name.clone(), position, Some(*idx))),
+                _ => departures.push((name.clone(), position, None)),
+            }
+        }
+    }
+
+    assert!(
+        departures.is_empty(),
+        "a constructor must pass its own parameter binders, in order (name, position, index \
+         found): {:?}",
+        &departures[..departures.len().min(8)]
+    );
+    assert_eq!(
+        (checked, parameterless),
+        (157, 50),
+        "the constructor census, and how many cannot exercise the ordering"
+    );
+    assert_eq!(
+        (checked - parameterless, widths.len()),
+        (107, 4),
+        "107 constructors do exercise it, across four distinct parameter widths"
+    );
+    assert!(
+        widths.contains(&1) && widths.iter().next_back() == Some(&6),
+        "the widths must reach beyond one, or `in order` is untested: {widths:?}"
+    );
+}
