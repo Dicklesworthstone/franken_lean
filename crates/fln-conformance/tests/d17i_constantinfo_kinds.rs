@@ -754,3 +754,100 @@ fn a_private_name_prefix_names_the_scope_and_not_the_storing_module() {
         );
     }
 }
+
+/// `Lean.Name.beq`: one definition, BOTH reject classes, fully accounted for.
+///
+/// This bead's exhaustive pass found that `eq_4` and `eq_def` failed as
+/// `UnknownConstant` while `eq_1`, `eq_2` and `eq_3` failed as
+/// `DefinitionTypeMismatch` — the same definition producing both families at
+/// once. That split was the evidence for "one root cause, two symptoms", and it
+/// is the last named observation on this bead with nothing behind it.
+///
+/// The measurement resolves it, and the shape is not what the row text
+/// suggests. The five equation lemmas were NEVER missing: they live in
+/// `Init/Meta/Defs` and are `Thm` in BOTH parts. What was missing were two
+/// things owned by a DIFFERENT module, `Init/Prelude`, and neither of them is
+/// carried by `Init/Meta/Defs` at either level:
+///
+///   `Lean.Name.beq`                                   Axiom  -> Defn
+///   `_private.Init.Prelude.0.Lean.Name.beq.match_1`   ABSENT -> Defn
+///
+/// Two different absences, one owning module, two reject classes in a third
+/// module whose own declarations were all present. `eq_4` and `eq_def` name the
+/// auxiliary in their own statements, so the kernel reported the constant it
+/// could not find; `eq_1..eq_3` only need `Lean.Name.beq` to UNFOLD to close an
+/// `rfl`, and it was a postulate, so defeq got stuck and the kernel reported a
+/// type mismatch. Same repair, because both absences are the exported level.
+///
+/// Note the privacy scope: the lemmas are `_private.Init.Meta.Defs.0.…` even
+/// though they are about a `Prelude` definition — the generated-here rule this
+/// file already pins in `SCOPE_IS_NOT_STORAGE`, showing up on the bead's own
+/// headline example.
+const BEQ_EQUATION_LEMMAS: &[&str] = &[
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.eq_1",
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.eq_2",
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.eq_3",
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.eq_4",
+    "_private.Init.Meta.Defs.0.Lean.Name.beq.eq_def",
+];
+
+#[test]
+fn both_reject_classes_for_one_definition_reduce_to_two_absences_in_another_module() {
+    let lib = lib_or_skip!();
+
+    // The lemmas themselves, in the module that generated them. Present at BOTH
+    // levels: the rows were never about these, and asserting it is what stops
+    // "the equation lemmas were missing" from being a plausible reading.
+    let (exported, private) = exported_and_private(&lib, "Init/Meta/Defs");
+    for lemma in BEQ_EQUATION_LEMMAS {
+        assert_eq!(
+            exported.get(*lemma).copied(),
+            Some("Thm"),
+            "{lemma}: present in the exported part, so its rejection was never about its own \
+             absence"
+        );
+        assert_eq!(
+            private.get(*lemma).copied(),
+            Some("Thm"),
+            "{lemma}: and unchanged at private level"
+        );
+    }
+
+    // Neither missing constant is carried by the module that references them.
+    // This is what makes the failure CROSS-module: nothing the referencing
+    // module could have decoded better would have supplied either one.
+    for absent in [
+        "Lean.Name.beq",
+        "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+    ] {
+        assert_eq!(
+            exported.get(absent).copied(),
+            None,
+            "{absent}: Init/Meta/Defs does not own this at exported level"
+        );
+        assert_eq!(
+            private.get(absent).copied(),
+            None,
+            "{absent}: nor at private level — it belongs to Init/Prelude"
+        );
+    }
+
+    // The two absences, in the module that does own them, each explaining one
+    // of the two reject classes.
+    let (exported, private) = exported_and_private(&lib, "Init/Prelude");
+    assert_eq!(
+        exported.get("Lean.Name.beq").copied(),
+        Some("Axiom"),
+        "a postulated `Lean.Name.beq` cannot be unfolded, which is the \
+         DefinitionTypeMismatch half (eq_1, eq_2, eq_3)"
+    );
+    assert_eq!(private.get("Lean.Name.beq").copied(), Some("Defn"));
+    let auxiliary = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
+    assert_eq!(
+        exported.get(auxiliary).copied(),
+        None,
+        "an absent auxiliary named in a lemma's own statement is the \
+         UnknownConstant half (eq_4, eq_def)"
+    );
+    assert_eq!(private.get(auxiliary).copied(), Some("Defn"));
+}
