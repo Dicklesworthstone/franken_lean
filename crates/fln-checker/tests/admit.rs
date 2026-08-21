@@ -2308,6 +2308,17 @@ fn kr600_803_init_prod_fixture_pins_constructor_index_parameters_and_fields() {
 }
 
 #[test]
+fn kr600_803_init_prod_fixture_pins_iota_rule_constructor_and_fields() {
+    let entries = init_prod_entries();
+    let metadata = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.rules()[0].constructor(), entries[1].name());
+    assert_eq!(metadata.rules()[0].num_fields(), 2);
+}
+
+#[test]
 fn kr600_803_init_except_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = init_except_constructor_entries();
     for (entry, expected_index) in [(&entries[0], 0), (&entries[1], 1)] {
