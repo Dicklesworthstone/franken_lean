@@ -1454,6 +1454,44 @@ def refusal_conservation_error(refused, reproduced, unreproduced):
     return None
 
 
+def unreproduced_axiom_error(text, line_map, decl, unreproduced):
+    """Pin the claim that a not-reproduced refusal actually COSTS something.
+
+    `inductive_refusal_not_reproduced` asserts two things at once: the pin accepts
+    the row as an inductive, and the artifact ships it as an axiom anyway. The
+    splice measures the first. Nothing measured the second, and it is the half
+    that makes the row a finding rather than a note -- if such a row were quietly
+    being emitted as an inductive after all, the list would be reporting a loss
+    that the artifact does not actually carry.
+
+    Bound to the PUBLISHED bytes: the emitter's own line map has to call the row an
+    axiom, and the line it points at in `text` has to be that axiom line, naming
+    this row and not a neighbour. Returns an error string, or None.
+    """
+    lines = text.rstrip("\n").split("\n")
+    axiom_line = {hit[1]: ln for ln, hit in line_map.items()
+                  if isinstance(hit, tuple) and hit[0] == "axiom"}
+    bad = []
+    for name in sorted(unreproduced):
+        ln = axiom_line.get(name)
+        if ln is None:
+            bad.append(f"{name}: the emitter did not write it as an axiom")
+            continue
+        if ln > len(lines):
+            bad.append(f"{name}: line {ln} is past the end of the artifact")
+            continue
+        want = (decl.get(name) or {}).get("decl_name") or name
+        line = lines[ln - 1]
+        if not line.startswith("axiom ") or not line[6:].startswith(want):
+            bad.append(f"{name}: line {ln} is {line[:60]!r}, not its axiom line")
+    if bad:
+        return ("a row reported as accepted-but-published-as-an-axiom is not "
+                f"published as an axiom: {bad[:4]}. That list claims a cost the "
+                "artifact would not be paying, and the rows in it would be "
+                "findings about nothing")
+    return None
+
+
 def probe_refused_inductives(lean, env, work, text, line_map, decl, deps, blocks):
     """Does a refused inductive still fail against the FINISHED facade?
 
@@ -2339,6 +2377,9 @@ def main():
         inductive_refused, refusal_reproduced, unreproduced)
     if _cons:
         raise SystemExit("REFUSE: " + _cons)
+    _cost = unreproduced_axiom_error(text, line_map, decl, unreproduced)
+    if _cost:
+        raise SystemExit("REFUSE: " + _cost)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
