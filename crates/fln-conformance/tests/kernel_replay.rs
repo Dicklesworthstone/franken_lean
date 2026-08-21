@@ -13880,15 +13880,41 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
 /// site escapes the rule rather than being wrongly caught by it. The prose form
 /// counts only where the segment also says "thread", because the three numbers
 /// alone are a list of sections, not a claim about determinism.
+///
+/// AND THAT NOUN MUST BE NEAR THE NUMERALS, NOT MERELY IN THE SAME SEGMENT. The
+/// first version of this rule asked whether the SEGMENT said "thread", and the
+/// hidden-site rule hands it a WHOLE DOCUMENT -- so an unrelated "sections 1, 8
+/// and 32" anywhere in a file that mentions threads scored as a claim visible
+/// only to the whole-text call and to no line, which the hidden-site rule then
+/// reports as a wrapped site nobody wrote. A guard that invents a site is worse
+/// than one that misses it, because the honest repair for it is to weaken the
+/// guard. Measured, planted below: whole-segment 1 hidden site, local 0.
+///
+/// The window is taken on char boundaries. A byte window panics on the em dash
+/// in `AGENTS.md` -- measured, not feared -- and a panicking guard is an
+/// invariant failure, not a diagnostic.
 fn thread_matrix_claim_count(segment: &str) -> usize {
+    /// How far from the numerals the noun may sit and still be about them.
+    const NEAR: usize = 40;
     let stripped = segment
         .chars()
         .filter(|c| !c.is_whitespace())
-        .collect::<String>();
+        .collect::<String>()
+        .to_ascii_lowercase();
     let mut sites = stripped.matches("{1,8,32}").count();
-    if segment.to_ascii_lowercase().contains("thread") {
-        for prose in ["1,8and32", "1,8,and32", "1,8or32"] {
-            sites += stripped.matches(prose).count();
+    for prose in ["1,8and32", "1,8,and32", "1,8or32"] {
+        for (at, hit) in stripped.match_indices(prose) {
+            let mut low = at.saturating_sub(NEAR);
+            while !stripped.is_char_boundary(low) {
+                low -= 1;
+            }
+            let mut high = (at + hit.len() + NEAR).min(stripped.len());
+            while !stripped.is_char_boundary(high) {
+                high += 1;
+            }
+            if stripped[low..high].contains("thread") {
+                sites += 1;
+            }
         }
     }
     sites
@@ -17149,6 +17175,28 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     assert!(
         states_thread_matrix_claim("at 1, 8, and 32 threads"),
         "an Oxford comma is a spelling, not a different claim"
+    );
+    // AND THE NOUN MUST BE NEAR THE NUMERALS. This decoy is invisible to every
+    // per-line scan and visible only to the whole-document one, so the guard
+    // reports a wrapped claim site that nobody wrote. Measured against the rule
+    // this replaces: whole-segment 1 hidden, local 0.
+    let unrelated = format!(
+        "see sections 1, 8 and 32 of the plan\n{}\nthe matrix runs on threads\n",
+        "filler ".repeat(20)
+    );
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break(&unrelated),
+        0,
+        "a list naming those three numbers is not a claim just because the DOCUMENT mentions \
+         threads somewhere else; a guard that invents a site is worse than one that misses it"
+    );
+    // AND THE WINDOW IS TAKEN ON CHAR BOUNDARIES. Measured: a byte window panics
+    // here, inside the em dash, and AGENTS.md is full of them.
+    assert_eq!(
+        thread_matrix_claim_count(&format!("\u{2014}{} 1, 8 and 32 threads", "a".repeat(38))),
+        1,
+        "the neighbourhood window must not split a multi-byte character; a panicking guard is an \
+         invariant failure, not a diagnostic"
     );
     // AND THE BOUND THAT REPLACES IT: THE NUMBERS ALONE ARE NOT A CLAIM. This is
     // the control against my own widening -- without the "thread" requirement,
