@@ -224,6 +224,8 @@ const ARRAY_MAP_M_GO_UNARY_PROOF_1: &str =
 const ARRAY_MAP_M_GO_UNARY_PROOF_1_MODULE: &str = "Init/Data/Array/BasicAux";
 const ARRAY_MAP_M_GO_UNARY_PROOF_2: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_2";
 const ARRAY_MAP_M_GO_UNARY_PROOF_2_MODULE: &str = "Init/Data/Array/BasicAux";
+const ARRAY_MAP_M_GO_UNARY_PROOF_3: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go._unary._proof_3";
+const ARRAY_MAP_M_GO_UNARY_PROOF_3_MODULE: &str = "Init/Data/Array/BasicAux";
 /// The private implementation backing `mapMonoMImp`.
 const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
 /// The pin's private array stores this definition in the BasicAux module.
@@ -1934,6 +1936,17 @@ fn array_map_m_go_unary_second_proof_is_decoded_from_its_private_storage_module(
     assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_2.to_owned()));
     let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
     let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_2).unwrap();
+    assert!(matches!(recovered, ConstantInfo::Thm(_)));
+}
+
+#[test]
+fn array_map_m_go_unary_third_proof_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_map_m_go_unary_third_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_MAP_M_GO_UNARY_PROOF_3_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+    assert!(private_names.contains(&ARRAY_MAP_M_GO_UNARY_PROOF_3.to_owned()));
+    let private_view = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap();
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|info| info.name().to_display_string() == ARRAY_MAP_M_GO_UNARY_PROOF_3).unwrap();
     assert!(matches!(recovered, ConstantInfo::Thm(_)));
 }
 
