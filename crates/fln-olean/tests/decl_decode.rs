@@ -11721,6 +11721,218 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Every constructor's scalar tail is 0, 8 or 16 bytes - nothing else.
+///
+/// An earlier cell derived the scalar-area arithmetic for CONS CELLS -
+/// `cs_sz - (8 + 8 * other)`, zero for a cons and eight for a name link, that
+/// eight being the `Name.hash` word. This does not re-derive it. It asks what
+/// the whole corpus does with that width.
+///
+/// THE ANSWER IS THREE VALUES. Across 84,992 constructor objects in Prelude the
+/// scalar tail is 0 bytes (18,407), 8 (42,914) or 16 (23,671) and never
+/// anything else. That is not forced: the width is `cs_sz` minus a quantity
+/// fixed by the arity, and `cs_sz` is a sixteen-bit field, so tails of 24, 32
+/// or any multiple of eight up to the field's range are expressible. The format
+/// uses three.
+///
+/// `Init.olean` uses only TWO - it has no 16-byte tail at all - so even the
+/// three is not a constant of the format, and the counts are per module.
+///
+/// WHAT THIS IS NOT. It is NOT independent evidence for `49e423e7`'s fourteen
+/// multi-size shapes. For a fixed `(tag, arity)` the tail and the stored size
+/// differ by a constant, so "more than one tail width" and "more than one
+/// stored size" are the same statement written twice. The fourteen shapes come
+/// out identical here BY ARITHMETIC, and a cell that reported that as
+/// corroboration would be counting one fact as two.
+///
+/// WHAT IS GENUINELY NEW is the shape of the split. Of those fourteen, THIRTEEN
+/// have tails `{0, 8}` - some of their objects carry an inline word and some
+/// carry none - and exactly ONE, `(7, 3)`, has `{8, 16}`, where every object
+/// carries at least one word and some carry two. That distinction is not
+/// available from the sizes alone without doing this subtraction.
+///
+/// THE CONSERVATION, per module: the summed `cs_sz` equals the summed pointer
+/// bytes plus the summed tails. That is one identity per object added up, so it
+/// is near-tautological and is asserted only to catch a tally that lost or
+/// doubled entries - the same admission `f4d108f7` and `5e57207b` carry.
+///
+/// AND THE SIZES ARE FEW: nine distinct `cs_sz` values among Prelude's 84,992
+/// constructors, the largest 80 bytes. The `17,656`-byte object of `1e3e85df`
+/// was an array, not a constructor; constructors are small and there are not
+/// many shapes of them.
+///
+/// POPULATION SCOPE: all four modules, constructor objects only, each asserted
+/// by name.
+#[test]
+fn every_constructor_tail_is_zero_eight_or_sixteen() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize, u16)> = Vec::new();
+    let mut conserved: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut splits: Vec<(String, usize, usize)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+
+        let mut tails: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut sizes: BTreeSet<u16> = BTreeSet::new();
+        let mut by_shape: std::collections::BTreeMap<(u8, u8), BTreeSet<usize>> =
+            std::collections::BTreeMap::new();
+        let mut total_size = 0usize;
+        let mut total_pointer = 0usize;
+        let mut total_tail = 0usize;
+
+        for object in &objects {
+            if object.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            let pointer_bytes = 8 + 8 * usize::from(object.other);
+            let size = usize::from(object.cs_sz);
+            // Every object's size is its header, one word per declared
+            // pointer, and whatever scalar area follows.
+            let tail = size
+                .checked_sub(pointer_bytes)
+                .expect("a constructor cannot be smaller than its own pointers");
+            *tails.entry(tail).or_default() += 1;
+            sizes.insert(object.cs_sz);
+            by_shape
+                .entry((object.tag, object.other))
+                .or_default()
+                .insert(tail);
+            total_size += size;
+            total_pointer += pointer_bytes;
+            total_tail += tail;
+        }
+
+        let count: usize = tails.values().sum();
+        rows.push((
+            module.clone(),
+            count,
+            tails.get(&0).copied().unwrap_or(0),
+            tails.get(&8).copied().unwrap_or(0),
+            tails.get(&16).copied().unwrap_or(0),
+            sizes.len(),
+            *sizes.iter().next_back().expect("non-empty"),
+        ));
+        conserved.push((module.clone(), total_size, total_pointer, total_tail));
+
+        // Only the widths 0, 8 and 16 occur, so those three account for
+        // everything; assert that rather than trusting the row above.
+        assert_eq!(
+            tails.keys().copied().collect::<Vec<_>>(),
+            tails
+                .keys()
+                .copied()
+                .filter(|width| [0, 8, 16].contains(width))
+                .collect::<Vec<_>>(),
+            "{module}: a scalar tail of some other width would appear here"
+        );
+
+        splits.push((
+            module.clone(),
+            by_shape
+                .values()
+                .filter(|widths| widths.iter().copied().collect::<Vec<_>>() == vec![0, 8])
+                .count(),
+            by_shape
+                .values()
+                .filter(|widths| widths.iter().copied().collect::<Vec<_>>() == vec![8, 16])
+                .count(),
+        ));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize, u16)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e, f)| (m.to_owned(), a, b, c, d, e, f))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 102, 4, 98, 0, 3, 56),
+            ("Init.BinderNameHint.olean", 200, 42, 134, 24, 6, 56),
+            ("Init.SizeOfLemmas.olean", 691, 196, 456, 39, 5, 56),
+            ("Init/Prelude.olean", 84992, 18407, 42914, 23671, 9, 80),
+        ]),
+        "per module: constructor objects, then how many have a scalar tail of \
+         0, 8 and 16 bytes, then the distinct `cs_sz` values and the largest. \
+         Three widths and no others, though `Init.olean` uses only two - so \
+         even the three is not a constant of the format. Nine distinct sizes \
+         among Prelude's 84,992 constructors, the largest 80 bytes"
+    );
+    for (module, count, zero, eight, sixteen, ..) in &rows {
+        assert_eq!(
+            zero + eight + sixteen,
+            *count,
+            "{module}: the three widths must account for every constructor"
+        );
+    }
+
+    assert_eq!(
+        conserved
+            .iter()
+            .map(|(m, s, p, t)| (m.as_str(), *s, *p, *t))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 2912, 2128, 784),
+            ("Init.BinderNameHint.olean", 6560, 5104, 1456),
+            ("Init.SizeOfLemmas.olean", 21744, 17472, 4272),
+            ("Init/Prelude.olean", 3088448, 2366400, 722048),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "summed `cs_sz`, summed pointer bytes, summed tails. One identity per \
+         object added up, so near-tautological and asserted only to catch a \
+         lost or doubled tally"
+    );
+    for (module, size, pointer, tail) in &conserved {
+        assert_eq!(pointer + tail, *size, "{module}: the sizes must reconcile");
+    }
+
+    assert_eq!(
+        splits
+            .iter()
+            .map(|(m, a, b)| (m.as_str(), *a, *b))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 0, 0),
+            ("Init.BinderNameHint.olean", 7, 0),
+            ("Init.SizeOfLemmas.olean", 4, 0),
+            ("Init/Prelude.olean", 13, 1),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "shapes whose objects show tails `{{0, 8}}` and shapes showing \
+         `{{8, 16}}`. \
+         This is NOT independent evidence for `49e423e7`'s fourteen multi-size \
+         shapes: for a fixed arity the tail and the size differ by a constant, \
+         so the two statements are one fact written twice. What the subtraction \
+         adds is the SHAPE of the split - thirteen shapes where some objects \
+         carry an inline word and some carry none, and exactly one, `(7, 3)`, \
+         where every object carries at least one and some carry two"
+    );
+}
+
 /// Arrays carry no slack either - and `1e3e85df` did not depend on which field.
 ///
 /// `8cc7474c` found every string's `m_capacity` equal to its `m_size`. Arrays
