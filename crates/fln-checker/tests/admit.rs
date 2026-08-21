@@ -1918,6 +1918,60 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_prod_entries() -> Vec<ConstantEntry> {
+    let prod = checker_name("Prod");
+    let mk = checker_qualified(&["Prod", "mk"]);
+    let rec = checker_qualified(&["Prod", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let w_name = checker_name("w");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let w = Level::param(primary_name("w"));
+    let left_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
+    let prod_type = || Expr::sort(Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs")).expect("universe successor packs"));
+    let prod_expr = |left: Expr, right: Expr| Expr::app(Expr::app(Expr::const_(primary_name("Prod"), vec![u.clone(), v.clone()]), left), right);
+    let mk_expr = |left: Expr, right: Expr, first: Expr, second: Expr| Expr::app(Expr::app(Expr::app(Expr::app(Expr::const_(Name::from_components(["Prod", "mk"]), vec![u.clone(), v.clone()]), left), right), first), second);
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, prod_expr(bv(1), bv(0)), Expr::sort(w.clone()));
+    let minor = || primary_pi("fst", BinderInfo::Default, bv(2), primary_pi("snd", BinderInfo::Default, bv(2), Expr::app(bv(2), mk_expr(bv(4), bv(3), bv(1), bv(0)))));
+    let rec_type = primary_pi("α", BinderInfo::Implicit, left_type(), primary_pi(
+        "β", BinderInfo::Implicit, right_type(), primary_pi(
+            "motive", BinderInfo::Implicit, motive(), primary_pi(
+                "mk", BinderInfo::Default, minor(), primary_pi(
+                    "t", BinderInfo::Default, prod_expr(bv(4), bv(3)), Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    ));
+    let minor_applied = Expr::app(Expr::app(bv(2), bv(1)), bv(0));
+    let rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
+        primary_name("β"), right_type(), Expr::lam(
+            primary_name("motive"), motive(), Expr::lam(
+                primary_name("mk"), minor(), Expr::lam(
+                    primary_name("fst"), bv(3), Expr::lam(
+                        primary_name("snd"), bv(3), minor_applied, BinderInfo::Default,
+                    ), BinderInfo::Default,
+                ), BinderInfo::Default,
+            ), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    let inductive_type = primary_pi(
+        "α", BinderInfo::Default, left_type(), primary_pi("β", BinderInfo::Default, right_type(), prod_type()),
+    );
+    let constructor_type = primary_pi("α", BinderInfo::Default, left_type(), primary_pi(
+        "β", BinderInfo::Default, right_type(), primary_pi(
+            "fst", BinderInfo::Default, bv(1), primary_pi("snd", BinderInfo::Default, bv(1), prod_expr(bv(3), bv(2))),
+        ),
+    ));
+    vec![
+        ConstantEntry::new(prod.clone(), ConstantDeclaration::inductive(vec![u_name.clone(), v_name.clone()], decoded(&inductive_type), ConstantSafety::Safe, InductiveDeclaration::new(2, 0, vec![prod.clone()], vec![mk.clone()], 0, false, false))),
+        ConstantEntry::new(mk.clone(), ConstantDeclaration::constructor(vec![u_name.clone(), v_name.clone()], decoded(&constructor_type), ConstantSafety::Safe, ConstructorDeclaration::new(prod.clone(), 0, 2, 2))),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(vec![w_name, u_name, v_name], decoded(&rec_type), ConstantSafety::Safe, RecursorDeclaration::new(vec![prod], 2, 0, 1, 1, vec![RecursorRule::new(mk, 2, decoded(&rhs))], false))),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -2114,6 +2168,25 @@ fn kr600_803_init_sum_refuses_a_forged_inr_iota_rule() {
             fln_checker::admit::InductiveRejection::RecursorShape { .. }
         )
     ));
+}
+
+#[test]
+fn kr600_803_init_prod_pair_recursor_and_iota_are_reconstructed() {
+    let entries = init_prod_entries();
+    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    assert!(verdict.is_admitted(), "exact Init.Prod block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_prod_refuses_a_forged_iota_rule() {
+    let mut entries = init_prod_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(checker_qualified(&["Prod", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Prod", "mk"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
 }
 
 #[test]
