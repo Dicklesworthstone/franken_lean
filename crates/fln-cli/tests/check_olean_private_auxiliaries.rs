@@ -1009,6 +1009,28 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     assert_eq!(
         [
             cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim() == r##""\"companionPartsLoaded\":{}}},","##
+                        && lines[1].trim()
+                            == r##""\"k2Checked\":false,\"g1Satisfied\":false}}\n""##
+                })
+                .count(),
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},","##
+                        && lines[1].trim() == r##""\"k2Checked\":false,""##
+                })
+                .count(),
+        ],
+        [1, 1],
+        "the check-olean JSON render paths keep companion loading beside their terminal K2/G1 status",
+    );
+    assert_eq!(
+        [
+            cli_source_lines
                 .iter()
                 .filter(|line| {
                     line.trim()
