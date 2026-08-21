@@ -14285,6 +14285,25 @@ fn within_allowance(unqualified: usize, allowed: usize) -> bool {
     unqualified <= allowed
 }
 
+/// The fewest claim lines the scanned documents may yield before the scan is looking
+/// in the wrong place.
+///
+/// THE ANTI-VACUITY FLOOR HAD NO ANTI-VACUITY PLANT, which is the joke this cell is
+/// here to stop telling. It exists so a scan that finds nothing cannot report green,
+/// and it was only ever exercised from ABOVE: the two documents yield five lines, so
+/// every mutant that WEAKENS it -- `>= 0`, or deleting the assertion outright --
+/// passes exactly as the real rule does. The one direction it was safe against is the
+/// direction that cannot hurt: a floor raised above five reddens immediately.
+///
+/// Four rather than five on purpose. The floor is a minimum, not a census: repairing a
+/// document by removing one of its five claim sites must not redden this guard, and
+/// that is also why it cannot be pinned to the live count.
+fn enough_claim_lines_seen(checked: usize) -> bool {
+    /// Five are observed today across the two scanned documents.
+    const MINIMUM_CLAIM_LINES: usize = 4;
+    checked >= MINIMUM_CLAIM_LINES
+}
+
 /// A qualifier belongs to the sentence stating the claim, not to the paragraph.
 ///
 /// Named once, at module scope, because the two tiers of this guard read it. The
@@ -17845,6 +17864,25 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
              gets; a row that forgives nothing records nothing"
         );
     }
+    // AND THE FLOOR THAT CATCHES A SCAN FINDING NOTHING MUST ITSELF REFUSE
+    // NOTHING. Zero is the case it exists for and the case nothing reached: the
+    // two documents yield five lines, so the floor was only ever met from above
+    // and every weakening of it passed.
+    assert!(
+        !enough_claim_lines_seen(0),
+        "a scan that found no claim line at all must fail: that is the whole reason this floor \
+         exists, and it is the one input it was never given"
+    );
+    assert!(
+        !enough_claim_lines_seen(3),
+        "one line short of the floor must fail, or the floor is a suggestion"
+    );
+    assert!(
+        enough_claim_lines_seen(4),
+        "exactly at the floor must pass: it is a minimum, and a document repaired by removing \
+         one of its five sites must not redden this guard"
+    );
+
     // THE ALLOWANCE IS INCLUSIVE, AND ONLY THE PLAN WAS SAYING SO. Exactly at
     // the allowance must pass; one over must not; and a document with no
     // allowance may carry no sites at all. Planted because the live boundary is
@@ -18029,7 +18067,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         }
     }
     assert!(
-        checked >= 4,
+        enough_claim_lines_seen(checked),
         "only {checked} determinism claim lines found across AGENTS.md and README.md; the \
          scan is looking in the wrong place and would pass over a bare claim"
     );
