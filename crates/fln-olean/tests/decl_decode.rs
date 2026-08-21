@@ -6387,7 +6387,12 @@ fn the_measured_chain_reconciles() {
     assert_eq!(
         get("6 records/seed") + get("6 records/interior"),
         100,
-        "one four-field record per spine node, less the two shared head records"
+        "one four-field record per spine node, less two. The two are SEED nodes \
+         sharing a record with each other - measured in \
+         `the_sharing_excesses_account_for_every_gap` as a seed excess of 2 and \
+         an interior excess of 0. This message said \"the two shared head \
+         records\" until then, which is a different pair at a different level \
+         that happens also to number two"
     );
     assert_eq!(
         get("7 elements/pointer") + get("7 elements/boxed"),
@@ -7221,5 +7226,262 @@ fn the_remaining_pooled_identities() {
         "the shared `tag 2` wraps a `tag 1`, which is what 9 of the 14 \
          interior-only ones do - it sits in the majority class and nothing \
          marks it out, after `c726dec5` and `ddfa2317` found the same"
+    );
+}
+
+/// Every gap in the ledger accounted for as a SHARING EXCESS.
+///
+/// I wrote at `75a1373c` that every pooled quantity the ledger names now has
+/// its identity closed. That was true of the pooled-versus-membership ones and
+/// false of the reference-versus-object ones, which are the other half of the
+/// same table and had three gaps with no explanation: 71 heads to 69 objects,
+/// 69 slot-2 arrays to 51, and 123 elements to 111.
+///
+/// Each is exactly the sharing excess - the sum over objects of one less than
+/// their reference count - and each is asserted both as a subtraction and as
+/// that sum, so neither route stands alone.
+///
+///   heads     71 - 69 = 2    refcounts 67 once, 2 twice
+///   arrays    69 - 51 = 18   refcounts 44 once, 6 twice, and ONE THIRTEEN TIMES
+///   elements 123 - 111 = 12
+///
+/// ONE ARRAY IS REFERENCED THIRTEEN TIMES. Six others are referenced twice and
+/// the remaining 44 once, so a single object accounts for twelve of the
+/// eighteen. That is the same shape as the in-degree-15 node `b327b20c` found
+/// in the spine: this data has hubs, and a mean would hide them.
+///
+/// AND THE LEDGER MISATTRIBUTED A CAUSE. Its `100` assertion read "less the two
+/// shared head records". The two are SEED NODES sharing a four-field record
+/// with each other - seed excess 2, interior excess 0 - which is a different
+/// pair at a different level that happens also to number two. The assertion was
+/// right and its explanation was wrong, which is worse than no explanation:
+/// a reader debugging that line would have gone to the head records. The
+/// message is corrected in this commit.
+///
+/// Two equal numbers arising at different levels is exactly how a wrong cause
+/// gets written down and never questioned - it agrees with the arithmetic.
+#[test]
+fn the_sharing_excesses_account_for_every_gap() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut refcounts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        // Tally references, then derive objects and excess from the tally.
+        let tally = |references: &[usize]| -> (usize, usize, usize, Vec<(usize, usize)>) {
+            let mut per: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for &object in references {
+                *per.entry(object).or_default() += 1;
+            }
+            let excess: usize = per.values().map(|count| count - 1).sum();
+            let mut histogram: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for count in per.values() {
+                *histogram.entry(*count).or_default() += 1;
+            }
+            (
+                references.len(),
+                per.len(),
+                excess,
+                histogram.into_iter().collect(),
+            )
+        };
+
+        // Heads.
+        let mut head_references: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                head_references.push(head);
+            }
+        }
+        let (heads, head_objects, head_excess, head_histogram) = tally(&head_references);
+        *counts.entry("heads/references".to_owned()).or_default() += heads;
+        *counts.entry("heads/objects".to_owned()).or_default() += head_objects;
+        *counts.entry("heads/excess".to_owned()).or_default() += head_excess;
+        for (count, many) in head_histogram {
+            *refcounts.entry(format!("heads/{count}")).or_default() += many;
+        }
+
+        let records: BTreeSet<usize> = head_references.iter().copied().collect();
+
+        // Slot-2 arrays.
+        let array_references: Vec<usize> = records
+            .iter()
+            .filter_map(|&record| resolve(word_at(bytes, record + 8 + 8 * 2)))
+            .collect();
+        let (arrays, array_objects, array_excess, array_histogram) = tally(&array_references);
+        *counts.entry("arrays/references".to_owned()).or_default() += arrays;
+        *counts.entry("arrays/objects".to_owned()).or_default() += array_objects;
+        *counts.entry("arrays/excess".to_owned()).or_default() += array_excess;
+        for (count, many) in array_histogram {
+            *refcounts.entry(format!("arrays/{count}")).or_default() += many;
+        }
+
+        // Elements, over the DISTINCT arrays.
+        let mut element_references: Vec<usize> = Vec::new();
+        for &array in &array_references.iter().copied().collect::<BTreeSet<_>>() {
+            for i in 0..word_at(bytes, array + 8) {
+                if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) {
+                    element_references.push(element);
+                }
+            }
+        }
+        let (elements, element_objects, element_excess, _) = tally(&element_references);
+        *counts.entry("elements/references".to_owned()).or_default() += elements;
+        *counts.entry("elements/objects".to_owned()).or_default() += element_objects;
+        *counts.entry("elements/excess".to_owned()).or_default() += element_excess;
+
+        // The spine's record excess, per population - the ledger's misattributed 2.
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        for (name, population) in [("seed", true), ("interior", false)] {
+            let references: Vec<usize> = all
+                .iter()
+                .filter(|&&node| seeds.contains(&node) == population)
+                .filter_map(|&node| resolve(word_at(bytes, node + 8)))
+                .collect();
+            let (refs, objects_, excess, _) = tally(&references);
+            *counts
+                .entry(format!("spine {name}/references"))
+                .or_default() += refs;
+            *counts.entry(format!("spine {name}/objects")).or_default() += objects_;
+            *counts.entry(format!("spine {name}/excess")).or_default() += excess;
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            counts.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| counts.get(key).copied().unwrap_or_default();
+
+    assert_eq!(
+        counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("arrays/excess".to_owned(), 18),
+            ("arrays/objects".to_owned(), 51),
+            ("arrays/references".to_owned(), 69),
+            ("elements/excess".to_owned(), 12),
+            ("elements/objects".to_owned(), 111),
+            ("elements/references".to_owned(), 123),
+            ("heads/excess".to_owned(), 2),
+            ("heads/objects".to_owned(), 69),
+            ("heads/references".to_owned(), 71),
+            ("spine interior/excess".to_owned(), 0),
+            ("spine interior/objects".to_owned(), 46),
+            ("spine interior/references".to_owned(), 46),
+            ("spine seed/excess".to_owned(), 2),
+            ("spine seed/objects".to_owned(), 54),
+            ("spine seed/references".to_owned(), 56),
+        ],
+        "every reference-versus-object pair the ledger names, with its excess"
+    );
+
+    // Each gap is exactly the excess, by two routes.
+    for name in [
+        "heads",
+        "arrays",
+        "elements",
+        "spine seed",
+        "spine interior",
+    ] {
+        let references = get(&format!("{name}/references"));
+        let objects_ = get(&format!("{name}/objects"));
+        assert_eq!(
+            references - objects_,
+            get(&format!("{name}/excess")),
+            "{name}: references less objects is the sharing excess, the sum over \
+             objects of one less than their reference count"
+        );
+    }
+    assert!(
+        get("arrays/excess") > 0 && get("heads/excess") > 0,
+        "with no excess anywhere these identities are 0 = 0 and describe nothing"
+    );
+
+    // The hub.
+    assert_eq!(
+        refcounts.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("arrays/1".to_owned(), 44),
+            ("arrays/13".to_owned(), 1),
+            ("arrays/2".to_owned(), 6),
+            ("heads/1".to_owned(), 67),
+            ("heads/2".to_owned(), 2),
+        ],
+        "ONE array is referenced thirteen times and accounts for twelve of the \
+         eighteen excess on its own - the same hub shape as `b327b20c`'s \
+         in-degree-15 node, which a mean would hide"
+    );
+
+    // The ledger's misattributed cause, measured.
+    assert_eq!(
+        (get("spine seed/excess"), get("spine interior/excess")),
+        (2, 0),
+        "the ledger's `100` said \"less the two shared head records\". The two \
+         are SEED NODES sharing a four-field record with each other; the head \
+         records' own excess is also 2, at a different level. The assertion was \
+         right and its explanation was wrong, which is worse than none"
     );
 }
