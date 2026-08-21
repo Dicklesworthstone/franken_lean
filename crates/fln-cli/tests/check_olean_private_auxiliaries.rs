@@ -85,7 +85,7 @@ fn json_array_field<'a>(json: &'a str, field: &str) -> &'a str {
     let value = json
         .split_once(&marker)
         .map(|(_, value)| value)
-        .expect("JSON report contains the requested array field");
+        .unwrap_or_else(|| panic!("missing required JSON array field `{field}`: {json}"));
     assert!(value.starts_with('['), "JSON field is an array: {json}");
 
     let mut depth = 0_usize;
@@ -664,6 +664,12 @@ fn assert_human_named_residuals(
         .parse::<usize>()
         .expect("human residual omitted count is a usize");
     assert_eq!(omitted, 0, "{stdout}");
+}
+
+#[test]
+#[should_panic(expected = "missing required JSON array field `decodedPrivateAuxiliaryNames`")]
+fn decoded_private_auxiliary_names_is_required() {
+    let _ = json_array_field("{}", "decodedPrivateAuxiliaryNames");
 }
 
 #[test]
