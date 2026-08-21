@@ -3084,6 +3084,30 @@ def main():
             "REFUSE: facade manifest demanded count must exceed facade-demand "
             f"count ({json.dumps(demanded_facade_inequality_join, sort_keys=True)})"
         )
+    roundtrip_kernel_special_inequality_join = {
+        "summary_type_roundtrip_checked": manifest_summary.get(
+            "type_roundtrip_checked"
+        ),
+        "summary_kernel_special_population": manifest_summary.get(
+            "kernel_special_population"
+        ),
+    }
+    if (not isinstance(roundtrip_kernel_special_inequality_join[
+            "summary_type_roundtrip_checked"], int)
+            or isinstance(roundtrip_kernel_special_inequality_join[
+                "summary_type_roundtrip_checked"], bool)
+            or not isinstance(roundtrip_kernel_special_inequality_join[
+                "summary_kernel_special_population"], int)
+            or isinstance(roundtrip_kernel_special_inequality_join[
+                "summary_kernel_special_population"], bool)
+            or roundtrip_kernel_special_inequality_join[
+                "summary_type_roundtrip_checked"]
+            <= roundtrip_kernel_special_inequality_join[
+                "summary_kernel_special_population"]):
+        raise SystemExit(
+            "REFUSE: facade manifest type-roundtrip count must exceed kernel "
+            f"special population ({json.dumps(roundtrip_kernel_special_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5162,6 +5186,9 @@ def main():
         ),
         "manifest_demanded_facade_inequality_join": (
             demanded_facade_inequality_join
+        ),
+        "manifest_roundtrip_kernel_special_inequality_join": (
+            roundtrip_kernel_special_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
