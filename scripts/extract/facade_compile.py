@@ -1926,6 +1926,27 @@ def main():
             "REFUSE: facade manifest substrate-emission count must exceed "
             f"bare-name probe count ({json.dumps(substrate_bare_name_inequality_join, sort_keys=True)})"
         )
+    bare_name_projection_inequality_join = {
+        "summary_bare_names_probed": manifest_summary.get("bare_names_probed"),
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+    }
+    if (not isinstance(bare_name_projection_inequality_join[
+            "summary_bare_names_probed"], int)
+            or isinstance(bare_name_projection_inequality_join[
+                "summary_bare_names_probed"], bool)
+            or not isinstance(bare_name_projection_inequality_join[
+                "summary_projection_types_checked"], int)
+            or isinstance(bare_name_projection_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or bare_name_projection_inequality_join["summary_bare_names_probed"]
+            <= bare_name_projection_inequality_join[
+                "summary_projection_types_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest bare-name probe count must exceed "
+            f"projection-type count ({json.dumps(bare_name_projection_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3851,6 +3872,9 @@ def main():
         ),
         "manifest_substrate_bare_name_inequality_join": (
             substrate_bare_name_inequality_join
+        ),
+        "manifest_bare_name_projection_inequality_join": (
+            bare_name_projection_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
