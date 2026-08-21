@@ -7815,6 +7815,24 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
             "count reworded but not re-serialized",
             row.replace("\"compared\":600000", "\"compared\":0600000"),
         ),
+        // A KEY CARRIED TWICE. The extractors take the FIRST occurrence, so a
+        // second copy appended later is invisible to the reader while being the
+        // one a human scanning the file is most likely to read -- the two would
+        // then disagree about what the row says, silently. Re-serialization is
+        // what closes it: the canonical form has one of each key, so a row with
+        // a duplicate cannot be reproduced and is refused rather than
+        // half-read.
+        (
+            "a field carried twice",
+            row.replace("\"class\":", "\"compared\":0,\"class\":"),
+        ),
+        // The same argument for a key the format does not define at all: the
+        // row must be CLOSED, or arbitrary content could ride along in a
+        // retained receipt and survive review by not being displayed.
+        (
+            "an unknown field smuggled in",
+            row.replace("\"class\":", "\"reviewed\":\"yes\",\"class\":"),
+        ),
     ];
     for (name, damaged) in mutations {
         assert!(
@@ -7996,6 +8014,14 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 ..sample_whole_mathlib_receipt()
             },
             "twice",
+        ),
+        (
+            "a family count that is not a number",
+            WholeMathlibReceipt {
+                restrictive_families: vec!["rejected:BlockMismatch=two".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "non-u64 count",
         ),
         (
             "a family that triages nobody",
