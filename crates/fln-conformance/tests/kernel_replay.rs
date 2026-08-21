@@ -6237,6 +6237,16 @@ fn the_inventory_walk_refuses_an_entry_whose_name_is_not_utf8() {
         "the refusal must name the undecodable path rather than fail for something incidental: \
          {reason}"
     );
+    // AND IT MUST NAME THE RIGHT ENTRY. The message carries the path, so a walk
+    // that refused correctly but reported the WRONG file -- the first entry, say,
+    // or whichever it happened to be holding -- would satisfy the check above
+    // while sending whoever repairs the corpus to a file that is fine. `Bad\u{FFFD}`
+    // is how the undecodable stem renders lossily; `Good` is the neighbour that
+    // must not be blamed.
+    assert!(
+        reason.contains("Bad") && !reason.contains("Good"),
+        "the refusal names the wrong entry: {reason}"
+    );
 }
 
 /// A symlinked FILE is refused, so the inventory cannot include something that
@@ -6281,6 +6291,14 @@ fn the_inventory_walk_refuses_a_symlinked_file_entry() {
         reason.contains("symlink"),
         "the refusal must name the symlink rather than fail for something incidental: {reason}"
     );
+    // WHICH entry, not just that one was refused. Both symlink cells assert the
+    // same word on the same production message, so the entry name is the only
+    // part that differs between them -- and it is the part that would be wrong
+    // if the walk reported some other entry as the link.
+    assert!(
+        reason.contains("Alias.olean") && !reason.contains("Real.olean"),
+        "the refusal must blame the planted link, not the real olean beside it: {reason}"
+    );
 }
 
 /// A symlinked DIRECTORY is refused too, which is the case that matters more.
@@ -6312,6 +6330,10 @@ fn the_inventory_walk_refuses_a_symlinked_directory_entry() {
     assert!(
         reason.contains("symlink"),
         "the refusal must name the symlink rather than fail for something incidental: {reason}"
+    );
+    assert!(
+        reason.contains("Aliased") && !reason.contains("Real.olean"),
+        "the refusal must blame the linked directory, not a real entry beside it: {reason}"
     );
 }
 
