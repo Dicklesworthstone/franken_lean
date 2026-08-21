@@ -3712,6 +3712,9 @@ def main():
     field_sets_init_provided_inequality_join = {"summary_field_sets_checked": manifest_summary.get("field_sets_checked"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(field_sets_init_provided_inequality_join["summary_field_sets_checked"], int) or isinstance(field_sets_init_provided_inequality_join["summary_field_sets_checked"], bool) or not isinstance(field_sets_init_provided_inequality_join["summary_init_provided"], int) or isinstance(field_sets_init_provided_inequality_join["summary_init_provided"], bool) or field_sets_init_provided_inequality_join["summary_field_sets_checked"] <= field_sets_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest field-set count must exceed Init-provided count " + json.dumps(field_sets_init_provided_inequality_join, sort_keys=True))
+    field_sets_demanded_init_substrate_inequality_join = {"summary_field_sets_checked": manifest_summary.get("field_sets_checked"), "summary_demanded_init_substrate": manifest_summary.get("demanded_init_substrate")}
+    if (not isinstance(field_sets_demanded_init_substrate_inequality_join["summary_field_sets_checked"], int) or isinstance(field_sets_demanded_init_substrate_inequality_join["summary_field_sets_checked"], bool) or not isinstance(field_sets_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], int) or isinstance(field_sets_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"], bool) or field_sets_demanded_init_substrate_inequality_join["summary_field_sets_checked"] <= field_sets_demanded_init_substrate_inequality_join["summary_demanded_init_substrate"]):
+        raise SystemExit("REFUSE: facade manifest field-set count must exceed demanded Init-substrate count " + json.dumps(field_sets_demanded_init_substrate_inequality_join, sort_keys=True))
     demanded_init_provided_inequality_join = {"summary_demanded": manifest_summary.get("demanded"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(demanded_init_provided_inequality_join["summary_demanded"], int) or isinstance(demanded_init_provided_inequality_join["summary_demanded"], bool) or not isinstance(demanded_init_provided_inequality_join["summary_init_provided"], int) or isinstance(demanded_init_provided_inequality_join["summary_init_provided"], bool) or demanded_init_provided_inequality_join["summary_demanded"] <= demanded_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest demand count must exceed Init-provided count " + json.dumps(demanded_init_provided_inequality_join, sort_keys=True))
@@ -5997,6 +6000,9 @@ def main():
         ),
         "manifest_field_sets_init_provided_inequality_join": (
             field_sets_init_provided_inequality_join
+        ),
+        "manifest_field_sets_demanded_init_substrate_inequality_join": (
+            field_sets_demanded_init_substrate_inequality_join
         ),
         "manifest_demanded_init_provided_inequality_join": (
             demanded_init_provided_inequality_join
