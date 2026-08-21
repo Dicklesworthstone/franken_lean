@@ -2624,6 +2624,110 @@ mod tests {
         );
     }
 
+    /// A `DataValue` whose constructor tag is outside `0..=5` is refused.
+    ///
+    /// This completes the `DataValue` group: the boxed-value guard (55507f50),
+    /// the `ofBool` arity (466d162b) and now the constructor catch-all, which
+    /// is the last of the three without a mutant.
+    ///
+    /// SHADOWING CHECKED, including one INSIDE the same function that the
+    /// other two cells did not have to consider. The scalar guard passes,
+    /// since the slot still holds a pointer. The `ofBool` arity check lives
+    /// inside the tag-1 arm, so a tag of 6 never enters it — the two rules
+    /// cannot be confused by this plant, which matters because they are the
+    /// nearest neighbours in the file. And the enclosing pair, list cell and
+    /// `Expr.mdata` are untouched, so their rules cannot fire; all three
+    /// headers are re-asserted after the plant.
+    #[test]
+    fn a_data_value_with_an_unknown_constructor_is_refused() {
+        let mut bytes = mdata_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified mdata fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let mdata_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("mdata expression");
+        let mdata_header = view.obj_header(mdata_off).expect("mdata header");
+
+        let cell_off = view
+            .deref(view.read_u64(mdata_off + 8).expect("kvmap slot"))
+            .expect("cons cell");
+        let cell_header = view.obj_header(cell_off).expect("cons header");
+        let pair_off = view
+            .deref(view.read_u64(cell_off + 8).expect("head pointer"))
+            .expect("pair object");
+        let pair_header = view.obj_header(pair_off).expect("pair header");
+
+        let value_ptr = view.read_u64(pair_off + 16).expect("value pointer");
+        assert_eq!(value_ptr & 1, 0, "the value is a heap object, not a box");
+        let value_off = view.deref(value_ptr).expect("DataValue object");
+        let (tag, other, cs_sz) = view.obj_header(value_off).expect("DataValue header");
+        assert!(
+            tag <= 5,
+            "the fixture's value is one of the six known constructors, not tag {tag}"
+        );
+        assert_eq!(tag, 1, "specifically ofBool");
+
+        // Claim a seventh constructor. Arity and size are left alone, and a
+        // tag of 6 skips the ofBool arm entirely, so its arity rule is out of
+        // reach as well.
+        let header = view.read_u64(value_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (6_u64 << 56);
+        bytes[value_off as usize..value_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(value_off).expect("value after plant"),
+            (6, other, cs_sz),
+            "only the tag moved"
+        );
+        assert_eq!(
+            view.obj_header(pair_off).expect("pair after plant"),
+            pair_header,
+            "the pair is untouched"
+        );
+        assert_eq!(
+            view.obj_header(cell_off).expect("cell after plant"),
+            cell_header,
+            "the list cell is untouched"
+        );
+        assert_eq!(
+            view.obj_header(mdata_off).expect("mdata after plant"),
+            mdata_header,
+            "and the enclosing expression is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a DataValue with an unknown constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "DataValue ctor",
+                    ..
+                }
+            ),
+            "expected the constructor refusal rather than the ofBool arity one: {error:?}"
+        );
+    }
+
     /// A scalar-boxed `DataValue` is refused.
     ///
     /// Every `DataValue` constructor carries a payload — a string, a bool, a
