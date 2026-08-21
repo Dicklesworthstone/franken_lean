@@ -150,6 +150,21 @@ fn assert_json_private_companion_partition_is_disjoint(json: &str, fields: &[&st
     assert_eq!(covered, private_companions, "{json}");
 }
 
+fn assert_json_named_residual_groups_are_non_empty(json: &str, fields: &[&str]) {
+    for field in fields {
+        let residuals = json_object_field(json, field);
+        assert!(
+            json_usize_field(residuals, "observed") > 0,
+            "{field} is vacuous: {json}",
+        );
+        assert!(
+            !json_name_set(residuals).is_empty(),
+            "{field} has no decoded names: {json}",
+        );
+        assert_eq!(json_usize_field(residuals, "omitted"), 0, "{json}");
+    }
+}
+
 fn human_line_suffix<'a>(stdout: &'a str, prefix: &str) -> &'a str {
     stdout
         .lines()
@@ -655,6 +670,26 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "privateCliPrivateReportResiduals",
             "privateInitDataResiduals",
             "privateInitPreludeResiduals",
+        ],
+    );
+    assert_json_named_residual_groups_are_non_empty(
+        &json.stdout,
+        &[
+            "coreObservablesLoopResiduals",
+            "privateInitPreludeUnsafeRecResiduals",
+            "privateInitPreludeProofNResiduals",
+            "leanNameHashProofResiduals",
+            "leanNameBeqMatchResiduals",
+            "privateLeanNameResiduals",
+            "privateInitPreludeResiduals",
+            "coreObservablesSyntaxMatchResiduals",
+            "privateLeanSyntaxResiduals",
+            "privateLoopMatchOneResiduals",
+            "privateLoopMatchNResiduals",
+            "privateLoopUnsafeRecResiduals",
+            "privateInsertIdxLoopUnaryResiduals",
+            "privateUnaryResiduals",
+            "coreObservablesLoopUnsafeRecResiduals",
         ],
     );
     assert_json_named_residuals(
