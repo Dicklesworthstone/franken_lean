@@ -11410,3 +11410,300 @@ fn the_tag_four_node_name() {
          the fragile assertion; every structural fact above is independent of it"
     );
 }
+
+/// Where else that name link is used - the first step OUTWARD from the
+/// structure.
+///
+/// `c2f98113` measured the link as referenced five times corpus-wide against a
+/// node reached from four of the eight, and named the other references as
+/// unmeasured. They are five DISTINCT holder objects - no object names it twice
+/// - and exactly one of them is the node in the closure.
+///
+/// THE OTHER FOUR ARE OUTSIDE EVERY POPULATION THIS BEAD HAS CHARACTERISED:
+/// not the ten, not the 111, not the eight, not a spine node, not a seed. Their
+/// shapes:
+///
+///   an array, twice - once at slot 43 of a large one
+///   a three-field record at 32 bytes, once
+///   a two-field object at 24 bytes, once
+///
+/// TWO OF THEM WEAR SHAPES THIS FILE HAS ALREADY NAMED AND ARE NOT MEMBERS OF
+/// THEM. The three-field record at 32 bytes is the TEN's exact profile -
+/// `cae89f06` pinned that combination as what distinguishes the ten from the
+/// 111 - and this object is not one of the ten. The two-field object is the
+/// spine-node shape and is not a spine node.
+///
+/// So the shape-is-not-identity finding, which `daaaabe2` opened and
+/// `2baabd20` generalised, holds at the boundary too: leaving the structure
+/// does not leave the shapes behind.
+///
+/// THE MEMBERSHIP CHECK HERE IS NOT THE TAUTOLOGY THE LAST TWO WAVES ASKED FOR.
+/// Membership was reachable - one of the five holders IS in the closure - so
+/// the other four being outside is a measured outcome and not a consequence of
+/// how they were selected.
+///
+/// POPULATION SCOPE, named because `b28cb524` was a wave lost to leaving it
+/// implicit: the link and all five holders live in `Init/Prelude.olean`. The
+/// other three fixtures contribute nothing here, and the cell asserts that
+/// rather than letting an all-module walk be read as a Prelude figure.
+#[test]
+fn the_other_references_to_that_name() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut holders: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut in_closure = 0usize;
+    let mut in_characterised = 0usize;
+    let mut shapes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut modules_with_the_link: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut ten_profile_outside = 0usize;
+    let mut spine_shape_outside = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        // Every population this bead has characterised.
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut known111: BTreeSet<usize> = BTreeSet::new();
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        known111.insert(element);
+                    }
+                }
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut spine = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && spine.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        let mut ten: BTreeSet<usize> = BTreeSet::new();
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                if shape(element) != Some((0, 3)) {
+                    continue;
+                }
+                ten.insert(element);
+                if let Some(below) = resolve(word_at(bytes, element + 8 + 8)) {
+                    for k in 0..word_at(bytes, below + 8) {
+                        if let Some(deeper) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                            && shape(deeper) == Some((0, 3))
+                        {
+                            eight.insert(deeper);
+                        }
+                    }
+                }
+            }
+        }
+        if eight.is_empty() {
+            continue;
+        }
+
+        // The closure, and the one node in it.
+        let mut closure: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<usize> = eight.iter().copied().collect();
+        while let Some(offset) = stack.pop() {
+            if !closure.insert(offset) {
+                continue;
+            }
+            let object = at.get(&offset).expect("a walked object");
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 8 + 8 * slot)) {
+                        stack.push(child);
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, offset + 8) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 24 + 8 * i as usize)) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        let node = closure
+            .iter()
+            .copied()
+            .find(|&offset| shape(offset) == Some((4, 2)))
+            .expect("the one `tag 4` node");
+        let link = resolve(word_at(bytes, node + 8)).expect("its name link");
+
+        // Every slot naming that link.
+        for holder in &objects {
+            let naming = if holder.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(holder.other))
+                    .filter(|&slot| {
+                        resolve(word_at(bytes, holder.off + 8 + 8 * slot)) == Some(link)
+                    })
+                    .count()
+            } else if holder.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, holder.off + 8))
+                    .filter(|&i| {
+                        resolve(word_at(bytes, holder.off + 24 + 8 * i as usize)) == Some(link)
+                    })
+                    .count()
+            } else {
+                0
+            };
+            if naming == 0 {
+                continue;
+            }
+            references += naming;
+            holders.insert((index, holder.off));
+            *modules_with_the_link.entry(module.clone()).or_default() += naming;
+            *shapes
+                .entry(if holder.tag == abi::TAG_ARRAY {
+                    "array".to_owned()
+                } else {
+                    format!(
+                        "tag {} arity {} size {}",
+                        holder.tag, holder.other, holder.cs_sz
+                    )
+                })
+                .or_default() += 1;
+
+            if closure.contains(&holder.off) {
+                in_closure += 1;
+            }
+            let characterised = ten.contains(&holder.off)
+                || known111.contains(&holder.off)
+                || eight.contains(&holder.off)
+                || spine.contains(&holder.off);
+            if characterised {
+                in_characterised += 1;
+            } else {
+                if (holder.tag, holder.other, holder.cs_sz) == (0, 3, 32) {
+                    ten_profile_outside += 1;
+                }
+                if (holder.tag, holder.other) == (0, 2) {
+                    spine_shape_outside += 1;
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Objects, not occurrences.
+    assert_eq!(
+        (references, holders.len()),
+        (5, 5),
+        "five references from five DISTINCT holders - no object names the link \
+         twice, so here the two bases coincide"
+    );
+    assert_eq!(
+        modules_with_the_link.len(),
+        1,
+        "and every one of them is in a single module. The link is \
+         Prelude-only; the other three fixtures contribute nothing, which is \
+         asserted rather than left for an all-module walk to be misread as a \
+         Prelude figure"
+    );
+
+    assert_eq!(
+        in_closure, 1,
+        "exactly one holder is the node in the closure"
+    );
+    assert_eq!(
+        in_characterised, 1,
+        "and it is the ONLY holder in any population this bead has \
+         characterised - the other four are outside the ten, the 111, the \
+         eight and the spine entirely. Membership was reachable, since that one \
+         holder has it, so this is a measured outcome and not a consequence of \
+         selection"
+    );
+
+    assert_eq!(
+        shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("array".to_owned(), 2),
+            ("tag 0 arity 2 size 24".to_owned(), 1),
+            ("tag 0 arity 3 size 32".to_owned(), 1),
+            ("tag 4 arity 2 size 32".to_owned(), 1),
+        ],
+        "the holders by shape"
+    );
+
+    // Shape is not identity, at the boundary too.
+    assert_eq!(
+        (ten_profile_outside, spine_shape_outside),
+        (1, 1),
+        "one holder outside every population carries the TEN's exact profile - \
+         three fields at 32 bytes, the combination `cae89f06` pinned as what \
+         separates the ten from the 111 - and another carries the spine-node \
+         shape. Neither is a member. Leaving the structure does not leave the \
+         shapes behind"
+    );
+}
