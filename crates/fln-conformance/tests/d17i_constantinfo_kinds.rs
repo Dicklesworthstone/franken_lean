@@ -34,7 +34,9 @@ use std::path::{Path, PathBuf};
 
 use fln_core::expr::{Expr, ExprNode};
 use fln_core::name::Name;
-use fln_env::constants::{ConstantInfo, ConstructorVal, InductiveVal, RecursorVal};
+use fln_env::constants::{
+    ConstantInfo, ConstructorVal, DefinitionSafety, InductiveVal, QuotKind, RecursorVal,
+};
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{OleanView, WalkBudget};
 
@@ -1883,4 +1885,142 @@ fn recursor_rule_arities_and_constructor_indices_match_their_declarations() {
         "a decode returning a uniform zero index would satisfy the check above for every \
          single-constructor type; the pin reaches {largest_index}"
     );
+}
+
+/// The quotient constants and the kind each carries.
+///
+/// `QuotKind` is a stored byte nothing in this file has ever read, and it is
+/// dispatched on at reduction time: `quot_reduce_rec` locates the `Quot.mk`
+/// argument at position 5 for `Lift` and position 4 for `Ind`. A `Lift`/`Ind`
+/// swap would therefore not fail to decode and would not fail to resolve — it
+/// would reduce at the wrong argument positions, silently, on every quotient in
+/// the corpus. The four constants and their four kinds are a bijection at the
+/// pin, so the pin is an equality rather than a containment.
+const QUOTIENT_CONSTANTS: &[(&str, QuotKind)] = &[
+    ("Quot", QuotKind::Type),
+    ("Quot.ind", QuotKind::Ind),
+    ("Quot.lift", QuotKind::Lift),
+    ("Quot.mk", QuotKind::Ctor),
+];
+
+#[test]
+fn the_four_quotient_constants_carry_four_distinct_kinds() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let found: Vec<(String, QuotKind)> = infos
+        .iter()
+        .filter_map(|info| match info {
+            ConstantInfo::Quot(v) => Some((info.name().to_display_string(), v.kind)),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<(String, QuotKind)> = QUOTIENT_CONSTANTS
+        .iter()
+        .map(|(name, kind)| ((*name).to_string(), *kind))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the quotient constants and their kinds are what `quot_reduce_rec` dispatches on"
+    );
+
+    // Bijection, stated separately: four constants carrying the same kind twice
+    // would still satisfy a per-name check written against a wrong table.
+    let kinds: BTreeSet<String> = found.iter().map(|(_, k)| format!("{k:?}")).collect();
+    assert_eq!(
+        kinds.len(),
+        4,
+        "each quotient constant must carry a distinct kind"
+    );
+}
+
+/// Safety flags agree wherever the artifact stores them twice, and the non-safe
+/// population is real rather than a decode returning a default.
+///
+/// `is_unsafe` and `DefinitionSafety` are stored bytes nothing in this file
+/// reads. They are load-bearing twice over: KR-973 refuses a safe context that
+/// references an unsafe declaration, and the delta gate repaired at `e7cdcbbc`
+/// keeps its safety refusal on the `Defn` arm, so a definition decoded with the
+/// wrong safety either becomes unfoldable when it must not be or stops being
+/// unfoldable when it should be.
+///
+/// Measured over `Init/Prelude` at private level: 1,677 `Safe`, 32 `Partial`,
+/// 11 `Unsafe` definitions, and zero disagreements between a constructor and
+/// its inductive or a recursor and its block.
+///
+/// The census floors matter more than the agreement here. Every constructor and
+/// recursor in this module is safe, so the agreement check alone is satisfied by
+/// a decode that returned `false` for every `is_unsafe` byte it ever read — and
+/// the same uniform-default failure would make every definition look `Safe`.
+/// Requiring a real `Partial` and a real `Unsafe` population is what rules that
+/// out.
+#[test]
+fn safety_flags_agree_where_stored_twice_and_the_non_safe_population_is_real() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut safe = 0usize;
+    let mut partial = 0usize;
+    let mut unsafe_defs = 0usize;
+    for info in &infos {
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(info.name().to_display_string(), v)),
+            ConstantInfo::Defn(v) => match v.safety {
+                DefinitionSafety::Safe => safe += 1,
+                DefinitionSafety::Partial => partial += 1,
+                DefinitionSafety::Unsafe => unsafe_defs += 1,
+            },
+            _ => {}
+        }
+    }
+    assert!(
+        safe > 1_000 && partial >= 30 && unsafe_defs >= 10,
+        "the pin carries a real non-safe population; a decode defaulting every safety byte \
+         would report all-safe and pass every agreement check below \
+         (safe {safe}, partial {partial}, unsafe {unsafe_defs})"
+    );
+
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Ctor(v) => {
+                let induct = inductives
+                    .get(&v.induct.to_display_string())
+                    .expect("constructor's inductive decodes");
+                assert_eq!(
+                    v.is_unsafe, induct.is_unsafe,
+                    "{name} and its inductive disagree on safety"
+                );
+            }
+            ConstantInfo::Rec(v) => {
+                for type_name in &v.all {
+                    let induct = inductives
+                        .get(&type_name.to_display_string())
+                        .expect("recursor's block type decodes");
+                    assert_eq!(
+                        v.is_unsafe,
+                        induct.is_unsafe,
+                        "{name} and block member {} disagree on safety",
+                        type_name.to_display_string()
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `Init/Prelude` decoded at private level — the subject of the cells below.
+fn decode_prelude_private(lib: &Path) -> Vec<ConstantInfo> {
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part")
 }
