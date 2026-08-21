@@ -9807,3 +9807,123 @@ fn a_constructor_result_passes_its_parameters_as_its_own_binders() {
         "the widths must reach beyond one, or `in order` is untested: {widths:?}"
     );
 }
+
+/// `(module, exported names, private names, greedy subsequence match, adjacent
+/// inversions among the shared names, adjacent lexicographic inversions)`.
+const ARRAY_ORDER_ROWS: &[(&str, usize, usize, usize, usize, usize)] = &[
+    ("Init.Prelude", 2204, 2314, 2, 1101, 1113),
+    ("Init.Meta.Defs", 379, 530, 3, 190, 183),
+];
+
+/// The two parts order the declarations they SHARE almost independently, and
+/// neither array is lexicographic.
+///
+/// Two cells already read this array's order. One shows it is not in dependency
+/// order; the other shows the private part re-serialises rather than appends,
+/// by finding the private-only names interleaved throughout. Both are about
+/// where the ADDED names sit. Neither asks whether the names present in both
+/// parts keep their relative order, and they do not:
+///
+///   the exported array is NOT a subsequence of the private one. Matching
+///     greedily from the left gets 2 of 2,204 names for `Init/Prelude` and 3 of
+///     379 for `Init.Meta.Defs` before the sequences diverge. Even the first
+///     element differs — `Monad.rec` against `HXor.recOn`
+///   among the shared names alone, 1,101 of 2,203 adjacent pairs appear in the
+///     opposite relative order in the private part. About half, which is what
+///     two unrelated orderings look like rather than a perturbation of one
+///
+/// So "the private part re-serialises" is stronger than it sounds. It is not
+/// the exported sequence with insertions; it is a different sequence over a
+/// superset of the names, and nothing about the exported order survives.
+///
+/// NEITHER ARRAY IS LEXICOGRAPHIC, and that is the artifact fact behind two
+/// reworks in this file. 1,113 of 2,203 adjacent pairs are out of alphabetical
+/// order, the first at index 1. A cell that collects names by walking the array
+/// and compares the result against a lexicographically written table is
+/// comparing against an order the artifact does not have — it will fail for a
+/// reason that has nothing to do with what the cell is about. Both times that
+/// happened here the fix was to key the collection by name. This cell records
+/// why that fix is necessary rather than stylistic.
+#[test]
+fn the_two_parts_share_names_but_not_their_order() {
+    let lib = lib_or_skip!();
+
+    for (module, exported_len, private_len, greedy, shared_inversions, lex_inversions) in
+        ARRAY_ORDER_ROWS
+    {
+        let (exported_infos, _) = decode_at(&lib, module, Level::Exported);
+        let (private_infos, _) = decode_at(&lib, module, Level::Private);
+        let exported: Vec<String> = exported_infos
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+        let private: Vec<String> = private_infos
+            .iter()
+            .map(|info| info.name().to_display_string())
+            .collect();
+        assert_eq!(
+            (exported.len(), private.len()),
+            (*exported_len, *private_len),
+            "{module}: the array lengths this row is stated against"
+        );
+
+        // Greedy left-to-right subsequence match. If the exported sequence were
+        // the private one with names removed, this would consume all of it.
+        let mut cursor = 0usize;
+        for name in &private {
+            if cursor < exported.len() && *name == exported[cursor] {
+                cursor += 1;
+            }
+        }
+        assert_eq!(
+            cursor, *greedy,
+            "{module}: the exported array is not a subsequence of the private one"
+        );
+        assert!(
+            cursor < exported.len() / 100,
+            "{module}: and it diverges almost immediately, not near the end"
+        );
+        assert_ne!(
+            exported.first(),
+            private.first(),
+            "{module}: the two parts do not even agree on which declaration comes first"
+        );
+
+        // Relative order of the names present in both.
+        let position: BTreeMap<&String, usize> = private
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect();
+        let shared: Vec<usize> = exported
+            .iter()
+            .filter_map(|name| position.get(name).copied())
+            .collect();
+        assert_eq!(
+            shared.len(),
+            exported.len(),
+            "{module}: every exported name must still be present, or this measures loss \
+             rather than reordering"
+        );
+        let inversions = shared.windows(2).filter(|pair| pair[0] > pair[1]).count();
+        assert_eq!(
+            inversions, *shared_inversions,
+            "{module}: adjacent pairs whose relative order the private part reverses"
+        );
+        assert!(
+            inversions * 3 > shared.len(),
+            "{module}: the reordering must be pervasive rather than a few swaps"
+        );
+
+        // And the array is not alphabetical either.
+        let lex = exported.windows(2).filter(|pair| pair[0] > pair[1]).count();
+        assert_eq!(
+            lex, *lex_inversions,
+            "{module}: adjacent pairs out of lexicographic order in the exported array"
+        );
+        assert!(
+            lex * 3 > exported.len(),
+            "{module}: not nearly sorted either, so walk order cannot stand in for name order"
+        );
+    }
+}
