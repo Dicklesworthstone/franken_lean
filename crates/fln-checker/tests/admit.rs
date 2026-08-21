@@ -2743,6 +2743,43 @@ fn kr600_803_color_refuses_a_forged_num_rules_count() {
 }
 
 #[test]
+fn kr600_803_color_refuses_a_forged_num_indices_count() {
+    let mut entries = enumeration_entries(BinderInfo::Implicit);
+    let declaration = entries[3].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Color", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices() + 1,
+                metadata.num_motives(),
+                metadata.num_minors(),
+                metadata.rules().to_vec(),
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_color_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = enumeration_entries(BinderInfo::Implicit);
     for (entry, expected_index) in [(&entries[1], 0), (&entries[2], 1)] {
