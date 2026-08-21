@@ -18493,6 +18493,77 @@ fn the_corpus_matrix_receipt_round_trips_through_its_own_serializer() {
     }
 }
 
+/// The two receipt validators disagree about one field ON PURPOSE, and nothing held that.
+///
+/// `CorpusMatrixReceipt::validate` refuses `available_parallelism: 0`;
+/// `WholeMathlibReceipt::validate` accepts it, with a written reason. Both are right for the
+/// claim they serve -- the corpus-matrix cost is quoted in AGENTS.md as measured ON A 64-WAY
+/// HOST and has exactly one row behind it, so an unknown host cannot carry it, while the
+/// sibling's timings are comparative. Until this cell the divergence lived only in two
+/// comments, and a reader tidying one of them would have changed what a claim means with
+/// nothing failing.
+///
+/// **What this pins and what it deliberately does not.** It pins the DECIDED difference, in
+/// both directions, so harmonising either way reddens here rather than silently. It does NOT
+/// pin the sibling's other, undecided weakness: that validator has no 64-hex shape rule on
+/// its two digest fields, which the corpus-matrix one has carried since `2c0bace2`. That is a
+/// gap rather than a decision, and measured before writing this: label hashes
+/// (`sentinel-fixture-hash`, `both-directions-at-once`, `0123456789abcdef`) flow into
+/// `validate` in six sibling tests plus `sample_whole_mathlib_receipt` itself, so closing it
+/// means re-basing seven guards' fixtures, not adding a rule beside the others. Asserting the
+/// sibling ACCEPTS a label would make that repair redden a cell that calls itself a
+/// divergence, which is a wall wearing a ledger's clothes.
+#[test]
+fn the_two_validators_diverge_on_available_parallelism_by_decision() {
+    let pin = suite_lock_reference_pin();
+    let text = fs::read_to_string(corpus_matrix_receipt_path(&pin))
+        .expect("the retained receipt must be readable");
+    let matrix = CorpusMatrixReceipt::from_row(
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("the retained receipt must hold at least one row"),
+    )
+    .expect("the committed row must parse");
+
+    // The two green controls first: both receipts are valid as they stand, so a red below is
+    // about the one field and not about a fixture that had rotted.
+    matrix
+        .validate(&pin)
+        .expect("the committed corpus-matrix row must validate");
+    let sibling = sample_whole_mathlib_receipt();
+    sibling
+        .validate(&sibling.pin.clone(), &sibling.corpus_commit.clone())
+        .expect("the sibling sample must validate");
+
+    let unknown_host = CorpusMatrixReceipt {
+        available_parallelism: 0,
+        ..matrix.clone()
+    };
+    assert!(
+        unknown_host.validate(&pin).is_err(),
+        "the corpus-matrix receipt must refuse a host that could not report its parallelism: \
+         its cost figure is quoted as measured on a 64-way host and one row stands behind that \
+         sentence. If this now passes, the quoted claim lost its host binding"
+    );
+
+    let unknown_host_sibling = WholeMathlibReceipt {
+        available_parallelism: 0,
+        ..sample_whole_mathlib_receipt()
+    };
+    assert!(
+        unknown_host_sibling
+            .validate(
+                &unknown_host_sibling.pin,
+                &unknown_host_sibling.corpus_commit
+            )
+            .is_ok(),
+        "the whole-Mathlib receipt must keep accepting an unknown host: the producer writes 0 \
+         when the platform will not answer, and this receipt's timings are comparative rather \
+         than quoted. If you have just made the two validators agree, decide which claim you \
+         changed before deleting this"
+    );
+}
+
 /// A row that compared nothing must not stand as the observation (bead `franken_lean-p6x1`).
 ///
 /// **The mutant this exists for, and it was live.** Measured at `2ebe03e0`, with both
