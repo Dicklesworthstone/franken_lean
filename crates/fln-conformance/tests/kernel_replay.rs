@@ -8839,6 +8839,15 @@ fn a_stem_ending_in_a_dot_mints_a_name_no_import_can_match() {
 /// **The refusals are told apart by the entry they name**, since a message
 /// saying only "bad fixture entry" would let the absolute cell pass on the
 /// parent-directory cell's panic.
+///
+/// **A third entry exists for a mutant the first two cannot kill.** `..` and the
+/// root both appear as the FIRST component, so a guard written as
+/// `matches!(components().next(), Some(Normal(_)))` -- checking where the path
+/// starts instead of what it contains -- refuses both and passes everything
+/// here. `Sub/../../escaped/F.olean` starts with an ordinary name and still
+/// climbs two levels out, which is measured rather than argued. Two decoys
+/// chosen for two wrong rules, and a third wrong rule sitting between them: the
+/// same gap the `.olean` dotfile closed in the extension filter one commit ago.
 #[test]
 fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() {
     // THE MECHANISM, LEXICALLY, WITH NO FILESYSTEM INVOLVED. If either of these
@@ -8893,6 +8902,15 @@ fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() 
         "../t6r7-escaped-sibling/Foo.olean",
     );
     let absolute = refuse("t6r7-selftest-escape-absolute-v1", outside_entry);
+    // THE ESCAPE THAT DOES NOT START AT THE FIRST COMPONENT. Both entries above
+    // put the offending component first -- `..` and the root -- so a guard that
+    // examined only `components().next()` refuses both and survives every
+    // assertion in this test. Measured: this entry's first component is an
+    // ordinary name, and it still climbs two levels out of the tree.
+    let deep = refuse(
+        "t6r7-selftest-escape-deep-v1",
+        "Sub/../../t6r7-escaped-deep/Foo.olean",
+    );
 
     // ASSERTED ON THE PART THAT DIFFERS: both refusals share every word except
     // the entry, so each cell must find its own and not the other's.
@@ -8906,10 +8924,23 @@ fn a_fixture_entry_that_leaves_the_tree_is_refused_before_anything_is_written() 
     );
 
     assert!(
+        deep.contains("Sub/../../t6r7-escaped-deep/Foo.olean"),
+        "the deep refusal must name its own entry: {deep}"
+    );
+
+    assert!(
         !escaped_sibling.exists(),
         "the entry was refused and a directory still appeared at {}; the check must run BEFORE \
          `create_dir_all`, or the refusal is an announcement about a write that already happened",
         escaped_sibling.display()
+    );
+    // The deep entry resolves to a SIBLING of the fixture tree, two levels up:
+    // `<tmp>/<fixture>/Sub/../..` is `<tmp>`. `create_dir_all` walks that chain
+    // and would have created the directory outside.
+    assert!(
+        !tmp.join("t6r7-escaped-deep").exists(),
+        "an escape whose `..` is not its first component still left {} behind",
+        tmp.join("t6r7-escaped-deep").display()
     );
     assert!(
         !outside_target.exists(),
