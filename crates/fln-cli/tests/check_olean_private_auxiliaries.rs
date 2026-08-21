@@ -162,8 +162,15 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         private_companion_observed,
         "{json}",
     );
+    let decoded_private_loop_auxiliaries = json_object_field(json, "decodedPrivateLoopAuxiliaries");
+    let decoded_private_loop_observed =
+        json_usize_field(decoded_private_loop_auxiliaries, "observed");
     assert!(
-        decoded_private_auxiliaries > 0,
+        decoded_private_loop_observed <= decoded_private_auxiliaries,
+        "{json}",
+    );
+    assert!(
+        decoded_private_loop_observed > 0,
         "{json}",
     );
 }
