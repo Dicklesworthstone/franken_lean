@@ -9931,3 +9931,182 @@ fn the_two_parts_share_names_but_not_their_order() {
         );
     }
 }
+
+/// Fields whose projection is a THEOREM rather than a definition.
+const PROOF_PROJECTIONS: &[&str] = &[
+    "And.left",
+    "And.right",
+    "Char.valid",
+    "Fin.isLt",
+    "String.isValidUTF8",
+    "Subtype.property",
+];
+/// Fields that carry no projection under any name.
+const UNPROJECTED_FIELDS: &[&str] = &[
+    "ByteArray.IsValidUTF8.hm",
+    "ByteArray.IsValidUTF8.m",
+    "Nonempty.val",
+];
+/// The one projection that exists only under a privacy-scoped name.
+const SCOPED_PROJECTION: (&str, &str) = (
+    "Lean.Macro.State.expandedMacroDecls",
+    "_private.Init.Prelude.0.Lean.Macro.State.expandedMacroDecls",
+);
+
+/// Almost every field DOES project — the cell above counts definitions, and a
+/// projection is not always a definition.
+///
+/// The projection cell reports eight "incomplete" families: three Prop-valued
+/// with no projections and five short by exactly one. Its assertions are true
+/// as written, because they ask whether a DEFINITION named `<Inductive>.<field>`
+/// exists. Its prose says the field is not projected, and for five of the eight
+/// that is wrong. Looking for the declaration under any kind and any scope:
+///
+///   136 fields project to a `Defn`
+///   6 project to a `Thm` — `And.left`, `And.right`, `Char.valid`, `Fin.isLt`,
+///     `String.isValidUTF8`, `Subtype.property`. A projection whose result is a
+///     proposition is a theorem, which is why a search restricted to `Defn`
+///     reports it absent
+///   1 exists only under a PRIVACY-SCOPED name:
+///     `Lean.Macro.State.expandedMacroDecls` is declared as
+///     `_private.Init.Prelude.0.…`, matching its constructor, which the
+///     block-naming cell already records as scoped
+///   3 are genuinely absent, and they belong to just TWO structures:
+///     `Nonempty.val` and both fields of `ByteArray.IsValidUTF8`
+///
+/// So the population is 145 fields with 3 unprojected, not 8 families with 9
+/// missing projections. `And` in particular projects both of its fields.
+///
+/// The two structures that really project nothing are Props whose fields are
+/// not propositions — `Nonempty.val` would take a proof to the data it asserts
+/// the existence of, which is exactly the elimination Lean refuses and exactly
+/// why `Nonempty` differs from `Inhabited`. I state that as the shape of the
+/// two cases rather than as a derived rule, because deciding whether a field's
+/// type is a proposition needs inference this file does not have.
+///
+/// The lesson is the one this file keeps relearning from the other side: a
+/// search keyed on a NAME plus an assumed KIND finds less than exists, and
+/// reports the shortfall as absence.
+#[test]
+fn nearly_every_structure_field_projects_though_not_always_to_a_definition() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let declared = kinds(&infos);
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<String>)> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_name.to_display_string());
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+
+    let mut definitions = 0usize;
+    let mut theorems: BTreeSet<String> = BTreeSet::new();
+    let mut absent: BTreeSet<String> = BTreeSet::new();
+    let mut scoped: BTreeSet<String> = BTreeSet::new();
+    let mut fields = 0usize;
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        let start = ctor.num_params as usize;
+        for field in &binders[start..start + ctor.num_fields as usize] {
+            fields += 1;
+            let plain = format!("{name}.{field}");
+            match declared.get(&plain) {
+                Some(&"Defn") => definitions += 1,
+                Some(&"Thm") => drop(theorems.insert(plain)),
+                Some(other) => panic!("{plain}: unexpected projection kind {other}"),
+                None => {
+                    // Look for it under a privacy scope before calling it absent.
+                    let suffix = format!(".{plain}");
+                    match declared
+                        .keys()
+                        .find(|candidate| candidate.ends_with(&suffix))
+                    {
+                        Some(_) => {
+                            definitions += 1;
+                            scoped.insert(plain);
+                        }
+                        None => drop(absent.insert(plain)),
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        (fields, definitions, theorems.len(), absent.len()),
+        (145, 137, 6, 3),
+        "every field is accounted for as a definition, a theorem, or genuinely absent"
+    );
+    assert_eq!(
+        definitions + theorems.len() + absent.len(),
+        fields,
+        "and the three categories partition the fields"
+    );
+    assert_eq!(
+        theorems.iter().map(String::as_str).collect::<Vec<&str>>(),
+        PROOF_PROJECTIONS.to_vec(),
+        "the projections that are theorems rather than definitions"
+    );
+    assert_eq!(
+        absent.iter().map(String::as_str).collect::<Vec<&str>>(),
+        UNPROJECTED_FIELDS.to_vec(),
+        "the only fields with no projection under any name or kind"
+    );
+
+    let (field, scoped_name) = SCOPED_PROJECTION;
+    assert_eq!(
+        scoped.iter().map(String::as_str).collect::<Vec<&str>>(),
+        vec![field],
+        "exactly one projection is reachable only under a privacy-scoped name"
+    );
+    assert_eq!(
+        declared.get(scoped_name).copied(),
+        Some("Defn"),
+        "and that is the name it is declared under"
+    );
+
+    // The three absent fields belong to two structures, both Props.
+    let owners: BTreeSet<&str> = UNPROJECTED_FIELDS
+        .iter()
+        .map(|field| {
+            let cut = field.rfind('.').expect("a qualified field name");
+            &field[..cut]
+        })
+        .collect();
+    assert_eq!(
+        owners.len(),
+        2,
+        "the unprojected fields come from two structures"
+    );
+    for owner in owners {
+        let induct = inductives
+            .get(owner)
+            .unwrap_or_else(|| panic!("{owner} must decode"));
+        assert!(
+            inductive_result_is_prop(induct),
+            "{owner}: only a Prop-valued structure withholds a projection"
+        );
+    }
+}
