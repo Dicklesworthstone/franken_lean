@@ -8981,3 +8981,115 @@ fn the_gapped_match_auxiliaries_are_absent_at_both_levels_and_defeat_a_counting_
         "every auxiliary this cell reasons about is named"
     );
 }
+
+/// `(gapped base, the declarations that use it)` — its own auxiliaries do not
+/// count as users.
+const GAPPED_BASE_USERS: &[(&str, &[&str])] = &[
+    ("List.hasDecEq", &["instDecidableEqList"]),
+    ("String.decEq", &["instDecidableEqString"]),
+    ("instDecidableEqRaw", &[]),
+];
+
+/// The three gapped bases all sit on the decidable-equality path, established
+/// by STORED REFERENCE rather than by their names.
+///
+/// The numbering cell observes that all three bases with non-contiguous
+/// `match_N` auxiliaries are decidable-equality functions, and explicitly
+/// declines to claim it, on the grounds that a shared name shape is not a
+/// relation. That was the right refusal and it left the observation unusable.
+/// The reference graph settles it without appealing to any name:
+///
+///   `List.hasDecEq` is used by exactly ONE declaration, `instDecidableEqList`
+///   `String.decEq` is used by exactly ONE, `instDecidableEqString`
+///   `instDecidableEqRaw` is used by NONE, because it is itself the instance
+///
+/// So two of the three are implementations sitting behind exactly one instance
+/// each, and the third is an instance. All three are on the same path, and the
+/// argument nowhere reads a `decEq` substring.
+///
+/// This also closes a gap between prose and code in the derived-equality cell.
+/// Its doc says `instDecidableEqList` uses `List.hasDecEq`; its assertion says
+/// only that the instance delegates to no OTHER INSTANCE, which is a different
+/// and weaker claim. The reference it describes was never checked, and a
+/// decoder that dropped it would have satisfied that cell.
+///
+/// "Exactly one" is the load-bearing part. A decode that lost the reference
+/// gives zero users; one that duplicated the declaration gives two. Both are
+/// caught, where "is used somewhere" would catch neither.
+///
+/// A declaration's own auxiliaries are excluded from its user set — the
+/// question is who USES it, not which of its generated pieces mention it.
+#[test]
+fn every_gapped_base_is_on_the_decidable_equality_path_by_reference() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let targets: BTreeSet<&str> = GAPPED_BASE_USERS.iter().map(|(base, _)| *base).collect();
+    let mut users: BTreeMap<&str, Vec<String>> =
+        targets.iter().map(|base| (*base, Vec::new())).collect();
+    let mut walked = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        let value = match info {
+            ConstantInfo::Defn(v) => &v.value,
+            ConstantInfo::Thm(v) => &v.value,
+            ConstantInfo::Opaque(v) => &v.value,
+            _ => continue,
+        };
+        walked += 1;
+        let referenced = referenced_constants(value);
+        for base in &targets {
+            // Its own auxiliaries are not users of it.
+            if name.starts_with(base) {
+                continue;
+            }
+            if referenced.contains(*base) {
+                users
+                    .get_mut(*base)
+                    .expect("seeded above")
+                    .push(name.clone());
+            }
+        }
+    }
+    assert!(
+        walked > 1_500,
+        "the value walk must cover the module, got {walked} declarations"
+    );
+
+    for (base, expected) in GAPPED_BASE_USERS {
+        let found = users.get(*base).expect("seeded above");
+        assert_eq!(
+            found.iter().map(String::as_str).collect::<Vec<&str>>(),
+            expected.to_vec(),
+            "{base}: the declarations that use it, by stored reference"
+        );
+    }
+
+    // The two roles must both be present, or "on the same path" is one claim
+    // repeated rather than two shapes meeting.
+    let implementations = GAPPED_BASE_USERS
+        .iter()
+        .filter(|(_, users)| users.len() == 1)
+        .count();
+    let instances = GAPPED_BASE_USERS
+        .iter()
+        .filter(|(base, users)| users.is_empty() && base.starts_with("instDecidableEq"))
+        .count();
+    assert_eq!(
+        (implementations, instances, GAPPED_BASE_USERS.len()),
+        (2, 1, 3),
+        "two implementations behind one instance each, and one instance"
+    );
+
+    // And the instances doing the using are real declarations, not names.
+    let declared = kinds(&infos);
+    for (_, expected) in GAPPED_BASE_USERS {
+        for user in *expected {
+            assert_eq!(
+                declared.get(*user).copied(),
+                Some("Defn"),
+                "{user} must itself be a decoded definition"
+            );
+        }
+    }
+}
