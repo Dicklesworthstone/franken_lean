@@ -166,6 +166,10 @@ the toolchain would report a perfect facade:
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
 
+  * A MANIFEST-INPUT-SET JOIN requires exactly the known resistance artifact and
+    three pinned environment shards. A valid hash list cannot omit a load-bearing
+    extraction input or substitute an unrelated file.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -188,6 +192,12 @@ DEMANDED_EFFECTS = frozenset(("pure", "toolchain-monad", "io", "monad-transforme
 DEMANDED_BUCKETS = frozenset(("R-NONE", "R-EFFECT", "R-EXTERN", "R-UNSAFE"))
 DEMANDED_SAFETIES = frozenset(("safe", "unsafe"))
 DEMANDED_FORMS = frozenset(("axiom", "transparent-abbrev", "class-projection", "class", "structure"))
+MANIFEST_INPUTS = frozenset((
+    "contracts/facade_resistance.ndjson",
+    "contracts/builtin_environment.tsv",
+    "contracts/builtin_environment.001.tsv",
+    "contracts/builtin_environment.002.tsv",
+))
 
 
 def input_digest(path):
@@ -952,6 +962,14 @@ def join_manifest_input_digests(summary):
     entries = summary.get("inputs")
     if not isinstance(entries, list) or not entries:
         raise SystemExit("REFUSE: facade manifest has no extraction-input digests")
+    declared_paths = [entry.get("path") if isinstance(entry, dict) else None for entry in entries]
+    if (not all(isinstance(path, str) for path in declared_paths)
+            or len(declared_paths) != len(MANIFEST_INPUTS)
+            or frozenset(declared_paths) != MANIFEST_INPUTS):
+        raise SystemExit(
+            "REFUSE: facade manifest input-set join disagrees with the extraction "
+            f"contract (declared={declared_paths!r})"
+        )
     seen = set()
     for entry in entries:
         if not isinstance(entry, dict):
