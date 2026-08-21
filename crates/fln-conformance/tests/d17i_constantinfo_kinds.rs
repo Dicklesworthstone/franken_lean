@@ -12014,3 +12014,70 @@ fn the_minor_counts_exceed_the_rules_by_the_nested_familys_duplication() {
         "and the ordinary recursors add nothing to the gap"
     );
 }
+
+/// `num_motives` summed exceeds the blocks-plus-nesting total by the family's
+/// duplication.
+///
+/// The motive cell pins `num_motives == all.len() + num_nested` per recursor,
+/// and the census pins 127 blocks with two levels of nesting between them.
+/// Nothing sums the motives. They come to 135, where the blocks and their
+/// nesting account for 129.
+///
+/// The gap of six is the nested family again, for the same reason as the
+/// minors: `num_motives` describes the BLOCK, so all three `Lean.Syntax`
+/// recursors declare three motives each — nine — where the block itself needs
+/// three. The 126 ordinary recursors contribute nothing to the gap.
+///
+/// Between them, this and the minors cell say the same thing about two fields:
+/// a recursor's counts describe its block, not itself, so summing them over
+/// recursors double-counts every block that owns more than one. The two gaps
+/// have different sizes — six and fourteen — because the fields describe
+/// different things, and pinning both stops either being read as a constant
+/// correction for nesting.
+///
+/// Conservation runs first.
+#[test]
+fn the_motive_counts_exceed_the_blocks_by_the_nested_familys_duplication() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut motives = 0usize;
+    let mut family = 0usize;
+    let mut blocks = 0usize;
+    let mut nesting = 0usize;
+    for info in &infos {
+        match info {
+            ConstantInfo::Induct(v) => {
+                blocks += 1;
+                nesting += v.num_nested as usize;
+            }
+            ConstantInfo::Rec(v) => {
+                motives += v.num_motives as usize;
+                if NESTED_RECURSOR_FAMILY.contains(&info.name().to_display_string().as_str()) {
+                    family += v.num_motives as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Conservation first: the gap is the family declaring the block's motives
+    // once per member instead of once.
+    let owed = blocks + nesting;
+    assert_eq!(
+        motives - owed,
+        family - (1 + nesting),
+        "the whole gap must come from the nested family declaring its block's motives more \
+         than once"
+    );
+    assert_eq!(
+        (motives, blocks, nesting, family),
+        (135, 127, 2, 9),
+        "the motive, block and nesting censuses this row is stated against"
+    );
+    assert_eq!(
+        motives - owed,
+        6,
+        "and the ordinary recursors add nothing to the gap"
+    );
+}
