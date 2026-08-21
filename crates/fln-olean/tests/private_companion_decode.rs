@@ -612,7 +612,7 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 14] = [
+    let families: [(&str, fn(&str) -> bool); 15] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -627,9 +627,10 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
         ("_unary", family::unary),
         ("_sunfold", family::sunfold),
         ("_f", family::private_f),
+        ("Array.shrink.loop._f", family::array_shrink_loop_f),
     ];
-    let mut representatives: [Option<(String, String)>; 14] = [
-        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+    let mut representatives: [Option<(String, String)>; 15] = [
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
     ];
 
     for relative in init_chain_modules(&lib) {
@@ -689,7 +690,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 14] = [
+    let families: [(&str, fn(&str) -> bool); 15] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -704,6 +705,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
         ("_unary", family::unary),
         ("_sunfold", family::sunfold),
         ("_f", family::private_f),
+        ("Array.shrink.loop._f", family::array_shrink_loop_f),
     ];
 
     for (family, belongs_to_family) in families {
