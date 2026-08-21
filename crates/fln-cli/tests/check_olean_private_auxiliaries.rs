@@ -952,6 +952,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths keep private Init residuals beside list-to-array auxiliary match residuals",
     );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
+                    == r##""\"listToArrayAuxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"privateInitDataListToArrayResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},","##
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths keep list-to-array auxiliary match residuals beside private Init.Data list-to-array residuals",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
