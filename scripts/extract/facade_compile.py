@@ -178,6 +178,10 @@ the toolchain would report a perfect facade:
     and their measured memberships to reconstruct the joined resistance cohort.
     Bucket-level assurance rows cannot drift from their summary total.
 
+  * A RESISTANCE-ASSURANCE JOIN requires each ratchet bucket's pinned step and
+    assurance-level prefix. Measured resistance membership cannot drift from the
+    confidence boundary that governs how it may be claimed.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -206,6 +210,12 @@ MANIFEST_INPUTS = frozenset((
     "contracts/builtin_environment.001.tsv",
     "contracts/builtin_environment.002.tsv",
 ))
+RATCHET_STEPS = {
+    "R-NONE": (1, "L2"),
+    "R-EFFECT": (2, "L1"),
+    "R-UNSAFE": (3, "L0"),
+    "R-EXTERN": (4, "L1"),
+}
 
 
 def input_digest(path):
@@ -1036,11 +1046,15 @@ def join_resistance_demand(manifest_summary, module_join):
     for step in ratchet_steps:
         bucket = step.get("bucket")
         members = step.get("members")
-        if (bucket not in DEMANDED_BUCKETS
+        expected = RATCHET_STEPS.get(bucket)
+        if (expected is None
                 or not isinstance(members, int)
                 or isinstance(members, bool)
                 or members < 0
-                or bucket in ratchet_members):
+                or bucket in ratchet_members
+                or step.get("step") != expected[0]
+                or not isinstance(step.get("l_level"), str)
+                or not step["l_level"].startswith(expected[1])):
             raise SystemExit(
                 f"REFUSE: resistance ratchet-step join found invalid row {step!r}"
             )
@@ -1056,7 +1070,7 @@ def join_resistance_demand(manifest_summary, module_join):
             or values["demanded_names"] < values["exact_demanded"]
             or values["union_demanded"] < values["joined"]
             or values["tactic_files"] == 0
-            or set(ratchet_members) != DEMANDED_BUCKETS
+            or set(ratchet_members) != set(RATCHET_STEPS)
             or sum(ratchet_members.values()) != values["joined"]):
         raise SystemExit(
             "REFUSE: resistance-demand cross join disagrees with its cohorts "
