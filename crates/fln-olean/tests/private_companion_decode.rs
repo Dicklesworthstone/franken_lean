@@ -299,6 +299,11 @@ const FORMAT_SHOULD_FLATTEN_MATCH_1: &str =
     "_private.Init.Data.Format.Basic.0.Std.Format.FlattenAllowability.shouldFlatten.match_1";
 /// The pin's private formatting companion stores this definition in Basic.
 const FORMAT_SHOULD_FLATTEN_MATCH_1_MODULE: &str = "Init/Data/Format/Basic";
+/// The private match implementation for `Vector.elimAsArray`.
+const VECTOR_ELIM_AS_ARRAY_MATCH_1: &str =
+    "_private.Init.Data.Vector.Basic.0.Vector.elimAsArray.match_1";
+/// The pin's private vector companion stores this definition in Basic.
+const VECTOR_ELIM_AS_ARRAY_MATCH_1_MODULE: &str = "Init/Data/Vector/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -2100,6 +2105,34 @@ fn format_should_flatten_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {FORMAT_SHOULD_FLATTEN_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn vector_elim_as_array_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("vector_elim_as_array_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, VECTOR_ELIM_AS_ARRAY_MATCH_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&VECTOR_ELIM_AS_ARRAY_MATCH_1.to_owned()),
+        "the private companion of {VECTOR_ELIM_AS_ARRAY_MATCH_1_MODULE} must retain \\
+         {VECTOR_ELIM_AS_ARRAY_MATCH_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == VECTOR_ELIM_AS_ARRAY_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {VECTOR_ELIM_AS_ARRAY_MATCH_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {VECTOR_ELIM_AS_ARRAY_MATCH_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
