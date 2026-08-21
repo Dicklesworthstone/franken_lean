@@ -2137,6 +2137,43 @@ fn kr600_803_init_bool_refuses_a_forged_num_parameters_count() {
 }
 
 #[test]
+fn kr600_803_init_bool_refuses_a_forged_num_motives_count() {
+    let mut entries = init_bool_entries();
+    let declaration = entries[3].declaration();
+    let metadata = declaration
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Bool", "rec"]),
+        ConstantDeclaration::recursor(
+            declaration.level_parameters().to_vec(),
+            declaration.type_().clone(),
+            declaration.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives() + 1,
+                metadata.num_minors(),
+                metadata.rules().to_vec(),
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_init_bool_fixture_pins_recursor_levels_motives_minors_and_rules() {
     let entries = init_bool_entries();
     let recursor = entries[3].declaration();
