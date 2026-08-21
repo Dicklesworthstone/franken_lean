@@ -940,11 +940,36 @@ impl<'a> DeclDecoder<'a> {
                 });
             }
         };
-        let expected_cs_sz = (8 + 8 * u64::from(vother) + scalar_bytes).div_ceil(8) * 8;
+        let meaningful = 8 + 8 * u64::from(vother) + scalar_bytes;
+        let expected_cs_sz = meaningful.div_ceil(8) * 8;
         if u64::from(vcs_sz) != expected_cs_sz {
             return Err(DeclError::Shape {
                 offset: voff,
                 what: "ConstantInfo payload object size disagrees with its field layout",
+            });
+        }
+
+        // The alignment padding after the last meaningful scalar. `cs_sz` above
+        // proves how many such bytes there are; this proves they are empty.
+        //
+        // The two checks catch different mistakes. A wrong `vother` usually
+        // moves the whole scalar area and shows up as a size disagreement, but
+        // an off-by-one in the SCALAR count alone leaves the size intact and
+        // silently reinterprets a real flag byte as padding, or padding as a
+        // flag. Reading a declaration's safety or `isUnsafe` from the wrong
+        // byte is precisely the kind of quiet misread this file refuses
+        // everywhere else, so the padding is held to the same standard as the
+        // reducibility-hint padding bound at 201976e7.
+        //
+        // Measured over all 215,111 ConstantInfo payloads of the pin: zero have
+        // a nonzero byte here, across all eight variants.
+        let padding = self
+            .view
+            .read_bytes_at(voff + meaningful, expected_cs_sz - meaningful)?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(DeclError::Shape {
+                offset: voff + meaningful,
+                what: "ConstantInfo payload scalar padding is not zero",
             });
         }
 
@@ -2266,6 +2291,60 @@ mod tests {
         assert!(
             regular > 0,
             "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
+    }
+
+    /// A nonzero byte in a payload's scalar padding is refused.
+    ///
+    /// Distinct from the size check: this mutant leaves `cs_sz`, every pointer
+    /// slot and the real `isUnsafe` byte untouched, so only the padding rule
+    /// can kill it.
+    #[test]
+    fn a_constant_info_payload_with_dirty_scalar_padding_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_ptr = view
+            .read_u64(arrays.constants.0 + 24)
+            .expect("first ConstantInfo");
+        let info_off = view.deref(info_ptr).expect("ConstantInfo object");
+        let val_ptr = view.read_u64(info_off + 8).expect("AxiomVal pointer");
+        let val_off = view.deref(val_ptr).expect("AxiomVal object");
+
+        // Positive control, and the layout this mutant depends on: one pointer
+        // field, so the scalar area starts at +16, `isUnsafe` occupies +16, and
+        // +17..+24 is padding.
+        let (_, other, cs_sz) = view.obj_header(val_off).expect("AxiomVal header");
+        assert_eq!(other, 1);
+        assert_eq!(cs_sz, 24);
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+        let flag = val_off as usize + 16;
+        assert_eq!(bytes[flag], 0, "fixture is a safe axiom");
+        assert!(
+            bytes[flag + 1..val_off as usize + 24]
+                .iter()
+                .all(|b| *b == 0),
+            "its padding starts clean"
+        );
+
+        // Dirty one padding byte and nothing else.
+        bytes[flag + 1] = 1;
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("dirty scalar padding must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ConstantInfo payload scalar padding is not zero",
+                    ..
+                }
+            ),
+            "{error:?}"
         );
     }
 
