@@ -2506,6 +2506,147 @@ mod tests {
         .bytes
     }
 
+    /// One recursor carrying a SINGLE computation rule, so the region contains
+    /// a `RecursorRule` object.
+    ///
+    /// An empty rule list is boxed nil and holds no rule at all, so a recursor
+    /// with no rules would leave `decode_constant_info`'s rule loop with
+    /// nothing to iterate — the fieldless-boxing hazard once more. The rule
+    /// list must have an entry.
+    fn recursor_module() -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Rec(RecursorVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "rec"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    all: Vec::new(),
+                    num_params: 0,
+                    num_indices: 0,
+                    num_motives: 0,
+                    num_minors: 0,
+                    rules: vec![RecursorRule {
+                        ctor: Name::from_components(["Demo", "ctor"]),
+                        nfields: 0,
+                        rhs: Expr::sort(Level::zero()),
+                    }],
+                    k: false,
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `RecursorRule` that is not a three-field structure is refused.
+    ///
+    /// A computation rule is `ctor`, `nfields`, `rhs`. Those three are read at
+    /// fixed offsets, so a different shape takes the constructor name, the
+    /// field count or the right-hand side from the wrong word — and the rhs is
+    /// an expression the kernel will later reduce with.
+    ///
+    /// SHADOWING CHECKED, with four exclusions. The plant touches only the
+    /// rule object's tag, so the payload size and padding binds (1b53cb09,
+    /// e9348f58) and the `RecursorVal arity` check all read an unchanged
+    /// header; and the rule is the HEAD of a list cell, so the list rules
+    /// (233a306d, 8cb55e5e) inspect the cell, not the rule. The cell asserts
+    /// the payload and list-cell headers after the plant.
+    #[test]
+    fn a_recursor_rule_that_is_not_a_three_field_structure_is_refused() {
+        let mut bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified recursor fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("wrapper header").0,
+            7,
+            "the recursor variant"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+        let val_header = view.obj_header(val_off).expect("RecursorVal header");
+
+        // Slot 6 is the rule list, and it must be a cons rather than boxed nil.
+        let list_ptr = view.read_u64(val_off + 8 + 8 * 6).expect("rules slot");
+        assert_eq!(
+            list_ptr & 1,
+            0,
+            "the fixture declares one rule, so the list is a cons"
+        );
+        let cell_off = view.deref(list_ptr).expect("cons cell");
+        let cell_header = view.obj_header(cell_off).expect("cons header");
+        assert_eq!(cell_header.0, 1, "List.cons");
+
+        // The rule is the cell's head.
+        let rule_off = view
+            .deref(view.read_u64(cell_off + 8).expect("head pointer"))
+            .expect("RecursorRule object");
+        let (tag, other, cs_sz) = view.obj_header(rule_off).expect("rule header");
+        assert_eq!((tag, other), (0, 3), "ctor, nfields and rhs");
+
+        // Claim a constructor the structure does not have.
+        let header = view.read_u64(rule_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (1_u64 << 56);
+        bytes[rule_off as usize..rule_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(rule_off).expect("rule after plant"),
+            (1, other, cs_sz),
+            "only the rule's tag moved"
+        );
+        assert_eq!(
+            view.obj_header(val_off).expect("payload after plant"),
+            val_header,
+            "the RecursorVal is untouched, so its arity and the size and padding \
+             binds cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(cell_off).expect("cell after plant"),
+            cell_header,
+            "and the list cell is untouched, so the list rules cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a recursor rule of the wrong shape must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "RecursorRule shape",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// One quotient constant, so the region contains a `QuotVal`.
     ///
     /// The pin ships only FOUR quotient declarations in total (measured over
