@@ -247,6 +247,11 @@ the toolchain would report a perfect facade:
     generator's facade-demand, Init-demand, substrate-emission, and quarantine
     measures. Aggregate totals cannot hide a row that crossed role boundaries.
 
+  * A MANIFEST-GLOBAL-PROVIDER JOIN requires every structural-provider edge in
+    the full manifest to resolve to, and collectively cover, its class and
+    structure declarations. An un-demanded projection cannot cite a phantom or
+    self-referential owner.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1387,6 +1392,37 @@ def main():
             "REFUSE: facade manifest role-partition join disagrees with its "
             f"summary ({json.dumps(manifest_role_join, sort_keys=True)})"
         )
+    manifest_names = set(manifest_name_counts)
+    structural_names = {
+        row["name"] for row in manifest_rows
+        if row.get("form") in {"class", "structure"}
+    }
+    provider_edges = [
+        (row["name"], row.get("provided_by")) for row in manifest_rows
+        if row.get("provided_by") is not None
+    ]
+    provider_names = {provider for _, provider in provider_edges}
+    unresolved_providers = sorted(provider_names - manifest_names)
+    self_providers = sorted(name for name, provider in provider_edges if name == provider)
+    manifest_provider_join = {
+        "provider_edges": len(provider_edges),
+        "provider_owners": len(provider_names),
+        "structural_declarations": len(structural_names),
+        "unresolved_owners": len(unresolved_providers),
+        "self_references": len(self_providers),
+        "owners_without_dependents": len(structural_names - provider_names),
+        "nonstructural_owners": len(provider_names - structural_names),
+    }
+    if (manifest_provider_join["provider_edges"] == 0
+            or manifest_provider_join["unresolved_owners"] != 0
+            or manifest_provider_join["self_references"] != 0
+            or manifest_provider_join["owners_without_dependents"] != 0
+            or manifest_provider_join["nonstructural_owners"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest global-provider join failed "
+            f"({json.dumps(manifest_provider_join, sort_keys=True)}, "
+            f"unresolved={unresolved_providers[:8]!r}, self={self_providers[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -1815,6 +1851,7 @@ def main():
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
+        "manifest_global_provider_join": manifest_provider_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
