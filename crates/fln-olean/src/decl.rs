@@ -2468,6 +2468,140 @@ mod tests {
         );
     }
 
+    /// One axiom whose type is an `Expr.mdata` carrying a ONE-ENTRY `KVMap`, so
+    /// the region contains a key/value pair object.
+    ///
+    /// An empty KVMap is the empty list, which is scalar-boxed nil and holds no
+    /// pair at all — the boxing trap again. The map must have an entry for
+    /// `decode_kvmap`'s pair rule to be reachable.
+    fn mdata_expr_module() -> Vec<u8> {
+        let data = KVMap::from_entries(vec![(
+            Name::from_components(["demo", "flag"]),
+            DataValue::OfBool(true),
+        )]);
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "mdata"]),
+                        level_params: Vec::new(),
+                        type_: Expr::mdata(data, Expr::sort(Level::zero())),
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `KVMap` entry that is not a two-field pair is refused.
+    ///
+    /// This completes `KVMap`'s own rule, as the last three waves completed
+    /// `Level`, `Expr` and `Literal`.
+    ///
+    /// SHADOWING CHECKED. The pair is the HEAD of a list cell, so the list
+    /// rules (233a306d, 8cb55e5e) inspect the CELL and not the pair, and the
+    /// plant leaves that cell alone. `decode_kvmap` has no size bind, and the
+    /// enclosing `Expr.mdata` object is untouched, so the Expr constructor,
+    /// arity and size rules cannot fire either. The cell asserts both the list
+    /// cell and the mdata header after planting.
+    #[test]
+    fn a_kvmap_entry_that_is_not_a_pair_is_refused() {
+        let mut bytes = mdata_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified mdata fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let mdata_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("mdata expression");
+
+        let mdata_header = view.obj_header(mdata_off).expect("Expr.mdata header");
+        assert_eq!(mdata_header.0, 10, "Expr.mdata");
+
+        // Slot 0 is the KVMap, erased to its entry list. It must be a cons
+        // cell, not the scalar box an empty map would be.
+        let list_ptr = view.read_u64(mdata_off + 8).expect("kvmap slot");
+        assert_eq!(
+            list_ptr & 1,
+            0,
+            "the fixture's map has an entry, so it is a cons"
+        );
+        let cell_off = view.deref(list_ptr).expect("cons cell");
+        let cell_header = view.obj_header(cell_off).expect("cons header");
+        assert_eq!(cell_header.0, 1, "List.cons");
+
+        // The pair is the cell's HEAD.
+        let pair_off = view
+            .deref(view.read_u64(cell_off + 8).expect("head pointer"))
+            .expect("pair object");
+        let (tag, other, cs_sz) = view.obj_header(pair_off).expect("pair header");
+        assert_eq!((tag, other), (0, 2), "a key and a value");
+
+        // Claim a constructor the pair does not have.
+        let header = view.read_u64(pair_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (1_u64 << 56);
+        bytes[pair_off as usize..pair_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(pair_off).expect("pair after plant"),
+            (1, other, cs_sz),
+            "only the pair's tag moved"
+        );
+        assert_eq!(
+            view.obj_header(cell_off).expect("cell after plant"),
+            cell_header,
+            "the list cell is untouched, so the list rules cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(mdata_off).expect("mdata after plant"),
+            mdata_header,
+            "and the enclosing Expr.mdata is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a KVMap entry that is not a pair must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "KVMap pair",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// One axiom whose type is a natural-number LITERAL, so the region contains
     /// a `Literal` object.
     ///
