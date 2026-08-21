@@ -873,3 +873,151 @@ fn the_cons_cell_scalar_area_is_empty_and_that_is_what_fixes_its_size() {
         modules.len()
     );
 }
+
+/// The measured cons cells are the ones the DECODER walked, not merely ones
+/// reachable from the root.
+///
+/// CONFIRMED ABSENT BEFORE WRITING THIS. Every cell above - `c48c0813`'s
+/// collision measurement, `35efc748`'s two witnesses, `ac97cb3a`'s derived
+/// width - classifies objects by walking bytes from the root word. None of them
+/// establishes that the objects so measured are the objects `list_ptrs`
+/// traverses. That gap is invisible while the numbers agree and fatal if they
+/// do not: a width measured over cells the decoder never visits would license a
+/// size rule for a population the rule will not be applied to, and the repair
+/// would be built on a measurement of the wrong set.
+///
+/// The binding is a COUNT, per declaration. For each `ConstantVal` on the wire
+/// this walks its `levelParams` chain and counts the cells; for each decoded
+/// constant it takes `level_params.len()`; and it requires the two to be equal
+/// for that declaration by name. Equality in both directions is what makes the
+/// populations the same one: no cell the decoder skipped, no name it invented.
+/// Only then are the width and the size asserted, and they are asserted on the
+/// cells that count bound.
+///
+/// The anti-vacuity guard is the total. Every assertion here is an equality
+/// that a corpus of universe-monomorphic declarations satisfies as `0 == 0`,
+/// so the cell would pass over an empty population and report a binding it
+/// never made - the shape this campaign has been finding all week, arriving in
+/// the denominator. It therefore requires the bound total to be positive and
+/// prints it.
+#[test]
+fn the_measured_cons_cells_are_the_ones_the_decoder_walked() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+        }
+    }
+
+    let mut bound = 0usize;
+    let mut declarations = 0usize;
+    let mut widths: BTreeSet<i64> = BTreeSet::new();
+    let mut sizes: BTreeSet<u16> = BTreeSet::new();
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let infos = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .unwrap_or_else(|e| panic!("{module}: decode: {e}"));
+
+        let (objects, base) = objects_of(bytes);
+        // Indexed once: Prelude carries enough objects that a linear scan per
+        // chain hop would make this cell quadratic.
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let deref = |ptr: u64| -> Option<usize> {
+            (ptr & 1 == 0)
+                .then(|| usize::try_from(ptr.checked_sub(base)?).ok())
+                .flatten()
+        };
+
+        // Every `ConstantVal` on the wire, by the name in its slot 0, with the
+        // length of the `levelParams` chain in its slot 1.
+        let mut on_the_wire: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            // (0, 3, 32): three pointer fields and no scalar area, the shape
+            // measured over 215,111 objects and enforced by `decode_constant_val`.
+            if (object.tag, object.other, object.cs_sz) != (0, 3, 32) {
+                continue;
+            }
+            let Ok(name) = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(word_at(bytes, object.off + 8))
+            else {
+                continue;
+            };
+
+            let mut cursor = word_at(bytes, object.off + 16);
+            let mut cells = 0usize;
+            while cursor & 1 == 0 {
+                let Some(cell) = deref(cursor) else {
+                    break;
+                };
+                let Some(cell) = at.get(&cell) else {
+                    break;
+                };
+                assert_eq!(
+                    (cell.tag, cell.other),
+                    (1, 2),
+                    "{module}: a `levelParams` chain must be cons cells"
+                );
+                widths.insert(i64::from(cell.cs_sz) - (8 + 8 * i64::from(cell.other)));
+                sizes.insert(cell.cs_sz);
+                cells += 1;
+                cursor = word_at(bytes, cell.off + 16);
+            }
+            on_the_wire.insert(name.to_display_string(), cells);
+        }
+
+        // The binding, per declaration.
+        for info in &infos {
+            let name = info.name().to_display_string();
+            let decoded = info.constant_val().level_params.len();
+            let chained = on_the_wire.get(&name).copied().unwrap_or_else(|| {
+                panic!("{module}: {name} decoded, but no ConstantVal on the wire carries its name")
+            });
+            assert_eq!(
+                chained, decoded,
+                "{module}: {name}: the decoder returned {decoded} universe \
+                 parameters from a chain of {chained} cells. Unequal means the \
+                 cells measured by the cells above are not the cells \
+                 `list_ptrs` walks, and the recorded width describes the wrong \
+                 population"
+            );
+            bound += decoded;
+            declarations += 1;
+        }
+    }
+
+    // Without this the equalities above are all `0 == 0` over a corpus with no
+    // universe-polymorphic declarations, and the cell reports a binding it
+    // never made.
+    assert!(
+        bound > 0,
+        "no universe parameters were bound across {declarations} declarations \
+         in {} modules; every equality above held vacuously",
+        modules.len()
+    );
+
+    // Asserted on the bound cells only - the ones just proven to be the
+    // decoder's - rather than on everything shaped like a cons cell.
+    assert_eq!(
+        widths.iter().copied().collect::<Vec<_>>(),
+        vec![0_i64],
+        "the cells the decoder walked store nothing after head and tail \
+         ({bound} cells over {declarations} declarations)"
+    );
+    assert_eq!(
+        sizes.iter().copied().collect::<Vec<_>>(),
+        vec![24_u16],
+        "and the size that follows from that width, on the same population"
+    );
+}
