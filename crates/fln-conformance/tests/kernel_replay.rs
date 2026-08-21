@@ -4858,6 +4858,79 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// Namespace qualification is a UNIFORM prefix, at every depth.
+///
+/// **What depends on this.** The names this projection produces are matched
+/// against the import lists recorded inside the oleans themselves, and
+/// `closed_whole_mathlib_corpus` REFUSES to proceed when any import fails to
+/// resolve. If qualification were ever non-uniform -- applied to top-level
+/// modules but not to nested ones, say, which is the shape a `split` or a
+/// depth-sensitive branch drifts into -- then nested imports alone would stop
+/// resolving. The lane would not report "the qualifier is wrong"; it would
+/// report unresolved imports for a subset of the corpus, and the failure would
+/// look like a corpus-integrity problem in modules nobody had touched.
+///
+/// **Why two walks and not one expectation.** Comparing against a hand-written
+/// list would pin the names, not the RELATION. This walks one unchanged tree
+/// twice, once unqualified and once qualified, and requires the second to be the
+/// first with one prefix in front of it -- every element, no exceptions. That is
+/// the property the import matching actually rests on, and it holds or fails
+/// independently of what the names happen to be.
+///
+/// **The tree spans depths on purpose.** "Uniform across depths" tested at one
+/// depth is not tested at all, so the fixture is asserted to contain both a
+/// top-level module and one nested two levels down before the relation is
+/// checked. Without those two assertions this test would keep passing over a
+/// flattened fixture while saying nothing about the case that breaks.
+#[test]
+fn namespace_qualification_is_a_uniform_prefix_at_every_depth() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-prefix-v1",
+        &["Top.olean", "Deep/Down/Leaf.olean", "Mid/Node.olean"],
+    );
+
+    let bare = walk_olean_inventory(&library, None)
+        .unwrap_or_else(|reason| panic!("the fixture tree must walk unqualified: {reason}"));
+    let qualified = walk_olean_inventory(&library, Some("Ns"))
+        .unwrap_or_else(|reason| panic!("the fixture tree must walk qualified: {reason}"));
+
+    // ANTI-VACUITY, before the relation: the tree must actually span depths, or
+    // "uniform at every depth" is a claim about one depth.
+    assert!(
+        bare.modules.iter().any(|name| !name.contains('.')),
+        "the fixture must hold a top-level module, or depth uniformity is untested: {:?}",
+        bare.modules
+    );
+    assert!(
+        bare.modules
+            .iter()
+            .any(|name| name.matches('.').count() >= 2),
+        "the fixture must hold a module nested at least two levels deep, or depth uniformity is \
+         untested: {:?}",
+        bare.modules
+    );
+
+    assert_eq!(
+        bare.oleans, qualified.oleans,
+        "the same tree was walked twice; the file set cannot depend on the namespace"
+    );
+    assert_eq!(
+        bare.modules.len(),
+        qualified.modules.len(),
+        "qualification must not add or drop modules"
+    );
+    for (unqualified, name) in bare.modules.iter().zip(&qualified.modules) {
+        assert_eq!(
+            name,
+            &format!("Ns.{unqualified}"),
+            "qualification must be exactly one prefix on every module. `{unqualified}` became \
+             `{name}`, which is not `Ns.` in front of it -- and a qualifier that treats some \
+             depths differently makes nested imports alone fail to resolve, which reads as a \
+             corpus-integrity problem rather than as a naming bug"
+        );
+    }
+}
+
 /// A DIRECTORY named `*.olean` is traversed, never counted as a module.
 ///
 /// **The hazard is an ordering, and orderings rot silently.** The walk tests
