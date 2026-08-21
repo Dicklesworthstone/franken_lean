@@ -269,6 +269,159 @@ fn recovered_family_covers_match_and_proof_and_loop_auxiliaries() {
     }
 }
 
+/// The auxiliary families `franken_lean-timy` names, as predicates over a
+/// display-form constant name.
+///
+/// Each mirrors a `\.<pattern>$`-anchored form: the leading dot is required, so
+/// a bare top-level `match_1` is not counted. `.loop` and `.go` are component
+/// tests rather than suffix tests because the recursion auxiliary is a segment,
+/// not a terminal.
+mod family {
+    fn components(name: &str) -> Vec<&str> {
+        name.split('.').collect()
+    }
+
+    /// A nonempty run of ASCII digits — the `\d+` of the measured patterns.
+    fn digits(rest: &str) -> bool {
+        !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// `\d+(_\d+)*` — only `match_N` admits the underscore-joined form.
+    fn digit_groups(rest: &str) -> bool {
+        !rest.is_empty() && rest.split('_').all(digits)
+    }
+
+    fn last_component_suffix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+        let parts = components(name);
+        if parts.len() < 2 {
+            return None;
+        }
+        parts.last().and_then(|last| last.strip_prefix(prefix))
+    }
+
+    /// `.match_1`, `.match_1_1`, …
+    pub fn match_n(name: &str) -> bool {
+        last_component_suffix(name, "match_").is_some_and(digit_groups)
+    }
+
+    /// `._proof_1`, …
+    pub fn proof_n(name: &str) -> bool {
+        last_component_suffix(name, "_proof_").is_some_and(digits)
+    }
+
+    /// `.eq_1`, … — equation lemmas.
+    pub fn eq_n(name: &str) -> bool {
+        last_component_suffix(name, "eq_").is_some_and(digits)
+    }
+
+    /// `.eq_def`.
+    pub fn eq_def(name: &str) -> bool {
+        let parts = components(name);
+        parts.len() >= 2 && parts.last() == Some(&"eq_def")
+    }
+
+    /// A `loop` component anywhere but the head.
+    pub fn loop_(name: &str) -> bool {
+        components(name)
+            .iter()
+            .skip(1)
+            .any(|component| *component == "loop")
+    }
+}
+
+/// Enumerate every module under `Init` that has a complete companion chain.
+fn init_chain_modules(lib: &PathBuf) -> Vec<String> {
+    let mut out = Vec::new();
+    let root = lib.join("Init");
+    let mut pending = vec![root];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+        for entry in entries {
+            let entry = entry.expect("directory entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension() != Some(std::ffi::OsStr::new("olean")) {
+                continue;
+            }
+            let server = PathBuf::from(format!("{}.server", path.display()));
+            let private = PathBuf::from(format!("{}.private", path.display()));
+            if !(server.is_file() && private.is_file()) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(lib)
+                .expect("module path is under the stdlib root")
+                .with_extension("");
+            out.push(relative.to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn every_named_auxiliary_family_decodes_across_the_whole_init_corpus() {
+    let lib = lib_or_skip!("every_named_auxiliary_family_decodes_across_the_whole_init_corpus");
+
+    // An aggregate count cannot witness a per-family gap: one family could be
+    // wholly absent while the total still looked healthy. franken_lean-timy
+    // names match_N, _proof_N, eq_N/eq_def and the `.loop` recursion auxiliary
+    // as one population, so each is bound to its own measured floor here.
+    //
+    // Counts are per-module-distinct names summed over every Init module with a
+    // complete chain, measured at the pin.
+    let modules = init_chain_modules(&lib);
+    assert_eq!(
+        modules.len(),
+        600,
+        "every Init module at the pin carries a complete companion chain"
+    );
+
+    let mut match_n = 0_usize;
+    let mut proof_n = 0_usize;
+    let mut eq_n = 0_usize;
+    let mut eq_def = 0_usize;
+    let mut loop_ = 0_usize;
+    let mut exported_total = 0_usize;
+    let mut private_total = 0_usize;
+
+    for relative in &modules {
+        let chain = chain_bytes(&lib, relative);
+        let (exported, private) = exported_and_private_names(&chain);
+        exported_total += exported.len();
+        private_total += private.len();
+        for name in &private {
+            if family::match_n(name) {
+                match_n += 1;
+            }
+            if family::proof_n(name) {
+                proof_n += 1;
+            }
+            if family::eq_n(name) {
+                eq_n += 1;
+            }
+            if family::eq_def(name) {
+                eq_def += 1;
+            }
+            if family::loop_(name) {
+                loop_ += 1;
+            }
+        }
+    }
+
+    assert_eq!(exported_total, 51_506, "exported corpus total moved");
+    assert_eq!(private_total, 65_404, "private corpus total moved");
+    assert_eq!(match_n, 2_592, "match_N decode coverage moved");
+    assert_eq!(proof_n, 3_480, "_proof_N decode coverage moved");
+    assert_eq!(eq_n, 3_449, "eq_N decode coverage moved");
+    assert_eq!(eq_def, 507, "eq_def decode coverage moved");
+    assert_eq!(loop_, 686, "`.loop` decode coverage moved");
+}
+
 #[test]
 fn a_companion_part_read_without_its_dependencies_is_a_typed_refusal() {
     let lib = lib_or_skip!("a_companion_part_read_without_its_dependencies_is_a_typed_refusal");
