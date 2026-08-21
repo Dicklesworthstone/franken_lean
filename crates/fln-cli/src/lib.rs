@@ -2595,6 +2595,22 @@ fn check_olean_failure(
     MultiplexerOutput::failure(stderr, exit_code)
 }
 
+/// Count declarations whose logical name is rooted at Lean's `_private`
+/// namespace. Module-system checking decodes these from the authoritative
+/// private companion part; this is a report-only observation, not a corpus or
+/// G1-completeness claim.
+fn decoded_private_auxiliaries(constants: &[fln::ConstantInfo]) -> usize {
+    constants
+        .iter()
+        .filter(|constant| {
+            constant
+                .name()
+                .to_display_string()
+                .starts_with("_private.")
+        })
+        .count()
+}
+
 fn render_check_olean_success(
     bytes: usize,
     checked: &fln::CheckedOlean,
@@ -2602,12 +2618,14 @@ fn render_check_olean_success(
 ) -> MultiplexerOutput {
     let constants = checked.declarations.len();
     let extensions = checked.decoded.module.extensions.len();
+    let private_auxiliaries = decoded_private_auxiliaries(&checked.decoded.constants);
     let stdout = if json {
         format!(
             concat!(
                 "{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,",
                 "\"scope\":\"decoded-declarations\",\"artifactBytes\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
+                "\"decodedPrivateAuxiliaries\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2617,6 +2635,7 @@ fn render_check_olean_success(
             json_string(CHECK_OLEAN_SCHEMA),
             bytes,
             constants,
+            private_auxiliaries,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2630,6 +2649,7 @@ fn render_check_olean_success(
                 "authority: K1 + independent checker\n",
                 "artifact bytes: {}\n",
                 "declarations checked: {}\n",
+                "decoded _private auxiliaries: {} (reporting only; not a G1 claim)\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2640,6 +2660,7 @@ fn render_check_olean_success(
             ),
             bytes,
             constants,
+            private_auxiliaries,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -2966,6 +2987,11 @@ fn render_check_olean_set_success(
         .iter()
         .map(|module| module.decoded.module.extensions.len())
         .sum();
+    let private_auxiliaries: usize = checked
+        .modules
+        .iter()
+        .map(|module| decoded_private_auxiliaries(&module.decoded.constants))
+        .sum();
     let companion_modules = checked
         .modules
         .iter()
@@ -2978,6 +3004,7 @@ fn render_check_olean_set_success(
                 "\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},",
                 "\"modulesChecked\":{},\"importsResolved\":{},",
                 "\"declarationsChecked\":{},\"dependencyOrderDerived\":true,",
+                "\"decodedPrivateAuxiliaries\":{},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -2989,6 +3016,7 @@ fn render_check_olean_set_success(
             checked.modules.len(),
             imports,
             declarations,
+            private_auxiliaries,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3004,6 +3032,7 @@ fn render_check_olean_set_success(
                 "modules checked: {}\n",
                 "imports resolved: {}\n",
                 "declarations checked: {}\n",
+                "decoded _private auxiliaries: {} (reporting only; not a G1 claim)\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3016,6 +3045,7 @@ fn render_check_olean_set_success(
             checked.modules.len(),
             imports,
             declarations,
+            private_auxiliaries,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
