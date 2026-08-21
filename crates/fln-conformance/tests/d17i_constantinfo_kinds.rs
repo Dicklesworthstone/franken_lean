@@ -15098,3 +15098,150 @@ fn extension_blocks_cross_namespaces_with_four_universal_and_forty_one_confined(
         "Init.olean contributes no block name the rest of Init lacks"
     );
 }
+
+/// The wholesale-drop law holds over the whole library, and adds no new
+/// exported-absent name.
+///
+/// `multi_declaration_survives_the_export_boundary_whole_or_not_at_all` pins the
+/// law over the `Init` closure: a multiply-declared name has the SAME
+/// multiplicity at exported level, or is absent from every exported array, never
+/// something in between. That is what lets every level-comparison cell in this
+/// file key on names at one level and trust the other — and it was measured on
+/// 600 of the library's 2,431 chains.
+///
+/// It holds on all of them. Over 158,583 exported occurrences against 158,407
+/// distinct names, and the 128 names the library declares more than once at
+/// private level, the pairing is:
+///
+///   (2,2) ×93   (3,3) ×16   (4,4) ×6   (5,5) ×2
+///   (8,8) ×1    (9,9) ×1    (11,11) ×1
+///   (0,2) ×4    (0,4) ×4
+///
+/// Zero partial drops. The library reaches depths `Init` never does — eight,
+/// nine and eleven modules for one name — and even there the two levels agree
+/// exactly.
+///
+/// THE EIGHT EXPORTED-ABSENT NAMES ARE THE SAME EIGHT. They are precisely
+/// `PRIVATE_ONLY_MULTI_DECLARED`, the table measured over `Init`, so the other
+/// 1,831 chains contribute no private-only collision of their own. The cell
+/// asserts that against the existing table rather than restating the names, so
+/// the two populations are bound: if a library module ever hid a collision below
+/// the export boundary, this fails while the `Init` cell stays green.
+///
+/// The two excesses differ by exactly what those eight contribute: 192 at
+/// private level against 176 at exported, and 4×(2−1) + 4×(4−1) = 16. Both
+/// excesses are recomputed here, so the arithmetic is checked rather than
+/// quoted from two other cells.
+///
+/// Anti-vacuity: the equal classes are populated at seven distinct depths, so
+/// "equal or absent" is not a disguised way of saying the multiplicities are all
+/// two.
+///
+/// Conservation first: the pair classes must account for every multiply-declared
+/// name, and each excess must equal its own occurrences-minus-distinct gap,
+/// before the law is stated.
+#[test]
+fn the_wholesale_drop_law_holds_library_wide_and_adds_no_new_absentee() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut exported: BTreeMap<String, usize> = BTreeMap::new();
+    let mut private: BTreeMap<String, usize> = BTreeMap::new();
+    let mut exported_total = 0usize;
+    let mut private_total = 0usize;
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        for name in module_view(&lib, &module, Level::Exported).const_names {
+            exported_total += 1;
+            *exported.entry(name).or_default() += 1;
+        }
+        for name in module_view(&lib, &module, Level::Private).const_names {
+            private_total += 1;
+            *private.entry(name).or_default() += 1;
+        }
+    }
+
+    let mut pairs: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (name, count) in &private {
+        if *count > 1 {
+            *pairs
+                .entry((exported.get(name).copied().unwrap_or(0), *count))
+                .or_default() += 1;
+        }
+    }
+
+    // Conservation first: each excess against its own gap, then the classes.
+    let exported_excess: usize = exported.values().filter(|c| **c > 1).map(|c| c - 1).sum();
+    let private_excess: usize = private.values().filter(|c| **c > 1).map(|c| c - 1).sum();
+    assert_eq!(
+        (exported_excess, private_excess),
+        (
+            exported_total - exported.len(),
+            private_total - private.len()
+        ),
+        "each level's multiplicity excess must equal its occurrences-minus-distinct gap"
+    );
+    assert_eq!(
+        pairs.values().sum::<usize>(),
+        private.values().filter(|c| **c > 1).count(),
+        "every multiply-declared name must land in exactly one pair class"
+    );
+
+    assert_eq!(
+        (
+            exported_total,
+            exported.len(),
+            exported_excess,
+            private_excess
+        ),
+        (158_583, 158_407, 176, 192),
+        "the library census at both levels and the two excesses"
+    );
+
+    // The law: no partial drop anywhere.
+    assert_eq!(
+        pairs,
+        BTreeMap::from([
+            ((0, 2), 4),
+            ((0, 4), 4),
+            ((2, 2), 93),
+            ((3, 3), 16),
+            ((4, 4), 6),
+            ((5, 5), 2),
+            ((8, 8), 1),
+            ((9, 9), 1),
+            ((11, 11), 1),
+        ]),
+        "every pair is equal or exported-absent; a partial drop would be a tenth class"
+    );
+
+    // Bound to the Init table: the library adds no exported-absent name.
+    let absent: BTreeSet<String> = private
+        .iter()
+        .filter(|(name, count)| **count > 1 && !exported.contains_key(*name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(
+        absent,
+        PRIVATE_ONLY_MULTI_DECLARED
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect::<BTreeSet<String>>(),
+        "the exported-absent collisions are exactly the ones Init already names"
+    );
+    assert_eq!(
+        private_excess - exported_excess,
+        pairs
+            .iter()
+            .filter(|((e, _), _)| *e == 0)
+            .map(|((_, p), n)| (p - 1) * n)
+            .sum::<usize>(),
+        "and they account for the whole difference between the two excesses"
+    );
+}
