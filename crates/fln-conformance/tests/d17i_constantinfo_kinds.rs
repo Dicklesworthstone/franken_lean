@@ -16193,3 +16193,110 @@ fn the_path_to_module_projection_is_injective_because_paths_hold_no_dot() {
         "one olean sits at the root of each namespace"
     );
 }
+/// Constant extension payloads, with the single-carrier accidents separated out.
+///
+/// The namespace cell pins WHICH blocks occur and how widely. It says nothing
+/// about what they hold. Crossing the 120-name vocabulary against payload
+/// behaviour looks like it should give a clean split into constant and varying
+/// blocks, and it does — but the constant side is mostly an artefact, and saying
+/// so is the point of this cell.
+///
+/// Over 2,433 exported parts and 45,162 `(module, block)` pairs:
+///
+///                        carried by >1 module   carried by exactly 1
+///   always exactly 1              6                      9
+///   constant, some other N        1                     11
+///   varying                      93                      0
+///
+/// Twenty-seven blocks have a constant payload, and TWENTY of them are constant
+/// only because they appear in a single module. A block with one carrier cannot
+/// vary; counting it as an invariant is the vacuity trap, and a cell that
+/// reported "27 blocks carry a constant payload" would be stating nine plus
+/// eleven accidents as a finding.
+///
+/// Seven survive the separation. Four are the universal blocks, constant at one
+/// entry across all 2,433 modules; the other three are `Lean.Meta.coeExt` and
+/// `computedFieldAttr` at one entry across four and five modules, and
+/// `specInvariantAttr` at five entries across two. Only the universal four are
+/// constant across anything like the library.
+///
+/// THE EMPTY CELL IS A CHECK, not an omission. A varying block carried by one
+/// module is impossible — one carrier yields one value — so that class must be
+/// zero, and asserting it catches a walk that double-counted a module or lost a
+/// carrier. It is the only cell of the six whose emptiness is guaranteed by the
+/// classification rather than by the artifact.
+///
+/// Conservation first: the classes must reproduce the vocabulary, and the
+/// carrier counts must reproduce the pair total, before any class is read as a
+/// fact about the format.
+#[test]
+fn constant_extension_payloads_are_mostly_single_carrier_accidents() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut values: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut carriers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pairs = 0usize;
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        for block in module_view(&lib, &module, Level::Exported).extensions {
+            pairs += 1;
+            values
+                .entry(block.name.clone())
+                .or_default()
+                .insert(block.entries);
+            *carriers.entry(block.name).or_default() += 1;
+        }
+    }
+
+    let mut classes: BTreeMap<(&str, bool), usize> = BTreeMap::new();
+    for (name, seen) in &values {
+        let shape = if seen.len() > 1 {
+            "varying"
+        } else if *seen.iter().next().expect("nonempty") == 1 {
+            "always one"
+        } else {
+            "constant, other"
+        };
+        *classes.entry((shape, carriers[name] > 1)).or_default() += 1;
+    }
+
+    // Conservation first, both margins.
+    assert_eq!(
+        classes.values().sum::<usize>(),
+        values.len(),
+        "every block must fall in exactly one class"
+    );
+    assert_eq!(
+        carriers.values().sum::<usize>(),
+        pairs,
+        "the carrier counts must account for every (module, block) pair"
+    );
+    assert_eq!(
+        (values.len(), pairs),
+        (120, 45_162),
+        "the vocabulary and pair census this row is stated against"
+    );
+
+    assert_eq!(
+        classes,
+        BTreeMap::from([
+            (("always one", true), 6),
+            (("always one", false), 9),
+            (("constant, other", true), 1),
+            (("constant, other", false), 11),
+            (("varying", true), 93),
+        ]),
+        "twenty of the twenty-seven constant blocks have a single carrier"
+    );
+
+    // The impossible class, asserted because the classification guarantees it.
+    assert!(
+        !classes.contains_key(&("varying", false)),
+        "a block with one carrier cannot vary; this class being non-empty means the walk \
+         miscounted carriers"
+    );
+}
