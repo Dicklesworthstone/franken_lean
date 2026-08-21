@@ -54,6 +54,9 @@ the toolchain would report a perfect facade:
     artifact to name a declared curated module. Otherwise a use outside the
     reported slice can affect aggregate controls while disappearing from the
     per-module evidence.
+  * A CENSUS-PARTITION JOIN requires every exact-demand symbol to resolve to a
+    known partition row before the toolchain-api filter is applied. An
+    uncensused symbol must refuse the run, never silently leave its denominator.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -133,6 +136,8 @@ def load_demand(path, part):
     by_module = defaultdict(set)
     modules = None
     unscoped = []
+    uncensused = []
+    partition_classes = Counter()
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             try:
@@ -150,6 +155,10 @@ def load_demand(path, part):
             if key is None:
                 raise SystemExit(f"REFUSE: {path}:{lineno} carries no census_key")
             cls = part.get('"' + key.replace('"', '\\"') + '"')
+            if cls is None:
+                uncensused.append(f"{row['name']}[{key}]")
+                continue
+            partition_classes[cls] += 1
             if cls != "toolchain-api":
                 continue
             used_by = row.get("used_by")
@@ -166,6 +175,12 @@ def load_demand(path, part):
     if len(set(modules)) != len(modules):
         raise SystemExit(f"REFUSE: {path} repeats a curated module — the per-module "
                          "denominator would be ambiguous")
+    if uncensused:
+        raise SystemExit(
+            "REFUSE: exact-demand census-partition join found uncensused symbols "
+            "(" + ", ".join(sorted(uncensused)[:8]) + ") — no demand may "
+            "silently disappear before the toolchain-api filter"
+        )
     out_of_slice = sorted(set(by_module).difference(modules))
     if unscoped or out_of_slice:
         details = []
@@ -185,7 +200,8 @@ def load_demand(path, part):
         "curated_modules": len(modules),
         "toolchain_use_edges": sum(len(names) for names in by_module.values()),
     }
-    return modules, by_module, module_join
+    partition_join = dict(sorted(partition_classes.items()))
+    return modules, by_module, module_join, partition_join
 
 
 def reference_import_lines(text):
@@ -485,7 +501,7 @@ def main():
 
     lean, tag, corpus_commit = pinned_lean()
     part = load_partition()
-    modules, by_module, module_join = load_demand(args.demand, part)
+    modules, by_module, module_join, partition_join = load_demand(args.demand, part)
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-compile-{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
@@ -609,6 +625,7 @@ def main():
                    input_digest(PARTITION)],
         "curated_modules": sorted(modules),
         "curated_module_join": module_join,
+        "census_partition_join": partition_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
