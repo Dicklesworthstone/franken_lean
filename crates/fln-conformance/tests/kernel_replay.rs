@@ -10105,11 +10105,48 @@ fn every_family_token_a_run_can_emit_belongs_to_the_closed_taxonomy() {
     for class in reject_class_variants_from_source() {
         tokens.push(format!("rejected:{class}"));
     }
-    for reason in [
+    // EVERY REASON A RUN CAN EMIT, AND TWO WERE MISSING. This list held
+    // `ExecutionSteps`, `Cancelled` and `Memory`; `Heartbeats` and
+    // `RecursionDepth` were absent, so a test whose name is "every family token a
+    // run can emit" was checking four of the six arms of `resource_usage_facts`.
+    // `inconclusive:Heartbeats` was produced NOWHERE in this file -- not as a
+    // literal, not through this loop -- so nothing had ever seen it.
+    //
+    // The list is total by the compiler, not by care: `named` matches every
+    // variant with no catch-all, so a new `ResourceReason` cannot be added
+    // without landing here, and the count below fails if it is added to the
+    // taxonomy but not to this population.
+    fn named(reason: &ResourceReason) -> &'static str {
+        match reason {
+            ResourceReason::Heartbeats { .. } => "Heartbeats",
+            ResourceReason::ExecutionSteps => "ExecutionSteps",
+            ResourceReason::RecursionDepth { .. } => "RecursionDepth",
+            ResourceReason::Cancelled => "Cancelled",
+            ResourceReason::Memory { .. } => "Memory",
+            ResourceReason::StructuralBudget { .. } => "StructuralBudget",
+        }
+    }
+    let reasons = [
+        ResourceReason::Heartbeats {
+            consumed: 2,
+            limit: 1,
+        },
         ResourceReason::ExecutionSteps,
+        ResourceReason::RecursionDepth { limit: 1 },
         ResourceReason::Cancelled,
         ResourceReason::Memory { limit_bytes: 8 },
-    ] {
+        // `StructuralBudget` is carried by the `StructuralUnit::ALL` loop below,
+        // which covers its three units rather than one representative.
+        ResourceReason::StructuralBudget {
+            unit: StructuralUnit::InputBytes,
+        },
+    ];
+    assert_eq!(
+        reasons.iter().map(named).collect::<BTreeSet<_>>().len(),
+        6,
+        "a `ResourceReason` arm is missing from the population this taxonomy is checked over"
+    );
+    for reason in reasons {
         tokens.push(
             resource_usage_facts(&ResourceUsage {
                 reason,
@@ -13060,9 +13097,19 @@ fn every_resource_reason_maps_to_its_own_token_and_the_right_slot() {
              single census family: the counts still balance, and every exhaustion of one cause is \
              attributed to the other"
         );
-        // BOUND TO THE CLOSED FAMILY TAXONOMY, not merely to a prefix. A token
-        // carrying a `,` or `=` would be re-read as a different family with a
-        // different count when a census row is parsed back.
+        // BOUND TO THE SHAPE AND DIRECTION RULES -- NOT to membership in a
+        // closed set, and the previous wording here said otherwise. This comment
+        // read "bound to the closed family taxonomy", which overstates what the
+        // call proves: `check_family_token` refuses an empty name, a `,` or `=`
+        // that would make a census row re-read as a different family, a
+        // non-`rejected:` token in the restrictive direction and a `rejected:`
+        // or `accepted` token in the non-answer one. It has no list of known
+        // families, so `banana` passes here. Closure over the tokens a RUN can
+        // emit lives in
+        // `every_family_token_a_run_can_emit_belongs_to_the_closed_taxonomy`,
+        // which sorts them into four prefix shapes -- a different check, in a
+        // different place, and the one to read if you want to know what the
+        // taxonomy admits.
         check_family_token(&token, FamilyDirection::NoAnswer)
             .unwrap_or_else(|reason| panic!("`{name}` emits an illegal family token: {reason}"));
 
