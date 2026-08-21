@@ -5534,6 +5534,146 @@ fn the_published_disagreement_count_includes_every_d23_bucket() {
     }
 }
 
+/// Run `assert_conservation` over a deliberately illegal population and return
+/// the law it broke.
+///
+/// The panic hook is silenced around the call so a planted violation does not
+/// read as a failure in the log, and restored immediately after.
+fn conservation_violation(counts: &CorpusCounts) -> String {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        counts.assert_conservation("planted violation")
+    }));
+    std::panic::set_hook(previous);
+    let payload = outcome.expect_err("an illegal population must not conserve");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Each of the five conservation laws catches its OWN violation.
+///
+/// **Six live laws, zero demonstrations.** Five arithmetic, plus the family-token
+/// rule the loop applies before them. `assert_conservation` runs on every
+/// scored module and on the corpus total, and every test that calls it hands it
+/// a LEGAL population -- so it has never once fired. Delete any single law and
+/// nothing on this bead would notice: the scorer would go on producing legal
+/// counts, and the remaining laws would go on passing. That is the same shape as
+/// the empty carve-out registry and the collision detector that never collided,
+/// in the code that protects the corpus census itself.
+///
+/// **Each cell breaks exactly one field of a legal base.** Starting from a
+/// population that satisfies all six and changing one number is what makes the
+/// resulting message attributable; a probe that violated two laws would be
+/// caught by whichever is checked first and would say nothing about the other.
+///
+/// **The expectations name the part that differs.** Two of the six messages end
+/// `must be triaged to exactly one family`, so a cell asserting on that phrase
+/// would pass for either. The restrictive and non-answer cells assert on
+/// `restrictive row` and `subject non-answer` instead.
+#[test]
+fn each_conservation_law_catches_its_own_violation() {
+    let legal = || {
+        let mut counts = CorpusCounts {
+            decoded: 10,
+            compared: 6,
+            agree: 4,
+            unsoundly_permissive: 1,
+            restrictive_without_carve_out: 1,
+            unscorable: 4,
+            oracle_skipped: 3,
+            subject_no_answer: 1,
+            ..CorpusCounts::default()
+        };
+        counts
+            .restrictive_families
+            .insert("rejected:BlockMismatch".to_string(), 1);
+        counts
+            .no_answer_families
+            .insert("inconclusive:Steps".to_string(), 1);
+        counts
+    };
+    // THE BASE MUST BE LEGAL, or every probe below fires for the wrong law.
+    legal().assert_conservation("legal base");
+
+    let cases: [(&str, fn(&mut CorpusCounts), &str); 6] = [
+        (
+            // The token loop runs BEFORE the sum checks, so this must keep the
+            // family SUM correct: otherwise the restrictive-triage law would
+            // fire instead and this cell would prove nothing about tokens.
+            "a restrictive family is not a rejection token",
+            |counts| {
+                counts.restrictive_families.clear();
+                counts
+                    .restrictive_families
+                    .insert("inconclusive:Steps".to_string(), 1);
+            },
+            "is not a `rejected:` token",
+        ),
+        (
+            "decoded no longer covers compared plus unscorable",
+            |counts| counts.decoded = 11,
+            "decoded must equal compared + unscorable",
+        ),
+        (
+            "a compared row belongs to no direction bucket",
+            |counts| counts.agree = 5,
+            "D23 direction buckets",
+        ),
+        (
+            "an unscorable row is neither an oracle skip nor a subject non-answer",
+            |counts| counts.oracle_skipped = 2,
+            "unscorable rows must split",
+        ),
+        (
+            "a restrictive row is triaged to no family",
+            |counts| counts.restrictive_families.clear(),
+            "every restrictive row",
+        ),
+        (
+            "a non-answer is triaged twice",
+            |counts| {
+                counts
+                    .no_answer_families
+                    .insert("inconclusive:Steps".to_string(), 2);
+            },
+            "every subject non-answer",
+        ),
+    ];
+
+    let mut seen: Vec<String> = Vec::new();
+    for (name, break_one_law, expected) in cases {
+        let mut counts = legal();
+        break_one_law(&mut counts);
+        let message = conservation_violation(&counts);
+        assert!(
+            message.contains(expected),
+            "`{name}` broke a law, but not the one it names: expected `{expected}`, got \
+             `{message}`"
+        );
+        seen.push(message);
+    }
+
+    // NO TWO CELLS MAY HAVE TRIPPED THE SAME LAW. Five distinct violations must
+    // produce five distinct complaints, or one law is standing in for another
+    // and the cell that appears to cover it covers nothing.
+    for (index, message) in seen.iter().enumerate() {
+        for (other, other_message) in seen.iter().enumerate() {
+            assert!(
+                index == other || message != other_message,
+                "two planted violations produced the same complaint: {message}"
+            );
+        }
+    }
+}
+
 /// Per-module counts ACCUMULATE into a corpus total, families included.
 ///
 /// **The one production function on this path with no coverage at all.**
