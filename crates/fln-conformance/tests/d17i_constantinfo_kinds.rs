@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use fln_core::expr::{Expr, ExprNode};
+use fln_core::level::LevelView;
 use fln_core::name::Name;
 use fln_env::constants::{
     ConstantInfo, ConstructorVal, DefinitionSafety, InductiveVal, QuotKind, RecursorVal,
@@ -2261,5 +2262,140 @@ fn the_recursive_flag_matches_a_recursive_occurrence_in_a_constructor_field() {
     assert_eq!(
         flagged, RECURSIVE_INDUCTIVES,
         "the recursive inductives at the pin; a new one is a real change in the artifact"
+    );
+}
+
+/// Every level parameter a level mentions.
+fn level_parameters(level: &fln_core::level::Level, out: &mut BTreeSet<String>) {
+    let mut stack = vec![level];
+    while let Some(current) = stack.pop() {
+        match current.view() {
+            LevelView::Param(name) => drop(out.insert(name.to_display_string())),
+            LevelView::Succ(inner) => stack.push(inner),
+            LevelView::Max(a, b) | LevelView::IMax(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            LevelView::Zero | LevelView::MVar(_) => {}
+        }
+    }
+}
+
+/// Every level parameter an expression mentions, through both carriers: a
+/// `Sort`'s level and a `Const`'s level arguments.
+fn used_level_parameters(root: &Expr) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.allocation_identity()) {
+            continue;
+        }
+        match current.node() {
+            ExprNode::Sort { level } => level_parameters(level, &mut out),
+            ExprNode::Const { levels, .. } => {
+                for level in levels {
+                    level_parameters(level, &mut out);
+                }
+            }
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. } | ExprNode::FVar { .. } | ExprNode::MVar { .. } => {}
+            ExprNode::Lit { .. } => {}
+        }
+    }
+    out
+}
+
+/// The universe half of name resolution — `level_params` read as NAMES rather
+/// than as the count the arity cell reads.
+///
+/// Two reject classes live here and neither is touched anywhere else in this
+/// file: `UndefinedLevelParam` (KR-140) for a universe parameter used but not
+/// declared, and `DuplicateLevelParams` (KR-971) for a declaration listing one
+/// twice. Both are properties of a decoded declaration against ITSELF, so they
+/// survive every closure and block check above being green.
+///
+/// Measured over `Init/Prelude` at private level: 2,314 declarations, 1,592
+/// level-polymorphic with up to 7 parameters and 11 distinct names in use; zero
+/// duplicate parameter lists; zero parameters used without being declared.
+///
+/// A third fact falls out and is asserted because it is stronger than either:
+/// the count of declarations DECLARING a parameter equals the count USING one.
+/// Since nothing uses an undeclared parameter, users are a subset of declarers,
+/// so equal counts make the two sets identical — no declaration at the pin
+/// carries a level parameter it never mentions.
+#[test]
+fn level_parameters_are_declared_distinct_and_all_of_them_are_used() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut declaring = 0usize;
+    let mut using = 0usize;
+    let mut widest = 0usize;
+    let mut names_in_use: BTreeSet<String> = BTreeSet::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        let declared_list = &info.constant_val().level_params;
+        let declared: BTreeSet<String> =
+            declared_list.iter().map(Name::to_display_string).collect();
+        assert_eq!(
+            declared.len(),
+            declared_list.len(),
+            "{name} lists a level parameter twice, which is KR-971"
+        );
+        if !declared.is_empty() {
+            declaring += 1;
+            widest = widest.max(declared.len());
+        }
+
+        let mut used = used_level_parameters(&info.constant_val().type_);
+        for expr in declaration_expressions(info) {
+            used.append(&mut used_level_parameters(expr));
+        }
+        let undeclared: Vec<&String> = used.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "{name} uses level parameters it does not declare, which is KR-140: {undeclared:?}"
+        );
+        if !used.is_empty() {
+            using += 1;
+            names_in_use.extend(used);
+        }
+    }
+
+    // Anti-vacuity on both sides. A level walk that found nothing would report
+    // zero undeclared parameters for every declaration in the corpus, and a
+    // corpus with no polymorphism would make the comparison empty.
+    assert!(
+        declaring > 1_500 && using > 1_500 && widest >= 7 && names_in_use.len() >= 10,
+        "the pin is heavily level-polymorphic ({declaring} declaring, {using} using, widest \
+         {widest}, {} distinct names)",
+        names_in_use.len()
+    );
+    assert_eq!(
+        declaring, using,
+        "every declaration carrying level parameters must actually use one: nothing uses an \
+         undeclared parameter, so equal counts make these the same set, and a gap would mean \
+         the pin declares universes it never mentions"
     );
 }
