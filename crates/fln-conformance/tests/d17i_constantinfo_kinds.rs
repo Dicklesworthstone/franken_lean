@@ -5464,3 +5464,153 @@ fn extra_const_names_overlap_declared_names_exactly_at_the_splitters() {
          a consequence of the law rather than an absence of data"
     );
 }
+
+/// The two `Init` modules whose import array repeats a row IDENTICALLY.
+const IDENTICAL_IMPORT_ROWS: &[&str] = &["Init.Data.Nat", "Init.Data.String"];
+
+/// Every `Init` module in the pin, as dotted names.
+fn init_modules(lib: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![lib.join("Init")];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "olean") {
+                let rel = path
+                    .strip_prefix(lib)
+                    .expect("under lib")
+                    .with_extension("");
+                out.push(rel.to_string_lossy().replace('/', "."));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// An import row is NOT keyed by its module name, and only barely by the whole
+/// row — which matters because keying it by name is the natural thing to do and
+/// silently discards `importAll`.
+///
+/// The import cell above reads one module's seven rows and settles what
+/// licenses the cross-module private reference. It leaves the array's own
+/// shape unasserted, and `ModuleImport`'s doc-comment makes a claim about that
+/// shape — "array order and duplicate rows are observable and are therefore
+/// preserved" — that nothing here tested.
+///
+/// Measured over all 600 `Init` modules, 3,153 import edges, and the counts are
+/// identical at both levels:
+///
+///   102 modules import the same module TWICE, so the module name is not a key
+///   100 of those repeat with DIFFERENT flags — the same module imported once
+///     plainly and once as `meta`, or once plainly and once as `import all`
+///   2 repeat a row identically, and they are named above
+///
+/// So neither candidate key holds. A decoder or environment builder that keys
+/// imports by module name drops 100 flag-distinct edges across `Init` alone,
+/// and among what it drops are `importAll` edges — precisely the flag that
+/// licenses reading a private part, which is the mechanism this whole bead
+/// turns on. That is the non-injective-projection shape this repository has
+/// caught before: a projection used as an identity without anyone checking that
+/// it is injective.
+///
+/// One flag relation falls out and is asserted ONE-WAY, because the converse is
+/// false and measured false: all 226 `importAll` edges have `isExported` clear,
+/// while 1,379 edges have `isExported` clear without `importAll`. Implication,
+/// not equivalence.
+#[test]
+fn import_rows_are_keyed_by_neither_the_module_name_nor_reliably_the_row() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+    let present: BTreeSet<&String> = modules.iter().collect();
+
+    let mut edges = 0usize;
+    let mut repeated_name: Vec<&String> = Vec::new();
+    let mut repeated_row: Vec<&String> = Vec::new();
+    let mut flag_distinct = 0usize;
+    let mut import_all = 0usize;
+    let mut import_all_exported = 0usize;
+    let mut unexported_without_import_all = 0usize;
+    let mut combinations: BTreeSet<(bool, bool, bool)> = BTreeSet::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for module in &modules {
+        let view = module_view(&lib, module, Level::Exported);
+        edges += view.imports.len();
+
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut rows: BTreeSet<(String, bool, bool, bool)> = BTreeSet::new();
+        let mut duplicate_name = false;
+        let mut duplicate_row = false;
+        for import in &view.imports {
+            let name = import.module.to_display_string();
+            let row = (
+                name.clone(),
+                import.import_all,
+                import.is_exported,
+                import.is_meta,
+            );
+            combinations.insert((import.import_all, import.is_exported, import.is_meta));
+            if import.import_all {
+                import_all += 1;
+                if import.is_exported {
+                    import_all_exported += 1;
+                }
+            } else if !import.is_exported {
+                unexported_without_import_all += 1;
+            }
+            if !present.contains(&name) {
+                unresolved.push(format!("{module} -> {name}"));
+            }
+            duplicate_name |= !names.insert(name);
+            duplicate_row |= !rows.insert(row);
+        }
+        if duplicate_name {
+            repeated_name.push(module);
+            if duplicate_row {
+                repeated_row.push(module);
+            } else {
+                flag_distinct += 1;
+            }
+        }
+    }
+
+    assert!(
+        unresolved.is_empty(),
+        "every import names a module the pin supplies; these do not: {:?}",
+        &unresolved[..unresolved.len().min(8)]
+    );
+    assert_eq!(edges, 3_153, "the import edge census must be complete");
+    assert_eq!(
+        (repeated_name.len(), flag_distinct),
+        (102, 100),
+        "the module name is not a key, and almost every repeat is flag-distinct rather than a \
+         true duplicate"
+    );
+    assert_eq!(
+        repeated_row, IDENTICAL_IMPORT_ROWS,
+        "the whole row is not a key either, and these two are why"
+    );
+
+    // The flag relation, one-way. Both sides are asserted so that a future
+    // artifact turning it into an equivalence fails here rather than passing.
+    assert_eq!(
+        (import_all, import_all_exported),
+        (226, 0),
+        "importAll implies isExported is clear"
+    );
+    assert!(
+        unexported_without_import_all > 1_000,
+        "the converse must stay false: {unexported_without_import_all} edges are unexported \
+         without importAll"
+    );
+    assert_eq!(
+        combinations.len(),
+        5,
+        "five of the eight flag combinations occur at the pin, so no flag decodes to a constant"
+    );
+}
