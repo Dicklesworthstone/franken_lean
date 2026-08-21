@@ -2533,7 +2533,16 @@ mod tests {
                         ],
                         type_: Expr::sort(Level::zero()),
                     },
-                    all: Vec::new(),
+                    // TWO names, DIFFERENT, and chosen when the fixture is
+                    // written rather than when a cell asserts on them - the
+                    // rule the last three waves arrived at. An empty `all` is
+                    // boxed nil with no cells, and two equal names would let a
+                    // reversal decode identically. See
+                    // `the_recursor_mutual_block_keeps_its_arity_and_order`.
+                    all: vec![
+                        Name::from_components(["Demo", "rec"]),
+                        Name::from_components(["Demo", "recAux"]),
+                    ],
                     // DISTINCT on purpose. The telescope counts are four
                     // consecutive boxed-Nat slots read by index, so equal
                     // values would make a slot swap invisible: every one of
@@ -2570,6 +2579,102 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// The recursor's mutual block keeps both its ARITY and its ORDER.
+    ///
+    /// `all` is the list of declarations elaborated together with this one. It
+    /// is a `List Name` like `levelParams`, and it fails the same way: every
+    /// cell is a well-formed cons and every head a well-formed `Name`, so a
+    /// truncated or reordered list is a valid object describing a different
+    /// mutual block, and no shape rule can see it.
+    ///
+    /// NOTE WHICH SLOT 1. `levelParams` is slot 1 of the `ConstantVal`; `all`
+    /// is slot 1 of the `RecursorVal` that CONTAINS that ConstantVal. Two
+    /// `List Name` fields at the same index in nested objects is exactly the
+    /// confusion a positional decoder can make silently, so this cell walks
+    /// from the payload while the level-params cell walks from the base, and
+    /// this one asserts the other list is not what it found.
+    #[test]
+    fn the_recursor_mutual_block_keeps_its_arity_and_order() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        let all: Vec<String> = recursor.all.iter().map(Name::to_display_string).collect();
+        assert_eq!(all.len(), 2, "the mutual block's size");
+        assert_eq!(
+            all,
+            vec!["Demo.rec".to_owned(), "Demo.recAux".to_owned()],
+            "in that order"
+        );
+
+        assert!(
+            all.len() > 1 && all[0] != all[1],
+            "the fixture must keep at least two DISTINCT block members, or a \
+             reversal would decode identically and this cell would prove \
+             nothing: {all:?}"
+        );
+
+        // The two `List Name` fields must not be confused for one another.
+        let params: Vec<String> = recursor
+            .base
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        assert_ne!(
+            all, params,
+            "the mutual block and the universe parameters are different lists \
+             at the same slot index in nested objects; a positional mix-up \
+             would return one for the other"
+        );
+
+        // The same order on the wire, walked from the PAYLOAD's slot 1.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+
+        let mut cursor = view.read_u64(val_off + 8 + 8).expect("all slot");
+        let mut on_the_wire = Vec::new();
+        while cursor & 1 == 0 {
+            let cell = view.deref(cursor).expect("cons cell");
+            assert_eq!(
+                view.obj_header(cell).expect("cons header").0,
+                1,
+                "List.cons"
+            );
+            let head = view.read_u64(cell + 8).expect("head pointer");
+            on_the_wire.push(
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(head)
+                    .expect("member name")
+                    .to_display_string(),
+            );
+            cursor = view.read_u64(cell + 16).expect("tail pointer");
+        }
+        assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+        assert_eq!(
+            on_the_wire, all,
+            "the decoded block must be in the order the cells are chained"
+        );
     }
 
     /// The recursor's universe parameters keep both their ARITY and their
