@@ -134,6 +134,10 @@ the toolchain would report a perfect facade:
     Init substrate in memory and requires the disposition matrix to refuse. The
     matrix is proved sensitive to a wrong demanded-row classification.
 
+  * A CORPUS-PIN JOIN requires the exact-demand artifact's mathlib commit to
+    equal the corpus pin in `SUITE.lock`. The demand slice cannot be reported
+    against a different source epoch.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -209,7 +213,7 @@ def load_partition():
     return part
 
 
-def load_demand(path, part, expected_pin):
+def load_demand(path, part, expected_pin, expected_corpus_commit):
     """Curated module -> the toolchain-api constants it actually uses, from the
     elaborated exact-demand artifact (never a lexical scan: `open Lean Meta Elab`
     makes ~95% of real usage unqualified, measured on this same slice)."""
@@ -218,6 +222,7 @@ def load_demand(path, part, expected_pin):
     declared_toolchain_api_demand = None
     census_missing = None
     demand_pin = None
+    demand_corpus_commit = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -234,6 +239,7 @@ def load_demand(path, part, expected_pin):
                 declared_toolchain_api_demand = row.get("toolchain_api_demanded")
                 census_missing = row.get("census_missing")
                 demand_pin = row.get("pin")
+                demand_corpus_commit = row.get("corpus_commit")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -278,6 +284,12 @@ def load_demand(path, part, expected_pin):
             "REFUSE: exact-demand Reference-pin join disagrees with this rig "
             f"(demand={demand_pin!r}, compiler={expected_pin!r})"
         )
+    if demand_corpus_commit != expected_corpus_commit:
+        raise SystemExit(
+            "REFUSE: exact-demand corpus-pin join disagrees with this rig "
+            f"(demand={demand_corpus_commit!r}, "
+            f"suite={expected_corpus_commit!r})"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -320,6 +332,7 @@ def load_demand(path, part, expected_pin):
         "toolchain_distinct_symbols": rebuilt_distinct,
         "census_missing": 0,
         "reference_pin": expected_pin,
+        "corpus_commit": expected_corpus_commit,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
@@ -934,7 +947,9 @@ def main():
 
     lean, tag, corpus_commit = pinned_lean()
     part = load_partition()
-    modules, by_module, module_join, partition_join = load_demand(args.demand, part, tag)
+    modules, by_module, module_join, partition_join = load_demand(
+        args.demand, part, tag, corpus_commit
+    )
     work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-compile-{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
