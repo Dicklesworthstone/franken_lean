@@ -11721,6 +11721,332 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The array holder's own context rescues two fifths of the blind spot.
+///
+/// `94ea5264` found 10,262 objects with no constructor arrival - reached only
+/// through array elements, where there is no parent shape or slot to key on -
+/// and counted them as indeterminate. It counted them and then left them, which
+/// is the same stopping point `03c853b1` took when it called something
+/// enumerable without enumerating it.
+///
+/// AN ARRAY ELEMENT HAS NO CONTEXT BUT THE ARRAY DOES. Keying on the context
+/// the holding ARRAY itself arrives through resolves 4,099 of the 10,262. Two
+/// shapes are rescued entirely - `(0, 1)`'s 489 and `(1, 1)`'s 1,589, both
+/// through grandparent contexts with no mixing at all - while `(0, 2)` gets
+/// back only 162 of 5,238.
+///
+/// ONE LEVEL IS THE COMPLETE DEPTH HERE, NOT AN ARBITRARY STOP, and that is
+/// asserted rather than assumed: of every array holding one of these objects,
+/// NONE is itself without a constructor arrival. There is no third level to go
+/// to, so this refinement is finished rather than truncated.
+///
+/// The decomposition becomes
+///
+///   resolvable by a constructor context   13,431
+///   rescued by the holding array's        4,099
+///   indeterminate                          7,337
+///
+/// and indeterminacy falls from 459 per thousand to 295.
+///
+/// THE RANKING SHIFTS AGAIN, AND THE SUPERLATIVE CHANGES HANDS. `94ea5264`
+/// called `(1, 2)` the best of the six at 14 per thousand. Under this stronger
+/// rule `(1, 1)` is best at THREE, having moved from 834 - by far the largest
+/// movement, because every one of its array-only objects is rescued. `(1, 2)`
+/// is unchanged at 14 and now second.
+///
+/// That earlier claim was true of the rule it was measured under, and it is not
+/// stable across a stronger one. Which is the point worth keeping: every
+/// "worst" and "best" this bead has produced is relative to a discriminator,
+/// and four cells in a row have now had their ordering disturbed by the next
+/// refinement. `(0, 2)` is the exception - worst on every measure so far, and
+/// still at 868 here.
+///
+/// POPULATION SCOPE: all four modules pooled, the six shapes `03c853b1` left
+/// unseparated, and within them the 10,262 objects with no constructor arrival.
+#[test]
+fn the_array_holders_own_context_rescues_two_fifths() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    type Context = (u8, u8, u16, usize);
+    const SURVIVORS: [(u8, u8); 6] = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2)];
+
+    // Grandparent contexts: the contexts the holding ARRAY arrives through.
+    let mut grand_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut grand_arrivals: std::collections::BTreeMap<(usize, usize), BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+    let mut shape_of: std::collections::BTreeMap<(usize, usize), (u8, u8, u16)> =
+        std::collections::BTreeMap::new();
+    let mut has_ctor: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut ctor_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut ctor_arrivals: std::collections::BTreeMap<(usize, usize), BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+    let mut orphan_arrays = 0usize;
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                shape_of.insert(
+                    (index, object.off),
+                    (object.tag, object.other, object.cs_sz),
+                );
+            }
+        }
+
+        // Which objects have a constructor arrival, and where every array
+        // arrives from.
+        let mut array_contexts: std::collections::BTreeMap<usize, BTreeSet<Context>> =
+            std::collections::BTreeMap::new();
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let Some(child) = resolve(word_at(bytes, parent.off + 8 + 8 * slot))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                let key = (parent.tag, parent.other, parent.cs_sz, slot);
+                if child.1.tag <= abi::TAG_MAX_CTOR_TAG {
+                    has_ctor.insert((index, child.0));
+                    // Recomputed here, not quoted from `94ea5264`.
+                    ctor_sizes
+                        .entry(((child.1.tag, child.1.other), key))
+                        .or_default()
+                        .insert(child.1.cs_sz);
+                    ctor_arrivals
+                        .entry((index, child.0))
+                        .or_default()
+                        .insert(key);
+                } else if child.1.tag == abi::TAG_ARRAY {
+                    array_contexts.entry(child.0).or_default().insert(key);
+                }
+            }
+        }
+        // Push each array's own contexts down onto its elements.
+        for holder in &objects {
+            if holder.tag != abi::TAG_ARRAY {
+                continue;
+            }
+            let inherited = array_contexts.get(&holder.off);
+            for i in 0..word_at(bytes, holder.off + 8) {
+                let Some(child) = resolve(word_at(bytes, holder.off + 24 + 8 * i as usize))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                if child.1.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                match inherited {
+                    None => orphan_arrays += 1,
+                    Some(keys) => {
+                        for key in keys {
+                            grand_sizes
+                                .entry(((child.1.tag, child.1.other), *key))
+                                .or_default()
+                                .insert(child.1.cs_sz);
+                            grand_arrivals
+                                .entry((index, child.0))
+                                .or_default()
+                                .insert(*key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Per shape: what the extra level buys.
+    let mut table: Vec<(u8, u8, usize, usize, usize, usize, usize)> = Vec::new();
+    for shape in SURVIVORS {
+        let mut blind = 0usize;
+        let mut rescued = 0usize;
+        let mut still = 0usize;
+        for (key, profile) in &shape_of {
+            if (profile.0, profile.1) != shape || has_ctor.contains(key) {
+                continue;
+            }
+            blind += 1;
+            match grand_arrivals.get(key) {
+                None => still += 1,
+                Some(keys) => {
+                    if keys.iter().any(|context| {
+                        grand_sizes
+                            .get(&(shape, *context))
+                            .is_some_and(|seen| seen.len() == 1)
+                    }) {
+                        rescued += 1;
+                    } else {
+                        still += 1;
+                    }
+                }
+            }
+        }
+        let contexts = grand_sizes.iter().filter(|((s, _), _)| *s == shape).count();
+        let mixed = grand_sizes
+            .iter()
+            .filter(|((s, _), seen)| *s == shape && seen.len() > 1)
+            .count();
+        assert_eq!(
+            rescued + still,
+            blind,
+            "{shape:?}: every blind object lands"
+        );
+        table.push((shape.0, shape.1, blind, contexts, mixed, rescued, still));
+    }
+
+    assert_eq!(
+        orphan_arrays, 0,
+        "EVERY array holding one of these objects itself has a constructor \
+         arrival, so one level up is the COMPLETE depth for this population and \
+         not an arbitrary place to stop - there is no third level to go to"
+    );
+    assert_eq!(
+        table,
+        vec![
+            (0, 1, 489, 3, 0, 489, 0),
+            (0, 2, 5238, 6, 1, 162, 5076),
+            (0, 3, 2933, 5, 1, 1859, 1074),
+            (1, 1, 1589, 4, 0, 1589, 0),
+            (1, 2, 13, 1, 1, 0, 13),
+            (2, 2, 0, 0, 0, 0, 0),
+        ],
+        "per shape: objects with no constructor arrival, the grandparent \
+         contexts they reach, how many of those are mixed, and the split into \
+         RESCUED and still indeterminate. `(0, 1)` and `(1, 1)` are rescued \
+         entirely - no mixed grandparent context at all - while `(0, 2)` \
+         recovers 162 of 5,238"
+    );
+    assert_eq!(
+        (
+            table.iter().map(|row| row.2).sum::<usize>(),
+            table.iter().map(|row| row.5).sum::<usize>(),
+            table.iter().map(|row| row.6).sum::<usize>()
+        ),
+        (10262, 4099, 6163),
+        "the blind spot `94ea5264` measured, and what the extra level buys: two \
+         fifths of it"
+    );
+
+    // The whole population again, and the ranking that will not hold still.
+    // Population and constructor-context indeterminacy are RECOMPUTED here
+    // rather than carried over as literals from `94ea5264`.
+    let mut population: std::collections::BTreeMap<(u8, u8), usize> =
+        std::collections::BTreeMap::new();
+    let mut all_mixed: std::collections::BTreeMap<(u8, u8), usize> =
+        std::collections::BTreeMap::new();
+    for (key, profile) in &shape_of {
+        let shape = (profile.0, profile.1);
+        if !SURVIVORS.contains(&shape) {
+            continue;
+        }
+        *population.entry(shape).or_default() += 1;
+        if let Some(contexts) = ctor_arrivals.get(key)
+            && !contexts.iter().any(|context| {
+                ctor_sizes
+                    .get(&(shape, *context))
+                    .is_some_and(|seen| seen.len() == 1)
+            })
+        {
+            *all_mixed.entry(shape).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        population.values().copied().collect::<Vec<_>>(),
+        vec![1350, 6506, 5553, 1912, 7591, 1955],
+        "the six shapes' populations, recomputed"
+    );
+    assert_eq!(
+        all_mixed.values().copied().collect::<Vec<_>>(),
+        vec![277, 572, 148, 6, 97, 74],
+        "and the objects whose every constructor arrival is mixed, recomputed -          so this cell quotes no figure from `94ea5264`"
+    );
+
+    let indeterminate: Vec<((u8, u8), usize)> = {
+        let mut out: Vec<((u8, u8), usize)> = SURVIVORS
+            .iter()
+            .map(|shape| {
+                let still = table
+                    .iter()
+                    .find(|row| (row.0, row.1) == *shape)
+                    .map(|row| row.6)
+                    .expect("shape present");
+                (
+                    *shape,
+                    (all_mixed.get(shape).copied().unwrap_or(0) + still) * 1000 / population[shape],
+                )
+            })
+            .collect();
+        out.sort_by_key(|(_, permille)| *permille);
+        out
+    };
+    assert_eq!(
+        indeterminate,
+        vec![
+            ((1, 1), 3),
+            ((1, 2), 14),
+            ((2, 2), 37),
+            ((0, 1), 205),
+            ((0, 3), 220),
+            ((0, 2), 868),
+        ],
+        "indeterminate objects per thousand under the stronger rule, best \
+         first. `94ea5264` called `(1, 2)` the best at 14; `(1, 1)` is best \
+         here at THREE, having moved from 834 - the largest movement, since \
+         every one of its array-only objects is rescued. That earlier claim was \
+         true of the rule it was measured under and is not stable across a \
+         stronger one. `(0, 2)` is the exception: worst on every measure this \
+         bead has produced, and still worst here"
+    );
+    let pooled_population: usize = population.values().sum();
+    let pooled_all_mixed: usize = all_mixed.values().sum();
+    let pooled_blind: usize = table.iter().map(|row| row.2).sum();
+    assert_eq!(
+        (
+            pooled_population - pooled_all_mixed - table.iter().map(|row| row.6).sum::<usize>(),
+            table.iter().map(|row| row.6).sum::<usize>() + pooled_all_mixed,
+            pooled_population,
+            pooled_blind
+        ),
+        (17530, 7337, 24867, 10262),
+        "so the pooled split is 17,530 resolvable against 7,337 indeterminate - \
+         295 per thousand, down from the 459 `94ea5264` measured with \
+         constructor contexts alone"
+    );
+}
+
 /// The objects no context resolves - and the ranking inverts.
 ///
 /// `259eadde` reported 159 "minority objects" and called them small numbers. It
@@ -11748,6 +12074,11 @@ fn the_other_references_to_that_name() {
 ///   no constructor arrival at all          10,262
 ///
 /// so 46% are indeterminate, not the impression "159" left.
+///
+/// That 46% is itself an upper bound and
+/// `the_array_holders_own_context_rescues_two_fifths` brings it to 29.5%: an
+/// array element has no context of its own, but the ARRAY does, and going one
+/// level up resolves 4,099 of the 10,262. The ranking below shifts again there.
 ///
 /// THE RANKING INVERTS, WHICH IS THE FINDING. By mixed-context count
 /// (`03c853b1`) and by minority arrivals (`259eadde`), `(1, 2)` is the worst of
