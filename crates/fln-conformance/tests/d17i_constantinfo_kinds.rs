@@ -1214,6 +1214,7 @@ fn a_module_with_imports_is_reference_closed_only_at_private_level() {
 
     let mut referenced_counts = Vec::new();
     let mut deficits = Vec::new();
+    let mut structural_counts = Vec::new();
     for level in [Level::Exported, Level::Private] {
         let (infos, imports) = decode_at(&lib, MODULE, level);
         assert!(
@@ -1244,6 +1245,19 @@ fn a_module_with_imports_is_reference_closed_only_at_private_level() {
             "the import closure must actually be walked, got {} names",
             available.len()
         );
+
+        // The STRUCTURAL surface, over the same closure. `81165464` showed the
+        // exported deficit is expression-only for the import-free root; this is
+        // the same question one import edge out, and it reuses the closure
+        // already computed rather than walking it again.
+        let structural: BTreeSet<String> =
+            infos.iter().flat_map(structural_name_references).collect();
+        structural_counts.push(structural.len());
+        let structural_unresolved: Vec<&String> = structural.difference(&available).collect();
+        assert!(
+            structural_unresolved.is_empty(),
+            "block admission resolves these by name across imports too, so an unresolved one              here would be a BlockMismatch the exported level could produce:              {structural_unresolved:?}"
+        );
     }
 
     // Anti-vacuity: an empty reference scan satisfies "zero unresolved".
@@ -1255,6 +1269,13 @@ fn a_module_with_imports_is_reference_closed_only_at_private_level() {
         deficits[0], CROSS_MODULE_DEFICIT,
         "the exported deficit is what makes the private closure below a repair rather than a \
          tautology; it must be exactly these three"
+    );
+    // Anti-vacuity for the structural half, and the shape that matters: the
+    // structural surface resolves at BOTH levels while the expression surface
+    // does not, one import edge out exactly as at the root.
+    assert!(
+        structural_counts[0] > 100 && structural_counts[1] > structural_counts[0],
+        "structural scan must reach the declarations at both levels: {structural_counts:?}"
     );
     assert!(
         deficits[1].is_empty(),
