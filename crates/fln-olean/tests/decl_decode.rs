@@ -1417,3 +1417,154 @@ fn the_all_and_ctors_chains_are_bound_to_the_decoder_too() {
         "and carry the size recorded for the `levelParams` cells"
     );
 }
+
+/// WHAT the 99 are, by a pinned histogram of what their tails point at.
+///
+/// `a_third_shape_shares_the_cons_cell_header_and_bounds_the_size_rule` pins
+/// the count and deliberately records no hypothesis. It also cannot show its
+/// own characterisation on a green run - that only reaches the failure message,
+/// which is the channel defect `ac97cb3a` had to fix once already. This cell
+/// puts the characterisation in an assertion, where a green run means it still
+/// holds and a red one names what changed.
+///
+/// THE BOXED SCALARS SETTLE IT. A `List` tail is a pointer to another cell or
+/// the boxed nil, which is boxed ZERO - there is no other nullary constructor
+/// of `List`. Seventeen of the 99 carry a boxed tail of 1 through 6. An object
+/// whose second field holds boxed 1..6 belongs to a type with SEVERAL nullary
+/// constructors, so it is not a list, and no walk of it as a list can be
+/// correct. The remaining 82 point at two-field structures - 71 at `tag 0`, 11
+/// at `tag 4` - which is consistent with the same reading and does not on its
+/// own establish it.
+///
+/// So the 99 are constructors of OTHER inductives that coincide with
+/// `List.cons` on tag, arity and size. That is why `daaaabe2` blocks the size
+/// rule: 24 bytes at `(1, 2)` is a shape several types share, not a signature
+/// of `List.cons`, and no refinement of the SIZE can separate them because the
+/// size is identical.
+///
+/// The histogram is measured, not guessed. It was computed over the same four
+/// modules by an independent walker before being written here, and that walker
+/// reproduced w115's two published numbers exactly - 7,591 objects at `(1, 2)`
+/// and 99 third tails, first at `Init/Prelude.olean` `0x32e7d0`. Two
+/// implementations agreeing on the population is the reason this pin is a
+/// record rather than a hypothesis.
+#[test]
+fn the_third_shape_tails_are_not_list_tails() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut population = 0usize;
+    let mut third_tails = 0usize;
+    let mut histogram: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+
+        for object in &objects {
+            if (object.tag, object.other) != (1, 2) {
+                continue;
+            }
+            population += 1;
+            if object.cs_sz != 24 {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let target = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten()
+                .and_then(|off| at.get(&off));
+            let ends_the_list = second & 1 == 1 && second >> 1 == 0;
+            if ends_the_list || target.is_some_and(|t| (t.tag, t.other) == (1, 2)) {
+                continue; // cons-shaped, and not one of the 99
+            }
+            third_tails += 1;
+            let kind = match target {
+                Some(t) => format!("tag {} arity {}", t.tag, t.other),
+                None if second & 1 == 1 => format!("boxed scalar {}", second >> 1),
+                None => "unresolvable".to_owned(),
+            };
+            *histogram.entry(kind).or_default() += 1;
+        }
+    }
+
+    // Kept from the pinned remainder cell, and checked here too so the two
+    // cannot drift apart about which population they describe.
+    assert!(
+        population >= 100,
+        "too few (1,2) objects to characterise: {population}"
+    );
+    assert_eq!(
+        histogram.values().sum::<usize>(),
+        third_tails,
+        "every third tail must land in exactly one bucket"
+    );
+
+    if !prelude_loaded {
+        // Nothing to pin: the third shape does not occur in the C3 fixtures
+        // alone, which is why the count is Prelude-gated in the sibling cell
+        // too. The arithmetic above still ran.
+        assert_eq!(
+            third_tails, 0,
+            "the C3 fixtures were not expected to contain the third shape; \
+             finding one here is a new fact: {histogram:?}"
+        );
+        return;
+    }
+
+    // The remainder, still pinned two-way.
+    assert_eq!(
+        third_tails, 99,
+        "the same 99 the remainder cell pins: {histogram:?}"
+    );
+
+    // The measured histogram. A change either way names what moved.
+    let measured: Vec<(String, usize)> = histogram.into_iter().collect();
+    assert_eq!(
+        measured,
+        vec![
+            ("boxed scalar 1".to_owned(), 6),
+            ("boxed scalar 2".to_owned(), 4),
+            ("boxed scalar 3".to_owned(), 2),
+            ("boxed scalar 4".to_owned(), 2),
+            ("boxed scalar 5".to_owned(), 2),
+            ("boxed scalar 6".to_owned(), 1),
+            ("tag 0 arity 2".to_owned(), 71),
+            ("tag 4 arity 2".to_owned(), 11),
+        ],
+        "what the 99 third tails point at, measured over the pinned corpus"
+    );
+
+    // The load-bearing half, stated as its own assertion so it cannot be lost
+    // in a histogram edit: a boxed tail other than nil is proof the object is
+    // not a list.
+    let not_nil_scalars: usize = measured
+        .iter()
+        .filter(|(kind, _)| kind.starts_with("boxed scalar "))
+        .map(|(_, count)| *count)
+        .sum();
+    assert_eq!(
+        not_nil_scalars, 17,
+        "objects whose tail is a boxed value OTHER than nil. `List` has one \
+         nullary constructor and it is boxed zero, so these cannot be list \
+         cells however they are walked - which is why no size rule can rescue \
+         `list_ptrs`"
+    );
+}
