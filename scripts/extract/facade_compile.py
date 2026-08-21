@@ -1744,6 +1744,28 @@ def main():
             "REFUSE: facade manifest field-set count must exceed structural "
             f"class count ({json.dumps(field_set_structural_class_inequality_join, sort_keys=True)})"
         )
+    projection_field_set_inequality_join = {
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+    }
+    if (not isinstance(projection_field_set_inequality_join[
+            "summary_projection_types_checked"], int)
+            or isinstance(projection_field_set_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or not isinstance(projection_field_set_inequality_join[
+                "summary_field_sets_checked"], int)
+            or isinstance(projection_field_set_inequality_join[
+                "summary_field_sets_checked"], bool)
+            or projection_field_set_inequality_join[
+                "summary_projection_types_checked"]
+            <= projection_field_set_inequality_join[
+                "summary_field_sets_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-type count must exceed field "
+            f"set count ({json.dumps(projection_field_set_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3645,6 +3667,9 @@ def main():
         ),
         "manifest_field_set_structural_class_inequality_join": (
             field_set_structural_class_inequality_join
+        ),
+        "manifest_projection_field_set_inequality_join": (
+            projection_field_set_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
