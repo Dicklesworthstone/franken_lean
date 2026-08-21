@@ -2940,6 +2940,17 @@ impl CorpusCounts {
                 + self.restrictive_without_carve_out,
             "{scope}: compared rows must conserve the D23 direction buckets"
         );
+        // THE UNSCORABLE SPLIT. `unscorable` is only ever incremented alongside
+        // one of these two, so this holds by construction at every write site --
+        // which is exactly why it is worth stating. It is the ONLY thing that
+        // binds `oracle_skipped`: without it that field is a free number, and a
+        // receipt could carry any value at all for "how much the oracle would
+        // not answer for" while every other law still balanced.
+        assert_eq!(
+            self.unscorable,
+            self.oracle_skipped + self.subject_no_answer,
+            "{scope}: unscorable rows must split into oracle skips and subject non-answers"
+        );
         // THE TRIAGE IS TOTAL, OR IT IS NOT A TRIAGE. `franken_lean-t6r7` asks
         // that every rejection land in a NAMED family; a census that counted
         // fewer rows than the buckets it describes would publish a partial
@@ -4713,7 +4724,77 @@ fn whole_mathlib_class(
     }
 }
 
+/// Everything a receipt needs that the RUN produces, separated from everything
+/// it needs that the HOST produces.
+///
+/// The split exists so the field mapping can be tested. Built inline, the
+/// producer was a 25-field struct literal that nothing exercised: a
+/// transposition -- `agree: total.compared`, `oracle_skipped:
+/// total.subject_no_answer` -- would compile, satisfy every conservation law
+/// that happened to still balance, and file a plausible row. The lane that would
+/// have caught it needs a corpus that is not on this host, so the only way to
+/// check the mapping is to make it a function of its inputs and hand it inputs.
+struct WholeMathlibRunFacts<'a> {
+    spec: &'a CorpusReceiptSpec,
+    counts: &'a CorpusCounts,
+    closure_modules: u64,
+    corpus_fixture_hash: &'a str,
+    observed_unix_s: u64,
+    wall_ms: u64,
+}
+
 impl WholeMathlibReceipt {
+    /// Assemble a receipt from one run's facts. Pure in its arguments except for
+    /// the four ambient host descriptors, which are properties of the machine
+    /// rather than of the observation and are read here so an operator cannot
+    /// forget or mistype them.
+    fn from_run(facts: &WholeMathlibRunFacts<'_>) -> WholeMathlibReceipt {
+        let counts = facts.counts;
+        WholeMathlibReceipt {
+            bead: facts.spec.bead.to_string(),
+            pin: suite_lock_reference_pin(),
+            corpus_commit: facts.spec.corpus_commit.clone(),
+            observed_unix_s: facts.observed_unix_s,
+            corpus_fixture_hash: facts.corpus_fixture_hash.to_string(),
+            closure_modules: facts.closure_modules,
+            seed_modules: facts.spec.seed_modules,
+            decoded: counts.decoded,
+            compared: counts.compared,
+            agree: counts.agree,
+            unsoundly_permissive: counts.unsoundly_permissive,
+            restrictive_with_carve_out: counts.restrictive_with_carve_out,
+            restrictive_without_carve_out: counts.restrictive_without_carve_out,
+            unscorable: counts.unscorable,
+            oracle_skipped: counts.oracle_skipped,
+            subject_no_answer: counts.subject_no_answer,
+            restrictive_families: family_census_rows(&counts.restrictive_families),
+            no_answer_families: family_census_rows(&counts.no_answer_families),
+            wall_ms: facts.wall_ms,
+            profile: if cfg!(debug_assertions) {
+                "dev"
+            } else {
+                "release"
+            }
+            .to_string(),
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            available_parallelism: std::thread::available_parallelism()
+                .map(|n| n.get() as u64)
+                .unwrap_or(0),
+            // The lane digests its OWN source, so the provenance cannot be
+            // forgotten by an operator or mistyped by one.
+            lane_source_digest_at_run: hash(
+                Domain::Fixture,
+                include_str!("kernel_replay.rs").as_bytes(),
+            )
+            .to_hex(),
+            class: whole_mathlib_class(
+                counts.unsoundly_permissive,
+                counts.restrictive_without_carve_out,
+            )
+            .to_string(),
+        }
+    }
+
     /// The canonical one-line form. Field order is fixed and is part of the
     /// format: a receipt that does not re-serialize to the bytes it was read
     /// from is refused rather than repaired, so there is exactly one spelling
@@ -4989,6 +5070,15 @@ impl WholeMathlibReceipt {
                 self.compared
             ));
         }
+        if self.unscorable != self.oracle_skipped + self.subject_no_answer {
+            return Err(format!(
+                "row does not split its unscorable population: unscorable {} != oracle_skipped \
+                 {} + subject_no_answer {}. This is the only law that binds oracle_skipped at \
+                 all; without it the field is free and the row could say anything about how \
+                 much the oracle declined to answer for",
+                self.unscorable, self.oracle_skipped, self.subject_no_answer
+            ));
+        }
 
         // THE TRIAGE IS TOTAL. A row may not claim a family census that covers
         // fewer rows than the buckets it describes.
@@ -5053,6 +5143,169 @@ fn whole_mathlib_receipt_path(pin: &str) -> PathBuf {
     fln_conformance::checked_manifest_dir!()
         .join("evidence/whole_mathlib_differential")
         .join(format!("{pin}.jsonl"))
+}
+
+/// The producer's field mapping, checked with an all-distinct population.
+///
+/// **The defect this exists for.** Until this test the receipt was assembled by
+/// a 25-field struct literal inside the driver, and the driver needs a corpus
+/// that is not on this host. So the mapping was written once and executed never.
+/// `agree: total.compared` or `oracle_skipped: total.subject_no_answer` would
+/// have compiled, kept every conservation law that still happened to balance,
+/// and produced a row that reads perfectly. Nothing in the suite could tell.
+///
+/// **Why every number differs.** A transposition is only detectable if the two
+/// fields it swaps hold different values, so the population below uses a
+/// distinct value for every count -- and asserts that they ARE distinct, so the
+/// premise cannot rot when someone edits a number. The single exception is
+/// `unsoundly_permissive`, which is pinned at zero because a nonzero value makes
+/// the row mean something else entirely (it changes the class token), and that
+/// case is covered by its own mutant in the guard test.
+///
+/// **What this does not do.** It does not run the lane, score a declaration, or
+/// establish that `total` is populated correctly by the scorer -- only that
+/// whatever the scorer produces reaches the right cell of the row.
+#[test]
+fn the_receipt_producer_maps_every_count_to_its_own_field() {
+    let mut counts = CorpusCounts {
+        decoded: 700_044,
+        compared: 600_014,
+        agree: 600_000,
+        unsoundly_permissive: 0,
+        restrictive_with_carve_out: 3,
+        restrictive_without_carve_out: 11,
+        unscorable: 100_030,
+        oracle_skipped: 60_013,
+        subject_no_answer: 40_017,
+        ..CorpusCounts::default()
+    };
+    counts
+        .restrictive_families
+        .insert("rejected:BlockMismatch".to_string(), 4);
+    counts
+        .restrictive_families
+        .insert("rejected:TypeMismatch".to_string(), 10);
+    counts.no_answer_families.insert(
+        "context:import_context_not_faithfully_representable".to_string(),
+        40_000,
+    );
+    counts
+        .no_answer_families
+        .insert("inconclusive:Steps".to_string(), 17);
+
+    // The sentinel population must be a LEGAL one, or this test would be
+    // asserting the shape of a run that could never occur.
+    counts.assert_conservation("sentinel population");
+
+    let spec = CorpusReceiptSpec {
+        bead: "franken_lean-t6r7",
+        corpus_commit: suite_lock_corpus_commit(),
+        seed_modules: 8_009,
+        receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+    };
+    let receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &counts,
+        closure_modules: 10_007,
+        corpus_fixture_hash: "sentinel-fixture-hash",
+        observed_unix_s: 1_786_111_222,
+        wall_ms: 12_345_678,
+    });
+
+    // THE PREMISE, asserted rather than assumed: distinct values are what make a
+    // swap visible, so a later edit that collides two of them must fail here and
+    // not silently weaken every assertion below.
+    let distinct = [
+        ("closure_modules", receipt.closure_modules),
+        ("seed_modules", receipt.seed_modules),
+        ("decoded", receipt.decoded),
+        ("compared", receipt.compared),
+        ("agree", receipt.agree),
+        (
+            "restrictive_with_carve_out",
+            receipt.restrictive_with_carve_out,
+        ),
+        (
+            "restrictive_without_carve_out",
+            receipt.restrictive_without_carve_out,
+        ),
+        ("unscorable", receipt.unscorable),
+        ("oracle_skipped", receipt.oracle_skipped),
+        ("subject_no_answer", receipt.subject_no_answer),
+        ("observed_unix_s", receipt.observed_unix_s),
+        ("wall_ms", receipt.wall_ms),
+    ];
+    let mut seen = BTreeMap::new();
+    for (field, value) in distinct {
+        if let Some(other) = seen.insert(value, field) {
+            panic!(
+                "the sentinel population gives `{other}` and `{field}` the same value {value}; a \
+                 transposition between them would be invisible to every assertion in this test"
+            );
+        }
+    }
+
+    assert_eq!(receipt.bead, "franken_lean-t6r7");
+    assert_eq!(receipt.pin, suite_lock_reference_pin());
+    assert_eq!(receipt.corpus_commit, suite_lock_corpus_commit());
+    assert_eq!(receipt.observed_unix_s, 1_786_111_222);
+    assert_eq!(receipt.corpus_fixture_hash, "sentinel-fixture-hash");
+    assert_eq!(receipt.closure_modules, 10_007);
+    assert_eq!(receipt.seed_modules, 8_009);
+    assert_eq!(receipt.decoded, 700_044);
+    assert_eq!(receipt.compared, 600_014);
+    assert_eq!(receipt.agree, 600_000);
+    assert_eq!(receipt.unsoundly_permissive, 0);
+    assert_eq!(receipt.restrictive_with_carve_out, 3);
+    assert_eq!(receipt.restrictive_without_carve_out, 11);
+    assert_eq!(receipt.unscorable, 100_030);
+    assert_eq!(receipt.oracle_skipped, 60_013);
+    assert_eq!(receipt.subject_no_answer, 40_017);
+    assert_eq!(receipt.wall_ms, 12_345_678);
+
+    // The census travels in canonical (ascending) order, so two runs that saw
+    // the same families produce byte-identical rows.
+    assert_eq!(
+        receipt.restrictive_families,
+        vec![
+            "rejected:BlockMismatch=4".to_string(),
+            "rejected:TypeMismatch=10".to_string()
+        ]
+    );
+    assert_eq!(
+        receipt.no_answer_families,
+        vec![
+            "context:import_context_not_faithfully_representable=40000".to_string(),
+            "inconclusive:Steps=17".to_string()
+        ]
+    );
+
+    // The class is DERIVED from the counts, not chosen: 11 restrictive rows with
+    // no carve-out is a refutation and the row must say so.
+    assert_eq!(
+        receipt.class, "refuted_this_run_found_a_restrictive_divergence",
+        "a run that found restrictive divergences must not file the clean class"
+    );
+
+    // Provenance the producer reads from the host rather than from the run.
+    assert!(!receipt.lane_source_digest_at_run.is_empty());
+    assert!(!receipt.target.is_empty());
+    assert!(receipt.profile == "dev" || receipt.profile == "release");
+
+    // And the whole thing must satisfy the guard and survive a round trip: a
+    // producer that emits rows its own reader refuses is worse than one that
+    // emits nothing.
+    if let Err(reason) = receipt.validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit())
+    {
+        panic!("the producer emitted a row its own guard refuses: {reason}");
+    }
+    let row = receipt.to_row();
+    let parsed =
+        WholeMathlibReceipt::from_row(&row).expect("a produced row must be readable by the reader");
+    assert!(
+        parsed == receipt,
+        "a produced row must survive its own round trip"
+    );
 }
 
 /// A receipt describing a clean whole-Mathlib run, used as the GREEN CONTROL for
@@ -5251,6 +5504,14 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 ..sample_whole_mathlib_receipt()
             },
             "partial triage",
+        ),
+        (
+            "unscorable population does not split",
+            WholeMathlibReceipt {
+                oracle_skipped: 59_999,
+                ..sample_whole_mathlib_receipt()
+            },
+            "split its unscorable population",
         ),
         (
             "non-answers left untriaged",
@@ -5928,52 +6189,17 @@ fn run_accepted_corpus_kernel_differential(
     // the run whose row must survive; filing it after the asserts would retain
     // only the clean observations and quietly discard every refutation.
     if let Some(spec) = receipt_spec {
-        let receipt = WholeMathlibReceipt {
-            bead: spec.bead.to_string(),
-            pin: suite_lock_reference_pin(),
-            corpus_commit: spec.corpus_commit.clone(),
+        let receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+            spec: &spec,
+            counts: &total,
+            closure_modules: inventory.modules.len() as u64,
+            corpus_fixture_hash: &inventory.fixture_hash,
             observed_unix_s: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_secs())
                 .unwrap_or(0),
-            corpus_fixture_hash: inventory.fixture_hash.clone(),
-            closure_modules: inventory.modules.len() as u64,
-            seed_modules: spec.seed_modules,
-            decoded: total.decoded,
-            compared: total.compared,
-            agree: total.agree,
-            unsoundly_permissive: total.unsoundly_permissive,
-            restrictive_with_carve_out: total.restrictive_with_carve_out,
-            restrictive_without_carve_out: total.restrictive_without_carve_out,
-            unscorable: total.unscorable,
-            oracle_skipped: total.oracle_skipped,
-            subject_no_answer: total.subject_no_answer,
-            restrictive_families: family_census_rows(&total.restrictive_families),
-            no_answer_families: family_census_rows(&total.no_answer_families),
             wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            profile: if cfg!(debug_assertions) {
-                "dev"
-            } else {
-                "release"
-            }
-            .to_string(),
-            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-            available_parallelism: std::thread::available_parallelism()
-                .map(|n| n.get() as u64)
-                .unwrap_or(0),
-            // The lane digests its OWN source, so the provenance cannot be
-            // forgotten by an operator or mistyped by one.
-            lane_source_digest_at_run: hash(
-                Domain::Fixture,
-                include_str!("kernel_replay.rs").as_bytes(),
-            )
-            .to_hex(),
-            class: whole_mathlib_class(
-                total.unsoundly_permissive,
-                total.restrictive_without_carve_out,
-            )
-            .to_string(),
-        };
+        });
         let row = receipt.to_row();
         eprintln!("kernel_reference_corpus RECEIPT: {row}");
         eprintln!(
