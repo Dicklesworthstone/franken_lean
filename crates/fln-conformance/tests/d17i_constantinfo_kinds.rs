@@ -15776,3 +15776,118 @@ fn every_part_in_the_library_identifies_itself_as_the_pin() {
         "a single toolchain built every part of this library, and it is the pinned one"
     );
 }
+
+/// The server part adds no names anywhere in the library — and strictness fails
+/// four times as often as `Init` alone suggests.
+///
+/// `the_server_parts_documentation_vocabulary_is_six_names_and_often_empty`
+/// establishes over the 600-module census that the server part carries the
+/// exported constant array unchanged as a SEQUENCE and adds only documentation
+/// extensions. That is the fact the part-selection repair rests on: reading the
+/// server part instead of the private one recovers no declarations. It was
+/// measured on a quarter of the library.
+///
+/// It holds on all of it. Across 2,431 chains the server part reproduces BOTH
+/// exported arrays name-for-name and in order — `constNames` and
+/// `extraConstNames` alike, 2,431 of 2,431 each. Not one module in `Std`, `Lean`
+/// or `Lake` adds a declaration or an auxiliary name at the server level.
+///
+/// The other three figures generalise less tidily, and pinning them together is
+/// the point — a reader who has only the `Init` cell would scale them wrongly:
+///
+///   extension nesting, non-strict   2,431 of 2,431 — a law
+///   extension nesting, STRICT       2,197, so 234 chains fail it
+///   private part adds declarations  1,860, so 571 chains gain none
+///
+/// The server-added block count per module runs 0, 1, 2, 3, 4, 5 across
+/// 198 / 405 / 1,044 / 701 / 80 / 3 chains. The ceiling of five is the same
+/// ceiling `Init` shows: four times the population buys no module a sixth
+/// documentation block, which makes five a property of the format rather than
+/// of the sample.
+///
+/// Anti-vacuity: 198 chains add nothing at the server level and 3 add five, so
+/// the histogram is neither empty nor uniform; and the two sequence equalities
+/// are stated over arrays holding 158,583 and 70,948 names, not over empty ones.
+///
+/// Conservation first: the size classes must account for every chain before the
+/// ceiling or any class is named.
+#[test]
+fn the_server_part_adds_no_names_anywhere_in_the_library() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut chains = 0usize;
+    let mut declared_sequence = 0usize;
+    let mut extra_sequence = 0usize;
+    let mut nests = 0usize;
+    let mut strictly_nests = 0usize;
+    let mut private_grew = 0usize;
+    let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+    for path in &all.exported {
+        if !all.private.contains(path) {
+            continue;
+        }
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        chains += 1;
+
+        let exported = module_view(&lib, &module, Level::Exported);
+        let server = server_module_view(&lib, &module);
+        let private = module_view(&lib, &module, Level::Private);
+        let (_, exported_extra) = header_names(&lib, &module, Level::Exported);
+
+        if server.const_names == exported.const_names {
+            declared_sequence += 1;
+        }
+        if server.extra_const_names == exported.extra_const_names
+            && exported_extra.len() as u64 == server.extra_const_names
+        {
+            extra_sequence += 1;
+        }
+        if private.const_names.len() > exported.const_names.len() {
+            private_grew += 1;
+        }
+
+        let names = |view: &ModuleDataView| -> BTreeSet<String> {
+            view.extensions.iter().map(|b| b.name.clone()).collect()
+        };
+        let (e, s, p) = (names(&exported), names(&server), names(&private));
+        if e.is_subset(&s) && s.is_subset(&p) {
+            nests += 1;
+        }
+        if e.len() < s.len() && s.len() < p.len() {
+            strictly_nests += 1;
+        }
+        *sizes.entry(s.difference(&e).count()).or_default() += 1;
+    }
+
+    // Conservation first.
+    assert_eq!(
+        sizes.values().sum::<usize>(),
+        chains,
+        "every chain must land in exactly one server-contribution class"
+    );
+    assert_eq!(chains, 2_431, "the library chain census");
+
+    // The law the part-selection repair rests on, now library-wide.
+    assert_eq!(
+        (declared_sequence, extra_sequence, nests),
+        (2_431, 2_431, 2_431),
+        "the server part reproduces both exported arrays in order, and the extensions nest"
+    );
+
+    // What does NOT generalise, pinned so nobody scales the Init figures.
+    assert_eq!(
+        (strictly_nests, private_grew),
+        (2_197, 1_860),
+        "strictness fails for 234 chains and 571 private parts add no declaration"
+    );
+
+    assert_eq!(
+        sizes,
+        BTreeMap::from([(0, 198), (1, 405), (2, 1_044), (3, 701), (4, 80), (5, 3)]),
+        "the server-added block count per module, with the same ceiling of five Init shows"
+    );
+}
