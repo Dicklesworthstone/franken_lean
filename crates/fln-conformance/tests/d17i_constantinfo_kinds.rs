@@ -3273,3 +3273,119 @@ fn constructor_results_are_headed_by_their_own_inductive_at_the_right_arity() {
         "the constructor census must be reached, got {checked}"
     );
 }
+
+/// Is this inductive's declared type a `Prop`?
+///
+/// `admit.rs` reads `result_level` from the DECLARED inductive type's sort
+/// rather than inferring it, so this is the same value the elimination rules
+/// consume.
+fn inductive_result_is_prop(induct: &InductiveVal) -> bool {
+    let mut current = &induct.base.type_;
+    while let ExprNode::ForallE { body, .. } = current.node() {
+        current = body;
+    }
+    matches!(current.node(), ExprNode::Sort { level } if level.is_zero())
+}
+
+/// The inductive's own result sort, and the K rule stated as an IMPLICATION
+/// rather than a name list.
+///
+/// Two cells rest on this value without ever reading it. `admit.rs` takes
+/// `result_level` from the declared inductive type's sort — not from inference —
+/// so it is the input to the elimination rules the 228 rows were about. And
+/// `cd572cac` asserts `k = true` for exactly `Eq`, `HEq` and `True` with `PUnit`
+/// as a negative control, justified in prose by "PUnit is not a Prop". That
+/// justification was never measured; the cell asserted the conclusion and
+/// explained it in a comment.
+///
+/// Measured over `Init/Prelude` at private level: all 127 inductive types result
+/// in a `Sort` — 74 `Succ`, 41 `Max`, 10 `Zero`, 2 `Param`, none headed by
+/// anything else. The 10 Prop-valued ones include `Eq`, `HEq`, `True`, `And` and
+/// `Nat.le`; `PUnit` and `Nat` are not among them.
+///
+/// So the K rule becomes derivable here instead of asserted: every recursor
+/// carrying `k` has a block head that is Prop-valued, single-constructor, and
+/// field-free — and `PUnit` satisfies two of those three while failing
+/// Prop-ness, which is exactly why it has no K. The negative control is now a
+/// measurement rather than a comment.
+#[test]
+fn inductives_result_in_sorts_and_k_follows_from_prop_ness() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, &ConstructorVal> = BTreeMap::new();
+    let mut recursors: Vec<(String, &RecursorVal)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => drop(constructors.insert(name, v)),
+            ConstantInfo::Rec(v) => recursors.push((name, v)),
+            _ => {}
+        }
+    }
+
+    // Every inductive type must END in a sort, or `result_level` is reading
+    // something that is not a universe.
+    for (name, induct) in &inductives {
+        let mut current = &induct.base.type_;
+        while let ExprNode::ForallE { body, .. } = current.node() {
+            current = body;
+        }
+        assert!(
+            matches!(current.node(), ExprNode::Sort { .. }),
+            "{name}: an inductive's declared type must result in a Sort — that value is what \
+             the elimination rules read"
+        );
+    }
+    let props = inductives
+        .values()
+        .filter(|v| inductive_result_is_prop(v))
+        .count();
+    assert!(
+        props >= 8 && props < inductives.len(),
+        "both Prop and non-Prop inductives must exist, or the implication below is vacuous \
+         ({props} Prop of {})",
+        inductives.len()
+    );
+
+    // K implies Prop AND single constructor AND no fields.
+    for (name, rec) in &recursors {
+        if !rec.k {
+            continue;
+        }
+        let head = inductives
+            .get(&rec.all[0].to_display_string())
+            .expect("recursor's block head decodes");
+        assert!(
+            inductive_result_is_prop(head),
+            "{name} carries K, so its inductive must be a Prop"
+        );
+        assert_eq!(head.ctors.len(), 1, "{name} carries K, so one constructor");
+        let ctor = constructors
+            .get(&head.ctors[0].to_display_string())
+            .expect("constructor decodes");
+        assert_eq!(
+            ctor.num_fields, 0,
+            "{name} carries K, so its constructor must be field-free"
+        );
+    }
+
+    // The negative control, now derived rather than asserted: PUnit meets two of
+    // the three conditions and fails Prop-ness.
+    let punit = inductives.get("PUnit").expect("PUnit decodes");
+    assert_eq!(punit.ctors.len(), 1);
+    assert_eq!(
+        constructors
+            .get(&punit.ctors[0].to_display_string())
+            .expect("PUnit.unit decodes")
+            .num_fields,
+        0
+    );
+    assert!(
+        !inductive_result_is_prop(punit),
+        "PUnit is single-constructor and field-free, so Prop-ness is the ONLY thing standing \
+         between it and K; if it ever measures as a Prop, the K population must grow with it"
+    );
+}
