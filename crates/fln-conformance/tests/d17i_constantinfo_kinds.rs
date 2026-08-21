@@ -11284,3 +11284,113 @@ fn the_recursive_blocks_are_exactly_those_owning_a_self_referencing_recursor() {
         "exactly one block keeps its self-reference outside its primary recursor"
     );
 }
+
+/// A block owns `1 + num_nested` recursors — per block, not in total.
+///
+/// Three cells assert that `Init/Prelude` carries 129 recursors and other cells
+/// assert it carries 127 inductives, one of which nests twice. Nothing relates
+/// them. The global arithmetic — 127 + 2 = 129 — would add nothing, because all
+/// three numbers are already pinned and their sum is then a matter of addition
+/// rather than a fact about the artifact.
+///
+/// The PER-BLOCK form is a fact, and it is what this cell asserts: for every one
+/// of the 127 inductives, the number of recursors whose block head is that
+/// inductive equals `1 + num_nested`. A global count cannot see a compensating
+/// swap — one block owning three recursors while another owned none keeps the
+/// total at 129 and satisfies every existing pin. Per block, it does not.
+///
+/// Measured: 126 blocks own exactly one recursor and one owns three, with no
+/// departures. `Lean.Syntax` is that block, and its `num_nested` of 2 is
+/// precisely the two extra recursors `rec_1` and `rec_2`.
+///
+/// The nesting term is what makes the rule more than "one recursor per block",
+/// and exactly one block exercises it. That is asserted, so the day nesting
+/// disappears from this module the cell says the rule is no longer being tested
+/// rather than passing on the degenerate case.
+///
+/// Every recursor is also required to name a decoded inductive as its block
+/// head — without that the ownership count could quietly drop a recursor whose
+/// block did not resolve, and the partition would balance by losing a member.
+#[test]
+fn a_block_owns_one_recursor_plus_its_nesting() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut nesting: BTreeMap<String, u32> = BTreeMap::new();
+    let mut heads: Vec<(String, String)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(nesting.insert(name, v.num_nested)),
+            ConstantInfo::Rec(v) => {
+                let head = v
+                    .all
+                    .first()
+                    .unwrap_or_else(|| panic!("{name}: a recursor must name its block"))
+                    .to_display_string();
+                heads.push((name, head));
+            }
+            _ => {}
+        }
+    }
+
+    // Conservation first: every recursor is owned by exactly one decoded block.
+    let orphans: Vec<&String> = heads
+        .iter()
+        .filter(|(_, head)| !nesting.contains_key(head))
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "every recursor's block head must be a decoded inductive: {orphans:?}"
+    );
+    let mut owned: BTreeMap<&String, usize> = nesting.keys().map(|block| (block, 0)).collect();
+    for (_, head) in &heads {
+        *owned.get_mut(head).expect("checked above") += 1;
+    }
+    assert_eq!(
+        owned.values().sum::<usize>(),
+        heads.len(),
+        "the ownership table must account for every recursor"
+    );
+
+    let mut departures: Vec<(&String, u32, usize)> = Vec::new();
+    for (block, count) in &owned {
+        let expected = 1 + nesting[*block] as usize;
+        if *count != expected {
+            departures.push((block, nesting[*block], *count));
+        }
+    }
+    assert!(
+        departures.is_empty(),
+        "a block owns one recursor plus its nesting (block, num_nested, owned): {departures:?}"
+    );
+
+    let spread: BTreeMap<usize, usize> =
+        owned.values().fold(BTreeMap::new(), |mut table, count| {
+            *table.entry(*count).or_default() += 1;
+            table
+        });
+    assert_eq!(
+        spread.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+        vec![(1, 126), (3, 1)],
+        "126 blocks own one recursor and one owns three"
+    );
+
+    // The nesting term must be exercised, or the rule degenerates to "one each".
+    let nested: Vec<(&String, u32)> = nesting
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(block, count)| (block, *count))
+        .collect();
+    assert_eq!(
+        nested.len(),
+        1,
+        "exactly one block nests, and it is what makes the `+ num_nested` term meaningful"
+    );
+    assert_eq!(
+        owned[nested[0].0],
+        1 + nested[0].1 as usize,
+        "and that block's extra recursors are exactly its nesting"
+    );
+}
