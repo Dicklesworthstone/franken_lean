@@ -13749,3 +13749,124 @@ fn every_olean_in_the_library_agrees_with_its_companion_status() {
         "the flag must take both values, or a constant decode would satisfy the equality"
     );
 }
+
+/// The mirror law over 600 modules — and three neighbours of it that do not
+/// generalise.
+///
+/// `the_two_remaining_header_arrays_are_a_different_population` checks two
+/// modules and calls `constNames.len() == constants` "the mirror law". It is the
+/// invariant every cell in this file leans on without saying so: name `i` and
+/// constant `i` are the same declaration, so any cell that resolves a decoded
+/// constant against the name array is trusting it. Two modules is thin support
+/// for something that load-bearing, and it is a header read — no declaration
+/// needs decoding, so widening costs almost nothing.
+///
+/// It holds: 600 modules at both levels, 1,200 checks, zero mismatches.
+///
+/// ITS THREE NEIGHBOURS DO NOT, and each is asserted in that same two-module
+/// loop, so each would fail if the loop were widened:
+///
+///   `extra_const_names > 0` — "extraConstNames is populated at the pin" — is
+///     false for 448 of the 1,200 module-levels, which carry an empty array
+///   `extra_const_names != constants` is false for 188 module-levels. I expected
+///     those to be the trivial both-empty cases; 165 are, but 23 have the two
+///     arrays at equal NON-ZERO lengths, so the inequality fails where it was
+///     making a real claim about two populations and not only where it says
+///     nothing
+///   `private.constants > exported.constants` holds for 400 of 600, the same
+///     400 the name-census cell found, which the mirror law explains: the two
+///     arrays move together by definition. The `extra` half of that same
+///     assertion holds for 333
+///
+/// None of this makes the older cell wrong — its samples satisfy all four. It
+/// makes three of its four claims statements about `Init.Prelude` and
+/// `Init.Meta.Defs` rather than about the pin, and only the mirror law survives
+/// as a law.
+///
+/// Anti-vacuity: an all-zero decode satisfies `names == constants` everywhere,
+/// so the widest pair is pinned. The zero-extra population is itself the
+/// evidence that empty arrays occur and are not a decode failure.
+///
+/// Conservation first: every module-level must land in exactly one of the
+/// zero-extra and non-zero-extra classes, so a walk that dropped files cannot
+/// shrink both sides into agreement.
+#[test]
+fn the_mirror_law_holds_corpus_wide_and_its_neighbours_do_not() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut checks = 0usize;
+    let mut widest = 0u64;
+    let mut empty_extra = 0usize;
+    let mut extra_equals_constants = 0usize;
+    let mut equal_and_non_empty = 0usize;
+    let mut constants_grew = 0usize;
+    let mut extra_grew = 0usize;
+    for module in &modules {
+        let exported = module_view(&lib, module, Level::Exported);
+        let private = module_view(&lib, module, Level::Private);
+
+        for view in [&exported, &private] {
+            checks += 1;
+            // The mirror law itself.
+            assert_eq!(
+                view.const_names.len() as u64,
+                view.constants,
+                "{module}: constNames and constants must be the same length"
+            );
+            widest = widest.max(view.constants);
+            if view.extra_const_names == 0 {
+                empty_extra += 1;
+            }
+            if view.extra_const_names == view.constants {
+                extra_equals_constants += 1;
+                if view.constants > 0 {
+                    equal_and_non_empty += 1;
+                }
+            }
+        }
+
+        if private.constants > exported.constants {
+            constants_grew += 1;
+        }
+        if private.extra_const_names > exported.extra_const_names {
+            extra_grew += 1;
+        }
+    }
+
+    // Conservation first: the classes account for every module-level walked.
+    assert_eq!(
+        checks,
+        modules.len() * 2,
+        "each module must contribute an exported and a private reading"
+    );
+    assert_eq!(
+        (empty_extra, extra_equals_constants),
+        (448, 188),
+        "the two populations that refute the older cell's neighbouring assertions"
+    );
+
+    // The equality is NOT just an empty-array artefact, which is what I assumed
+    // before measuring: 23 module-levels have the two arrays at equal NON-ZERO
+    // lengths, so `extra != constants` fails on cases where it was making a real
+    // claim about two populations, not only on trivial ones.
+    assert_eq!(
+        equal_and_non_empty, 23,
+        "equal-length pairs that are not both empty"
+    );
+    assert_eq!(
+        extra_equals_constants - equal_and_non_empty,
+        165,
+        "leaving the both-empty remainder, and the two classes must exhaust the equalities"
+    );
+    assert_eq!(
+        (constants_grew, extra_grew),
+        (400, 333),
+        "and the growth claim, which holds for two thirds of the corpus and not for it"
+    );
+    assert_eq!(
+        widest, 2_314,
+        "the largest mirrored pair, so the law is not carried by empty arrays"
+    );
+}
