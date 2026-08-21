@@ -463,6 +463,29 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         2,
         "both check-olean JSON render paths keep dependency status beside decoded-private counts",
     );
+    assert_eq!(
+        [
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,","##
+                        && lines[1].trim() == r##""\"companionPartsLoaded\":{}}},","##
+                })
+                .count(),
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,","##
+                        && lines[1].trim()
+                            == r##""\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},","##
+                })
+                .count(),
+        ],
+        [1, 1],
+        "both check-olean JSON render paths keep extension status beside companion loading",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
