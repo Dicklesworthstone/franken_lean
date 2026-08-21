@@ -5433,6 +5433,15 @@ fn write_inventory_fixture_with(
     // retry with the same list matches and completes the tree; a retry with a
     // different list is refused. Both are what the reader wants; neither was
     // true before.
+    //
+    // AND IT IS A RECORD OF THE REQUEST, NOT OF THE TREE. Five fixtures in this
+    // file add files after the writer returns -- two symlinks, a non-UTF-8 name,
+    // and two over-cap sparse files -- and the record has never heard of any of
+    // them. That is deliberate: the record answers "was this name last built
+    // from this list", which is the question the union hazard turns on. Anyone
+    // tempted to strengthen it into a hash of the tree would break those five,
+    // and `the_shape_record_is_of_the_request_not_of_the_tree` is where the
+    // boundary is pinned.
     static MANIFEST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = MANIFEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staging = manifest.with_extension(format!("manifest-{}-{seq}", std::process::id()));
@@ -6664,7 +6673,10 @@ fn re_spelling_an_entry_is_not_a_change_of_shape() {
         .unwrap_or_else(|error| panic!("read the shape record: {error}"));
     assert_eq!(
         recorded, "Dir/One.olean",
-        "the shape record must describe the tree, not the spelling it was asked for"
+        "the shape record must hold the canonical form of the REQUEST, not the spelling it was \
+         asked for. It does not describe the tree -- see \
+         `the_shape_record_is_of_the_request_not_of_the_tree`, which this message used to \
+         overstate"
     );
 
     // AND A REAL DIFFERENCE IS STILL REFUSED. Without this, everything above is
@@ -6685,6 +6697,75 @@ fn re_spelling_an_entry_is_not_a_change_of_shape() {
     assert!(
         message.contains("Dir/Two.olean") && message.contains("Dir/One.olean"),
         "the refusal must still name both file sets: {message}"
+    );
+}
+
+/// The shape record is of the REQUEST, not of the tree.
+///
+/// **Five fixtures already disagree with their own record.** Two add a symlink
+/// after the writer returns, one adds a file whose name is not UTF-8, and two
+/// add an over-cap sparse file and a small one. Three of those five compile only
+/// on unix, so the count is five there and two everywhere -- said precisely
+/// because "five fixtures" is the kind of number that gets quoted. The writer
+/// never saw any of them, so the record does not mention them, and a walk of
+/// those trees does.
+/// The record and the tree are different objects, and the record's question is
+/// "was this name last built from this list", which is the one the union hazard
+/// turns on.
+///
+/// **The message next door used to say otherwise, and this test is why it does
+/// not.** It read "the shape record must describe the tree", which is false of
+/// five live fixtures. A guard's scope is exactly the kind of claim that gets
+/// widened in prose and then relied on.
+///
+/// **Pinned so the boundary is not "improved" away.** Strengthening the record
+/// into a hash of the tree is an obvious-looking upgrade and would redden every
+/// fixture that adds a file by hand -- for a hazard the record was never written
+/// to catch. If someone does it deliberately, this test is where they say so.
+///
+/// **The disagreement is exhibited, not described**: the walk finds two modules
+/// in a tree whose record names one.
+#[test]
+fn the_shape_record_is_of_the_request_not_of_the_tree() {
+    const NAME: &str = "t6r7-selftest-record-scope-v1";
+    let library = write_inventory_fixture(NAME, &["Declared.olean"]);
+
+    // A file the writer never heard of, exactly as five real fixtures do.
+    fs::write(library.join("Undeclared.olean"), b"")
+        .unwrap_or_else(|error| panic!("add an undeclared entry: {error}"));
+
+    // REBUILDING IS STILL ACCEPTED. The record cannot see the extra file, so the
+    // same list is the same shape -- and nothing removes the file either,
+    // because the writer only ever creates or truncates what it was asked for.
+    let again = write_inventory_fixture(NAME, &["Declared.olean"]);
+    assert_eq!(again, library, "the rebuild must return the same tree");
+    assert!(
+        library.join("Undeclared.olean").is_file(),
+        "the rebuild must leave a file it was never told about; the writer creates, it does not \
+         sweep"
+    );
+
+    let recorded =
+        fs::read_to_string(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{NAME}.manifest")))
+            .unwrap_or_else(|error| panic!("read the shape record: {error}"));
+    assert_eq!(
+        recorded, "Declared.olean",
+        "the record holds the request it was given"
+    );
+    assert!(
+        !recorded.contains("Undeclared"),
+        "the record must NOT have grown to describe the tree: {recorded}"
+    );
+
+    // THE DISAGREEMENT, EXHIBITED. Two modules in a tree whose record names one.
+    let walked = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the tree must walk: {reason}"));
+    assert_eq!(
+        walked.modules.len(),
+        2,
+        "the WALK sees both files while the record knows one; that gap is the point of this test, \
+         and it is what a tree-hashing record would remove along with five working fixtures: {:?}",
+        walked.modules
     );
 }
 
