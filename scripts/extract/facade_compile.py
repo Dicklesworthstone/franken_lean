@@ -150,6 +150,10 @@ the toolchain would report a perfect facade:
     declaration count and opaque/theorem body-unavailability census to be
     well-formed and bounded at the pinned Reference epoch.
 
+  * A GONE-SYMBOL JOIN requires the exact-demand artifact's measured `gone` set
+    to be empty. Symbols absent at the pinned Reference epoch cannot silently
+    remain in a compile-demand denominator.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -241,6 +245,7 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
     distinct_used_constants = None
     declared_decls = None
     unavailable_bodies = None
+    gone = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -264,6 +269,7 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
                 distinct_used_constants = row.get("distinct_used_constants")
                 declared_decls = row.get("decls")
                 unavailable_bodies = row.get("decl_bodies_unavailable")
+                gone = row.get("gone")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -355,6 +361,13 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
             f"Reference summary (decls={declared_decls!r}, "
             f"decl_bodies_unavailable={unavailable_bodies!r})"
         )
+    if not isinstance(gone, list) or gone:
+        detail = (", ".join(str(name) for name in gone[:8])
+                  if isinstance(gone, list) else repr(gone))
+        raise SystemExit(
+            "REFUSE: exact-demand gone-symbol join found names absent from the "
+            f"pinned Reference ({detail})"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -403,6 +416,7 @@ def load_demand(path, part, expected_pin, expected_corpus_commit):
         "distinct_used_constants": distinct_used_constants,
         "decls": declared_decls,
         "decl_bodies_unavailable": dict(sorted(unavailable_bodies.items())),
+        "gone": 0,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
