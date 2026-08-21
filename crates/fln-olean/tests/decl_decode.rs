@@ -11142,3 +11142,248 @@ fn the_one_tag_four_node_in_the_closure() {
          size and the field types do the work, not the tag and arity"
     );
 }
+
+/// One level below the `tag 4` node: its name link, and how widely it is
+/// shared.
+///
+/// THE NODE'S OWN FIELDS ARE ALREADY PINNED. It has arity 2, and `4584151d`
+/// walks both - slot 0 a name link the production `decode_name` accepts, slot 1
+/// boxed nil. Walking "that node's fields" again would re-pin two assertions
+/// that already exist, so this goes one level deeper, into the name link's own
+/// fields, which nothing has read.
+///
+/// AND THE NON-MEMBERSHIP CHECK IS STILL A TAUTOLOGY. The 111, the ten and the
+/// eight are all the three-field shape; this node is a two-field one and its
+/// name link is a different shape again. Nothing measured can make that check
+/// fail. It is asked here for the second consecutive wave and the answer is the
+/// one `84951450` established: a comparison the selection already guarantees is
+/// not evidence.
+///
+/// What the link actually holds:
+///
+///   prefix   boxed zero - the anonymous name, so this is a SINGLE component
+///   string   an eight-character payload
+///   exactly ONE name link in the corpus points at that string object
+///   the link itself is referenced FIVE times across the corpus
+///
+/// THE SINGLE-COMPONENT FACT COULD HAVE COME OUT OTHERWISE, which is what makes
+/// it worth asserting: a name link may carry a pointer prefix, and this file has
+/// measured plenty that do - `2a2d8234` found 50 of 111 two-component names in
+/// one field alone. The check has discriminating power, per `f2da5b0e`.
+///
+/// THE FIVE REFERENCES ARE THE INTERESTING NUMBER. The node itself is reached
+/// from four of the eight, and the link it names is used five times corpus-wide
+/// - so this name is not private to the structure this bead has been walking.
+/// That is the first object in the whole descent measured to be shared with
+/// something OUTSIDE it.
+///
+/// The eight-character text is the fragile part, flagged as at `aec3efd1` and
+/// `3373af3b`; every structural fact above is independent of it.
+#[test]
+fn the_tag_four_node_name() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut links = 0usize;
+    let mut anonymous_prefix = 0usize;
+    let mut string_payloads: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    let mut links_sharing_the_string = 0usize;
+    let mut link_references = 0usize;
+    let mut decoded: BTreeSet<String> = BTreeSet::new();
+    let mut components: BTreeSet<usize> = BTreeSet::new();
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        // Down to the eight, then the closure, then the one `tag 4` node.
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            let Some(node) = resolve(word_at(bytes, record + 8 + 8 * 4)) else {
+                continue;
+            };
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(ten) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                let Some(below) = resolve(word_at(bytes, ten + 8 + 8)) else {
+                    continue;
+                };
+                for k in 0..word_at(bytes, below + 8) {
+                    if let Some(element) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        eight.insert(element);
+                    }
+                }
+            }
+        }
+        let mut closure: BTreeSet<usize> = BTreeSet::new();
+        let mut stack: Vec<usize> = eight.iter().copied().collect();
+        while let Some(offset) = stack.pop() {
+            if !closure.insert(offset) {
+                continue;
+            }
+            let object = at.get(&offset).expect("a walked object");
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 8 + 8 * slot)) {
+                        stack.push(child);
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, offset + 8) {
+                    if let Some(child) = resolve(word_at(bytes, offset + 24 + 8 * i as usize)) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+
+        for &offset in &closure {
+            if shape(offset) != Some((4, 2)) {
+                continue;
+            }
+            let link = resolve(word_at(bytes, offset + 8)).expect("slot 0 is a pointer");
+            links += 1;
+
+            // Structural: the prefix, and the string it names.
+            let prefix = word_at(bytes, link + 8);
+            if prefix & 1 == 1 && prefix >> 1 == 0 {
+                anonymous_prefix += 1;
+            }
+            let string = resolve(word_at(bytes, link + 16)).expect("the component");
+            assert_eq!(
+                at.get(&string).map(|o| o.tag),
+                Some(abi::TAG_STRING),
+                "{module}: a string link's component is a string"
+            );
+            *string_payloads
+                .entry(usize::try_from(word_at(bytes, string + 8)).expect("in range"))
+                .or_default() += 1;
+
+            // How widely the string and the link are shared.
+            links_sharing_the_string += objects
+                .iter()
+                .filter(|other| (other.tag, other.other) == (1, 2))
+                .filter(|other| resolve(word_at(bytes, other.off + 16)) == Some(string))
+                .count();
+            for other in &objects {
+                if other.tag <= abi::TAG_MAX_CTOR_TAG {
+                    for slot in 0..usize::from(other.other) {
+                        if resolve(word_at(bytes, other.off + 8 + 8 * slot)) == Some(link) {
+                            link_references += 1;
+                        }
+                    }
+                } else if other.tag == abi::TAG_ARRAY {
+                    for i in 0..word_at(bytes, other.off + 8) {
+                        if resolve(word_at(bytes, other.off + 24 + 8 * i as usize)) == Some(link) {
+                            link_references += 1;
+                        }
+                    }
+                }
+            }
+
+            let name = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(word_at(bytes, offset + 8))
+                .unwrap_or_else(|e| panic!("{module}: the name must decode: {e}"))
+                .to_display_string();
+            components.insert(name.split('.').count());
+            decoded.insert(name);
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(links, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(links, 1, "one node, one name link");
+
+    // Structural, independent of any string decoding.
+    assert_eq!(
+        anonymous_prefix, 1,
+        "the prefix is the boxed anonymous name, so this is a SINGLE component. \
+         A name link may carry a pointer prefix and this file has measured 50 \
+         that do, so the check could have come out otherwise"
+    );
+    assert_eq!(
+        components.into_iter().collect::<Vec<_>>(),
+        vec![1],
+        "which the production decoder's rendering agrees with"
+    );
+    assert_eq!(
+        string_payloads.into_iter().collect::<Vec<_>>(),
+        vec![(9, 1)],
+        "the component's stored byte count, terminator included"
+    );
+    assert_eq!(
+        links_sharing_the_string, 1,
+        "exactly one name link in the corpus names that string object"
+    );
+    assert_eq!(
+        link_references, 5,
+        "and the link itself is referenced FIVE times corpus-wide, against a \
+         node reached from four of the eight. So this name is not private to \
+         the structure this bead has been walking - the first object in the \
+         whole descent measured to be shared with something OUTSIDE it"
+    );
+
+    // The fragile part, last and flagged.
+    assert_eq!(
+        decoded.into_iter().collect::<Vec<_>>(),
+        vec!["lcErased".to_owned()],
+        "the eight-character text, read through the production decoder. This is \
+         the fragile assertion; every structural fact above is independent of it"
+    );
+}
