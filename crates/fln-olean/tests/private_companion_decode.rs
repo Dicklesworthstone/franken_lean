@@ -156,6 +156,11 @@ const STRING_EXTRA_EXPORTED_UNSAFE_RECS: [&str; 2] = [
     "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
     "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
 ];
+/// The analogous exported-mangled helpers for `removeNumLeadingSpaces`.
+const STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS: [&str; 2] = [
+    "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.consumeSpaces._unsafe_rec",
+    "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.saveLine._unsafe_rec",
+];
 /// The two tail-recursive merge-sort implementation helpers in the pinned
 /// `Init.Data.List.Sort.Impl` companion delta.
 /// `mergeSortTR₂` helpers that are `_private.`-mangled AND declared by the
@@ -667,6 +672,54 @@ fn string_extra_exported_mangled_unsafe_rec_helpers_remain_concrete() {
         .expect("private constants decode");
 
     for name in STRING_EXTRA_EXPORTED_UNSAFE_RECS {
+        assert!(
+            exported_names.contains(&name.to_owned()),
+            "the exported String.Extra part must retain its private-mangled helper {name}"
+        );
+        assert!(
+            private_names.contains(&name.to_owned()),
+            "the private chain must retain the exported helper {name}"
+        );
+        let exported = exported_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("exported decoder lost {name}"));
+        assert!(
+            is_concrete_recovery(exported),
+            "exported decoder decoded {name} only as {} instead of a concrete declaration",
+            exported.kind_name()
+        );
+        let chained = private_constants
+            .iter()
+            .find(|info| info.name().to_display_string() == name)
+            .unwrap_or_else(|| panic!("private chain lost exported helper {name}"));
+        assert!(
+            is_concrete_recovery(chained),
+            "private chain decoded {name} only as {} instead of a concrete declaration",
+            chained.kind_name()
+        );
+    }
+}
+
+#[test]
+fn string_remove_leading_spaces_exported_mangled_helpers_remain_concrete() {
+    let lib =
+        lib_or_skip!("string_remove_leading_spaces_exported_mangled_helpers_remain_concrete");
+    let chain = chain_bytes(&lib, "Init/Data/String/Extra");
+    let (exported_names, private_names) = exported_and_private_names(&chain);
+
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let private_constants = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode");
+
+    for name in STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS {
         assert!(
             exported_names.contains(&name.to_owned()),
             "the exported String.Extra part must retain its private-mangled helper {name}"
