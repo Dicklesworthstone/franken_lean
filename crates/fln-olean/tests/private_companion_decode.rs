@@ -365,6 +365,11 @@ mod family {
     pub fn unary(name: &str) -> bool {
         last_component_suffix(name, "_unary").is_some_and(str::is_empty)
     }
+
+    /// `._sunfold` — compiler-generated structural-unfolding helper.
+    pub fn sunfold(name: &str) -> bool {
+        last_component_suffix(name, "_sunfold").is_some_and(str::is_empty)
+    }
 }
 
 /// Enumerate every module under `Init` that has a complete companion chain.
@@ -470,7 +475,7 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 10] = [
+    let families: [(&str, fn(&str) -> bool); 11] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -481,9 +486,10 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
         (".go", family::go),
         ("_unsafe_rec", family::unsafe_rec),
         ("_unary", family::unary),
+        ("_sunfold", family::sunfold),
     ];
-    let mut representatives: [Option<(String, String)>; 10] =
-        [None, None, None, None, None, None, None, None, None, None];
+    let mut representatives: [Option<(String, String)>; 11] =
+        [None, None, None, None, None, None, None, None, None, None, None];
 
     for relative in init_chain_modules(&lib) {
         let chain = chain_bytes(&lib, &relative);
@@ -542,7 +548,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 10] = [
+    let families: [(&str, fn(&str) -> bool); 11] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
@@ -553,6 +559,7 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
         (".go", family::go),
         ("_unsafe_rec", family::unsafe_rec),
         ("_unary", family::unary),
+        ("_sunfold", family::sunfold),
     ];
 
     for (family, belongs_to_family) in families {
@@ -721,6 +728,116 @@ fn verified_chain_decode_accepts_a_strict_superset() {
     let constants = decode_chain_constants(&exported_view, &private_view, WalkBudget::default())
         .expect("a strict superset must be accepted");
     assert_eq!(constants.len(), 3, "the private array is what is returned");
+}
+
+#[test]
+fn extra_const_names_contents_decode_and_agree_with_the_reported_count() {
+    let lib = lib_or_skip!("extra_const_names_contents_decode_and_agree_with_the_reported_count");
+
+    // (module, exported extraConstNames, chain extraConstNames) — measured at
+    // the pin. `module_data` has always reported these counts; until now the
+    // names behind them were unreachable, so the count is asserted alongside
+    // the decoded contents to prove the two agree rather than drift.
+    let expected = [
+        ("Init/Data/List/ToArrayImpl", 1_usize, 2_usize),
+        ("Init/Control/MonadAttach", 2, 7),
+        ("Init/Prelude", 424, 713),
+    ];
+
+    for (relative, exported_count, chain_count) in expected {
+        let chain = chain_bytes(&lib, relative);
+
+        let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+        let exported_names = exported_view
+            .extra_const_names(WalkBudget::default())
+            .expect("exported extraConstNames decode");
+        assert_eq!(
+            exported_names.len(),
+            exported_count,
+            "{relative}: exported extraConstNames count moved at the pin"
+        );
+        assert_eq!(
+            u64::try_from(exported_names.len()).expect("count fits"),
+            exported_view
+                .module_data(WalkBudget::default())
+                .expect("exported ModuleData decodes")
+                .extra_const_names,
+            "{relative}: decoded contents disagree with the reported count"
+        );
+
+        let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+            .expect("server part parses against the exported region");
+        let private_view =
+            OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+                .expect("private part parses against the exported and server regions");
+        let chain_names = private_view
+            .extra_const_names(WalkBudget::default())
+            .expect("chain extraConstNames decode");
+        assert_eq!(
+            chain_names.len(),
+            chain_count,
+            "{relative}: chain extraConstNames count moved at the pin"
+        );
+
+        // Every name must actually render; an empty or anonymous entry would
+        // mean the array was walked but the names were not really decoded.
+        for name in &chain_names {
+            let rendered = name.to_display_string();
+            assert!(
+                !rendered.is_empty() && rendered != "[anonymous]",
+                "{relative}: extraConstNames entry decoded to {rendered:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decoded_extra_const_names_are_code_generator_names_not_declarations() {
+    let lib = lib_or_skip!("decoded_extra_const_names_are_code_generator_names_not_declarations");
+    let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
+
+    let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+        .expect("server part parses against the exported region");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against the exported and server regions");
+
+    let extra: Vec<String> = private_view
+        .extra_const_names(WalkBudget::default())
+        .expect("chain extraConstNames decode")
+        .iter()
+        .map(|name| name.to_display_string())
+        .collect();
+    assert_eq!(
+        extra,
+        vec![
+            "List.toArrayImpl._redArg".to_owned(),
+            "List.toArrayAux._redArg".to_owned(),
+        ],
+        "the exact extraConstNames of this module at the pin"
+    );
+
+    // The load-bearing negative, and the reason this decode does not touch
+    // franken_lean-timy's UnknownConstant rows: none of these names has a
+    // ConstantInfo. Decoding them yields names the kernel can never admit.
+    let constants: Vec<String> = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("chain constants decode")
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    for name in &extra {
+        assert!(
+            !constants.contains(name),
+            "{name} is in extraConstNames AND in constants; the pin's contract is \
+             that these populations are disjoint"
+        );
+    }
+    assert!(
+        constants.contains(&TIMY_WITNESS.to_owned()),
+        "the admissible auxiliary still comes from `constants`, not from \
+         extraConstNames — that distinction is the whole of franken_lean-timy"
+    );
 }
 
 #[test]
