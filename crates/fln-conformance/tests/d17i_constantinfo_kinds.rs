@@ -14096,3 +14096,115 @@ fn a_shared_extension_block_is_frozen_by_the_server_and_grown_by_the_private_par
         "the server-added blocks, counted here as a difference and there as a distribution"
     );
 }
+
+/// The thirteen extension blocks the private part ever adds entries to, with the
+/// number of modules where each grows.
+const BLOCKS_THE_PRIVATE_PART_GROWS: &[(&str, usize)] = &[
+    ("Lean.Compiler.LCNF.monoExt", 303),
+    ("Lean.Compiler.LCNF.impureSigExt", 303),
+    ("Lean.Compiler.inlineAttrs", 189),
+    ("Lean.Compiler.LCNF.baseExt", 141),
+    ("Lean.Meta.Match.Extension.extension", 110),
+    ("Lean.backwardDefeqAttr", 44),
+    ("Lean.defeqAttr", 33),
+    (
+        "_private.Lean.Meta.Constructions.SparseCasesOn.0.Lean.Meta.sparseCasesOnInfoExt",
+        15,
+    ),
+    ("Lean.Elab.Structural.eqnInfoExt", 13),
+    ("Lean.Meta.simpExtension", 8),
+    ("Lean.Meta.instanceExtension", 6),
+    ("Lean.Meta.Grind.grindExt", 5),
+    ("Lean.Elab.WF.eqnInfoExt", 3),
+];
+
+/// WHICH shared blocks the private part grows — thirteen of a hundred and two.
+///
+/// The cell above counts 1,173 growth events between the server and private
+/// levels and stops there. A count says the private part adds content somewhere;
+/// it does not say the additions are concentrated, and "1,173 growths spread
+/// evenly over 102 blocks" and "1,173 growths in 13 blocks" are very different
+/// descriptions of what the private part IS.
+///
+/// It is the second. Exactly 13 block names ever grow, 89 never do, and every
+/// one of the 13 is compiler-back-end or elaborator metadata: the three LCNF
+/// blocks, the inline attributes, the match-equation extension, the two defeq
+/// attribute blocks, sparse `casesOn` info, both equation-compiler `eqnInfoExt`
+/// blocks, simp, instances and grind.
+///
+/// That is the extension-array telling of this bead's story. d17i is about
+/// equation-compiler auxiliaries living only in the private part, and here the
+/// same split appears in a completely different array: `Lean.Elab.Structural`
+/// and `Lean.Elab.WF` `eqnInfoExt` grow at private level and nowhere else.
+///
+/// `exportedAxiomsExt` is NOT among the thirteen, and the cell asserts its
+/// absence rather than leaving it to be inferred. The axioms cell requires its
+/// private-level count to stay at the EXPORTED figure across all 517 carrying
+/// modules; a single growth event here would falsify it. Binding the two means
+/// the contradiction shows up in whichever cell runs first instead of only in
+/// the one that happens to name the block.
+///
+/// TWO BLOCKS MOVE TOGETHER: `monoExt` and `impureSigExt` grow in 303 modules
+/// each. Pinned as two rows rather than one sum, so a change that shifted a
+/// module from one to the other could not pass.
+///
+/// Conservation first: the per-block growth counts must sum to the 1,173 the
+/// previous cell pins, and the growing and never-growing names must exhaust the
+/// shared vocabulary.
+#[test]
+fn the_private_part_grows_thirteen_blocks_and_the_axioms_block_is_not_one() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let sizes = |view: &ModuleDataView| -> BTreeMap<String, u64> {
+        view.extensions
+            .iter()
+            .map(|block| (block.name.clone(), block.entries))
+            .collect()
+    };
+
+    let mut growth: BTreeMap<String, usize> = BTreeMap::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    for module in &modules {
+        let server = sizes(&server_module_view(&lib, module));
+        let private = sizes(&module_view(&lib, module, Level::Private));
+        for (name, was) in &server {
+            shared.insert(name.clone());
+            let now = private
+                .get(name)
+                .unwrap_or_else(|| panic!("{module}: {name} vanished at private level"));
+            if now > was {
+                *growth.entry(name.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    // Conservation first: against the event total, and against the vocabulary.
+    assert_eq!(
+        growth.values().sum::<usize>(),
+        1_173,
+        "the per-block counts must sum to the growth events the previous cell pins"
+    );
+    assert_eq!(
+        (shared.len(), growth.len(), shared.len() - growth.len()),
+        (102, 13, 89),
+        "the growing and never-growing blocks must exhaust the shared vocabulary"
+    );
+
+    let expected: BTreeMap<String, usize> = BLOCKS_THE_PRIVATE_PART_GROWS
+        .iter()
+        .map(|(name, count)| ((*name).to_string(), *count))
+        .collect();
+    assert_eq!(
+        growth, expected,
+        "the thirteen blocks the private part adds entries to, and how often"
+    );
+
+    // Bound to the axioms cell, which requires exactly this.
+    assert!(
+        !growth.contains_key(EXPORTED_AXIOMS_EXT) && shared.contains(EXPORTED_AXIOMS_EXT),
+        "the axioms block is shared and must never grow, or its count would stop tracking the \
+         exported declaration census"
+    );
+}
