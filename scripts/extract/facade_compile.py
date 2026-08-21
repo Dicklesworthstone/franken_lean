@@ -1912,6 +1912,18 @@ def main():
             "REFUSE: facade manifest safety probe pin diverges "
             f"({json.dumps(safety_probed_pin_join, sort_keys=True)})"
         )
+    reducible_candidates_pin_join = {
+        "summary_reducible_candidates": manifest_summary.get(
+            "reducible_candidates"
+        ),
+        "pinned_reducible_candidates": 814,
+    }
+    if (reducible_candidates_pin_join["summary_reducible_candidates"]
+            != reducible_candidates_pin_join["pinned_reducible_candidates"]):
+        raise SystemExit(
+            "REFUSE: facade manifest reducible-candidate pin diverges "
+            f"({json.dumps(reducible_candidates_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3016,6 +3028,7 @@ def main():
         "manifest_reducibility_probed_pin_join": reducibility_probed_pin_join,
         "manifest_result_head_probed_pin_join": result_head_probed_pin_join,
         "manifest_safety_probed_pin_join": safety_probed_pin_join,
+        "manifest_reducible_candidates_pin_join": reducible_candidates_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
