@@ -805,6 +805,19 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateProofNResiduals",
+        6,
+        &[
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateCliPrivateReportProofResiduals",
         2,
         &[
@@ -1223,6 +1236,20 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         &[
             "_private.CliPrivateReport.0._proof_2", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
             "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2", "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private _proof_N residuals",
+        "decoded _private _proof_N residual names",
+        6,
+        &[
+            "_private.CliPrivateReport.0._proof_2",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
             "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
         ],
     );
