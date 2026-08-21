@@ -13853,9 +13853,23 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
 /// The scanned documents must satisfy both rules per site. The derived scope
 /// applies the same conjunction, so a document outside the list cannot pass by
 /// naming one and omitting the other.
+/// Whether a line states the thread-matrix claim, however it spaces it.
+///
+/// Matching the exact literal misses `{1,8,32}`. That is not hypothetical: the
+/// plan's PG-5 gate row spells it without spaces, says "per commit", and names
+/// no scope -- so the row that DEFINES the gate is the one site no rule could
+/// see. Whitespace is stripped before the comparison so a spelling cannot hide a
+/// claim.
+fn states_thread_matrix_claim(line: &str) -> bool {
+    line.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .contains("{1,8,32}")
+}
+
 fn unscoped_claim_sites(text: &str, qualifiers: &[&str], cadence: &[&str]) -> usize {
     text.lines()
-        .filter(|line| line.contains("{1, 8, 32}"))
+        .filter(|line| states_thread_matrix_claim(line))
         .filter(|line| {
             !qualifiers.iter().any(|word| line.contains(word))
                 || !cadence.iter().any(|word| line.contains(word))
@@ -17045,8 +17059,22 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         0,
         "a site naming both must not count, or the rule refuses honest lines"
     );
+    // A SPELLING MUST NOT HIDE A CLAIM.
+    assert!(
+        states_thread_matrix_claim("across {1,8,32} threads per commit"),
+        "the unspaced spelling must be recognised, or the plan's PG-5 gate row stays invisible"
+    );
+    assert!(
+        !states_thread_matrix_claim("across 1, 8 and 32 threads"),
+        "prose about the same numbers is not a statement of the claim"
+    );
+    // THREE, NOT TWO, AND THE THIRD WAS ALWAYS THERE. Raising a ledger is the
+    // direction that hides rot, so the reason is recorded: the count rose
+    // because the matcher stopped missing `{1,8,32}`, not because a new site
+    // appeared. It is the PG-5 gate row, which says "per commit" and names no
+    // scope -- the strongest place the unqualified claim could sit.
     const UNSCANNED_ALLOWANCE: [(&str, usize); 1] =
-        [("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md", 2)];
+        [("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md", 3)];
     for entry in fs::read_dir(&repo).expect("the repository root must be readable") {
         let entry = entry.expect("a repository root entry must be readable");
         let name = entry.file_name().to_string_lossy().into_owned();
