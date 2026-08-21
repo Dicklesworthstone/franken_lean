@@ -45,7 +45,46 @@ from collections import Counter, defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCHEMA = "fln-facade-llevel/1"
-OWNER = "W6 · the generated facade registry in fln-elab (plan §22 Appendix C)"
+OWNER = "W6-fln-elab"
+
+# Prose that is identical across hundreds of rows belongs in ONE place. A ledger
+# that repeats its own boilerplate per row is four times its own size and no
+# easier to read; the codes below are expanded once, in the summary's legend.
+LEGEND = {
+    "owner": {
+        "W6-fln-elab": "W6 · the generated facade registry in fln-elab, which plan "
+                       "§22 Appendix C derives from the toolchain-api subset",
+        "init-lane": "the Init/library-code lane (G1→G3), not the facade registry",
+    },
+    "evidence": {
+        "curated-demand-check": "name and Reference type stand up against the "
+            "standalone facade, checked as part of a real curated mathlib file's "
+            "measured demand, with no Reference Lean.* in scope",
+        "facade-standalone-elaboration": "declared and elaborated in the standalone "
+            "facade; no curated file in this slice uses it, so no demand check "
+            "exercised it",
+        "facade-declaration-refused": "the standalone facade cannot declare the row "
+            "at all; the pin's own diagnostic is in the mechanism column",
+        "curated-demand-check-failed": "declared in the facade, but unresolved when "
+            "a real curated file's demand was checked against the facade alone",
+        "init-substrate": "defined under Init: the implicitly imported prelude "
+            "serves the shape; the facade neither declares nor owns it",
+    },
+    "promotion_prerequisite": {
+        "class-expression": "the facade must express what an axiom cannot — a class "
+            "declared as a class, a transparent definition where defeq is demanded "
+            "— before this row can reach L1",
+        "diagnostic-repair": "repair the pin diagnostic this row carries, or record "
+            "a precise typed Unsupported for it",
+        "corpus-rig": "the §18.2 metaprogram-corpus rig must EXECUTE this row "
+            "against the oracle before L2",
+        "curated-use-then-rig": "a curated file that actually uses it, then the "
+            "§18.2 rig; a row no real file demands cannot be promoted on this "
+            "evidence",
+        "init-source-elab": "Init source-elaborated by the native toolchain (G3), "
+            "then the metaprogram-corpus rig for behavior",
+    },
+}
 
 # The equivalence class each bucket TARGETS, with the reason it is a target and
 # not a measurement. §4.3: bit = identical results always; obs = identical
@@ -141,40 +180,22 @@ def main():
             unclassified.append(name)
             continue
         if name in init_rows:
-            level, evidence, mechanism = "L1", "init-substrate", (
-                "defined under Init: the implicitly imported prelude serves the "
-                "shape; the facade neither declares nor owns it")
-            prereq = ("Init source-elaborated by the native toolchain (G3), then "
-                      "the metaprogram-corpus rig for behavior")
-            owner = "the Init/library-code lane (G1→G3), not the facade registry"
+            level, evidence, mechanism = "L1", "init-substrate", None
+            prereq, owner = "init-source-elab", "init-lane"
         elif not decl.get("emitted"):
             level, evidence = "L0", "facade-declaration-refused"
             mechanism = decl.get("quarantine_reason") or "not emitted"
-            prereq = ("the facade must express what an axiom cannot — a class "
-                      "declared as a class, a transparent definition where defeq "
-                      "is demanded — before this row can reach L1")
-            owner = OWNER
+            prereq, owner = "class-expression", OWNER
         elif verdicts and verdicts != {"available"}:
             level, evidence = "L0", "curated-demand-check-failed"
-            mechanism = ("declared in the facade but unresolved when a real curated "
-                         "file's demand was checked against the facade alone")
-            prereq = "resolve the declaration failure the compile artifact records"
-            owner = OWNER
+            mechanism = None
+            prereq, owner = "diagnostic-repair", OWNER
         elif verdicts == {"available"}:
-            level, evidence = "L1", "curated-demand-check"
-            mechanism = ("name and Reference type stand up against the standalone "
-                         "facade with no Reference Lean.* in scope")
-            prereq = ("the §18.2 metaprogram-corpus rig must EXECUTE this row "
-                      "against the oracle before L2")
-            owner = OWNER
+            level, evidence, mechanism = "L1", "curated-demand-check", None
+            prereq, owner = "corpus-rig", OWNER
         else:
-            level, evidence = "L1", "facade-standalone-elaboration"
-            mechanism = ("declared and elaborated in the standalone facade; no "
-                         "curated file in this slice uses it, so no demand check "
-                         "exercised it")
-            prereq = ("a curated file that uses it, then the §18.2 rig; a row no "
-                      "real file demands cannot be promoted on this evidence")
-            owner = OWNER
+            level, evidence, mechanism = "L1", "facade-standalone-elaboration", None
+            prereq, owner = "curated-use-then-rig", OWNER
 
         counts[level] += 1
         out.append({
@@ -182,12 +203,8 @@ def main():
             "l_level": level,
             "l_level_claim_state": "OBSERVED",
             "l_level_evidence": evidence,
-            "l_level_ceiling_reason": (
-                "no row from this spike may exceed L1: nothing was executed. L2 "
-                "requires the gated metaprogram-corpus rig (§18.2)"),
             "equivalence_class": equiv,
             "equivalence_claim_state": "TARGETED",
-            "equivalence_reason": equiv_why,
             "mechanism": mechanism,
             "behavior_note_candidate": bucket in BEHAVIOR_NOTE,
             "load_bearing": res.get("provenance") in ("exact", "both") or bool(used_in),
@@ -212,7 +229,7 @@ def main():
     # The ratchet order (acceptance d) at ROW granularity: L0 rows first, because
     # each names a mechanism the facade cannot express, and every one of them is a
     # symbol a real curated mathlib file actually uses.
-    blockers = Counter(r["mechanism"].split(" -- ")[-1][:90]
+    blockers = Counter((r["mechanism"] or r["l_level_evidence"]).split(" -- ")[-1][:90]
                        for r in out if r["l_level"] == "L0")
     summary = {
         "schema": SCHEMA, "kind": "summary", "claim_class": "bounded_model",
@@ -221,6 +238,10 @@ def main():
         "demanded_toolchain_api": len(demand), "rows": len(out),
         "unclassified": 0,
         "by_level": dict(counts),
+        "legend": LEGEND,
+        "equivalence_legend": {b: why for b, (_, why) in BUCKET_EQUIV.items()},
+        "ceiling_note": "no row from this spike may exceed L1: nothing was executed; "
+                        "L2 requires the gated metaprogram-corpus rig (§18.2)",
         "l0_blocking_mechanisms": blockers.most_common(),
         "ceiling": "L1",
         "ceiling_reason": "this spike declared and resolved types; it executed nothing",
@@ -230,12 +251,12 @@ def main():
                        "axioms for the demanded class surface, then re-run the "
                        "compile rig",
              "members": sum(1 for r in out if r["l_level"] == "L0"
-                            and "not a class" in r["mechanism"])},
+                            and "not a class" in (r["mechanism"] or ""))},
             {"step": 2, "target": "remaining L0 rows",
              "action": "each names its own pin diagnostic in the module artifact; "
                        "repair or record a typed Unsupported",
              "members": sum(1 for r in out if r["l_level"] == "L0"
-                            and "not a class" not in r["mechanism"])},
+                            and "not a class" not in (r["mechanism"] or ""))},
             {"step": 3, "target": "L1 rows in R-NONE",
              "action": "native implementation + differential fixtures; L2 on a "
                        "gated corpus pass",
