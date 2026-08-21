@@ -2566,6 +2566,22 @@ fn kr600_803_color_fixture_pins_iota_rule_constructors_and_fields() {
 }
 
 #[test]
+fn kr600_803_color_fixture_pins_iota_rhs_closure() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for rule in metadata.rules() {
+        let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
+            TermOutcome::Complete(facts) => facts,
+            other => panic!("fixture iota inspection must complete: {other:?}"),
+        };
+        assert_eq!(facts.external_bound_span, 0);
+    }
+}
+
+#[test]
 fn kr600_803_dependent_nonrecursive_fields_are_reconstructed_independently() {
     let entries = dependent_field_inductive_entries();
     let verdict = admit_inductive(
