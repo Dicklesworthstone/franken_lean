@@ -1077,6 +1077,18 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         cli_source_lines
             .windows(2)
             .filter(|lines| {
+                lines[0].trim() == r##""\"finalGround\":{}}},","##
+                    && lines[1].trim()
+                        == r##""\"finalExecution\":{{\"steps\":{},\"systemPolls\":{},","##
+            })
+            .count(),
+        1,
+        "the source-run renderer keeps final ground beside final execution",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
                 lines[0].trim()
                     == r##""\"decodedPrivateAuxiliaries\":{},","##
                     && lines[1].trim()
