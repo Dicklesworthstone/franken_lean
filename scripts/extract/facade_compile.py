@@ -3766,6 +3766,9 @@ def main():
     class_projections_type_roundtrip_inequality_join = {"summary_class_provided_projections": manifest_summary.get("class_provided_projections"), "summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked")}
     if (not isinstance(class_projections_type_roundtrip_inequality_join["summary_class_provided_projections"], int) or isinstance(class_projections_type_roundtrip_inequality_join["summary_class_provided_projections"], bool) or not isinstance(class_projections_type_roundtrip_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(class_projections_type_roundtrip_inequality_join["summary_type_roundtrip_checked"], bool) or class_projections_type_roundtrip_inequality_join["summary_class_provided_projections"] <= class_projections_type_roundtrip_inequality_join["summary_type_roundtrip_checked"]):
         raise SystemExit("REFUSE: facade manifest class-provided projection count must exceed type-roundtrip count " + json.dumps(class_projections_type_roundtrip_inequality_join, sort_keys=True))
+    type_roundtrip_private_names_inequality_join = {"summary_type_roundtrip_checked": manifest_summary.get("type_roundtrip_checked"), "summary_private_name_rows": manifest_summary.get("private_name_rows")}
+    if (not isinstance(type_roundtrip_private_names_inequality_join["summary_type_roundtrip_checked"], int) or isinstance(type_roundtrip_private_names_inequality_join["summary_type_roundtrip_checked"], bool) or not isinstance(type_roundtrip_private_names_inequality_join["summary_private_name_rows"], int) or isinstance(type_roundtrip_private_names_inequality_join["summary_private_name_rows"], bool) or type_roundtrip_private_names_inequality_join["summary_type_roundtrip_checked"] <= type_roundtrip_private_names_inequality_join["summary_private_name_rows"]):
+        raise SystemExit("REFUSE: facade manifest type-roundtrip count must exceed private-name row count " + json.dumps(type_roundtrip_private_names_inequality_join, sort_keys=True))
     private_names_structural_refused_inequality_join = {"summary_private_name_rows": manifest_summary.get("private_name_rows"), "summary_structural_refused": manifest_summary.get("structural_refused")}
     if (not isinstance(private_names_structural_refused_inequality_join["summary_private_name_rows"], int) or isinstance(private_names_structural_refused_inequality_join["summary_private_name_rows"], bool) or not isinstance(private_names_structural_refused_inequality_join["summary_structural_refused"], int) or isinstance(private_names_structural_refused_inequality_join["summary_structural_refused"], bool) or private_names_structural_refused_inequality_join["summary_private_name_rows"] <= private_names_structural_refused_inequality_join["summary_structural_refused"]):
         raise SystemExit("REFUSE: facade manifest private-name row count must exceed structural-refusal count " + json.dumps(private_names_structural_refused_inequality_join, sort_keys=True))
@@ -6072,6 +6075,9 @@ def main():
         ),
         "manifest_class_projections_type_roundtrip_inequality_join": (
             class_projections_type_roundtrip_inequality_join
+        ),
+        "manifest_type_roundtrip_private_names_inequality_join": (
+            type_roundtrip_private_names_inequality_join
         ),
         "manifest_private_names_structural_refused_inequality_join": (
             private_names_structural_refused_inequality_join
