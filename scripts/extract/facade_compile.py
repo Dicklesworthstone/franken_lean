@@ -282,6 +282,10 @@ the toolchain would report a perfect facade:
     withheld structural row reasoned and no emitted class or structure marked
     refused. Structural failure cannot leak into a successful block claim.
 
+  * A MANIFEST-NONEMISSION-PROVENANCE JOIN requires every withheld declaration
+    to carry a nonempty quarantine reason and every emitted declaration to
+    carry none. Emission status cannot become a row-level unexplained gap.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1700,6 +1704,46 @@ def main():
             f"unexplained={unexplained_withheld_structures[:8]!r}, "
             f"refused_emitted={refused_emitted_structurals[:8]!r})"
         )
+    invalid_emission_state_rows = []
+    unexplained_withheld_rows = []
+    reasoned_emitted_rows = []
+    for row in manifest_rows:
+        emitted = row.get("emitted")
+        reason = row.get("quarantine_reason")
+        reasoned = isinstance(reason, str) and bool(reason.strip())
+        if emitted is not True and emitted is not False:
+            invalid_emission_state_rows.append(row["name"])
+        elif emitted is False and not reasoned:
+            unexplained_withheld_rows.append(row["name"])
+        elif emitted is True and reasoned:
+            reasoned_emitted_rows.append(row["name"])
+    manifest_nonemission_provenance_join = {
+        "declaration_rows": len(manifest_rows),
+        "withheld_rows": sum(row.get("emitted") is False for row in manifest_rows),
+        "reasoned_withheld_rows": sum(
+            row.get("emitted") is False
+            and isinstance(row.get("quarantine_reason"), str)
+            and bool(row["quarantine_reason"].strip())
+            for row in manifest_rows
+        ),
+        "invalid_emission_state_rows": len(invalid_emission_state_rows),
+        "unexplained_withheld_rows": len(unexplained_withheld_rows),
+        "reasoned_emitted_rows": len(reasoned_emitted_rows),
+    }
+    if (manifest_nonemission_provenance_join["declaration_rows"] == 0
+            or manifest_nonemission_provenance_join["withheld_rows"] == 0
+            or manifest_nonemission_provenance_join["reasoned_withheld_rows"]
+            != manifest_nonemission_provenance_join["withheld_rows"]
+            or manifest_nonemission_provenance_join["invalid_emission_state_rows"] != 0
+            or manifest_nonemission_provenance_join["unexplained_withheld_rows"] != 0
+            or manifest_nonemission_provenance_join["reasoned_emitted_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest nonemission-provenance join failed "
+            f"({json.dumps(manifest_nonemission_provenance_join, sort_keys=True)}, "
+            f"invalid={invalid_emission_state_rows[:8]!r}, "
+            f"unexplained={unexplained_withheld_rows[:8]!r}, "
+            f"reasoned_emitted={reasoned_emitted_rows[:8]!r})"
+        )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
         if (row.get("role") == "init-substrate" and row.get("form") is not None)
@@ -2135,6 +2179,7 @@ def main():
         "manifest_level_parameter_totality_join": manifest_level_parameter_join,
         "manifest_transparency_fallback_join": manifest_transparency_fallback_join,
         "manifest_structural_fallback_join": manifest_structural_fallback_join,
+        "manifest_nonemission_provenance_join": manifest_nonemission_provenance_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
