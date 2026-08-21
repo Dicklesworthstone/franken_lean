@@ -11947,3 +11947,70 @@ fn the_rule_field_counts_sum_to_the_census_plus_the_doubly_ruled() {
         "the correction is these fields, not one per extra rule — they only sum alike"
     );
 }
+
+/// `num_minors` summed exceeds the rule total by exactly the nested family's
+/// duplication.
+///
+/// `num_minors` is pinned per recursor and the rule total is pinned at 160.
+/// Neither side is summed against the other, and the sums do not match: 174
+/// against 160. The gap is not an error. `num_minors` is a property of the
+/// BLOCK, so each of the three `Lean.Syntax` recursors carries the family total
+/// of seven, while the rules partition among them four, one and two.
+///
+/// So the difference of 14 is exactly the family's over-count — 21 declared
+/// against 7 owned — and the other 126 recursors contribute nothing to it. That
+/// last part is what makes the equation a check rather than a subtraction: a
+/// single ordinary recursor whose `num_minors` disagreed with its rule count
+/// would change the difference, and the existing per-recursor pins would catch
+/// it only for that recursor, not as a corpus fact.
+///
+/// Conservation runs first: the gap must equal the family's contribution before
+/// any figure is pinned.
+#[test]
+fn the_minor_counts_exceed_the_rules_by_the_nested_familys_duplication() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut minors = 0usize;
+    let mut rules = 0usize;
+    let mut family_minors = 0usize;
+    let mut family_rules = 0usize;
+    let mut recursors = 0usize;
+    for info in &infos {
+        let ConstantInfo::Rec(rec) = info else {
+            continue;
+        };
+        recursors += 1;
+        minors += rec.num_minors as usize;
+        rules += rec.rules.len();
+        if NESTED_RECURSOR_FAMILY.contains(&info.name().to_display_string().as_str()) {
+            family_minors += rec.num_minors as usize;
+            family_rules += rec.rules.len();
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        minors - rules,
+        family_minors - family_rules,
+        "the whole gap between declared minors and owned rules must come from the nested \
+         family"
+    );
+    assert_eq!(
+        (recursors, minors, rules),
+        (129, 174, 160),
+        "the recursor, minor and rule censuses this row is stated against"
+    );
+    assert_eq!(
+        (family_minors, family_rules),
+        (21, 7),
+        "the family declares seven minors three times over and owns seven rules between them"
+    );
+    // The ordinary recursors contribute nothing, which is what makes this a
+    // check rather than a subtraction.
+    assert_eq!(
+        minors - rules,
+        14,
+        "and the ordinary recursors add nothing to the gap"
+    );
+}
