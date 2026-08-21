@@ -1908,6 +1908,26 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         human.stdout,
         json.stdout,
     );
+    let human_extensions_interpreted = match human_line_suffix(
+        &human.stdout,
+        "extension blocks observed: ",
+    )
+    .split_once(" (")
+    .map(|(_, status)| status.strip_suffix(')'))
+    .flatten()
+    .expect("human extension-block summary has an interpretation status")
+    {
+        "interpreted" => true,
+        "not interpreted" => false,
+        status => panic!("human extension interpretation status is known: {status}"),
+    };
+    assert_eq!(
+        human_extensions_interpreted,
+        json_bool_field(&json.stdout, "extensionsInterpreted"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
+    );
     let human_declarations_checked = human_line_suffix(&human.stdout, "declarations checked: ")
         .parse::<usize>()
         .expect("human declarations-checked count is a usize");
