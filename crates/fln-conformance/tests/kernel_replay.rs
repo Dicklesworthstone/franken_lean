@@ -4478,7 +4478,7 @@ fn whole_mathlib_corpus_resurrection_preflight() {
                 .expect("enumerate the pinned built Mathlib corpus");
             paths.sort();
             assert!(
-                paths.len() >= 8_000,
+                paths.len() as u64 >= WHOLE_MATHLIB_SEED_FLOOR,
                 "whole-Mathlib preflight found only {} oleans under {}; a truncated corpus is not a smaller green sweep",
                 paths.len(),
                 library.display()
@@ -4560,7 +4560,7 @@ fn whole_mathlib_corpus_resurrection_sweep() {
     } = closed_whole_mathlib_corpus(&reference_lib)
         .expect("decode the closed whole-Mathlib import graph");
     assert!(
-        mathlib_modules.len() >= 8_000,
+        mathlib_modules.len() as u64 >= WHOLE_MATHLIB_SEED_FLOOR,
         "whole-Mathlib resurrection found only {} modules; a truncated corpus is not a smaller green sweep",
         mathlib_modules.len(),
     );
@@ -4610,6 +4610,11 @@ fn whole_mathlib_corpus_resurrection_sweep() {
 /// could not have come from a run of this lane.
 const WHOLE_MATHLIB_MODULE_FLOOR: u64 = 10_000;
 const WHOLE_MATHLIB_DECODED_FLOOR: u64 = 700_000;
+/// The floor on `Mathlib.*` SEED modules, as distinct from the closure they pull
+/// in. The pinned corpus provisions ~8.2k of them; the closure adds `Init`,
+/// `Std`, `Lean` and the package tree on top, which is why the two floors differ
+/// by thousands and why a row must carry both numbers.
+const WHOLE_MATHLIB_SEED_FLOOR: u64 = 8_000;
 
 const WHOLE_MATHLIB_RECEIPT_SCHEMA: &str = "fln.whole-mathlib-differential-receipt/1";
 
@@ -4650,7 +4655,16 @@ struct WholeMathlibReceipt {
     corpus_commit: String,
     observed_unix_s: u64,
     corpus_fixture_hash: String,
-    modules: u64,
+    /// Modules in the replayed import CLOSURE. For the whole-Mathlib lane this
+    /// is strictly larger than `seed_modules`: it includes every `Init`, `Std`,
+    /// `Lean` and package module Mathlib imports. It was called `modules` for
+    /// exactly one commit, which invited the reading "the Mathlib corpus is this
+    /// big" -- a number about the closure wearing the name of the corpus.
+    closure_modules: u64,
+    /// Modules the lane SEEDED, i.e. the `Mathlib.*` population the phrase
+    /// "whole Mathlib" actually refers to. Carried so that claim is
+    /// substantiated by the row rather than implied by the lane's name.
+    seed_modules: u64,
     decoded: u64,
     compared: u64,
     agree: u64,
@@ -4672,12 +4686,27 @@ struct WholeMathlibReceipt {
 
 /// The class token a run earns, derived from what it actually observed rather
 /// than chosen by whoever files the row.
-fn whole_mathlib_class(counts: &CorpusCounts) -> &'static str {
-    if counts.unsoundly_permissive != 0 {
+///
+/// **One statement, two callers, on purpose.** The producer calls this to fill
+/// the row in and [`WholeMathlibReceipt::validate`] calls it to decide whether
+/// the row it is reading told the truth. Writing the rule twice -- once as an
+/// `if` chain here and once as a `match` there -- would look like independent
+/// corroboration and be nothing of the kind: the two copies can drift, and the
+/// drift is silent in the direction that matters. A producer whose rule had
+/// grown a case the validator lacked would file rows its own guard rejects; a
+/// validator whose rule lagged the producer's would wave through exactly the
+/// refutation-wearing-the-clean-class this token exists to prevent. This
+/// function takes the two counts rather than a `CorpusCounts` so the reader,
+/// which has only the parsed row, can call the same code the writer did.
+fn whole_mathlib_class(
+    unsoundly_permissive: u64,
+    restrictive_without_carve_out: u64,
+) -> &'static str {
+    if unsoundly_permissive != 0 {
         // Accepting what the Reference rejects is release-blocking. It must not
         // sit quietly in an evidence file wearing the clean class.
         "refuted_this_run_accepted_what_the_reference_rejected"
-    } else if counts.restrictive_without_carve_out != 0 {
+    } else if restrictive_without_carve_out != 0 {
         "refuted_this_run_found_a_restrictive_divergence"
     } else {
         "observed_once_not_an_invariant"
@@ -4699,8 +4728,8 @@ impl WholeMathlibReceipt {
         };
         format!(
             "{{\"schema\":{},\"bead\":{},\"pin\":{},\"corpus_commit\":{},\
-             \"observed_unix_s\":{},\"corpus_fixture_hash\":{},\"modules\":{},\
-             \"decoded\":{},\"compared\":{},\"agree\":{},\"unsoundly_permissive\":{},\
+             \"observed_unix_s\":{},\"corpus_fixture_hash\":{},\"closure_modules\":{},\
+             \"seed_modules\":{},\"decoded\":{},\"compared\":{},\"agree\":{},\"unsoundly_permissive\":{},\
              \"restrictive_with_carve_out\":{},\"restrictive_without_carve_out\":{},\
              \"unscorable\":{},\"oracle_skipped\":{},\"subject_no_answer\":{},\
              \"restrictive_families\":[{}],\"no_answer_families\":[{}],\"wall_ms\":{},\
@@ -4712,7 +4741,8 @@ impl WholeMathlibReceipt {
             json_string(&self.corpus_commit),
             self.observed_unix_s,
             json_string(&self.corpus_fixture_hash),
-            self.modules,
+            self.closure_modules,
+            self.seed_modules,
             self.decoded,
             self.compared,
             self.agree,
@@ -4793,7 +4823,8 @@ impl WholeMathlibReceipt {
             corpus_commit: text(row, "corpus_commit")?,
             observed_unix_s: number(row, "observed_unix_s")?,
             corpus_fixture_hash: text(row, "corpus_fixture_hash")?,
-            modules: number(row, "modules")?,
+            closure_modules: number(row, "closure_modules")?,
+            seed_modules: number(row, "seed_modules")?,
             decoded: number(row, "decoded")?,
             compared: number(row, "compared")?,
             agree: number(row, "agree")?,
@@ -4884,12 +4915,27 @@ impl WholeMathlibReceipt {
         // ANTI-VACUITY, before any content check. `all()` over an empty
         // population is vacuously true, and so is "no divergences" over no
         // comparisons.
-        if self.modules < WHOLE_MATHLIB_MODULE_FLOOR {
+        if self.closure_modules < WHOLE_MATHLIB_MODULE_FLOOR {
             return Err(format!(
-                "row records {} module(s), below the {WHOLE_MATHLIB_MODULE_FLOOR} the driver \
-                 asserts before it compares anything. Zero divergences over a corpus this \
-                 small is not the observation the row appears to carry",
-                self.modules
+                "row records {} closure module(s), below the {WHOLE_MATHLIB_MODULE_FLOOR} the \
+                 driver asserts before it compares anything. Zero divergences over a corpus \
+                 this small is not the observation the row appears to carry",
+                self.closure_modules
+            ));
+        }
+        if self.seed_modules < WHOLE_MATHLIB_SEED_FLOOR {
+            return Err(format!(
+                "row records {} seeded Mathlib module(s), below the {WHOLE_MATHLIB_SEED_FLOOR} \
+                 floor. A large CLOSURE around a truncated seed set is still not whole Mathlib, \
+                 and this is the cell that separates the two",
+                self.seed_modules
+            ));
+        }
+        if self.seed_modules > self.closure_modules {
+            return Err(format!(
+                "row records {} seed module(s) inside a {} module closure; a seed set cannot \
+                 exceed the closure that contains it and the row contradicts itself",
+                self.seed_modules, self.closure_modules
             ));
         }
         if self.decoded < WHOLE_MATHLIB_DECODED_FLOOR {
@@ -4980,14 +5026,10 @@ impl WholeMathlibReceipt {
         // CONTENT. The class must match what the counts actually say: a
         // refutation wearing the clean token is the one failure this format
         // exists to make impossible.
-        let expected = match (
+        let expected = whole_mathlib_class(
             self.unsoundly_permissive,
             self.restrictive_without_carve_out,
-        ) {
-            (0, 0) => "observed_once_not_an_invariant",
-            (0, _) => "refuted_this_run_found_a_restrictive_divergence",
-            _ => "refuted_this_run_accepted_what_the_reference_rejected",
-        };
+        );
         if self.class != expected {
             return Err(format!(
                 "row claims class {} but its own counts earn {expected} \
@@ -5028,7 +5070,8 @@ fn sample_whole_mathlib_receipt() -> WholeMathlibReceipt {
         corpus_commit: suite_lock_corpus_commit(),
         observed_unix_s: 1_786_000_000,
         corpus_fixture_hash: "0123456789abcdef".to_string(),
-        modules: WHOLE_MATHLIB_MODULE_FLOOR,
+        closure_modules: WHOLE_MATHLIB_MODULE_FLOOR,
+        seed_modules: WHOLE_MATHLIB_SEED_FLOOR,
         decoded: WHOLE_MATHLIB_DECODED_FLOOR,
         compared: 600_000,
         agree: 600_000,
@@ -5070,8 +5113,12 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         ("truncated", row[..row.len() / 2].to_string()),
         ("field dropped", row.replace(",\"wall_ms\":11000000", "")),
         (
+            "seed count dropped",
+            row.replace(",\"seed_modules\":8000", ""),
+        ),
+        (
             "whitespace introduced",
-            row.replace("\"modules\":", "\"modules\": "),
+            row.replace("\"decoded\":", "\"decoded\": "),
         ),
         (
             "count reworded but not re-serialized",
@@ -5116,12 +5163,28 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             "zero declarations compared",
         ),
         (
-            "empty corpus",
+            "empty closure",
             WholeMathlibReceipt {
-                modules: 0,
+                closure_modules: 0,
                 ..sample_whole_mathlib_receipt()
             },
             "below the",
+        ),
+        (
+            "a big closure around a truncated Mathlib",
+            WholeMathlibReceipt {
+                seed_modules: 12,
+                ..sample_whole_mathlib_receipt()
+            },
+            "still not whole Mathlib",
+        ),
+        (
+            "more seeds than closure",
+            WholeMathlibReceipt {
+                seed_modules: WHOLE_MATHLIB_MODULE_FLOOR + 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "cannot exceed the closure",
         ),
         (
             "decoded below the floor",
@@ -5251,7 +5314,7 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 restrictive_families: vec!["rejected:BlockMismatch=10".to_string()],
                 ..sample_whole_mathlib_receipt()
             },
-            "earns refuted_this_run_found_a_restrictive_divergence",
+            "counts earn refuted_this_run_found_a_restrictive_divergence",
         ),
         (
             "an unsound acceptance wearing the clean class",
@@ -5260,7 +5323,7 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
                 unsoundly_permissive: 1,
                 ..sample_whole_mathlib_receipt()
             },
-            "earns refuted_this_run_accepted_what_the_reference_rejected",
+            "counts earn refuted_this_run_accepted_what_the_reference_rejected",
         ),
     ];
 
@@ -5279,6 +5342,100 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
              `{expected}`, got `{reason}`"
         );
     }
+}
+
+/// Every whole-Mathlib receipt retained for the CURRENT pin must satisfy the
+/// guard its own producer writes to.
+///
+/// **Why this does not fail when the file is absent, and why that is not a
+/// loophole.** The corpus the lane needs is host state. It is not provisioned
+/// here today, so no run can have produced a row, so demanding a committed file
+/// would be a standing red for a missing input rather than for a defect -- a red
+/// that fires for a cause nobody can fix from the repository is one everybody
+/// learns to ignore, which is worse than no guard at all.
+///
+/// **What stops it from being decorative.** A guard over an empty population is
+/// vacuously green and would stay green if `validate` were gutted tomorrow. So
+/// the population is not the only thing checked: a PLANTED synthetic receipt and
+/// a forged counterpart run on EVERY invocation, so the guard's machinery is
+/// exercised whether or not a real row exists. If `validate` stopped refusing
+/// what it must, this test would go red today, with no corpus and no receipt.
+///
+/// **What a green run here earns.** Nothing about the corpus, the kernel, or any
+/// Mathlib declaration. Only this: no retained row for this pin contradicts
+/// itself or the pin it is filed under. When the absent case fires it prints a
+/// typed row saying so, because "the guard passed" and "there was nothing to
+/// check" must not be the same observation in a log.
+#[test]
+fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
+    let pin = suite_lock_reference_pin();
+    let corpus = suite_lock_corpus_commit();
+
+    // THE PLANTED MEMBER, unconditionally. A green control that must pass and a
+    // forgery that must not, so an empty population cannot make this vacuous.
+    if let Err(reason) = sample_whole_mathlib_receipt().validate(&pin, &corpus) {
+        panic!("the planted control receipt must satisfy the guard, but: {reason}");
+    }
+    let forged = WholeMathlibReceipt {
+        pin: format!("{pin}-not-this-epoch"),
+        ..sample_whole_mathlib_receipt()
+    };
+    assert!(
+        forged.validate(&pin, &corpus).is_err(),
+        "the guard accepted a receipt filed under another Reference epoch; with no retained \
+         rows to check, this planted pair is the ONLY thing keeping this test honest"
+    );
+
+    // THE REAL POPULATION, which may legitimately be empty at this commit.
+    let path = whole_mathlib_receipt_path(&pin);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            println!(
+                "{{\"schema\":\"fln-t6r7-mathlib-receipt-retention/1\",\"status\":\"none_retained\",\
+                 \"pin\":{},\"corpus_commit\":{},\"path\":{},\"reason\":{},\
+                 \"claims\":\"the guard machinery was exercised against a planted control only; \
+                 NO whole-Mathlib run is evidenced by this test passing\"}}",
+                json_string(&pin),
+                json_string(&corpus),
+                json_string(&path.display().to_string()),
+                json_string(&error.to_string()),
+            );
+            return;
+        }
+    };
+
+    // Present but empty is a DIFFERENT thing from absent, and it is a failure: a
+    // file somebody created and then emptied is not a lighter claim than one
+    // that was never written, it is a retracted observation left in place.
+    let rows = text.lines().filter(|row| !row.trim().is_empty()).count();
+    assert!(
+        rows != 0,
+        "{} exists but holds no rows. An empty receipt file is not a lighter claim than an \
+         absent one; it is an observation that was removed without being retracted",
+        path.display()
+    );
+    for (index, row) in text
+        .lines()
+        .filter(|row| !row.trim().is_empty())
+        .enumerate()
+    {
+        let receipt = WholeMathlibReceipt::from_row(row)
+            .unwrap_or_else(|reason| panic!("{} row {index}: {reason}", path.display()));
+        if let Err(reason) = receipt.validate(&pin, &corpus) {
+            panic!(
+                "{} row {index} is retained but not valid: {reason}",
+                path.display()
+            );
+        }
+    }
+    println!(
+        "{{\"schema\":\"fln-t6r7-mathlib-receipt-retention/1\",\"status\":\"validated\",\
+         \"pin\":{},\"corpus_commit\":{},\"rows\":{}}}",
+        json_string(&pin),
+        json_string(&corpus),
+        rows,
+    );
 }
 
 /// The receipt path is keyed by the Reference pin, so advancing `SUITE.lock`
@@ -5323,11 +5480,12 @@ fn whole_mathlib_kernel_differential() {
     } = closed_whole_mathlib_corpus(&reference_lib)
         .expect("inventory the exact closed whole-Mathlib graph");
     assert!(
-        mathlib_modules.len() >= 8_000,
-        "whole-Mathlib differential seed floor: {} < 8000",
+        mathlib_modules.len() as u64 >= WHOLE_MATHLIB_SEED_FLOOR,
+        "whole-Mathlib differential seed floor: {} < {WHOLE_MATHLIB_SEED_FLOOR}",
         mathlib_modules.len()
     );
     let corpus_commit = suite_lock_corpus_commit();
+    let seed_modules = mathlib_modules.len() as u64;
     let mathlib_oracle_applicable = mathlib_modules
         .iter()
         .map(|name| {
@@ -5360,6 +5518,7 @@ fn whole_mathlib_kernel_differential() {
             receipt: Some(CorpusReceiptSpec {
                 bead: "franken_lean-t6r7",
                 corpus_commit,
+                seed_modules,
                 receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
             }),
         },
@@ -5419,6 +5578,10 @@ struct CorpusDifferentialScope {
 struct CorpusReceiptSpec {
     bead: &'static str,
     corpus_commit: String,
+    /// How many modules the lane SEEDED, as opposed to how many its import
+    /// closure reached. The driver is corpus-generic and only ever sees the
+    /// closure, so this number can only come from the lane that chose the seeds.
+    seed_modules: u64,
     /// Environment variable naming the file the row is appended to. The row is
     /// ALWAYS printed; it is written into the tree only when an operator names a
     /// path, because a test that edits a tracked file on its own is a
@@ -5774,7 +5937,8 @@ fn run_accepted_corpus_kernel_differential(
                 .map(|since| since.as_secs())
                 .unwrap_or(0),
             corpus_fixture_hash: inventory.fixture_hash.clone(),
-            modules: inventory.modules.len() as u64,
+            closure_modules: inventory.modules.len() as u64,
+            seed_modules: spec.seed_modules,
             decoded: total.decoded,
             compared: total.compared,
             agree: total.agree,
@@ -5804,7 +5968,11 @@ fn run_accepted_corpus_kernel_differential(
                 include_str!("kernel_replay.rs").as_bytes(),
             )
             .to_hex(),
-            class: whole_mathlib_class(&total).to_string(),
+            class: whole_mathlib_class(
+                total.unsoundly_permissive,
+                total.restrictive_without_carve_out,
+            )
+            .to_string(),
         };
         let row = receipt.to_row();
         eprintln!("kernel_reference_corpus RECEIPT: {row}");
