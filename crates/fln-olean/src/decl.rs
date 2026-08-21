@@ -1210,6 +1210,20 @@ impl ChainConstants {
     }
 }
 
+/// Do two regions of a chain carry the same module identity stamp?
+///
+/// Lean writes the same version, flags, `lean_version` and `githash` into every
+/// part of one module's chain. Comparing them is the only cheap way to tell a
+/// real companion from an artifact of a different module: companion regions
+/// parse and resolve their pointers regardless of provenance, so nothing
+/// downstream will notice the substitution on its own.
+fn same_chain_identity(a: &OleanView<'_>, b: &OleanView<'_>) -> bool {
+    a.header.version == b.header.version
+        && a.header.flags == b.header.flags
+        && a.header.lean_version == b.header.lean_version
+        && a.header.githash == b.header.githash
+}
+
 /// Ceilings for composing one module-system chain.
 ///
 /// Mirrors what `fln::OleanDecodeLimits` gives the product door: a byte ceiling
@@ -1311,22 +1325,16 @@ pub fn decode_chain_constants_from_parts(
 
     let server_view = OleanView::parse_with_dependencies(server, &[exported])?;
     let private_view = OleanView::parse_with_dependencies(private, &[exported, server])?;
-    for (part, view) in [
-        (OleanChainPart::Server, &server_view),
-        (OleanChainPart::Private, &private_view),
-    ] {
-        // Three parts of ONE module share an identity stamp. Without this a
-        // caller can hand in a private companion from a DIFFERENT module: the
-        // regions parse, the pointers resolve, and the result is a coherent-
-        // looking chain describing no module that exists. It would surface as
-        // PrivatePartIncomplete, which names the wrong fault.
-        if view.header.version != exported_view.header.version
-            || view.header.flags != exported_view.header.flags
-            || view.header.lean_version != exported_view.header.lean_version
-            || view.header.githash != exported_view.header.githash
-        {
-            return Err(DeclError::ChainPartMismatch { part });
-        }
+    // The server part's identity is checked here because no door downstream
+    // ever sees it; the private part's is checked by
+    // `decode_chain_constants_with_origin`, so that callers building their own
+    // views get the law too. One place per part, no duplicated comparison.
+    if !same_chain_identity(&exported_view, &server_view) {
+        return Err(DeclError::ChainPartMismatch {
+            part: OleanChainPart::Server,
+        });
+    }
+    for view in [&server_view, &private_view] {
         view.walk(budget)?;
         // `walk` proves every pointer, string and bignum in the region is
         // sound, but it is generic over the object graph and knows nothing of
@@ -1369,6 +1377,18 @@ pub fn decode_chain_constants_with_origin(
     private: &OleanView<'_>,
     budget: WalkBudget,
 ) -> DResult<ChainConstants> {
+    // The identity law lives HERE and not only in the parts door, because this
+    // is the entry point callers that build their own views reach for — and a
+    // private companion from another module parses perfectly. Without this the
+    // mismatch surfaces from `verify_private_superset` below as
+    // `PrivatePartIncomplete`, which blames a missing declaration for what is
+    // really two unrelated artifacts.
+    if !same_chain_identity(exported, private) {
+        return Err(DeclError::ChainPartMismatch {
+            part: OleanChainPart::Private,
+        });
+    }
+
     let exported_constants = DeclDecoder::new(exported, budget).decode_module_constants()?;
     let private_constants = DeclDecoder::new(private, budget).decode_module_constants()?;
     verify_private_superset(&exported_constants, &private_constants)?;
@@ -1544,6 +1564,69 @@ mod tests {
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ),
     ];
+
+    /// The VIEW door must refuse a mismatched pair on its own.
+    ///
+    /// `decode_chain_constants_from_parts` is not the only entry point: the
+    /// conformance fixtures and several tests build their own `OleanView`s and
+    /// call the view door directly, so a law enforced only in the parts door
+    /// would not protect them.
+    #[test]
+    fn the_view_door_refuses_a_private_part_from_another_module() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_view_door_refuses_a_private_part_from_another_module: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |relative: &str, suffix: &str| {
+            std::fs::read(lib.join(format!("{relative}.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read {relative}{suffix}: {error}"))
+        };
+
+        let exported = read("Init/Data/List/ToArrayImpl", "");
+        let server = read("Init/Data/List/ToArrayImpl", ".server");
+        let private = read("Init/Data/List/ToArrayImpl", ".private");
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+            .expect("private parses against its own chain");
+
+        // Positive control: the module's own pair still decodes through the
+        // view door, so the refusal below is the identity law and not the door
+        // being broken for everything.
+        let ok = decode_chain_constants_with_origin(
+            &exported_view,
+            &private_view,
+            WalkBudget::default(),
+        )
+        .expect("a module's own pair decodes");
+        assert_eq!(
+            ok.constants.len(),
+            6,
+            "Init.Data.List.ToArrayImpl at the pin"
+        );
+
+        // A foreign private companion, parsed against ITS OWN chain so the
+        // view itself is well formed. Only the identity stamp distinguishes it.
+        let other_exported = read("Init/Control/MonadAttach", "");
+        let other_server = read("Init/Control/MonadAttach", ".server");
+        let other_private = read("Init/Control/MonadAttach", ".private");
+        let foreign_view =
+            OleanView::parse_with_dependencies(&other_private, &[&other_exported, &other_server])
+                .expect("the other module's private part parses against its own chain");
+
+        let error = decode_chain_constants_with_origin(
+            &exported_view,
+            &foreign_view,
+            WalkBudget::default(),
+        )
+        .expect_err("a private part from another module must be refused");
+        assert!(
+            !matches!(error, DeclError::PrivatePartIncomplete { .. }),
+            "a mismatched pair must not be blamed on a missing declaration: {error:?}"
+        );
+    }
 
     /// The byte ceiling is charged before anything is parsed.
     #[test]
