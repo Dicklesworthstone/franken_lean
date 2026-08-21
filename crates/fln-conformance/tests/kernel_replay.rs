@@ -4510,6 +4510,7 @@ impl CorpusMatrixReceipt {
                 .ok_or_else(|| format!("unterminated string field `{key}`"))?;
             let value = &rest[..end];
             assert_no_escape(key, value)?;
+            assert_string_terminator(key, rest, end)?;
             Ok(value.to_string())
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
@@ -11402,6 +11403,7 @@ impl WholeMathlibReceipt {
                 .ok_or_else(|| format!("unterminated string field `{key}`"))?;
             let value = &rest[..end];
             assert_no_escape(key, value)?;
+            assert_string_terminator(key, rest, end)?;
             Ok(value.to_string())
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
@@ -12711,6 +12713,37 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // A CHARACTER AFTER A STRING'S CLOSING QUOTE. `text` stops at the first
+    // quote after the field opens. With escapes refused, the way left to stop
+    // early is a bare quote inside a value -- measured before this commit,
+    // `"bead":"a"b"` was read as `a` and accepted. Appending a character after
+    // the sample's own bead is the same shape as the exponent two cells down:
+    // the value THIS reader returns is unchanged, so every rule that looks at
+    // the bead passes exactly as before, and only the character it stopped at
+    // differs.
+    let trailing = row.replace(
+        &format!("\"bead\":\"{}\"", sample.bead),
+        &format!("\"bead\":\"{}\"x", sample.bead),
+    );
+    assert_ne!(
+        trailing, row,
+        "the surgery must have changed the row, or the sample's bead is not written where it was \
+         looked for"
+    );
+    let trailing_reason = match WholeMathlibReceipt::from_row(&trailing) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a row whose bead is followed by a stray character was read as {:?}, which is what it \
+             reads from the well-formed row -- nothing about the value distinguishes them",
+            read.bead
+        ),
+    };
+    assert!(
+        trailing_reason.contains("bead") && trailing_reason.contains("punctuation"),
+        "the refusal must name the field and say the string did not end where the row's \
+         punctuation does: {trailing_reason}"
+    );
+
     // AN EXPONENT APPENDED TO A NUMBER. `number` reads digits and stops at the
     // first character that is not one. Appending `e9` therefore leaves THIS
     // reader's answer identical -- the same value, so every count, floor and sum
@@ -13716,6 +13749,31 @@ fn assert_number_terminator(key: &str, rest: &str, end: usize) -> Result<(), Str
             "numeric field `{key}` is followed by `{other}` where the row's punctuation belongs. \
              This reader stops at the first non-digit and keeps what it has, so the value it read \
              is not the value the row states"
+        )),
+    }
+}
+
+/// A string must end where the row's punctuation begins.
+///
+/// The last of the three extractors to get this check. `text` stops at the first
+/// quote after the field opens; with escapes now refused, the remaining way to
+/// stop early is a bare quote in the middle of a value. Measured: `"bead":"a"b"`
+/// is read as `a` and accepted, and the character after the quote this reader
+/// stopped at is `b` rather than the row's comma. The bead is the routing field,
+/// so the row would name the wrong work item while validating.
+///
+/// **Whitespace is refused too, deliberately.** ` ,` after a value is legal JSON
+/// and this rule rejects it, as the sibling rules already reject it after a
+/// number or an array. The producer never writes it, and accepting it would mean
+/// this reader has to skip whitespace everywhere else -- which it does not, so
+/// accepting it here would be a promise the rest of the reader cannot keep.
+fn assert_string_terminator(key: &str, rest: &str, end: usize) -> Result<(), String> {
+    match rest[end..].chars().nth(1) {
+        Some(',') | Some('}') | None => Ok(()),
+        Some(other) => Err(format!(
+            "string field `{key}` is followed by `{other}` where the row's punctuation belongs, so \
+             the quote this reader stopped at came from inside the value and the text it read is \
+             shorter than the row states"
         )),
     }
 }
