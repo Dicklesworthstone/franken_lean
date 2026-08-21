@@ -1582,6 +1582,39 @@ VERIFY2_SUFFIX = ".verify2.lean"
 SCRATCH_SUFFIXES = (CANDIDATE_SUFFIX, VERIFY_SUFFIX, VERIFY2_SUFFIX)
 
 
+def pin_acceptance_error(text, accepted):
+    """The text about to be published is one the pin actually accepted.
+
+    80587043 pins that the file on disk is the text this run reasoned about. That
+    leaves the other half open: that the text itself was ever run past the pin.
+    Today it always was -- the attempt loop's for-else raises "the facade did not
+    converge" rather than falling through, so the best-of update is reachable only
+    via the break that follows a clean pin run -- but that is a property of the
+    CONTROL FLOW, invisible at runtime, and it is one `break` or one deleted
+    `else:` away from silently ceasing to hold. The success branch already grew a
+    `continue` once, when the generated-constructor check landed.
+
+    Recorded as digests of the texts the pin accepted, so the question is asked of
+    the BYTES rather than of the flow that produced them: a boolean would say that
+    some break happened, not that this text is what the pin accepted.
+
+    Returns an error string, or None.
+    """
+    if not accepted:
+        return ("no attempt was ever recorded as accepted by the pin, yet a facade "
+                "is about to be published. Either the loop reached the best-of "
+                "selection without going through the replace, or the recording "
+                "stopped happening and every acceptance claim here is empty")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest not in accepted:
+        return (f"the text about to be published ({len(text)} bytes, sha256 "
+                f"{digest[:16]}) is not one of the {len(accepted)} texts the pin "
+                "accepted. The best-of selection chose a facade that was never run "
+                "past the Reference, and every check downstream would still pass, "
+                "because they all describe that same unvalidated text")
+    return None
+
+
 def published_bytes_error(out, text):
     """The file that ships is byte-for-byte the text this run validated.
 
@@ -2292,6 +2325,7 @@ def main():
     # repair loop re-derive it against the facade as it now stands; a row that
     # still fails is re-quarantined with its current reason, so this can only add.
     best = None
+    pin_accepted = set()
     for readmit in range(args.readmit_rounds):
         if readmit:
             if not quarantine and not transparent_refused and not any(
@@ -2366,6 +2400,11 @@ def main():
                 if demoted:
                     continue
                 os.replace(candidate, args.out)
+                # Recorded here and nowhere else: this is the only path on which a
+                # rendered text both passed the pin and became the output. The
+                # demotion `continue` above passed the pin too and is deliberately
+                # NOT recorded, because that text is retried rather than published.
+                pin_accepted.add(hashlib.sha256(text.encode("utf-8")).hexdigest())
                 break
             (blamed_axioms, blamed_attrs, blamed_structs, blamed_transparent,
              blamed_inductives, blame_msg) = (set(), set(), set(), set(), set(), {})
@@ -2615,6 +2654,10 @@ def main():
     _decl_written = declared_written_error(line_map, inductive_decls)
     if _decl_written:
         raise SystemExit("REFUSE: " + _decl_written)
+
+    _acc = pin_acceptance_error(text, pin_accepted)
+    if _acc:
+        raise SystemExit("REFUSE: " + _acc)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
