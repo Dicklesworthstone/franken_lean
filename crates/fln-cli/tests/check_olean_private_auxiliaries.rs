@@ -391,6 +391,12 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     let decoded_private_auxiliary_name_strings =
         json_non_empty_name_strings(decoded_private_auxiliary_names);
+    assert!(
+        decoded_private_auxiliary_name_strings
+            .iter()
+            .all(|name| name.starts_with("_private.")),
+        "{json}",
+    );
     let decoded_private_auxiliary_name_set = decoded_private_auxiliary_name_strings
         .iter()
         .cloned()
