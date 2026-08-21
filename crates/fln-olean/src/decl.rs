@@ -713,6 +713,18 @@ impl<'a> DeclDecoder<'a> {
         })
     }
 
+    /// Trailing `u8` scalars an Expr constructor stores AFTER its `Data` word.
+    ///
+    /// The scalar area of an Expr is the `Data` `u64` first, then bytes: the
+    /// binder info of `lam`/`forallE`, and the `nonDep` flag of `letE`. Every
+    /// other constructor stores nothing after `Data`.
+    fn expr_scalar_bytes(tag: u8) -> u64 {
+        match tag {
+            6 | 7 | 8 => 1,
+            _ => 0,
+        }
+    }
+
     /// Which slots of an Expr ctor are themselves Expr children.
     fn expr_child_slots(tag: u8) -> &'static [u64] {
         match tag {
@@ -739,7 +751,7 @@ impl<'a> DeclDecoder<'a> {
                 stack.pop();
                 continue;
             }
-            let (tag, other, _) = self.view.obj_header(off)?;
+            let (tag, other, cs_sz) = self.view.obj_header(off)?;
             let slots = Self::expr_slots(tag).ok_or(DeclError::Shape {
                 offset: off,
                 what: "Expr ctor",
@@ -780,6 +792,29 @@ impl<'a> DeclDecoder<'a> {
                 continue;
             }
             self.charge()?;
+            // The last unbound stored size in this decoder. An Expr is its
+            // object slots, then the `Data` word, then the trailing bytes above
+            // — so unlike Name and Level the expected size depends on the TAG
+            // and not on the pointer count alone.
+            //
+            // The `Data` word is read at `off + 8 + 8*other` and cross-checked
+            // against our recomputation, and the binder byte at `+ 8` past it.
+            // Both offsets come from the assumed layout rather than from the
+            // object: too small an object and those reads cross into a
+            // neighbour, too large and stored bytes go unaccounted. The
+            // resulting mismatch would be reported as an Expr.Data cross-check
+            // divergence — the identity layer blamed for a misread, the same
+            // wrong diagnosis the Name (81b0234c) and Level (7498bf87) binds
+            // removed.
+            let expected_cs_sz =
+                (8 + 8 * u64::from(other) + 8 + Self::expr_scalar_bytes(tag)).div_ceil(8) * 8;
+            if u64::from(cs_sz) != expected_cs_sz {
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Expr object size disagrees with its slots-data-scalars layout",
+                });
+            }
+
             let expr = self.build_expr(off, tag, other)?;
             // The stored Expr.Data word: first scalar (u64s precede u8s).
             let stored = self.view.read_u64(off + 8 + 8 * other as u64)?;
@@ -2340,6 +2375,119 @@ mod tests {
         assert!(
             regular > 0,
             "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
+    }
+
+    /// One axiom whose type is `forall (_ : Sort 0), Sort 0`, so the region
+    /// contains a `forallE` — the branch of the Expr size table that carries a
+    /// trailing binder byte after the `Data` word.
+    fn forall_expr_module() -> Vec<u8> {
+        let body = Expr::sort(Level::zero());
+        let type_ = Expr::forall_e(
+            Name::from_components(["x"]),
+            Expr::sort(Level::zero()),
+            body,
+            BinderInfo::Default,
+        );
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "pi"]),
+                        level_params: Vec::new(),
+                        type_,
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// Both branches of the Expr size table are exercised, and a contradictory
+    /// size is refused before `Expr.Data` is compared.
+    ///
+    /// The trailing-byte branch is the one worth planting on: `forallE` stores
+    /// a binder byte after `Data`, so its object is a full word larger than a
+    /// pointer count alone would predict. A table that forgot the trailing
+    /// scalars would compute 32 here instead of 40 and reject the real pin.
+    #[test]
+    fn an_expr_object_whose_size_contradicts_its_layout_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        // Positive control, so the refusal below cannot be a broken fixture.
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let pi_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("forallE expression");
+
+        // forallE: three slots, then Data, then the binder byte -> 40 bytes.
+        let (tag, other, cs_sz) = view.obj_header(pi_off).expect("forallE header");
+        assert_eq!(tag, 7, "forallE");
+        assert_eq!(other, 3, "binder name, binder type, body");
+        assert_eq!(
+            cs_sz, 40,
+            "8 header + 24 slots + 8 Data + 1 binder byte, padded"
+        );
+        assert_eq!(
+            DeclDecoder::expr_scalar_bytes(tag),
+            1,
+            "the table must know forallE carries a trailing byte"
+        );
+        assert_eq!(
+            DeclDecoder::expr_scalar_bytes(3),
+            0,
+            "and that sort carries none"
+        );
+
+        // Plant a size one word short: enough to hold the slots and Data, but
+        // not the binder byte the decoder then reads.
+        let header = view.read_u64(pi_off).expect("header word");
+        let planted = (header & !0x0000_ffff_0000_0000) | (32_u64 << 32);
+        bytes[pi_off as usize..pi_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("an Expr whose size contradicts its layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Expr object size disagrees with its slots-data-scalars layout",
+                    ..
+                }
+            ),
+            "expected the size refusal rather than an Expr.Data cross-check: {error:?}"
         );
     }
 
