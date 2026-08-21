@@ -363,6 +363,11 @@ const OPTION_MEM_TO_ARRAY_SIMP_1_1: &str =
     "_private.Init.Data.Option.Array.0.Option.mem_toArray._simp_1_1";
 /// The pin's private option companion stores this theorem in Array.
 const OPTION_MEM_TO_ARRAY_SIMP_1_1_MODULE: &str = "Init/Data/Option/Array";
+/// The private simplifier theorem for `Option.toArray_join`.
+const OPTION_TO_ARRAY_JOIN_SIMP_1_1: &str =
+    "_private.Init.Data.Option.Array.0.Option.toArray_join._simp_1_1";
+/// The pin's private option companion stores this theorem in Array.
+const OPTION_TO_ARRAY_JOIN_SIMP_1_1_MODULE: &str = "Init/Data/Option/Array";
 /// The private stored definition implementing `List.hasDecEq`.
 const LIST_HAS_DEC_EQ: &str = "List.hasDecEq";
 /// The census places the implementation in Prelude's private companion.
@@ -2558,6 +2563,35 @@ fn option_mem_to_array_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_MEM_TO_ARRAY_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_to_array_join_simp_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("option_to_array_join_simp_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, OPTION_TO_ARRAY_JOIN_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_TO_ARRAY_JOIN_SIMP_1_1.to_owned()),
+        "the private companion of {OPTION_TO_ARRAY_JOIN_SIMP_1_1_MODULE} must retain \\
+         {OPTION_TO_ARRAY_JOIN_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == OPTION_TO_ARRAY_JOIN_SIMP_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_TO_ARRAY_JOIN_SIMP_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {OPTION_TO_ARRAY_JOIN_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
