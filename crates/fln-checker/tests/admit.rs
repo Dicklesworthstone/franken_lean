@@ -2191,6 +2191,21 @@ fn kr600_803_init_unit_refuses_a_forged_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_unit_fixture_pins_constructor_and_iota_rule() {
+    let entries = init_unit_entries();
+    let constructor = entries[1].declaration();
+    let constructor_metadata = constructor.constructor_metadata().expect("fixture constructor metadata");
+    assert_eq!(constructor_metadata.inductive(), &checker_name("Unit"));
+    assert_eq!(constructor_metadata.index(), 0);
+    assert_eq!(constructor_metadata.num_parameters(), 0);
+    assert_eq!(constructor_metadata.num_fields(), 0);
+    assert!(constructor.level_parameters().is_empty());
+    let recursor = entries[2].declaration().recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.rules()[0].constructor(), entries[1].name());
+    assert_eq!(recursor.rules()[0].num_fields(), 0);
+}
+
+#[test]
 fn kr600_803_init_sum_branches_recursor_and_iota_are_reconstructed() {
     let entries = init_sum_entries();
     let verdict = admit_inductive(
