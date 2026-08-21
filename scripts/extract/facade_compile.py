@@ -2015,6 +2015,28 @@ def main():
             "REFUSE: facade manifest declaration count must exceed Init "
             f"provision count ({json.dumps(declaration_init_provision_inequality_join, sort_keys=True)})"
         )
+    init_substrate_provision_inequality_join = {
+        "summary_init_substrate_checked": manifest_summary.get(
+            "init_substrate_checked"
+        ),
+        "summary_init_provided": manifest_summary.get("init_provided"),
+    }
+    if (not isinstance(init_substrate_provision_inequality_join[
+            "summary_init_substrate_checked"], int)
+            or isinstance(init_substrate_provision_inequality_join[
+                "summary_init_substrate_checked"], bool)
+            or not isinstance(init_substrate_provision_inequality_join[
+                "summary_init_provided"], int)
+            or isinstance(init_substrate_provision_inequality_join[
+                "summary_init_provided"], bool)
+            or init_substrate_provision_inequality_join[
+                "summary_init_substrate_checked"]
+            <= init_substrate_provision_inequality_join[
+                "summary_init_provided"]):
+        raise SystemExit(
+            "REFUSE: facade manifest Init-substrate count must exceed Init "
+            f"provision count ({json.dumps(init_substrate_provision_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3952,6 +3974,9 @@ def main():
         ),
         "manifest_declaration_init_provision_inequality_join": (
             declaration_init_provision_inequality_join
+        ),
+        "manifest_init_substrate_provision_inequality_join": (
+            init_substrate_provision_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
