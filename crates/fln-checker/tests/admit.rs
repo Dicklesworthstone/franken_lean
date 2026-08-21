@@ -4218,6 +4218,32 @@ fn kr600_803_color_refuses_a_forged_constructor_field_count() {
 }
 
 #[test]
+fn kr600_803_color_refuses_a_forged_constructor_index() {
+    let mut entries = enumeration_entries(BinderInfo::Implicit);
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Color", "red"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("Color"), 1, 0, 0),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+        )
+    ));
+}
+
+#[test]
 fn kr600_803_color_refuses_a_forged_num_indices_count() {
     let mut entries = enumeration_entries(BinderInfo::Implicit);
     let declaration = entries[3].declaration();
