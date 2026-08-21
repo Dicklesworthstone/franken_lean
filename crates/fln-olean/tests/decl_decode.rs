@@ -11721,6 +11721,256 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The 6,163 that stay indeterminate - three contexts and one size.
+///
+/// `259932d6` left a remainder: of the 10,262 blind objects, the holding
+/// array's own context rescues 4,099 and 6,163 stay indeterminate. That
+/// remainder was a subtraction, never a description. This describes it.
+///
+/// IT IS CARRIED BY THREE CONTEXTS. All 6,163 arrive through just THREE
+/// distinct mixed grandparent contexts, one for each of the three shapes that
+/// have any remainder at all - `(0, 2)` with 5,076, `(0, 3)` with 1,074 and
+/// `(1, 2)` with 13. The other three shapes have none. So the residue is not
+/// diffuse: two shapes carry 99.8% of it and a single context each.
+///
+/// AND NONE OF THEM ARRIVES NOWHERE. Zero of the 6,163 lack a grandparent
+/// arrival entirely; every one reaches at least one context and every context
+/// it reaches is mixed. `the_array_holders_own_context_rescues_two_fifths`
+/// folds those two cases into one `still` counter and so cannot tell them
+/// apart - here they are separated, and the second is empty.
+///
+/// THE MINORITY IS EXACTLY ONE SIZE. Within each of the three shapes the
+/// smaller side of the split is its stored-size-32 bucket: 77 of `(0, 2)`'s
+/// 5,076, 93 of `(0, 3)`'s 1,074, 2 of `(1, 2)`'s 13. Those sum to 172, which
+/// is the whole size-32 population of the remainder. A rule that guessed each
+/// context's majority would be wrong on exactly those 172 - 2.8% of the 6,163,
+/// and 0.7% of the 24,867 objects in these six shapes.
+///
+/// That the minority is the same stored size in all three is a fact about this
+/// corpus, pinned because it is checkable and not because I can explain it. It
+/// is the kind of coincidence that would be worth a mechanism if it survived a
+/// wider corpus, and this cell claims no mechanism.
+///
+/// DENOMINATORS FOR EVERY FIGURE, since `259eadde` was reddened for offering a
+/// count with none: 6,163 of 10,262 blind, of 24,867 in the six shapes; 172 of
+/// 6,163; three contexts; 61 holding arrays.
+///
+/// POPULATION SCOPE: all four modules pooled, the six shapes `03c853b1` left
+/// unseparated. The measurement script for this cell mirrors it field for
+/// field rather than measuring the concept, which is what w235 and w236 both
+/// caught me not doing.
+#[test]
+fn the_remainder_is_three_contexts_and_one_size() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    type Context = (u8, u8, u16, usize);
+    const SURVIVORS: [(u8, u8); 6] = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2)];
+
+    let mut grand_sizes: std::collections::BTreeMap<((u8, u8), Context), BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut grand_arrivals: std::collections::BTreeMap<(usize, usize), BTreeSet<Context>> =
+        std::collections::BTreeMap::new();
+    let mut holders: std::collections::BTreeMap<(usize, usize), BTreeSet<(usize, usize)>> =
+        std::collections::BTreeMap::new();
+    let mut profile_of: std::collections::BTreeMap<(usize, usize), (u8, u8, u16)> =
+        std::collections::BTreeMap::new();
+    let mut has_ctor: BTreeSet<(usize, usize)> = BTreeSet::new();
+
+    for (index, (_, bytes)) in modules.iter().enumerate() {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                profile_of.insert(
+                    (index, object.off),
+                    (object.tag, object.other, object.cs_sz),
+                );
+            }
+        }
+        let mut array_contexts: std::collections::BTreeMap<usize, BTreeSet<Context>> =
+            std::collections::BTreeMap::new();
+        for parent in &objects {
+            if parent.tag > abi::TAG_MAX_CTOR_TAG {
+                continue;
+            }
+            for slot in 0..usize::from(parent.other) {
+                let Some((off, child)) = resolve(word_at(bytes, parent.off + 8 + 8 * slot))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                let key = (parent.tag, parent.other, parent.cs_sz, slot);
+                if child.tag <= abi::TAG_MAX_CTOR_TAG {
+                    has_ctor.insert((index, off));
+                } else if child.tag == abi::TAG_ARRAY {
+                    array_contexts.entry(off).or_default().insert(key);
+                }
+            }
+        }
+        for holder in &objects {
+            if holder.tag != abi::TAG_ARRAY {
+                continue;
+            }
+            let Some(inherited) = array_contexts.get(&holder.off) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, holder.off + 8) {
+                let Some((off, child)) = resolve(word_at(bytes, holder.off + 24 + 8 * i as usize))
+                    .and_then(|off| at.get(&off).map(|o| (off, *o)))
+                else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                let shape = (child.tag, child.other);
+                for key in inherited {
+                    grand_sizes
+                        .entry((shape, *key))
+                        .or_default()
+                        .insert(child.cs_sz);
+                    grand_arrivals.entry((index, off)).or_default().insert(*key);
+                }
+                holders
+                    .entry((index, off))
+                    .or_default()
+                    .insert((index, holder.off));
+            }
+        }
+    }
+
+    // The remainder, per shape, with the two `still` cases kept apart.
+    let mut rows: Vec<(u8, u8, usize, Vec<(u16, usize)>, usize, usize)> = Vec::new();
+    let mut blind_total = 0usize;
+    let mut no_grandparent = 0usize;
+    let mut all_contexts: BTreeSet<((u8, u8), Context)> = BTreeSet::new();
+    let mut all_holders: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut minority_total = 0usize;
+    let mut pooled_sizes: std::collections::BTreeMap<u16, usize> =
+        std::collections::BTreeMap::new();
+
+    for shape in SURVIVORS {
+        let mut sizes: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+        let mut contexts: BTreeSet<((u8, u8), Context)> = BTreeSet::new();
+        let mut arrays: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (key, profile) in &profile_of {
+            if (profile.0, profile.1) != shape || has_ctor.contains(key) {
+                continue;
+            }
+            blind_total += 1;
+            let reached = grand_arrivals.get(key);
+            let stays = match reached {
+                None => {
+                    no_grandparent += 1;
+                    true
+                }
+                Some(keys) => !keys.iter().any(|context| {
+                    grand_sizes
+                        .get(&(shape, *context))
+                        .is_some_and(|seen| seen.len() == 1)
+                }),
+            };
+            if !stays {
+                continue;
+            }
+            *sizes.entry(profile.2).or_default() += 1;
+            *pooled_sizes.entry(profile.2).or_default() += 1;
+            if let Some(keys) = reached {
+                contexts.extend(keys.iter().map(|context| (shape, *context)));
+            }
+            if let Some(set) = holders.get(key) {
+                arrays.extend(set.iter().copied());
+            }
+        }
+        let still: usize = sizes.values().sum();
+        if still > 0 {
+            minority_total += still - sizes.values().copied().max().expect("non-empty");
+        }
+        all_contexts.extend(contexts.iter().copied());
+        all_holders.extend(arrays.iter().copied());
+        rows.push((
+            shape.0,
+            shape.1,
+            still,
+            sizes.into_iter().collect(),
+            contexts.len(),
+            arrays.len(),
+        ));
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (0, 1, 0, vec![], 0, 0),
+            (0, 2, 5076, vec![(24, 4999), (32, 77)], 1, 27),
+            (0, 3, 1074, vec![(32, 93), (40, 981)], 1, 6),
+            (1, 1, 0, vec![], 0, 0),
+            (1, 2, 13, vec![(24, 11), (32, 2)], 1, 28),
+            (2, 2, 0, vec![], 0, 0),
+        ],
+        "per shape: the still-indeterminate count, its stored-size split, the \
+         distinct MIXED grandparent contexts it arrives through, and the \
+         distinct arrays holding it. Three shapes have no remainder at all, and \
+         each of the other three is carried by exactly ONE context"
+    );
+    assert_eq!(
+        (
+            rows.iter().map(|row| row.2).sum::<usize>(),
+            blind_total,
+            all_contexts.len(),
+            all_holders.len(),
+            no_grandparent
+        ),
+        (6163, 10262, 3, 61, 0),
+        "the remainder against its denominators: 6,163 of the 10,262 blind \
+         objects, carried by THREE contexts and 61 arrays. And ZERO of them \
+         lack a grandparent arrival - every one reaches a context and every \
+         context it reaches is mixed. `259932d6` folds those two cases into a \
+         single `still` counter and cannot tell them apart; separated here, the \
+         second is empty"
+    );
+
+    // The minority is one stored size.
+    assert_eq!(
+        (pooled_sizes.into_iter().collect::<Vec<_>>(), minority_total),
+        (vec![(24, 5010), (32, 172), (40, 981)], 172),
+        "the remainder's stored sizes, and the error a majority-guess rule \
+         would make. Within EACH of the three shapes the smaller side is its \
+         size-32 bucket - 77, 93 and 2 - and those sum to 172, the whole \
+         size-32 population of the remainder. So the guess errs on 2.8% of the \
+         6,163 and 0.7% of the 24,867 in these six shapes. That the minority is \
+         the same stored size in all three is pinned because it is checkable, \
+         not because this cell can explain it"
+    );
+}
+
 /// The walk conserves edges, and has exactly one entry point.
 ///
 /// `be041416` counted the walk's OUT side - every slot, classified boxed,
