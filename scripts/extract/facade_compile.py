@@ -78,6 +78,9 @@ the toolchain would report a perfect facade:
   * A TYPE-DEPENDENCY SHAPE JOIN requires every non-Init demand to carry a
     duplicate-free, non-self-referential list of named type dependencies. The
     dependency relation used by the provider join must itself be well-formed.
+  * A TYPE-DEPENDENCY TARGET JOIN resolves every non-manifest type dependency
+    against the empty facade (Init only), while manifest targets must be unique.
+    The generated closure cannot hide an undeclared dependency behind the pin.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -561,6 +564,33 @@ def join_type_ascriptions(dispositions, sigs):
     }
 
 
+def join_type_dependency_targets(dispositions, manifest_rows):
+    """Split demanded type dependencies into manifest and Init-only targets."""
+    rows_by_name = defaultdict(list)
+    for row in manifest_rows:
+        rows_by_name[row["name"]].append(row)
+    dependencies = {
+        dependency
+        for name, outcome in dispositions.items()
+        if outcome != "init-substrate"
+        for dependency in rows_by_name[name][0]["type_deps"]
+    }
+    ambiguous = sorted(
+        dependency for dependency in dependencies
+        if dependency in rows_by_name and len(rows_by_name[dependency]) != 1
+    )
+    if ambiguous:
+        raise SystemExit(
+            "REFUSE: type-dependency target join found ambiguous manifest targets "
+            "(" + ", ".join(ambiguous[:8]) + ")"
+        )
+    init_only = sorted(dependency for dependency in dependencies if dependency not in rows_by_name)
+    return init_only, {
+        "manifest_targets": len(dependencies) - len(init_only),
+        "init_only_targets": len(init_only),
+    }
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -700,6 +730,23 @@ def main():
         fh.write("-- the negative control: a facade that declares nothing\n")
     empty_root = build_facade(lean, env, os.path.join(work, "empty"), empty_src, "empty")
 
+    init_type_dependencies, type_dependency_target_join = join_type_dependency_targets(
+        demand_dispositions, manifest_rows
+    )
+    init_dependency_verdicts, _, _ = run_probe(
+        lean, empty_root, work, "control_type_dependencies", init_type_dependencies
+    )
+    missing_init_dependencies = [
+        name for name in init_type_dependencies
+        if init_dependency_verdicts[name] != "available"
+    ]
+    if missing_init_dependencies:
+        raise SystemExit(
+            "REFUSE: type-dependency target join found non-manifest dependencies "
+            "outside Init (" + ", ".join(missing_init_dependencies[:8]) + ")"
+        )
+    type_dependency_target_join["init_only_verified"] = len(init_type_dependencies)
+
     # THE NEGATIVE CONTROL, run before any result is believed. The same probe over
     # the same names against an EMPTY facade must resolve strictly fewer names. It
     # will not resolve zero: part of the demanded toolchain-api surface is defined
@@ -799,6 +846,7 @@ def main():
         "demanded_provider_join": demand_providers,
         "demanded_signature_printer_join": demand_printers,
         "demanded_type_dependency_join": demand_type_dependencies,
+        "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
