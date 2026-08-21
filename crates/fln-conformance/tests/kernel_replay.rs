@@ -4886,6 +4886,145 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// The census is CANONICAL: two runs that saw the same families produce
+/// byte-identical rows, whatever order the families were first seen in.
+///
+/// **A vacuity in my own earlier test is what prompted this.**
+/// `the_receipt_producer_maps_every_count_to_its_own_field` asserts the census
+/// comes out as an exact sorted vector -- but it INSERTS `rejected:BlockMismatch`
+/// before `rejected:TypeMismatch`, and `context:...` before `inconclusive:...`.
+/// Both censuses are therefore inserted in the order they are expected to emerge,
+/// so that assertion passes identically whether the emitter sorts, preserves
+/// insertion order, or does anything else that happens to agree on an
+/// already-ordered input. It cannot fail for the reason it appears to check.
+///
+/// **What the property is actually for.** `to_row` is a CANONICAL form, and
+/// `from_row` refuses any row it cannot re-serialize byte for byte. If the census
+/// order depended on the order families were encountered -- which is the order the
+/// corpus happens to be walked in -- then two runs over the same corpus could
+/// emit different bytes for the same observation, and a retained row from one
+/// would be refused as non-canonical when read by the other. That failure would
+/// be intermittent and would look like file corruption rather than like an
+/// ordering bug.
+///
+/// **The mutant this is aimed at is one word.** `BTreeMap` guarantees the order;
+/// `HashMap` would not, and swapping them is a plausible edit that nothing else
+/// here would catch. So the fixture inserts in DELIBERATELY reversed order and
+/// asserts both that the output is sorted and that the insertion order was not
+/// already the sorted one -- otherwise this test would inherit the same vacuity
+/// it exists to remove.
+#[test]
+fn the_family_census_is_canonical_whatever_order_families_were_seen_in() {
+    // Reverse-sorted on purpose. If these are ever re-ordered into sorted order,
+    // the anti-vacuity assertion below fails rather than the test silently
+    // becoming another copy of the one it repairs.
+    let restrictive = [
+        ("rejected:TypeMismatch", 5_u64),
+        ("rejected:BlockMismatch", 3),
+        ("rejected:AlreadyDeclared", 2),
+    ];
+    let no_answer = [
+        ("inconclusive:Steps", 40_u64),
+        (
+            "context:import_context_not_faithfully_representable",
+            40_000,
+        ),
+    ];
+    let mut sorted_restrictive = restrictive.map(|(name, _)| name).to_vec();
+    sorted_restrictive.sort_unstable();
+    assert_ne!(
+        restrictive.map(|(name, _)| name).to_vec(),
+        sorted_restrictive,
+        "the fixture must be inserted OUT of sorted order, or this test cannot tell a sorting \
+         emitter from one that preserves insertion order -- which is exactly the hole it exists \
+         to close"
+    );
+
+    let build = |forward: bool| {
+        let mut counts = CorpusCounts {
+            decoded: 700_050,
+            compared: 600_010,
+            agree: 600_000,
+            restrictive_without_carve_out: 10,
+            unscorable: 100_040,
+            oracle_skipped: 60_000,
+            subject_no_answer: 40_040,
+            ..CorpusCounts::default()
+        };
+        // Same content, opposite encounter orders.
+        let mut restrictive = restrictive.to_vec();
+        let mut no_answer = no_answer.to_vec();
+        if !forward {
+            restrictive.reverse();
+            no_answer.reverse();
+        }
+        for (name, count) in restrictive {
+            counts.restrictive_families.insert(name.to_string(), count);
+        }
+        for (name, count) in no_answer {
+            counts.no_answer_families.insert(name.to_string(), count);
+        }
+        counts.assert_conservation("canonical census");
+        counts
+    };
+
+    let first = build(true);
+    let second = build(false);
+
+    let rows = family_census_rows(&first.restrictive_families);
+    assert_eq!(
+        rows,
+        vec![
+            "rejected:AlreadyDeclared=2".to_string(),
+            "rejected:BlockMismatch=3".to_string(),
+            "rejected:TypeMismatch=5".to_string(),
+        ],
+        "the census must be emitted in sorted order, not in the order the families were seen"
+    );
+    assert_eq!(
+        rows,
+        family_census_rows(&second.restrictive_families),
+        "the two encounter orders produced different censuses"
+    );
+
+    // The whole row, which is what actually gets retained and re-read.
+    let spec = CorpusReceiptSpec {
+        bead: "franken_lean-t6r7",
+        corpus_commit: suite_lock_corpus_commit(),
+        seed_modules: 8_009,
+        receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+    };
+    let receipt_of = |counts: &CorpusCounts| {
+        WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+            spec: &spec,
+            counts,
+            closure_modules: 10_007,
+            corpus_fixture_hash: "same-corpus-either-way",
+            observed_unix_s: 1_786_444_555,
+            wall_ms: 9,
+        })
+    };
+    let row = receipt_of(&first).to_row();
+    assert_eq!(
+        row,
+        receipt_of(&second).to_row(),
+        "two runs over the same corpus emitted different BYTES for the same observation. \
+         `from_row` refuses anything it cannot re-serialize exactly, so a row retained by one \
+         run would be rejected as non-canonical when read back by the other, intermittently, \
+         and it would read as file corruption rather than as an ordering bug"
+    );
+
+    // And the canonical row must still be one the guard accepts, from either
+    // order: a form nothing can validate is not a canonical form.
+    for counts in [&first, &second] {
+        if let Err(reason) =
+            receipt_of(counts).validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit())
+        {
+            panic!("a canonical row was refused by its own guard: {reason}");
+        }
+    }
+}
+
 /// Every NON-ANSWER token the lane can actually produce is a legal family too,
 /// including the one that is COMPOSED out of another enum.
 ///
