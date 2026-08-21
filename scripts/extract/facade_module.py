@@ -1944,6 +1944,36 @@ def disk_bytes(path):
 
 
 @checked_by_self_test
+def scratch_accumulation(parent, prefix):
+    """How many sibling scratch directories there are, and what they hold.
+
+    869acaef gave the SELF-TEST an accumulation disclosure and left the extractor
+    saying "one directory per run" -- a claim about accumulation with no number
+    attached, on the larger pile of the two: 107 extractor directories at 15.3 MiB
+    against 187 self-test directories at 10.10 MiB when both were last measured.
+    One place fixed and not the other, which is the shape this file keeps having
+    to repair.
+
+    Written once and used by both, so the two disclosures cannot drift into
+    answering the same question differently the way the disk-size sites did.
+    Returns (count, bytes_on_disk); a parent that cannot be listed claims nothing.
+    """
+    count = total = 0
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return 0, 0
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        count += 1
+        for root, _dirs, names in os.walk(os.path.join(parent, entry)):
+            for name in names:
+                total += disk_bytes(os.path.join(root, name))
+    return count, total
+
+
+@checked_by_self_test
 def environment_failure(exc):
     """Is this the machine failing, rather than a guard?
 
@@ -3406,18 +3436,8 @@ def self_test():
     # reintroduced by putting a check inside a disclosure.
     _mine = sum(disk_bytes(os.path.join(_r, _f))
                 for _r, _, _fs in os.walk(work) for _f in _fs)
-    _peers = _siblings = 0
     _parent = os.path.dirname(work) or "."
-    try:
-        for _entry in os.listdir(_parent):
-            if _entry.startswith("fln-l8f-selftest-"):
-                _peers += 1
-                _siblings += sum(
-                    disk_bytes(os.path.join(_r, _f))
-                    for _r, _, _fs in os.walk(os.path.join(_parent, _entry))
-                    for _f in _fs)
-    except OSError:
-        pass
+    _peers, _siblings = scratch_accumulation(_parent, "fln-l8f-selftest-")
     try:
         _free = (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(_parent))
     except OSError:
@@ -3430,6 +3450,22 @@ def self_test():
              f"{_free} free. Nothing was deleted -- a run has no business "
              "removing files a reader may be halfway through -- but a checker "
              "that outgrows the disk it checks has to say so")
+    _acc_dir = os.path.join(work, "acc")
+    os.makedirs(os.path.join(_acc_dir, "pfx-one", "deep"), exist_ok=True)
+    os.makedirs(os.path.join(_acc_dir, "pfx-two"), exist_ok=True)
+    os.makedirs(os.path.join(_acc_dir, "other"), exist_ok=True)
+    builtins.open(os.path.join(_acc_dir, "pfx-one", "deep", "f"), "w").write("a" * 16)
+    builtins.open(os.path.join(_acc_dir, "other", "f"), "w").write("b" * 16)
+    _c, _b = scratch_accumulation(_acc_dir, "pfx-")
+    case("scratch/counts-only-the-prefixed-directories",
+         None if _c == 2 else f"counted {_c}, expected 2", False)
+    case("scratch/totals-a-nested-file",
+         None if _b >= 4096 else f"totalled {_b}, missing the nested file", False)
+    case("scratch/ignores-an-unprefixed-neighbour",
+         None if _b < 8192 else "counted a directory outside the prefix", False)
+    case("scratch/a-missing-parent-claims-nothing",
+         None if scratch_accumulation(os.path.join(work, "gone"), "x") == (0, 0)
+         else "claimed directories under a parent that is not there", False)
     case("work/disclosure-states-the-accumulation",
          None if all(str(v) in _line for v in (_mine, _peers, _siblings, _free))
          else "the scratch disclosure omits one of its own numbers", False)
@@ -5035,9 +5071,16 @@ def main():
         _err = leftover_scratch_error(_path, _sufs)
         if _err:
             raise SystemExit("REFUSE: " + _err)
+    _wparent = os.path.dirname(work) or "."
+    _wpeers, _wtotal = scratch_accumulation(_wparent, "fln-l8f-facade-")
+    try:
+        _wfree = (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(_wparent))
+    except OSError:
+        _wfree = -1
     print(f"facade-module: probe scratch left in {work}: {_wfiles} files, "
-          f"{_wbytes} bytes (st_blocks). Nothing removes it and it is keyed by "
-          f"pid, so this is one directory per run", file=sys.stderr)
+          f"{_wbytes} bytes on disk. Nothing removes it and it is keyed by pid, "
+          f"so this is one directory per run: {_wpeers} of them now hold "
+          f"{_wtotal} bytes against {_wfree} free", file=sys.stderr)
 
     print(f"facade-module: demanded={len(demand)} init_substrate={len(init_demanded)} "
           f"facade_demand={len(facade_demand)} emitted={len(emitted)} "
