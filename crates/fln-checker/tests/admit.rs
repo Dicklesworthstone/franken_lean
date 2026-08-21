@@ -1564,6 +1564,96 @@ fn init_or_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_and_entries() -> Vec<ConstantEntry> {
+    let and = checker_name("And");
+    let intro = checker_qualified(&["And", "intro"]);
+    let rec = checker_qualified(&["And", "rec"]);
+    let prop = || Expr::sort(Level::zero());
+    let and_expr = |a: Expr, b: Expr| {
+        Expr::app(Expr::app(Expr::const_(primary_name("And"), Vec::new()), a), b)
+    };
+    let intro_expr = |a: Expr, b: Expr, left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::app(Expr::const_(Name::from_components(["And", "intro"]), Vec::new()), a),
+                    b,
+                ),
+                left,
+            ),
+            right,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, and_expr(bv(1), bv(0)), prop());
+    let minor = || primary_pi(
+        "left", BinderInfo::Default, bv(2),
+        primary_pi(
+            "right", BinderInfo::Default, bv(2),
+            Expr::app(bv(2), intro_expr(bv(4), bv(3), bv(1), bv(0))),
+        ),
+    );
+    let rec_type = primary_pi("a", BinderInfo::Implicit, prop(), primary_pi(
+        "b", BinderInfo::Implicit, prop(), primary_pi(
+            "motive", BinderInfo::Implicit, motive(), primary_pi(
+                "intro", BinderInfo::Default, minor(), primary_pi(
+                    "t", BinderInfo::Default, and_expr(bv(4), bv(3)), Expr::app(bv(2), bv(0)),
+                ),
+            ),
+        ),
+    ));
+    let rhs = Expr::lam(primary_name("a"), prop(), Expr::lam(
+        primary_name("b"), prop(), Expr::lam(
+            primary_name("motive"), motive(), Expr::lam(
+                primary_name("intro"), minor(), Expr::lam(
+                    primary_name("left"), bv(3), Expr::lam(
+                        primary_name("right"), bv(3),
+                        Expr::app(Expr::app(bv(2), bv(1)), bv(0)), BinderInfo::Default,
+                    ), BinderInfo::Default,
+                ), BinderInfo::Default,
+            ), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    vec![
+        ConstantEntry::new(and.clone(), ConstantDeclaration::inductive(
+            Vec::new(), decoded(&primary_pi("a", BinderInfo::Default, prop(), primary_pi("b", BinderInfo::Default, prop(), prop()))), ConstantSafety::Safe,
+            InductiveDeclaration::new(2, 0, vec![and.clone()], vec![intro.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(intro.clone(), ConstantDeclaration::constructor(
+            Vec::new(), decoded(&primary_pi("a", BinderInfo::Default, prop(), primary_pi(
+                "b", BinderInfo::Default, prop(), primary_pi(
+                    "left", BinderInfo::Default, bv(1), primary_pi(
+                        "right", BinderInfo::Default, bv(1), and_expr(bv(3), bv(2)),
+                    ),
+                ),
+            ))), ConstantSafety::Safe, ConstructorDeclaration::new(and.clone(), 0, 2, 2),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            Vec::new(), decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![and], 2, 0, 1, 1, vec![RecursorRule::new(intro, 2, decoded(&rhs))], false),
+        )),
+    ]
+}
+
+#[test]
+fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
+    let entries = init_and_entries();
+    let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
+    assert!(verdict.is_admitted(), "exact Init.And block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_and_refuses_a_forged_iota_rule() {
+    let mut entries = init_and_entries();
+    let declaration = entries[2].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[2] = ConstantEntry::new(checker_qualified(&["And", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["And", "intro"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
