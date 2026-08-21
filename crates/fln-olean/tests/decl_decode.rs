@@ -11721,6 +11721,194 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The rest of the `mpz` family has no witness - with denominators this time.
+///
+/// `ddb61b49` closed by listing three items of this family as still uncovered:
+/// "Nat with negative mpz", "Name.num mpz", and "Int: neither scalar nor mpz".
+/// That is a list of claims about the corpus, and `be041416` is the record of
+/// what happens when I carry such a list forward instead of testing it. So this
+/// tests it, and reports a denominator for every zero rather than a bare zero.
+///
+/// THE ONLY THING THAT REFERENCES AN `mpz` IN THIS CORPUS is the single-field
+/// `(0, 1, 16)` literal wrapper, at slot 0, twice. Across all four modules, no
+/// object of any other shape points at one. That single fact settles two of the
+/// three items, and it is a stronger statement than either of them.
+///
+///   Nat with negative mpz   0 of 2 - both size words are +2
+///   Name.num mpz            0 of 1,955 `(2, 2)` objects hold an `mpz`
+///
+/// THE THIRD IS NOT SHAPE-DECIDABLE AND IS RECORDED AS UNDECIDED, NOT AS ZERO.
+/// `decode_int` is reached only from a `DataValue` variant, and a `DataValue`
+/// cannot be picked out by shape: `(4, 1)` has 122 objects across these modules
+/// at TWO stored sizes, 16 and 24, and two stored sizes at one tag and arity
+/// mean two layouts and so at least two types. A zero here would be a claim
+/// about a population I cannot enumerate. What IS measured is the bound above:
+/// nothing but the literal wrapper points at an `mpz`, so if such a `DataValue`
+/// exists it does not hold one.
+///
+/// AND THE SIZE WORD HAS TWO HALVES THAT I HAVE BEEN READING DIFFERENTLY.
+/// `region::mpz_limbs` takes the signed size from the HIGH 32 bits;
+/// `ddb61b49`'s wire walk takes its limb count from the LOW 32. On both objects
+/// the halves are 2 and 2, so that cell is correct - but it was correct by a
+/// coincidence it did not check, and its "independent" walk would have read a
+/// different limb count had the halves differed. Both halves are pinned here
+/// and that cell's comment now says which field it reads.
+///
+/// This is the same shape as `7a0a90fa`'s predicate mismatch: I used one field
+/// and described a check computed from another. It is worth noting that the
+/// version that bites is always the one where the two happen to agree, because
+/// nothing goes red.
+///
+/// POPULATION SCOPE: all four modules pooled for the counts, with the `mpz`
+/// objects themselves per module; the three C3 fixtures hold none, so every
+/// non-zero figure here comes from `Init/Prelude.olean`.
+#[test]
+fn the_remaining_mpz_family_items_have_no_witness() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    let mut holder_shapes: std::collections::BTreeMap<(u8, u8, u16, usize), usize> =
+        std::collections::BTreeMap::new();
+    let mut size_halves: Vec<(u32, i32)> = Vec::new();
+    let mut mpz_total = 0usize;
+    let mut negative = 0usize;
+    let mut two_two = 0usize;
+    let mut two_two_with_mpz = 0usize;
+    let mut four_one = 0usize;
+    let mut four_one_sizes: BTreeSet<u16> = BTreeSet::new();
+
+    for (_, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let mpz: BTreeSet<usize> = objects
+            .iter()
+            .filter(|o| o.tag == abi::TAG_MPZ)
+            .map(|o| o.off)
+            .collect();
+        mpz_total += mpz.len();
+
+        for &off in &mpz {
+            let word = word_at(bytes, off + 8);
+            // `region::mpz_limbs` reads the HIGH half as a signed size; the
+            // limb count this file's other cell uses is the LOW half.
+            let low = (word & 0xFFFF_FFFF) as u32;
+            let high = ((word >> 32) as u32) as i32;
+            size_halves.push((low, high));
+            if high < 0 {
+                negative += 1;
+            }
+        }
+
+        for object in &objects {
+            if (object.tag, object.other) == (2, 2) {
+                two_two += 1;
+                if resolve(word_at(bytes, object.off + 16))
+                    .is_some_and(|target| mpz.contains(&target))
+                {
+                    two_two_with_mpz += 1;
+                }
+            }
+            if (object.tag, object.other) == (4, 1) {
+                four_one += 1;
+                four_one_sizes.insert(object.cs_sz);
+            }
+            // Every reference to an `mpz`, by holder shape and slot.
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if resolve(word_at(bytes, object.off + 8 + 8 * slot))
+                        .is_some_and(|target| mpz.contains(&target))
+                    {
+                        *holder_shapes
+                            .entry((object.tag, object.other, object.cs_sz, slot))
+                            .or_default() += 1;
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, object.off + 8) {
+                    if resolve(word_at(bytes, object.off + 24 + 8 * i as usize))
+                        .is_some_and(|target| mpz.contains(&target))
+                    {
+                        *holder_shapes
+                            .entry((object.tag, 0, object.cs_sz, usize::MAX))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // One holder shape, and it settles two of the three items.
+    assert_eq!(
+        holder_shapes.into_iter().collect::<Vec<_>>(),
+        vec![((0, 1, 16, 0), 2)],
+        "the ONLY objects referencing an `mpz` anywhere in the four modules are \
+         two single-field `(0, 1, 16)` literal wrappers, at slot 0. No object \
+         of any other shape points at one - which is a stronger statement than \
+         either of the two items it settles"
+    );
+    assert_eq!(
+        (mpz_total, negative),
+        (2, 0),
+        "`Nat with negative mpz` has no witness: neither of the two `mpz` \
+         objects carries a negative size. Reported against its denominator, not \
+         as a bare zero"
+    );
+    assert_eq!(
+        (two_two, two_two_with_mpz),
+        (1955, 0),
+        "`Name.num mpz` has no witness either: of 1,955 `(2, 2)` objects pooled \
+         across the four modules, NONE holds an `mpz` at slot 1"
+    );
+
+    // The third item is not decidable from shape, and is not reported as zero.
+    assert_eq!(
+        (four_one, four_one_sizes.into_iter().collect::<Vec<_>>()),
+        (122, vec![16, 24]),
+        "`Int: neither scalar nor mpz` is reached only from a `DataValue`, and \
+         `DataValue` cannot be picked out by shape: `(4, 1)` has 122 objects at \
+         TWO stored sizes, and two sizes at one tag and arity are two layouts \
+         and so at least two types. This cell therefore records that item as \
+         UNDECIDED rather than as a zero - a zero would be a claim about a \
+         population it cannot enumerate"
+    );
+
+    // The two halves of the size word, which I have been reading differently.
+    assert_eq!(
+        size_halves,
+        vec![(2, 2), (2, 2)],
+        "the LOW half of each size word and its HIGH half read as a signed \
+         size. `region::mpz_limbs` uses the high one and `ddb61b49`'s wire walk \
+         uses the low one; they agree on both objects, so that cell is right - \
+         but it was right by a coincidence it never checked, and its walk would \
+         have read a different limb count had the halves differed"
+    );
+}
+
 /// The `mpz` literal decodes through the production path - the block `be041416`
 /// retired, taken.
 ///
@@ -11749,6 +11937,13 @@ fn the_other_references_to_that_name() {
 /// its limbs equal the ones this cell reads off the wire independently. The
 /// third is the one that would catch a decoder agreeing with a wrong
 /// expectation.
+///
+/// The wire read takes the limb count from the LOW half of the size word;
+/// `region::mpz_limbs` takes its signed size from the HIGH half. Those are
+/// different fields, which is what makes the check independent - and it is only
+/// a check at all because they agree on these two objects.
+/// `the_remaining_mpz_family_items_have_no_witness` measures that agreement,
+/// which this cell assumed.
 ///
 /// THE SCALAR CONTROL IS DECODED THE SAME WAY and its `to_u64` is SOME, so the
 /// two arms are distinguished by a property of the decoded value rather than by
@@ -11867,6 +12062,9 @@ fn the_mpz_literal_decodes_through_the_production_path() {
     for &expr in &mpz_arm {
         let payload = resolve(word_at(bytes, expr + 8)).expect("literal payload");
         let mpz = resolve(word_at(bytes, payload + 8)).expect("mpz object");
+        // The LOW half of the size word. `region::mpz_limbs` reads the HIGH
+        // half as a signed size; the two agree here, measured in
+        // `the_remaining_mpz_family_items_have_no_witness`.
         let size = usize::try_from(word_at(bytes, mpz + 8) & 0xFFFF_FFFF).expect("limb count");
         let limbs_at = usize::try_from(word_at(bytes, mpz + 16).wrapping_sub(base)).expect("limbs");
         wire_limbs.insert(
@@ -11909,8 +12107,10 @@ fn the_mpz_literal_decodes_through_the_production_path() {
         assert_eq!(
             nat.limbs_le(),
             &[0_u64, 1],
-            "with the limbs this cell read off the wire by a separate walk, so \
-             a decoder agreeing with a wrong expectation would still fail here"
+            "with the limbs this cell read off the wire by a separate walk - \
+             one that takes its count from the LOW half of the size word where \
+             the decoder takes a signed size from the HIGH half, so a decoder \
+             agreeing with a wrong expectation would still fail here"
         );
     }
 
