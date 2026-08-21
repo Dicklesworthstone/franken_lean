@@ -383,17 +383,19 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             cli_source_lines
                 .windows(2)
                 .filter(|lines| {
-                    lines[0].trim() == r#""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"#
+                    lines[0].trim()
+                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
                         && lines[1].trim()
-                            == r#""\"module\":{{\"isModulePart\":{},\"imports\":0,"#
+                            == r##""\"module\":{{\"isModulePart\":{},\"imports\":0,","##
                 })
                 .count(),
             cli_source_lines
                 .windows(2)
                 .filter(|lines| {
-                    lines[0].trim() == r#""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"#
+                    lines[0].trim()
+                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
                         && lines[1].trim()
-                            == r#""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,"#
+                            == r##""\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,","##
                 })
                 .count(),
         ],
