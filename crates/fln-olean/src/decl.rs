@@ -2378,6 +2378,80 @@ mod tests {
         );
     }
 
+    /// An Expr claiming an arity its constructor does not have is refused.
+    ///
+    /// NO CO-PLANTING IS NEEDED HERE, and that is worth stating because the
+    /// Level arity mutant (cb87680c) did need it. The two functions order their
+    /// checks differently: `decode_level` binds the object size immediately
+    /// after the header, so a wrong arity there trips the SIZE law first;
+    /// `decode_expr` checks the arity against `expr_slots` first and binds the
+    /// size later, just before the node is built. So this mutant moves `other`
+    /// alone and still reaches the rule it targets. I verified that from the
+    /// code order rather than assuming the two were symmetric.
+    #[test]
+    fn an_expr_claiming_the_wrong_arity_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let pi_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("forallE expression");
+
+        let (tag, other, _) = view.obj_header(pi_off).expect("forallE header");
+        assert_eq!(tag, 7, "forallE");
+        assert_eq!(
+            other, 3,
+            "and its constructor really does carry three slots"
+        );
+        assert_eq!(
+            DeclDecoder::expr_slots(tag),
+            Some(3),
+            "the table the rule compares against"
+        );
+
+        // Claim two slots where the constructor has three. The size word is
+        // left alone: the arity rule is reached before the size law here.
+        let header = view.read_u64(pi_off).expect("header word");
+        let planted = (header & !0x00ff_0000_0000_0000) | (2_u64 << 48);
+        bytes[pi_off as usize..pi_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let (tag, other, _) = view.obj_header(pi_off).expect("planted header");
+        assert_eq!((tag, other), (7, 2), "the plant landed as intended");
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("an Expr claiming the wrong arity must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Expr arity",
+                    ..
+                }
+            ),
+            "expected the arity refusal rather than the size law or an \
+             Expr.Data cross-check: {error:?}"
+        );
+    }
+
     /// The post-order law is enforced, and a cyclic Expr child is refused
     /// rather than walked forever.
     ///
