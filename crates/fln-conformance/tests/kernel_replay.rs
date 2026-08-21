@@ -4997,15 +4997,31 @@ fn walk_olean_inventory(
     // choice. Said plainly so a mutation campaign records it as inert rather
     // than as a surviving mutant somebody ought to chase.
     oleans.sort();
-    let modules = module_names_below(library, module_prefix)?;
+    // ONE TRAVERSAL, NOT TWO. This used to call `module_names_below`, which
+    // walks the tree AGAIN from the same root and re-sorts what it finds. The
+    // two vectors then came from two `read_dir` sweeps at different moments, and
+    // the comment below claimed their lengths "always agree" -- true of a tree
+    // nobody is writing to, and this suite has no test that walks a fixture
+    // another test is building. It was unreachable because of the test
+    // population, not because two traversals of one root must agree.
+    //
+    // Projecting the paths already collected removes the window and makes the
+    // parallel correspondence structural: `modules[i]` is now the projection of
+    // `oleans[i]` because it is built from it, not because two independent
+    // enumerations happen to sort the same way.
+    let modules = oleans
+        .iter()
+        .map(|path| {
+            module_name_from_path(library, path)
+                .map(|relative| qualify_module_name(module_prefix, relative))
+        })
+        .collect::<Result<Vec<String>, String>>()?;
 
-    // DEFENSIVE, NOT REACHABLE FROM ANY TREE. Both vectors come from
-    // `collect_present_oleans` over the same root, so their lengths always
-    // agree; no fixture can make this fire. It guards a future
-    // `module_names_below` that filtered, deduped or re-enumerated -- drift in a
-    // helper, not a property of the input. Said plainly so nobody counts it as
-    // input validation, and so a mutation campaign does not record it as a
-    // surviving mutant that ought to have been killed.
+    // DEFENSIVE, AND NOW IMPOSSIBLE RATHER THAN MERELY UNOBSERVED. `modules` is
+    // a `map` over `oleans`, so the lengths cannot differ without the iterator
+    // protocol being wrong. It stays because the guard costs nothing and states
+    // what the two vectors mean to each other; a mutation campaign should record
+    // it as inert, not chase it.
     if modules.len() != oleans.len() {
         return Err(format!(
             "{} olean(s) below {} produced {} module name(s); the enumeration and the projection \
@@ -6335,6 +6351,73 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
         !tmp.join("nested").exists(),
         "`nested/name` was refused and a tree appeared anyway; the name check must run before \
          anything is created"
+    );
+}
+
+/// The walk and `module_names_below` are now two implementations of one meaning,
+/// and they must still agree.
+///
+/// **Splitting them is what makes this assertion worth anything.** Until this
+/// commit the walk CALLED `module_names_below`, so comparing the two compared a
+/// value with itself -- the definition of a vacuous test. The walk now projects
+/// the paths it already collected, which removes a second `read_dir` sweep of
+/// the same tree and makes `modules[i]` the projection of `oleans[i]` by
+/// construction. The cost of that is a second copy of the same rule.
+///
+/// **And the second copy is not dead code.** `module_names_below` still has a
+/// caller: the corpus inventory reads `mathlib_modules` through it. So the two
+/// paths that name a module -- the one every fixture test exercises and the one
+/// the corpus lane uses -- are now separate, and nothing else in this file would
+/// notice if they drifted. A module named one way here and another way there
+/// resolves against no import, which reads downstream as a corpus with missing
+/// imports rather than as two projections disagreeing.
+///
+/// **The tree spans the cases that could distinguish them**: a top-level module,
+/// a nested one, a directory whose name carries a dot, and a parent module --
+/// the shape where path order and name order disagree, which is where two
+/// differently-ordered implementations would part company.
+#[test]
+fn the_walks_two_module_name_paths_still_agree() {
+    let library = write_inventory_fixture(
+        "t6r7-two-projections-v1",
+        &[
+            "Top.olean",
+            "Algebra.olean",
+            "Algebra/Group.olean",
+            "Mid.dotted/Leaf.olean",
+        ],
+    );
+
+    let walked = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the fixture must walk: {reason}"));
+    let separately = module_names_below(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the helper must enumerate: {reason}"));
+
+    // ANTI-VACUITY FIRST. Comparing two empty vectors, or two one-element ones,
+    // says nothing about ORDER -- and order is the half most likely to drift
+    // once the two are separate.
+    assert_eq!(
+        walked.modules.len(),
+        4,
+        "the fixture's four modules must all be named: {:?}",
+        walked.modules
+    );
+    assert!(
+        walked
+            .modules
+            .iter()
+            .any(|name| name.matches('.').count() >= 3),
+        "the tree must span a nested module, or agreement over flat names says nothing about how \
+         either side joins components: {:?}",
+        walked.modules
+    );
+
+    assert_eq!(
+        walked.modules, separately,
+        "the walk's own projection and `module_names_below` disagree. They are two copies of one \
+         rule since the walk stopped calling the helper, and only the corpus lane uses the \
+         helper -- so a drift here would show up as a corpus whose imports resolve against \
+         nothing, not as a naming bug"
     );
 }
 
@@ -8200,14 +8283,14 @@ fn expected_module_name(base: &Path, path: &Path, prefix: &str) -> String {
 /// consumer zipping them would attribute every module to the wrong file while
 /// every count stayed right.
 ///
-/// **It cannot diverge today, and that is exactly why it is worth pinning.** Both
-/// vectors come out in path order, so the correspondence holds -- by coincidence
-/// of construction, not because anything requires it. `module_names_below` sorts
-/// PATHS and maps; the day it sorts or dedupes NAMES instead, which is an
-/// entirely reasonable-looking change to make, the vectors silently stop
-/// corresponding and nothing else in the file would notice. The assertion
-/// recomputes each name from its own path rather than comparing against a
-/// hardcoded list, so it states the RELATION rather than today's answer.
+/// **It USED to be a coincidence, and this doc used to say so.** The walk called
+/// `module_names_below`, which enumerated the tree a second time; both vectors
+/// came out in path order and corresponded because two independent sweeps
+/// happened to sort the same way. The walk now projects the paths it already
+/// holds, so the correspondence is structural. What this test still earns is the
+/// MEANING: the assertion recomputes each name from its own path rather than
+/// comparing against a hardcoded list, so a projection replaced by a stub fails
+/// here instead of agreeing with itself.
 ///
 /// **The extension match is exact, checked from both sides.** `Ignored.OLEAN`
 /// differs only in case and `NoExtension` has none at all; both must be absent.
