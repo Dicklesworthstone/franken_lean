@@ -4207,3 +4207,128 @@ fn recursors_are_named_under_their_block_but_constructors_are_not_always() {
          miss every one of them, and one of them is private while its inductive is not."
     );
 }
+
+/// The generated binder names inside a recursor's type.
+///
+/// Binder names do not affect defeq, so it would be easy to treat them as
+/// cosmetic. They are not cosmetic here: recursor comparison at admission is
+/// BYTE-EXACT, so the names Lean generates are part of what a regeneration has
+/// to reproduce — and a regeneration that differs from the decoded recursor is a
+/// `BlockMismatch`, which is the family this bead's 228 rows came from.
+///
+/// Three generated names, measured over `Init/Prelude` at private level:
+///
+///   the MAJOR binder is `t`, in all 129 recursors without exception
+///   the MOTIVE binder is `motive` when there is one, `motive_1` when there are
+///     several — 129 of 129
+///   each MINOR binder is its constructor's name with the inductive's prefix
+///     STRIPPED
+///
+/// THE MINOR RULE IS THE INTERESTING ONE, because its fallback is exactly the
+/// population the naming cell above refutes. When a constructor is not under its
+/// inductive, there is no prefix to strip, and Lean names the binder with the
+/// FULL constructor name instead: `Lean.Macro.State.rec` binds
+/// `_private.Init.Prelude.0.Lean.Macro.State.mk`, and `Lean.Name._impl.rec`
+/// binds `Lean.Name.anonymous._impl` and its siblings.
+///
+/// So the four constructors that broke the naming relation in the cell above
+/// reappear here, in a different field, producing exactly the deviation that
+/// relation predicts. Both facts are one phenomenon seen twice, and deriving the
+/// expected binder name from the prefix rule — rather than from a leaf-name
+/// shortcut — is what makes the two agree.
+///
+/// The three `Lean.Syntax` recursors are excluded from the minor comparison
+/// alone: their minors cover the nested-expanded block, which `all` does not
+/// name, so there is nothing here to compare against. Their major and motive
+/// names are still checked.
+#[test]
+fn recursor_binder_names_follow_the_generated_shape() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut ctors_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            ctors_of.insert(
+                info.name().to_display_string(),
+                v.ctors.iter().map(Name::to_display_string).collect(),
+            );
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut compared_minors = 0usize;
+    let mut fallbacks = 0usize;
+    for info in &infos {
+        let ConstantInfo::Rec(rec) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let binders: Vec<String> = {
+            let mut out = Vec::new();
+            let mut current = &rec.base.type_;
+            while let ExprNode::ForallE {
+                binder_name, body, ..
+            } = current.node()
+            {
+                out.push(binder_name.to_display_string());
+                current = body;
+            }
+            out
+        };
+        let params = rec.num_params as usize;
+        let motives = rec.num_motives as usize;
+        let minors = rec.num_minors as usize;
+
+        assert_eq!(
+            binders[params],
+            if motives == 1 { "motive" } else { "motive_1" },
+            "{name}: the motive binder is generated with a fixed name"
+        );
+        let major = params + motives + minors + rec.num_indices as usize;
+        assert_eq!(
+            binders[major], "t",
+            "{name}: the major premise binder is generated as `t`"
+        );
+        checked += 1;
+
+        if NESTED_NUMERIC_EXCEPTIONS.contains(&name.as_str()) {
+            continue;
+        }
+        let induct = rec.all[0].to_display_string();
+        let prefix = format!("{induct}.");
+        let expected: Vec<String> = ctors_of
+            .get(&induct)
+            .expect("block head decodes")
+            .iter()
+            .map(|ctor| match ctor.strip_prefix(&prefix) {
+                Some(rest) => rest.to_string(),
+                None => {
+                    fallbacks += 1;
+                    ctor.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            binders[params + motives..params + motives + minors],
+            expected[..],
+            "{name}: each minor premise binder is its constructor's name with the inductive's \
+             prefix stripped, and the FULL name where there is no prefix to strip"
+        );
+        compared_minors += 1;
+    }
+
+    assert!(
+        checked >= 120 && compared_minors >= 120,
+        "the recursor census must be reached ({checked} checked, {compared_minors} minors \
+         compared)"
+    );
+    // The fallback must actually occur, or the prefix rule is indistinguishable
+    // from a leaf-name shortcut over this artifact — and the leaf shortcut is
+    // what a first attempt would write.
+    assert!(
+        fallbacks >= 4,
+        "the full-name fallback must be exercised by the constructors that are not under their \
+         inductive, got {fallbacks}"
+    );
+}
