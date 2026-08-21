@@ -70,6 +70,10 @@ const CORE_OBSERVABLES_SYNTAX_MATCH_RESIDUAL_PREFIXES: [&str; 2] = [
 const ARRAY_MAP_M_PROOF_RESIDUAL_PREFIX: &str =
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_";
 const ARRAY_MAP_M_GO_RESIDUAL: &str = "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go";
+const STRING_EXTRA_UNSAFE_REC_RESIDUALS: [&str; 2] = [
+    "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+    "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+];
 
 const USAGE: &str = concat!(
     "Usage:\n",
@@ -2827,6 +2831,10 @@ fn is_array_map_m_go_residual(display: &str) -> bool {
     display == ARRAY_MAP_M_GO_RESIDUAL
 }
 
+fn is_string_extra_unsafe_rec_residual(display: &str) -> bool {
+    STRING_EXTRA_UNSAFE_REC_RESIDUALS.contains(&display)
+}
+
 fn is_private_loop_match_one_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -3044,6 +3052,14 @@ fn render_check_olean_success(
     };
     array_map_m_go_residuals
         .observe_matching(&checked.decoded.constants, is_array_map_m_go_residual);
+    let mut string_extra_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    string_extra_unsafe_rec_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_string_extra_unsafe_rec_residual,
+    );
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3206,6 +3222,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut array_map_m_go_residuals)
     };
+    let string_extra_unsafe_rec_observed = string_extra_unsafe_rec_residuals.observed;
+    let string_extra_unsafe_rec_omitted = string_extra_unsafe_rec_residuals.omitted();
+    let string_extra_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut string_extra_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut string_extra_unsafe_rec_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -3268,6 +3291,7 @@ fn render_check_olean_success(
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMGoResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"stringExtraUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -3337,6 +3361,9 @@ fn render_check_olean_success(
             array_map_m_go_observed,
             array_map_m_go_names,
             array_map_m_go_omitted,
+            string_extra_unsafe_rec_observed,
+            string_extra_unsafe_rec_names,
+            string_extra_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3420,6 +3447,9 @@ fn render_check_olean_success(
                 "decoded _private Array.mapM'.go residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Array.mapM'.go residual names: {}\n",
                 "decoded _private Array.mapM'.go residual names omitted: {}\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names: {}\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -3500,6 +3530,9 @@ fn render_check_olean_success(
             array_map_m_go_observed,
             array_map_m_go_names,
             array_map_m_go_omitted,
+            string_extra_unsafe_rec_observed,
+            string_extra_unsafe_rec_names,
+            string_extra_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3996,6 +4029,16 @@ fn render_check_olean_set_success(
         array_map_m_go_residuals
             .observe_matching(&module.decoded.constants, is_array_map_m_go_residual);
     }
+    let mut string_extra_unsafe_rec_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        string_extra_unsafe_rec_residuals.observe_matching(
+            &module.decoded.constants,
+            is_string_extra_unsafe_rec_residual,
+        );
+    }
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -4168,6 +4211,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut array_map_m_go_residuals)
     };
+    let string_extra_unsafe_rec_observed = string_extra_unsafe_rec_residuals.observed;
+    let string_extra_unsafe_rec_omitted = string_extra_unsafe_rec_residuals.omitted();
+    let string_extra_unsafe_rec_names = if json {
+        render_named_residuals_json(&mut string_extra_unsafe_rec_residuals)
+    } else {
+        render_named_residuals_human(&mut string_extra_unsafe_rec_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -4236,6 +4286,7 @@ fn render_check_olean_set_success(
                 "\"coreObservablesSyntaxMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"arrayMapMGoResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"stringExtraUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopEqDefResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInsertIdxLoopUnaryResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4307,6 +4358,9 @@ fn render_check_olean_set_success(
             array_map_m_go_observed,
             array_map_m_go_names,
             array_map_m_go_omitted,
+            string_extra_unsafe_rec_observed,
+            string_extra_unsafe_rec_names,
+            string_extra_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -4392,6 +4446,9 @@ fn render_check_olean_set_success(
                 "decoded _private Array.mapM'.go residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private Array.mapM'.go residual names: {}\n",
                 "decoded _private Array.mapM'.go residual names omitted: {}\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names: {}\n",
+                "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -4473,7 +4530,10 @@ fn render_check_olean_set_success(
             array_map_m_proof_omitted,
             array_map_m_go_observed,
             array_map_m_go_names,
-            array_map_m_go_omitted,
+           array_map_m_go_omitted,
+            string_extra_unsafe_rec_observed,
+            string_extra_unsafe_rec_names,
+            string_extra_unsafe_rec_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
