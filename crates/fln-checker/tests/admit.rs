@@ -2037,6 +2037,21 @@ fn kr600_803_init_and_fixture_pins_recursor_levels_motives_minors_and_rules() {
 }
 
 #[test]
+fn kr600_803_init_and_fixture_pins_constructor_and_iota_rule() {
+    let entries = init_and_entries();
+    let constructor = entries[1].declaration();
+    let constructor_metadata = constructor.constructor_metadata().expect("fixture constructor metadata");
+    assert_eq!(constructor_metadata.inductive(), &checker_name("And"));
+    assert_eq!(constructor_metadata.index(), 0);
+    assert_eq!(constructor_metadata.num_parameters(), 2);
+    assert_eq!(constructor_metadata.num_fields(), 2);
+    assert!(constructor.level_parameters().is_empty());
+    let recursor = entries[2].declaration().recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.rules()[0].constructor(), entries[1].name());
+    assert_eq!(recursor.rules()[0].num_fields(), 2);
+}
+
+#[test]
 fn kr600_803_init_bool_constructors_recursor_and_iota_are_reconstructed() {
     let entries = init_bool_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
