@@ -16996,6 +16996,48 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
          wrong line for a claim that one line already makes"
     );
 
+    // THE DOCUMENT LIST IS HAND-WRITTEN, AND A HAND-LISTED SCOPE ROTS. Measured
+    // over every tracked markdown file: the claim also appears TWICE in
+    // COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md -- the document
+    // AGENTS.md calls the single source of truth -- and both sites name neither
+    // a scope nor a cadence. The guard below has never read that file, so those
+    // two statements have never been checked by the thing that exists to check
+    // them.
+    //
+    // They are recorded here rather than repaired: this test may only change
+    // itself. The allowance is ONE-WAY. A new unqualified site in any top-level
+    // document reddens; repairing one of these two does NOT, because the check
+    // is `<=` per document rather than an equality. An allowance that reddened a
+    // correct repair would be a wall, not a ledger.
+    const UNSCANNED_ALLOWANCE: [(&str, usize); 1] =
+        [("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md", 2)];
+    for entry in fs::read_dir(&repo).expect("the repository root must be readable") {
+        let entry = entry.expect("a repository root entry must be readable");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".md") || name == "AGENTS.md" || name == "README.md" {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let unqualified = text
+            .lines()
+            .filter(|line| line.contains("{1, 8, 32}"))
+            .filter(|line| !QUALIFIERS.iter().any(|word| line.contains(word)))
+            .count();
+        let allowed = UNSCANNED_ALLOWANCE
+            .iter()
+            .find(|(doc, _)| *doc == name)
+            .map_or(0, |(_, count)| *count);
+        assert!(
+            unqualified <= allowed,
+            "{name} states the {{1, 8, 32}} determinism claim {unqualified} time(s) without \
+             naming its scope, and this guard does not read that file. Allowance is {allowed}. \
+             Either qualify the claim there or add the document to the list below so it is \
+             checked like the others"
+        );
+    }
+
     let mut checked = 0usize;
     for doc in ["AGENTS.md", "README.md"] {
         let text = fs::read_to_string(repo.join(doc))
