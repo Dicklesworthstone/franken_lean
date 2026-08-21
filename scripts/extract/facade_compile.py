@@ -40,6 +40,10 @@ the toolchain would report a perfect facade:
     remain unresolved against both the generated and empty facades. A row marked
     quarantined is neither emitted nor Init substrate; treating it as available
     would make the disposition join lie.
+  * A DISPOSITION MATRIX applies those expectations to the whole demanded set:
+    emitted rows must be facade-only, Init rows must be substrate-only, and
+    quarantined rows must be absent. A classified denominator is not enough if
+    the generated facade's observed behavior contradicts its classification.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -281,6 +285,31 @@ def choose_quarantine_control(dispositions):
     return candidates[0]
 
 
+def enforce_disposition_matrix(dispositions, generated, empty):
+    """Refuse a manifest disposition that disagrees with both probe controls."""
+    mismatches = []
+    for name in sorted(dispositions):
+        outcome = dispositions[name]
+        generated_verdict = generated[name]
+        empty_verdict = empty[name]
+        if outcome == "emitted":
+            matches = generated_verdict == "available" and empty_verdict != "available"
+        elif outcome == "init-substrate":
+            matches = generated_verdict == "available" and empty_verdict == "available"
+        else:
+            matches = generated_verdict == "unresolved" and empty_verdict == "unresolved"
+        if not matches:
+            mismatches.append(
+                f"{name}({outcome}: generated={generated_verdict}, empty={empty_verdict})"
+            )
+    if mismatches:
+        raise SystemExit(
+            "REFUSE: demanded-row disposition matrix disagrees with the facade "
+            "controls (" + "; ".join(mismatches[:8]) + ")"
+        )
+    return dict(sorted(Counter(dispositions.values()).items()))
+
+
 def probe_text(names, sigs):
     """Two lines per symbol, because they answer two different questions.
 
@@ -424,6 +453,10 @@ def main():
             f"an EMPTY facade resolves {ok_empty} — the probe is measuring the "
             "substrate, not the facade, and no result from it may be published")
 
+    disposition_matrix = enforce_disposition_matrix(
+        demand_dispositions, v_facade, v_empty
+    )
+
     quarantine_name = choose_quarantine_control(demand_dispositions)
     quarantine_generated = v_facade[quarantine_name]
     quarantine_empty = v_empty[quarantine_name]
@@ -490,7 +523,12 @@ def main():
         "curated_modules": sorted(modules),
         "checked": checked,
         "distinct_symbols": len(control_names),
-        "demanded_dispositions": dict(sorted(Counter(demand_dispositions.values()).items())),
+        "demanded_dispositions": disposition_matrix,
+        "disposition_matrix_control": {
+            "emitted": disposition_matrix.get("emitted", 0),
+            "init_substrate": disposition_matrix.get("init-substrate", 0),
+            "quarantined": disposition_matrix.get("quarantined", 0),
+        },
         "available": verdict_counts["available"],
         "unresolved": verdict_counts["unresolved"],
         "resolved_but_rejected": verdict_counts["resolved-but-rejected"],
