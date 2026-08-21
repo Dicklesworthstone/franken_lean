@@ -2525,13 +2525,19 @@ mod tests {
                         type_: Expr::sort(Level::zero()),
                     },
                     all: Vec::new(),
-                    num_params: 0,
-                    num_indices: 0,
-                    num_motives: 0,
-                    num_minors: 0,
+                    // DISTINCT on purpose. The telescope counts are four
+                    // consecutive boxed-Nat slots read by index, so equal
+                    // values would make a slot swap invisible: every one of
+                    // them would decode to the same number and a pin on them
+                    // would assert nothing. See
+                    // `the_recursor_telescope_counts_come_from_their_own_slots`.
+                    num_params: 1,
+                    num_indices: 2,
+                    num_motives: 3,
+                    num_minors: 4,
                     rules: vec![RecursorRule {
                         ctor: Name::from_components(["Demo", "ctor"]),
-                        nfields: 0,
+                        nfields: 5,
                         rhs: Expr::sort(Level::zero()),
                     }],
                     k: false,
@@ -2550,6 +2556,80 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// Each telescope count is read from its OWN slot.
+    ///
+    /// `numParams`, `numIndices`, `numMotives` and `numMinors` are four
+    /// consecutive boxed-Nat slots decoded by index, and `nfields` is a fifth
+    /// inside the rule. Nothing about the object's shape distinguishes them:
+    /// they are all Nats of the same size in adjacent words, so an off-by-one
+    /// in the slot index produces a perfectly well-formed `RecursorVal` with
+    /// the numbers rotated. No size, arity or constructor rule can see that —
+    /// the object is valid, it just describes a different recursor, and a
+    /// kernel told the wrong minor-premise count would build the wrong
+    /// eliminator.
+    ///
+    /// So this is a PIN rather than a mutant: there is no malformed byte to
+    /// plant, and the property is that the decoded values match the encoded
+    /// ones position by position. It is only worth anything because the
+    /// fixture gives the five fields five DIFFERENT values; with the zeros it
+    /// carried before, every rotation would still have passed.
+    #[test]
+    fn the_recursor_telescope_counts_come_from_their_own_slots() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        // The five values are pairwise distinct, so any rotation or off-by-one
+        // among the slots changes at least one of these assertions.
+        assert_eq!(recursor.num_params, 1, "numParams is slot 2");
+        assert_eq!(recursor.num_indices, 2, "numIndices is slot 3");
+        assert_eq!(recursor.num_motives, 3, "numMotives is slot 4");
+        assert_eq!(recursor.num_minors, 4, "numMinors is slot 5");
+
+        assert_eq!(recursor.rules.len(), 1, "one computation rule");
+        assert_eq!(recursor.rules[0].nfields, 5, "and its own field count");
+        assert_eq!(
+            recursor.rules[0].ctor.to_display_string(),
+            "Demo.ctor",
+            "read from the rule's first field, not the recursor's name"
+        );
+        assert_eq!(
+            recursor.base.name.to_display_string(),
+            "Demo.rec",
+            "and the recursor's name is not the rule's"
+        );
+
+        // The guard that keeps the assertions above from going quiet: if a
+        // later edit made the fixture's counts equal again, this fails and
+        // says why.
+        let counts = [
+            recursor.num_params,
+            recursor.num_indices,
+            recursor.num_motives,
+            recursor.num_minors,
+            recursor.rules[0].nfields,
+        ];
+        let mut sorted = counts;
+        sorted.sort_unstable();
+        let distinct = sorted.windows(2).all(|pair| pair[0] != pair[1]);
+        assert!(
+            distinct,
+            "the fixture's counts must stay pairwise distinct, or a slot \
+             rotation would decode identically and this cell would assert \
+             nothing: {counts:?}"
+        );
     }
 
     /// A `RecursorRule` that is not a three-field structure is refused.
