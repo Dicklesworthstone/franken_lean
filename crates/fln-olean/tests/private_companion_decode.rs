@@ -280,6 +280,11 @@ const FLOAT_OF_BITS_PROOF_1_MODULE: &str = "Init/Data/Float";
 const RAT_MUL_SIMP_1: &str = "_private.Init.Data.Rat.Basic.0.Rat.mul._simp_1";
 /// The pin's private rational companion stores this theorem in Basic.
 const RAT_MUL_SIMP_1_MODULE: &str = "Init/Data/Rat/Basic";
+/// The private simp theorem for `ByteArray.fastAppend_eq`.
+const BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1: &str =
+    "_private.Init.Data.ByteArray.Basic.0.ByteArray.fastAppend_eq._simp_1_1";
+/// The pin's private byte-array companion stores this theorem in Basic.
+const BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1_MODULE: &str = "Init/Data/ByteArray/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1963,6 +1968,37 @@ fn rat_mul_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {RAT_MUL_SIMP_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn byte_array_fast_append_simp_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("byte_array_fast_append_simp_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1.to_owned()),
+        "the private companion of {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1_MODULE} must retain \\
+         {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1)
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {BYTE_ARRAY_FAST_APPEND_EQ_SIMP_1_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
