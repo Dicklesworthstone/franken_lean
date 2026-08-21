@@ -4828,6 +4828,38 @@ impl CorpusMatrixReceipt {
                 self.diverging_modules
             ));
         }
+        // AND AGREEMENT BETWEEN THREE LABELS IS NOT AGREEMENT BETWEEN DIGESTS.
+        // Ordered before the equality rule below on purpose, and measured
+        // rather than assumed: with this check placed after it, a truncated
+        // digest was refused for DIFFERING from the others -- true, but it
+        // names the wrong defect, and a reader repairing that row would make
+        // three placeholders agree instead of restoring a digest. How many,
+        // then what kind, then whether they agree.
+        // The two rules above ask how MANY digests there are and whether they
+        // are EQUAL. Neither asks whether they are digests, so `["x","x","x"]`
+        // satisfies both -- three per width, all equal -- and that row is the
+        // whole observation: the digest of the per-module verdict stream at each
+        // width IS the evidence that the widths agreed. The cardinality rule was
+        // added because `all()` over an empty list is vacuously true; this is
+        // the same vacuity one step in, where the list is full and its contents
+        // mean nothing.
+        //
+        // 64 lowercase hex, measured on all three committed digests. Each
+        // element is checked rather than only the first, because the equality
+        // rule above runs BEFORE this one only by placement -- a future reorder
+        // would leave a rule that inspected one element and generalised.
+        if let Some((width, digest)) = self.corpus_digests.iter().enumerate().find(|(_, digest)| {
+            digest.len() != 64
+                || !digest
+                    .chars()
+                    .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        }) {
+            return Err(format!(
+                "row records `{digest}` as the verdict-stream digest for width index {width}, \
+                 which is not a 64-character lowercase hex digest. Three equal placeholders \
+                 satisfy every other rule here while recording no observation at all"
+            ));
+        }
         if !self
             .corpus_digests
             .iter()
@@ -18474,6 +18506,26 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 ..real.clone()
             },
             "empty corpus_fixture_hash",
+        ),
+        (
+            "three equal placeholders where the digests should be",
+            CorpusMatrixReceipt {
+                corpus_digests: vec!["x".to_string(), "x".to_string(), "x".to_string()],
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
+        ),
+        (
+            "one width's digest truncated, the others intact",
+            CorpusMatrixReceipt {
+                corpus_digests: vec![
+                    real.corpus_digests[0].clone(),
+                    real.corpus_digests[1][..63].to_string(),
+                    real.corpus_digests[2].clone(),
+                ],
+                ..real.clone()
+            },
+            "width index 1",
         ),
         (
             "a corpus revision named rather than digested",
