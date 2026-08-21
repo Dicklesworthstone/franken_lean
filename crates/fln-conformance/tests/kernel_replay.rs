@@ -9273,6 +9273,38 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
         "empty module name for",
         "projects to a module name with an empty segment",
     ];
+    // AND THE LIST IS A MIRROR OF THE EMITTER WITH NOTHING BINDING THE TWO. Every
+    // string above is a copy of a refusal the projection actually writes, and the
+    // cells below reason carefully about which fragments discriminate BETWEEN
+    // THOSE COPIES. Reword a refusal at its source and the list goes stale: the
+    // discrimination proofs still pass, about text nothing emits, and the probes
+    // keep identifying exactly one entry of a list that has stopped describing
+    // the code.
+    //
+    // The region ends at this test's own definition, so the copies IN this array
+    // are outside it -- the count check is what proves that rather than assumes
+    // it, the same form used for the census needles: strictly more occurrences in
+    // the file than in the region means at least one copy lies outside, and the
+    // ones outside are these.
+    const PROJECTION_SOURCE: &str = include_str!("kernel_replay.rs");
+    let mirror = PROJECTION_SOURCE
+        .find("fn the_module_projection_refuses_a_path_it_cannot_honestly_name")
+        .expect("this test must be able to locate its own definition");
+    let emitter = &PROJECTION_SOURCE[..mirror];
+    for message in MESSAGES {
+        assert!(
+            emitter.contains(message),
+            "`{message}` is listed here as a refusal of this projection, and the projection no \
+             longer writes it. Either the wording moved and this list is stale, or the refusal \
+             is gone and the cells below are discriminating between messages nothing emits"
+        );
+        assert!(
+            emitter.matches(message).count() < PROJECTION_SOURCE.matches(message).count(),
+            "`{message}` occurs only inside the region this test searches, so the copy in the \
+             array above is being read as the emitter's own"
+        );
+    }
+
     for probe in [
         "is outside",
         "non-normal",
