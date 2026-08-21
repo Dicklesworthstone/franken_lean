@@ -5870,6 +5870,36 @@ fn kr600_803_witness_mk_refuses_a_forged_constructor_safety() {
 }
 
 #[test]
+fn kr600_803_witness_mk_refuses_a_forged_constructor_inductive_owner() {
+    let mut entries = dependent_field_inductive_entries();
+    let constructor = entries[1].declaration();
+    entries[1] = ConstantEntry::new(
+        checker_qualified(&["Witness", "mk"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            constructor.safety(),
+            ConstructorDeclaration::new(checker_name("NotWitness"), 0, 0, 2),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Witness.mk constructor inductive-owner verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_witness_refuses_a_forged_num_indices_count() {
     let mut entries = dependent_field_inductive_entries();
     let declaration = entries[2].declaration();
