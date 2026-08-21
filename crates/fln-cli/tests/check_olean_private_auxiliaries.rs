@@ -122,6 +122,50 @@ fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expecte
     );
 }
 
+fn human_line_suffix<'a>(stdout: &'a str, prefix: &str) -> &'a str {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("human report is missing {prefix:?}: {stdout}"))
+}
+
+fn assert_human_named_residuals(
+    stdout: &str,
+    summary_label: &str,
+    names_label: &str,
+    observed: usize,
+    expected_names: &[&str],
+) {
+    let observed_text = human_line_suffix(stdout, &format!("{summary_label}: "));
+    let actual_observed = observed_text
+        .split_once(" (")
+        .map(|(value, _)| value)
+        .expect("human residual summary has a reporting suffix")
+        .parse::<usize>()
+        .expect("human residual observed count is a usize");
+    assert_eq!(actual_observed, observed, "{stdout}");
+
+    let rendered_names = human_line_suffix(stdout, &format!("{names_label}: "));
+    let actual_names = if rendered_names == "none" {
+        BTreeSet::new()
+    } else {
+        rendered_names
+            .split(", ")
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    };
+    let expected_names = expected_names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_names, expected_names, "{stdout}");
+
+    let omitted = human_line_suffix(stdout, &format!("{names_label} omitted: "))
+        .parse::<usize>()
+        .expect("human residual omitted count is a usize");
+    assert_eq!(omitted, 0, "{stdout}");
+}
+
 #[test]
 fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part() {
     let proposition = fln::Name::from_components(["CliPrivateReport", "P"]);
@@ -526,9 +570,20 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stderr.is_empty());
     assert!(json.stdout.contains("\"companionPartsLoaded\":true"));
     assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":29"));
-    assert!(json.stdout.contains(
-        "\"decodedPrivateLoopAuxiliaries\":{\"observed\":7,"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "decodedPrivateLoopAuxiliaries",
+        7,
+        &[
+            "_private.CliPrivateReport.0.loop",
+            "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "coreObservablesLoopResiduals",
@@ -576,12 +631,29 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0.loop.eq_def",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"privateEqNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateUnsafeRecSunfoldResiduals\":{\"observed\":10,"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateEqNResiduals",
+        1,
+        &["_private.CliPrivateReport.0.eq_1"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateUnsafeRecSunfoldResiduals",
+        10,
+        &[
+            "_private.CliPrivateReport.0._sunfold",
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateSunfoldFResiduals",
@@ -591,15 +663,34 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.CliPrivateReport.0._sunfold",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"privateSunfoldResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0._sunfold\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateUnsafeRecResiduals\":{\"observed\":9,"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateLoopProofResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop._proof_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateSunfoldResiduals",
+        1,
+        &["_private.CliPrivateReport.0._sunfold"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateUnsafeRecResiduals",
+        9,
+        &[
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateLoopProofResiduals",
+        1,
+        &["_private.CliPrivateReport.0.loop._proof_1"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateStandaloneProofNResiduals",
@@ -621,12 +712,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"leanNameBeqMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"listToArrayAuxMatchResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "leanNameBeqMatchResiduals",
+        1,
+        &["_private.Init.Prelude.0.Lean.Name.beq.match_1"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "listToArrayAuxMatchResiduals",
+        1,
+        &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "coreObservablesSyntaxMatchResiduals",
@@ -645,9 +742,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"arrayMapMGoResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.Array.BasicAux.0.Array.mapM'.go\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "arrayMapMGoResiduals",
+        1,
+        &["_private.Init.Data.Array.BasicAux.0.Array.mapM'.go"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateGoResiduals",
@@ -677,12 +777,18 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"privateLoopMatchOneResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateLoopMatchNResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateLoopMatchOneResiduals",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateLoopMatchNResiduals",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateLoopUnsafeRecResiduals",
@@ -692,24 +798,36 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
     );
-    assert!(json.stdout.contains(
-        "\"privateLoopEqDefResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateInsertIdxLoopUnaryResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
-    assert!(json.stdout.contains(
-        "\"privateUnaryResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateLoopEqDefResiduals",
+        1,
+        &["_private.CliPrivateReport.0.loop.eq_def"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateInsertIdxLoopUnaryResiduals",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateUnaryResiduals",
+        1,
+        &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateMergeSortTRUnsafeRecResiduals",
         1,
         &["_private.CliPrivateReport.0.mergeSortTR._unsafe_rec"],
     );
-    assert!(json.stdout.contains(
-        "\"privateRunUnsafeRecResiduals\":{\"observed\":1,\"names\":[{\"name\":\"_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    assert_json_named_residuals(
+        &json.stdout,
+        "privateRunUnsafeRecResiduals",
+        1,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec"],
+    );
     assert_json_named_residuals(
         &json.stdout,
         "privateGoUnsafeRecResiduals",
@@ -738,284 +856,133 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             .stdout
             .contains("decoded _private auxiliaries: 29 (reporting only; not a G1 claim)")
     );
-    assert!(human.stdout.contains(
-        "decoded _private.loop auxiliaries: 7 (reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private.loop auxiliary names: _private.CliPrivateReport.0.loop"));
-    assert!(human
-        .stdout
-        .contains("decoded _private.loop auxiliary names omitted: 0"));
-    assert!(human.stdout.contains(
-        "core-observables .loop residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "core-observables .loop residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("core-observables .loop residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private eq_def/match_N residuals: 8 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private eq_def/match_N residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.match_1, _private.CliPrivateReport.0.loop.eq_def, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private eq_def/match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private match_N residuals: 6 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private match_N residual names: _private.CliPrivateReport.0.match_1, _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1, _private.Init.Prelude.0.Lean.Name.beq.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private eq_def residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private eq_def residual names: _private.CliPrivateReport.0.eq_def, _private.CliPrivateReport.0.loop.eq_def"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private eq_def residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private eq_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private eq_N residual names: _private.CliPrivateReport.0.eq_1"));
-    assert!(human
-        .stdout
-        .contains("decoded _private eq_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec/_sunfold residuals: 10 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unsafe_rec/_sunfold residual names: _private.CliPrivateReport.0._sunfold"));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unsafe_rec/_sunfold residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private _sunfold/_f residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private _sunfold/_f residual names: _private.CliPrivateReport.0._f, _private.CliPrivateReport.0._sunfold"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private _sunfold/_f residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private _sunfold residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private _sunfold residual names: _private.CliPrivateReport.0._sunfold"));
-    assert!(human
-        .stdout
-        .contains("decoded _private _sunfold residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private _unsafe_rec residuals: 9 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unsafe_rec residual names: _private.CliPrivateReport.0._unsafe_rec"));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .loop._proof_* residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .loop._proof_* residual names: _private.CliPrivateReport.0.loop._proof_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop._proof_* residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded standalone _private _proof_N residuals: 5 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded standalone _private _proof_N residual names: _private.CliPrivateReport.0._proof_2, _private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1, _private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2, _private.Init.Prelude.0.Lean.Name.hash._proof_1, _private.Init.Prelude.0.Lean.Name.hash._proof_2"));
-    assert!(human
-        .stdout
-        .contains("decoded standalone _private _proof_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private Lean.Name.hash._proof_N residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private Lean.Name.hash._proof_N residual names: _private.Init.Prelude.0.Lean.Name.hash._proof_1, _private.Init.Prelude.0.Lean.Name.hash._proof_2"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private Lean.Name.hash._proof_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private Lean.Name.beq.match_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private Lean.Name.beq.match_N residual names: _private.Init.Prelude.0.Lean.Name.beq.match_1"));
-    assert!(human
-        .stdout
-        .contains("decoded _private Lean.Name.beq.match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private List.toArrayAux.match_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private List.toArrayAux.match_N residual names: _private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"));
-    assert!(human
-        .stdout
-        .contains("decoded _private List.toArrayAux.match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "core-observables Lean.Syntax match_N residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "core-observables Lean.Syntax match_N residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("core-observables Lean.Syntax match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private Array.mapM'._proof_N residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private Array.mapM'._proof_N residual names: _private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1, _private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private Array.mapM'._proof_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private Array.mapM'.go residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private Array.mapM'.go residual names: _private.Init.Data.Array.BasicAux.0.Array.mapM'.go"));
-    assert!(human
-        .stdout
-        .contains("decoded _private Array.mapM'.go residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .go residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .go residual names: _private.Init.Data.Array.BasicAux.0.Array.mapM'.go, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .go residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names: _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec, _private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private String.findLeadingSpacesSize _unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private List.MergeSort companion-only _unsafe_rec residuals: 3 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private List.MergeSort companion-only _unsafe_rec residual names: _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private List.MergeSort companion-only _unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .loop.match_1 residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .loop.match_1 residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop.match_1 residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .loop.match_N residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .loop.match_N residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop.match_N residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .loop._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .loop._unsafe_rec residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop._unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .loop.eq_def residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop.eq_def residual names: _private.CliPrivateReport.0.loop.eq_def"));
-    assert!(human
-        .stdout
-        .contains("decoded _private .loop.eq_def residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private insertIdx.loop._unary residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private insertIdx.loop._unary residual names: _private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private insertIdx.loop._unary residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private _unary residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unary residual names: _private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"));
-    assert!(human
-        .stdout
-        .contains("decoded _private _unary residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private mergeSortTR._unsafe_rec residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private mergeSortTR._unsafe_rec residual names: _private.CliPrivateReport.0.mergeSortTR._unsafe_rec"));
-    assert!(human
-        .stdout
-        .contains("decoded _private mergeSortTR._unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .run._unsafe_rec residuals: 1 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .run._unsafe_rec residual names: _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .run._unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "decoded _private .go._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "decoded _private .go._unsafe_rec residual names: _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec, _private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("decoded _private .go._unsafe_rec residual names omitted: 0"));
-    assert!(human.stdout.contains(
-        "core-observables Lean.Syntax .loop._unsafe_rec residuals: 2 (decoded companion names; reporting only; not a G1 claim)"
-    ));
-    assert!(human.stdout.contains(
-        "core-observables Lean.Syntax .loop._unsafe_rec residual names: _private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec, _private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"
-    ));
-    assert!(human
-        .stdout
-        .contains("core-observables Lean.Syntax .loop._unsafe_rec residual names omitted: 0"));
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private.loop auxiliaries", "decoded _private.loop auxiliary names", 7,
+        &[
+            "_private.CliPrivateReport.0.loop", "_private.CliPrivateReport.0.loop.eq_def",
+            "_private.CliPrivateReport.0.loop._proof_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "core-observables .loop residuals", "core-observables .loop residual names", 3,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private eq_def/match_N residuals", "decoded _private eq_def/match_N residual names", 8,
+        &[
+            "_private.CliPrivateReport.0.eq_def", "_private.CliPrivateReport.0.loop.eq_def", "_private.CliPrivateReport.0.match_1",
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1", "_private.Init.Prelude.0.Lean.Name.beq.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private match_N residuals", "decoded _private match_N residual names", 6,
+        &[
+            "_private.CliPrivateReport.0.match_1", "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1",
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private eq_def residuals", "decoded _private eq_def residual names", 2,
+        &["_private.CliPrivateReport.0.eq_def", "_private.CliPrivateReport.0.loop.eq_def"],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private eq_N residuals", "decoded _private eq_N residual names", 1, &["_private.CliPrivateReport.0.eq_1"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private _unsafe_rec/_sunfold residuals", "decoded _private _unsafe_rec/_sunfold residual names", 10,
+        &[
+            "_private.CliPrivateReport.0._sunfold", "_private.CliPrivateReport.0._unsafe_rec", "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec", "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private _sunfold/_f residuals", "decoded _private _sunfold/_f residual names", 2,
+        &["_private.CliPrivateReport.0._f", "_private.CliPrivateReport.0._sunfold"],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private _sunfold residuals", "decoded _private _sunfold residual names", 1, &["_private.CliPrivateReport.0._sunfold"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private _unsafe_rec residuals", "decoded _private _unsafe_rec residual names", 9,
+        &[
+            "_private.CliPrivateReport.0._unsafe_rec", "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec", "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private .loop._proof_* residuals", "decoded _private .loop._proof_* residual names", 1, &["_private.CliPrivateReport.0.loop._proof_1"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded standalone _private _proof_N residuals", "decoded standalone _private _proof_N residual names", 5,
+        &[
+            "_private.CliPrivateReport.0._proof_2", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2", "_private.Init.Prelude.0.Lean.Name.hash._proof_1",
+            "_private.Init.Prelude.0.Lean.Name.hash._proof_2",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private Lean.Name.hash._proof_N residuals", "decoded _private Lean.Name.hash._proof_N residual names", 2,
+        &["_private.Init.Prelude.0.Lean.Name.hash._proof_1", "_private.Init.Prelude.0.Lean.Name.hash._proof_2"],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private Lean.Name.beq.match_N residuals", "decoded _private Lean.Name.beq.match_N residual names", 1, &["_private.Init.Prelude.0.Lean.Name.beq.match_1"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private List.toArrayAux.match_N residuals", "decoded _private List.toArrayAux.match_N residual names", 1, &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout, "core-observables Lean.Syntax match_N residuals", "core-observables Lean.Syntax match_N residual names", 2,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private Array.mapM'._proof_N residuals", "decoded _private Array.mapM'._proof_N residual names", 2,
+        &["_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1", "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2"],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private Array.mapM'.go residuals", "decoded _private Array.mapM'.go residual names", 1, &["_private.Init.Data.Array.BasicAux.0.Array.mapM'.go"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private .go residuals", "decoded _private .go residual names", 3,
+        &[
+            "_private.Init.Data.Array.BasicAux.0.Array.mapM'.go", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private String.findLeadingSpacesSize _unsafe_rec residuals", "decoded _private String.findLeadingSpacesSize _unsafe_rec residual names", 2,
+        &[
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
+            "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private List.MergeSort companion-only _unsafe_rec residuals", "decoded _private List.MergeSort companion-only _unsafe_rec residual names", 3,
+        &[
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec",
+            "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private .loop.match_1 residuals", "decoded _private .loop.match_1 residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private .loop.match_N residuals", "decoded _private .loop.match_N residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private .loop._unsafe_rec residuals", "decoded _private .loop._unsafe_rec residual names", 2,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"],
+    );
+    assert_human_named_residuals(&human.stdout, "decoded _private .loop.eq_def residuals", "decoded _private .loop.eq_def residual names", 1, &["_private.CliPrivateReport.0.loop.eq_def"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private insertIdx.loop._unary residuals", "decoded _private insertIdx.loop._unary residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private _unary residuals", "decoded _private _unary residual names", 1, &["_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private mergeSortTR._unsafe_rec residuals", "decoded _private mergeSortTR._unsafe_rec residual names", 1, &["_private.CliPrivateReport.0.mergeSortTR._unsafe_rec"]);
+    assert_human_named_residuals(&human.stdout, "decoded _private .run._unsafe_rec residuals", "decoded _private .run._unsafe_rec residual names", 1, &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeSortTR.run._unsafe_rec"]);
+    assert_human_named_residuals(
+        &human.stdout, "decoded _private .go._unsafe_rec residuals", "decoded _private .go._unsafe_rec residual names", 2,
+        &["_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.mergeTR.go._unsafe_rec", "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec"],
+    );
+    assert_human_named_residuals(
+        &human.stdout, "core-observables Lean.Syntax .loop._unsafe_rec residuals", "core-observables Lean.Syntax .loop._unsafe_rec residual names", 2,
+        &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec"],
+    );
     assert!(human.stdout.contains("G1 satisfied: no"));
 }
