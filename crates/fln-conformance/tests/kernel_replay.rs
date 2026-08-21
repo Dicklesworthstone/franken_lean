@@ -17397,6 +17397,33 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         stale_scan_form("The corpus-scale matrix Doesn't exist").contains("does not exist"),
         "and this is the order that catches it: lowercase, then expand"
     );
+    // A WRAP IS NOT A DISAGREEMENT, AND AN EXACT COUNT IS STILL AN EXACT COUNT.
+    // The marker check compares whitespace-free forms, so reflowing the sentence
+    // cannot redden it. Measured against the rule this replaces: the wrapped
+    // form was false, which is a guard reddening over a claim nobody changed.
+    let marker_now = "observations recorded: 1, latest observed 2026-07-26";
+    let wrapped_doc =
+        "the corpus lane has observations recorded: 1, latest\nobserved 2026-07-26 at the pin\n";
+    assert!(
+        !wrapped_doc.contains(marker_now),
+        "this is the reading that reddens: a raw `contains` cannot see a phrase across a line \
+         break, and a reflow is not an edit to the claim"
+    );
+    assert!(
+        whitespace_free(wrapped_doc).contains(&whitespace_free(marker_now)),
+        "and this is the reading that does not: the document says exactly what the receipt says"
+    );
+    // AND THE CONTROL AGAINST THAT WIDENING: THE NUMBERS STILL HAVE TO MATCH.
+    for disagreeing in [
+        "observations recorded: 2, latest observed 2026-07-26",
+        "observations recorded: 1, latest observed 2026-07-27",
+    ] {
+        assert!(
+            !whitespace_free(wrapped_doc).contains(&whitespace_free(disagreeing)),
+            "ignoring whitespace must not make a different count or a different date read as \
+             the same marker: {disagreeing}"
+        );
+    }
     // A CONTRACTION IS A SPELLING, AND THE STALE RULE WAS WRITTEN AGAINST ONE
     // WORDING. Measured against the rule this replaces: each of these was
     // invisible, and each is the natural way to write the retracted claim.
@@ -17898,8 +17925,18 @@ fn the_corpus_matrix_observation_is_retained_and_bound_to_the_current_pin() {
     for doc in SCANNED_DOCUMENTS {
         let doc_text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
+        // COMPARED WITH THE WHITESPACE REMOVED, BECAUSE A HARD WRAP IS NOT A
+        // DISAGREEMENT. The marker is a six-word phrase and this was a raw
+        // `contains` over the file: reflow the paragraph so "latest" ends a line
+        // and the document still says exactly what the receipt says, while this
+        // guard reports that the documents and the evidence file disagree about
+        // how much evidence exists. Both documents carry it unwrapped today --
+        // measured, and `rg` finds no line ending mid-marker -- so nothing moves
+        // now; the point is that an editor reflowing a paragraph must not be
+        // able to redden a claim it did not change. Same reasoning, same
+        // normalisation, as the claim scan two guards up.
         assert!(
-            doc_text.contains(&marker),
+            whitespace_free(&doc_text).contains(&whitespace_free(&marker)),
             "{doc} does not carry `{marker}`, but the retained receipt at {} holds {} \
              observation(s), the most recent taken on {}. The documents and the evidence file \
              disagree about how much evidence exists or when it was taken. The count is the \
