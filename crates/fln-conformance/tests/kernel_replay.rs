@@ -13824,6 +13824,30 @@ fn claim_sites_hidden_by_a_line_break(text: &str, needle: &str) -> usize {
     collapsed.saturating_sub(per_line)
 }
 
+/// Where a stale claim about the matrix straddles a line break.
+///
+/// The sibling of `claim_sites_hidden_by_a_line_break`, for the other scan in
+/// the same loop. That one asks whether ONE phrase is visible; this one asks
+/// whether a CONJUNCTION is -- the stale rule fires only when a single line
+/// mentions the matrix and calls it missing, so "the corpus-scale matrix" on one
+/// line and "does not exist" on the next is caught by neither half.
+///
+/// Returns the 1-based number of the first line of such a pair. Pairs where one
+/// line alone already states both are excluded: those belong to the per-line
+/// rule, and reporting them here would blame the wrong line.
+fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let states_it = |line: &str| line.contains("matrix") && stale.iter().any(|s| line.contains(s));
+    lines.windows(2).enumerate().find_map(|(index, pair)| {
+        let joined = format!("{} {}", pair[0], pair[1]);
+        let split = joined.contains("matrix")
+            && stale.iter().any(|s| joined.contains(s))
+            && !states_it(pair[0])
+            && !states_it(pair[1]);
+        split.then_some(index + 1)
+    })
+}
+
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
     let rows = text
         .lines()
@@ -16956,10 +16980,33 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
          of occurrences is what makes them look hidden"
     );
 
+    // THE STALE SCAN IS PER-LINE TOO, and it wants a CONJUNCTION: a line must
+    // both mention the matrix and call it missing. Split across a break, neither
+    // half does. Synthetic, because no pair in either document straddles one
+    // today -- measured -- so an empty population needs a planted member.
+    assert_eq!(
+        stale_claim_split_across_lines("the corpus-scale matrix\ndoes not exist yet\n", &STALE),
+        Some(1),
+        "a stale claim split across a break must be found, or the rule below cannot fire"
+    );
+    assert_eq!(
+        stale_claim_split_across_lines("the matrix does not exist\nand that is that\n", &STALE),
+        None,
+        "a line that states both belongs to the per-line rule; reporting it here would blame the \
+         wrong line for a claim that one line already makes"
+    );
+
     let mut checked = 0usize;
     for doc in ["AGENTS.md", "README.md"] {
         let text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
+        assert_eq!(
+            stale_claim_split_across_lines(&text, &STALE),
+            None,
+            "{doc} calls the corpus-scale matrix missing across a line break, where the stale \
+             scan needs both halves on one line: neither half states it, so the document keeps a \
+             retracted description while this guard reports green"
+        );
         assert_eq!(
             claim_sites_hidden_by_a_line_break(&text, "{1, 8, 32}"),
             0,
