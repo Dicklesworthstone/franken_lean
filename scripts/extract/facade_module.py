@@ -1950,6 +1950,14 @@ def published_bytes_error(out, text, what="the facade"):
                 "the acceptance digest of empty is still a digest, and the "
                 "coverage floor counts a set rather than the artifact, so a "
                 "zero-byte publication passes every other check in this file")
+    if os.path.islink(out):
+        return (f"{what} at {out} is a SYMLINK to "
+                f"{os.path.realpath(out)}. Every byte this run compared, and every "
+                "count the manifest publishes, would describe a file at that other "
+                "path -- the leftover check looks beside the link rather than "
+                "beside the bytes, and `git commit -o` carries the link, not the "
+                "content. Nothing else here would have noticed: reading through a "
+                "symlink is exactly as successful as reading the file")
     try:
         with open(out, "rb") as fh:
             raw = fh.read()
@@ -2716,6 +2724,14 @@ def self_test():
     _surrogate = "axiom X : Type\n" + chr(0xD800)
     case("bytes/text-encodable", unencodable_text_error(text), False)
     case("bytes/text-not-encodable", unencodable_text_error(_surrogate), True)
+    _real = at("real-target.lean", text)
+    _link = os.path.join(work, "linked-artifact.lean")
+    if not os.path.islink(_link):
+        os.symlink(_real, _link)
+    case("bytes/symlinked-artifact-refused",
+         published_bytes_error(_link, text), True)
+    case("bytes/regular-file-still-passes",
+         published_bytes_error(_real, text), False)
     case("bytes/empty-artifact-refused",
          published_bytes_error(at("empty.lean", ""), ""), True)
     case("bytes/empty-text-against-real-file",
