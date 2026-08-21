@@ -7528,3 +7528,179 @@ fn the_whole_library_postulates_exactly_fifteen_axioms_in_two_modules() {
         "the postulate set must span both safety values"
     );
 }
+
+/// Postulates that no declaration in the library references at all.
+const UNREFERENCED_POSTULATES: &[&str] = &[
+    "Lean.ofReduceBool",
+    "Lean.ofReduceNat",
+    "Quot.lcInv",
+    "isScalarObj",
+    "lcAny",
+    "lcCast",
+    "lcErased",
+    "lcUnreachable",
+    "lcVoid",
+    "sorryAx",
+];
+
+/// Every use of a postulate that IS referenced: `(axiom, module, declaration)`.
+const POSTULATE_USES: &[(&str, &str, &str)] = &[
+    ("Lean.trustCompiler", "Init.Core", "Lean.reduceBool"),
+    ("Lean.trustCompiler", "Init.Core", "Lean.reduceNat"),
+    (
+        "lcProof",
+        "Init.Data.Array.Basic",
+        "_private.Init.Data.Array.Basic.0.Array.anyMUnsafe.any",
+    ),
+    (
+        "lcProof",
+        "Init.Data.Array.Basic",
+        "_private.Init.Data.Array.Basic.0.Array.foldlMUnsafe.fold",
+    ),
+    (
+        "lcProof",
+        "Init.Data.Array.Basic",
+        "_private.Init.Data.Array.Basic.0.Array.foldrMUnsafe.fold",
+    ),
+    (
+        "lcProof",
+        "Init.Data.Array.Basic",
+        "_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop",
+    ),
+    (
+        "lcProof",
+        "Init.Data.Array.Basic",
+        "_private.Init.Data.Array.Basic.0.Array.mapMUnsafe.map",
+    ),
+    (
+        "lcProof",
+        "Init.Data.ByteArray.Basic",
+        "ByteArray.foldlMUnsafe.fold",
+    ),
+    (
+        "lcProof",
+        "Init.Data.ByteArray.Basic",
+        "ByteArray.forInUnsafe.loop",
+    ),
+    (
+        "lcProof",
+        "Init.Data.FloatArray.Basic",
+        "_private.Init.Data.FloatArray.Basic.0.FloatArray.foldlMUnsafe.fold",
+    ),
+    (
+        "lcProof",
+        "Init.Data.FloatArray.Basic",
+        "_private.Init.Data.FloatArray.Basic.0.FloatArray.forInUnsafe.loop",
+    ),
+    ("lcProof", "Init.Prelude", "unsafeCast._proof_1"),
+];
+
+/// Who USES the postulates — the other half of the trusted base.
+///
+/// The cell above establishes WHAT the library postulates: fifteen axioms in
+/// two modules. That is half the question. A postulate nothing references
+/// cannot affect a single theorem, and a postulate everything references is the
+/// whole trusted base in practice, and the artifact says which is which.
+///
+/// Measured over all 600 census modules at private level, walking every stored
+/// expression, for the twelve non-classical postulates:
+///
+///   TEN are referenced by NOTHING — including `sorryAx`. No declaration in the
+///     pinned `Init` library depends on a sorry, so the escape hatch is present
+///     and provably unused
+///   `Lean.trustCompiler` has exactly TWO users, both in `Init.Core`, and they
+///     are `Lean.reduceBool` and `Lean.reduceNat` — the compiler-trust bridge,
+///     used by precisely the two declarations named after it
+///   `lcProof` has exactly TEN users across four modules, and every one is an
+///     UNSAFE implementation auxiliary: the `*Unsafe` fold/loop/map bodies plus
+///     `unsafeCast._proof_1`
+///
+/// `propext`, `Quot.sound` and `Classical.choice` are deliberately outside this
+/// scan. They are the axioms the doctrine keeps, they are referenced widely,
+/// and counting their uses would say nothing. The twelve here are the ones
+/// whose use would be a finding.
+///
+/// Every user is pinned by NAME, not by count. A new declaration reaching for
+/// `lcProof` is a change in what rests on the unsafe base; a first user of
+/// `sorryAx` is a different kind of event entirely, and neither should surface
+/// as a number moving from 10 to 11.
+///
+/// COST: like the postulate cell above, this decodes all 600 modules at private
+/// level and additionally walks every stored expression. The two are the
+/// heaviest cells in the file and do the same corpus pass; if that pass has to
+/// be paid once rather than twice, merge them rather than dropping either — the
+/// negative halves are what neither can be sampled for.
+#[test]
+fn only_two_postulates_are_referenced_and_sorry_is_not_one_of_them() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let watched: BTreeSet<&str> = UNREFERENCED_POSTULATES
+        .iter()
+        .copied()
+        .chain(POSTULATE_USES.iter().map(|(axiom, _, _)| *axiom))
+        .collect();
+    assert_eq!(
+        watched.len(),
+        12,
+        "the twelve non-classical postulates are what this cell watches"
+    );
+
+    let mut uses: Vec<(String, String, String)> = Vec::new();
+    for module in &modules {
+        let (infos, _) = decode_at(&lib, module, Level::Private);
+        for info in &infos {
+            let mut referenced = BTreeSet::new();
+            for expr in declaration_expressions(info) {
+                referenced.append(&mut referenced_constants(expr));
+            }
+            for axiom in referenced
+                .iter()
+                .filter(|name| watched.contains(name.as_str()))
+            {
+                uses.push((
+                    axiom.clone(),
+                    module.clone(),
+                    info.name().to_display_string(),
+                ));
+            }
+        }
+    }
+    uses.sort();
+
+    let expected: Vec<(String, String, String)> = POSTULATE_USES
+        .iter()
+        .map(|(axiom, module, declaration)| {
+            (
+                (*axiom).to_owned(),
+                (*module).to_owned(),
+                (*declaration).to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        uses, expected,
+        "every use of a postulate in the library, by name — a new one is a change in what \
+         rests on the unsafe base"
+    );
+
+    let referenced: BTreeSet<&String> = uses.iter().map(|(axiom, _, _)| axiom).collect();
+    let silent: Vec<&&str> = UNREFERENCED_POSTULATES
+        .iter()
+        .filter(|axiom| referenced.contains(&(**axiom).to_owned()))
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these postulates are supposed to be referenced by nothing: {silent:?}"
+    );
+
+    // Anti-vacuity: the walk must actually find references. A reference scan
+    // that returned nothing would satisfy every "referenced by nothing" claim
+    // above and is the only way this cell can go quietly empty.
+    assert_eq!(
+        uses.len(),
+        12,
+        "the reference walk must reach the uses that do exist"
+    );
+}
