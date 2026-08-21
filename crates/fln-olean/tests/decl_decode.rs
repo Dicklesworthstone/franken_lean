@@ -11720,6 +11720,342 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// What the `constants`-rooted holder IS: this module's declaration 43.
+///
+/// `83016935` split the link from the node - the link reaches three roots, the
+/// node reaches `entries` alone - and left the holders themselves unread. The
+/// `constants`-rooted one is the interesting half, because it is the object
+/// that carries the name out of `entries`, and its identity was never measured.
+///
+/// It is a `ConstantVal`, and NOT because of its shape. `c4cbf83c` was reddened
+/// for reading `(0, 3, 32)` as identifying `ConstantVal`, and this cell does not
+/// repeat that: the object is reached by INDEXING, from `constants[43]` through
+/// the `ConstantInfo` wrapper and its payload, and its name field is then the
+/// same object as the link.
+///
+/// THE FACT THAT MAKES IT MORE THAN ONE OBJECT'S BIOGRAPHY. `constNames[i]` and
+/// the `ConstantVal` under `constants[i]` are the SAME NAME OBJECT, at every
+/// index of every module here - 2,222 of 2,222 pooled, none unresolved. The two
+/// arrays do not merely agree on spelling, they share storage. So a decoder that
+/// let the two arrays drift apart, or indexed one by the other's position, is
+/// producing declarations under the wrong names, and this is the identity that
+/// would catch it.
+///
+/// THAT IS THE RESOLUTION OF `83016935`. The name escapes `entries` because
+/// `lcErased` IS A DECLARATION OF THIS MODULE - element 43 of the name array
+/// and element 43 of the declaration array - while the compiler structure in
+/// `entries` references the very same name object. Nothing crosses the boundary
+/// except a shared pointer, which is why `1dd7c288`'s object-level exclusion
+/// survives it untouched.
+///
+/// DISCRIMINATING POWER, because index-wise identity would be worthless if the
+/// candidates were few: every module's name objects are pairwise DISTINCT -
+/// 2,204 distinct objects across 2,204 indices in Prelude - so there is exactly
+/// one right answer per index and 2,203 wrong ones.
+///
+/// THE DENOMINATOR IS THE WHOLE ARRAY, asserted rather than assumed. The walk
+/// counts an unresolved index instead of skipping it, and the unresolved count
+/// is pinned at zero, so the 2,222 cannot be a filtered sample of a larger
+/// population - the trap `bs5o` fell into.
+///
+/// ONE THING THAT IS NOT UNIFORM, and it is pinned per module rather than
+/// blanket. In the three modules that declare anything the two arrays are
+/// DIFFERENT objects, so the shared-name-object finding is not the trivial
+/// consequence of one array being the other. In `Init.olean`, which declares
+/// nothing, they are THE SAME OBJECT - one empty array, shared. A blanket
+/// "the arrays are distinct" would have been false, and this file has now been
+/// reddened four times for stating a convenient reading as a measured one.
+///
+/// POPULATION SCOPE: the invariant is pooled over all four modules and their
+/// lengths are pinned individually; the index-43 facts are `Init/Prelude.olean`
+/// alone, asserted rather than left implicit.
+#[test]
+fn the_constants_rooted_holder_is_this_modules_declaration() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut lengths: Vec<(String, u64, u64)> = Vec::new();
+    let mut same_object: Vec<(String, bool)> = Vec::new();
+    let mut shared = 0usize;
+    let mut pooled = 0usize;
+    let mut unresolved = 0usize;
+    let mut distinct: Vec<(String, usize, usize)> = Vec::new();
+    let mut link_indices: Vec<u64> = Vec::new();
+    let mut holder_is_declaration = 0usize;
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let names_array = resolve(word_at(bytes, root + 16)).expect("constNames array");
+        let consts_array = resolve(word_at(bytes, root + 24)).expect("constants array");
+        let names_len = word_at(bytes, names_array + 8);
+        let consts_len = word_at(bytes, consts_array + 8);
+        lengths.push((module.clone(), names_len, consts_len));
+        same_object.push((module.clone(), names_array == consts_array));
+
+        // The shared-storage invariant, index by index.
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut counted = 0usize;
+        for i in 0..names_len {
+            let slot = 24 + 8 * i as usize;
+            let named = resolve(word_at(bytes, names_array + slot));
+            let info = resolve(word_at(bytes, consts_array + slot));
+            // A `ConstantInfo` wraps one payload; every payload's slot 0 is its
+            // `ConstantVal`, whichever variant it is.
+            let value = info
+                .filter(|&off| at.get(&off).is_some_and(|o| o.other >= 1))
+                .and_then(|off| resolve(word_at(bytes, off + 8)))
+                .and_then(|payload| resolve(word_at(bytes, payload + 8)));
+            let Some((named, value)) = named.zip(value) else {
+                // Counted, never skipped: a skipped index would shrink the
+                // denominator and turn this walk into a sampler.
+                unresolved += 1;
+                continue;
+            };
+            counted += 1;
+            seen.insert(named);
+            if resolve(word_at(bytes, value + 8)) == Some(named) {
+                shared += 1;
+            }
+        }
+        pooled += counted;
+        distinct.push((module.clone(), seen.len(), counted));
+
+        if module != "Init/Prelude.olean" {
+            continue;
+        }
+
+        // Prelude only: rebuild the closure, take its one `tag 4` node, and
+        // follow that node's name link back into the two arrays.
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            let Some(seed) = resolve(word_at(bytes, record + 8 + 8 * 4)) else {
+                continue;
+            };
+            if shape(seed) != Some((0, 2)) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, seed + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(ten) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                let Some(below) = resolve(word_at(bytes, ten + 8 + 8)) else {
+                    continue;
+                };
+                for k in 0..word_at(bytes, below + 8) {
+                    if let Some(element) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        eight.insert(element);
+                    }
+                }
+            }
+        }
+        let mut closure: BTreeSet<usize> = BTreeSet::new();
+        for &element in &eight {
+            closure.extend(reachable_from(bytes, base, base + element as u64));
+        }
+        let node = closure
+            .iter()
+            .copied()
+            .find(|&off| shape(off) == Some((4, 2)))
+            .expect("the one `tag 4` node");
+        let link = resolve(word_at(bytes, node + 8)).expect("its name link");
+
+        for i in 0..names_len {
+            if resolve(word_at(bytes, names_array + 24 + 8 * i as usize)) == Some(link) {
+                link_indices.push(i);
+            }
+        }
+        for &i in &link_indices {
+            let slot = 24 + 8 * i as usize;
+            let value = resolve(word_at(bytes, consts_array + slot))
+                .and_then(|off| resolve(word_at(bytes, off + 8)))
+                .and_then(|payload| resolve(word_at(bytes, payload + 8)))
+                .expect("the declaration record at that index");
+            // The holder `83016935` found under `constants` is exactly this.
+            if resolve(word_at(bytes, value + 8)) == Some(link) {
+                holder_is_declaration += 1;
+            }
+        }
+    }
+
+    // The arrays are the same length in every module, empty one included.
+    assert_eq!(
+        lengths
+            .iter()
+            .map(|(m, n, c)| (m.as_str(), *n, *c))
+            .collect::<Vec<_>>(),
+        if prelude_loaded {
+            vec![
+                ("Init.olean", 0, 0),
+                ("Init.BinderNameHint.olean", 2, 2),
+                ("Init.SizeOfLemmas.olean", 16, 16),
+                ("Init/Prelude.olean", 2204, 2204),
+            ]
+        } else {
+            vec![
+                ("Init.olean", 0, 0),
+                ("Init.BinderNameHint.olean", 2, 2),
+                ("Init.SizeOfLemmas.olean", 16, 16),
+            ]
+        },
+        "`constNames` and `constants` have equal length in each module"
+    );
+
+    // Not blanket: distinct arrays wherever anything is declared, one shared
+    // empty array where nothing is.
+    assert_eq!(
+        same_object
+            .iter()
+            .map(|(m, same)| (m.as_str(), *same))
+            .collect::<Vec<_>>(),
+        if prelude_loaded {
+            vec![
+                ("Init.olean", true),
+                ("Init.BinderNameHint.olean", false),
+                ("Init.SizeOfLemmas.olean", false),
+                ("Init/Prelude.olean", false),
+            ]
+        } else {
+            vec![
+                ("Init.olean", true),
+                ("Init.BinderNameHint.olean", false),
+                ("Init.SizeOfLemmas.olean", false),
+            ]
+        },
+        "the two roots are DIFFERENT array objects wherever the module declares \
+         anything, so the shared-name-object finding below is not the trivial \
+         consequence of one array being the other. `Init.olean` declares \
+         nothing and its two roots are the SAME empty array - pinned per module \
+         because a blanket claim either way is false"
+    );
+
+    // The denominator is the whole array.
+    assert_eq!(
+        unresolved, 0,
+        "every index resolved to a name and a declaration record, so the pooled \
+         count below is the whole population and not a filtered sample of it"
+    );
+
+    // The invariant: same index, same NAME OBJECT.
+    let expected = if prelude_loaded { 2222 } else { 18 };
+    assert_eq!(
+        (shared, pooled),
+        (expected, expected),
+        "`constNames[i]` and the `ConstantVal` under `constants[i]` are the SAME \
+         OBJECT at every index of every module - the arrays share storage rather \
+         than merely agreeing on spelling. A decoder that let them drift, or \
+         indexed one by the other's position, would produce declarations under \
+         the wrong names and would fail here"
+    );
+
+    // Discriminating power: one right answer per index, and many wrong ones.
+    assert_eq!(
+        distinct
+            .iter()
+            .map(|(m, d, c)| (m.as_str(), *d, *c))
+            .collect::<Vec<_>>(),
+        if prelude_loaded {
+            vec![
+                ("Init.olean", 0, 0),
+                ("Init.BinderNameHint.olean", 2, 2),
+                ("Init.SizeOfLemmas.olean", 16, 16),
+                ("Init/Prelude.olean", 2204, 2204),
+            ]
+        } else {
+            vec![
+                ("Init.olean", 0, 0),
+                ("Init.BinderNameHint.olean", 2, 2),
+                ("Init.SizeOfLemmas.olean", 16, 16),
+            ]
+        },
+        "the name objects are pairwise DISTINCT in every module - as many \
+         distinct objects as indices - so index-wise identity has exactly one \
+         right answer out of 2,204 in Prelude and is not something a wrong \
+         decoder could hit by accident"
+    );
+    assert!(
+        pooled >= 100,
+        "anti-vacuity: the pooled population must stay large enough for the \
+         base rate above to mean anything, got {pooled}"
+    );
+
+    if !prelude_loaded {
+        assert!(
+            link_indices.is_empty(),
+            "the closure is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // The link is a declaration of this module, at one index.
+    assert_eq!(
+        link_indices,
+        vec![43],
+        "the node's name link is element 43 of `constNames`, and at exactly one \
+         index - counted as OBJECT positions, not as occurrences of a spelling"
+    );
+    assert_eq!(
+        holder_is_declaration, 1,
+        "and the `ConstantVal` reached by INDEXING `constants` at that same 43 \
+         is the very object `83016935` found under the `constants` root: its \
+         name field is the link itself. Reached by index rather than by shape, \
+         because `c4cbf83c` was reddened for reading `(0, 3, 32)` as \
+         identifying `ConstantVal` and this cell must not repeat it"
+    );
+}
+
 /// What the four outside holders belong to - and a name that crosses the root
 /// boundary.
 ///
