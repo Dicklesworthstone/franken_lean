@@ -8787,6 +8787,70 @@ fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Res
     Ok(rows.len())
 }
 
+/// ONE RECEIPT IS ONE LINE, whatever a field contains.
+///
+/// **What depends on it.** The retained file is line-oriented:
+/// `validate_retained_receipts` splits on `\n` and treats each piece as a row.
+/// If any field could carry a raw newline, one receipt would arrive as two
+/// fragments -- and the guard would then be reading rows that no producer wrote,
+/// with the split falling wherever the hostile content put it. A second, forged
+/// "row" could be smuggled inside a legitimate one, and every count on either
+/// side of the break would belong to neither receipt.
+///
+/// **Nothing asserted this.** `json_string` escapes newlines, returns, tabs and
+/// control characters, so the property holds -- but it held by the escaper's good
+/// behaviour alone, and the escaper is shared with several other row formats in
+/// this file. A change made for one of those would silently break the retention
+/// file's framing here.
+///
+/// **The row is also required to be REFUSED, not merely contained.** Surviving as
+/// one line is the framing property; being rejected by the reader is the content
+/// property. Both matter, and they are different: a hostile row that stayed on
+/// its own line but was ACCEPTED would corrupt nothing structurally and
+/// everything semantically.
+#[test]
+fn a_receipt_row_is_one_line_even_when_a_field_is_hostile() {
+    // Every character the escaper special-cases, plus a bare control byte.
+    let hostile = "a\nb\r\nc\td\"e\\f\u{1}g";
+    let mut receipt = sample_whole_mathlib_receipt();
+    receipt.bead = hostile.to_string();
+    receipt.corpus_fixture_hash = hostile.to_string();
+    receipt.target = hostile.to_string();
+    receipt.no_answer_families = vec![format!("context:{hostile}=40000")];
+
+    let row = receipt.to_row();
+    assert!(
+        !row.contains('\n') && !row.contains('\r'),
+        "a receipt row carried a raw line break, so one receipt would arrive as two rows: {row:?}"
+    );
+    assert_eq!(
+        row.lines().count(),
+        1,
+        "a receipt must occupy exactly one line of the retained file"
+    );
+
+    // FRAMING HOLDS UNDER THE REAL SPLITTER: a good row beside a hostile one is
+    // two rows, not three, and the hostile one is refused rather than
+    // half-read.
+    let good = sample_whole_mathlib_receipt().to_row();
+    let file = format!("{good}\n{row}\n");
+    assert_eq!(
+        file.lines().filter(|line| !line.trim().is_empty()).count(),
+        2,
+        "the hostile receipt split its own row; the file no longer frames one receipt per line"
+    );
+    let reason = validate_retained_receipts(
+        &file,
+        &suite_lock_reference_pin(),
+        &suite_lock_corpus_commit(),
+    )
+    .expect_err("a row carrying escaped control characters must not be retained");
+    assert!(
+        reason.contains("row 1"),
+        "the refusal must blame the hostile row, not its innocent neighbour: {reason}"
+    );
+}
+
 /// A retained file is checked ROW BY ROW, including the rows after the first.
 ///
 /// **The bug this is aimed at.** The receipt file accumulates one row per run.
