@@ -2529,6 +2529,170 @@ fn or_rule_rhs(
     builder.finish(root)
 }
 
+#[cfg(any())]
+fn list_application(
+    builder: &mut StructuralTermBuilder,
+    list: &WireName,
+    universe: &WireName,
+    parameter: ExprId,
+) -> ExprId {
+    let list = builder.constant(list, std::slice::from_ref(universe));
+    builder.apply(list, parameter)
+}
+
+#[cfg(any())]
+fn list_constructor_type(
+    list: &WireName,
+    constructor: &WireName,
+    universe: &WireName,
+    cons: bool,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(universe);
+    let mut result = list_application(&mut builder, list, universe, builder.bvar(0));
+    if cons {
+        result = list_application(&mut builder, list, universe, builder.bvar(2));
+        let tail_type = list_application(&mut builder, list, universe, builder.bvar(1));
+        result = builder.forall("tail", BinderStyle::Default, tail_type, result);
+        result = builder.forall("head", BinderStyle::Default, builder.bvar(0), result);
+    }
+    let root = builder.forall_name(constructor, BinderStyle::Default, parameter_type, result);
+    builder.finish(root)
+}
+
+#[cfg(any())]
+fn list_motive_type(
+    builder: &mut StructuralTermBuilder,
+    list: &WireName,
+    motive_universe: &WireName,
+    list_universe: &WireName,
+) -> ExprId {
+    let subject = list_application(builder, list, list_universe, builder.bvar(0));
+    let sort = builder.sort_parameter(motive_universe);
+    builder.forall("t", BinderStyle::Default, subject, sort)
+}
+
+#[cfg(any())]
+fn list_minor_type(
+    builder: &mut StructuralTermBuilder,
+    list: &WireName,
+    constructor: &WireName,
+    motive_universe: &WireName,
+    list_universe: &WireName,
+    cons: bool,
+) -> ExprId {
+    if !cons {
+        let constructor = builder.constant(constructor, std::slice::from_ref(list_universe));
+        let constructor = builder.apply(constructor, builder.bvar(1));
+        return builder.apply(builder.bvar(0), constructor);
+    }
+    let constructor = builder.constant(constructor, std::slice::from_ref(list_universe));
+    let constructor = builder.apply(constructor, builder.bvar(5));
+    let constructor = builder.apply(constructor, builder.bvar(2));
+    let constructor = builder.apply(constructor, builder.bvar(1));
+    let mut result = builder.apply(builder.bvar(4), constructor);
+    let ih_type = builder.apply(builder.bvar(3), builder.bvar(0));
+    result = builder.forall("tail_ih", BinderStyle::Default, ih_type, result);
+    let tail_type = list_application(builder, list, list_universe, builder.bvar(3));
+    result = builder.forall("tail", BinderStyle::Default, tail_type, result);
+    result = builder.forall("head", BinderStyle::Default, builder.bvar(2), result);
+    let _ = motive_universe;
+    result
+}
+
+#[cfg(any())]
+fn list_recursor_type(
+    list: &WireName,
+    nil: &WireName,
+    cons: &WireName,
+    motive_universe: &WireName,
+    list_universe: &WireName,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(list_universe);
+    let motive_type = list_motive_type(&mut builder, list, motive_universe, list_universe);
+    let nil_minor = list_minor_type(
+        &mut builder,
+        list,
+        nil,
+        motive_universe,
+        list_universe,
+        false,
+    );
+    let cons_minor = list_minor_type(
+        &mut builder,
+        list,
+        cons,
+        motive_universe,
+        list_universe,
+        true,
+    );
+    let major_type = list_application(&mut builder, list, list_universe, builder.bvar(3));
+    let mut result = builder.apply(builder.bvar(2), builder.bvar(0));
+    result = builder.forall("t", BinderStyle::Default, major_type, result);
+    result = builder.forall("cons", BinderStyle::Default, cons_minor, result);
+    result = builder.forall("nil", BinderStyle::Default, nil_minor, result);
+    result = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
+    let root = builder.forall("α", BinderStyle::Implicit, parameter_type, result);
+    builder.finish(root)
+}
+
+#[cfg(any())]
+fn list_rule_rhs(
+    list: &WireName,
+    nil: &WireName,
+    cons: &WireName,
+    motive_universe: &WireName,
+    list_universe: &WireName,
+    selected_cons: bool,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(list_universe);
+    let motive_type = list_motive_type(&mut builder, list, motive_universe, list_universe);
+    let nil_minor = list_minor_type(
+        &mut builder,
+        list,
+        nil,
+        motive_universe,
+        list_universe,
+        false,
+    );
+    let cons_minor = list_minor_type(
+        &mut builder,
+        list,
+        cons,
+        motive_universe,
+        list_universe,
+        true,
+    );
+    let mut result = builder.bvar(1);
+    if selected_cons {
+        result = builder.apply(result, builder.bvar(1));
+        result = builder.apply(result, builder.bvar(0));
+        let recursor = checker_child(list, "rec");
+        let mut recursive =
+            builder.constant(&recursor, &[motive_universe.clone(), list_universe.clone()]);
+        for argument in [
+            builder.bvar(5),
+            builder.bvar(4),
+            builder.bvar(3),
+            builder.bvar(2),
+            builder.bvar(0),
+        ] {
+            recursive = builder.apply(recursive, argument);
+        }
+        result = builder.apply(result, recursive);
+        let tail_type = list_application(&mut builder, list, list_universe, builder.bvar(5));
+        result = builder.lambda("tail", BinderStyle::Default, tail_type, result);
+        result = builder.lambda("head", BinderStyle::Default, builder.bvar(4), result);
+    }
+    result = builder.lambda("cons", BinderStyle::Default, cons_minor, result);
+    result = builder.lambda("nil", BinderStyle::Default, nil_minor, result);
+    result = builder.lambda("motive", BinderStyle::Default, motive_type, result);
+    let root = builder.lambda("α", BinderStyle::Default, parameter_type, result);
+    builder.finish(root)
+}
+
 fn compare_inductive_expression(
     actual: &WireExpr,
     expected: &WireExpr,
