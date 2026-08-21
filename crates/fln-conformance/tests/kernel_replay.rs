@@ -5738,6 +5738,83 @@ fn the_inventory_walk_refuses_a_non_injective_projection() {
     );
 }
 
+/// Two files with one name, separated in the emitted order by a third.
+///
+/// **Both existing collision fixtures put the repeat next to itself.**
+/// `A/B.olean` beside `A.B.olean` emits `["A.B", "A.B"]`, and the four-pair
+/// fixture emits each pair adjacent too. So a rule written as an adjacent
+/// dedupe -- `windows(2).any(|w| w[0] == w[1])`, the cheap way to spot a repeat
+/// in a list somebody assumes is sorted -- refuses both and cannot be told apart
+/// from the real one.
+///
+/// **The list is in PATH order, not name order, which is what makes the gap
+/// reachable.** That was established when the parent-module ordering was pinned:
+/// `modules[i]` is the projection of `oleans[i]`, and paths sort by component.
+/// So a third file whose PATH falls between two colliding ones separates their
+/// equal names. `A/C.olean` does exactly that -- `A/B.olean` < `A/C.olean` <
+/// `A.B.olean` -- and the emitted names come out `["A.B", "A.C", "A.B"]`.
+///
+/// **The separation is asserted from the real projection, not assumed.** The
+/// names are read back through `module_names_below`, which projects without
+/// checking injectivity, so the cell can state where the two occurrences landed.
+/// If a future change sorted the names, they would become adjacent again and
+/// this assertion -- not the refusal -- is what would say so.
+#[test]
+fn a_collision_split_by_a_third_file_is_still_refused() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-split-collision-v1",
+        &["A/B.olean", "A/C.olean", "A.B.olean"],
+    );
+
+    // WHERE THE EQUAL NAMES ACTUALLY LAND. `module_names_below` projects in path
+    // order and does not check injectivity, so it can show the emitted sequence
+    // that the walk is about to refuse.
+    let ordered = module_names_below(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the projection itself must succeed: {reason}"));
+    assert_eq!(
+        ordered.len(),
+        3,
+        "all three files must project before their order means anything: {ordered:?}"
+    );
+    let first = ordered
+        .iter()
+        .position(|name| name == "Fixture.A.B")
+        .unwrap_or_else(|| panic!("the colliding name is missing: {ordered:?}"));
+    let second = ordered
+        .iter()
+        .rposition(|name| name == "Fixture.A.B")
+        .unwrap_or_else(|| panic!("the colliding name appears once: {ordered:?}"));
+    assert!(
+        second > first + 1,
+        "the two occurrences of `Fixture.A.B` must be SEPARATED, or an adjacent dedupe would \
+         catch them and this fixture adds nothing to the two that already exist: {ordered:?}"
+    );
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(accepted) => panic!(
+            "two files sharing one module name were accepted because a third sorted between \
+             them: {:?}",
+            accepted.modules
+        ),
+    };
+    assert!(
+        reason.contains("not injective"),
+        "the refusal must be the injectivity rule's: {reason}"
+    );
+    assert!(
+        reason.contains("Fixture.A.B"),
+        "the refusal must name the module the two files collided on: {reason}"
+    );
+    // The file that merely sits between them is not part of the collision and
+    // must not be reported as though it were.
+    assert!(
+        !reason.contains("Fixture.A.C"),
+        "`Fixture.A.C` collides with nothing; naming it would send the reader to a third file \
+         that is doing no harm: {reason}"
+    );
+}
+
 /// Many collisions are summarised, and the message says how many it dropped.
 ///
 /// **A cap that says nothing about what it hid reads as a complete list.** The
