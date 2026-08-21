@@ -7916,6 +7916,109 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
     }
 }
 
+/// Validate EVERY row a retained receipt file holds, and say how many there were.
+///
+/// **Why this is a function rather than a loop inside the guard.** The file is
+/// opened with `append(true)`, so after two runs it holds two rows and after
+/// twenty it holds twenty: MULTI-ROW IS THE STEADY STATE, not an edge case. The
+/// loop that walks it lived inside a guard which only ever executes against the
+/// real file -- absent on every host so far -- and it panicked rather than
+/// returning, so nothing could probe it. A guard that silently stopped after the
+/// first row would let every subsequent run's observation into the tree
+/// unchecked, and the file would look examined because its first line was.
+///
+/// Returning `Result` is what lets the controls assert a LATER row is caught;
+/// an assertion inside cannot be caught.
+fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
+    let rows = text
+        .lines()
+        .filter(|row| !row.trim().is_empty())
+        .collect::<Vec<_>>();
+    // Present but empty is a DIFFERENT thing from absent, and it is a failure: a
+    // file somebody created and then emptied is not a lighter claim than one that
+    // was never written, it is a retracted observation left in place.
+    if rows.is_empty() {
+        return Err(
+            "holds no rows. An empty receipt file is not a lighter claim than an absent one; it \
+             is an observation that was removed without being retracted"
+                .to_string(),
+        );
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let receipt = WholeMathlibReceipt::from_row(row)
+            .map_err(|reason| format!("row {index}: {reason}"))?;
+        receipt
+            .validate(pin, corpus_commit)
+            .map_err(|reason| format!("row {index} is retained but not valid: {reason}"))?;
+    }
+    Ok(rows.len())
+}
+
+/// A retained file is checked ROW BY ROW, including the rows after the first.
+///
+/// **The bug this is aimed at.** The receipt file accumulates one row per run.
+/// If the guard checked only the first, a corrupt or wrong-epoch row appended by
+/// any later run would sit in the tree as retained evidence while the guard went
+/// on passing -- and the file would look examined, because its first line was.
+/// Every negative control below puts the bad row LAST, so passing requires the
+/// walk to reach it.
+#[test]
+fn a_retained_receipt_file_is_validated_row_by_row() {
+    let pin = suite_lock_reference_pin();
+    let corpus = suite_lock_corpus_commit();
+    let good = sample_whole_mathlib_receipt().to_row();
+
+    // A file that has been appended to several times is the ordinary case.
+    assert_eq!(
+        validate_retained_receipts(&format!("{good}\n{good}\n{good}\n"), &pin, &corpus),
+        Ok(3),
+        "three appended observations must all be read"
+    );
+    // Blank lines are separators, not rows.
+    assert_eq!(
+        validate_retained_receipts(&format!("{good}\n\n   \n{good}\n"), &pin, &corpus),
+        Ok(2)
+    );
+
+    // Nothing at all, and nothing but whitespace, are both refusals.
+    for empty in ["", "\n", "   \n\t\n"] {
+        let reason = validate_retained_receipts(empty, &pin, &corpus)
+            .expect_err("an empty retained file must be refused");
+        assert!(reason.contains("holds no rows"), "{reason}");
+    }
+
+    // A LATER row that is invalid must be caught, and named by its index.
+    let wrong_epoch = WholeMathlibReceipt {
+        pin: format!("{pin}-not-this-epoch"),
+        ..sample_whole_mathlib_receipt()
+    }
+    .to_row();
+    let reason =
+        validate_retained_receipts(&format!("{good}\n{good}\n{wrong_epoch}\n"), &pin, &corpus)
+            .expect_err("a wrong-epoch row in third position must be refused");
+    assert!(
+        reason.contains("row 2") && reason.contains("epoch"),
+        "the refusal must name WHICH row failed, or a multi-row file cannot be repaired: {reason}"
+    );
+
+    // A LATER row that is unreadable must be caught too -- a different failure
+    // path (the reader) from the one above (the guard).
+    let reason = validate_retained_receipts(
+        &format!("{good}\n{{\"schema\":\"fln.whole-mathlib-differential-receipt/1\"}}\n"),
+        &pin,
+        &corpus,
+    )
+    .expect_err("an unreadable row in second position must be refused");
+    assert!(
+        reason.contains("row 1"),
+        "the refusal must name the unreadable row: {reason}"
+    );
+
+    // ANTI-VACUITY: the good row must really be good, or every case above would
+    // fail for the wrong reason.
+    assert_eq!(validate_retained_receipts(&good, &pin, &corpus), Ok(1));
+}
+
 /// Every whole-Mathlib receipt retained for the CURRENT pin must satisfy the
 /// guard its own producer writes to.
 ///
@@ -7977,30 +8080,10 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
         }
     };
 
-    // Present but empty is a DIFFERENT thing from absent, and it is a failure: a
-    // file somebody created and then emptied is not a lighter claim than one
-    // that was never written, it is a retracted observation left in place.
-    let rows = text.lines().filter(|row| !row.trim().is_empty()).count();
-    assert!(
-        rows != 0,
-        "{} exists but holds no rows. An empty receipt file is not a lighter claim than an \
-         absent one; it is an observation that was removed without being retracted",
-        path.display()
-    );
-    for (index, row) in text
-        .lines()
-        .filter(|row| !row.trim().is_empty())
-        .enumerate()
-    {
-        let receipt = WholeMathlibReceipt::from_row(row)
-            .unwrap_or_else(|reason| panic!("{} row {index}: {reason}", path.display()));
-        if let Err(reason) = receipt.validate(&pin, &corpus) {
-            panic!(
-                "{} row {index} is retained but not valid: {reason}",
-                path.display()
-            );
-        }
-    }
+    let rows = match validate_retained_receipts(&text, &pin, &corpus) {
+        Ok(rows) => rows,
+        Err(reason) => panic!("{}: {reason}", path.display()),
+    };
     println!(
         "{{\"schema\":\"fln-t6r7-mathlib-receipt-retention/1\",\"status\":\"validated\",\
          \"pin\":{},\"corpus_commit\":{},\"rows\":{}}}",
