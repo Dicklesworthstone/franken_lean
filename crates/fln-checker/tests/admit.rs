@@ -2579,6 +2579,22 @@ fn kr600_803_init_list_fixture_pins_constructor_indices_parameters_and_fields() 
 }
 
 #[test]
+fn kr600_803_init_list_fixture_pins_iota_rule_constructors_and_fields() {
+    let entries = init_list_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    for (rule, constructor, expected_fields) in [
+        (&metadata.rules()[0], entries[1].name(), 0),
+        (&metadata.rules()[1], entries[2].name(), 2),
+    ] {
+        assert_eq!(rule.constructor(), constructor);
+        assert_eq!(rule.num_fields(), expected_fields);
+    }
+}
+
+#[test]
 fn kr600_803_init_empty_eliminator_is_reconstructed_independently() {
     let entries = init_empty_entries();
     let verdict = admit_inductive(
