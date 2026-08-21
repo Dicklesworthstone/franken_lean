@@ -1952,6 +1952,23 @@ fn kr600_803_init_option_refuses_a_forged_some_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_option_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_option_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 2);
+    assert_eq!(metadata.num_parameters(), 1);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 2);
+    assert_eq!(metadata.rules().len(), 2);
+    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Option", "none"]));
+    assert_eq!(metadata.rules()[0].num_fields(), 0);
+    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Option", "some"]));
+    assert_eq!(metadata.rules()[1].num_fields(), 1);
+}
+
+#[test]
 fn kr600_803_init_list_recursive_parameter_and_iota_rules_are_reconstructed() {
     let entries = init_list_entries();
     let verdict = admit_inductive(
