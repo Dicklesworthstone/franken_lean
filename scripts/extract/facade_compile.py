@@ -2088,6 +2088,24 @@ def main():
             "REFUSE: facade manifest emission-pin-presence count diverges "
             f"({json.dumps(emission_pin_presence_count_join, sort_keys=True)})"
         )
+    probe_metadata_count_join = {
+        "summary_extern_probed": manifest_summary.get("extern_probed"),
+        "summary_kind_probed": manifest_summary.get("kind_probed"),
+        "summary_module_probed": manifest_summary.get("module_probed"),
+        "summary_safety_probed": manifest_summary.get("safety_probed"),
+        "pinned_probe_metadata_count": 2042,
+    }
+    if (any(count != probe_metadata_count_join["pinned_probe_metadata_count"]
+            for count in (
+                probe_metadata_count_join["summary_extern_probed"],
+                probe_metadata_count_join["summary_kind_probed"],
+                probe_metadata_count_join["summary_module_probed"],
+                probe_metadata_count_join["summary_safety_probed"],
+            ))):
+        raise SystemExit(
+            "REFUSE: facade manifest probe-metadata count equality diverges "
+            f"({json.dumps(probe_metadata_count_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3212,6 +3230,7 @@ def main():
         "manifest_emission_pin_presence_count_join": (
             emission_pin_presence_count_join
         ),
+        "manifest_probe_metadata_count_join": probe_metadata_count_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
