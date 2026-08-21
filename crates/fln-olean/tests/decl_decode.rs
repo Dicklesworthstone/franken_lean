@@ -10883,3 +10883,262 @@ fn the_eight_terminate_the_descent() {
          the eight themselves"
     );
 }
+
+/// The one `tag 4 arity 2` node in the closure - and a units slip in
+/// `aec3efd1`'s prose.
+///
+/// `b314a1a5` found exactly one node of this shape among the 39 objects
+/// reachable from the eight. Its identity:
+///
+///   one object at size 32, reached from FOUR of the eight
+///   slot 0   a name link, which the production `decode_name` accepts
+///   slot 1   boxed nil - the empty list
+///
+/// That is `aec3efd1`'s `Expr.const` profile exactly: two pointers plus a
+/// trailing word, a name, and an empty level list.
+///
+/// THE CHECK THIS WAVE ASKED FOR IS A TAUTOLOGY AND I AM SAYING SO. "Confirm it
+/// is not among the 111, the ten, or the eight" cannot fail: all three of those
+/// populations are the three-field shape and this is a two-field one, so the
+/// shape excludes it before anything is measured. Asserting it would be the
+/// circularity refused at `84951450`, where the order asked me to pin that a
+/// `tag 0` tail is "not cons" and the selection had already guaranteed it.
+///
+/// THE NON-TAUTOLOGICAL MEMBERSHIP QUESTION is whether this is one of the
+/// `Expr.const` nodes `aec3efd1` characterised, and it is not.
+///
+/// AND THOSE NUMBER TWO OBJECTS, NOT ELEVEN. `aec3efd1` describes "11 objects,
+/// scalar width 8, size 32"; the eleven third-shape parents with a `tag 4` tail
+/// reach only TWO distinct tail objects, named `obj` five times and `tobj` six.
+/// That cell's ASSERTIONS are per-use and remain true - it counted one entry
+/// per parent - but its prose called them objects. The same units slip that
+/// reddened `f2da5b0e` and `c998a3f8`, here in a description rather than a pin,
+/// which is why nothing caught it.
+///
+/// `2baabd20` measured this shape carrying two sizes corpus-wide, 220 at 24 and
+/// 2,235 at 32, so the shape alone identifies nothing; the size and the field
+/// types do the work, exactly as that cell concluded.
+#[test]
+fn the_one_tag_four_node_in_the_closure() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut found: Vec<(u16, usize)> = Vec::new();
+    let mut slot0: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut slot1_boxed_nil = 0usize;
+    let mut decoded = 0usize;
+    let mut among_the_eleven = 0usize;
+    let mut eleven_uses = 0usize;
+    let mut eleven_objects: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut corpus_by_size: std::collections::BTreeMap<u16, usize> =
+        std::collections::BTreeMap::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+
+        // `aec3efd1`'s tails, by use and by object.
+        for object in &objects {
+            if (object.tag, object.other) == (4, 2) {
+                *corpus_by_size.entry(object.cs_sz).or_default() += 1;
+            }
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if let Some(tail) = resolve(word_at(bytes, object.off + 16))
+                && shape(tail) == Some((4, 2))
+            {
+                eleven_uses += 1;
+                eleven_objects.insert((index, tail));
+            }
+        }
+        let eleven: BTreeSet<usize> = eleven_objects
+            .iter()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, off)| *off)
+            .collect();
+
+        // Down to the eight, then the closure.
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+        let mut eight: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            let Some(node) = resolve(word_at(bytes, record + 8 + 8 * 4)) else {
+                continue;
+            };
+            if shape(node) != Some((0, 2)) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, node + 16)) else {
+                continue;
+            };
+            if shape(tail) != Some((4, 1)) {
+                continue;
+            }
+            let Some(inner) = resolve(word_at(bytes, tail + 8)) else {
+                continue;
+            };
+            let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3)) else {
+                continue;
+            };
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(ten) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                let Some(below) = resolve(word_at(bytes, ten + 8 + 8)) else {
+                    continue;
+                };
+                for k in 0..word_at(bytes, below + 8) {
+                    if let Some(element) = resolve(word_at(bytes, below + 24 + 8 * k as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        eight.insert(element);
+                    }
+                }
+            }
+        }
+
+        // Closure from each root separately, so "reached from how many" is
+        // per-root and not a single merged walk.
+        let closure_of = |root: usize| -> BTreeSet<usize> {
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut stack = vec![root];
+            while let Some(offset) = stack.pop() {
+                if !seen.insert(offset) {
+                    continue;
+                }
+                let object = at.get(&offset).expect("a walked object");
+                if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                    for slot in 0..usize::from(object.other) {
+                        if let Some(child) = resolve(word_at(bytes, offset + 8 + 8 * slot)) {
+                            stack.push(child);
+                        }
+                    }
+                } else if object.tag == abi::TAG_ARRAY {
+                    for i in 0..word_at(bytes, offset + 8) {
+                        if let Some(child) = resolve(word_at(bytes, offset + 24 + 8 * i as usize)) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+            seen
+        };
+        let closures: Vec<BTreeSet<usize>> = eight.iter().map(|&root| closure_of(root)).collect();
+        let mut union: BTreeSet<usize> = BTreeSet::new();
+        for closure in &closures {
+            union.extend(closure);
+        }
+
+        for &offset in &union {
+            if shape(offset) != Some((4, 2)) {
+                continue;
+            }
+            let object = at.get(&offset).expect("resolved above");
+            let reached = closures.iter().filter(|c| c.contains(&offset)).count();
+            found.push((object.cs_sz, reached));
+            if eleven.contains(&offset) {
+                among_the_eleven += 1;
+            }
+            let name_word = word_at(bytes, offset + 8);
+            let link = resolve(name_word).expect("slot 0 is a pointer");
+            *slot0
+                .entry(format!("tag {} arity {}", at[&link].tag, at[&link].other))
+                .or_default() += 1;
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(name_word)
+                .unwrap_or_else(|e| panic!("{module}: slot 0 must be a Name: {e}"));
+            decoded += 1;
+            let levels = word_at(bytes, offset + 16);
+            if levels & 1 == 1 && levels >> 1 == 0 {
+                slot1_boxed_nil += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            found.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // The node's identity, as an object.
+    assert_eq!(
+        found,
+        vec![(32, 4)],
+        "exactly one node of this shape in the closure: size 32, reached from \
+         FOUR of the eight"
+    );
+    assert_eq!(
+        slot0.into_iter().collect::<Vec<_>>(),
+        vec![("tag 1 arity 2".to_owned(), 1)],
+        "slot 0 is a string name link"
+    );
+    assert_eq!(decoded, 1, "which the production `decode_name` accepts");
+    assert_eq!(
+        slot1_boxed_nil, 1,
+        "and slot 1 is boxed nil - `aec3efd1`'s `Expr.const` profile exactly"
+    );
+
+    // The membership question that is not settled by the shape.
+    assert_eq!(
+        among_the_eleven, 0,
+        "it is not one of the `Expr.const` nodes `aec3efd1` characterised. \
+         Checking it against the 111, the ten or the eight would settle \
+         nothing: those are all the three-field shape and this is a two-field \
+         one, so the shape excludes it before anything is measured"
+    );
+    assert_eq!(
+        (eleven_uses, eleven_objects.len()),
+        (11, 2),
+        "and `aec3efd1`'s tails are TWO objects reached eleven times. That \
+         cell's assertions are per-use and remain true; its prose called them \
+         \"11 objects\", which is the units slip that reddened `f2da5b0e` and \
+         `c998a3f8`, here in a description rather than a pin"
+    );
+
+    // The shape identifies nothing on its own.
+    assert_eq!(
+        corpus_by_size.into_iter().collect::<Vec<_>>(),
+        vec![(24, 220), (32, 2235)],
+        "this shape carries two sizes corpus-wide, so `2baabd20` again: the \
+         size and the field types do the work, not the tag and arity"
+    );
+}
