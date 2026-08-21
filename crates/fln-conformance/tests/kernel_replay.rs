@@ -14016,9 +14016,17 @@ fn states_thread_matrix_claim(line: &str) -> bool {
     thread_matrix_claim_count(line) > 0
 }
 
+/// A qualifier belongs to the sentence stating the claim, not to the paragraph.
+///
+/// Named once, at module scope, because the two tiers of this guard read it. The
+/// allowance tier (documents this test does not otherwise check) and the strict
+/// tier (`AGENTS.md`, `README.md`) had already drifted apart twice: first on
+/// which spelling counts as the claim, then on how near the qualifier must sit.
+/// A bound that lives inside one of them is a bound the other cannot honour.
+const NEARBY_QUALIFIER: usize = 600;
+
 fn unscoped_claim_sites(text: &str, qualifiers: &[&str], cadence: &[&str]) -> usize {
-    /// A qualifier belongs to the sentence stating the claim, not to the paragraph.
-    const NEARBY: usize = 600;
+    const NEARBY: usize = NEARBY_QUALIFIER;
     text.lines()
         .filter(|line| states_thread_matrix_claim(line))
         .filter(|line| {
@@ -17299,6 +17307,37 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "a qualifier in the sentence that states the claim must still count, or the bound \
          reddens every honest site"
     );
+    // AND THE STRICT TIER MUST NOT BE WEAKER THAN THE LENIENT ONE. The scanned
+    // documents are checked with no allowance at all, and they were still asked
+    // only whether the LINE mentions a qualifier -- so the tier that forgives
+    // three known sites was applying a rule the tier that forgives nothing did
+    // not. Measured at the five real qualified sites: qualifier within 70
+    // collapsed characters, cadence within 318, on lines up to 3359, so both
+    // tiers stay green on every one of them.
+    //
+    // The two are asserted to AGREE here rather than merely to exist, because
+    // agreeing today is what they did before drifting twice.
+    assert_eq!(
+        unscoped_claim_sites(&distant, &QUALIFIERS, &CADENCE) == 0,
+        qualifier_is_near_the_claim(&distant, &QUALIFIERS, NEARBY_QUALIFIER)
+            && qualifier_is_near_the_claim(&distant, &CADENCE, NEARBY_QUALIFIER),
+        "the allowance tier and the scanned tier must reach the same verdict on the same line, \
+         or a claim refused where three are forgiven passes where none are"
+    );
+    assert!(
+        !qualifier_is_near_the_claim(&distant, &QUALIFIERS, NEARBY_QUALIFIER),
+        "a qualifier 1000 characters away must not satisfy the scanned tier either; it was the \
+         weaker of the two and it is the one with no allowance"
+    );
+    assert!(
+        qualifier_is_near_the_claim(
+            "the matrix runs {1, 8, 32} over the corpus, an on-demand shortfall",
+            &QUALIFIERS,
+            NEARBY_QUALIFIER
+        ),
+        "a qualifier in the sentence stating the claim must satisfy the scanned tier, or every \
+         honest site in AGENTS.md reddens"
+    );
     // AND THE NOUN MUST BE NEAR THE NUMERALS. This decoy is invisible to every
     // per-line scan and visible only to the whole-document one, so the guard
     // reports a wrapped claim site that nobody wrote. Measured against the rule
@@ -17470,7 +17509,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
             }
             checked += 1;
             assert!(
-                QUALIFIERS.iter().any(|word| line.contains(word)),
+                qualifier_is_near_the_claim(line, &QUALIFIERS, NEARBY_QUALIFIER),
                 "{doc}:{} states the {{1, 8, 32}} determinism claim without naming its \
                  scope, while the per-commit matrix's input is the Prelude and the \
                  corpus-scale matrix is an on-demand lane that gates nothing. A reader \
@@ -17479,7 +17518,7 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
                 index + 1
             );
             assert!(
-                CADENCE.iter().any(|word| line.contains(word)),
+                qualifier_is_near_the_claim(line, &CADENCE, NEARBY_QUALIFIER),
                 "{doc}:{} states the {{1, 8, 32}} claim without naming the corpus lane's \
                  cadence. PG-5 asks for {{1, 8, 32}} PER COMMIT; the corpus lane runs on \
                  demand, which is a DOCUMENTED SHORTFALL against that gate rather than \
