@@ -93,6 +93,9 @@ the toolchain would report a perfect facade:
   * A REFERENCE-PIN JOIN requires the exact-demand artifact's extraction pin to
     equal the Reference compiler pin running this rig. Matching names from a
     different upstream epoch are not compatible evidence.
+  * A MANIFEST-PIN JOIN requires the facade manifest's schema and extraction pin
+    to match this rig before demanded rows are consumed. Demand and facade rows
+    cannot be joined across generated-contract epochs.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -748,9 +751,18 @@ def main():
 
     sigs = {}
     manifest_rows = []
+    manifest_summary = None
     with open(args.module_manifest, encoding="utf-8") as fh:
         for line in fh:
             row = json.loads(line)
+            if row.get("kind") == "summary":
+                if manifest_summary is not None:
+                    raise SystemExit(
+                        "REFUSE: facade manifest has multiple summaries — its "
+                        "contract epoch is ambiguous"
+                    )
+                manifest_summary = row
+                continue
             if row.get("kind") != "decl":
                 continue
             manifest_rows.append(row)
@@ -761,6 +773,15 @@ def main():
     if not sigs:
         raise SystemExit("REFUSE: the module manifest carries no signatures — the "
                          "run would silently degrade to a name-only check")
+    if (manifest_summary is None
+            or manifest_summary.get("schema") != "fln-facade-module/1"
+            or manifest_summary.get("pin") != tag):
+        raise SystemExit(
+            "REFUSE: facade manifest pin join disagrees with this rig "
+            f"(schema={None if manifest_summary is None else manifest_summary.get('schema')!r}, "
+            f"pin={None if manifest_summary is None else manifest_summary.get('pin')!r}, "
+            f"compiler={tag!r})"
+        )
 
     demand_names = {name for names in by_module.values() for name in names}
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
@@ -891,6 +912,7 @@ def main():
         "curated_modules": sorted(modules),
         "curated_module_join": module_join,
         "census_partition_join": partition_join,
+        "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
