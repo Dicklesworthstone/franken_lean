@@ -7330,6 +7330,14 @@ fn a_shape_record_that_cannot_be_read_is_not_an_absent_one() {
 ///
 /// **The green control is the one a `contains` implementation fails.** A name
 /// that merely mentions the word must still build; only the suffix is reserved.
+///
+/// **A second refused name exists because the first is a LIVE collision.** Its
+/// owner has been built, so a rule that refused only what actually clashes --
+/// "is there really something at that path?" -- refuses it too and cannot be
+/// told apart from a reservation. The second name's owner has never been built,
+/// so a collision check sees nothing to protect, and it must still be refused:
+/// build order is not fixed, and letting the record path be taken first is what
+/// produces the order-dependent failure this rule was written to remove.
 #[test]
 fn a_fixture_tree_may_not_sit_where_another_fixtures_record_does() {
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -7389,6 +7397,62 @@ fn a_fixture_tree_may_not_sit_where_another_fixtures_record_does() {
     assert!(
         !tmp.join(&reserved).is_dir(),
         "a tree was created at the record's path"
+    );
+
+    // THE SUFFIX IS RESERVED, NOT MERELY CONTESTED. The decoy above is the
+    // record name of a fixture that ALREADY EXISTS, so a rule that refused only
+    // a live collision -- "is there really something at that path?" -- refuses
+    // it exactly as this one does and cannot be told apart. The name below ends
+    // in the same suffix and its owner has never been built, so a collision
+    // check sees nothing to protect.
+    //
+    // It must still be refused, because build order is not fixed. Let
+    // `t6r7-never-built-v1.manifest` take that path today and the fixture it
+    // belongs to may be added tomorrow -- and then which of the two fails, and
+    // how, depends on which ran first. That is the order-dependent diagnosis
+    // this rule exists to remove, and a collision check cannot remove it,
+    // because at the moment of the first build there is no collision yet.
+    const UNOWNED: &str = "t6r7-never-built-v1.manifest";
+    const WOULD_OWN: &str = "t6r7-never-built-v1";
+
+    // THE DISCRIMINATING PROPERTY, READ OFF THE DISK. If the owner ever were
+    // built, a collision check would refuse this too and the cell would stop
+    // distinguishing anything.
+    assert!(
+        !tmp.join(WOULD_OWN).exists(),
+        "`{WOULD_OWN}` must NOT exist, or this name is a live collision like the one above and \
+         proves nothing about reservation"
+    );
+    assert!(
+        !tmp.join(UNOWNED).exists(),
+        "`{UNOWNED}` must not already be on disk before the refusal is asked for"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| write_inventory_fixture(UNOWNED, &["Any.olean"]));
+    std::panic::set_hook(previous);
+    let payload = outcome.err().unwrap_or_else(|| {
+        panic!("`{UNOWNED}` takes a reserved record path and must be refused even with no owner")
+    });
+    let unowned = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        unowned.contains("shape record uses"),
+        "an unowned record name must be refused for the RESERVATION, not for anything else: \
+         {unowned}"
+    );
+    assert!(
+        unowned.contains(UNOWNED),
+        "the refusal must name the fixture it is about: {unowned}"
+    );
+    assert!(
+        !tmp.join(UNOWNED).exists(),
+        "the name was refused and a tree appeared anyway at the reserved path"
     );
 }
 
