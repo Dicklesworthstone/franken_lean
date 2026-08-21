@@ -11720,6 +11720,260 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Where the sixteen dependents point - and the arrays they do NOT own.
+///
+/// `bed63990` split the 26 singleton slots into ten whose element is the
+/// entry's own name and sixteen whose is not, and left the sixteen unread.
+/// This reads them, and doing so exposes a defect in that cell's own prose.
+///
+/// THE ARRAYS ARE SHARED, so slots and objects are different populations.
+/// `bed63990` pins the histogram `{0: 2178, 1: 26}` and its comment called that
+/// a count "over array objects". It is a count over SLOTS. Per distinct object
+/// the same walk gives ONE empty array, referenced from 2,178 slots, and TEN
+/// singletons across 26. The assertion was correct and its description was not;
+/// w198 passed it because the number matches the code. The comment is corrected
+/// in this commit.
+///
+/// THE TEN SINGLETONS ARE ONE PER AXIOM: the set of names they contain is
+/// exactly the ten self-referential names, by object identity. Their slot
+/// multiplicities are `[1, 1, 1, 1, 1, 1, 1, 1, 6, 12]`, summing to the 26.
+///
+/// AND THAT IS THE MECHANISM BEHIND THE SIXTEEN. A dependent entry does not get
+/// an array of its own - it points at the SAME array object the axiom's own
+/// entry points at. So each multiplicity is one own-slot plus its dependents,
+/// 10 own + 16 dependents = 26, and the two shared arrays carry 11 and 5. The
+/// sixteen of `bed63990` are precisely the surplus slots on those two.
+///
+/// WHERE THEY POINT: all sixteen name a member of the ten, by pointer identity
+/// - but only TWO DISTINCT OBJECTS between them, `lcProof` eleven times and
+/// `Classical.choice` five. Sixteen occurrences, two objects. Counting
+/// occurrences would report sixteen targets and miss that eight of the ten are
+/// never named by anything but themselves.
+///
+/// So the ten split two targeted and eight untargeted, pinned as indices.
+///
+/// DISCRIMINATING POWER: the ten are 10 of 2,204 declarations, so sixteen
+/// arbitrary names landing inside them is not something an indifferent
+/// structure produces. And no dependent names ITSELF, which is what makes
+/// `bed63990`'s classification a real split rather than a restatement.
+///
+/// THE TWO TARGETS, structurally rather than by rendering: prefix-first, one is
+/// a single component of 8 stored bytes and the other is two components of 10
+/// and 7. Read off the wire, so nothing here depends on the decoder's
+/// rendering.
+///
+/// POPULATION SCOPE: `Init/Prelude.olean`, asserted rather than left implicit.
+#[test]
+fn where_the_sixteen_dependents_point() {
+    let Some(lib) = reference_lib() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(lib.join("Init/Prelude.olean")) else {
+        return;
+    };
+    let bytes = bytes.as_slice();
+
+    let (objects, base) = objects_of(bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+    let resolve = |word: u64| -> Option<usize> {
+        (word & 1 == 0)
+            .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+            .flatten()
+            .filter(|off| at.contains_key(off))
+    };
+    let tag = |off: usize| at.get(&off).map(|o| o.tag);
+
+    let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+    let names_array = resolve(word_at(bytes, root + 16)).expect("constNames array");
+    let entries_array = resolve(word_at(bytes, root + 40)).expect("entries array");
+    let names_len = word_at(bytes, names_array + 8);
+
+    // The one payload aligned with `constNames`, found rather than assumed.
+    let mut payload = None;
+    for e in 0..word_at(bytes, entries_array + 8) {
+        let Some(entry) = resolve(word_at(bytes, entries_array + 24 + 8 * e as usize)) else {
+            continue;
+        };
+        let Some(candidate) = resolve(word_at(bytes, entry + 16)) else {
+            continue;
+        };
+        if tag(candidate) != Some(abi::TAG_ARRAY) || word_at(bytes, candidate + 8) != names_len {
+            continue;
+        }
+        let aligned = (0..names_len).all(|i| {
+            let slot = 24 + 8 * i as usize;
+            resolve(word_at(bytes, candidate + slot))
+                .and_then(|element| resolve(word_at(bytes, element + 8)))
+                == resolve(word_at(bytes, names_array + slot))
+        });
+        if aligned && names_len > 0 {
+            payload = Some(candidate);
+        }
+    }
+    let payload = payload.expect("the aligned payload");
+
+    // Slots grouped by the array OBJECT they hold.
+    let mut by_object: std::collections::BTreeMap<usize, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for i in 0..names_len {
+        let Some(element) = resolve(word_at(bytes, payload + 24 + 8 * i as usize)) else {
+            continue;
+        };
+        let Some(list) = resolve(word_at(bytes, element + 16)) else {
+            continue;
+        };
+        if tag(list) == Some(abi::TAG_ARRAY) {
+            by_object.entry(list).or_default().push(i);
+        }
+    }
+
+    let mut empty_objects = 0usize;
+    let mut empty_slots = 0usize;
+    let mut singleton_objects = 0usize;
+    let mut singleton_slots = 0usize;
+    let mut multiplicities: Vec<usize> = Vec::new();
+    let mut own = 0usize;
+    let mut dependents = 0usize;
+    let mut contents: BTreeSet<usize> = BTreeSet::new();
+    let mut targets: Vec<usize> = Vec::new();
+    let mut self_named: BTreeSet<usize> = BTreeSet::new();
+
+    for (&list, slots) in &by_object {
+        if word_at(bytes, list + 8) == 0 {
+            empty_objects += 1;
+            empty_slots += slots.len();
+            continue;
+        }
+        singleton_objects += 1;
+        singleton_slots += slots.len();
+        multiplicities.push(slots.len());
+        let held = resolve(word_at(bytes, list + 24)).expect("the singleton's element");
+        contents.insert(held);
+        for &i in slots {
+            let named = resolve(word_at(bytes, names_array + 24 + 8 * i as usize));
+            if named == Some(held) {
+                own += 1;
+                self_named.insert(i as usize);
+            } else {
+                dependents += 1;
+                targets.push(held);
+            }
+        }
+    }
+    multiplicities.sort_unstable();
+
+    // Objects against slots - the correction this cell exists to make.
+    assert_eq!(
+        (
+            empty_objects,
+            empty_slots,
+            singleton_objects,
+            singleton_slots
+        ),
+        (1, 2178, 10, 26),
+        "ONE empty array object is referenced from 2,178 slots and TEN singleton \
+         objects from 26. `bed63990` pins the per-slot pair and its comment \
+         called it a count over objects; the objects are 1 and 10, and that \
+         comment is corrected in this commit"
+    );
+
+    // One singleton per axiom, by object identity.
+    assert_eq!(
+        (contents.len(), singleton_objects),
+        (10, 10),
+        "the singletons hold ten DISTINCT names between them - one array per \
+         axiom, no two axioms sharing an array"
+    );
+
+    // The mechanism, as an arithmetic identity rather than a description.
+    assert_eq!(
+        multiplicities,
+        vec![1, 1, 1, 1, 1, 1, 1, 1, 6, 12],
+        "slot multiplicity per array OBJECT: eight arrays used once, one used \
+         six times, one twelve"
+    );
+    assert_eq!(
+        (own, dependents, own + dependents),
+        (10, 16, 26),
+        "and each multiplicity is one OWN slot plus its dependents, so 10 + 16 \
+         is the 26. The sixteen of `bed63990` are exactly the surplus slots on \
+         the two shared arrays - a dependent never gets an array of its own, it \
+         points at the one the axiom's own entry points at"
+    );
+
+    // Where the sixteen point: occurrences against objects.
+    let distinct: BTreeSet<usize> = targets.iter().copied().collect();
+    assert_eq!(
+        (targets.len(), distinct.len()),
+        (16, 2),
+        "SIXTEEN OCCURRENCES, TWO OBJECTS. Counting occurrences would report \
+         sixteen targets and hide that the sixteen name only two things"
+    );
+    let mut multiplicity: Vec<usize> = distinct
+        .iter()
+        .map(|t| targets.iter().filter(|&&x| x == *t).count())
+        .collect();
+    multiplicity.sort_unstable();
+    assert_eq!(
+        multiplicity,
+        vec![5, 11],
+        "eleven of the sixteen name one of them and five the other"
+    );
+    assert!(
+        distinct.iter().all(|t| contents.contains(t)),
+        "every target is one of the ten, by pointer identity - and the ten are \
+         10 of {names_len} declarations, so sixteen names landing inside them \
+         is not what an indifferent structure gives"
+    );
+    assert_eq!(
+        self_named.len(),
+        10,
+        "the own-slots are ten distinct indices, so no entry is counted twice"
+    );
+
+    // Two targeted, eight not - as indices, not as a count.
+    let targeted: Vec<u64> = (0..names_len)
+        .filter(|&i| {
+            resolve(word_at(bytes, names_array + 24 + 8 * i as usize))
+                .is_some_and(|named| distinct.contains(&named))
+        })
+        .collect();
+    assert_eq!(
+        targeted,
+        vec![504, 885],
+        "the ten split TWO targeted and eight named by nothing but themselves, \
+         pinned as indices so that a member moving across the split cannot \
+         leave a total looking right"
+    );
+
+    // Which two, structurally rather than by rendering.
+    let mut shapes: Vec<Vec<u64>> = distinct
+        .iter()
+        .map(|&target| {
+            let mut component = Some(target);
+            let mut stored = Vec::new();
+            while let Some(off) = component {
+                stored.push(
+                    resolve(word_at(bytes, off + 16))
+                        .map(|string| word_at(bytes, string + 8))
+                        .unwrap_or(0),
+                );
+                component = resolve(word_at(bytes, off + 8));
+            }
+            stored.reverse();
+            stored
+        })
+        .collect();
+    shapes.sort();
+    assert_eq!(
+        shapes,
+        vec![vec![8_u64], vec![10_u64, 7]],
+        "prefix-first stored byte counts: one target is a single component of 8 \
+         bytes, the other two components of 10 and 7. Read off the wire, so \
+         this does not depend on how the decoder renders a name"
+    );
+}
+
 /// The compiler structure inside `entries` that shares the declaration names.
 ///
 /// `c384f87e` showed `constNames[i]` and the `ConstantVal` under `constants[i]`
@@ -12004,12 +12258,16 @@ fn the_extension_that_shares_the_declaration_names() {
          not depend on how a numeric component is rendered"
     );
 
-    // Per array OBJECT.
+    // Per SLOT. See `where_the_sixteen_dependents_point` for the object count.
     assert_eq!(
         lengths_histogram.into_iter().collect::<Vec<_>>(),
         vec![(0, 2178), (1, 26)],
-        "the payload's second fields are 2,178 empty arrays and 26 singletons, \
-         counted over array objects rather than over the names inside them"
+        "the payload has 2,178 slots holding an empty array and 26 holding a \
+         singleton - counted PER SLOT, one tally per index. The first version \
+         of this comment said `counted over array objects`, which is false: \
+         the arrays are SHARED, and per distinct object the same walk gives 1 \
+         empty and 10 singletons. The assertion was right and its description \
+         was not, which is why w198 passed it"
     );
 
     // The decomposition, bound per member and not as a total.
