@@ -12932,6 +12932,158 @@ fn assert_structural_budget_resource_facts_are_total() {
     }
 }
 
+/// Every `ResourceReason` maps to its own token, in the right slot.
+///
+/// **Only one of six arms was ever pinned.**
+/// `assert_structural_budget_resource_facts_are_total` proves the
+/// `StructuralBudget` arm total over `StructuralUnit::ALL`, and is deliberately
+/// called before the pin-gated skip so it runs on a host with no Reference. The
+/// other five arms of `resource_usage_facts` had nothing. `inconclusive:Steps`
+/// and `inconclusive:Depth` appear all over this file, but as LITERALS in census
+/// fixtures and fault rows -- never as this function's output.
+/// `inconclusive:Heartbeats` and `inconclusive:Memory` occur exactly once each in
+/// the whole file: at the arm that produces them.
+///
+/// **The slots are the part that can be wrong while still looking right.** The
+/// facts triple is `(token, steps, depth)`. `RecursionDepth` puts `observed` in
+/// the DEPTH slot and zero in steps; `Heartbeats`, `ExecutionSteps` and `Memory`
+/// do the opposite. Swap those two and an exhaustion at depth 900 is filed as
+/// 900 STEPS at depth 0 -- a well-formed evidence row, a plausible number, and
+/// the wrong cause. The observed value here is 900 precisely so a swap shows up
+/// as 900-versus-0 rather than as zero-versus-zero.
+///
+/// **Distinct tokens, because a merge is invisible downstream.** Two reasons
+/// sharing an outcome token collapse into one census family, and the census
+/// would balance perfectly while attributing every heartbeat exhaustion to
+/// something else. `ExecutionSteps` exists specifically to NOT borrow the
+/// heartbeat name, per its own doc; nothing checked that they still differ.
+///
+/// **Exhaustiveness is the compiler's, not a hand-list's.** `witness` matches
+/// every variant with no catch-all, so adding a `ResourceReason` fails to
+/// compile HERE -- which drags whoever adds it to the list three lines below.
+/// That coupling is the honest limit: the list itself is written by hand, and
+/// what makes it maintainable is that nobody can extend the taxonomy without
+/// being sent to this function.
+#[test]
+fn every_resource_reason_maps_to_its_own_token_and_the_right_slot() {
+    fn witness(reason: &ResourceReason) -> &'static str {
+        match reason {
+            ResourceReason::Heartbeats { .. } => "Heartbeats",
+            ResourceReason::ExecutionSteps => "ExecutionSteps",
+            ResourceReason::RecursionDepth { .. } => "RecursionDepth",
+            ResourceReason::Cancelled => "Cancelled",
+            ResourceReason::Memory { .. } => "Memory",
+            ResourceReason::StructuralBudget { .. } => "StructuralBudget",
+        }
+    }
+
+    const OBSERVED: u64 = 900;
+    // Which slot each reason's observed value belongs in. `Steps` means the u64
+    // field carries it and the depth field is zero; `Depth` is the mirror image;
+    // `Neither` means the reason carries no number through this triple at all.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Slot {
+        Steps,
+        Depth,
+        Neither,
+    }
+
+    let cases: Vec<(ResourceReason, &str, Slot)> = vec![
+        (
+            ResourceReason::Heartbeats {
+                consumed: OBSERVED,
+                limit: 64,
+            },
+            "inconclusive:Heartbeats",
+            Slot::Steps,
+        ),
+        (
+            ResourceReason::ExecutionSteps,
+            "inconclusive:Steps",
+            Slot::Steps,
+        ),
+        (
+            ResourceReason::RecursionDepth { limit: 64 },
+            "inconclusive:Depth",
+            Slot::Depth,
+        ),
+        (
+            ResourceReason::Cancelled,
+            "inconclusive:Cancelled",
+            Slot::Neither,
+        ),
+        (
+            ResourceReason::Memory { limit_bytes: 64 },
+            "inconclusive:Memory",
+            Slot::Steps,
+        ),
+        (
+            ResourceReason::StructuralBudget {
+                unit: StructuralUnit::InputBytes,
+            },
+            "inconclusive:StructuralBudget:InputBytes",
+            Slot::Neither,
+        ),
+    ];
+
+    // THE LIST COVERS EVERY VARIANT. `witness` cannot compile if a variant is
+    // added without an arm, and this count cannot pass if one is added without a
+    // case -- so the two together are what make the hand-written list total.
+    let covered = cases
+        .iter()
+        .map(|(reason, _, _)| witness(reason))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        covered.len(),
+        6,
+        "a `ResourceReason` variant has no case here. `witness` names {covered:?}; add the \
+         missing one with its token and its slot rather than widening this number"
+    );
+
+    let mut tokens = BTreeSet::new();
+    for (reason, expected_token, slot) in cases {
+        let name = witness(&reason);
+        let usage = ResourceUsage {
+            reason,
+            allowed: 64,
+            observed: OBSERVED,
+        };
+        let (token, steps, depth) = resource_usage_facts(&usage);
+
+        assert_eq!(
+            token, expected_token,
+            "`{name}` must file itself as `{expected_token}`"
+        );
+        assert!(
+            tokens.insert(token.clone()),
+            "`{name}` reuses the token `{token}`. Two reasons sharing one token collapse into a \
+             single census family: the counts still balance, and every exhaustion of one cause is \
+             attributed to the other"
+        );
+        // BOUND TO THE CLOSED FAMILY TAXONOMY, not merely to a prefix. A token
+        // carrying a `,` or `=` would be re-read as a different family with a
+        // different count when a census row is parsed back.
+        check_family_token(&token, FamilyDirection::NoAnswer)
+            .unwrap_or_else(|reason| panic!("`{name}` emits an illegal family token: {reason}"));
+
+        let observed_slot = match (steps, depth) {
+            (0, 0) => Slot::Neither,
+            (s, 0) if s == OBSERVED => Slot::Steps,
+            (0, d) if u64::from(d) == OBSERVED => Slot::Depth,
+            other => panic!(
+                "`{name}` reported {other:?}, which is neither the observed value in one slot nor \
+                 zero in both"
+            ),
+        };
+        assert_eq!(
+            observed_slot, slot,
+            "`{name}` put its observed value in the wrong slot: {steps} step(s), depth {depth}. A \
+             depth exhaustion filed as steps is a well-formed row with a plausible number and the \
+             wrong cause"
+        );
+    }
+}
+
 fn resource_exhaustion(v: &Outcome<Verdict>) -> Option<&ResourceUsage> {
     match v {
         Outcome::Inconclusive(inconclusive) => match &inconclusive.cause {
