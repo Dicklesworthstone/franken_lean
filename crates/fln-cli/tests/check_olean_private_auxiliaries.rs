@@ -1102,6 +1102,18 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
             .windows(2)
             .filter(|lines| {
                 lines[0].trim()
+                    == r##""\"execution\":{{\"steps\":{},\"systemPolls\":{},","##
+                    && lines[1].trim() == r##""\"peakStackDepth\":{}}}}}\n""##
+            })
+            .count(),
+        1,
+        "the FLBC-run renderer keeps execution beside peak stack depth",
+    );
+    assert_eq!(
+        cli_source_lines
+            .windows(2)
+            .filter(|lines| {
+                lines[0].trim()
                     == r##""\"decodedPrivateAuxiliaries\":{},","##
                     && lines[1].trim()
                         == r##""\"decodedPrivateAuxiliaryNames\":{},","##
