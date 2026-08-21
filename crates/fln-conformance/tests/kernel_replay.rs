@@ -12265,14 +12265,21 @@ fn the_whole_mathlib_floors_are_anchored_and_coherent() {
 /// complaint about indices and say nothing about the reader at all.
 #[test]
 fn truncating_a_row_never_splits_a_character() {
-    for row in [
+    // THE FOUR-BYTE ROW EARNS ITS PLACE. Every other case here needs at most ONE
+    // byte of walk-back -- measured -- so a cut written as `if !boundary { cut -=
+    // 1 }` instead of a loop satisfies all of them. `aa🎯bb` has its midpoint two
+    // bytes inside a four-byte character, so a single step leaves the cut still
+    // inside it and the slice that follows panics.
+    const ROWS: [&str; 7] = [
         "aé a",
         "café au lait",
         "{\"schema\":\"x\",\"bead\":\"franken–lean\"}",
         "",
         "x",
         "ありがとう",
-    ] {
+        "aa🎯bb",
+    ];
+    for row in ROWS {
         let cut = truncate_near_half(row);
         assert!(
             row.starts_with(&cut),
@@ -12294,13 +12301,28 @@ fn truncating_a_row_never_splits_a_character() {
     }
 
     // ANTI-VACUITY: at least one case must actually need the walk-back, or this
-    // test is a list of strings whose midpoints were already boundaries.
-    let needs_walkback = ["aé a", "ありがとう"]
-        .iter()
-        .any(|row| !row.is_char_boundary(row.len() / 2));
+    // test is a list of strings whose midpoints were already boundaries. Read
+    // from ROWS rather than from a second list of its own: the old version named
+    // two strings by hand and would have gone on passing if the loop above had
+    // stopped using them.
     assert!(
-        needs_walkback,
+        ROWS.iter().any(|row| !row.is_char_boundary(row.len() / 2)),
         "no case here has a midpoint inside a character, so nothing exercises the walk-back"
+    );
+
+    // AND ONE MUST NEED MORE THAN A SINGLE BYTE OF IT. Without this the list can
+    // drift back to characters of two and three bytes whose midpoints always
+    // land one step from a boundary, and a cut that steps back once instead of
+    // walking would pass again. Computed with `is_char_boundary`, not with the
+    // function under test: the midpoint is inside a character AND so is the byte
+    // before it.
+    assert!(
+        ROWS.iter().any(|row| {
+            let midpoint = row.len() / 2;
+            !row.is_char_boundary(midpoint) && !row.is_char_boundary(midpoint - 1)
+        }),
+        "every case needs at most one byte of walk-back, so a single step back would satisfy them \
+         all and nothing here distinguishes a walk from a step"
     );
 }
 
