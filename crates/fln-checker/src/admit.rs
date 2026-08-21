@@ -2919,10 +2919,10 @@ fn list_rule_rhs(
             recursive = builder.apply(recursive, argument);
         }
         result = builder.apply(result, recursive);
-        let parameter = builder.bvar(5);
+        let parameter = builder.bvar(4);
         let tail_type = list_application(&mut builder, list, list_universe, parameter);
         result = builder.lambda("tail", BinderStyle::Default, tail_type, result);
-        let head_type = builder.bvar(4);
+        let head_type = builder.bvar(3);
         result = builder.lambda("head", BinderStyle::Default, head_type, result);
     }
     result = builder.lambda("cons", BinderStyle::Default, cons_minor, result);

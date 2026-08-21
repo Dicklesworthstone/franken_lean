@@ -1131,10 +1131,10 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                     cons_minor_type(),
                     Expr::lam(
                         primary_name("head"),
-                        bv(4),
+                        bv(3),
                         Expr::lam(
                             primary_name("tail"),
-                            list_expr(bv(5)),
+                            list_expr(bv(4)),
                             Expr::app(
                                 Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
                                 recursive_call,
