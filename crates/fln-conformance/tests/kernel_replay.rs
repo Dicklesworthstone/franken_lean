@@ -13919,6 +13919,63 @@ fn thread_matrix_claim_sites(segment: &str) -> Vec<usize> {
     sites
 }
 
+/// Every markdown document in the repository, not merely the ones at its root.
+///
+/// The derived scope read `read_dir` at the TOP LEVEL, so it covered ten files
+/// and could not see the other thirteen. A claim in `crates/*/tests/*.md` or
+/// `tribunal/fixtures/*/*.md` was outside every rule here -- the scope was
+/// derived in the dimension that had already bitten (new root documents) and
+/// hand-shaped in the one that had not (depth).
+///
+/// THE SKIP IS A RULE, NOT A LIST, because a hand-listed scope is what this
+/// paragraph exists to stop being. Directories whose name begins with `.` are
+/// not repository documents (`.git`, and this host's untracked `.ntm` scratch,
+/// which no guard may be allowed to redden). `target` is build output. `vendor`
+/// is upstream's text, 61 tracked markdown files of it, and our determinism
+/// claim is not stated there -- scanning it would report on Lean's prose as
+/// though we had written it. Each exception is refused in the fixture below.
+///
+/// `file_type` does not follow symlinks, so a symlinked directory is never
+/// descended and the walk cannot cycle. The order is sorted: a scope that
+/// depends on directory order is not a scope.
+fn markdown_documents_below(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            // THE DOT RULE IS ABOUT NAMES, NOT ABOUT DIRECTORIES. Applying it to
+            // directories alone left `./._COMPREHENSIVE_PLAN...|....md` in scope
+            // -- 4096 bytes of untracked editor droppings sitting in the root,
+            // which the scan at the previous commit was already reading. It
+            // states the claim zero times, so nothing is red today; the hazard is
+            // that ANY untracked markdown a pane leaves in the root is scanned,
+            // and one containing the claim reddens the guard for every pane over
+            // a file that is not part of the repository. Nothing is deleted here:
+            // the file is excluded by rule and reported.
+            if name.starts_with('.') {
+                continue;
+            }
+            if kind.is_dir() {
+                if name == "target" || name == "vendor" {
+                    continue;
+                }
+                pending.push(entry.path());
+            } else if kind.is_file() && name.ends_with(".md") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// The one place a segment is collapsed, so every rule below indexes the same
 /// string. Positions from one of them are meaningless against another otherwise,
 /// and this guard has already shipped two scans that recognised different claims.
@@ -17272,6 +17329,47 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "three numbers in a list are not a statement about thread counts; a widening that reads \
          them as one invents sites nobody wrote"
     );
+    // THE SCOPE STOPPED AT THE ROOT, AND DEPTH IS A DIRECTION IT WAS NEVER
+    // DERIVED IN. Measured on the real repository: root-only sees 10 documents,
+    // this walk sees 23, and the three that state the claim are the same three,
+    // so the scope widens by thirteen files without a verdict moving.
+    let scope_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("t6r7-scope-walk-v1");
+    for relative in [
+        "root.md",
+        "docs/nested.md",
+        "docs/deeper/still.md",
+        "target/built.md",
+        "vendor/upstream.md",
+        ".hidden/scratch.md",
+        "._droppings.md",
+        "docs/._droppings.md",
+    ] {
+        let path = scope_root.join(relative);
+        fs::create_dir_all(path.parent().expect("a fixture entry has a parent"))
+            .expect("the scope fixture tree must be creatable");
+        fs::write(&path, b"").expect("a scope fixture document must be writable");
+    }
+    let walked = markdown_documents_below(&scope_root)
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&scope_root)
+                .expect("a walked path lies below the fixture root")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        walked,
+        vec![
+            "docs/deeper/still.md".to_string(),
+            "docs/nested.md".to_string(),
+            "root.md".to_string()
+        ],
+        "the walk must descend into ordinary directories, refuse build output, vendored text and \
+         every dotted NAME whether file or directory, and report a sorted order that does not \
+         depend on the filesystem"
+    );
+
     // THREE, NOT TWO, AND THE THIRD WAS ALWAYS THERE. Raising a ledger is the
     // direction that hides rot, so the reason is recorded: the count rose
     // because the matcher stopped missing `{1,8,32}`, not because a new site
@@ -17279,13 +17377,35 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     // scope -- the strongest place the unqualified claim could sit.
     const UNSCANNED_ALLOWANCE: [(&str, usize); 1] =
         [("COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKEN_LEAN.md", 3)];
-    for entry in fs::read_dir(&repo).expect("the repository root must be readable") {
-        let entry = entry.expect("a repository root entry must be readable");
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".md") || name == "AGENTS.md" || name == "README.md" {
+    // AND THE KEY IS THE PATH, NOT THE FILE NAME. Two documents may share a name
+    // once the walk goes below the root, and an allowance keyed by name would
+    // then answer for a file it was never written about.
+    let documents = markdown_documents_below(&repo);
+    assert!(
+        documents
+            .iter()
+            .any(|path| path.ends_with("crates/fln-kernel/tests/REFERENCE_DIFFERENTIAL.md")),
+        "the walk must reach documents below the root on the REAL repository, not only in the \
+         fixture: a cell that passes on a synthetic tree proves the rule fires, not that this \
+         scope covers anything"
+    );
+    assert!(
+        !documents
+            .iter()
+            .any(|path| path.components().any(|part| part.as_os_str() == "vendor")),
+        "vendored upstream markdown must stay out of the scope, or this guard reports on Lean's \
+         prose as though we had written it"
+    );
+    for path in documents {
+        let name = path
+            .strip_prefix(&repo)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if name == "AGENTS.md" || name == "README.md" {
             continue;
         }
-        let Ok(text) = fs::read_to_string(entry.path()) else {
+        let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
         // BOTH HALVES, AS THE SCANNED PATH REQUIRES. This counted only sites
