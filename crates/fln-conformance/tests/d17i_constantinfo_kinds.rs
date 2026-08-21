@@ -16009,3 +16009,96 @@ fn the_axioms_witness_agrees_with_the_constant_array_library_wide() {
         "the widest axioms block; the exported champion is not the private one"
     );
 }
+
+/// The remaining three header fields, over every part in the library.
+///
+/// `every_part_in_the_library_identifies_itself_as_the_pin` pins `lean_version`
+/// and `githash` across all 7,295 parts, and its own doc comment defers the
+/// `version` and `flags` bytes to `Init` scope, where
+/// `no_header_field_names_which_part_of_the_chain_it_is` covers 1,800 of them.
+/// That deferral was a cost judgement about a second full read, and it left the
+/// header's other three fields — magic, `version`, `flags` — unmeasured for the
+/// 5,495 parts outside `Init`.
+///
+/// They are constant too. All 7,295 parts carry `(magic "olean", version 2,
+/// flags 1)`: ONE class, spanning `Init`, `Std`, `Lean`, `Lake` and the four
+/// leaf executables, and spanning all three roles. Together with the identity
+/// cell, every field of the 88-byte header is now pinned library-wide except
+/// `base_addr`, which the layout cell shows takes 7,295 distinct values by
+/// construction.
+///
+/// SO THE HEADER SPLITS CLEANLY IN TWO. Four fields are constant across the
+/// entire artifact and one is unique per part. There is no field in between —
+/// nothing that varies by role, by namespace, or by anything else — which is
+/// what makes "read the header to find out which part this is" impossible rather
+/// than merely unimplemented, and it now rests on the whole library instead of
+/// on `Init`.
+///
+/// Anti-vacuity: the three role counts are UNEQUAL — 2,433 exported against
+/// 2,431 of each companion — so a walk that quietly visited only exported parts
+/// would report 2,433 three times and fail here. `Init` contributes 1,803 parts,
+/// which is 601 chains rather than the 600-module census, the aggregator
+/// included.
+///
+/// Conservation first: the role classes and the shape classes must each account
+/// for all 7,295 parts before the single shape is named.
+#[test]
+fn every_part_in_the_library_carries_the_same_magic_version_and_flags() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut shapes: BTreeMap<(u8, u8), usize> = BTreeMap::new();
+    let mut roles: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut init_parts = 0usize;
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean");
+        let stem = lib.join(module);
+        let has_chain = all.private.contains(path);
+        let from_init = module.replace('/', ".").split('.').next() == Some("Init");
+        for part in ["olean", "olean.server", "olean.private"] {
+            if part != "olean" && !has_chain {
+                continue;
+            }
+            let (version, flags, _) = header_shape(&stem.with_extension(part));
+            *shapes.entry((version, flags)).or_default() += 1;
+            *roles.entry(part).or_default() += 1;
+            if from_init {
+                init_parts += 1;
+            }
+        }
+    }
+
+    // Conservation first: both classifications cover the same population.
+    let parts: usize = roles.values().sum();
+    assert_eq!(
+        shapes.values().sum::<usize>(),
+        parts,
+        "every part read must be classified by its header shape"
+    );
+    assert_eq!(
+        roles,
+        BTreeMap::from([
+            ("olean", 2_433),
+            ("olean.server", 2_431),
+            ("olean.private", 2_431),
+        ]),
+        "the three roles, unequal because two oleans have no companions"
+    );
+    assert_eq!(parts, 7_295, "the library part census");
+
+    // One shape for the whole artifact.
+    assert_eq!(
+        shapes,
+        BTreeMap::from([((2, 1), 7_295)]),
+        "version and flags take one value across every part of every library"
+    );
+
+    // Init's share is 601 chains, not the 600-module census.
+    assert_eq!(
+        init_parts,
+        601 * 3,
+        "the Init parts include the aggregator's chain, which the census omits"
+    );
+}
