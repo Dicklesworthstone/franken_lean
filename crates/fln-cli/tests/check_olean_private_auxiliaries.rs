@@ -693,6 +693,15 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportUnsafeRecResiduals",
+        2,
+        &[
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateLoopProofResiduals",
         1,
         &["_private.CliPrivateReport.0.loop._proof_1"],
@@ -942,6 +951,16 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.List.Sort.Impl.0.List.MergeSort.Internal.splitRevAt.go._unsafe_rec", "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.consumeSpaces._unsafe_rec",
             "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport _unsafe_rec residuals",
+        "decoded _private CliPrivateReport _unsafe_rec residual names",
+        2,
+        &[
+            "_private.CliPrivateReport.0._unsafe_rec",
+            "_private.CliPrivateReport.0.mergeSortTR._unsafe_rec",
         ],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private .loop._proof_* residuals", "decoded _private .loop._proof_* residual names", 1, &["_private.CliPrivateReport.0.loop._proof_1"]);
