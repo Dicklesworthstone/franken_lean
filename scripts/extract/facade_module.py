@@ -1426,6 +1426,34 @@ def probe_generated_ctor_types(lean, env, work, text, decl, deps, owners):
     return owners_bad
 
 
+def refusal_conservation_error(refused, reproduced, unreproduced):
+    """Every recorded refusal must come back either reproduced or not reproduced.
+
+    probe_refused_inductives SKIPS a refused row it cannot splice -- no block could
+    be built for it, or it never got an `axiom` line to splice over -- and a filter
+    that CONTINUES is a sampler: the two verdict lists would then cover fewer rows
+    than `inductive_refused` counts, while the manifest presents them as the whole
+    story. Nothing else in this run can notice, because both lists are internally
+    consistent and every row in them is correct.
+
+    Compared by NAME rather than by count alone, so a row landing in both buckets
+    is caught too. Returns an error string, or None when the partition holds.
+    """
+    refused, reproduced = set(refused), set(reproduced)
+    unreproduced = set(unreproduced)
+    missing = sorted(refused - reproduced - unreproduced)
+    extra = sorted((reproduced | unreproduced) - refused)
+    both = sorted(reproduced & unreproduced)
+    if missing or extra or both:
+        return (f"the {len(refused)} recorded inductive refusals do not partition "
+                f"into {len(reproduced)} reproduced and {len(unreproduced)} not "
+                f"reproduced. Unaccounted for: {missing[:6]}; verdicts for rows "
+                f"that were never refused: {extra[:6]}; rows in both: {both[:6]}. "
+                "A refusal with no verdict was silently dropped by the splice, and "
+                "the manifest would present the survivors as the whole set")
+    return None
+
+
 def probe_refused_inductives(lean, env, work, text, line_map, decl, deps, blocks):
     """Does a refused inductive still fail against the FINISHED facade?
 
@@ -2305,6 +2333,12 @@ def main():
     refusal_verdict = probe_refused_inductives(
         lean, env, work, text, line_map, decl, deps, refused_blocks)
     unreproduced = sorted(n for n, v in refusal_verdict.items() if v is None)
+    refusal_reproduced = {k: v for k, v in sorted(refusal_verdict.items())
+                          if v is not None}
+    _cons = refusal_conservation_error(
+        inductive_refused, refusal_reproduced, unreproduced)
+    if _cons:
+        raise SystemExit("REFUSE: " + _cons)
 
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -2816,8 +2850,7 @@ def main():
         "inductive_refused": len(inductive_refused),
         "inductive_refused_reasons": {k: inductive_refused[k]
                                       for k in sorted(inductive_refused)},
-        "inductive_refusal_reproduced": {
-            k: v for k, v in sorted(refusal_verdict.items()) if v is not None},
+        "inductive_refusal_reproduced": refusal_reproduced,
         "inductive_refusal_not_reproduced": unreproduced,
         "inductive_refusal_note": "each refused block was rebuilt against the "
             "PUBLISHED facade and spliced in place of the `axiom` line the row "
