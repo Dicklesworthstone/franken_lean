@@ -2534,6 +2534,21 @@ fn kr600_803_color_fixture_pins_recursor_mutual_family_and_k() {
 }
 
 #[test]
+fn kr600_803_color_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = enumeration_entries(BinderInfo::Implicit);
+    let recursor = entries[3].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 1);
+    assert_eq!(metadata.num_parameters(), 0);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 2);
+    assert_eq!(metadata.rules().len(), 2);
+}
+
+#[test]
 fn kr600_803_color_fixture_pins_constructor_indices_parameters_and_fields() {
     let entries = enumeration_entries(BinderInfo::Implicit);
     for (entry, expected_index) in [(&entries[1], 0), (&entries[2], 1)] {
