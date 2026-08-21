@@ -3002,6 +3002,15 @@ fn assert_family_token_refused(token: &str, direction: FamilyDirection, because:
         Ok(()) => panic!("`{token}` was accepted as a `{field}` entry"),
         Err(reason) => reason,
     };
+    // `contains("")` IS ALWAYS TRUE. An empty `because` would turn this helper
+    // into `is_err()` -- exactly the check it was written to replace -- and every
+    // caller would keep passing while naming no rule at all. Refused at the door
+    // so the helper cannot be silently disabled by its own argument.
+    assert!(
+        !because.is_empty(),
+        "`{token}`: a refusal must be checked against a NAMED rule; an empty expectation matches \
+         every message"
+    );
     assert!(
         reason.contains(because),
         "`{token}` was refused as a `{field}` entry, but not for `{because}`: {reason}"
@@ -8151,6 +8160,11 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
             Err(reason) => reason,
         };
         assert!(
+            !expected.is_empty(),
+            "`{name}` carries an empty expectation, which `contains` satisfies for every \
+             message; the cell would pass whatever the reader did"
+        );
+        assert!(
             reason.contains(expected),
             "`{name}` was refused, but for the wrong reason: expected a message naming \
              `{expected}`, got `{reason}`"
@@ -8506,6 +8520,13 @@ fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
             ),
             Err(reason) => reason,
         };
+        // The cross-product check below would also fail on an empty expectation
+        // -- it matches every other cell's refusal -- but it would report a
+        // collision rather than the real fault, so the vacuity is named here.
+        assert!(
+            !expected.is_empty(),
+            "`{name}` carries an empty expectation, which matches every message"
+        );
         assert!(
             reason.contains(expected),
             "`{name}` was refused for the wrong reason: expected a message naming \
@@ -11810,6 +11831,15 @@ fn a_receipt_that_compared_nothing_is_refused() {
                  evidence for the PG-5 waiver does not have to describe a run that happened"
             )
         });
+        // Added by `franken_lean-t6r7`: this loop has the same shape as the
+        // whole-Mathlib receipt's, and `contains("")` is always true, so an
+        // empty expectation would silently reduce a cell to `is_err()`. Purely
+        // additive -- it refuses nothing this test accepted before unless an
+        // expectation is genuinely empty.
+        assert!(
+            !expected.is_empty(),
+            "mutant `{mutation}` carries an empty expectation, which matches every message"
+        );
         assert!(
             reason.contains(expected),
             "mutant `{mutation}` was refused for the wrong reason. Expected a message naming \
