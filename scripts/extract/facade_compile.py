@@ -1824,6 +1824,16 @@ def main():
             "REFUSE: facade manifest attempts-count pin diverges "
             f"({json.dumps(attempts_count_pin_join, sort_keys=True)})"
         )
+    extern_probed_pin_join = {
+        "summary_extern_probed": manifest_summary.get("extern_probed"),
+        "pinned_extern_probed": 2042,
+    }
+    if (extern_probed_pin_join["summary_extern_probed"]
+            != extern_probed_pin_join["pinned_extern_probed"]):
+        raise SystemExit(
+            "REFUSE: facade manifest extern-probe pin diverges "
+            f"({json.dumps(extern_probed_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2918,6 +2928,7 @@ def main():
         "manifest_explicit_printer_pin_join": explicit_printer_pin_join,
         "manifest_maxexplicit_printer_pin_join": maxexplicit_printer_pin_join,
         "manifest_attempts_count_pin_join": attempts_count_pin_join,
+        "manifest_extern_probed_pin_join": extern_probed_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
