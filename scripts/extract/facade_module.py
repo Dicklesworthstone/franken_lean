@@ -1916,6 +1916,14 @@ def published_bytes_error(out, text, what="the facade"):
     # case into a crash, and a crash is not a verdict: it names no artifact, gives
     # no byte counts, and reads as a broken extractor rather than a broken output.
     want = text.encode("utf-8")
+    if not want:
+        return (f"{what} is empty. Nothing here would have said so: this check "
+                "compares the file against the text the run built, and both being "
+                "empty is a match, so the comparison is vacuous exactly when there "
+                "is nothing to compare. The pin elaborates an empty file cleanly, "
+                "the acceptance digest of empty is still a digest, and the "
+                "coverage floor counts a set rather than the artifact, so a "
+                "zero-byte publication passes every other check in this file")
     try:
         with open(out, "rb") as fh:
             raw = fh.read()
@@ -2654,6 +2662,12 @@ def self_test():
 
     # published_bytes_error: the artifact on disk is the text this run built
     case("bytes/identical", published_bytes_error(at("f.lean", text), text), False)
+    # An empty artifact matches empty text, so this check was vacuous exactly
+    # where it mattered most.
+    case("bytes/empty-artifact-refused",
+         published_bytes_error(at("empty.lean", ""), ""), True)
+    case("bytes/empty-text-against-real-file",
+         published_bytes_error(at("real.lean", text), ""), True)
     case("bytes/appended", published_bytes_error(at("app.lean", text + "x"), text), True)
     case("bytes/missing",
          published_bytes_error(os.path.join(work, "gone.lean"), text), True)
