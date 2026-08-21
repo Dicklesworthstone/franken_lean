@@ -4750,6 +4750,40 @@ impl CorpusMatrixReceipt {
                     .to_string(),
             );
         }
+        // A NAME IS NOT A DIGEST, AND THIS FIELD IS THE ONLY HANDLE ON WHICH
+        // CORPUS WAS OBSERVED. Emptiness was refused; SHAPE was not, so a row
+        // could identify its corpus revision as `mathlib` or `latest` and pass
+        // every check here. Measured before adding it: the committed hash
+        // appears NOWHERE else in the tree -- `git grep` finds it only in this
+        // receipt and one bead -- so nothing downstream would ever contradict a
+        // label. `SUITE.lock` pins the corpus at a commit, but the receipt
+        // carries no corpus-commit field, so a real BINDING is not available
+        // without the corpus in the tree. Requiring the field to BE a digest is
+        // the strongest check this file can make on its own, and it is a check
+        // on the field's kind rather than on its value.
+        //
+        // 64 lowercase hex, measured from the committed row and from the
+        // producer, which fills this from the inventory's own fixture hash. The
+        // width is pinned deliberately: a digest of a different width is a
+        // digest of a different thing.
+        //
+        // NOT applied to the sibling receipt type, which carries the same field
+        // with the same emptiness-only rule: ten fixtures in this file give it a
+        // LABEL on purpose, so tightening it is a real change to those guards
+        // rather than a rule added beside them. Disclosed rather than done.
+        if self.corpus_fixture_hash.len() != 64
+            || !self
+                .corpus_fixture_hash
+                .chars()
+                .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        {
+            return Err(format!(
+                "row names its corpus revision as `{}`, which is not a 64-character lowercase \
+                 hex digest. This field is the only record of WHICH corpus was observed, and a \
+                 label cannot be checked against anything",
+                self.corpus_fixture_hash
+            ));
+        }
         if self.lane_source_digest_at_run.trim().is_empty() {
             return Err(
                 "row carries an empty lane_source_digest_at_run, so it names no producing \
@@ -18413,6 +18447,30 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 ..real.clone()
             },
             "empty corpus_fixture_hash",
+        ),
+        (
+            "a corpus revision named rather than digested",
+            CorpusMatrixReceipt {
+                corpus_fixture_hash: "mathlib-v4.32.0".to_string(),
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
+        ),
+        (
+            "a digest one character short",
+            CorpusMatrixReceipt {
+                corpus_fixture_hash: real.corpus_fixture_hash[..63].to_string(),
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
+        ),
+        (
+            "the right digest in the wrong case",
+            CorpusMatrixReceipt {
+                corpus_fixture_hash: real.corpus_fixture_hash.to_ascii_uppercase(),
+                ..real.clone()
+            },
+            "not a 64-character lowercase hex digest",
         ),
         (
             "no producing source named",
