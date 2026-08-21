@@ -1003,3 +1003,111 @@ fn the_reject_class_split_is_predicted_by_each_lemmas_own_references() {
          assertion above is vacuous"
     );
 }
+
+/// Every expression a declaration carries: its type, its value where it has
+/// one, and a recursor's rule right-hand sides.
+///
+/// The rule bodies are easy to forget and were the one thing my first pass at
+/// this measurement dropped — 129 recursors' worth. A reference scan that
+/// silently skips part of its input reports a smaller deficit than the truth
+/// and reads as a stronger result, which is the opposite of what a scan owes.
+fn declaration_expressions(info: &ConstantInfo) -> Vec<&Expr> {
+    let mut out = vec![&info.constant_val().type_];
+    match info {
+        ConstantInfo::Defn(v) => out.push(&v.value),
+        ConstantInfo::Thm(v) => out.push(&v.value),
+        ConstantInfo::Opaque(v) => out.push(&v.value),
+        ConstantInfo::Rec(v) => out.extend(v.rules.iter().map(|rule| &rule.rhs)),
+        ConstantInfo::Axiom(_)
+        | ConstantInfo::Quot(_)
+        | ConstantInfo::Induct(_)
+        | ConstantInfo::Ctor(_) => {}
+    }
+    out
+}
+
+/// Names referenced by the module's declarations that the module does not
+/// itself declare.
+fn unresolved_references(infos: &[ConstantInfo]) -> (BTreeSet<String>, usize) {
+    let declared: BTreeSet<String> = infos
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    let mut referenced = BTreeSet::new();
+    for info in infos {
+        for expr in declaration_expressions(info) {
+            referenced.append(&mut referenced_constants(expr));
+        }
+    }
+    let total = referenced.len();
+    (referenced.difference(&declared).cloned().collect(), total)
+}
+
+/// `Init/Prelude` is reference-CLOSED at private level, and its exported
+/// deficit is exactly the six auxiliaries the census reports.
+///
+/// Every other pin in this file asks whether a NAMED constant is present. This
+/// asks the general question the `UnknownConstant` class is actually about:
+/// does anything the module references fail to resolve? `Init/Prelude` is the
+/// only module where that can be asked without an import closure, because it
+/// imports nothing — so every constant it references must be declared by it, or
+/// the reference is unresolvable outright.
+///
+/// The two levels answer differently, which is what makes either answer worth
+/// recording:
+///
+///   exported   2,204 declared, 1,321 referenced, SIX unresolved
+///   private    2,314 declared, 1,543 referenced, ZERO unresolved
+///
+/// The six are not a list this test carries. They are derived here by closure
+/// and compared against `ARTIFACT_INCOMPLETE_ROWS`, whose auxiliaries were
+/// taken from the census's own rows. Two independent derivations of the same
+/// six: the census is not reporting a hand-picked set, it is reporting the
+/// exported part's reference deficit, and the private part closes it exactly.
+#[test]
+fn the_import_free_root_module_is_reference_closed_at_private_level() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+
+    let exported_view = OleanView::parse(&exported).expect("parse exported part");
+    let exported_infos = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode exported part");
+    let private_view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let private_infos = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let (exported_unresolved, exported_referenced) = unresolved_references(&exported_infos);
+    let (private_unresolved, private_referenced) = unresolved_references(&private_infos);
+
+    // Anti-vacuity. A walker that returned nothing would report zero unresolved
+    // at BOTH levels and look like the strongest possible result.
+    assert!(
+        exported_referenced > 1_000 && private_referenced > exported_referenced,
+        "the reference scan must actually reach the declarations (exported \
+         {exported_referenced}, private {private_referenced})"
+    );
+
+    let expected: BTreeSet<String> = ARTIFACT_INCOMPLETE_ROWS
+        .iter()
+        .map(|(_, auxiliary, _)| (*auxiliary).to_string())
+        .collect();
+    assert_eq!(
+        exported_unresolved, expected,
+        "the exported part's reference deficit must be exactly the auxiliaries the census \
+         names. These are derived two different ways — by closure here, from the census's own \
+         rows there — and a disagreement means one of them is describing something else."
+    );
+    assert!(
+        private_unresolved.is_empty(),
+        "the private part must close every reference its declarations make; anything left \
+         here is a genuine UnknownConstant source at the root of the corpus: \
+         {private_unresolved:?}"
+    );
+}
