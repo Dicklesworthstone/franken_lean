@@ -3524,6 +3524,26 @@ def main():
             "REFUSE: facade manifest substrate-emission count must exceed "
             f"inductive-declaration count ({json.dumps(substrate_inductive_inequality_join, sort_keys=True)})"
         )
+    substrate_structural_refusal_inequality_join = {
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+        "summary_structural_refused": manifest_summary.get("structural_refused"),
+    }
+    if (not isinstance(substrate_structural_refusal_inequality_join[
+            "summary_substrate_emitted"], int)
+            or isinstance(substrate_structural_refusal_inequality_join[
+                "summary_substrate_emitted"], bool)
+            or not isinstance(substrate_structural_refusal_inequality_join[
+                "summary_structural_refused"], int)
+            or isinstance(substrate_structural_refusal_inequality_join[
+                "summary_structural_refused"], bool)
+            or substrate_structural_refusal_inequality_join[
+                "summary_substrate_emitted"]
+            <= substrate_structural_refusal_inequality_join[
+                "summary_structural_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest substrate-emission count must exceed "
+            f"structural-refusal count ({json.dumps(substrate_structural_refusal_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5662,6 +5682,9 @@ def main():
         ),
         "manifest_substrate_inductive_inequality_join": (
             substrate_inductive_inequality_join
+        ),
+        "manifest_substrate_structural_refusal_inequality_join": (
+            substrate_structural_refusal_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
