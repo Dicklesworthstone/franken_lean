@@ -11720,6 +11720,200 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Necessary, not sufficient - measuring two sentences `a5e8cb68` left behind.
+///
+/// That cell asserted two things in prose and measured neither. Both are wrong,
+/// and they are wrong in opposite directions, which is why one cell measures
+/// both. The sentences are corrected in the same commit.
+///
+/// FIRST: "a parent whose own identity is undecided cannot decide its child's".
+/// Call a constructor shape SPLIT when its objects do not all share one
+/// boxed-or-pointer slot pattern - that is, when the shape alone does not fix
+/// which slots hold scalars. Prelude has 36 constructor shapes and 15 are
+/// split. Crossing that against the 18 arrival contexts of `a5e8cb68`:
+///
+///   unsplit parent, pure context     4
+///   split   parent, pure context    12
+///   split   parent, mixed context    2
+///   unsplit parent, mixed context    0
+///
+/// The zero is real and one-directional: NO mixed context has an unsplit
+/// parent, so a split parent is NECESSARY. It is nowhere near sufficient -
+/// twelve of the fourteen split-parent contexts are perfectly pure. An
+/// undecided parent usually does decide its child. The sentence claimed the
+/// implication that does not hold.
+///
+/// This is the shape `fln-shrinking-allowance-guard-direction` warns about: the
+/// true statement is one-way, and stating it as an equivalence turns a
+/// twelve-context majority into counterexamples.
+///
+/// SECOND: "even a rule keyed on context would have to agree with itself across
+/// arrivals". That reads as a hazard and names none. ZERO of the 414
+/// multi-arrival objects reach a pure context that disagrees with another pure
+/// context, AND NONE CAN: a pure context's class is the class of every child it
+/// has, so two pure contexts naming one object must name it the same. The
+/// constraint is satisfied by construction. What the 414 actually decompose
+/// into is 333 that arrive only through pure contexts and 81 that touch at
+/// least one mixed one - which is a fact, where the warning was not.
+///
+/// SPLIT IS COARSER THAN THE SIGNATURE AUDIT, and the two do not conflict. That
+/// audit counts distinct FIELD signatures per shape; this counts distinct
+/// boxed-or-pointer patterns, which merges signatures that differ only in which
+/// pointee type sits in a slot. So split implies more than one field signature
+/// and not the reverse, and 15 split shapes is a floor under that audit's
+/// counts rather than a competing number.
+///
+/// Its `(2, 2)` population is 1,955 against this cell's 1,938 for the same
+/// reason and not a disagreement: that audit pools four modules and this one is
+/// Prelude alone, 1938 + 1 + 10 + 6.
+///
+/// POPULATION SCOPE: `Init/Prelude.olean`, asserted rather than left implicit.
+#[test]
+fn the_inheritance_claim_is_necessary_not_sufficient() {
+    let Some(lib) = reference_lib() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(lib.join("Init/Prelude.olean")) else {
+        return;
+    };
+    let bytes = bytes.as_slice();
+
+    let (objects, base) = objects_of(bytes);
+    let at: std::collections::BTreeMap<usize, Obj> = objects.iter().map(|o| (o.off, *o)).collect();
+    let resolve = |word: u64| -> Option<usize> {
+        (word & 1 == 0)
+            .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+            .flatten()
+            .filter(|off| at.contains_key(off))
+    };
+
+    // A shape is SPLIT when its objects disagree about which slots are scalars.
+    let mut patterns: std::collections::BTreeMap<(u8, u8), BTreeSet<Vec<bool>>> =
+        std::collections::BTreeMap::new();
+    for object in &objects {
+        if object.tag > abi::TAG_MAX_CTOR_TAG {
+            continue;
+        }
+        let pattern: Vec<bool> = (0..usize::from(object.other))
+            .map(|slot| word_at(bytes, object.off + 8 + 8 * slot) & 1 == 1)
+            .collect();
+        patterns
+            .entry((object.tag, object.other))
+            .or_default()
+            .insert(pattern);
+    }
+    let split: BTreeSet<(u8, u8)> = patterns
+        .iter()
+        .filter(|(_, seen)| seen.len() > 1)
+        .map(|(shape, _)| *shape)
+        .collect();
+
+    // `a5e8cb68`'s contexts, rebuilt rather than quoted.
+    let two_two: BTreeSet<usize> = objects
+        .iter()
+        .filter(|o| (o.tag, o.other) == (2, 2))
+        .map(|o| o.off)
+        .collect();
+    let class = |off: usize| -> &'static str {
+        let word = word_at(bytes, off + 16);
+        if word & 1 == 1 {
+            "boxed"
+        } else if resolve(word).is_some() {
+            "pointer"
+        } else {
+            "unresolved"
+        }
+    };
+    let mut contexts: std::collections::BTreeMap<(u8, u8, usize), BTreeSet<&'static str>> =
+        std::collections::BTreeMap::new();
+    let mut arrivals: std::collections::BTreeMap<usize, BTreeSet<(u8, u8, usize)>> =
+        std::collections::BTreeMap::new();
+    for parent in &objects {
+        let slots: Vec<(usize, u64)> = if parent.tag <= abi::TAG_MAX_CTOR_TAG {
+            (0..usize::from(parent.other))
+                .map(|slot| (slot, word_at(bytes, parent.off + 8 + 8 * slot)))
+                .collect()
+        } else if parent.tag == abi::TAG_ARRAY {
+            (0..word_at(bytes, parent.off + 8))
+                .map(|i| (usize::MAX, word_at(bytes, parent.off + 24 + 8 * i as usize)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (slot, word) in slots {
+            let Some(child) = resolve(word).filter(|c| two_two.contains(c)) else {
+                continue;
+            };
+            let key = (parent.tag, parent.other, slot);
+            contexts.entry(key).or_default().insert(class(child));
+            arrivals.entry(child).or_default().insert(key);
+        }
+    }
+
+    // The cross-tab. The zero is the whole point.
+    let mut cross = [[0usize; 2]; 2];
+    for (key, classes) in &contexts {
+        let parent_split = usize::from(split.contains(&(key.0, key.1)));
+        let mixed = usize::from(classes.len() > 1);
+        cross[parent_split][mixed] += 1;
+    }
+    assert_eq!(
+        (patterns.len(), split.len()),
+        (36, 15),
+        "constructor shapes in Prelude, and those whose objects disagree about \
+         which slots hold scalars"
+    );
+    assert_eq!(
+        (cross[0][0], cross[0][1], cross[1][0], cross[1][1]),
+        (4, 0, 12, 2),
+        "arrival contexts by (parent shape is split, context is mixed). NO \
+         mixed context has an unsplit parent, so a split parent is NECESSARY. \
+         Twelve of the fourteen split-parent contexts are perfectly pure, so it \
+         is nowhere near sufficient - `a5e8cb68` claimed the implication that \
+         does not hold, and stating a one-way rule as an equivalence turns a \
+         twelve-context majority into counterexamples"
+    );
+    assert_eq!(
+        cross.iter().flatten().sum::<usize>(),
+        18,
+        "and the four cells account for every context, so the zero is a \
+         measured absence rather than a group that was never looked at"
+    );
+
+    // The second sentence: a hazard that names none.
+    let pure: std::collections::BTreeMap<(u8, u8, usize), &'static str> = contexts
+        .iter()
+        .filter(|(_, classes)| classes.len() == 1)
+        .map(|(key, classes)| (*key, *classes.iter().next().expect("one")))
+        .collect();
+    let multi: Vec<&BTreeSet<(u8, u8, usize)>> =
+        arrivals.values().filter(|set| set.len() > 1).collect();
+    let disagreeing = multi
+        .iter()
+        .filter(|set| {
+            set.iter()
+                .filter_map(|key| pure.get(key))
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        })
+        .count();
+    let pure_only = multi
+        .iter()
+        .filter(|set| set.iter().all(|key| pure.contains_key(key)))
+        .count();
+    assert_eq!(
+        (multi.len(), disagreeing, pure_only, multi.len() - pure_only),
+        (414, 0, 333, 81),
+        "of the 414 multi-arrival objects, ZERO reach two pure contexts that \
+         disagree - and none can, since a pure context's class is the class of \
+         every child it has, so two of them naming one object must name it the \
+         same. `a5e8cb68` wrote that as a hazard; it is satisfied by \
+         construction. The decomposition is the fact: 333 arrive only through \
+         pure contexts and 81 touch at least one mixed one"
+    );
+}
+
 /// The arrival context does not discriminate either - and one refinement of two.
 ///
 /// `e0dd56f8` ended by saying that where tag, arity and size fail to identify a
@@ -11738,8 +11932,14 @@ fn the_other_references_to_that_name() {
 /// THE AMBIGUITY IS INHERITED, which is the part worth having. Both mixed
 /// parents wear shapes this file has already shown to be ambiguous - `(1, 2)`
 /// is the cons-or-name shape that blocks `list_ptrs`, and `(1, 1)` appears in
-/// `e0dd56f8`'s four-shape family. A parent whose own identity is undecided
-/// cannot decide its child's.
+/// `e0dd56f8`'s four-shape family.
+///
+/// This paragraph used to end "a parent whose own identity is undecided cannot
+/// decide its child's". Measured in
+/// `the_inheritance_claim_is_necessary_not_sufficient`, that is FALSE: an
+/// undecided parent is NECESSARY for a mixed context and nowhere near
+/// sufficient - twelve contexts have an undecided parent and decide their child
+/// perfectly. The one-directional form is the true one.
 ///
 /// ONE MORE BIT RESOLVES ONE OF THEM AND NOT THE OTHER. Refining the `(1, 2)`
 /// parent by its OWN second field splits the 689 edges into three contexts, all
@@ -11753,8 +11953,14 @@ fn the_other_references_to_that_name() {
 /// would be a claim about every rule I did not try.
 ///
 /// CONTEXTS ARE NOT UNIQUE PER OBJECT EITHER: 414 of the 1,938 are reached from
-/// more than one distinct context, so even a rule keyed on context would have
-/// to agree with itself across arrivals.
+/// more than one distinct context.
+///
+/// That sentence used to continue "so even a rule keyed on context would have
+/// to agree with itself across arrivals", as though it named a hazard. It does
+/// not. Measured: ZERO of the 414 arrive through two pure contexts that
+/// disagree, and none can - a pure context's class is the class of every child
+/// it has, so two of them naming one object must name it the same. The
+/// requirement is satisfied by construction and the warning was empty.
 ///
 /// Both refinements are pinned with their edge counts reconciled against the
 /// mixed totals they refine - 583 + 88 + 18 against 689, and 56 + 19 + 10
@@ -11909,8 +12115,10 @@ fn the_arrival_context_does_not_discriminate_either() {
         ],
         "and BOTH mixed parents wear shapes this file has already shown to be \
          ambiguous - `(1, 2)` is the cons-or-name shape that blocks \
-         `list_ptrs`. The ambiguity is inherited: a parent whose own identity is \
-         undecided cannot decide its child's"
+         `list_ptrs`. An undecided parent is NECESSARY for a mixed context and \
+         not sufficient; the first version of this message said an undecided \
+         parent `cannot decide its child's`, which \
+         `the_inheritance_claim_is_necessary_not_sufficient` measures false"
     );
 
     // One refinement works.
@@ -11959,9 +12167,11 @@ fn the_arrival_context_does_not_discriminate_either() {
     assert_eq!(
         arrivals.values().filter(|set| set.len() > 1).count(),
         414,
-        "414 of the 1,938 are reached from more than one distinct context, so \
-         even a context-keyed rule would have to agree with itself across \
-         arrivals"
+        "414 of the 1,938 are reached from more than one distinct context. The \
+         first version added `so even a context-keyed rule would have to agree \
+         with itself across arrivals`, which reads as a hazard and is not one - \
+         see `the_inheritance_claim_is_necessary_not_sufficient`, where zero of \
+         the 414 disagree and none can"
     );
 }
 
