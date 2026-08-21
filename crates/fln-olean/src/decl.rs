@@ -2506,6 +2506,124 @@ mod tests {
         .bytes
     }
 
+    /// One quotient constant, so the region contains a `QuotVal`.
+    ///
+    /// The pin ships only FOUR quotient declarations in total (measured over
+    /// all 2,431 chained modules while binding the payload sizes), so this is
+    /// the one constructor whose real-world coverage is thinnest and the one
+    /// most worth exercising from a fixture rather than hoping the corpus does
+    /// it.
+    fn quot_module() -> Vec<u8> {
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Quot(QuotVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "quot"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(Level::zero()),
+                    },
+                    kind: QuotKind::Lift,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// A `QuotKind` byte outside `0..=3` is refused.
+    ///
+    /// The four kinds are Type, Ctor, Lift and Ind, and they say which axiom
+    /// of the quotient a declaration IS. A fifth value has no meaning, and
+    /// silently folding it onto one of the four would misidentify a quotient
+    /// primitive — a semantic fault like the definition safety byte (95c98cbd),
+    /// not a layout one.
+    ///
+    /// SHADOWING CHECKED. The kind is the FIRST scalar of the payload, at
+    /// `voff + 8 + 8*other`, so the plant leaves the header alone and the
+    /// payload size and padding binds (1b53cb09, e9348f58) cannot fire — the
+    /// byte is not in the padding those guard. Both are asserted after the
+    /// plant.
+    #[test]
+    fn a_quot_kind_byte_outside_its_four_values_is_refused() {
+        let mut bytes = quot_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified quotient fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        assert_eq!(
+            view.obj_header(info_off).expect("wrapper header").0,
+            4,
+            "the quotient variant"
+        );
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("QuotVal pointer"))
+            .expect("QuotVal object");
+
+        // QuotVal is one pointer — the base — then the kind byte.
+        let (tag, other, cs_sz) = view.obj_header(val_off).expect("QuotVal header");
+        assert_eq!(other, 1, "the ConstantVal");
+        let kind = val_off as usize + 8 + 8;
+        assert_eq!(
+            bytes[kind], 2,
+            "the fixture is QuotKind::Lift, so the plant is a change"
+        );
+        assert!(
+            bytes[kind + 1..val_off as usize + cs_sz as usize]
+                .iter()
+                .all(|b| *b == 0),
+            "and its padding starts clean"
+        );
+
+        bytes[kind] = 4;
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(val_off).expect("header after plant"),
+            (tag, other, cs_sz),
+            "the header is untouched, so the size bind cannot fire"
+        );
+        assert!(
+            bytes[kind + 1..val_off as usize + cs_sz as usize]
+                .iter()
+                .all(|b| *b == 0),
+            "and the padding is untouched, so the padding bind cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a QuotKind byte outside 0..=3 must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "QuotKind byte",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `DataValue.ofBool` claiming a pointer field is refused.
     ///
     /// `ofBool` carries a single scalar byte and NO pointers, so the decoder
