@@ -1986,6 +1986,23 @@ def main():
             "REFUSE: facade manifest emission-verification count pin diverges "
             f"({json.dumps(emission_verification_count_join, sort_keys=True)})"
         )
+    uncensused_zero_join = {
+        "summary_uncensused_emitted": manifest_summary.get(
+            "uncensused_emitted"
+        ),
+        "summary_uncensused_closure": manifest_summary.get(
+            "uncensused_closure"
+        ),
+        "pinned_uncensused_count": 0,
+    }
+    if (uncensused_zero_join["summary_uncensused_emitted"]
+            != uncensused_zero_join["pinned_uncensused_count"]
+            or uncensused_zero_join["summary_uncensused_closure"]
+            != uncensused_zero_join["pinned_uncensused_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest uncensused-count equality diverges "
+            f"({json.dumps(uncensused_zero_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3100,6 +3117,7 @@ def main():
         "manifest_emission_verification_count_join": (
             emission_verification_count_join
         ),
+        "manifest_uncensused_zero_join": uncensused_zero_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
