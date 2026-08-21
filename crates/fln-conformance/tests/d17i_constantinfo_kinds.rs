@@ -12136,7 +12136,7 @@ fn the_rule_field_surplus_localises_to_the_nested_block() {
 
     let width = |name: &String| *fields.get(name).unwrap_or(&0) as usize;
     let mut exact = 0usize;
-    let mut foreign_blocks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut foreign_blocks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (head, rules) in &covered {
         let mine = own
             .get(head)
@@ -12161,7 +12161,10 @@ fn the_rule_field_surplus_localises_to_the_nested_block() {
         if foreign.is_empty() && duplicated == 0 && covered_fields == own_fields {
             exact += 1;
         } else {
-            foreign_blocks.insert(head.clone(), foreign);
+            // Keyed as a set so the pin cannot depend on rule encounter order; the
+            // multiset size is pinned below, since a duplicate inside a block that is
+            // already non-exact would otherwise vanish into the set.
+            foreign_blocks.insert(head.clone(), foreign.iter().cloned().collect());
         }
     }
 
@@ -12177,7 +12180,7 @@ fn the_rule_field_surplus_localises_to_the_nested_block() {
             DOUBLY_RULED_CONSTRUCTORS
                 .iter()
                 .map(|name| (*name).to_owned())
-                .collect::<Vec<String>>()
+                .collect::<BTreeSet<String>>()
         )]),
         "the whole surplus is the nested family, ruling exactly the doubly-ruled constructors"
     );
@@ -12188,5 +12191,11 @@ fn the_rule_field_surplus_localises_to_the_nested_block() {
         ),
         (12, 9),
         "and the surplus is three fields, the widths this row is stated against"
+    );
+    assert_eq!(
+        covered["Lean.Syntax"].len(),
+        7,
+        "the family rules seven times in all — pinned as a count because the set above \
+         would swallow a repeat"
     );
 }
