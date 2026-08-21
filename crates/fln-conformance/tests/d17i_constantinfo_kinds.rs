@@ -9093,3 +9093,144 @@ fn every_gapped_base_is_on_the_decidable_equality_path_by_reference() {
         }
     }
 }
+
+/// The declaration reference graph is acyclic once the non-safe recursive
+/// implementations are removed — and those are exactly the cycles.
+///
+/// The import-graph cell establishes acyclicity between MODULES. Between
+/// DECLARATIONS nothing had asked, and it is the sharper question: a cycle in
+/// the reference graph means no order exists in which the kernel could admit
+/// the declarations, since each would need the other already present.
+///
+/// Measured over `Init/Prelude` at private level, 2,314 declarations, walking
+/// every stored expression for the constants it names:
+///
+///   the full graph HAS cycles — 32 of them, with 32 distinct participants,
+///     every one a self-loop or a two-step loop among recursive implementations
+///   every participant is a definition whose `DefinitionSafety` is NOT `Safe`,
+///     and they all share the same non-safe variant
+///   removing the non-safe definitions leaves 2,271 declarations and ZERO
+///     cycles, so an admission order exists for everything the kernel would
+///     accept
+///
+/// Being non-safe is necessary but NOT sufficient: 43 definitions are not
+/// `Safe` and only 32 are in a cycle. The other 11 are non-safe and perfectly
+/// well-founded. That is asserted, because "the cycles are the unsafe ones"
+/// invites the converse and the converse is false.
+///
+/// The safety variant is derived from the decoded declarations rather than
+/// written into the cell. A test that hardcoded which variant the recursive
+/// implementations carry would still pass if the decoder mapped the byte to a
+/// different variant, which is the mistake this measurement nearly made.
+#[test]
+fn the_reference_graph_is_acyclic_once_the_non_safe_definitions_are_removed() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+    assert_eq!(infos.len(), 2314, "the declaration census must be reached");
+
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut safety: BTreeMap<String, DefinitionSafety> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        if let ConstantInfo::Defn(v) = info {
+            safety.insert(name.clone(), v.safety);
+        }
+        let mut referenced = BTreeSet::new();
+        for expr in declaration_expressions(info) {
+            referenced.append(&mut referenced_constants(expr));
+        }
+        edges.insert(name, referenced);
+    }
+    let declared: BTreeSet<&String> = edges.keys().collect();
+
+    // Three-colour DFS over a chosen node set; returns the participants.
+    let participants = |nodes: &BTreeSet<&String>| -> BTreeSet<String> {
+        let mut colour: BTreeMap<&String, u8> = nodes.iter().map(|name| (*name, 0)).collect();
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for start in nodes {
+            if colour[start] != 0 {
+                continue;
+            }
+            colour.insert(start, 1);
+            let mut path: Vec<&String> = vec![start];
+            let mut stack: Vec<(&String, Vec<&String>)> = vec![(
+                start,
+                edges[*start]
+                    .iter()
+                    .filter(|to| nodes.contains(to))
+                    .collect(),
+            )];
+            while let Some((node, pending)) = stack.last_mut() {
+                let node = *node;
+                let Some(next) = pending.pop() else {
+                    colour.insert(node, 2);
+                    stack.pop();
+                    path.pop();
+                    continue;
+                };
+                if colour[next] == 1 {
+                    // `next` is on the current path: everything from it back to
+                    // the head is a cycle, and a self-loop is the length-one case.
+                    let start_index = path.iter().position(|on| *on == next).unwrap_or(0);
+                    found.extend(path[start_index..].iter().map(|name| (*name).clone()));
+                    found.insert(next.clone());
+                } else if colour[next] == 0 {
+                    colour.insert(next, 1);
+                    path.push(next);
+                    stack.push((
+                        next,
+                        edges[next].iter().filter(|to| nodes.contains(to)).collect(),
+                    ));
+                }
+            }
+        }
+        found
+    };
+
+    let cyclic = participants(&declared);
+    assert_eq!(
+        cyclic.len(),
+        32,
+        "the full graph must carry exactly the cycles measured at the pin"
+    );
+
+    // Every participant is a non-safe definition, and they agree on which
+    // variant — derived, not written down.
+    let variants: BTreeSet<&'static str> = cyclic
+        .iter()
+        .map(|name| match safety.get(name) {
+            Some(DefinitionSafety::Safe) => "Safe",
+            Some(DefinitionSafety::Partial) => "Partial",
+            Some(DefinitionSafety::Unsafe) => "Unsafe",
+            None => "not a definition",
+        })
+        .collect();
+    assert_eq!(
+        variants.len(),
+        1,
+        "the cycle participants must agree on a single safety, got {variants:?}"
+    );
+    assert!(
+        !variants.contains("Safe") && !variants.contains("not a definition"),
+        "and it must be a non-safe definition variant, got {variants:?}"
+    );
+
+    let safe: BTreeSet<&String> = declared
+        .iter()
+        .filter(|name| !matches!(safety.get(**name), Some(variant) if *variant != DefinitionSafety::Safe))
+        .copied()
+        .collect();
+    assert_eq!(
+        (safe.len(), participants(&safe).len()),
+        (2_271, 0),
+        "removing the non-safe definitions must leave an acyclic graph"
+    );
+
+    // Necessary but not sufficient: more definitions are non-safe than are cyclic.
+    let non_safe = declared.len() - safe.len();
+    assert_eq!(
+        (non_safe, cyclic.len()),
+        (43, 32),
+        "eleven non-safe definitions are well-founded, so the converse fails"
+    );
+}
