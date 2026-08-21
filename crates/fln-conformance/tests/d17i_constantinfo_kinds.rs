@@ -1789,3 +1789,98 @@ fn numeric_block_observables_agree_and_the_k_population_is_exact() {
          Prop; if this ever flips, the rule being tested above has been misread"
     );
 }
+
+/// The last two stored block relations nothing checks: a rule's field count
+/// against its constructor's, and a constructor's index against its position.
+///
+/// `71f8e0fa` checked WHICH constructor each rule names and `cd572cac` checked
+/// the recursor's aggregate counts. Neither looks inside a rule. A recursor rule
+/// stores `nfields` — how many arguments the minor premise consumes — and a
+/// constructor stores `cidx`, its ordinal in its inductive. Block admission
+/// regenerates both and compares, so either being wrong is a `BlockMismatch`
+/// while every name agrees, every aggregate count agrees, and every cell above
+/// this one stays green.
+///
+/// Measured over `Init/Prelude` at private level: 160 rules, every `nfields`
+/// equal to its constructor's `num_fields`, and every `cidx` equal to the
+/// constructor's position in its inductive's `ctors` list.
+///
+/// Both are checked against a floor, because both are the kind of field a
+/// broken decode would most plausibly return as a uniform zero: 143 of the 160
+/// rules bind at least one field, and the largest `cidx` at the pin is 12, so
+/// neither assertion can be satisfied by an all-zeros read.
+#[test]
+fn recursor_rule_arities_and_constructor_indices_match_their_declarations() {
+    let lib = lib_or_skip!();
+    let base = lib.join("Init/Prelude.olean");
+    let read = |p: PathBuf| std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    let exported = read(base.clone());
+    let server = read(base.with_extension("olean.server"));
+    let private = read(base.with_extension("olean.private"));
+    let view = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+        .expect("parse private part");
+    let infos = DeclDecoder::new(&view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("decode private part");
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, &ConstructorVal> = BTreeMap::new();
+    let mut recursors: Vec<(String, &RecursorVal)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => drop(constructors.insert(name, v)),
+            ConstantInfo::Rec(v) => recursors.push((name, v)),
+            _ => {}
+        }
+    }
+
+    let mut rules_seen = 0usize;
+    let mut rules_binding_fields = 0usize;
+    for (name, rec) in &recursors {
+        for rule in &rec.rules {
+            rules_seen += 1;
+            let ctor_name = rule.ctor.to_display_string();
+            let ctor = constructors.get(&ctor_name).unwrap_or_else(|| {
+                panic!("{name} has a rule for {ctor_name}, which is not a decoded constructor")
+            });
+            assert_eq!(
+                rule.nfields, ctor.num_fields,
+                "{name}'s rule for {ctor_name} binds {} fields, but the constructor declares {}",
+                rule.nfields, ctor.num_fields
+            );
+            if rule.nfields > 0 {
+                rules_binding_fields += 1;
+            }
+        }
+    }
+    assert!(
+        rules_seen >= 150 && rules_binding_fields >= 100,
+        "the rule scan must reach the pin's rules and most of them bind fields \
+         ({rules_seen} rules, {rules_binding_fields} binding at least one)"
+    );
+
+    let mut largest_index = 0u32;
+    for (name, ctor) in &constructors {
+        let induct = inductives
+            .get(&ctor.induct.to_display_string())
+            .expect("constructor's inductive decodes");
+        let position = induct
+            .ctors
+            .iter()
+            .position(|c| c.to_display_string() == *name)
+            .unwrap_or_else(|| panic!("{name} is absent from its inductive's ctors list"));
+        assert_eq!(
+            ctor.cidx as usize, position,
+            "{name} stores index {} but sits at position {position}",
+            ctor.cidx
+        );
+        largest_index = largest_index.max(ctor.cidx);
+    }
+    assert!(
+        largest_index >= 10,
+        "a decode returning a uniform zero index would satisfy the check above for every \
+         single-constructor type; the pin reaches {largest_index}"
+    );
+}
