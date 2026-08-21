@@ -9296,8 +9296,10 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
     );
 
     // ANTI-VACUITY on the choice of expectations: each must appear in exactly
-    // one of the five messages this function can produce, or a cell could pass
-    // on a sibling's refusal. The list is the messages themselves, so it cannot
+    // one of the six messages this function can produce, or a cell could pass
+    // on a sibling's refusal. (It read FIVE while the array below held six -- a
+    // count in prose disagreeing with the population beside it, the same defect
+    // as the two hand-written seventeens repaired at e7be44c3.) The list is the messages themselves, so it cannot
     // drift from them silently.
     const MESSAGES: [&str; 6] = [
         "is outside",
@@ -9338,6 +9340,40 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
              array above is being read as the emitter's own"
         );
     }
+
+    // AND EVERY CHECK RAN FROM THE LIST. Each LISTED message must be emitted --
+    // the binding added at c77d3fb7. Nothing ran the other way: give the
+    // projection a seventh refusal and the list would not know, every proof below
+    // would still pass, and the cells would be discriminating within a subset of
+    // the messages that can actually reach a caller. That is the shape found in
+    // the platform-gated census at 0f3309e8, in a second guard.
+    //
+    // Counted from the emitter's own span, and NOT by counting `Err(`: two of the
+    // six refusals are produced by `map_err` and `ok_or_else`, so a naive count
+    // reads four and would have been wrong in the safe direction -- the direction
+    // that gets committed.
+    let emitter_start = PROJECTION_SOURCE
+        .find("fn module_name_from_path(")
+        .expect("the projection must exist to be counted");
+    let emitter_len = PROJECTION_SOURCE[emitter_start..]
+        .find("\n}\n")
+        .expect("the projection must terminate");
+    let projection = &PROJECTION_SOURCE[emitter_start..emitter_start + emitter_len];
+    assert!(
+        !projection.contains("MESSAGES"),
+        "the span read as the projection reaches this test, so the count below would include \
+         the array it is checking"
+    );
+    let refusals = projection.matches("return Err(").count()
+        + projection.matches("map_err(").count()
+        + projection.matches("ok_or_else(").count();
+    assert_eq!(
+        refusals,
+        MESSAGES.len(),
+        "the projection can refuse {refusals} way(s) and {} are listed here; a refusal the list \
+         does not know about is one the cells below never prove distinguishable",
+        MESSAGES.len()
+    );
 
     for probe in [
         "is outside",
