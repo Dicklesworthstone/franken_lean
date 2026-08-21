@@ -2404,6 +2404,30 @@ def main():
             "REFUSE: facade manifest declaration count must exceed transparent "
             f"value count ({json.dumps(declaration_transparent_value_inequality_join, sort_keys=True)})"
         )
+    declaration_explicit_value_inequality_join = {
+        "summary_declarations_emitted": manifest_summary.get(
+            "declarations_emitted"
+        ),
+        "summary_transparent_explicit_value": manifest_summary.get(
+            "transparent_explicit_value"
+        ),
+    }
+    if (not isinstance(declaration_explicit_value_inequality_join[
+            "summary_declarations_emitted"], int)
+            or isinstance(declaration_explicit_value_inequality_join[
+                "summary_declarations_emitted"], bool)
+            or not isinstance(declaration_explicit_value_inequality_join[
+                "summary_transparent_explicit_value"], int)
+            or isinstance(declaration_explicit_value_inequality_join[
+                "summary_transparent_explicit_value"], bool)
+            or declaration_explicit_value_inequality_join[
+                "summary_declarations_emitted"]
+            <= declaration_explicit_value_inequality_join[
+                "summary_transparent_explicit_value"]):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration count must exceed explicit "
+            f"value count ({json.dumps(declaration_explicit_value_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4392,6 +4416,9 @@ def main():
         ),
         "manifest_declaration_transparent_value_inequality_join": (
             declaration_transparent_value_inequality_join
+        ),
+        "manifest_declaration_explicit_value_inequality_join": (
+            declaration_explicit_value_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
