@@ -72,6 +72,9 @@ the toolchain would report a perfect facade:
   * A TYPE-ASCRIPTION JOIN requires every emitted or quarantined demand to enter
     the typed probe, while every Init-substrate demand remains name-only. The
     manifest disposition and the probe's actual checking mode must agree.
+  * A PROVIDER-DEPENDENCY JOIN requires a demanded row's `provided_by` owner to
+    occur exactly once in its declared type dependencies. Structural provenance
+    and type-level closure must name the same generated owner.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -348,6 +351,7 @@ def join_demanded_rows(names, manifest_rows):
     role_mismatches = []
     emission_mismatches = []
     provider_mismatches = []
+    provider_dependency_mismatches = []
     signature_provenance_mismatches = []
     roles = Counter()
     emission_join = Counter()
@@ -400,7 +404,15 @@ def join_demanded_rows(names, manifest_rows):
                     f"{name}(provided_by={provider!r})"
                 )
                 continue
+            type_deps = row.get("type_deps")
+            if (not isinstance(type_deps, list)
+                    or type_deps.count(provider) != 1):
+                provider_dependency_mismatches.append(
+                    f"{name}(provided_by={provider!r}, type_deps={type_deps!r})"
+                )
+                continue
             provider_join["structural"] += 1
+            provider_join["structural_type_dependency"] += 1
         else:
             if row.get("form") == "class-projection":
                 provider_mismatches.append(f"{name}(class-projection lacks provided_by)")
@@ -410,7 +422,8 @@ def join_demanded_rows(names, manifest_rows):
         roles[expected_role] += 1
         emission_join["emitted" if expected_emitted else "not_emitted"] += 1
     if (unclassified or signatureless or role_mismatches or emission_mismatches
-            or provider_mismatches or signature_provenance_mismatches):
+            or provider_mismatches or provider_dependency_mismatches
+            or signature_provenance_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -422,6 +435,10 @@ def join_demanded_rows(names, manifest_rows):
             details.append("emission-mismatch=" + ", ".join(emission_mismatches[:8]))
         if provider_mismatches:
             details.append("provider-mismatch=" + ", ".join(provider_mismatches[:8]))
+        if provider_dependency_mismatches:
+            details.append("provider-dependency=" + ", ".join(
+                provider_dependency_mismatches[:8]
+            ))
         if signature_provenance_mismatches:
             details.append("signature-provenance=" + ", ".join(
                 signature_provenance_mismatches[:8]
