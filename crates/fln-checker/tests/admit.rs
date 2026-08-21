@@ -797,6 +797,205 @@ fn nat_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+/// The universe-polymorphic `Init.Option` family. This fixture carries both
+/// the family universe and the recursor's independent motive universe, so a
+/// success requires the checker to reconstruct their distinct roles.
+fn init_option_entries() -> Vec<ConstantEntry> {
+    let option = checker_name("Option");
+    let none = checker_qualified(&["Option", "none"]);
+    let some = checker_qualified(&["Option", "some"]);
+    let rec = checker_qualified(&["Option", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let parameter_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let option_expr = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(primary_name("Option"), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let none_expr = |parameter: Expr| {
+        Expr::app(
+            Expr::const_(Name::from_components(["Option", "none"]), vec![u.clone()]),
+            parameter,
+        )
+    };
+    let some_expr = |parameter: Expr, value: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(Name::from_components(["Option", "some"]), vec![u.clone()]),
+                parameter,
+            ),
+            value,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive_type = || {
+        primary_pi(
+            "t",
+            BinderInfo::Default,
+            option_expr(bv(0)),
+            Expr::sort(v.clone()),
+        )
+    };
+    let none_minor_type = || Expr::app(bv(0), none_expr(bv(1)));
+    let some_minor_type = || {
+        primary_pi(
+            "value",
+            BinderInfo::Default,
+            bv(2),
+            Expr::app(bv(2), some_expr(bv(3), bv(0))),
+        )
+    };
+    let recursor_type = primary_pi(
+        "α",
+        BinderInfo::Implicit,
+        parameter_type(),
+        primary_pi(
+            "motive",
+            BinderInfo::Implicit,
+            motive_type(),
+            primary_pi(
+                "none",
+                BinderInfo::Default,
+                none_minor_type(),
+                primary_pi(
+                    "some",
+                    BinderInfo::Default,
+                    some_minor_type(),
+                    primary_pi(
+                        "t",
+                        BinderInfo::Default,
+                        option_expr(bv(3)),
+                        Expr::app(bv(3), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let none_rule_rhs = Expr::lam(
+        primary_name("α"),
+        parameter_type(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("none"),
+                none_minor_type(),
+                Expr::lam(
+                    primary_name("some"),
+                    some_minor_type(),
+                    bv(1),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let some_rule_rhs = Expr::lam(
+        primary_name("α"),
+        parameter_type(),
+        Expr::lam(
+            primary_name("motive"),
+            motive_type(),
+            Expr::lam(
+                primary_name("none"),
+                none_minor_type(),
+                Expr::lam(
+                    primary_name("some"),
+                    some_minor_type(),
+                    Expr::lam(
+                        primary_name("value"),
+                        bv(2),
+                        Expr::app(bv(1), bv(0)),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    vec![
+        ConstantEntry::new(
+            option.clone(),
+            ConstantDeclaration::inductive(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    parameter_type(),
+                )),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    1,
+                    0,
+                    vec![option.clone()],
+                    vec![none.clone(), some.clone()],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            none.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    option_expr(bv(0)),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(option.clone(), 0, 1, 0),
+            ),
+        ),
+        ConstantEntry::new(
+            some.clone(),
+            ConstantDeclaration::constructor(
+                vec![u_name.clone()],
+                decoded(&primary_pi(
+                    "α",
+                    BinderInfo::Default,
+                    parameter_type(),
+                    primary_pi("value", BinderInfo::Default, bv(0), option_expr(bv(1))),
+                )),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(option.clone(), 1, 1, 1),
+            ),
+        ),
+        ConstantEntry::new(
+            rec,
+            ConstantDeclaration::recursor(
+                vec![v_name, u_name],
+                decoded(&recursor_type),
+                ConstantSafety::Safe,
+                RecursorDeclaration::new(
+                    vec![option],
+                    1,
+                    0,
+                    1,
+                    2,
+                    vec![
+                        RecursorRule::new(none, 0, decoded(&none_rule_rhs)),
+                        RecursorRule::new(some, 1, decoded(&some_rule_rhs)),
+                    ],
+                    false,
+                ),
+            ),
+        ),
+    ]
+}
+
 #[test]
 fn kr600_803_nullary_type_enumeration_is_reconstructed_independently() {
     let entries = enumeration_entries(BinderInfo::Implicit);
@@ -851,6 +1050,69 @@ fn kr600_803_direct_self_recursion_is_reconstructed_independently() {
         return;
     };
     assert_eq!(admission.members().len(), 4);
+}
+
+#[test]
+fn kr600_803_init_option_universes_parameters_and_rules_are_reconstructed() {
+    let entries = init_option_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        verdict.is_admitted(),
+        "exact Init.Option block: {verdict:?}"
+    );
+    let fln_checker::admit::InductiveVerdict::Admitted(admission) = verdict else {
+        return;
+    };
+    assert_eq!(admission.members().len(), 4);
+}
+
+#[test]
+fn kr600_803_init_option_refuses_a_forged_some_iota_rule() {
+    let mut entries = init_option_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(
+        checker_qualified(&["Option", "rec"]),
+        ConstantDeclaration::recursor(
+            recursor.level_parameters().to_vec(),
+            recursor.type_().clone(),
+            recursor.safety(),
+            RecursorDeclaration::new(
+                metadata.mutual().to_vec(),
+                metadata.num_parameters(),
+                metadata.num_indices(),
+                metadata.num_motives(),
+                metadata.num_minors(),
+                vec![
+                    metadata.rules()[0].clone(),
+                    RecursorRule::new(
+                        checker_qualified(&["Option", "some"]),
+                        1,
+                        decoded(&Expr::bvar(0).expect("packs")),
+                    ),
+                ],
+                metadata.k(),
+            ),
+        ),
+    );
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
 }
 
 #[test]
