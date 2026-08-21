@@ -18639,6 +18639,44 @@ fn a_receipt_that_compared_nothing_is_refused() {
         });
     }
 
+    // AND THE TWO ORDERING RULES ARE INCLUSIVE, WHICH NOTHING SAID EITHER. Both
+    // are planted only from the violating side -- `units_compared: decoded + 1`
+    // and `wall_ms: sum - 1` -- so `>` widened to `>=` refuses the boundary and
+    // every existing plant still passes. Unlike the floors above, no coincidence
+    // covers these: the committed row carries 8,806 declarations of slack under
+    // `decoded` and 124,817 ms of setup outside its widths, so it sits nowhere
+    // near either boundary and the mutants survive outright.
+    //
+    // Both boundaries are legitimate runs, which is why refusing them would be a
+    // defect rather than a stricter rule. Comparing every declaration that was
+    // decoded is the IDEAL run, not a contradiction; and a lane whose widths
+    // account for the whole wall is one with no setup cost, not one that
+    // mismeasured itself.
+    for (label, boundary) in [
+        (
+            "comparing every declaration it decoded",
+            CorpusMatrixReceipt {
+                units_compared: real.decoded,
+                ..real.clone()
+            },
+        ),
+        (
+            "widths that account for the whole wall",
+            CorpusMatrixReceipt {
+                wall_ms: real.per_width_ms.iter().sum::<u64>(),
+                ..real.clone()
+            },
+        ),
+    ] {
+        boundary.validate(&pin).unwrap_or_else(|reason| {
+            panic!(
+                "a receipt {label} must validate: the rule bounds the parts by the whole and \
+                 the boundary is the whole. Refusing it would refuse the best run this lane \
+                 can have. {reason}"
+            )
+        });
+    }
+
     real.validate(&pin).unwrap_or_else(|reason| {
         panic!("the committed receipt must satisfy its own guard, but: {reason}")
     });
