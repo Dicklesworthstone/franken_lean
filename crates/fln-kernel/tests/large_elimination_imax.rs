@@ -42,10 +42,11 @@ use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal,
+    TheoremVal,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, Verdict};
-use fln_kernel::{Declaration, InductiveBlock, check};
+use fln_kernel::{Declaration, InductiveBlock, check, check_def_eq};
 
 fn n(s: &str) -> Name {
     Name::str(Name::anonymous(), s)
@@ -887,5 +888,182 @@ fn constructor_with_foreign_result_type_is_rejected() {
         rejected,
         "Wrong.mk : A (result A, not Wrong) must be rejected as an invalid constructor \
          return type; got {verdict:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The delta-gate half of d17i: a THEOREM as a recursor's major premise.
+// ---------------------------------------------------------------------------
+
+/// Settles the reachability question left open on `franken_lean-d17i`.
+///
+/// The pin's delta gate is `is_delta` -> `constant_info::has_value()`, which
+/// `declaration.h` defines as `is_theorem() || is_definition() || (allow_opaque
+/// && is_opaque())` with `allow_opaque` defaulting to false. So the pin unfolds
+/// THEOREMS and does not unfold opaques. Our `unfold_definition` bound only
+/// `ConstantInfo::Defn`, so we never unfolded a theorem at all.
+///
+/// The obvious worry is that the gap is unobservable, and for most of the
+/// surface it is: a theorem's type must be a Prop (KR-974 enforces it), so its
+/// value is always a proof, and `def_eq` between two proofs is decided by
+/// KR-306 proof irrelevance — which runs BEFORE lazy delta, exactly as at the
+/// pin — without unfolding anything. The `Eq`-shaped cases are covered a second
+/// time by K conversion.
+///
+/// `W` escapes both. It is a Prop, so a proof of it can be a theorem; it is a
+/// SUBSINGLETON, so its recursor eliminates into data; and its constructor has
+/// a FIELD, so `k` is false and K conversion cannot stand in for reducing the
+/// major. Eliminating into data also puts the two sides of the final query at a
+/// data type, where proof irrelevance does not apply. That combination is the
+/// whole point of the reproducer: it is the one shape where the delta gate is
+/// load-bearing, and `Acc` — the type d17i's own 228 rows were about — has it.
+///
+/// Before the gate was widened the major stayed a stuck `Const`, the recursor
+/// never fired, and the query was `NotDefEq`. That is d17i's restrictive
+/// direction: we refuse what the Reference accepts, never the reverse.
+#[test]
+fn a_theorem_major_premise_reduces_its_recursor() {
+    let u = n("u");
+    let mu = n("u_1");
+    let one = || Level::one();
+
+    // The block, at the same shape the guards above admit.
+    let block = w_block(&u, &mu);
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(block.clone()),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the W block must admit before it can be reduced against: {verdict:?}"
+    );
+    let mut env = Environment::new();
+    for t in &block.types {
+        env = env
+            .add_decl(ConstantInfo::Induct(t.clone()))
+            .expect("accepted inductive adds");
+    }
+    for c in &block.ctors {
+        env = env
+            .add_decl(ConstantInfo::Ctor(c.clone()))
+            .expect("accepted constructor adds");
+    }
+    for r in &block.recursors {
+        env = env
+            .add_decl(ConstantInfo::Rec(r.clone()))
+            .expect("accepted recursor adds");
+    }
+
+    // Instantiate everything at `u := 1`, so `α : Sort 1` is ordinary data and
+    // the motive lands in `Sort 1` rather than in Prop.
+    let w1 = || Expr::const_(n("W"), vec![one()]);
+    let carrier = || Expr::const_(n("A"), vec![]);
+    let w_a = || Expr::app(w1(), carrier());
+
+    let axiom = |name: &str, type_: Expr| {
+        Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            is_unsafe: false,
+        })
+    };
+    let admit_axiom = |env: &Environment, decl: &Declaration| -> Environment {
+        let verdict = check(env, decl, Budget::DEFAULT);
+        assert!(
+            matches!(
+                verdict,
+                fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+            ),
+            "setup axiom must admit: {verdict:?}"
+        );
+        let Declaration::Axiom(v) = decl.clone() else {
+            unreachable!("axiom helper is only called with axioms")
+        };
+        env.add_decl(ConstantInfo::Axiom(v))
+            .expect("accepted axiom adds")
+    };
+
+    // A : Sort 1;  a : A;  f : A → W A
+    env = admit_axiom(&env, &axiom("A", sort(one())));
+    env = admit_axiom(&env, &axiom("a", carrier()));
+    env = admit_axiom(&env, &axiom("f", forall("_x", carrier(), w_a())));
+
+    // theorem wp : W A := W.sup.{1} A f     — a THEOREM, which is the point.
+    let sup_applied = Expr::app(
+        Expr::app(Expr::const_(nn("W", "sup"), vec![one()]), carrier()),
+        Expr::const_(n("f"), vec![]),
+    );
+    let wp = Declaration::Thm(TheoremVal {
+        base: ConstantVal {
+            name: n("wp"),
+            level_params: vec![],
+            type_: w_a(),
+        },
+        value: sup_applied,
+        all: vec![n("wp")],
+    });
+    let verdict = check(&env, &wp, Budget::DEFAULT);
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the theorem carrying the proof must admit: {verdict:?}"
+    );
+    let Declaration::Thm(wp_val) = wp else {
+        unreachable!("just constructed a theorem")
+    };
+    env = env
+        .add_decl(ConstantInfo::Thm(wp_val))
+        .expect("accepted theorem adds");
+
+    // W.rec.{1,1} A (fun _ => A) (fun f ih => a) wp   ⟶   a
+    //
+    // Recursor argument order is params, motives, minors, indices, major, and
+    // `W.rec` carries one of each with no indices.
+    let motive = lam("t", w_a(), carrier());
+    let minor = lam(
+        "f",
+        forall("_x", carrier(), w_a()),
+        lam(
+            "ih",
+            forall("_x", carrier(), carrier()),
+            Expr::const_(n("a"), vec![]),
+        ),
+    );
+    let reduced = Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(nn("W", "rec"), vec![one(), one()]), carrier()),
+                motive,
+            ),
+            minor,
+        ),
+        Expr::const_(n("wp"), vec![]),
+    );
+
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &reduced,
+        &Expr::const_(n("a"), vec![]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the major is a theorem, so the recursor fires only if the delta gate \
+         unfolds theorems as the pin's `has_value()` does. Neither proof \
+         irrelevance nor K conversion can close this: W.sup has a field so `k` \
+         is false, and both sides here are at the DATA type A. Got {verdict:?}"
     );
 }

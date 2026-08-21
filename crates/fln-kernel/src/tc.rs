@@ -2755,14 +2755,27 @@ impl<'a> TypeChecker<'a> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
-        let Some(ConstantInfo::Defn(defn)) = self.env.find(name) else {
-            return Ok(None);
+        // KR-307 delta gate. Pin `type_checker.cpp` `is_delta` admits whatever
+        // `constant_info::has_value()` admits, and `declaration.h` defines that
+        // as `is_theorem() || is_definition() || (allow_opaque && is_opaque())`
+        // — with `allow_opaque` defaulting to false. So THEOREMS unfold and
+        // opaques do not. We bound only `Defn`, which left a theorem major
+        // permanently stuck: `Acc.rec` eliminates into data and its `k` flag is
+        // false (its constructor has a field), so neither proof irrelevance nor
+        // K conversion can stand in for the unfolding (bead franken_lean-d17i).
+        let (value, params) = match self.env.find(name) {
+            Some(ConstantInfo::Defn(defn)) => {
+                // A theorem carries no `DefinitionSafety`, and the pin reports
+                // `is_unsafe() == false` for every theorem, so the KR-973
+                // refusal stays on this arm rather than becoming a shared gate.
+                if defn.safety != DefinitionSafety::Safe {
+                    return Ok(None);
+                }
+                (defn.value.clone(), defn.base.level_params.clone())
+            }
+            Some(ConstantInfo::Thm(thm)) => (thm.value.clone(), thm.base.level_params.clone()),
+            _ => return Ok(None),
         };
-        if defn.safety != DefinitionSafety::Safe {
-            return Ok(None);
-        }
-        let value = defn.value.clone();
-        let params = defn.base.level_params.clone();
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
         for arg in args {
@@ -2788,6 +2801,10 @@ impl<'a> TypeChecker<'a> {
                     ReducibilityHints::Opaque => 0,
                 })
             }
+            // Pin `constant_info::get_hints()` has no hints field to read for a
+            // theorem and returns `g_opaque`, which is height 0 — the shortest,
+            // so lazy delta unfolds the other side first, as at the pin.
+            ConstantInfo::Thm(_) => Some(0),
             _ => None,
         }
     }
