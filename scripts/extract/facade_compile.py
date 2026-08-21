@@ -3709,6 +3709,9 @@ def main():
     kernel_special_init_substrate_inequality_join = {"summary_kernel_special_population": manifest_summary.get("kernel_special_population"), "summary_init_substrate_checked": manifest_summary.get("init_substrate_checked")}
     if (not isinstance(kernel_special_init_substrate_inequality_join["summary_kernel_special_population"], int) or isinstance(kernel_special_init_substrate_inequality_join["summary_kernel_special_population"], bool) or not isinstance(kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"], int) or isinstance(kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"], bool) or kernel_special_init_substrate_inequality_join["summary_kernel_special_population"] <= kernel_special_init_substrate_inequality_join["summary_init_substrate_checked"]):
         raise SystemExit("REFUSE: facade manifest kernel-special population must exceed Init-substrate count " + json.dumps(kernel_special_init_substrate_inequality_join, sort_keys=True))
+    kernel_special_init_provided_inequality_join = {"summary_kernel_special_population": manifest_summary.get("kernel_special_population"), "summary_init_provided": manifest_summary.get("init_provided")}
+    if (not isinstance(kernel_special_init_provided_inequality_join["summary_kernel_special_population"], int) or isinstance(kernel_special_init_provided_inequality_join["summary_kernel_special_population"], bool) or not isinstance(kernel_special_init_provided_inequality_join["summary_init_provided"], int) or isinstance(kernel_special_init_provided_inequality_join["summary_init_provided"], bool) or kernel_special_init_provided_inequality_join["summary_kernel_special_population"] <= kernel_special_init_provided_inequality_join["summary_init_provided"]):
+        raise SystemExit("REFUSE: facade manifest kernel-special population must exceed Init-provided count " + json.dumps(kernel_special_init_provided_inequality_join, sort_keys=True))
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5919,6 +5922,9 @@ def main():
         ),
         "manifest_kernel_special_init_substrate_inequality_join": (
             kernel_special_init_substrate_inequality_join
+        ),
+        "manifest_kernel_special_init_provided_inequality_join": (
+            kernel_special_init_provided_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
