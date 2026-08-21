@@ -610,7 +610,7 @@ fn declared_type_is_a_type(
     name: &WireName,
     declaration: &ConstantDeclaration,
     budget: &AdmissionBudget,
-    cancelled: &mut impl FnMut() -> bool,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DeclaredTypeFacts, Verdict> {
     // The candidate is not yet in the environment, so this context is exactly the
     // one KR-970 just proved does not already hold the name: a declaration cannot
@@ -679,7 +679,7 @@ fn reduces_to_a_sort(
     type_of_type: &WireExpr,
     context: &InferenceContext,
     budget: &AdmissionBudget,
-    cancelled: &mut impl FnMut() -> bool,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<DeclaredTypeFacts, Verdict> {
     if cancelled() {
         return Err(stopped(name, AdmissionPhase::DeclaredTypeSort));
@@ -2580,6 +2580,264 @@ fn classify_field_recursion(
     }
 }
 
+/// Reconstruct the fixed universe-polymorphic `Init.Option` family without
+/// consulting the primary checker. This deliberately names the one supported
+/// parameterized family: arbitrary parameterized inductives still take the
+/// ordinary typed deferral path below.
+fn admit_init_option(
+    environment: &ConstantEnvironment,
+    declarations: &[ConstantEntry],
+    inductive: &ConstantEntry,
+    budget: AdmissionBudget,
+    environment_budget: EnvironmentBudget,
+    comparison: &mut StructuralComparisonControl,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> InductiveVerdict {
+    let name = inductive.name();
+    let declaration = inductive.declaration();
+    let Some(metadata) = declaration.inductive_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::MissingMetadata {
+            name: name.clone(),
+        });
+    };
+    let Some(option_universe) = declaration.level_parameters().first() else {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: 0,
+        });
+    };
+    if declaration.level_parameters().len() != 1 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
+            observed: declaration.level_parameters().len(),
+        });
+    }
+    if metadata.num_parameters() != 1 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Parameters {
+            observed: metadata.num_parameters(),
+        });
+    }
+    if metadata.mutual() != std::slice::from_ref(name) {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::MutualMetadata);
+    }
+    if metadata.num_indices() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Indices {
+            observed: metadata.num_indices(),
+        });
+    }
+    if metadata.num_nested() != 0 {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Nested {
+            observed: metadata.num_nested(),
+        });
+    }
+    if metadata.is_recursive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Recursive);
+    }
+    if metadata.is_reflexive() {
+        return InductiveVerdict::Deferred(InductiveSupportLimit::Reflexive);
+    }
+    let none = checker_child(name, "none");
+    let some = checker_child(name, "some");
+    if metadata.constructors() != [none.clone(), some.clone()]
+        || declarations.len() != 4
+        || environment.find(name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+            name: name.clone(),
+        });
+    }
+    let Some(expected_type) = option_inductive_type(option_universe) else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(declaration.type_(), &expected_type, comparison, cancelled) {
+        Ok(true) => {}
+        Ok(false) => return InductiveVerdict::Deferred(InductiveSupportLimit::ResultUniverse),
+        Err(verdict) => return verdict,
+    }
+    if let Err(verdict) =
+        declared_type_is_a_type(environment, name, declaration, &budget, cancelled)
+    {
+        return map_member_preamble(name, verdict);
+    }
+    let mut staged_environment =
+        match stage_inductive_member(environment, inductive, environment_budget, cancelled) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+    let mut members = vec![name.clone()];
+    for (index, (constructor_name, has_field)) in [(none.clone(), false), (some.clone(), true)]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(constructor) = declarations
+            .iter()
+            .find(|entry| entry.name() == &constructor_name)
+        else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorMissing {
+                name: constructor_name,
+            });
+        };
+        let Some(constructor_metadata) = constructor.declaration().constructor_metadata() else {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: constructor_name,
+            });
+        };
+        let Some(expected_type) =
+            option_constructor_type(name, &constructor_name, option_universe, has_field)
+        else {
+            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+        };
+        if constructor.declaration().safety() != ConstantSafety::Safe
+            || constructor.declaration().level_parameters() != std::slice::from_ref(option_universe)
+            || constructor_metadata.inductive() != name
+            || constructor_metadata.index() != index as u32
+            || constructor_metadata.num_parameters() != 1
+            || constructor_metadata.num_fields() != u32::from(has_field)
+            || environment.find(&constructor_name).is_some()
+        {
+            return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                name: constructor_name,
+            });
+        }
+        match compare_inductive_expression(
+            constructor.declaration().type_(),
+            &expected_type,
+            comparison,
+            cancelled,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return InductiveVerdict::Rejected(InductiveRejection::ConstructorShape {
+                    name: constructor_name,
+                });
+            }
+            Err(verdict) => return verdict,
+        }
+        if let Err(verdict) = declared_type_is_a_type(
+            &staged_environment,
+            &constructor_name,
+            constructor.declaration(),
+            &budget,
+            cancelled,
+        ) {
+            return map_member_preamble(&constructor_name, verdict);
+        }
+        staged_environment = match stage_inductive_member(
+            &staged_environment,
+            constructor,
+            environment_budget,
+            cancelled,
+        ) {
+            Ok(environment) => environment,
+            Err(verdict) => return verdict,
+        };
+        members.push(constructor_name);
+    }
+    let recursor_name = checker_child(name, "rec");
+    let Some(recursor) = declarations
+        .iter()
+        .find(|entry| entry.name() == &recursor_name)
+    else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorMissing {
+            name: recursor_name,
+        });
+    };
+    let Some(recursor_metadata) = recursor.declaration().recursor_metadata() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    let recursor_levels = recursor.declaration().level_parameters();
+    let Some(motive_universe) = recursor_levels.first() else {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    };
+    if recursor.declaration().safety() != ConstantSafety::Safe
+        || recursor_levels.len() != 2
+        || recursor_levels.get(1) != Some(option_universe)
+        || motive_universe == option_universe
+        || recursor_metadata.mutual() != std::slice::from_ref(name)
+        || recursor_metadata.num_parameters() != 1
+        || recursor_metadata.num_indices() != 0
+        || recursor_metadata.num_motives() != 1
+        || recursor_metadata.num_minors() != 2
+        || recursor_metadata.rules().len() != 2
+        || recursor_metadata.k()
+        || environment.find(&recursor_name).is_some()
+    {
+        return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+            name: recursor_name,
+        });
+    }
+    let Some(expected_type) =
+        option_recursor_type(name, &none, &some, motive_universe, option_universe)
+    else {
+        return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+    };
+    match compare_inductive_expression(
+        recursor.declaration().type_(),
+        &expected_type,
+        comparison,
+        cancelled,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: recursor_name,
+            });
+        }
+        Err(verdict) => return verdict,
+    }
+    for (index, (constructor, selected_some)) in
+        [(none, false), (some, true)].into_iter().enumerate()
+    {
+        let Some(rule) = recursor_metadata.rules().get(index) else {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: recursor_name,
+            });
+        };
+        let Some(expected_rhs) = option_rule_rhs(
+            name,
+            &checker_child(name, "none"),
+            &checker_child(name, "some"),
+            motive_universe,
+            option_universe,
+            selected_some,
+        ) else {
+            return InductiveVerdict::InternalFault(InductiveFault::ExpectedArenaOverflow);
+        };
+        if rule.constructor() != &constructor || rule.num_fields() != u32::from(selected_some) {
+            return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                name: recursor_name,
+            });
+        }
+        match compare_inductive_expression(rule.rhs(), &expected_rhs, comparison, cancelled) {
+            Ok(true) => {}
+            Ok(false) => {
+                return InductiveVerdict::Rejected(InductiveRejection::RecursorShape {
+                    name: recursor_name,
+                });
+            }
+            Err(verdict) => return verdict,
+        }
+    }
+    if let Err(verdict) = declared_type_is_a_type(
+        &staged_environment,
+        &recursor_name,
+        recursor.declaration(),
+        &budget,
+        cancelled,
+    ) {
+        return map_member_preamble(&recursor_name, verdict);
+    }
+    if let Err(verdict) =
+        stage_inductive_member(&staged_environment, recursor, environment_budget, cancelled)
+    {
+        return verdict;
+    }
+    members.push(recursor_name);
+    InductiveVerdict::Admitted(InductiveAdmission { members })
+}
+
 /// Independently reconstruct one bounded, field-bearing, single `Type`
 /// inductive block, including direct self-recursive fields.
 pub fn admit_inductive(
@@ -2635,6 +2893,20 @@ pub fn admit_inductive_with(
     };
     if declaration.safety() != ConstantSafety::Safe {
         return InductiveVerdict::Deferred(InductiveSupportLimit::Unsafe);
+    }
+    if name == &checker_atom("Option")
+        && declaration.level_parameters().len() == 1
+        && metadata.num_parameters() == 1
+    {
+        return admit_init_option(
+            environment,
+            declarations,
+            inductive,
+            budget,
+            environment_budget,
+            &mut comparison,
+            &mut cancelled,
+        );
     }
     if !declaration.level_parameters().is_empty() {
         return InductiveVerdict::Deferred(InductiveSupportLimit::UniverseParameters {
