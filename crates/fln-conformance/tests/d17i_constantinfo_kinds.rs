@@ -3898,3 +3898,107 @@ fn the_recursor_telescope_binds_a_motive_and_a_major_of_the_right_shape() {
         argument_counts.len()
     );
 }
+
+/// Each quotient kind, and the type shape `quot_reduce_rec` assumes for it.
+///
+/// Columns are (kind, telescope length, index of the `Quot`-headed binder).
+/// Those indices are not decoration — they are the literal constants the kernel
+/// dispatches on: `quot_reduce_rec` reads the `Quot.mk` argument at position 5
+/// for `Lift` and 4 for `Ind`, and applies the function or motive taken from
+/// position 3 in both cases.
+const QUOTIENT_SHAPES: &[(QuotKind, usize, Option<usize>)] = &[
+    (QuotKind::Type, 2, None),
+    (QuotKind::Ctor, 3, None),
+    (QuotKind::Lift, 6, Some(5)),
+    (QuotKind::Ind, 5, Some(4)),
+];
+
+/// The quotient constants' types agree with the positions the kernel reduces at.
+///
+/// `45202876` pinned each quotient constant's `kind`. Nothing checked what that
+/// kind IMPLIES about its type — and the kernel's quotient reduction is written
+/// against the implication rather than against the kind alone. `quot_reduce_rec`
+/// locates the `Quot.mk` argument at a hardcoded index that depends only on the
+/// kind, and takes the function or motive from index 3. If the pin's quotient
+/// signatures ever moved, those constants would silently point at the wrong
+/// arguments: the reduction would still fire, on the wrong terms.
+///
+/// So this is a relation between two things already read separately — the stored
+/// `kind` and the decoded type — and it binds them at exactly the positions the
+/// kernel hardcodes.
+///
+/// Measured over `Init/Prelude` at private level: `Quot` takes 2 binders and
+/// `Quot.mk` 3, neither carrying a `Quot`-headed argument; `Quot.lift` takes 6
+/// with its `Quot` argument at index 5; `Quot.ind` takes 5 with its `Quot`
+/// argument at index 4. Both eliminators carry exactly one `Quot`-headed binder,
+/// and in both the binder at index 3 is a function type — the thing the
+/// reduction applies.
+#[test]
+fn quotient_types_place_their_arguments_where_the_kernel_reduces() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut seen = 0usize;
+    for info in &infos {
+        let ConstantInfo::Quot(quot) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let (_, expected_len, quot_index) = QUOTIENT_SHAPES
+            .iter()
+            .find(|(kind, _, _)| *kind == quot.kind)
+            .unwrap_or_else(|| panic!("{name}: unexpected quotient kind {:?}", quot.kind));
+
+        let domains = all_domains(&info.constant_val().type_);
+        assert_eq!(
+            domains.len(),
+            *expected_len,
+            "{name} ({:?}): telescope length is what the reduction's argument indices are \
+             relative to",
+            quot.kind
+        );
+
+        let quot_headed: Vec<usize> = domains
+            .iter()
+            .enumerate()
+            .filter(|(_, domain)| {
+                let mut current = **domain;
+                while let ExprNode::App { f, .. } = current.node() {
+                    current = f;
+                }
+                matches!(current.node(), ExprNode::Const { name, .. } if name.to_display_string() == "Quot")
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        match quot_index {
+            Some(index) => {
+                assert_eq!(
+                    quot_headed,
+                    vec![*index],
+                    "{name} ({:?}): the kernel reads its Quot.mk argument at this index and \
+                     nowhere else",
+                    quot.kind
+                );
+                // Index 3 is the function (`Lift`) or motive proof (`Ind`) the
+                // reduction applies; both are function types at the pin.
+                assert!(
+                    matches!(domains[3].node(), ExprNode::ForallE { .. }),
+                    "{name} ({:?}): the argument the reduction applies must be a function type",
+                    quot.kind
+                );
+            }
+            None => assert!(
+                quot_headed.is_empty(),
+                "{name} ({:?}): carries no Quot-headed argument at the pin, got {quot_headed:?}",
+                quot.kind
+            ),
+        }
+        seen += 1;
+    }
+    assert_eq!(
+        seen,
+        QUOTIENT_SHAPES.len(),
+        "every quotient kind must be present, or a shape above is never exercised"
+    );
+}
