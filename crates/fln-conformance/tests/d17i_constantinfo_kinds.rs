@@ -14837,3 +14837,117 @@ fn the_library_import_graph_is_acyclic_and_its_namespaces_are_layered() {
         "intra-Init edges are the census graph plus the aggregator the census omits"
     );
 }
+
+/// Import flags at library scope: six combinations, and `import all` is never
+/// exported.
+///
+/// The three-part-identity cell pins FIVE flag combinations over the census's
+/// 3,153 edges and uses that to argue the parts are being compared against
+/// varied data. Flags move independently of the layering — an edge can change
+/// `is_meta` without changing which namespaces it joins — so neither the
+/// layering cell nor the Init flag census constrains the other 7,145 edges.
+///
+/// Over all 10,298 library edges there are SIX:
+///
+///   (import_all, is_exported, is_meta)
+///   (false, true,  false)  6,329      (false, false, true)     68
+///   (false, false, false)  3,522      (false, true,  true)     64
+///   (true,  false, false)    301      (true,  false, true)     14
+///
+/// The sixth — `import all` carrying `is_meta` — does not occur anywhere in
+/// `Init`, which is why the census sees five. The Init figure is right for Init
+/// and would be wrong as a statement about the pin, so the cell asserts that no
+/// `Init`-sourced edge falls in that class rather than leaving the two counts to
+/// look like a contradiction.
+///
+/// A LAW FALLS OUT THAT NEITHER CENSUS STATES: every `import_all` edge has
+/// `is_exported` FALSE. All 315 of them, in both classes. There is no
+/// `(true, true, _)` edge in the library, so `import all` and re-export are
+/// mutually exclusive at the pin. That is a constraint between two flags, not a
+/// count of either, and it is invisible to any cell that tabulates them
+/// separately.
+///
+/// `Init` contributes 226 of the 315 `import all` edges — more than the rest of
+/// the library combined — and 27 of the 146 meta edges.
+///
+/// Anti-vacuity: all six classes are non-empty and both flags take both values,
+/// so the exclusion above is a real gap in an otherwise populated table rather
+/// than an artefact of one flag being constant.
+///
+/// Conservation first: the classes must reproduce the edge total before any
+/// class or exclusion is named.
+#[test]
+fn import_flags_take_six_combinations_and_import_all_is_never_exported() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut classes: BTreeMap<(bool, bool, bool), usize> = BTreeMap::new();
+    let mut edges = 0usize;
+    let mut init_meta_all = 0usize;
+    let mut init_import_all = 0usize;
+    for path in &all.exported {
+        let module = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean")
+            .replace('/', ".");
+        let from_init = module.split('.').next() == Some("Init");
+        for import in module_view(&lib, &module, Level::Exported).imports {
+            edges += 1;
+            let key = (import.import_all, import.is_exported, import.is_meta);
+            *classes.entry(key).or_default() += 1;
+            if from_init {
+                if import.import_all {
+                    init_import_all += 1;
+                }
+                if import.import_all && import.is_meta {
+                    init_meta_all += 1;
+                }
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        classes.values().sum::<usize>(),
+        edges,
+        "every edge must fall in exactly one flag class"
+    );
+    assert_eq!(edges, 10_298, "the library edge census, re-derived here");
+
+    assert_eq!(
+        classes,
+        BTreeMap::from([
+            ((false, false, false), 3_522),
+            ((false, false, true), 68),
+            ((false, true, false), 6_329),
+            ((false, true, true), 64),
+            ((true, false, false), 301),
+            ((true, false, true), 14),
+        ]),
+        "the six flag combinations the library uses"
+    );
+
+    // The law: import_all excludes is_exported.
+    let exported_import_all: usize = classes
+        .iter()
+        .filter(|((import_all, is_exported, _), _)| *import_all && *is_exported)
+        .map(|(_, count)| count)
+        .sum();
+    let import_all: usize = classes
+        .iter()
+        .filter(|((import_all, _, _), _)| *import_all)
+        .map(|(_, count)| count)
+        .sum();
+    assert_eq!(
+        (import_all, exported_import_all),
+        (315, 0),
+        "`import all` and re-export are mutually exclusive across the whole library"
+    );
+
+    // Why the census sees five classes and this sees six.
+    assert_eq!(
+        (init_meta_all, init_import_all),
+        (0, 226),
+        "no Init edge is both `import all` and meta, which is the class the census cannot see"
+    );
+}
