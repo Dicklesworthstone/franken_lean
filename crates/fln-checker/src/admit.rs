@@ -2707,7 +2707,7 @@ fn and_recursor_type(
     let left = builder.bvar(3);
     let right = builder.bvar(2);
     let major_type = and_application(&mut builder, and_name, left, right);
-    let motive = builder.bvar(3);
+    let motive = builder.bvar(2);
     let major = builder.bvar(0);
     let mut result = builder.apply(motive, major);
     result = builder.forall("t", BinderStyle::Default, major_type, result);
