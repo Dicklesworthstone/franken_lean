@@ -5326,9 +5326,23 @@ fn write_inventory_fixture_with(
     // this comment's problem to describe and the reader's problem to remember.
     // It is now the manifest's, below.
     static CLAIMED: OnceLock<Mutex<BTreeMap<String, Vec<String>>>> = OnceLock::new();
+    // ONE CANONICAL FORM, USED BY EVERYTHING BELOW. The registry and the shape
+    // record both used to key on the entry STRINGS. The duplicate guard above
+    // keys on the PATH, because that is what the filesystem keys on -- so the
+    // same argument was read three different ways in one function, and the two
+    // string readings answer a question about spelling while claiming to answer
+    // one about the tree.
+    //
+    // The visible cost is a FALSE alarm rather than a missed one: re-spell an
+    // entry -- `Dir//One.olean` for `Dir/One.olean` -- and the registry reports
+    // one fixture built twice with different contents, and the record reports a
+    // shape change, for a build that produces exactly the same files. Collapsing
+    // to the canonical form first makes both answer about the tree. Every
+    // existing fixture entry is already canonical, so no recorded shape moves.
+    let canonical = |entry: &str| Path::new(entry).components().collect::<PathBuf>();
     let mut requested = relative_files
         .iter()
-        .map(|entry| (*entry).to_string())
+        .map(|entry| canonical(entry).to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     requested.sort();
     // THE DECISION IS TAKEN UNDER THE LOCK; THE PANIC HAPPENS OUTSIDE IT.
@@ -5430,7 +5444,9 @@ fn write_inventory_fixture_with(
     fs::create_dir_all(&base)
         .unwrap_or_else(|error| panic!("create fixture tree {}: {error}", base.display()));
     for relative in relative_files {
-        let path = base.join(relative);
+        // Written through the same canonical form the record holds, so the file
+        // that lands is the file that was recorded.
+        let path = base.join(canonical(relative));
         let parent = path
             .parent()
             .unwrap_or_else(|| panic!("fixture entry {relative} has no parent directory"));
@@ -6586,6 +6602,89 @@ fn a_fixture_name_must_be_spelled_as_one_component_not_merely_parse_as_one() {
         !tmp.join("Spelled").exists(),
         "the name was refused and its tree exists anyway; the check must run before anything is \
          created"
+    );
+}
+
+/// Re-spelling an entry is not a change of shape, and both records used to say
+/// it was.
+///
+/// **One argument, three keys.** The duplicate guard keys entries on the PATH,
+/// because that is what the filesystem keys on. The name registry and the shape
+/// record keyed on the STRING. So the same list was read three ways inside one
+/// function, and the two string readings answered a question about spelling
+/// while claiming to answer one about the tree.
+///
+/// **The symptom is a false alarm, which is why it would have been believed.**
+/// `Dir//One.olean` and `Dir/One.olean` produce exactly the same file. Building
+/// a fixture with one and then the other made the registry report a fixture
+/// "built twice with different contents" and the record report a shape change --
+/// two accusations of a collision, about a build that changed nothing. A guard
+/// that cries wolf about a no-op is worse than one that stays quiet: the next
+/// person to see it learns to widen the guard.
+///
+/// **This closes the class rather than patching a fifth instance.** Entries are
+/// collapsed to one canonical form up front, and the registry, the record and
+/// the writes all use it. There is now a single answer to "which file does this
+/// entry name", instead of three that agree only while nobody spells anything
+/// unusually.
+///
+/// **And the guards must still fire on a real difference**, or this would be a
+/// weakening dressed as a fix. The last cell asks for a genuinely different list
+/// under the same name and requires the registry to refuse it.
+#[test]
+fn re_spelling_an_entry_is_not_a_change_of_shape() {
+    const NAME: &str = "t6r7-selftest-respelled-v1";
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+
+    // THE MECHANISM: different text, one file.
+    assert_ne!("Dir/One.olean", "Dir//One.olean");
+    assert_eq!(
+        tmp.join("Dir/One.olean"),
+        tmp.join("Dir//One.olean"),
+        "the two spellings must name one file, or there is no false alarm to remove"
+    );
+
+    let first = write_inventory_fixture(NAME, &["Dir/One.olean"]);
+    // The same tree, spelled differently. Before this commit the registry
+    // refused this call outright.
+    let second = write_inventory_fixture(NAME, &["Dir//One.olean"]);
+    assert_eq!(
+        first, second,
+        "the two builds must return the same tree, because they ARE the same tree"
+    );
+    assert!(
+        first.join("Dir/One.olean").is_file(),
+        "the entry must be written once, under its canonical spelling"
+    );
+
+    // THE RECORD HOLDS THE CANONICAL FORM, so a later run spelled either way
+    // matches it. A record holding `Dir//One.olean` would refuse the ordinary
+    // spelling on the next run.
+    let recorded = fs::read_to_string(tmp.join(format!("{NAME}.manifest")))
+        .unwrap_or_else(|error| panic!("read the shape record: {error}"));
+    assert_eq!(
+        recorded, "Dir/One.olean",
+        "the shape record must describe the tree, not the spelling it was asked for"
+    );
+
+    // AND A REAL DIFFERENCE IS STILL REFUSED. Without this, everything above is
+    // satisfied by a registry that stopped comparing anything at all.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let genuinely_different =
+        std::panic::catch_unwind(|| write_inventory_fixture(NAME, &["Dir/Two.olean"]));
+    std::panic::set_hook(previous);
+    let payload = genuinely_different
+        .err()
+        .unwrap_or_else(|| panic!("a different list under one name must still be refused"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("Dir/Two.olean") && message.contains("Dir/One.olean"),
+        "the refusal must still name both file sets: {message}"
     );
 }
 
