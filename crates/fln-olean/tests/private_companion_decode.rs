@@ -294,6 +294,11 @@ const DYADIC_NEG_ADD_CANCEL_SIMP_1_1_MODULE: &str = "Init/Data/Dyadic/Basic";
 const BIT_VEC_GET_MSB_PROOF_1: &str = "_private.Init.Data.BitVec.Basic.0.BitVec.getMsb._proof_1";
 /// The pin's private bit-vector companion stores this theorem in Basic.
 const BIT_VEC_GET_MSB_PROOF_1_MODULE: &str = "Init/Data/BitVec/Basic";
+/// The private match implementation for `FlattenAllowability.shouldFlatten`.
+const FORMAT_SHOULD_FLATTEN_MATCH_1: &str =
+    "_private.Init.Data.Format.Basic.0.Std.Format.FlattenAllowability.shouldFlatten.match_1";
+/// The pin's private formatting companion stores this definition in Basic.
+const FORMAT_SHOULD_FLATTEN_MATCH_1_MODULE: &str = "Init/Data/Format/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -2066,6 +2071,35 @@ fn bit_vec_get_msb_proof_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {BIT_VEC_GET_MSB_PROOF_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn format_should_flatten_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("format_should_flatten_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, FORMAT_SHOULD_FLATTEN_MATCH_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&FORMAT_SHOULD_FLATTEN_MATCH_1.to_owned()),
+        "the private companion of {FORMAT_SHOULD_FLATTEN_MATCH_1_MODULE} must retain \\
+         {FORMAT_SHOULD_FLATTEN_MATCH_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == FORMAT_SHOULD_FLATTEN_MATCH_1)
+        .unwrap_or_else(|| panic!("private decoder lost {FORMAT_SHOULD_FLATTEN_MATCH_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {FORMAT_SHOULD_FLATTEN_MATCH_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
