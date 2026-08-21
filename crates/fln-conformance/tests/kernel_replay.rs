@@ -4873,6 +4873,14 @@ impl CorpusMatrixReceipt {
         // `available_parallelism().map(...).unwrap_or(0)`. A host that cannot
         // report its parallelism cannot file a host-bound observation, and the
         // lane should refuse rather than retain a row whose host half is absent.
+        //
+        // THE SIBLING RECEIPT DELIBERATELY ACCEPTS 0 for the same field, and its
+        // reasoning is sound for the claim IT supports: comparative timings can
+        // tolerate an unknown host. This one cannot, because AGENTS.md quotes
+        // its cost as measured on a 64-way host and there is exactly one row
+        // behind that sentence. The divergence is deliberate at both ends and
+        // written down at both ends; making the two agree by fiat would change
+        // what one of the claims means.
         if self.bead.trim().is_empty() {
             return Err(
                 "row carries an empty bead, so it is filed against no work item".to_string(),
@@ -4885,12 +4893,23 @@ impl CorpusMatrixReceipt {
                     .to_string(),
             );
         }
-        if self.profile.trim().is_empty() {
-            return Err(
-                "row carries an empty profile. The 32-minute cost this waiver is granted on \
-                 was measured under a named build profile, and an unnamed one prices nothing"
-                    .to_string(),
-            );
+        // AND THE RULE NEXT DOOR WAS ALREADY STRONGER THAN THE ONE I WROTE HERE.
+        // This was `trim().is_empty()`, so `fastbuild` -- a profile no producer
+        // emits -- passed as a named build profile. The sibling receipt has
+        // required `dev` or `release` all along, against the SAME producer
+        // expression (`if cfg!(debug_assertions) { "dev" } else { "release" }`),
+        // and I found the asymmetry only by trying to push my weaker rule onto
+        // the sibling and watching its stricter one refuse my own decoys first.
+        // A blank-only rule prices nothing: `wall_ms` is the input to the cadence
+        // decision this waiver rests on, and it is uninterpretable without
+        // knowing which of the two profiles produced it.
+        if self.profile != "dev" && self.profile != "release" {
+            return Err(format!(
+                "row records profile `{}`, but the producer emits only `dev` or `release`. The \
+                 32-minute cost this waiver is granted on is uninterpretable without knowing \
+                 which of the two produced it",
+                self.profile
+            ));
         }
         if self.available_parallelism == 0 {
             return Err(
@@ -11912,11 +11931,22 @@ impl WholeMathlibReceipt {
                     .to_string(),
             );
         }
-        // `available_parallelism` is DELIBERATELY unconstrained, stated here so
+        // `available_parallelism` is DELIBERATELY unconstrained HERE, stated so
         // the asymmetry above is a decision rather than an oversight: the
         // producer writes 0 when the host would not report it, so zero is a
         // legitimate value meaning "unknown" and refusing it would refuse honest
         // rows from hosts that cannot answer.
+        //
+        // AND THE SIBLING RECEIPT NOW DECIDES THE OPPOSITE, which is worth
+        // naming rather than harmonising. `CorpusMatrixReceipt::validate`
+        // refuses 0, because the claim that receipt supports is quoted in
+        // AGENTS.md as measured ON A 64-WAY HOST: a row whose host capability is
+        // unknown cannot carry a host-bound cost figure, and there is exactly
+        // one such row. This receipt's timings are comparative rather than
+        // quoted, so an unknown-parallelism row is still worth retaining. Same
+        // field, same producer line, two claims -- the rule follows the claim,
+        // and a later reader making the two agree by fiat would be changing what
+        // one of them means.
 
         // CONTENT. The class must match what the counts actually say: a
         // refutation wearing the clean token is the one failure this format
@@ -18611,7 +18641,23 @@ fn a_receipt_that_compared_nothing_is_refused() {
                 profile: String::new(),
                 ..real.clone()
             },
-            "empty profile",
+            "the producer emits only",
+        ),
+        (
+            "a build profile no producer emits",
+            CorpusMatrixReceipt {
+                profile: "fastbuild".to_string(),
+                ..real.clone()
+            },
+            "the producer emits only",
+        ),
+        (
+            "the right profile with a space",
+            CorpusMatrixReceipt {
+                profile: " dev".to_string(),
+                ..real.clone()
+            },
+            "the producer emits only",
         ),
         (
             "a host that could not report its parallelism",
