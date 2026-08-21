@@ -2586,6 +2586,103 @@ mod tests {
         .bytes
     }
 
+    /// One axiom whose type is `Sort (0+1+1)`, so the outer `Level.succ` has a
+    /// heap child rather than a scalar one.
+    ///
+    /// `succ_level_module` is no use for the post-order law: its child is
+    /// `Level.zero`, which is scalar-boxed, and the law only applies to
+    /// non-scalar children. A cell built on that fixture would pass while
+    /// exercising nothing.
+    fn nested_succ_level_module() -> Vec<u8> {
+        let level = Level::zero()
+            .succ()
+            .and_then(Level::succ)
+            .expect("two successors are in range");
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[ConstantInfo::Axiom(AxiomVal {
+                    base: ConstantVal {
+                        name: Name::from_components(["Demo", "lvl2"]),
+                        level_params: Vec::new(),
+                        type_: Expr::sort(level),
+                    },
+                    is_unsafe: false,
+                })],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: 2,
+                flags: 1,
+                lean_version: "4.32.0",
+                githash: "0123456789abcdef0123456789abcdef01234567",
+                base_addr: 0x20_000,
+            },
+            WriteBudget::default(),
+        )
+        .expect("module encodes")
+        .bytes
+    }
+
+    /// The Level post-order law is enforced, with the same anti-cycle
+    /// rationale as its Expr counterpart and a separate implementation.
+    #[test]
+    fn a_level_child_that_does_not_precede_its_parent_is_refused() {
+        let mut bytes = nested_succ_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified nested-succ fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let sort_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("Sort expression");
+        // The pointer VALUE addressing the outer succ, reused as the plant.
+        let outer_ptr = view.read_u64(sort_off + 8).expect("level pointer");
+        let outer_off = view.deref(outer_ptr).expect("outer Level.succ");
+        assert_eq!(view.obj_header(outer_off).expect("header").0, 1, "succ");
+
+        // Its child must currently be a heap Level, not a scalar, or the law
+        // below would never be reached.
+        let child = view.read_u64(outer_off + 8).expect("succ child");
+        assert_eq!(child & 1, 0, "the inner successor is a heap object");
+        assert_ne!(child, outer_ptr, "the fixture is acyclic to begin with");
+
+        // Point the outer succ at itself.
+        let slot = outer_off as usize + 8;
+        bytes[slot..slot + 8].copy_from_slice(&outer_ptr.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a Level child that does not precede its parent must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Level child not below its parent (post-order law)",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `Level` whose stored size contradicts its layout is refused before its
     /// `Data` word is compared.
     #[test]
