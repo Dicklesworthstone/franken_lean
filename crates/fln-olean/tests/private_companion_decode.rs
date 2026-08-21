@@ -1995,6 +1995,70 @@ fn sunfold_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 }
 
 #[test]
+fn sunfold_family_keeps_concrete_members_on_both_chain_origins() {
+    let lib = lib_or_skip!("sunfold_family_keeps_concrete_members_on_both_chain_origins");
+    let mut exported_member = None;
+    let mut private_only_member = None;
+
+    for relative in init_chain_modules(&lib) {
+        let chain = chain_bytes(&lib, &relative);
+        let (exported, private) = exported_and_private_names(&chain);
+        if exported_member.is_none() {
+            exported_member = exported
+                .iter()
+                .find(|name| family::sunfold(name))
+                .map(|name| (relative.clone(), name.clone()));
+        }
+        if private_only_member.is_none() {
+            private_only_member = private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::sunfold(name))
+                .map(|name| (relative, name.clone()));
+        }
+        if exported_member.is_some() && private_only_member.is_some() {
+            break;
+        }
+    }
+
+    let (exported_relative, exported_name) = exported_member
+        .expect("the pinned Init exported parts contain an _sunfold representative");
+    let exported_chain = chain_bytes(&lib, &exported_relative);
+    let exported_view = OleanView::parse(&exported_chain.exported)
+        .unwrap_or_else(|error| panic!("_sunfold {exported_name}: parse exported: {error}"));
+    let exported = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_sunfold {exported_name}: decode exported: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == exported_name)
+        .unwrap_or_else(|| panic!("exported decoder lost _sunfold {exported_name}"));
+    assert!(
+        is_concrete_recovery(&exported),
+        "exported _sunfold {exported_name} decoded only as {} instead of a concrete declaration",
+        exported.kind_name()
+    );
+
+    let (private_relative, private_name) = private_only_member
+        .expect("the pinned Init private companions contain a private-only _sunfold representative");
+    let private_chain = chain_bytes(&lib, &private_relative);
+    let private_view = OleanView::parse_with_dependencies(
+        &private_chain.private,
+        &[&private_chain.exported, &private_chain.server],
+    )
+    .unwrap_or_else(|error| panic!("_sunfold {private_name}: parse private: {error}"));
+    let private = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_sunfold {private_name}: decode private: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == private_name)
+        .unwrap_or_else(|| panic!("private decoder lost _sunfold {private_name}"));
+    assert!(
+        is_concrete_recovery(&private),
+        "private-only _sunfold {private_name} decoded only as {} instead of a concrete declaration",
+        private.kind_name()
+    );
+}
+
+#[test]
 fn match_n_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
     let lib =
         lib_or_skip!("match_n_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
