@@ -98,6 +98,10 @@ fn numbered_private_auxiliary(name: &str, prefix: &str) -> bool {
     })
 }
 
+fn has_component(name: &str, component: &str) -> bool {
+    name.split('.').skip(1).any(|part| part == component)
+}
+
 fn assert_private_auxiliary_family(family: &str, belongs_to_family: impl Fn(&str) -> bool) {
     let Some((public_names, private_names)) = companion_and_public_names() else {
         return;
@@ -130,7 +134,7 @@ fn private_companion_decodes_proof_n_auxiliaries() {
 
 #[test]
 fn private_companion_decodes_loop_auxiliaries() {
-    assert_private_auxiliary_family(".loop", |name| name.contains(".loop."));
+    assert_private_auxiliary_family(".loop", |name| has_component(name, "loop"));
 }
 
 #[test]
