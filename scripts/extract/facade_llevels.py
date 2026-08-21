@@ -253,8 +253,19 @@ def main():
              "members": sum(1 for r in out if r["l_level"] == "L0"
                             and "not a class" in (r["mechanism"] or ""))},
             {"step": 2, "target": "remaining L0 rows",
-             "action": "each names its own pin diagnostic in the module artifact; "
-                       "repair or record a typed Unsupported",
+             "action": "each names its own pin diagnostic in the module artifact. "
+                       "MEASURED, so the next hand does not repeat it: 7 of these "
+                       "rows fail on an `optParam` whose printed DEFAULT VALUE "
+                       "cannot elaborate (`optParam Lean.Meta.Context { }`). "
+                       "Emitting structure field defaults from the pin was "
+                       "attempted and REGRESSES — curated-demand available "
+                       "574 -> 571 — because the four structures these rows need "
+                       "(Lean.Meta.Context/State, Lean.Elab.Term.Context/State) "
+                       "have defaults that need INSTANCE SYNTHESIS (Inhabited, "
+                       "EmptyCollection) over facade-opaque types, so their "
+                       "defaults are dropped anyway while three PersistentHashMap "
+                       "rows break. The real prerequisite is instance coverage for "
+                       "default values, not default emission.",
              "members": sum(1 for r in out if r["l_level"] == "L0"
                             and "not a class" not in (r["mechanism"] or ""))},
             {"step": 3, "target": "L1 rows in R-NONE",
