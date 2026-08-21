@@ -319,6 +319,11 @@ mod family {
         last_component_suffix(name, "eq_").is_some_and(digits)
     }
 
+    /// `._eq_1`, … — equation-compiler internal equation lemmas.
+    pub fn private_eq_n(name: &str) -> bool {
+        last_component_suffix(name, "_eq_").is_some_and(digits)
+    }
+
     /// `.eq_def`.
     pub fn eq_def(name: &str) -> bool {
         let parts = components(name);
@@ -445,15 +450,17 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
     // retain the names while failing to construct the corresponding
     // ConstantInfo. Find one *private-only* representative per family, then
     // pass each through DeclDecoder with its real companion address spaces.
-    let families: [(&str, fn(&str) -> bool); 6] = [
+    let families: [(&str, fn(&str) -> bool); 7] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
+        ("_eq_N", family::private_eq_n),
         ("eq_def", family::eq_def),
         (".loop", family::loop_),
         (".go", family::go),
     ];
-    let mut representatives: [Option<(String, String)>; 6] = [None, None, None, None, None, None];
+    let mut representatives: [Option<(String, String)>; 7] =
+        [None, None, None, None, None, None, None];
 
     for relative in init_chain_modules(&lib) {
         let chain = chain_bytes(&lib, &relative);
@@ -501,8 +508,9 @@ fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
 
 #[test]
 fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom() {
-    let lib =
-        lib_or_skip!("private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom");
+    let lib = lib_or_skip!(
+        "private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom"
+    );
 
     // This is deliberately stronger than the name census and the existence cell
     // above. A decoder that merely manufactures an axiom with the right name
@@ -511,10 +519,11 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
     // family, establish the RED side on the exported decoder, then the GREEN
     // side on the private companion decoder: the concrete declaration exists
     // there and keeps its real ConstantInfo kind.
-    let families: [(&str, fn(&str) -> bool); 6] = [
+    let families: [(&str, fn(&str) -> bool); 7] = [
         ("match_N", family::match_n),
         ("_proof_N", family::proof_n),
         ("eq_N", family::eq_n),
+        ("_eq_N", family::private_eq_n),
         ("eq_def", family::eq_def),
         (".loop", family::loop_),
         (".go", family::go),
@@ -590,7 +599,11 @@ fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
         .iter()
         .map(|info| info.name().to_display_string())
         .collect();
-    assert_eq!(constants.len(), 6, "the private array is returned, not the exported one");
+    assert_eq!(
+        constants.len(),
+        6,
+        "the private array is returned, not the exported one"
+    );
     assert!(
         names.contains(&TIMY_WITNESS.to_owned()),
         "the verified decode must still carry {TIMY_WITNESS}; got {names:?}"
