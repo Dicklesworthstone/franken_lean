@@ -10801,3 +10801,167 @@ fn the_binders_after_self_are_the_field_types_own() {
         tail_names.len()
     );
 }
+
+/// No constructor field mentions its own inductive in a NEGATIVE position.
+///
+/// Strict positivity is the admission rule that makes an inductive consistent:
+/// a field of type `(X → Bool) → X` would let you build a fixed point of
+/// `X → X` and derive `False`. Nothing here checks it. The recursive-flag cell
+/// asks whether a field mentions the inductive at all, which is the same
+/// question with the position thrown away — and the position is the entire
+/// content of the rule.
+///
+/// Measured over all 229 constructor fields in `Init/Prelude`:
+///
+///   17 field types MENTION their own inductive, which is what makes those
+///     constructors recursive
+///   ZERO mention it inside the domain of any `∀` within the field type,
+///     nested or leading
+///
+/// The 17 are what give the check teeth. A walk that found no occurrences at
+/// all would report zero negative ones and look identical, so the positive
+/// count is asserted alongside the negative one and the partition is closed:
+/// every field either mentions its inductive or does not.
+///
+/// SCOPE, because the real rule is larger than what an artifact walk can
+/// decide. This checks the domain condition — the inductive never appears to
+/// the left of an arrow inside a field type. Lean's strict positivity also
+/// constrains where the inductive may appear as an ARGUMENT to another
+/// inductive, and deciding that needs the parameter/index split of the
+/// containing type at each occurrence. What is asserted here is a necessary
+/// condition, and it is the half that a decode defect would break: a field type
+/// whose binders were rebuilt in the wrong order could move an occurrence from
+/// a result into a domain.
+#[test]
+fn no_constructor_field_mentions_its_inductive_in_a_domain() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: Vec<(String, &ConstructorVal, Vec<&Expr>)> = Vec::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders: Vec<&Expr> = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_type, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_type);
+                    current = body;
+                }
+                constructors.push((name, v, binders));
+            }
+            _ => {}
+        }
+    }
+
+    // Every subterm, plus the subterms that sit in a `∀` domain.
+    let survey = |root: &Expr, target: &str| -> (bool, bool, usize) {
+        let mut mentions = false;
+        let mut in_domain = false;
+        let mut domains = 0usize;
+        // Keyed on `(node, context)`, not on the node alone: a shared subterm
+        // reached once outside a domain and once inside is two different
+        // questions, and an identity-only key would answer the second with the
+        // first. It also bounds the walk at twice the node count instead of
+        // re-walking a shared term once per path that reaches it.
+        let mut seen: BTreeSet<(usize, bool)> = BTreeSet::new();
+        let mut stack: Vec<(&Expr, bool)> = vec![(root, false)];
+        while let Some((current, under)) = stack.pop() {
+            if !seen.insert((current.allocation_identity(), under)) {
+                continue;
+            }
+            if let ExprNode::Const { name, .. } = current.node() {
+                if name.to_display_string() == target {
+                    mentions = true;
+                    if under {
+                        in_domain = true;
+                    }
+                }
+            }
+            match current.node() {
+                ExprNode::App { f, a } => {
+                    stack.push((f, under));
+                    stack.push((a, under));
+                }
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    domains += 1;
+                    stack.push((binder_type, true));
+                    stack.push((body, under));
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                } => {
+                    stack.push((binder_type, under));
+                    stack.push((body, under));
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push((type_, under));
+                    stack.push((value, under));
+                    stack.push((body, under));
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    stack.push((expr, under));
+                }
+                _ => {}
+            }
+        }
+        (mentions, in_domain, domains)
+    };
+
+    let mut fields = 0usize;
+    let mut mentioning = 0usize;
+    let mut domains = 0usize;
+    let mut negative: Vec<(String, usize)> = Vec::new();
+    for (name, ctor, binders) in &constructors {
+        let induct = ctor.induct.to_display_string();
+        if !inductives.contains_key(&induct) {
+            continue;
+        }
+        let start = ctor.num_params as usize;
+        for (position, field_type) in binders[start..start + ctor.num_fields as usize]
+            .iter()
+            .enumerate()
+        {
+            fields += 1;
+            let (mentions, in_domain, seen_domains) = survey(field_type, &induct);
+            domains += seen_domains;
+            if mentions {
+                mentioning += 1;
+            }
+            if in_domain {
+                negative.push((name.clone(), position));
+            }
+        }
+    }
+
+    // Conservation first: every field either mentions its inductive or not.
+    assert_eq!(
+        mentioning + (fields - mentioning),
+        fields,
+        "the mentioning split must cover every field"
+    );
+    assert!(
+        negative.is_empty(),
+        "a constructor field must not mention its own inductive in a domain (name, field \
+         position): {negative:?}"
+    );
+    assert_eq!(
+        (fields, mentioning),
+        (229, 17),
+        "the field population and how many mention their own inductive"
+    );
+    assert!(
+        domains > 100,
+        "the walk must actually reach domains, or zero negative occurrences means nothing: \
+         {domains} inspected"
+    );
+}
