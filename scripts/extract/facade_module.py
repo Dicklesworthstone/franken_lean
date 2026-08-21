@@ -581,6 +581,10 @@ def structural_block(name, d, st, bs, deps, pks):
     binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
     params, fields = [], []
     for i, b in sorted(bs.items()):
+        # An unwritable non-instance binder is unreferenced (structural_refusal
+        # checked that) and gets a fresh, writable name.
+        if b["kind"] != "inst" and not writable_binder(b["user"]):
+            b = dict(b, user=f"flnp{i}")
         if i < st["num_params"]:
             params.append(dict(b, kind=pks.get(i, "default")))
         else:
@@ -608,11 +612,15 @@ def structural_refusal(name, st, bs):
     for i, b in sorted(bs.items()):
         if "\u271d" in b["type"]:
             return "a binder type mentions an inaccessible name"
-        # A NON-instance binder's name IS referenced by later binder and field
-        # types, so it cannot be dropped or renamed; such a structure keeps the
-        # axiom form rather than emitting a block that cannot parse.
+        # A non-instance binder with an unwritable name is renamed rather than
+        # refused — but only when nothing else names it. If a later binder or
+        # field type mentions it, the rename would silently change what that type
+        # means, so the structure keeps the axiom form instead.
         if b["kind"] != "inst" and not writable_binder(b["user"]):
-            return f"binder {b['user']!r} cannot be written as an identifier"
+            later = [o["type"] for j, o in sorted(bs.items()) if j > i]
+            if any(re.search(r"(?<![\w.])" + re.escape(b["user"]) + r"(?![\w.])", t)
+                   for t in later):
+                return f"binder {b['user']!r} cannot be written and is referenced"
     return None
 
 
