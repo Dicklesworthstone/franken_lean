@@ -2794,6 +2794,30 @@ def main():
             "REFUSE: facade manifest inductive-declaration count must exceed "
             f"inductive-refusal count ({json.dumps(inductive_population_inequality_join, sort_keys=True)})"
         )
+    structural_inductive_inequality_join = {
+        "summary_structural_declarations": manifest_summary.get(
+            "structural_declarations"
+        ),
+        "summary_inductive_declarations": manifest_summary.get(
+            "inductive_declarations"
+        ),
+    }
+    if (not isinstance(structural_inductive_inequality_join[
+            "summary_structural_declarations"], int)
+            or isinstance(structural_inductive_inequality_join[
+                "summary_structural_declarations"], bool)
+            or not isinstance(structural_inductive_inequality_join[
+                "summary_inductive_declarations"], int)
+            or isinstance(structural_inductive_inequality_join[
+                "summary_inductive_declarations"], bool)
+            or structural_inductive_inequality_join[
+                "summary_structural_declarations"]
+            <= structural_inductive_inequality_join[
+                "summary_inductive_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-declaration count must exceed "
+            f"inductive-declaration count ({json.dumps(structural_inductive_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4833,6 +4857,9 @@ def main():
         ),
         "manifest_inductive_population_inequality_join": (
             inductive_population_inequality_join
+        ),
+        "manifest_structural_inductive_inequality_join": (
+            structural_inductive_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
