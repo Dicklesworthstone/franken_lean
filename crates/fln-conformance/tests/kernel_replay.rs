@@ -5127,6 +5127,47 @@ fn write_inventory_fixture_with(
     relative_files: &[&str],
     mut write_entry: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> PathBuf {
+    // AND THE NAME ITSELF WAS NEVER CHECKED, WHICH IS THE MORE DANGEROUS HALF.
+    // Every entry below is validated three ways; `versioned_name` was joined
+    // straight onto the temporary directory and formatted into the shape
+    // record's path with nothing looking at it. It decides WHERE all of that
+    // goes, so it is the argument that can do the most damage.
+    //
+    // An empty name makes `base` the temporary directory itself -- the directory
+    // every fixture in this file already sits in, side by side, measured on a
+    // batch run's tree. The fixture's population would silently become all of
+    // them: the union hazard the registry and the shape record exist to prevent,
+    // arriving through the one parameter neither of them inspects. (Cargo
+    // documents this directory as per-PACKAGE, so other integration-test
+    // binaries would share it too; I have not observed one here, so the argument
+    // rests on the fixtures in this file, which is already enough.) A `..`
+    // climbs out into `target/`. A separator nests the tree while leaving the
+    // shape record beside a directory that is no longer its parent.
+    //
+    // Three distinct reasons, because a single "bad fixture name" would let any
+    // of the three pass in another's place.
+    let name_fault = {
+        let mut components = Path::new(versioned_name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => None,
+            (None, _) => Some(
+                "names nothing at all, so the fixture tree would BE the shared temporary \
+                 directory and its population would be every other fixture in this package",
+            ),
+            (Some(std::path::Component::Normal(_)), Some(_)) => Some(
+                "holds a path separator, so the tree would nest while the shape record stayed \
+                 beside a directory that is no longer its parent",
+            ),
+            (Some(_), _) => Some(
+                "is not an ordinary name, so it can climb out of the temporary directory \
+                 altogether",
+            ),
+        }
+    };
+    if let Some(fault) = name_fault {
+        panic!("fixture name `{versioned_name}` {fault}");
+    }
+
     // `relative_files` IS A PROMISE THE PARAMETER'S NAME MAKES AND NOTHING KEPT.
     // `Path::join` obeys the caller, not the name: an entry beginning with `/`
     // DISCARDS the base entirely and lands wherever it says -- outside
@@ -6193,6 +6234,108 @@ fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
              or the conflicting file is already on disk when the refusal arrives"
         );
     }
+}
+
+/// The fixture NAME is validated, and it is the argument that decides where
+/// everything goes.
+///
+/// **Three guards on the entries, none on the name.** An entry cannot escape the
+/// tree, repeat itself, or claim to be both a file and another entry's parent.
+/// `versioned_name` was joined straight onto the temporary directory and
+/// formatted into the shape record's path with nothing looking at it -- and it
+/// is the argument that decides where the tree and the record LAND, so it can do
+/// strictly more damage than any entry.
+///
+/// **An empty name is the interesting one, because it fails silently.** It makes
+/// the base the temporary directory itself -- the directory all 29 fixtures in
+/// this file already share, which is what a batch run's tree shows. The
+/// fixture's population becomes all of theirs: counts come back too high, and
+/// nothing in the walk, the name registry or the shape record can see it -- the
+/// union hazard those two exist to prevent, arriving through the parameter
+/// neither inspects. The neighbouring fixture built below is the evidence that
+/// the directory is not empty of oleans.
+///
+/// Cargo documents this directory as per-package, so other test binaries would
+/// share it as well. That is the documentation's claim and not an observation of
+/// mine: the only populated tree I looked at held fixtures from this file alone.
+/// The argument does not need it.
+///
+/// **Three reasons, told apart.** A single "bad fixture name" message would let
+/// any of the three pass in another's place, which is how a direction check goes
+/// dark while every call site stays green.
+///
+/// **Only the separator case can assert that nothing was built.** The other two
+/// resolve to directories that already exist -- the temporary directory and
+/// `target/` -- so their absence proves nothing. Said rather than quietly
+/// omitted.
+#[test]
+fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+
+    // GREEN CONTROL, WHICH DOUBLES AS THE EVIDENCE. An ordinary name builds --
+    // and the file it leaves is exactly what a fixture rooted at the temporary
+    // directory would pull into its own population.
+    let ok = write_inventory_fixture("t6r7-selftest-name-ok-v1", &["Neighbour.olean"]);
+    assert_eq!(ok, tmp.join("t6r7-selftest-name-ok-v1"));
+    assert!(
+        ok.join("Neighbour.olean").is_file(),
+        "an ordinary fixture name must still build"
+    );
+    assert!(
+        tmp.join("t6r7-selftest-name-ok-v1/Neighbour.olean")
+            .is_file(),
+        "this olean sits below the SHARED temporary directory. A fixture whose name was empty \
+         would be rooted there and would count it as one of its own modules"
+    );
+
+    let refuse = |name: &str| -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| write_inventory_fixture(name, &["Any.olean"]));
+        std::panic::set_hook(previous);
+        let payload = outcome
+            .err()
+            .unwrap_or_else(|| panic!("the fixture name `{name}` must be refused"));
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let empty = refuse("");
+    let climbing = refuse("..");
+    let nested = refuse("nested/name");
+
+    // EACH ON THE WORDS UNIQUE TO ITS OWN BRANCH, and asserted absent from the
+    // others: all three are refusals of a fixture name, so `is_err()` or a
+    // shared fragment would let one cell pass on another's panic.
+    assert!(
+        empty.contains("names nothing at all") && !empty.contains("climb out"),
+        "the empty name must be refused for having no components: {empty}"
+    );
+    assert!(
+        climbing.contains("climb out") && !climbing.contains("path separator"),
+        "`..` must be refused for leaving the temporary directory: {climbing}"
+    );
+    assert!(
+        nested.contains("path separator") && !nested.contains("names nothing at all"),
+        "`nested/name` must be refused for nesting: {nested}"
+    );
+    assert!(
+        nested.contains("nested/name"),
+        "the refusal must name the fixture it is about: {nested}"
+    );
+
+    // NOTHING WAS BUILT -- provable for this case only. `""` resolves to the
+    // temporary directory and `..` to `target/`; both exist regardless, so their
+    // absence would be no evidence at all.
+    assert!(
+        !tmp.join("nested").exists(),
+        "`nested/name` was refused and a tree appeared anyway; the name check must run before \
+         anything is created"
+    );
 }
 
 /// The shape is recorded BEFORE the tree is built, so a build that dies partway
