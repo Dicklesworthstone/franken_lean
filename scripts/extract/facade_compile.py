@@ -2428,6 +2428,23 @@ def main():
             "REFUSE: facade manifest safety-result-head probe diverges "
             f"({json.dumps(safety_result_head_probe_join, sort_keys=True)})"
         )
+    kind_implementation_probe_join = {
+        "summary_kind_probed": manifest_summary.get("kind_probed"),
+        "summary_implemented_by_probed": manifest_summary.get(
+            "implemented_by_probed"
+        ),
+        "pinned_kind_implementation_count": 2042,
+    }
+    if (kind_implementation_probe_join["summary_kind_probed"]
+            != kind_implementation_probe_join[
+                "pinned_kind_implementation_count"]
+            or kind_implementation_probe_join["summary_implemented_by_probed"]
+            != kind_implementation_probe_join[
+                "pinned_kind_implementation_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest kind-implementation probe diverges "
+            f"({json.dumps(kind_implementation_probe_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3595,6 +3612,9 @@ def main():
         ),
         "manifest_safety_result_head_probe_join": (
             safety_result_head_probe_join
+        ),
+        "manifest_kind_implementation_probe_join": (
+            kind_implementation_probe_join
         ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
