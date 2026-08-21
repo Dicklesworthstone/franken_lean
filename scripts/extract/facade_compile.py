@@ -1582,6 +1582,16 @@ def main():
             "REFUSE: facade manifest dropped-instance-attribute pin diverges "
             f"({json.dumps(instance_attrs_dropped_pin_join, sort_keys=True)})"
         )
+    substrate_emitted_pin_join = {
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+        "pinned_substrate_emitted": 1563,
+    }
+    if (substrate_emitted_pin_join["summary_substrate_emitted"]
+            != substrate_emitted_pin_join["pinned_substrate_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest substrate-emitted pin diverges "
+            f"({json.dumps(substrate_emitted_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2653,6 +2663,7 @@ def main():
         "manifest_private_name_rows_pin_join": private_name_rows_pin_join,
         "manifest_instance_attrs_kept_pin_join": instance_attrs_kept_pin_join,
         "manifest_instance_attrs_dropped_pin_join": instance_attrs_dropped_pin_join,
+        "manifest_substrate_emitted_pin_join": substrate_emitted_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
