@@ -1786,6 +1786,138 @@ fn init_unit_entries() -> Vec<ConstantEntry> {
     ]
 }
 
+fn init_sum_entries() -> Vec<ConstantEntry> {
+    let sum = checker_name("Sum");
+    let inl = checker_qualified(&["Sum", "inl"]);
+    let inr = checker_qualified(&["Sum", "inr"]);
+    let rec = checker_qualified(&["Sum", "rec"]);
+    let u_name = checker_name("u");
+    let v_name = checker_name("v");
+    let w_name = checker_name("w");
+    let u = Level::param(primary_name("u"));
+    let v = Level::param(primary_name("v"));
+    let w = Level::param(primary_name("w"));
+    let left_type = || Expr::sort(Level::succ(u.clone()).expect("universe successor packs"));
+    let right_type = || Expr::sort(Level::succ(v.clone()).expect("universe successor packs"));
+    let sum_type = || Expr::sort(Level::succ(Level::max(u.clone(), v.clone()).expect("universe maximum packs")).expect("universe successor packs"));
+    let sum_expr = |left: Expr, right: Expr| {
+        Expr::app(
+            Expr::app(Expr::const_(primary_name("Sum"), vec![u.clone(), v.clone()]), left),
+            right,
+        )
+    };
+    let inl_expr = |left: Expr, right: Expr, value: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(Name::from_components(["Sum", "inl"]), vec![u.clone(), v.clone()]), left),
+                right,
+            ),
+            value,
+        )
+    };
+    let inr_expr = |left: Expr, right: Expr, value: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::app(Expr::const_(Name::from_components(["Sum", "inr"]), vec![u.clone(), v.clone()]), left),
+                right,
+            ),
+            value,
+        )
+    };
+    let bv = |index| Expr::bvar(index).expect("packs");
+    let motive = || primary_pi("t", BinderInfo::Default, sum_expr(bv(1), bv(0)), Expr::sort(w.clone()));
+    let inl_minor = || primary_pi("value", BinderInfo::Default, bv(3), Expr::app(bv(1), inl_expr(bv(3), bv(2), bv(0))));
+    let inr_minor = || primary_pi("value", BinderInfo::Default, bv(3), Expr::app(bv(2), inr_expr(bv(4), bv(3), bv(0))));
+    let rec_type = primary_pi("α", BinderInfo::Implicit, left_type(), primary_pi(
+        "β", BinderInfo::Implicit, right_type(), primary_pi(
+            "motive", BinderInfo::Implicit, motive(), primary_pi(
+                "inl", BinderInfo::Default, inl_minor(), primary_pi(
+                    "inr", BinderInfo::Default, inr_minor(), primary_pi(
+                        "t", BinderInfo::Default, sum_expr(bv(5), bv(4)), Expr::app(bv(3), bv(0)),
+                    ),
+                ),
+            ),
+        ),
+    ));
+    let inl_rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
+        primary_name("β"), right_type(), Expr::lam(
+            primary_name("motive"), motive(), Expr::lam(
+                primary_name("inl"), inl_minor(), Expr::lam(
+                    primary_name("inr"), inr_minor(), Expr::lam(
+                        primary_name("value"), bv(4), Expr::app(bv(2), bv(0)), BinderInfo::Default,
+                    ), BinderInfo::Default,
+                ), BinderInfo::Default,
+            ), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    let inr_rhs = Expr::lam(primary_name("α"), left_type(), Expr::lam(
+        primary_name("β"), right_type(), Expr::lam(
+            primary_name("motive"), motive(), Expr::lam(
+                primary_name("inl"), inl_minor(), Expr::lam(
+                    primary_name("inr"), inr_minor(), Expr::lam(
+                        primary_name("value"), bv(3), Expr::app(bv(1), bv(0)), BinderInfo::Default,
+                    ), BinderInfo::Default,
+                ), BinderInfo::Default,
+            ), BinderInfo::Default,
+        ), BinderInfo::Default,
+    ), BinderInfo::Default);
+    let inductive_type = primary_pi(
+        "α",
+        BinderInfo::Default,
+        left_type(),
+        primary_pi("β", BinderInfo::Default, right_type(), sum_type()),
+    );
+    let inl_type = primary_pi(
+        "α",
+        BinderInfo::Default,
+        left_type(),
+        primary_pi(
+            "β",
+            BinderInfo::Default,
+            right_type(),
+            primary_pi("value", BinderInfo::Default, bv(1), sum_expr(bv(2), bv(1))),
+        ),
+    );
+    let inr_type = primary_pi(
+        "α",
+        BinderInfo::Default,
+        left_type(),
+        primary_pi(
+            "β",
+            BinderInfo::Default,
+            right_type(),
+            primary_pi("value", BinderInfo::Default, bv(0), sum_expr(bv(2), bv(1))),
+        ),
+    );
+    vec![
+        ConstantEntry::new(sum.clone(), ConstantDeclaration::inductive(
+            vec![u_name.clone(), v_name.clone()],
+            decoded(&inductive_type),
+            ConstantSafety::Safe,
+            InductiveDeclaration::new(2, 0, vec![sum.clone()], vec![inl.clone(), inr.clone()], 0, false, false),
+        )),
+        ConstantEntry::new(inl.clone(), ConstantDeclaration::constructor(
+            vec![u_name.clone(), v_name.clone()],
+            decoded(&inl_type),
+            ConstantSafety::Safe,
+            ConstructorDeclaration::new(sum.clone(), 0, 2, 1),
+        )),
+        ConstantEntry::new(inr.clone(), ConstantDeclaration::constructor(
+            vec![u_name.clone(), v_name.clone()],
+            decoded(&inr_type),
+            ConstantSafety::Safe,
+            ConstructorDeclaration::new(sum.clone(), 1, 2, 1),
+        )),
+        ConstantEntry::new(rec, ConstantDeclaration::recursor(
+            vec![w_name, u_name, v_name], decoded(&rec_type), ConstantSafety::Safe,
+            RecursorDeclaration::new(vec![sum], 2, 0, 1, 2, vec![
+                RecursorRule::new(inl, 1, decoded(&inl_rhs)),
+                RecursorRule::new(inr, 1, decoded(&inr_rhs)),
+            ], false),
+        )),
+    ]
+}
+
 #[test]
 fn kr600_803_init_and_parameters_fields_and_rule_are_reconstructed() {
     let entries = init_and_entries();
@@ -1933,6 +2065,43 @@ fn kr600_803_init_unit_refuses_a_forged_iota_rule() {
     entries[2] = ConstantEntry::new(checker_qualified(&["Unit", "rec"]), ConstantDeclaration::recursor(
         declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
         RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Unit", "unit"]), 0, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
+    ));
+    assert!(matches!(
+        admit_inductive(
+            &ConstantEnvironment::empty(),
+            &entries,
+            AdmissionBudget::unlimited(),
+            EnvironmentBudget::unlimited(),
+        ),
+        fln_checker::admit::InductiveVerdict::Rejected(
+            fln_checker::admit::InductiveRejection::RecursorShape { .. }
+        )
+    ));
+}
+
+#[test]
+fn kr600_803_init_sum_branches_recursor_and_iota_are_reconstructed() {
+    let entries = init_sum_entries();
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(verdict.is_admitted(), "exact Init.Sum block: {verdict:?}");
+}
+
+#[test]
+fn kr600_803_init_sum_refuses_a_forged_inr_iota_rule() {
+    let mut entries = init_sum_entries();
+    let declaration = entries[3].declaration();
+    let metadata = declaration.recursor_metadata().expect("fixture recursor metadata");
+    entries[3] = ConstantEntry::new(checker_qualified(&["Sum", "rec"]), ConstantDeclaration::recursor(
+        declaration.level_parameters().to_vec(), declaration.type_().clone(), declaration.safety(),
+        RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![
+            metadata.rules()[0].clone(),
+            RecursorRule::new(checker_qualified(&["Sum", "inr"]), 1, decoded(&Expr::bvar(0).expect("packs"))),
+        ], metadata.k()),
     ));
     assert!(matches!(
         admit_inductive(
