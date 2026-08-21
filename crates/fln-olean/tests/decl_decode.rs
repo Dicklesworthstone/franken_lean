@@ -7927,3 +7927,253 @@ fn the_categorical_zeros_have_denominators() {
          nothing either"
     );
 }
+
+/// The "not special" findings, and whether their tests could have said
+/// otherwise.
+///
+/// `1006bd18` gave the categorical zeros the denominators they lacked. The same
+/// vacuity applies to a negative result: this file says four times that a
+/// shared or heavily-referenced object is NOT SPECIAL, and each time it says so
+/// by comparing that object's properties against the population's. If the
+/// property is UNIFORM across the whole population, the comparison cannot come
+/// out any other way, and "not special" is guaranteed before it is measured.
+///
+/// So: how many distinct values does each property take?
+///
+///   `c726dec5`  head-record slots 0-3   ONE value each across all 69
+///               head-record slot 4      three values, 57 / 8 / 4
+///   `ddfa2317`  the `tag 1` inner       ONE value across the population
+///   `75a1373c`  the `tag 2` inner       two values
+///   `1cc74dd0`  the array length        five values
+///
+/// ONE OF THE FOUR WAS VACUOUS. `ddfa2317` concluded that the 12 shared `tag 1`
+/// elements are not distinguished because they point at a numbered name link -
+/// and so does every other `tag 1` element in the corpus. That comparison had
+/// no discriminating power at all; it could not have produced any other answer.
+///
+/// AND `c726dec5` WAS FOUR-FIFTHS VACUOUS. Its first four slot comparisons are
+/// uniform across all 69 records, so only the fifth - slot 4, which takes three
+/// values - could have distinguished the two shared records from the rest. The
+/// finding stands on that one comparison, not on five.
+///
+/// The other two are sound: two values and five values respectively, so a
+/// shared object COULD have sat outside the common case and did not.
+///
+/// This retracts nothing. Every one of those observations is true. What was
+/// missing is that a negative result is only as strong as the test's ability to
+/// have come out positive, and I asserted four of them without once asking
+/// whether the test could.
+#[test]
+fn the_not_special_findings_needed_discriminating_power() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    // Each property, as the multiset of values it takes over its population.
+    let mut values: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut tag0: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) == Some((0, 2)) {
+                tag0.push(object.off);
+            }
+        }
+        let records: BTreeSet<usize> = tag0
+            .iter()
+            .filter_map(|&node| resolve(word_at(bytes, node + 8)))
+            .filter(|&head| shape(head) == Some((0, 5)))
+            .collect();
+
+        // `c726dec5`'s property: each of the head record's five slots.
+        for &record in &records {
+            for slot in 0..5usize {
+                let word = word_at(bytes, record + 8 + 8 * slot);
+                let described = resolve(word).map_or("boxed".to_owned(), &described);
+                *values
+                    .entry(format!("c726dec5 slot {slot}/{described}"))
+                    .or_default() += 1;
+            }
+            // `1cc74dd0`'s property: the slot-2 array's length.
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                let length = word_at(bytes, array + 8);
+                *values
+                    .entry(format!("1cc74dd0 length/{length}"))
+                    .or_default() += 1;
+            }
+        }
+
+        // `ddfa2317` and `75a1373c`: the element inners.
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && shape(target) == Some((0, 2))
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+        let mut arrays: BTreeSet<usize> = BTreeSet::new();
+        for &node in &all {
+            let Some(record) = resolve(word_at(bytes, node + 8)) else {
+                continue;
+            };
+            let Some(carrier) = resolve(word_at(bytes, record + 8 + 8 * 3)) else {
+                continue;
+            };
+            for (tag, arity, slot) in [(3u8, 3u8, 2usize), (4, 2, 1)] {
+                if shape(carrier) == Some((tag, arity))
+                    && let Some(array) = resolve(word_at(bytes, carrier + 8 + 8 * slot))
+                {
+                    arrays.insert(array);
+                }
+            }
+        }
+        let mut first: BTreeSet<usize> = BTreeSet::new();
+        let mut second: BTreeSet<usize> = BTreeSet::new();
+        for array in arrays {
+            for i in 0..word_at(bytes, array + 8) {
+                let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize)) else {
+                    continue;
+                };
+                match shape(element) {
+                    Some((1, 1)) => {
+                        first.insert(element);
+                    }
+                    Some((2, 1)) => {
+                        second.insert(element);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (name, set) in [("ddfa2317 inner", first), ("75a1373c inner", second)] {
+            for element in set {
+                let word = word_at(bytes, element + 8);
+                let described = resolve(word).map_or("boxed".to_owned(), &described);
+                *values.entry(format!("{name}/{described}")).or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            values.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // How many distinct values each property takes: the discriminating power.
+    let distinct =
+        |prefix: &str| -> usize { values.keys().filter(|key| key.starts_with(prefix)).count() };
+
+    assert_eq!(
+        values
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>(),
+        vec![
+            ("1cc74dd0 length/1".to_owned(), 18),
+            ("1cc74dd0 length/2".to_owned(), 34),
+            ("1cc74dd0 length/3".to_owned(), 5),
+            ("1cc74dd0 length/4".to_owned(), 4),
+            ("1cc74dd0 length/5".to_owned(), 8),
+            ("75a1373c inner/tag 1 arity 1".to_owned(), 19),
+            ("75a1373c inner/tag 4 arity 2".to_owned(), 6),
+            ("c726dec5 slot 0/tag 2 arity 2".to_owned(), 69),
+            ("c726dec5 slot 1/tag 2 arity 2".to_owned(), 69),
+            ("c726dec5 slot 2/tag 246 arity 0".to_owned(), 69),
+            ("c726dec5 slot 3/tag 7 arity 3".to_owned(), 69),
+            ("c726dec5 slot 4/tag 0 arity 2".to_owned(), 57),
+            ("c726dec5 slot 4/tag 1 arity 2".to_owned(), 8),
+            ("c726dec5 slot 4/tag 5 arity 1".to_owned(), 4),
+            ("ddfa2317 inner/tag 2 arity 2".to_owned(), 70),
+        ],
+        "every property, as the values it takes over its whole population"
+    );
+
+    // The vacuous ones: a property with a single value cannot distinguish.
+    assert_eq!(
+        distinct("ddfa2317 inner/"),
+        1,
+        "`ddfa2317` concluded the 12 shared `tag 1` elements are not \
+         distinguished because they point at a numbered name link - and so does \
+         EVERY `tag 1` element. That comparison had no discriminating power and \
+         could not have produced another answer"
+    );
+    assert_eq!(
+        (
+            distinct("c726dec5 slot 0/"),
+            distinct("c726dec5 slot 1/"),
+            distinct("c726dec5 slot 2/"),
+            distinct("c726dec5 slot 3/"),
+        ),
+        (1, 1, 1, 1),
+        "`c726dec5`'s first four slot comparisons are uniform across all 69 \
+         records, so four-fifths of that finding could not have come out \
+         otherwise"
+    );
+    assert_eq!(
+        distinct("c726dec5 slot 4/"),
+        3,
+        "only its fifth comparison could distinguish, so the finding stands on \
+         one comparison and not five"
+    );
+
+    // The sound ones.
+    assert_eq!(
+        (distinct("75a1373c inner/"), distinct("1cc74dd0 length/")),
+        (2, 5),
+        "these two properties vary, so a shared object COULD have sat outside \
+         the common case and did not"
+    );
+
+    // Anti-vacuity for this cell itself.
+    assert!(
+        distinct("1cc74dd0 length/") > 1,
+        "at least one property must vary, or this cell is the same vacuity it \
+         is auditing"
+    );
+}
