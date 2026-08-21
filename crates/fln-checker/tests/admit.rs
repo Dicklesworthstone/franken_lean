@@ -6667,6 +6667,36 @@ fn kr600_803_init_nat_succ_refuses_a_forged_constructor_index() {
 }
 
 #[test]
+fn kr600_803_init_nat_succ_refuses_a_forged_constructor_safety() {
+    let mut entries = nat_entries();
+    let constructor = entries[2].declaration();
+    entries[2] = ConstantEntry::new(
+        checker_qualified(&["Nat", "succ"]),
+        ConstantDeclaration::constructor(
+            constructor.level_parameters().to_vec(),
+            constructor.type_().clone(),
+            ConstantSafety::Unsafe,
+            ConstructorDeclaration::new(checker_name("Nat"), 1, 0, 1),
+        ),
+    );
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
+        ),
+        "forged Nat.succ constructor safety verdict: {verdict:?}"
+    );
+}
+
+#[test]
 fn kr600_803_init_nat_refuses_a_forged_num_parameters_count() {
     let mut entries = nat_entries();
     let declaration = entries[3].declaration();
