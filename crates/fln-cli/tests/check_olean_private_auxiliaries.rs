@@ -1021,7 +1021,7 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
                 .filter(|lines| {
                     lines[0].trim()
                         == r##""\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},","##
-                        && lines[1].trim() == r##""\"k2Checked\":false,""##
+                        && lines[1].trim() == r##""\"k2Checked\":false,","##
                 })
                 .count(),
         ],
