@@ -6787,3 +6787,90 @@ fn the_two_decode_helpers_agree_and_decoding_is_deterministic() {
         "the agreement must be over the full census and every ConstantInfo kind, got {kinds:?}"
     );
 }
+
+/// The pinned toolchain, as the artifact identifies ITSELF rather than as the
+/// path says.
+const PIN_LEAN_VERSION: &str = "4.32.0";
+const PIN_GITHASH: &str = "8c9756b28d64dab099da31a4c09229a9e6a2ef35";
+
+/// One part's header identity: `(lean_version, githash, base_addr)`.
+fn header_identity(path: &Path) -> (String, String, u64) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let view = OleanView::parse(&bytes).unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
+    let header = &view.header;
+    (
+        header.lean_version.clone(),
+        header.githash.clone(),
+        header.base_addr,
+    )
+}
+
+/// The library this file measures identifies itself as the pin — from its own
+/// bytes, not from the directory it was found in.
+///
+/// Every count in this file is stated against "the pin": 2,204 and 2,314
+/// declarations, 600 modules, 3,153 import edges, 35,225 level nodes. All of it
+/// rests on `reference_lib`, which returns `FLN_REFERENCE_LIB` when set and
+/// checks only that the path is a DIRECTORY. Point that variable at a different
+/// toolchain and every cell here goes on asserting the pin's numbers against
+/// something else — failing with count mismatches that read as decode defects,
+/// or, for a toolchain whose numbers happened to line up, passing while
+/// describing the wrong artifact. Nothing established which toolchain was
+/// actually opened.
+///
+/// The header answers it. Measured:
+///
+///   all 600 `Init` modules carry ONE header identity — `lean_version` 4.32.0
+///     and githash `8c9756b2…`, and the whole 2,433-file library carries the
+///     same one
+///   the three parts of a chain share that identity and have THREE DISTINCT
+///     base addresses, which is why the companion chain has to be pointer-linked
+///     across regions rather than read as one file
+///
+/// The constancy is asserted because `region.rs` claims it in a comment —
+/// `lean_version` and `githash` are "properties of the TOOLCHAIN, identical
+/// across every module" — and nothing tested it. The distinct base addresses are
+/// asserted because they are the mechanism this bead's repair depends on: three
+/// parts, three regions, one pointer graph.
+#[test]
+fn the_library_under_test_identifies_itself_as_the_pinned_toolchain() {
+    let lib = lib_or_skip!();
+
+    let base = lib.join("Init/Prelude.olean");
+    let mut addresses: BTreeSet<u64> = BTreeSet::new();
+    for part in ["olean", "olean.server", "olean.private"] {
+        let (version, githash, address) = header_identity(&base.with_extension(part));
+        assert_eq!(
+            (version.as_str(), githash.as_str()),
+            (PIN_LEAN_VERSION, PIN_GITHASH),
+            "Init/Prelude.{part}: the part must identify itself as the pin"
+        );
+        addresses.insert(address);
+    }
+    assert_eq!(
+        addresses.len(),
+        3,
+        "the three parts occupy three distinct regions, which is why the chain is linked by \
+         pointer rather than read as one file"
+    );
+
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+    let mut identities: BTreeSet<(String, String)> = BTreeSet::new();
+    for module in &modules {
+        let path = lib.join(format!("{}.olean", module.replace('.', "/")));
+        let (version, githash, _) = header_identity(&path);
+        identities.insert((version, githash));
+    }
+    assert_eq!(
+        identities.len(),
+        1,
+        "lean_version and githash are properties of the toolchain, so every module must agree; \
+         got {identities:?}"
+    );
+    assert_eq!(
+        identities.first().map(|(v, g)| (v.as_str(), g.as_str())),
+        Some((PIN_LEAN_VERSION, PIN_GITHASH)),
+        "and that one identity must be the pin the file's numbers were measured against"
+    );
+}
