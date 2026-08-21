@@ -911,7 +911,43 @@ impl<'a> DeclDecoder<'a> {
             });
         }
         let voff = self.view.deref(self.view.read_u64(off + 8)?)?;
-        let (_vtag, vother, _) = self.view.obj_header(voff)?;
+        let (_vtag, vother, vcs_sz) = self.view.obj_header(voff)?;
+
+        // The payload's stored object SIZE, checked against the layout this
+        // decoder is about to read the object with.
+        //
+        // Every slot and scalar access below is arithmetic on `vother` — the
+        // pointer-field count — so if that arithmetic is wrong the reads land
+        // in a neighbouring object and produce plausible values rather than an
+        // error. `cs_sz` is the one stored field that can contradict the model
+        // independently, and until now `obj_header` handed it back and every
+        // caller in this file dropped it on the floor.
+        //
+        // Measured over all 215,111 ConstantInfo payloads of the pin: the
+        // stored size equals `align8(8 + 8*pointers + scalars)` for every one,
+        // across all eight variants, and the padding beyond the meaningful
+        // scalars is zero everywhere. So a disagreement is a misread, not a
+        // shape this reader simply has not met.
+        let scalar_bytes = match tag {
+            0 | 1 | 3 | 4 | 6 => 1_u64,
+            2 => 0,
+            5 => 3,
+            7 => 2,
+            _ => {
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "ConstantInfo ctor",
+                });
+            }
+        };
+        let expected_cs_sz = (8 + 8 * u64::from(vother) + scalar_bytes).div_ceil(8) * 8;
+        if u64::from(vcs_sz) != expected_cs_sz {
+            return Err(DeclError::Shape {
+                offset: voff,
+                what: "ConstantInfo payload object size disagrees with its field layout",
+            });
+        }
+
         let slot = |d: &Self, i: u64| d.view.read_u64(voff + 8 + 8 * i);
         let scalar_base = voff + 8 + 8 * vother as u64;
         let scalar_u8 =
@@ -2230,6 +2266,52 @@ mod tests {
         assert!(
             regular > 0,
             "Init.Prelude must carry regular hints, or this test exercises no padding"
+        );
+    }
+
+    /// The payload object's stored size is checked against the field layout.
+    #[test]
+    fn a_constant_info_payload_whose_size_contradicts_its_layout_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+        let arrays = view.module_arrays().expect("constant array");
+        let info_ptr = view
+            .read_u64(arrays.constants.0 + 24)
+            .expect("first ConstantInfo");
+        let info_off = view.deref(info_ptr).expect("ConstantInfo object");
+        let val_ptr = view.read_u64(info_off + 8).expect("AxiomVal pointer");
+        let val_off = view.deref(val_ptr).expect("AxiomVal object");
+
+        // Positive control: untouched, the fixture decodes.
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        // AxiomVal is one pointer plus one scalar byte, so align8(8+8+1) = 24.
+        let (_, other, cs_sz) = view.obj_header(val_off).expect("AxiomVal header");
+        assert_eq!(other, 1, "AxiomVal carries one pointer field");
+        assert_eq!(cs_sz, 24, "and therefore a 24-byte object");
+
+        // Plant a size that no layout of this object could produce. Only the
+        // header word changes; every field the decoder reads is untouched, so
+        // without the check the decode would succeed on a contradictory object.
+        let header = view.read_u64(val_off).expect("header word");
+        let planted = (header & !0x0000_ffff_0000_0000) | (32_u64 << 32);
+        bytes[val_off as usize..val_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted header");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a payload whose size contradicts its layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "ConstantInfo payload object size disagrees with its field layout",
+                    ..
+                }
+            ),
+            "{error:?}"
         );
     }
 
