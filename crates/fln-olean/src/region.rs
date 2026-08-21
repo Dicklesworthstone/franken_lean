@@ -414,6 +414,27 @@ impl<'a> OleanView<'a> {
         })
     }
 
+    /// Is `other`'s region one of the dependency regions this view was parsed
+    /// against?
+    ///
+    /// This is the structural bond between the parts of one module's chain, and
+    /// the only thing that actually identifies them as belonging together. The
+    /// fixed header CANNOT do it: `version`, `flags`, `lean_version` and
+    /// `githash` are properties of the TOOLCHAIN, identical across every module
+    /// it built — one distinct value across all 2,431 chained modules of the
+    /// pin — so comparing them proves two artifacts came from the same Lean,
+    /// not from the same module.
+    ///
+    /// `base_addr` is per-region and distinct for every module (2,431 distinct
+    /// values across 2,431 exported parts), and a companion stores the earlier
+    /// regions' compacted addresses, so a companion built for a different
+    /// module resolves against a different base and is caught here.
+    pub fn is_chained_to(&self, other: &OleanView<'_>) -> bool {
+        self.dependencies
+            .iter()
+            .any(|region| region.base_addr == other.header.base_addr)
+    }
+
     /// Parse one module-system sidecar with the compacted regions it may
     /// reference, in load order.
     ///

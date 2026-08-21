@@ -1223,18 +1223,26 @@ impl ChainConstants {
     }
 }
 
-/// Do two regions of a chain carry the same module identity stamp?
+/// Is `companion` genuinely a companion of `exported`?
 ///
-/// Lean writes the same version, flags, `lean_version` and `githash` into every
-/// part of one module's chain. Comparing them is the only cheap way to tell a
-/// real companion from an artifact of a different module: companion regions
-/// parse and resolve their pointers regardless of provenance, so nothing
-/// downstream will notice the substitution on its own.
-fn same_chain_identity(a: &OleanView<'_>, b: &OleanView<'_>) -> bool {
-    a.header.version == b.header.version
-        && a.header.flags == b.header.flags
-        && a.header.lean_version == b.header.lean_version
-        && a.header.githash == b.header.githash
+/// TWO SEPARATE QUESTIONS, and only one of them is about the module. The fixed
+/// header fields — `version`, `flags`, `lean_version`, `githash` — identify the
+/// TOOLCHAIN and nothing finer: across all 2,431 chained modules of the pin
+/// they take exactly ONE distinct value. Comparing them rejects a companion
+/// built by a different Lean, but it cannot tell one module's companion from
+/// another's, which is the substitution that actually happens.
+///
+/// The module-level bond is structural: a companion is parsed against the
+/// earlier regions and stores their compacted addresses, and `base_addr` is
+/// distinct per module (2,431 distinct values across 2,431 exported parts). So
+/// [`OleanView::is_chained_to`] is what identifies the pair, and the header
+/// comparison is kept as the cheaper toolchain check in front of it.
+fn is_companion_of(companion: &OleanView<'_>, exported: &OleanView<'_>) -> bool {
+    companion.header.version == exported.header.version
+        && companion.header.flags == exported.header.flags
+        && companion.header.lean_version == exported.header.lean_version
+        && companion.header.githash == exported.header.githash
+        && companion.is_chained_to(exported)
 }
 
 /// Ceilings for composing one module-system chain.
@@ -1301,7 +1309,7 @@ pub fn chain_extra_const_names(
     private: &OleanView<'_>,
     budget: WalkBudget,
 ) -> DResult<Vec<Name>> {
-    if !same_chain_identity(exported, private) {
+    if !is_companion_of(private, exported) {
         return Err(DeclError::ChainPartMismatch {
             part: OleanChainPart::Private,
         });
@@ -1394,7 +1402,7 @@ pub fn decode_chain_constants_from_parts(
     // ever sees it; the private part's is checked by
     // `decode_chain_constants_with_origin`, so that callers building their own
     // views get the law too. One place per part, no duplicated comparison.
-    if !same_chain_identity(&exported_view, &server_view) {
+    if !is_companion_of(&server_view, &exported_view) {
         return Err(DeclError::ChainPartMismatch {
             part: OleanChainPart::Server,
         });
@@ -1448,7 +1456,7 @@ pub fn decode_chain_constants_with_origin(
     // mismatch surfaces from `verify_private_superset` below as
     // `PrivatePartIncomplete`, which blames a missing declaration for what is
     // really two unrelated artifacts.
-    if !same_chain_identity(exported, private) {
+    if !is_companion_of(private, exported) {
         return Err(DeclError::ChainPartMismatch {
             part: OleanChainPart::Private,
         });
@@ -1839,6 +1847,67 @@ mod tests {
         let absent = Name::from_components(["fln", "not", "a", "declaration"]);
         assert_eq!(chained.position_of(&absent), None);
         assert_eq!(chained.origin_of(&absent), None);
+    }
+
+    /// The header stamp alone cannot tell one module's companion from another's,
+    /// and this proves the structural check is what does the work.
+    ///
+    /// Without this, `is_companion_of` could regress to a header comparison and
+    /// every refusal test in this file would still pass — for the wrong reason
+    /// in one case and by accident in the others. So the header fields are
+    /// asserted EQUAL across two different modules (i.e. the cheap check
+    /// admits the foreign part) while `is_chained_to` is asserted false.
+    #[test]
+    fn the_toolchain_stamp_does_not_identify_a_module_but_the_chaining_does() {
+        let Some(lib) = reference_lib() else {
+            eprintln!(
+                "SKIP the_toolchain_stamp_does_not_identify_a_module_but_the_chaining_does: \
+                 pinned Reference stdlib absent (set FLN_REFERENCE_LIB)"
+            );
+            return;
+        };
+        let read = |relative: &str, suffix: &str| {
+            std::fs::read(lib.join(format!("{relative}.olean{suffix}")))
+                .unwrap_or_else(|error| panic!("read {relative}{suffix}: {error}"))
+        };
+        let exported = read("Init/Data/List/ToArrayImpl", "");
+        let server = read("Init/Data/List/ToArrayImpl", ".server");
+        let private = read("Init/Data/List/ToArrayImpl", ".private");
+        let other_exported = read("Init/Control/MonadAttach", "");
+        let other_server = read("Init/Control/MonadAttach", ".server");
+        let other_private = read("Init/Control/MonadAttach", ".private");
+
+        let exported_view = OleanView::parse(&exported).expect("exported parses");
+        let own_private = OleanView::parse_with_dependencies(&private, &[&exported, &server])
+            .expect("own private parses");
+        let foreign_private =
+            OleanView::parse_with_dependencies(&other_private, &[&other_exported, &other_server])
+                .expect("foreign private parses against its own chain");
+
+        // The cheap check ADMITS the foreign part: one toolchain, one stamp.
+        assert_eq!(exported_view.header.version, foreign_private.header.version);
+        assert_eq!(exported_view.header.flags, foreign_private.header.flags);
+        assert_eq!(
+            exported_view.header.lean_version,
+            foreign_private.header.lean_version
+        );
+        assert_eq!(
+            exported_view.header.githash, foreign_private.header.githash,
+            "the header stamp is toolchain-wide; if this ever differs between two \
+             modules of one build, this test no longer witnesses anything"
+        );
+
+        // The structural bond separates them.
+        assert!(
+            own_private.is_chained_to(&exported_view),
+            "a module's own private part is chained to its exported region"
+        );
+        assert!(
+            !foreign_private.is_chained_to(&exported_view),
+            "another module's private part is not"
+        );
+        assert!(is_companion_of(&own_private, &exported_view));
+        assert!(!is_companion_of(&foreign_private, &exported_view));
     }
 
     /// The VIEW door must refuse a mismatched pair on its own.
