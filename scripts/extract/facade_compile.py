@@ -204,6 +204,11 @@ the toolchain would report a perfect facade:
     emission count to rows that are both emitted and marked `substrate`. A
     correct aggregate emission total may not hide a misclassified substrate.
 
+  * A MANIFEST-INIT-SUBSTRATE JOIN binds the extracted Init-substrate rows and
+    the demanded Init rows to the summary's Init-provided and probe-count
+    measures. The no-import substrate proof cannot quietly omit one of its
+    enumerated inputs.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1210,6 +1215,7 @@ def main():
 
     sigs = {}
     manifest_rows = []
+    manifest_init_substrate = []
     manifest_summary = None
     with open(args.module_manifest, encoding="utf-8") as fh:
         for line in fh:
@@ -1219,8 +1225,11 @@ def main():
                     raise SystemExit(
                         "REFUSE: facade manifest has multiple summaries — its "
                         "contract epoch is ambiguous"
-                    )
+                )
                 manifest_summary = row
+                continue
+            if row.get("kind") == "init-substrate":
+                manifest_init_substrate.append(row)
                 continue
             if row.get("kind") != "decl":
                 continue
@@ -1353,6 +1362,37 @@ def main():
         raise SystemExit(
             "REFUSE: facade manifest substrate-emission join disagrees with its "
             f"declaration rows ({json.dumps(substrate_emission_join, sort_keys=True)})"
+        )
+    init_substrate_names = {
+        row.get("name") for row in manifest_init_substrate
+        if isinstance(row.get("name"), str) and row["name"]
+    }
+    demanded_init_names = {
+        row["name"] for row in manifest_rows
+        if row.get("demanded_outcome") == "init-substrate"
+    }
+    init_substrate_join = {
+        "init_substrate_rows": len(manifest_init_substrate),
+        "init_substrate_names": len(init_substrate_names),
+        "demanded_init_names": len(demanded_init_names),
+        "checked_init_union": len(init_substrate_names | demanded_init_names),
+        "summary_init_provided": manifest_summary.get("init_provided"),
+        "summary_init_substrate_checked": manifest_summary.get(
+            "init_substrate_checked"
+        ),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (init_substrate_join["summary_init_provided"],
+                          init_substrate_join["summary_init_substrate_checked"]))
+            or init_substrate_join["init_substrate_rows"]
+            != init_substrate_join["init_substrate_names"]
+            or init_substrate_join["init_substrate_names"]
+            != init_substrate_join["summary_init_provided"]
+            or init_substrate_join["checked_init_union"]
+            != init_substrate_join["summary_init_substrate_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest Init-substrate join disagrees with its "
+            f"enumerated rows ({json.dumps(init_substrate_join, sort_keys=True)})"
         )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
@@ -1531,6 +1571,7 @@ def main():
         "manifest_transparency_join": transparency_join,
         "manifest_structural_join": structural_join,
         "manifest_substrate_emission_join": substrate_emission_join,
+        "manifest_init_substrate_join": init_substrate_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
