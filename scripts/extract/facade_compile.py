@@ -2750,6 +2750,28 @@ def main():
             "REFUSE: facade manifest class-projection count must exceed "
             f"structural-declaration count ({json.dumps(class_projection_structural_declaration_inequality_join, sort_keys=True)})"
         )
+    structural_population_inequality_join = {
+        "summary_structural_declarations": manifest_summary.get(
+            "structural_declarations"
+        ),
+        "summary_structural_refused": manifest_summary.get("structural_refused"),
+    }
+    if (not isinstance(structural_population_inequality_join[
+            "summary_structural_declarations"], int)
+            or isinstance(structural_population_inequality_join[
+                "summary_structural_declarations"], bool)
+            or not isinstance(structural_population_inequality_join[
+                "summary_structural_refused"], int)
+            or isinstance(structural_population_inequality_join[
+                "summary_structural_refused"], bool)
+            or structural_population_inequality_join[
+                "summary_structural_declarations"]
+            <= structural_population_inequality_join[
+                "summary_structural_refused"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-declaration count must exceed "
+            f"structural-refusal count ({json.dumps(structural_population_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4783,6 +4805,9 @@ def main():
         ),
         "manifest_class_projection_structural_declaration_inequality_join": (
             class_projection_structural_declaration_inequality_join
+        ),
+        "manifest_structural_population_inequality_join": (
+            structural_population_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
