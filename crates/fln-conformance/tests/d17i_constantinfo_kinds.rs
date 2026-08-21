@@ -5919,3 +5919,126 @@ fn a_recursors_rule_list_is_the_constructor_list_of_its_block() {
         "the rule-count spread must be real, got {rule_counts:?}"
     );
 }
+
+/// The extension whose entry count is an independent witness of the module's
+/// exported declaration count.
+const EXPORTED_AXIOMS_EXTENSION: &str = "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt";
+
+/// `(module, exported constNames, private constNames, witness entries)`.
+const AXIOM_WITNESS_ROWS: &[(&str, usize, usize, Option<u64>)] = &[
+    ("Init.Control", 0, 0, None),
+    ("Init.Prelude", 2204, 2314, Some(2204)),
+    ("Init.Meta.Defs", 379, 530, Some(379)),
+    ("Init.Data.List.Basic", 791, 805, Some(791)),
+    ("Init.Data.Array.Lemmas", 1018, 1297, Some(1018)),
+];
+
+/// `ExtensionBlock.entries` — the last unread field in the module header, and
+/// it turns out to carry a SECOND, INDEPENDENT count of the exported
+/// declarations.
+///
+/// The extension cell above maps every block to its `name` and compares the two
+/// levels as name sets. `entries` is never read, so the size of what each block
+/// holds has been invisible, and a duplicate block name would have collapsed
+/// into the same set unnoticed.
+///
+/// Reading it produces a relation worth more than the field itself. The block
+/// `exportedAxiomsExt` is written by `CollectAxioms`, a different part of the
+/// pipeline from the one that fills `constNames`, and its entry count equals the
+/// module's EXPORTED declaration count exactly — and stays at the exported
+/// figure when the module is read at PRIVATE level, where `constNames` is
+/// larger. That is the exported/private distinction this whole bead turns on,
+/// corroborated from an unrelated array. If part selection were wrong again, the
+/// constant array and this witness would disagree.
+///
+/// The presence rule is an exact biconditional, measured over all 600 `Init`
+/// modules and recorded here as provenance rather than asserted: the block
+/// occurs iff the module exports at least one declaration — 517 modules carry
+/// it and every count matches with zero violations, 83 lack it and ALL 83 have
+/// an empty exported constant array, and no module carries it with an empty
+/// one. `Init.Control` is the zero-export row below, so both sides of the
+/// biconditional are exercised by the cells that actually run.
+///
+/// Two smaller facts fall out and are asserted because the name-set comparison
+/// cannot see either: no block name repeats within a module, and no block is
+/// empty. A third — no shared block's entry count SHRINKS between the levels —
+/// extends the "the private part adds and never removes" result from block
+/// presence to block contents.
+#[test]
+fn the_axioms_extension_counts_exported_declarations_at_both_levels() {
+    let lib = lib_or_skip!();
+
+    for (module, exported_names, private_names, witness) in AXIOM_WITNESS_ROWS {
+        let exported = module_view(&lib, module, Level::Exported);
+        let private = module_view(&lib, module, Level::Private);
+        assert_eq!(
+            (exported.const_names.len(), private.const_names.len()),
+            (*exported_names, *private_names),
+            "{module}: the declaration counts this row is stated against"
+        );
+
+        for (label, view) in [("exported", &exported), ("private", &private)] {
+            let names: BTreeSet<&str> = view
+                .extensions
+                .iter()
+                .map(|block| block.name.as_str())
+                .collect();
+            assert_eq!(
+                names.len(),
+                view.extensions.len(),
+                "{module} [{label}]: a block name must not repeat, which the name-set \
+                 comparison elsewhere cannot see"
+            );
+            assert!(
+                view.extensions.iter().all(|block| block.entries > 0),
+                "{module} [{label}]: a stored extension block is never empty"
+            );
+
+            let found = view
+                .extensions
+                .iter()
+                .find(|block| block.name == EXPORTED_AXIOMS_EXTENSION)
+                .map(|block| block.entries);
+            assert_eq!(
+                found, *witness,
+                "{module} [{label}]: the axioms witness is present exactly when the module \
+                 exports a declaration, and counts them"
+            );
+        }
+
+        // The witness is pinned to the EXPORTED count at both levels, so for a
+        // module whose private array is larger it is a different number from
+        // the one the private level would report. Without that gap the equality
+        // would hold for an uninteresting reason.
+        if let Some(entries) = witness {
+            assert_eq!(*entries as usize, *exported_names);
+            assert!(
+                private_names > exported_names,
+                "{module}: this row must discriminate — the private array has to be strictly \
+                 larger for the witness to be saying anything"
+            );
+        }
+
+        // Contents, not just presence: nothing a level shares with the exported
+        // part ever holds fewer entries.
+        let sizes: BTreeMap<&str, u64> = exported
+            .extensions
+            .iter()
+            .map(|block| (block.name.as_str(), block.entries))
+            .collect();
+        let shrunk: Vec<&str> = private
+            .extensions
+            .iter()
+            .filter(|block| {
+                sizes
+                    .get(block.name.as_str())
+                    .is_some_and(|before| block.entries < *before)
+            })
+            .map(|block| block.name.as_str())
+            .collect();
+        assert!(
+            shrunk.is_empty(),
+            "{module}: the private part must not shrink an extension it shares: {shrunk:?}"
+        );
+    }
+}
