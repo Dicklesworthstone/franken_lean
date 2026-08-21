@@ -378,10 +378,21 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "both check-olean JSON render paths emit the private-companion residual object",
     );
     assert_eq!(
-        include_str!("../src/lib.rs")
-            .match_indices(r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{}"#)
-            .count(),
-        2,
+        [
+            include_str!("../src/lib.rs")
+                .match_indices(
+                    r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"
+                "\"module\":"#,
+                )
+                .count(),
+            include_str!("../src/lib.rs")
+                .match_indices(
+                    r#"\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},"
+                "\"extensionBlocksObserved\":{},"#,
+                )
+                .count(),
+        ],
+        [1, 1],
         "both check-olean JSON render paths emit the logical-root pair",
     );
 
