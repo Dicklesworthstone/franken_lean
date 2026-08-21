@@ -4965,6 +4965,19 @@ fn the_inventory_walk_runs_on_a_fixture_tree_without_a_corpus() {
         ],
     );
 
+    // THE DECOYS MUST BE THERE, or the filter has nothing to reject. Removing
+    // them from the list above leaves every assertion in this test passing --
+    // three oleans is still three -- while the property the fixture exists to
+    // exercise quietly stops being exercised. The strength lives in the INPUT,
+    // so the input is asserted.
+    for decoy in ["Alpha.olean.server", "ignored.txt"] {
+        assert!(
+            library.join(decoy).is_file(),
+            "the decoy `{decoy}` is missing from the fixture, so nothing here tests that a \
+             companion part and a text file are skipped"
+        );
+    }
+
     let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
         .unwrap_or_else(|reason| panic!("the fixture tree must be walkable: {reason}"));
 
@@ -6365,6 +6378,18 @@ fn the_inventory_vectors_are_parallel_and_the_extension_match_is_exact() {
             "NoExtension",
         ],
     );
+
+    // SAME ARGUMENT, AND SHARPER HERE. The rejection check below is written as
+    // `!any(...)`, which an ABSENT decoy satisfies perfectly -- delete the two
+    // entries and the loop proves that nothing which is not there was not
+    // collected. Their presence on disk is what makes it a test.
+    for decoy in ["Ignored.OLEAN", "NoExtension"] {
+        assert!(
+            library.join(decoy).is_file(),
+            "the decoy `{decoy}` is missing from the fixture, so the exactness check below is \
+             satisfied by its absence rather than by the filter"
+        );
+    }
 
     let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
         .unwrap_or_else(|reason| panic!("the parallel fixture must be walkable: {reason}"));
