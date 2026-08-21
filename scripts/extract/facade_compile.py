@@ -166,6 +166,11 @@ the toolchain would report a perfect facade:
     attempt's quarantine count to equal the manifest's published quarantine
     count. A clean final attempt cannot be paired with a stale outcome summary.
 
+  * A MANIFEST-NEGATIVE-CONTROL JOIN requires the recorded emission and Init
+    decoys to be distinct names outside every manifest and demand set, with no
+    falsified Init-substrate checks. A claimed negative control cannot overlap
+    the positive universe it is meant to falsify.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2108,6 +2113,34 @@ def main():
     )
 
     demand_names = {name for names in by_module.values() for name in names}
+    manifest_decoys = {
+        "emission": manifest_summary.get("emission_decoy"),
+        "init_substrate": manifest_summary.get("init_substrate_decoy"),
+    }
+    init_substrate_names = {row.get("name") for row in manifest_init_substrate}
+    forbidden_decoy_names = (
+        set(manifest_decoys.values()) &
+        (set(manifest_name_counts) | init_substrate_names | demand_names)
+    )
+    init_substrate_falsified = manifest_summary.get("init_substrate_falsified")
+    manifest_negative_control_join = {
+        "decoys": manifest_decoys,
+        "manifest_collisions": len(forbidden_decoy_names),
+        "init_substrate_falsified": (
+            len(init_substrate_falsified)
+            if isinstance(init_substrate_falsified, list) else None
+        ),
+    }
+    if (not all(isinstance(decoy, str) and decoy
+                for decoy in manifest_decoys.values())
+            or len(set(manifest_decoys.values())) != len(manifest_decoys)
+            or manifest_negative_control_join["manifest_collisions"] != 0
+            or init_substrate_falsified != []):
+        raise SystemExit(
+            "REFUSE: facade manifest negative-control join failed "
+            f"({json.dumps(manifest_negative_control_join, sort_keys=True)}, "
+            f"collisions={sorted(forbidden_decoy_names)!r})"
+        )
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
@@ -2282,6 +2315,7 @@ def main():
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
+        "manifest_negative_control_join": manifest_negative_control_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
