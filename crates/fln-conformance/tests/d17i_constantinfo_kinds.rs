@@ -10056,7 +10056,7 @@ fn nearly_every_structure_field_projects_though_not_always_to_a_definition() {
 
     assert_eq!(
         (fields, definitions, theorems.len(), absent.len()),
-        (145, 137, 6, 3),
+        (145, 136, 6, 3),
         "every field is accounted for as a definition, a theorem, or genuinely absent"
     );
     assert_eq!(
