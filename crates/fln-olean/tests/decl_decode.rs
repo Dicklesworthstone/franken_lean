@@ -3785,3 +3785,178 @@ fn the_slot_two_array_elements_are_name_name_expr_triples() {
         "and the expression admits six shapes"
     );
 }
+
+/// The triples' first field is one numbered name family.
+///
+/// The tag-4 option is offered a sixth time and is still impossible -
+/// `9d365d6a` pins that not one of the 11 has a pointer head, so there are no
+/// tag-4 head records. The first option is real, and this takes it.
+///
+/// `a4de2083` found field 0 UNIFORM where fields 1 and 2 vary, and said so as a
+/// caution: a uniform field is what a repeated constant looks like. It is not a
+/// constant. Across 157 references it reaches 31 distinct objects, every one a
+/// `Name.num` link whose prefix is a SINGLE-COMPONENT name and whose numeral is
+/// a boxed scalar - never a heap mpz - with 31 distinct values from 1 to 42.
+///
+/// So the field holds a numbered family: one base name, numbered instances. It
+/// is uniform in SHAPE and various in VALUE, which is a different thing from
+/// the repeated constant `a4de2083` was right to worry about, and only reading
+/// the numerals separates the two.
+///
+/// THE SINGLE-COMPONENT FACT IS STRUCTURAL - the prefix link's own prefix slot
+/// is the boxed anonymous name - and so is the boxedness of every numeral.
+/// Neither depends on decoding a string. The SPELLING does: `_uniq` comes from
+/// reading the string payload with the walker in this file, which I corrected
+/// once already this session after it returned truncated text. It is pinned
+/// because it is the identifying fact, and flagged because it is the fragile
+/// one: a red there names the real spelling and is a finding, not a fault.
+///
+/// All 157 are additionally handed to the production `decode_name`, which is
+/// what makes "these are names" a claim about the decoder rather than about my
+/// arithmetic.
+///
+/// No size is asserted. No extension or schema is named, and nothing is claimed
+/// about what the family MEANS - only that it is one.
+#[test]
+fn the_triple_first_field_is_a_numbered_name_family() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut link_shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut single_component = 0usize;
+    let mut boxed_numerals = 0usize;
+    let mut numerals: BTreeSet<u64> = BTreeSet::new();
+    let mut decoded = 0usize;
+    let mut spellings: BTreeSet<String> = BTreeSet::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        for record in records {
+            let array = resolve(word_at(bytes, record + 8 + 8 * 2)).expect("slot 2 is an array");
+            for i in 0..word_at(bytes, array + 8) {
+                let element =
+                    resolve(word_at(bytes, array + 24 + 8 * i as usize)).expect("an element");
+                let field = word_at(bytes, element + 8);
+                let off = resolve(field).expect("field 0 is a pointer");
+                references += 1;
+                distinct.insert((index, off));
+
+                let link = at.get(&off).expect("resolved above");
+                link_shapes.insert((link.tag, link.other));
+
+                // Structural: the prefix's own prefix slot is the anonymous name.
+                let prefix = resolve(word_at(bytes, off + 8)).expect("a prefix link");
+                if word_at(bytes, prefix + 8) & 1 == 1 && word_at(bytes, prefix + 8) >> 1 == 0 {
+                    single_component += 1;
+                }
+                // Structural: the numeral is boxed, never a heap object.
+                let numeral = word_at(bytes, off + 16);
+                if numeral & 1 == 1 {
+                    boxed_numerals += 1;
+                    numerals.insert(numeral >> 1);
+                }
+                // The production decoder, and the spelling it produces.
+                let name = DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(field)
+                    .unwrap_or_else(|e| panic!("{module}: field 0 must decode as a Name: {e}"));
+                decoded += 1;
+                let shown = name.to_display_string();
+                spellings.insert(
+                    shown
+                        .rsplit_once('.')
+                        .map_or(shown.clone(), |(base, _)| base.to_owned()),
+                );
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(references, 157, "one field 0 per triple");
+    assert_eq!(
+        distinct.len(),
+        31,
+        "reaching 31 distinct names - uniform in SHAPE but various in VALUE, \
+         which is not the repeated constant a uniform field could have been"
+    );
+    assert_eq!(
+        link_shapes.into_iter().collect::<Vec<_>>(),
+        vec![(2, 2)],
+        "every one the numbered link constructor"
+    );
+
+    // Structural, independent of any string decoding.
+    assert_eq!(
+        single_component, 157,
+        "every base name is a single component: the prefix link's own prefix \
+         slot is the boxed anonymous name"
+    );
+    assert_eq!(
+        boxed_numerals, 157,
+        "and every numeral is a boxed scalar, never a heap mpz"
+    );
+    assert_eq!(
+        (
+            numerals.len(),
+            numerals.first().copied(),
+            numerals.last().copied()
+        ),
+        (31, Some(1), Some(42)),
+        "31 distinct numerals from 1 to 42 - a numbered family, not a constant"
+    );
+
+    // The production decoder, then the fragile part.
+    assert_eq!(decoded, 157, "every one accepted by `decode_name`");
+    assert_eq!(
+        spellings.into_iter().collect::<Vec<_>>(),
+        vec!["_uniq".to_owned()],
+        "one base name across all 157. The SPELLING is the least robust thing \
+         in this cell - it comes from reading the string payload - so a failure \
+         here names the real base name and is a finding rather than a fault"
+    );
+}
