@@ -2468,6 +2468,85 @@ mod tests {
         );
     }
 
+    /// An `Expr` whose constructor tag is outside `0..=11` is refused.
+    ///
+    /// This completes the Shape rules for `Expr`, as 80dc4134 did for `Level`:
+    /// the arity (b32e0720), the object size (269b4671), the post-order law
+    /// (bc2d8630), the scalar child and scalar root (62de766d, a7095365) and
+    /// the binder byte (49b72dcf) all have mutants, and the constructor was the
+    /// last without one.
+    ///
+    /// SHADOWING CHECKED. `expr_slots` is consulted immediately after the
+    /// header, ahead of the arity check and well ahead of the size bind, so an
+    /// unknown tag is rejected before either can look at it. Note the size
+    /// bind would NOT have caught this on its own: `expr_scalar_bytes` falls
+    /// back to zero for an unknown tag, so tag 12 with this object's arity and
+    /// size is arithmetically consistent to it.
+    #[test]
+    fn an_expr_with_an_unknown_constructor_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let pi_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("forallE expression");
+
+        let (tag, other, cs_sz) = view.obj_header(pi_off).expect("forallE header");
+        assert_eq!(tag, 7, "forallE");
+        assert!(
+            DeclDecoder::expr_slots(tag).is_some(),
+            "the fixture's tag is one the table knows"
+        );
+        assert!(
+            DeclDecoder::expr_slots(12).is_none(),
+            "and 12 is one it does not, so the plant leaves the accepted set"
+        );
+
+        // Claim a twelfth constructor. Arity and size are left alone, and the
+        // size bind cannot object to them for an unknown tag anyway.
+        let header = view.read_u64(pi_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (12_u64 << 56);
+        bytes[pi_off as usize..pi_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(pi_off).expect("header after plant"),
+            (12, other, cs_sz),
+            "only the tag moved"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("an expression with an unknown constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Expr ctor",
+                    ..
+                }
+            ),
+            "expected the constructor refusal rather than an arity or size one: {error:?}"
+        );
+    }
+
     /// An Expr claiming an arity its constructor does not have is refused.
     ///
     /// NO CO-PLANTING IS NEEDED HERE, and that is worth stating because the
