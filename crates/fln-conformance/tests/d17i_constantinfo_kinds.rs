@@ -14356,3 +14356,98 @@ fn block_names_are_unique_per_module_and_the_vocabulary_splits_three_ways() {
         "the blocks no exported or server part ever carries"
     );
 }
+
+/// What `declaration_expressions` yields, counted against the kind census.
+///
+/// Sixteen cells in this file walk expressions through this one helper, and none
+/// checks what it returns. It is the premise under the reference graph, the
+/// closure cells, the cycle census and the `FVar`/`MVar` absence result: if it
+/// silently stopped yielding a kind's value — `Opaque`, say, or the recursor
+/// rules — every one of those cells would keep passing on a smaller surface and
+/// report the same green.
+///
+/// This bead has already paid for that once. `804c29d0` pinned 32 cycle
+/// participants measured with a probe that walked only definition values, while
+/// the cell's helper also yields recursor rule right-hand sides and saw 41. The
+/// helper's exact yield was the difference between a correct cell and a wrong
+/// one, and it was discovered by a failure rather than by a check.
+///
+/// The yield is fixed by the kind, so the census determines it:
+///
+///   Axiom, Quot, Induct, Ctor      one expression, the type
+///   Defn, Thm, Opaque              two, the type and the value
+///   Rec                            one plus one per reduction rule
+///
+/// Over `Init/Prelude` at private level that is 10 + 4 + 127 + 157 + 2×1,720 +
+/// 2×153 + 2×14 + 129 + 160 = 4,361 expressions from 2,314 declarations.
+///
+/// NEITHER SIDE OF THIS IS THE HELPER. The left side calls it and counts; the
+/// right side matches on the kind and reads `rules.len()` directly. Deleting an
+/// arm from the helper moves the left side only, which is the whole point — a
+/// cell that computed both sides through the helper would agree with any
+/// version of it.
+///
+/// Anti-vacuity: all eight kinds occur, and the three yield shapes are pinned
+/// separately, so a helper returning one expression per declaration fails on the
+/// 1,887 that carry exactly two and the 126 recursors that carry more, rather
+/// than passing a total that happened to match. The other three recursors —
+/// `Empty.rec`, `PEmpty.rec`, `False.rec` — have no rules and do yield one, so
+/// "every recursor yields more than one" would be false here.
+///
+/// Conservation first: the per-kind expression counts must reproduce the walked
+/// total before any kind's shape is named.
+#[test]
+fn declaration_expressions_yields_exactly_what_the_kind_census_predicts() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+    assert_eq!(infos.len(), 2_314, "the declaration census must be reached");
+
+    let mut walked = 0usize;
+    let mut predicted = 0usize;
+    let mut by_shape: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    for info in &infos {
+        walked += declaration_expressions(info).len();
+
+        // Independently of the helper: the kind fixes the shape.
+        let (shape, expected) = match info {
+            ConstantInfo::Axiom(_)
+            | ConstantInfo::Quot(_)
+            | ConstantInfo::Induct(_)
+            | ConstantInfo::Ctor(_) => ("type only", 1),
+            ConstantInfo::Defn(_) | ConstantInfo::Thm(_) | ConstantInfo::Opaque(_) => {
+                ("type and value", 2)
+            }
+            ConstantInfo::Rec(v) => ("type and rules", 1 + v.rules.len()),
+        };
+        predicted += expected;
+        *by_shape.entry(shape).or_default() += expected;
+        kinds.insert(kind_of(info));
+    }
+
+    // Conservation first: the two derivations must agree before either is pinned.
+    assert_eq!(
+        walked, predicted,
+        "the helper's yield must match what the kind census predicts; a dropped arm shows up \
+         here and nowhere else"
+    );
+    assert_eq!(
+        walked, 4_361,
+        "the expression census this file's sixteen walkers actually see"
+    );
+
+    assert_eq!(
+        by_shape,
+        BTreeMap::from([
+            ("type only", 298),
+            ("type and value", 3_774),
+            ("type and rules", 289),
+        ]),
+        "the three yield shapes, pinned apart so a uniform helper cannot pass on the total"
+    );
+    assert_eq!(
+        kinds.len(),
+        8,
+        "every ConstantInfo kind occurs, so no arm of the helper is untested here"
+    );
+}
