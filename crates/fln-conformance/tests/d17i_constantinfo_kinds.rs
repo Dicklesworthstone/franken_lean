@@ -8584,3 +8584,135 @@ fn an_instance_name_does_not_determine_its_type_but_its_stored_type_does() {
          its name fails to be"
     );
 }
+
+/// Instances that are NOT built on a generated `X.decEq`, and the instance each
+/// delegates to instead (`None` where it delegates to no instance at all).
+const INSTANCES_WITHOUT_GENERATED_DEC_EQ: &[(&str, Option<&str>)] = &[
+    ("instDecidableEqChar", Some("instDecidableEqUInt32")),
+    ("instDecidableEqFin", Some("instDecidableEqNat")),
+    ("instDecidableEqList", None),
+    ("instDecidableEqRaw", Some("instDecidableEqNat")),
+];
+
+/// Derived equality comes in TWO shapes, and only one of them has a generated
+/// function behind it.
+///
+/// Nine inductives in `Init/Prelude` carry a generated `X.decEq` and thirteen
+/// `instDecidableEq*` instances exist. The obvious reading — that the instances
+/// are the `decEq` functions wrapped — is right for nine of them and wrong for
+/// four, and the artifact says which by REFERENCE rather than by name.
+///
+///   each of the nine `X.decEq` is referenced by exactly one instance, and it
+///     is the instance whose name embeds `X`'s last component. Here the
+///     name-derived pairing and the reference-derived pairing AGREE, nine times
+///     out of nine — the opposite outcome to the cell above, where the name
+///     resolved to two inductives and only the type settled it
+///   the remaining four reference NO `X.decEq` at all. Three delegate to
+///     another instance — `Char` to `UInt32`, `Fin` and `Raw` to `Nat` — and
+///     `instDecidableEqList` delegates to no instance, using `List.hasDecEq`,
+///     a decidable-equality function that simply is not named `decEq`
+///
+/// `List.hasDecEq` is worth the cross-reference: it is one of the three bases
+/// whose `match_N` auxiliaries are NOT contiguous. A tool that enumerated
+/// derived equality by looking for the `.decEq` suffix would miss it entirely,
+/// and one that enumerated its match auxiliaries by counting from 1 would find
+/// one of three. The same declaration defeats two different name-shaped
+/// assumptions.
+///
+/// The delegating instances bottom out in generated ones: `UInt32` and `Nat`
+/// are both among the nine, so the two shapes compose rather than being
+/// disjoint worlds. That is asserted, since a delegation chain ending nowhere
+/// would be a different fact entirely.
+#[test]
+fn derived_equality_instances_split_into_generated_and_delegating() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut generated: BTreeSet<String> = BTreeSet::new();
+    let mut instances: BTreeMap<String, &Expr> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        if name.ends_with(".decEq") {
+            generated.insert(name.clone());
+        }
+        if let Some(suffix) = name.strip_prefix("instDecidableEq") {
+            if !suffix.is_empty() && !suffix.contains('.') {
+                if let ConstantInfo::Defn(v) = info {
+                    instances.insert(name, &v.value);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (generated.len(), instances.len()),
+        (9, 13),
+        "the generated-function and instance censuses"
+    );
+
+    let mut backed: BTreeMap<&String, Vec<&String>> = BTreeMap::new();
+    let mut unbacked: Vec<(&String, Vec<&String>)> = Vec::new();
+    for (name, value) in &instances {
+        let referenced = referenced_constants(value);
+        let functions: Vec<&String> = generated
+            .iter()
+            .filter(|function| referenced.contains(*function))
+            .collect();
+        if functions.is_empty() {
+            let delegates: Vec<&String> = instances
+                .keys()
+                .filter(|other| *other != name && referenced.contains(*other))
+                .collect();
+            unbacked.push((name, delegates));
+        } else {
+            assert_eq!(
+                functions.len(),
+                1,
+                "{name} must be built on exactly one generated function, got {functions:?}"
+            );
+            backed.insert(name, functions);
+        }
+    }
+    assert_eq!(
+        backed.len(),
+        generated.len(),
+        "every generated decEq must be behind exactly one instance"
+    );
+
+    // Name-derived and reference-derived pairing agree for the backed nine.
+    for (name, functions) in &backed {
+        let inductive = functions[0]
+            .strip_suffix(".decEq")
+            .expect("a generated function");
+        let component = inductive.rsplit('.').next().expect("a component");
+        assert_eq!(
+            **name,
+            format!("instDecidableEq{component}"),
+            "the instance built on {inductive}.decEq must be the one its name points at"
+        );
+    }
+
+    let observed: Vec<(&str, Option<&str>)> = unbacked
+        .iter()
+        .map(|(name, delegates)| {
+            (
+                name.as_str(),
+                delegates.first().map(|target| target.as_str()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        INSTANCES_WITHOUT_GENERATED_DEC_EQ.to_vec(),
+        "the instances with no generated function behind them, and what they delegate to"
+    );
+
+    // The delegations bottom out in the generated shape rather than wandering.
+    for (_, delegate) in INSTANCES_WITHOUT_GENERATED_DEC_EQ {
+        if let Some(target) = delegate {
+            assert!(
+                backed.keys().any(|name| *name == target),
+                "{target} must itself be built on a generated decEq"
+            );
+        }
+    }
+}
