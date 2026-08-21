@@ -6657,17 +6657,21 @@ fn kr600_803_init_nat_succ_refuses_a_forged_constructor_index() {
             ConstructorDeclaration::new(checker_name("Nat"), 0, 0, 1),
         ),
     );
-    assert!(matches!(
-        admit_inductive(
-            &ConstantEnvironment::empty(),
-            &entries,
-            AdmissionBudget::unlimited(),
-            EnvironmentBudget::unlimited(),
+    let verdict = admit_inductive(
+        &ConstantEnvironment::empty(),
+        &entries,
+        AdmissionBudget::unlimited(),
+        EnvironmentBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_checker::admit::InductiveVerdict::Rejected(
+                fln_checker::admit::InductiveRejection::ConstructorShape { .. }
+            )
         ),
-        fln_checker::admit::InductiveVerdict::Rejected(
-            fln_checker::admit::InductiveRejection::ConstructorShape { .. }
-        )
-    ));
+        "forged Nat.succ constructor-index verdict: {verdict:?}"
+    );
 }
 
 #[test]
