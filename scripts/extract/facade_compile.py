@@ -122,6 +122,10 @@ the toolchain would report a perfect facade:
     registration and drop-reason metadata. A name/type probe cannot claim an
     instance surface whose manifest lifecycle is contradictory.
 
+  * A DEMANDED-FORM JOIN requires every non-Init demanded row to carry a
+    recognized generated form. Name/type availability cannot stand in for an
+    unclassified declaration-emission shape.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -143,6 +147,7 @@ DEMANDED_OUTCOMES = frozenset(("emitted", "init-substrate", "quarantined"))
 DEMANDED_EFFECTS = frozenset(("pure", "toolchain-monad", "io", "monad-transformer"))
 DEMANDED_BUCKETS = frozenset(("R-NONE", "R-EFFECT", "R-EXTERN", "R-UNSAFE"))
 DEMANDED_SAFETIES = frozenset(("safe", "unsafe"))
+DEMANDED_FORMS = frozenset(("axiom", "transparent-abbrev", "class-projection", "class", "structure"))
 
 
 def input_digest(path):
@@ -449,6 +454,7 @@ def join_demanded_rows(names, manifest_rows):
     bucket_mismatches = []
     safety_mismatches = []
     instance_mismatches = []
+    form_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
@@ -459,6 +465,7 @@ def join_demanded_rows(names, manifest_rows):
     bucket_join = Counter()
     safety_join = Counter()
     instance_join = Counter()
+    form_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -504,6 +511,11 @@ def join_demanded_rows(names, manifest_rows):
                     f"drop_reason={drop_reason!r})"
                 )
                 continue
+            form = row.get("form")
+            if form not in DEMANDED_FORMS:
+                form_mismatches.append(f"{name}(form={form!r})")
+                continue
+            form_join[form] += 1
             printer = row.get("printer")
             level_params = row.get("level_params")
             if (printer not in ("pp.fullNames", "pp.explicit", "pp.maxexplicit")
@@ -583,7 +595,7 @@ def join_demanded_rows(names, manifest_rows):
             or provider_mismatches or provider_dependency_mismatches
             or signature_provenance_mismatches or type_dependency_shape_mismatches
             or level_parameter_mismatches or effect_mismatches or bucket_mismatches
-            or safety_mismatches or instance_mismatches):
+            or safety_mismatches or instance_mismatches or form_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -619,6 +631,8 @@ def join_demanded_rows(names, manifest_rows):
             details.append("safety=" + ", ".join(safety_mismatches[:8]))
         if instance_mismatches:
             details.append("instance=" + ", ".join(instance_mismatches[:8]))
+        if form_mismatches:
+            details.append("form=" + ", ".join(form_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
@@ -628,7 +642,7 @@ def join_demanded_rows(names, manifest_rows):
             dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())),
             dict(sorted(level_parameter_join.items())), dict(sorted(effect_join.items())),
             dict(sorted(bucket_join.items())), dict(sorted(safety_join.items())),
-            dict(sorted(instance_join.items())))
+            dict(sorted(instance_join.items())), dict(sorted(form_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -928,7 +942,7 @@ def main():
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
      demand_buckets, demand_safeties,
-     demand_instances) = join_demanded_rows(
+     demand_instances, demand_forms) = join_demanded_rows(
          demand_names, manifest_rows
      )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
@@ -1071,6 +1085,7 @@ def main():
         "demanded_bucket_join": demand_buckets,
         "demanded_safety_join": demand_safeties,
         "demanded_instance_join": demand_instances,
+        "demanded_form_join": demand_forms,
         "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
