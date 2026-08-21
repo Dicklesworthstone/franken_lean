@@ -9879,9 +9879,13 @@ fn the_two_parts_share_names_but_not_their_order() {
             cursor, *greedy,
             "{module}: the exported array is not a subsequence of the private one"
         );
+        // Multiplied rather than divided: `cursor < len / 100` truncates, and at
+        // 379 names that reads as `3 < 3` and refuses a correct measurement.
         assert!(
-            cursor < exported.len() / 100,
-            "{module}: and it diverges almost immediately, not near the end"
+            cursor * 100 < exported.len(),
+            "{module}: and it diverges almost immediately, not near the end — matched \
+             {cursor} of {} before diverging",
+            exported.len()
         );
         assert_ne!(
             exported.first(),
