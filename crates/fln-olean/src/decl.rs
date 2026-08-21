@@ -2378,6 +2378,69 @@ mod tests {
         );
     }
 
+    /// The post-order law is enforced, and a cyclic Expr child is refused
+    /// rather than walked forever.
+    ///
+    /// This is the fln-abaz finding 1 defence, and its failure mode is not a
+    /// wrong answer but a hang: the decode loop only charges its budget when it
+    /// BUILDS a node, and a cycle never builds one, so without this law the
+    /// stack grows without bound and no budget ever trips. A law whose whole
+    /// point is that it prevents non-termination is a poor thing to leave
+    /// untested, and it had no mutant until now.
+    #[test]
+    fn an_expr_child_that_does_not_precede_its_parent_is_refused() {
+        let mut bytes = forall_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        // Positive control: the well-formed fixture decodes.
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified forall fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        // The pointer VALUE that addresses the forallE, reused below so the
+        // planted child is a real object address rather than a guess.
+        let pi_ptr = view.read_u64(base_off + 24).expect("type pointer");
+        let pi_off = view.deref(pi_ptr).expect("forallE expression");
+        assert_eq!(view.obj_header(pi_off).expect("header").0, 7, "forallE");
+
+        // Slot 1 of forallE is the binder TYPE, one of its Expr children. Point
+        // it at the forallE itself: a one-node cycle. The object it names is
+        // valid and correctly shaped, so nothing but the post-order law
+        // separates this from a well-formed expression.
+        let child_slot = pi_off as usize + 8 + 8;
+        let original = view.read_u64(pi_off + 8 + 8).expect("binder type pointer");
+        assert_ne!(original, pi_ptr, "the fixture is acyclic to begin with");
+        bytes[child_slot..child_slot + 8].copy_from_slice(&pi_ptr.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a child that does not precede its parent must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Expr child not below its parent (post-order law)",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// One axiom whose type is `forall (_ : Sort 0), Sort 0`, so the region
     /// contains a `forallE` — the branch of the Expr size table that carries a
     /// trailing binder byte after the `Data` word.
