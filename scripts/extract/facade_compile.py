@@ -3201,6 +3201,30 @@ def main():
             "REFUSE: facade manifest projection-type count must exceed "
             f"inductive-declaration count ({json.dumps(projection_inductive_inequality_join, sort_keys=True)})"
         )
+    roundtrip_inductive_inequality_join = {
+        "summary_type_roundtrip_checked": manifest_summary.get(
+            "type_roundtrip_checked"
+        ),
+        "summary_inductive_declarations": manifest_summary.get(
+            "inductive_declarations"
+        ),
+    }
+    if (not isinstance(roundtrip_inductive_inequality_join[
+            "summary_type_roundtrip_checked"], int)
+            or isinstance(roundtrip_inductive_inequality_join[
+                "summary_type_roundtrip_checked"], bool)
+            or not isinstance(roundtrip_inductive_inequality_join[
+                "summary_inductive_declarations"], int)
+            or isinstance(roundtrip_inductive_inequality_join[
+                "summary_inductive_declarations"], bool)
+            or roundtrip_inductive_inequality_join[
+                "summary_type_roundtrip_checked"]
+            <= roundtrip_inductive_inequality_join[
+                "summary_inductive_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest type-roundtrip count must exceed "
+            f"inductive-declaration count ({json.dumps(roundtrip_inductive_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5294,6 +5318,9 @@ def main():
         ),
         "manifest_projection_inductive_inequality_join": (
             projection_inductive_inequality_join
+        ),
+        "manifest_roundtrip_inductive_inequality_join": (
+            roundtrip_inductive_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
