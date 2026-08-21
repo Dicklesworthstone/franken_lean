@@ -7704,3 +7704,128 @@ fn only_two_postulates_are_referenced_and_sorry_is_not_one_of_them() {
         "the reference walk must reach the uses that do exist"
     );
 }
+
+/// Modules reachable from `Init.Meta.Defs` in the raw import graph that its
+/// environment does not contain, because the edge reaching them is not
+/// re-exported.
+const REACHABLE_BUT_NOT_VISIBLE: &[&str] = &["Init.Control.State", "Init.Data.Nat.Div.Basic"];
+
+/// `is_exported` gates TRANSITIVE visibility, and the closure stays total once
+/// it does — the correction to my own cell, disclosed for three waves.
+///
+/// The `import_all` cell tightened the closure in one dimension and said so; it
+/// is still loose in a second. `is_exported` on an edge `M → Y` says whether a
+/// module importing `M` also receives `Y`. It therefore does NOT restrict what
+/// `M` itself sees — a module always has its own direct imports — but it does
+/// restrict what `M` inherits through them. Over half the corpus edges carry it
+/// false (1,612 of 3,153), and the previous closure followed every one.
+///
+/// Measured for `Init.Meta.Defs`, 898 referenced constants, three closures:
+///
+///   everything at private            9,217 names   0 unresolved
+///   respecting `import_all`          8,744 names   0 unresolved   46 modules
+///   also respecting `is_exported`    8,628 names   0 unresolved   44 modules
+///
+/// Each step strictly shrinks and resolution survives both. The two modules
+/// that drop out are named above: `Init.Control.State` and
+/// `Init.Data.Nat.Div.Basic` are REACHABLE from `Init.Meta.Defs` in the raw
+/// import graph and are not VISIBLE to it, because the only edges reaching them
+/// are not re-exported. Reachability in the graph the import-graph cell walks
+/// is not the same relation as membership in an environment, and this is the
+/// cell that says so.
+///
+/// The direct/transitive asymmetry is the part worth getting right: the walk
+/// seeds unconditionally from `Init.Meta.Defs`'s own seven edges and applies
+/// the flag only to edges discovered later. Filtering the direct edges too
+/// would drop `Init.Data.Array.GetLit`, `Init.Data.Char.Basic`, `Init.MetaTypes`
+/// and `Init.WFTactics`, which the module plainly does import.
+#[test]
+fn transitive_visibility_is_gated_by_is_exported_and_resolution_survives() {
+    let lib = lib_or_skip!();
+    const MODULE: &str = "Init.Meta.Defs";
+
+    let (own, _) = decode_at(&lib, MODULE, Level::Private);
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    for info in &own {
+        for expr in declaration_expressions(info) {
+            referenced.append(&mut referenced_constants(expr));
+        }
+    }
+    let mut available: BTreeSet<String> = own
+        .iter()
+        .map(|info| info.name().to_display_string())
+        .collect();
+    assert_eq!(
+        (available.len(), referenced.len()),
+        (530, 898),
+        "{MODULE}: the censuses this row is stated against"
+    );
+
+    let direct = module_view(&lib, MODULE, Level::Private).imports;
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    // Seeded unconditionally: a module always sees what it imports itself.
+    let mut queue: Vec<String> = direct
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect();
+    while let Some(current) = queue.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let (infos, _) = decode_at(&lib, &current, Level::Exported);
+        available.extend(infos.iter().map(|info| info.name().to_display_string()));
+        // The flag applies only to edges discovered THROUGH another module.
+        for onward in module_view(&lib, &current, Level::Exported).imports {
+            if onward.is_exported {
+                queue.push(onward.module.to_display_string());
+            }
+        }
+    }
+    for import in direct.iter().filter(|import| import.import_all) {
+        let (infos, _) = decode_at(&lib, &import.module.to_display_string(), Level::Private);
+        available.extend(infos.iter().map(|info| info.name().to_display_string()));
+    }
+
+    assert_eq!(
+        (available.len(), visited.len()),
+        (8_628, 44),
+        "the fully flag-respecting closure"
+    );
+    let unresolved: Vec<&String> = referenced.difference(&available).collect();
+    assert!(
+        unresolved.is_empty(),
+        "{MODULE} stays reference-closed under the tightest closure: {unresolved:?}"
+    );
+
+    // Reachable in the graph, absent from the environment.
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = direct
+        .iter()
+        .map(|import| import.module.to_display_string())
+        .collect();
+    while let Some(current) = queue.pop() {
+        if !reachable.insert(current.clone()) {
+            continue;
+        }
+        for onward in module_view(&lib, &current, Level::Exported).imports {
+            queue.push(onward.module.to_display_string());
+        }
+    }
+    let invisible: Vec<&String> = reachable.difference(&visited).collect();
+    assert_eq!(
+        invisible, REACHABLE_BUT_NOT_VISIBLE,
+        "these are reachable in the import graph and not visible to the module, which is what \
+         makes graph reachability the wrong relation for an environment"
+    );
+
+    // Non-vacuity: the tightening must be real in both dimensions.
+    let (permissive, missing) = closure_declared(&lib, MODULE, Level::Private);
+    assert_eq!(missing, 0, "an absent module would shrink every closure");
+    assert!(
+        available.len() < permissive.len() && !invisible.is_empty(),
+        "each dimension must remove something, or the flags are being respected vacuously \
+         ({} vs {})",
+        available.len(),
+        permissive.len()
+    );
+}
