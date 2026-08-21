@@ -2086,7 +2086,14 @@ def main():
         retry = [n for n in sorted(type_mismatches)
                  if (decl.get(n) or {}).get("typem")]
         if retry:
-            rlines, rmap = [], {}
+            # the retry is a WHOLE FILE, exactly as the first tier is: it must
+            # contain the facade it is ascribing against, or every row comes back
+            # "unknown identifier" and the ladder reads as a type mismatch.
+            rlines = list(text.rstrip("\n").split("\n"))
+            rlines.append("")
+            rlines.append("-- PROJECTION TYPE RETRY at the maximally explicit "
+                          "printing (not part of the artifact)")
+            rmap = {}
             for name in retry:
                 d = decl[name]
                 lv = d.get("levels") or ""
