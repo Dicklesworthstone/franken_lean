@@ -5953,7 +5953,8 @@ const AXIOM_WITNESS_ROWS: &[(&str, usize, usize, Option<u64>)] = &[
 /// constant array and this witness would disagree.
 ///
 /// The presence rule is an exact biconditional, measured over all 600 `Init`
-/// modules and recorded here as provenance rather than asserted: the block
+/// modules and now ASSERTED, in
+/// `the_axioms_extension_biconditional_holds_over_every_init_module`: the block
 /// occurs iff the module exports at least one declaration — 517 modules carry
 /// it and every count matches with zero violations, 83 lack it and ALL 83 have
 /// an empty exported constant array, and no module carries it with an empty
@@ -13542,5 +13543,119 @@ fn the_splitter_overlap_law_holds_over_every_init_module() {
         (declared_exported, declared_private),
         (51_506, 65_404),
         "the constNames totals, recomputed here beside a different array"
+    );
+}
+
+/// The axioms block's stored name, which is a private name rather than the bare
+/// `exportedAxiomsExt` the older cell's prose uses.
+const EXPORTED_AXIOMS_EXT: &str = "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt";
+
+/// The axioms-extension biconditional, asserted over 600 modules.
+///
+/// `the_axioms_extension_counts_exported_declarations_at_both_levels` checks
+/// five rows and records the corpus result as prose: "measured over all 600
+/// `Init` modules and recorded here as provenance rather than asserted". Same
+/// shape as the splitter sweep one cell above — honestly flagged, and therefore
+/// invisible to anything that runs.
+///
+/// It holds, and it is worth more than a presence rule. `exportedAxiomsExt` is
+/// written by `CollectAxioms`, a different part of the pipeline from the one
+/// that fills `constNames`, so its entry count is an INDEPENDENT witness to the
+/// exported declaration count. Over all 600 chains:
+///
+///   517 modules carry the block, and every one of them has an entry count equal
+///     to its exported `constNames` length — zero violations
+///   83 lack it, and every one of those has an EMPTY exported array
+///   no module carries the block with an empty exported array, so the
+///     biconditional closes in both directions
+///   read at PRIVATE level, all 517 counts stay at the EXPORTED figure, though
+///     `constNames` there is larger for 400 of them
+///
+/// THE LAST LINE IS THE ONE THIS BEAD CARES ABOUT. d17i was a part-selection
+/// defect: declarations read from the wrong part of the chain. Here a witness
+/// filled by an unrelated pass agrees with the exported count at both levels,
+/// across 517 modules. If part selection drifted again, `constNames` and this
+/// block would disagree, and the disagreement would be visible without decoding
+/// a single declaration.
+///
+/// The block's stored name is a `_private.…` name. The older cell's prose calls
+/// it `exportedAxiomsExt`, which is what it is called and not what it is stored
+/// as — the same gap the server-part cell had between four spelled names and
+/// their `_private` forms.
+///
+/// Conservation first: the carrying and lacking modules must account for all
+/// 600 before either side of the biconditional is characterised.
+#[test]
+fn the_axioms_extension_biconditional_holds_over_every_init_module() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let entries_of = |view: &ModuleDataView| -> Option<u64> {
+        view.extensions
+            .iter()
+            .find(|block| block.name == EXPORTED_AXIOMS_EXT)
+            .map(|block| block.entries)
+    };
+
+    let mut carrying = 0usize;
+    let mut lacking = 0usize;
+    let mut private_agrees = 0usize;
+    let mut widest = 0u64;
+    for module in &modules {
+        let exported = module_view(&lib, module, Level::Exported);
+        let declared = exported.const_names.len() as u64;
+        match entries_of(&exported) {
+            Some(entries) => {
+                carrying += 1;
+                widest = widest.max(entries);
+                assert_eq!(
+                    entries, declared,
+                    "{module}: the axioms block counts {entries} where the module exports \
+                     {declared}"
+                );
+                assert!(
+                    declared > 0,
+                    "{module}: a module with no exported declarations must not carry the block"
+                );
+                let private = module_view(&lib, module, Level::Private);
+                if entries_of(&private) == Some(declared) {
+                    private_agrees += 1;
+                }
+            }
+            None => {
+                lacking += 1;
+                assert_eq!(
+                    declared, 0,
+                    "{module}: the block is absent, so the exported array must be empty"
+                );
+            }
+        }
+    }
+
+    // Conservation first: the two sides exhaust the census.
+    assert_eq!(
+        carrying + lacking,
+        modules.len(),
+        "every module either carries the block or does not"
+    );
+    assert_eq!(
+        (carrying, lacking),
+        (517, 83),
+        "both sides of the biconditional are populated at the pin"
+    );
+
+    // The part-selection witness: private level does not inflate the count.
+    assert_eq!(
+        private_agrees, carrying,
+        "read at private level the block must still count the EXPORTED declarations"
+    );
+
+    // Magnitude, so the agreement is not carried only by small modules: a
+    // uniform-zero decode is already refused by the `declared > 0` check above,
+    // but a decode that agreed only where both sides were tiny would not be.
+    assert_eq!(
+        widest, 2_204,
+        "the largest block counts Prelude's exported declarations"
     );
 }
