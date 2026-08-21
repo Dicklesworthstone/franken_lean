@@ -2942,3 +2942,141 @@ fn the_two_shared_head_records_are_not_structurally_special() {
          neither is special is made about nothing"
     );
 }
+
+/// What the head records actually hold in slots 0, 1 and 2.
+///
+/// NEITHER THING THIS WAVE OFFERED IS AVAILABLE, and both reasons are worth
+/// recording. "Pin that 69 unique targets come from 71 heads" is already a hard
+/// assertion - `2475a62f` asserts `(references, distinct) == (71, 69)`. And
+/// there is no set of "2 heads the 71 do not share": the refcounts are 67
+/// records with one referrer and 2 with two, so the sharing involves FOUR
+/// parents across TWO records, and `c726dec5` classified those. Seventy-one
+/// minus sixty-nine is a difference of objects, not a subset of heads. Reading
+/// it as a subset is the reference-versus-object confusion that produced the
+/// original overstatement, arriving one layer along.
+///
+/// So this reads the slots. `2475a62f` pinned their tags and arities and
+/// nothing about their contents.
+///
+/// Slots 0 and 1 carry `tag 2` with two pointer fields - the shape of a
+/// `Name.num` link - in all 69, and the cell settles that by handing each to
+/// the PRODUCTION `decode_name` rather than by matching a shape. A hundred and
+/// thirty-eight decodes that all succeed is a fact about the decoder agreeing
+/// with the bytes, which shape-matching alone never is.
+///
+/// Slot 2 is the array tag, and an array's length is the first thing a reader
+/// wants and the last thing a tag tells you. The lengths run 1 to 5 across the
+/// 69 records, 157 elements in total.
+///
+/// No size is asserted here. Sizes were the measured thing where this file
+/// asserts them; reaching for one now would be smuggling back the
+/// discriminator `daaaabe2` disproved. No type, extension or schema is named.
+#[test]
+fn the_head_record_slots_are_names_and_a_short_array() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut records = 0usize;
+    let mut names_decoded = 0usize;
+    let mut name_shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut array_lengths: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+    let mut elements = 0u64;
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut here: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, object.off + 16)) else {
+                continue;
+            };
+            if at.get(&tail).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(head) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5)) {
+                here.insert(head);
+            }
+        }
+
+        for record in here {
+            records += 1;
+            // Slots 0 and 1: handed to the production decoder, not shape-matched.
+            for slot in 0..2usize {
+                let word = word_at(bytes, record + 8 + 8 * slot);
+                let off = resolve(word).expect("slots 0 and 1 are pointers");
+                let object = at.get(&off).expect("resolved above");
+                name_shapes.insert((object.tag, object.other));
+                DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(word)
+                    .unwrap_or_else(|e| {
+                        panic!("{module}: head record slot {slot} must decode as a Name: {e}")
+                    });
+                names_decoded += 1;
+            }
+            // Slot 2: an array. Its length is what a tag cannot tell you.
+            let array = resolve(word_at(bytes, record + 8 + 8 * 2)).expect("slot 2 is a pointer");
+            assert_eq!(
+                at.get(&array).map(|a| a.tag),
+                Some(abi::TAG_ARRAY),
+                "{module}: slot 2 carries the array tag"
+            );
+            let length = word_at(bytes, array + 8);
+            *array_lengths.entry(length).or_default() += 1;
+            elements += length;
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(records, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(records, 69, "the distinct head records `2475a62f` counts");
+    assert_eq!(
+        names_decoded, 138,
+        "two names per record, every one accepted by the production decoder - \
+         which is a fact about the decoder agreeing with the bytes, where \
+         matching a shape would only be the bytes agreeing with themselves"
+    );
+    assert_eq!(
+        name_shapes.into_iter().collect::<Vec<_>>(),
+        vec![(2, 2)],
+        "and all 138 are the same link shape"
+    );
+    assert_eq!(
+        array_lengths.into_iter().collect::<Vec<_>>(),
+        vec![(1, 18), (2, 34), (3, 5), (4, 4), (5, 8)],
+        "slot 2's array lengths across the 69 records"
+    );
+    assert_eq!(elements, 157, "and the elements they hold between them");
+}
