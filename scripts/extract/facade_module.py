@@ -218,6 +218,9 @@ open Lean in
           | DefinitionSafety.partial => "partial"
         | _ => if info.isUnsafe then "unsafe" else "safe"
       IO.println s!"SAFE\t{n}\t{sf}"
+      match env.getModuleIdxFor? n with
+      | some idx => IO.println s!"MOD\t{n}\t{env.header.moduleNames[idx.toNat]!}"
+      | none => pure ()
       let lvls := ",".intercalate (info.levelParams.map toString)
       let deps := ",".intercalate ((info.type.getUsedConstants.map toString).toList)
       IO.println s!"TYPE\t{n}\t{lvls}\t{inst}\t{fmt}"
@@ -362,6 +365,7 @@ def probe(lean, env, work, names):
     types, typesx, typesm, levels, insts, deps, missing = {}, {}, {}, {}, {}, {}, []
     reducibility = {}
     safety_status = {}
+    module_of = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     current = None
     for line in proc.stdout.splitlines():
@@ -384,6 +388,10 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("MOD\t"):
+            _, name, mod = line.split("\t", 2)
+            module_of[name] = mod.strip()
             current = None
         elif line.startswith("DEPS\t"):
             _, name, dep_csv = line.split("\t", 2)
@@ -414,7 +422,8 @@ def probe(lean, env, work, names):
             d[name] = d[name] + " " + line.strip()
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
-            {k: v for k, v in pbinders.items()}, reducibility, safety_status)
+            {k: v for k, v in pbinders.items()}, reducibility, safety_status,
+            module_of)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -631,6 +640,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     structs, binders, pbinders = {}, {}, {}
     pin_reducibility = {}
     pin_safety = {}
+    pin_module = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -649,12 +659,13 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy) = probe(lean, env, work, frontier)
+         rd, sfy, mod) = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
         pin_reducibility.update(rd)
         pin_safety.update(sfy)
+        pin_module.update(mod)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -686,7 +697,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         frontier = nxt
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
-            pin_reducibility, pin_safety)
+            pin_reducibility, pin_safety, pin_module)
 
 
 def order(names, deps):
@@ -1006,7 +1017,7 @@ def main():
                          "would be no facade left to emit")
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
      rounds, structs, binders, absent_projections, pbinders,
-     pin_reducibility, pin_safety) = close_over_types(
+     pin_reducibility, pin_safety, pin_module) = close_over_types(
         lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
@@ -1037,6 +1048,19 @@ def main():
     # DefinitionSafety, so it is asked, and a census that has drifted shows up as a
     # named list rather than as a quietly wrong resistance class.
     safety_disagreements = []
+    # MODULE ATTRIBUTION IS WHAT SPLITS THE SURFACE. A constant whose module sits
+    # under `Init` is not declared at all — it is recorded as shared substrate, and
+    # 118 demanded rows leave the facade's coverage that way. That split was read
+    # off the census's module column. The pin answers it directly
+    # (getModuleIdxFor? into the header's module names), so it is asked for every
+    # constant the emitter actually probes.
+    #
+    # BOUND, because the two are not interchangeable: the census still chooses what
+    # to PROBE, since the Init decision is made before a constant is looked at, so
+    # a census that wrongly calls something Init is never probed here. That
+    # direction is covered by the Init-substrate probe, which #checks all 224 of
+    # them with no imports; between the two, both directions are measured.
+    module_disagreements = []
 
     def is_reducible(n):
         pin = pin_reducibility.get(n)
@@ -1046,6 +1070,12 @@ def main():
                 in ((census.get(n) or {}).get("attrs") or ""))
 
     for n in sorted(types):
+        pin_m = pin_module.get(n)
+        census_row = census.get(n) or {}
+        census_m = dotted(census_row["module"]) if census_row.get("module") else None
+        if pin_m and census_m and pin_m != census_m:
+            module_disagreements.append(
+                {"name": n, "census": census_m, "pin": pin_m})
         pin_s = pin_safety.get(n)
         census_s = (census.get(n) or {}).get("safety")
         if pin_s is not None and census_s and pin_s != census_s:
@@ -1087,13 +1117,14 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2, rd2, sfy2) = close_over_types(lean, env, work, extra, census)
+         pb2, rd2, sfy2, mod2) = close_over_types(lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
         levels.update(lv2); insts.update(in2); deps.update(dp2)
         structs.update(st2); binders.update(bd2); pbinders.update(pb2)
         pin_reducibility.update(rd2)
         pin_safety.update(sfy2)
+        pin_module.update(mod2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1627,6 +1658,10 @@ def main():
         "explicit_printer": len(explicit_for),
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
+        "module_source": "the pin (getModuleIdxFor? into the header module names), "
+            "with the census column kept as the pre-probe filter and as a fallback",
+        "module_probed": len(pin_module),
+        "module_census_disagreements": module_disagreements,
         "safety_source": "the pin (DefinitionSafety / ConstantInfo.isUnsafe), with "
             "the census column kept only as a fallback for constants the probe did "
             "not reach",
@@ -1687,7 +1722,9 @@ def main():
             "bucket": d["bucket"], "effect": d["effect"],
             "safety": pin_safety.get(name, d["safety"]),
             "safety_source": "pin" if name in pin_safety else "census",
-            "module": d["module"], "level_params": d["levels"].split(",") if d["levels"] else [],
+            "module": pin_module.get(name, d["module"]),
+            "module_source": "pin" if name in pin_module else "census",
+            "level_params": d["levels"].split(",") if d["levels"] else [],
             "instance": d["instance"],
             "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
             "instance_drop_reason": attr_reason.get(name),
@@ -1742,6 +1779,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"mod_probed={len(pin_module)} mod_drift={len(module_disagreements)} "
           f"safe_probed={len(pin_safety)} "
           f"safe_drift={len(safety_disagreements)} "
           f"red_probed={len(pin_reducibility)} "
