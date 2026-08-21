@@ -1632,6 +1632,16 @@ def main():
             "REFUSE: facade manifest uncensused-closure pin diverges "
             f"({json.dumps(uncensused_closure_pin_join, sort_keys=True)})"
         )
+    bare_names_probed_pin_join = {
+        "summary_bare_names_probed": manifest_summary.get("bare_names_probed"),
+        "pinned_bare_names_probed": 1416,
+    }
+    if (bare_names_probed_pin_join["summary_bare_names_probed"]
+            != bare_names_probed_pin_join["pinned_bare_names_probed"]):
+        raise SystemExit(
+            "REFUSE: facade manifest bare-name probe pin diverges "
+            f"({json.dumps(bare_names_probed_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2708,6 +2718,7 @@ def main():
         "manifest_emission_verified_pin_join": emission_verified_pin_join,
         "manifest_uncensused_emitted_pin_join": uncensused_emitted_pin_join,
         "manifest_uncensused_closure_pin_join": uncensused_closure_pin_join,
+        "manifest_bare_names_probed_pin_join": bare_names_probed_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
