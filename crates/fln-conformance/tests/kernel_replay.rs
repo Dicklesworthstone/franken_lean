@@ -4730,13 +4730,19 @@ impl CorpusMatrixReceipt {
 
         // PROVENANCE. These two fields are what bind the row to a corpus revision and to the
         // source that produced it. Empty strings are not weak provenance, they are none.
-        if self.corpus_fixture_hash.is_empty() {
+        // TRIMMED, LIKE `bead` AND `target` TWO RULES DOWN. This was
+        // `is_empty()`, so a hash of spaces named no corpus revision and passed
+        // anyway -- the exact thing the message below says it refuses. A
+        // retained row is editable by hand, which is why this file already
+        // refuses to trust its numbers into arithmetic; a blank field is the
+        // same threat wearing a different shape.
+        if self.corpus_fixture_hash.trim().is_empty() {
             return Err(
                 "row carries an empty corpus_fixture_hash, so it names no corpus revision"
                     .to_string(),
             );
         }
-        if self.lane_source_digest_at_run.is_empty() {
+        if self.lane_source_digest_at_run.trim().is_empty() {
             return Err(
                 "row carries an empty lane_source_digest_at_run, so it names no producing \
                  source"
@@ -11643,13 +11649,19 @@ impl WholeMathlibReceipt {
         }
 
         // PROVENANCE. Empty strings are not weak provenance, they are none.
-        if self.corpus_fixture_hash.is_empty() {
+        // TRIMMED, LIKE `bead` AND `target` TWO RULES DOWN. This was
+        // `is_empty()`, so a hash of spaces named no corpus revision and passed
+        // anyway -- the exact thing the message below says it refuses. A
+        // retained row is editable by hand, which is why this file already
+        // refuses to trust its numbers into arithmetic; a blank field is the
+        // same threat wearing a different shape.
+        if self.corpus_fixture_hash.trim().is_empty() {
             return Err(
                 "row carries an empty corpus_fixture_hash, so it names no corpus revision"
                     .to_string(),
             );
         }
-        if self.lane_source_digest_at_run.is_empty() {
+        if self.lane_source_digest_at_run.trim().is_empty() {
             return Err(
                 "row carries an empty lane_source_digest_at_run, so it names no producing source"
                     .to_string(),
@@ -13570,6 +13582,59 @@ fn a_retained_whole_mathlib_receipt_is_bound_to_its_pin_and_corpus() {
     assert!(
         uncommitted_reason.contains("corpus commit"),
         "an absent corpus commit must be refused as a corpus mismatch: {uncommitted_reason}"
+    );
+
+    // BLANK IS NOT EMPTY, AND TWO OF THE FOUR RULES COULD NOT TELL. Every
+    // planted emptiness decoy in this file is `String::new()` -- measured, there
+    // is not one whitespace-only plant anywhere -- so nothing distinguished
+    // `is_empty()` from `trim().is_empty()`. `bead` and `target` already
+    // trimmed; `corpus_fixture_hash` and `lane_source_digest_at_run` did not,
+    // so a hash of spaces named no corpus revision and validated anyway, which
+    // is precisely what its own refusal says it prevents.
+    //
+    // Both now trim. These two cells are what keeps them there.
+    const BLANK: &str = "   ";
+    assert!(
+        !BLANK.is_empty() && BLANK.trim().is_empty(),
+        "the planted value must be blank WITHOUT being empty, or it does not distinguish the two \
+         rules and this cell repeats the ones above"
+    );
+
+    let blank_hash = WholeMathlibReceipt {
+        corpus_fixture_hash: BLANK.to_string(),
+        ..sample_whole_mathlib_receipt()
+    };
+    let blank_hash_reason = blank_hash
+        .validate(&pin, &corpus)
+        .expect_err("a corpus fixture hash of spaces names no corpus revision");
+    assert!(
+        blank_hash_reason.contains("corpus_fixture_hash"),
+        "the refusal must name the blank field, not some later rule: {blank_hash_reason}"
+    );
+
+    let blank_digest = WholeMathlibReceipt {
+        lane_source_digest_at_run: BLANK.to_string(),
+        ..sample_whole_mathlib_receipt()
+    };
+    let blank_digest_reason = blank_digest
+        .validate(&pin, &corpus)
+        .expect_err("a lane source digest of spaces names no producing source");
+    assert!(
+        blank_digest_reason.contains("lane_source_digest_at_run"),
+        "the refusal must name the blank field: {blank_digest_reason}"
+    );
+
+    // AND THE TWO THAT ALREADY TRIMMED STILL DO, which is the evidence for
+    // "two of the four" rather than a claim about code nobody re-read.
+    let blank_bead = WholeMathlibReceipt {
+        bead: BLANK.to_string(),
+        ..sample_whole_mathlib_receipt()
+    };
+    assert!(
+        blank_bead
+            .validate(&pin, &corpus)
+            .is_err_and(|reason| reason.contains("bead")),
+        "`bead` trimmed before this commit and must go on doing so"
     );
 
     // THE REAL POPULATION, which may legitimately be empty at this commit.
