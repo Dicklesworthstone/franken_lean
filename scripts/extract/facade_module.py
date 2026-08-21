@@ -1619,6 +1619,42 @@ def pin_acceptance_error(text, accepted):
     return None
 
 
+def scratch_coverage_error(created, published):
+    """Every scratch file this run actually made is one the leak check looks for.
+
+    abd699ad asks whether any scratch file survived; it looks for the suffixes it
+    was given. Nothing has ever asked the other question: whether the suffixes it
+    was given are the ones this run WRITES. Those are different claims, and the
+    gap between them is silent in the direction that costs something -- drop
+    CANDIDATE_SUFFIX from the set, or register an artifact with a narrower one,
+    and the candidate is still written every attempt and simply stops being looked
+    for. The leak guard keeps passing, because passing is what it does when it has
+    nothing to check.
+
+    So the scratch paths are recorded as they are CREATED, and each one must be
+    covered by the suffix set its own artifact was published with. The candidate
+    is written on every attempt of every round, so it is in this set on any run
+    that produces a facade at all: its coverage cannot lapse unnoticed.
+
+    Returns an error string, or None.
+    """
+    uncovered = []
+    for artifact, path in sorted(created):
+        entry = published.get(artifact)
+        if entry is None:
+            uncovered.append(f"{path} (its artifact {artifact} was never published)")
+            continue
+        if not any(path == artifact + suffix for suffix in entry[2]):
+            uncovered.append(f"{path} (not covered by the suffixes {artifact} "
+                             f"was published with)")
+    if uncovered:
+        return (f"this run created {len(uncovered)} scratch file(s) the leak check "
+                f"would never look for: {uncovered[:4]}. A scratch file outside the "
+                "set is one that can be left beside a published artifact with "
+                "nothing to notice, and the leak guard would report a clean run")
+    return None
+
+
 def publication_registry_error(published, declared):
     """Every artifact this tool declares it produces was published THROUGH the
     checks, and nothing else was.
@@ -2368,6 +2404,9 @@ def main():
     # what this run has published, filled in at each write and checked at the end;
     # see publication_registry_error for why this is not four call lines
     published = {}
+    # every scratch path this run creates, recorded where it is created so the
+    # leak check's scope can be compared against what actually gets written
+    scratch_created = set()
     for readmit in range(args.readmit_rounds):
         if readmit:
             if not quarantine and not transparent_refused and not any(
@@ -2404,6 +2443,7 @@ def main():
             pin_inductives, types, ind_companions, ctor_companions,
             pin_ind_params, pin_ctor_bodies, pin_ind_result)
             candidate = args.out + CANDIDATE_SUFFIX
+            scratch_created.add((args.out, candidate))
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
             proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
@@ -2778,6 +2818,7 @@ def main():
             f"@{decl[first]['decl_name']}")
         verify_map[len(verify_lines)] = ("TYPEDECOY", first)
     verify_path = args.out + VERIFY_SUFFIX
+    scratch_created.add((args.out, verify_path))
     with open(verify_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(verify_lines) + "\n")
     proc = subprocess.run([lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false",
@@ -2847,6 +2888,7 @@ def main():
                 f"@{decl[retry[0]]['decl_name']}")
             rmap[len(rlines)] = ("TYPEDECOY", retry[0])
             rpath = args.out + VERIFY2_SUFFIX
+            scratch_created.add((args.out, rpath))
             with open(rpath, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(rlines) + "\n")
             rproc = subprocess.run(
@@ -3466,6 +3508,7 @@ def main():
     # rather than against what was actually written.
     manifest_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
     tmp = args.manifest + MANIFEST_TMP_SUFFIX
+    scratch_created.add((args.manifest, tmp))
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(manifest_text)
     os.replace(tmp, args.manifest)
@@ -3513,6 +3556,9 @@ def main():
     _reg = publication_registry_error(published, (args.out, args.manifest))
     if _reg:
         raise SystemExit("REFUSE: " + _reg)
+    _cov = scratch_coverage_error(scratch_created, published)
+    if _cov:
+        raise SystemExit("REFUSE: " + _cov)
     for _path in sorted(published):
         _text, _what, _sufs = published[_path]
         _err = published_bytes_error(_path, _text, _what)
