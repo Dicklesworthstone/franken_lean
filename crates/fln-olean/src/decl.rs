@@ -2567,7 +2567,15 @@ mod tests {
                         RecursorRule {
                             ctor: Name::from_components(["Demo", "ctorAux"]),
                             nfields: 6,
-                            rhs: Expr::sort(Level::zero()),
+                            // A DIFFERENT right-hand side from the first
+                            // rule's. Two identical rhs expressions would let
+                            // a swap between the rules decode identically, and
+                            // the rhs is the half of a rule the kernel
+                            // actually reduces with. See
+                            // `each_recursor_rule_keeps_its_own_right_hand_side`.
+                            rhs: Expr::sort(
+                                Level::zero().succ().expect("one successor is in range"),
+                            ),
                         },
                     ],
                     // DIFFERENT on purpose, for the same reason the counts
@@ -2591,6 +2599,108 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// Every computation rule has a real right-hand side, and its OWN.
+    ///
+    /// The rhs is the half of a rule the kernel reduces with: `ctor` and
+    /// `nfields` say when the rule applies, the rhs says what it produces. The
+    /// arity/order pin above compares rules by `(ctor, nfields)` and would be
+    /// satisfied by two rules whose right-hand sides had been swapped, or by a
+    /// rule whose rhs slot held something degenerate, since neither shows up in
+    /// that pair.
+    ///
+    /// Both rules carried `Sort 0` until this commit, which made the property
+    /// untestable: identical expressions cannot reveal a swap. The second rule
+    /// now carries `Sort 1`.
+    ///
+    /// The two are also structurally different on the wire, which is the point
+    /// of choosing successive sorts rather than two arbitrary expressions:
+    /// `Sort 0` holds a scalar-boxed `Level.zero` in its slot, while `Sort 1`
+    /// holds a POINTER to a `Level.succ` object. So the cell can tell them
+    /// apart without decoding, and a rule that lost its rhs entirely would fail
+    /// the pointer check rather than silently compare equal.
+    #[test]
+    fn each_recursor_rule_keeps_its_own_right_hand_side() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        assert_eq!(recursor.rules.len(), 2, "two rules to tell apart");
+
+        // Each rhs is a real expression, and the two are different.
+        let first = &recursor.rules[0].rhs;
+        let second = &recursor.rules[1].rhs;
+        assert_eq!(
+            *first,
+            Expr::sort(Level::zero()),
+            "the first rule's right-hand side"
+        );
+        assert_eq!(
+            *second,
+            Expr::sort(Level::zero().succ().expect("one successor is in range")),
+            "and the second rule's, which is not the same expression"
+        );
+        assert_ne!(
+            first, second,
+            "the fixture's two right-hand sides must stay different, or a swap \
+             between the rules would decode identically and this cell would \
+             prove nothing"
+        );
+
+        // On the wire: slot 2 of each rule object must be a POINTER to an
+        // expression, and the two must not be the same object.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+
+        let mut cursor = view.read_u64(val_off + 8 + 8 * 6).expect("rules slot");
+        let mut rhs_offsets = Vec::new();
+        while cursor & 1 == 0 {
+            let cell = view.deref(cursor).expect("cons cell");
+            let rule_off = view
+                .deref(view.read_u64(cell + 8).expect("head pointer"))
+                .expect("RecursorRule object");
+            let rhs_ptr = view.read_u64(rule_off + 8 + 8 * 2).expect("rhs slot");
+            assert_eq!(
+                rhs_ptr & 1,
+                0,
+                "a rule's right-hand side is a heap expression, never a boxed \
+                 scalar and never absent"
+            );
+            let rhs_off = view.deref(rhs_ptr).expect("rhs expression");
+            assert_eq!(
+                view.obj_header(rhs_off).expect("rhs header").0,
+                3,
+                "Expr.sort in this fixture"
+            );
+            rhs_offsets.push(rhs_off);
+            cursor = view.read_u64(cell + 16).expect("tail pointer");
+        }
+        assert_eq!(cursor >> 1, 0, "the list ends in boxed nil");
+        assert_eq!(rhs_offsets.len(), 2, "one right-hand side per rule");
+        assert_ne!(
+            rhs_offsets[0], rhs_offsets[1],
+            "the two rules must point at DIFFERENT expression objects; sharing \
+             one would make a swap undetectable on the wire as well"
+        );
     }
 
     /// The recursor's computation rules keep both their ARITY and their ORDER.
