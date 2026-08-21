@@ -11991,6 +11991,77 @@ fn the_receipt_producer_maps_every_count_to_its_own_field() {
     assert_eq!(receipt.subject_no_answer, 40_017);
     assert_eq!(receipt.wall_ms, 12_345_678);
 
+    // THE ONE COUNT THIS SENTINEL LEAVES AT ZERO IS THE ONE THAT MATTERS MOST.
+    // Measured over the population above: `unsoundly_permissive` is the ONLY
+    // field valued zero. So a producer that ignored the count and wrote a
+    // literal zero satisfies every assertion in this test -- and the field is
+    // absent from the transposition registry above for the same reason, since
+    // there is nothing else at zero for it to collide with. Under D23 an
+    // unsoundly permissive row is release-blocking, which makes a field that
+    // silently reads zero the worst one to leave unpinned.
+    //
+    // A second population carries it non-zero. It conserves under all three sum
+    // laws -- 21 = 12 + 9, 12 = 5 + 4 + 1 + 2, 9 = 6 + 3 -- and its counts are
+    // pairwise distinct, so a transposition INTO this field is visible as well
+    // as a hard-coded constant.
+    let mut permissive = CorpusCounts {
+        decoded: 21,
+        compared: 12,
+        agree: 5,
+        unsoundly_permissive: 4,
+        restrictive_with_carve_out: 1,
+        restrictive_without_carve_out: 2,
+        unscorable: 9,
+        oracle_skipped: 6,
+        subject_no_answer: 3,
+        ..CorpusCounts::default()
+    };
+    permissive
+        .restrictive_families
+        .insert("rejected:BlockMismatch".to_string(), 3);
+    permissive
+        .no_answer_families
+        .insert("inconclusive:Steps".to_string(), 3);
+    permissive.assert_conservation("permissive sentinel");
+
+    let permissive_receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &permissive,
+        closure_modules: 30,
+        corpus_fixture_hash: "permissive-fixture-hash",
+        observed_unix_s: 1_700_000_000,
+        wall_ms: 77,
+    });
+    assert_eq!(
+        permissive_receipt.unsoundly_permissive, 4,
+        "the permissive count must reach its own field. A producer writing a literal zero here \
+         passes the sentinel above, where this is the only count that IS zero"
+    );
+    for (field, value) in [
+        ("closure_modules", permissive_receipt.closure_modules),
+        ("decoded", permissive_receipt.decoded),
+        ("compared", permissive_receipt.compared),
+        ("agree", permissive_receipt.agree),
+        (
+            "restrictive_with_carve_out",
+            permissive_receipt.restrictive_with_carve_out,
+        ),
+        (
+            "restrictive_without_carve_out",
+            permissive_receipt.restrictive_without_carve_out,
+        ),
+        ("unscorable", permissive_receipt.unscorable),
+        ("oracle_skipped", permissive_receipt.oracle_skipped),
+        ("subject_no_answer", permissive_receipt.subject_no_answer),
+        ("wall_ms", permissive_receipt.wall_ms),
+    ] {
+        assert_ne!(
+            value, permissive_receipt.unsoundly_permissive,
+            "`{field}` shares its value with `unsoundly_permissive`, so a transposition between \
+             them would be invisible here too"
+        );
+    }
+
     // The census travels in canonical (ascending) order, so two runs that saw
     // the same families produce byte-identical rows.
     assert_eq!(
