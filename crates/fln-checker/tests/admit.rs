@@ -24,7 +24,7 @@ use fln_checker::environment::{
     ReducibilityHint,
 };
 use fln_checker::infer::InferenceBudget;
-use fln_checker::term::TermBudget;
+use fln_checker::term::{TermBudget, TermOutcome, inspect};
 use fln_checker::whnf::WhnfBudget;
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, WireExpr, WireName, decode_expr, decode_name,
@@ -2187,6 +2187,17 @@ fn kr600_803_init_prod_refuses_a_forged_iota_rule() {
         RecursorDeclaration::new(metadata.mutual().to_vec(), metadata.num_parameters(), metadata.num_indices(), metadata.num_motives(), metadata.num_minors(), vec![RecursorRule::new(checker_qualified(&["Prod", "mk"]), 2, decoded(&Expr::bvar(0).expect("packs")))], metadata.k()),
     ));
     assert!(matches!(admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited()), fln_checker::admit::InductiveVerdict::Rejected(fln_checker::admit::InductiveRejection::RecursorShape { .. })));
+}
+
+#[test]
+fn kr600_803_sum_and_prod_recursor_major_premises_close_the_bvar_span() {
+    for recursor in [init_sum_entries().remove(3), init_prod_entries().remove(2)] {
+        let facts = match inspect(recursor.declaration().type_(), TermBudget::unlimited()) {
+            TermOutcome::Complete(facts) => facts,
+            other => panic!("fixture recursor inspection must complete: {other:?}"),
+        };
+        assert_eq!(facts.external_bound_span, 0, "{:?} recursor leaks a major-premise binder", recursor.name());
+    }
 }
 
 #[test]
