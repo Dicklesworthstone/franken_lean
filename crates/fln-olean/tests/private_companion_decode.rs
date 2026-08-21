@@ -162,7 +162,16 @@ const STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS: [&str; 2] = [
     "_private.Init.Data.String.Extra.0.String.removeNumLeadingSpaces.saveLine._unsafe_rec",
 ];
 /// A private unary helper nested under Prelude's syntax insertion loop.
-const INSERT_IDX_LOOP_UNARY: &str = "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary";
+/// The pin's only `insertIdx.loop._unary`, and it is not in `Init.Prelude`.
+///
+/// A corpus-wide search finds exactly ONE declaration with this suffix, in
+/// `Init.Data.Array.Basic`, where it is private-only and decodes as a
+/// definition. `Init.Prelude` declares nothing of the sort — zero matches in
+/// its constants and zero in its extraConstNames, chain included — so the
+/// module this cell reads has to be the one that owns the declaration.
+const INSERT_IDX_LOOP_UNARY: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._unary";
+/// The module that actually declares it.
+const INSERT_IDX_LOOP_UNARY_MODULE: &str = "Init/Data/Array/Basic";
 /// A private-mangled unary equation helper deliberately exported by the pinned
 /// array-sort lemmas module.
 const SUBARRAY_MERGE_SORT_UNARY_EQ_DEF: &str =
@@ -709,8 +718,7 @@ fn string_extra_exported_mangled_unsafe_rec_helpers_remain_concrete() {
 
 #[test]
 fn string_remove_leading_spaces_exported_mangled_helpers_remain_concrete() {
-    let lib =
-        lib_or_skip!("string_remove_leading_spaces_exported_mangled_helpers_remain_concrete");
+    let lib = lib_or_skip!("string_remove_leading_spaces_exported_mangled_helpers_remain_concrete");
     let chain = chain_bytes(&lib, "Init/Data/String/Extra");
     let (exported_names, private_names) = exported_and_private_names(&chain);
 
@@ -756,20 +764,20 @@ fn string_remove_leading_spaces_exported_mangled_helpers_remain_concrete() {
 }
 
 #[test]
-fn prelude_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind() {
+fn array_basic_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind() {
     let lib = lib_or_skip!(
-        "prelude_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind"
+        "array_basic_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_kind"
     );
-    let chain = chain_bytes(&lib, "Init/Prelude");
+    let chain = chain_bytes(&lib, INSERT_IDX_LOOP_UNARY_MODULE);
     let (exported_names, private_names) = exported_and_private_names(&chain);
 
     assert!(
         !exported_names.contains(&INSERT_IDX_LOOP_UNARY.to_owned()),
-        "the exported Prelude part must omit {INSERT_IDX_LOOP_UNARY}"
+        "the exported part of {INSERT_IDX_LOOP_UNARY_MODULE} must omit {INSERT_IDX_LOOP_UNARY}"
     );
     assert!(
         private_names.contains(&INSERT_IDX_LOOP_UNARY.to_owned()),
-        "the Prelude private companion must restore {INSERT_IDX_LOOP_UNARY}"
+        "the private companion of {INSERT_IDX_LOOP_UNARY_MODULE} must restore {INSERT_IDX_LOOP_UNARY}"
     );
 
     let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
@@ -2020,8 +2028,8 @@ fn sunfold_family_keeps_concrete_members_on_both_chain_origins() {
         }
     }
 
-    let (exported_relative, exported_name) = exported_member
-        .expect("the pinned Init exported parts contain an _sunfold representative");
+    let (exported_relative, exported_name) =
+        exported_member.expect("the pinned Init exported parts contain an _sunfold representative");
     let exported_chain = chain_bytes(&lib, &exported_relative);
     let exported_view = OleanView::parse(&exported_chain.exported)
         .unwrap_or_else(|error| panic!("_sunfold {exported_name}: parse exported: {error}"));
@@ -2037,8 +2045,9 @@ fn sunfold_family_keeps_concrete_members_on_both_chain_origins() {
         exported.kind_name()
     );
 
-    let (private_relative, private_name) = private_only_member
-        .expect("the pinned Init private companions contain a private-only _sunfold representative");
+    let (private_relative, private_name) = private_only_member.expect(
+        "the pinned Init private companions contain a private-only _sunfold representative",
+    );
     let private_chain = chain_bytes(&lib, &private_relative);
     let private_view = OleanView::parse_with_dependencies(
         &private_chain.private,
@@ -2101,8 +2110,8 @@ fn private_f_family_keeps_concrete_members_on_both_chain_origins() {
         exported.kind_name()
     );
 
-    let (private_relative, private_name) =
-        private_only_member.expect("the pinned Init private companions contain a private-only _f representative");
+    let (private_relative, private_name) = private_only_member
+        .expect("the pinned Init private companions contain a private-only _f representative");
     let private_chain = chain_bytes(&lib, &private_relative);
     let private_view = OleanView::parse_with_dependencies(
         &private_chain.private,
@@ -2148,8 +2157,8 @@ fn unary_family_keeps_concrete_members_on_both_chain_origins() {
         }
     }
 
-    let (exported_relative, exported_name) = exported_member
-        .expect("the pinned Init exported parts contain an _unary representative");
+    let (exported_relative, exported_name) =
+        exported_member.expect("the pinned Init exported parts contain an _unary representative");
     let exported_chain = chain_bytes(&lib, &exported_relative);
     let exported_view = OleanView::parse(&exported_chain.exported)
         .unwrap_or_else(|error| panic!("_unary {exported_name}: parse exported: {error}"));
@@ -2182,6 +2191,71 @@ fn unary_family_keeps_concrete_members_on_both_chain_origins() {
     assert!(
         is_concrete_recovery(&private),
         "private-only _unary {private_name} decoded only as {} instead of a concrete declaration",
+        private.kind_name()
+    );
+}
+
+#[test]
+fn unsafe_rec_family_keeps_concrete_members_on_both_chain_origins() {
+    let lib = lib_or_skip!("unsafe_rec_family_keeps_concrete_members_on_both_chain_origins");
+    let mut exported_member = None;
+    let mut private_only_member = None;
+
+    for relative in init_chain_modules(&lib) {
+        let chain = chain_bytes(&lib, &relative);
+        let (exported, private) = exported_and_private_names(&chain);
+        if exported_member.is_none() {
+            exported_member = exported
+                .iter()
+                .find(|name| family::unsafe_rec(name))
+                .map(|name| (relative.clone(), name.clone()));
+        }
+        if private_only_member.is_none() {
+            private_only_member = private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::unsafe_rec(name))
+                .map(|name| (relative, name.clone()));
+        }
+        if exported_member.is_some() && private_only_member.is_some() {
+            break;
+        }
+    }
+
+    let (exported_relative, exported_name) = exported_member
+        .expect("the pinned Init exported parts contain an _unsafe_rec representative");
+    let exported_chain = chain_bytes(&lib, &exported_relative);
+    let exported_view = OleanView::parse(&exported_chain.exported)
+        .unwrap_or_else(|error| panic!("_unsafe_rec {exported_name}: parse exported: {error}"));
+    let exported = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_unsafe_rec {exported_name}: decode exported: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == exported_name)
+        .unwrap_or_else(|| panic!("exported decoder lost _unsafe_rec {exported_name}"));
+    assert!(
+        is_concrete_recovery(&exported),
+        "exported _unsafe_rec {exported_name} decoded only as {} instead of a concrete declaration",
+        exported.kind_name()
+    );
+
+    let (private_relative, private_name) = private_only_member.expect(
+        "the pinned Init private companions contain a private-only _unsafe_rec representative",
+    );
+    let private_chain = chain_bytes(&lib, &private_relative);
+    let private_view = OleanView::parse_with_dependencies(
+        &private_chain.private,
+        &[&private_chain.exported, &private_chain.server],
+    )
+    .unwrap_or_else(|error| panic!("_unsafe_rec {private_name}: parse private: {error}"));
+    let private = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("_unsafe_rec {private_name}: decode private: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == private_name)
+        .unwrap_or_else(|| panic!("private decoder lost _unsafe_rec {private_name}"));
+    assert!(
+        is_concrete_recovery(&private),
+        "private-only _unsafe_rec {private_name} decoded only as {} instead of a concrete declaration",
         private.kind_name()
     );
 }
