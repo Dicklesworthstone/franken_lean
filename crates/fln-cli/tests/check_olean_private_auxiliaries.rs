@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -40,6 +41,71 @@ fn axiom(name: fln::Name, type_: fln::Expr) -> fln::ConstantInfo {
 
 fn write(path: &Path, bytes: Vec<u8>) {
     std::fs::write(path, bytes).expect("write module-system reporting fixture");
+}
+
+fn json_object_field<'a>(json: &'a str, field: &str) -> &'a str {
+    let marker = format!("\"{field}\":");
+    let value = json
+        .split_once(&marker)
+        .map(|(_, value)| value)
+        .expect("JSON report contains the requested object field");
+    assert!(value.starts_with('{'), "JSON field is an object: {json}");
+
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'\"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'\"' => in_string = true,
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &value[..=index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("JSON object field is closed: {json}");
+}
+
+fn json_usize_field(object: &str, field: &str) -> usize {
+    let marker = format!("\"{field}\":");
+    let value = object
+        .split_once(&marker)
+        .map(|(_, value)| value)
+        .expect("JSON object contains the requested integer field");
+    let digits = value
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    value[..digits]
+        .parse()
+        .expect("JSON integer field is a decimal usize")
+}
+
+fn json_name_set(object: &str) -> BTreeSet<String> {
+    object
+        .split("\"name\":\"")
+        .skip(1)
+        .map(|value| {
+            value
+                .split_once('\"')
+                .map(|(name, _)| name.to_owned())
+                .expect("JSON name field is terminated")
+        })
+        .collect()
 }
 
 #[test]
@@ -452,9 +518,24 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert!(json.stdout.contains(
         "\"coreObservablesLoopResiduals\":{\"observed\":3,\"names\":[{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
-    assert!(json.stdout.contains(
-        "\"privateEqDefMatchResiduals\":{\"observed\":8,\"names\":[{\"name\":\"_private.CliPrivateReport.0.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.CliPrivateReport.0.loop.eq_def\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
-    ));
+    let private_eq_def_match = json_object_field(&json.stdout, "privateEqDefMatchResiduals");
+    assert_eq!(json_usize_field(private_eq_def_match, "observed"), 8, "{}", json.stdout);
+    assert_eq!(json_usize_field(private_eq_def_match, "omitted"), 0, "{}", json.stdout);
+    assert_eq!(
+        json_name_set(private_eq_def_match),
+        BTreeSet::from([
+            "_private.CliPrivateReport.0.eq_def".to_owned(),
+            "_private.CliPrivateReport.0.loop.eq_def".to_owned(),
+            "_private.CliPrivateReport.0.match_1".to_owned(),
+            "_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Name.beq.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1".to_owned(),
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1".to_owned(),
+        ]),
+        "{}",
+        json.stdout,
+    );
     assert!(json.stdout.contains(
         "\"privateMatchNResiduals\":{\"observed\":6,\"names\":[{\"name\":\"_private.CliPrivateReport.0.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Name.beq.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1\",\"nameTruncated\":false},{\"name\":\"_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1\",\"nameTruncated\":false}],\"omitted\":0}"
     ));
