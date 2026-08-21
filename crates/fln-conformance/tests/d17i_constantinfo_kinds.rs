@@ -12823,3 +12823,99 @@ fn the_three_regions_of_a_chain_are_disjoint_and_laid_out_end_to_end() {
          evidence and must not be simplified away"
     );
 }
+
+/// One part's header shape: `(version, flags, base_addr)`.
+fn header_shape(path: &Path) -> (u8, u8, u64) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let view = OleanView::parse(&bytes).unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
+    (
+        view.header.version,
+        view.header.flags,
+        view.header.base_addr,
+    )
+}
+
+/// A part's ROLE is not written anywhere in its header.
+///
+/// The chain is assembled by filename — `.olean`, `.olean.server`,
+/// `.olean.private` — and every cell in this file that opens a part decides
+/// which one it is from the extension it asked for. Whether the bytes agree has
+/// never been checked, and the natural assumption is that a format carrying
+/// three kinds of region would stamp the kind in the header.
+///
+/// It does not. Across all 1,800 parts of the 600 `Init` chains, `version` is 2
+/// and `flags` is 1 — one value each, the same for exported, server and private.
+/// The two partitions of those 1,800 parts sit at opposite extremes:
+///
+///   by `(version, flags)`   one class of 1,800
+///   by filename role        three classes of 600
+///   by `base_addr`          1,800 classes of one
+///
+/// So the header's fixed fields cannot recover the role, and `base_addr`
+/// over-discriminates: it separates every part from every other, including the
+/// 600 that share a role.
+///
+/// PRECISELY WHAT IS AND IS NOT CLAIMED. Not "the header cannot tell you the
+/// role" — that would be false, and the cell one above is why. Within a single
+/// chain the three base addresses are ordered exported < server < private, so
+/// the role IS recoverable from headers once you already know the three parts
+/// belong together. The claim is narrower and it is the one that matters for
+/// decoding: no header field takes a role-specific VALUE, so a part examined
+/// ALONE carries nothing that says which of the three it is. Grouping has to
+/// come from the path or the content first; the header only orders a group it
+/// is handed.
+///
+/// Conservation first: the three role classes must account for all 1,800 parts
+/// before the header partition is compared against them, so a chain that failed
+/// to yield three parts cannot shrink the population silently.
+#[test]
+fn no_header_field_names_which_part_of_the_chain_it_is() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut by_role: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut addresses: BTreeSet<u64> = BTreeSet::new();
+    for module in &modules {
+        let stem = lib.join(module.replace('.', "/"));
+        for part in ["olean", "olean.server", "olean.private"] {
+            let (version, flags, base) = header_shape(&stem.with_extension(part));
+            *by_role.entry(part).or_default() += 1;
+            shapes.insert((version, flags));
+            addresses.insert(base);
+        }
+    }
+
+    // Conservation first: every part was reached, and the roles account for all
+    // of them.
+    let parts: usize = by_role.values().sum();
+    assert_eq!(
+        parts,
+        modules.len() * 3,
+        "each module must contribute exactly its three parts"
+    );
+    assert_eq!(
+        by_role,
+        BTreeMap::from([
+            ("olean", 600),
+            ("olean.private", 600),
+            ("olean.server", 600)
+        ]),
+        "the role partition: three classes of 600"
+    );
+
+    // The header partition is trivial where the role partition is not.
+    assert_eq!(
+        shapes,
+        BTreeSet::from([(2, 1)]),
+        "version and flags take one value across every part of every role"
+    );
+
+    // And the field that does vary varies too much to mean anything.
+    assert_eq!(
+        addresses.len(),
+        parts,
+        "base_addr separates every part from every other, including same-role ones"
+    );
+}
