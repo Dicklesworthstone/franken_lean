@@ -12395,6 +12395,116 @@ fn the_whole_mathlib_floors_are_anchored_and_coherent() {
     );
 }
 
+/// The floors are MINIMUMS, and nothing sat at the edge of one.
+///
+/// **Every receipt refused for being too small is far too small.** The fixture
+/// flow carries three modules and the measured-nothing row carries zero, while
+/// the planted control sits orders of magnitude above. Measured against the real
+/// comparison and both off-by-one neighbours: `0` and `3` are refused by `<`, by
+/// `<=` and by `< FLOOR - 1` alike, so no existing input can tell which one the
+/// guard uses.
+///
+/// **A floor is a minimum, not a threshold to exceed.** A corpus of exactly ten
+/// thousand closure modules IS the documented population, and `<=` would refuse
+/// it -- a lane that measured precisely what the floor asks for would be told it
+/// had measured too little. One module fewer must be refused, which `< FLOOR -
+/// 1` would allow. Both boundary values are needed: one pins each side of the
+/// comparison, and neither alone says where the edge is.
+///
+/// **The at-floor receipt has to pass every OTHER rule too**, which is what makes
+/// it a real boundary case rather than a shape: it conserves under all three sum
+/// laws, its seed set fits inside its closure, its census is empty because it
+/// found nothing, and its provenance comes from the producer.
+#[test]
+fn the_floors_are_minimums_not_thresholds_to_exceed() {
+    let pin = suite_lock_reference_pin();
+    let corpus = suite_lock_corpus_commit();
+
+    // A receipt sitting on chosen values for the three floors, legal in every
+    // other respect. `compared` is derived so the population always conserves.
+    let receipt_with = |closure: u64, seed: u64, decoded: u64| {
+        let compared = decoded - 100_000;
+        let counts = CorpusCounts {
+            decoded,
+            compared,
+            agree: compared,
+            unscorable: 100_000,
+            oracle_skipped: 100_000,
+            ..CorpusCounts::default()
+        };
+        counts.assert_conservation("floor boundary");
+        let spec = CorpusReceiptSpec {
+            bead: "franken_lean-t6r7",
+            corpus_commit: suite_lock_corpus_commit(),
+            seed_modules: seed,
+            receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+        };
+        WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+            spec: &spec,
+            counts: &counts,
+            closure_modules: closure,
+            corpus_fixture_hash: "boundary-fixture-hash",
+            observed_unix_s: 1_786_000_000,
+            wall_ms: 5,
+        })
+    };
+
+    // EXACTLY ON EVERY FLOOR MUST PASS.
+    if let Err(reason) = receipt_with(
+        WHOLE_MATHLIB_MODULE_FLOOR,
+        WHOLE_MATHLIB_SEED_FLOOR,
+        WHOLE_MATHLIB_DECODED_FLOOR,
+    )
+    .validate(&pin, &corpus)
+    {
+        panic!(
+            "a receipt sitting exactly on all three floors was refused. A floor is the smallest \
+             population that qualifies, so the value AT it qualifies: {reason}"
+        );
+    }
+
+    // AND ONE BELOW ANY OF THEM MUST NOT, each named by its own floor.
+    for (label, receipt, expected) in [
+        (
+            "closure",
+            receipt_with(
+                WHOLE_MATHLIB_MODULE_FLOOR - 1,
+                WHOLE_MATHLIB_SEED_FLOOR,
+                WHOLE_MATHLIB_DECODED_FLOOR,
+            ),
+            "closure module(s)",
+        ),
+        (
+            "seed",
+            receipt_with(
+                WHOLE_MATHLIB_MODULE_FLOOR,
+                WHOLE_MATHLIB_SEED_FLOOR - 1,
+                WHOLE_MATHLIB_DECODED_FLOOR,
+            ),
+            "seeded Mathlib module(s)",
+        ),
+        (
+            "decoded",
+            receipt_with(
+                WHOLE_MATHLIB_MODULE_FLOOR,
+                WHOLE_MATHLIB_SEED_FLOOR,
+                WHOLE_MATHLIB_DECODED_FLOOR - 1,
+            ),
+            "decoded declaration(s)",
+        ),
+    ] {
+        let reason = match receipt.validate(&pin, &corpus) {
+            Err(reason) => reason,
+            Ok(()) => panic!("one below the {label} floor must be refused, and was not"),
+        };
+        assert!(
+            reason.contains(expected),
+            "the {label} boundary must be refused by ITS OWN floor, not by a neighbouring rule: \
+             {reason}"
+        );
+    }
+}
+
 /// Truncating a row never splits a character.
 ///
 /// **The hazard is concrete, not theoretical.** `"aé a"` is five bytes and its
