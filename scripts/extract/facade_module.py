@@ -37,8 +37,10 @@ row per declaration with its role, partition, census facts and printed signature
 
 import argparse
 import hashlib
+import io
 import json
 import os
+import pathlib
 import re
 import builtins
 import contextlib
@@ -2227,14 +2229,19 @@ def self_test_sandbox(work):
     # Listed as a table so adding one is a line, and every entry below has a case
     # in the self-test that proves it blocks and a case that proves it does not
     # over-block.
-    PATH_OPS = (("remove", 1), ("unlink", 1), ("rmdir", 1),
-                ("rename", 2), ("replace", 2))
+    # THE INDICES MATTER, not a count. `os.symlink(source, destination)` puts the
+    # path being created SECOND, and a guard that checked the first argument would
+    # have refused a symlink to anywhere outside the sandbox while permitting one
+    # written on top of an artifact -- backwards, and it would have looked right.
+    PATH_OPS = (("remove", (0,)), ("unlink", (0,)), ("rmdir", (0,)),
+                ("rename", (0, 1)), ("replace", (0, 1)),
+                ("truncate", (0,)), ("symlink", (1,)), ("link", (1,)))
     PROC_OPS = ((subprocess, "Popen"), (os, "system"))
     saved = {}
 
-    def guard_paths(real, opname, count):
+    def guard_paths(real, opname, indices):
         def wrapper(*args, **kwargs):
-            for arg in args[:count]:
+            for arg in (args[i] for i in indices if i < len(args)):
                 target = os.path.realpath(str(arg))
                 if not target.startswith(root):
                     raise SelfTestViolation(
@@ -2243,6 +2250,29 @@ def self_test_sandbox(work):
                         "renamed away is not recoverable by re-running anything")
             return real(*args, **kwargs)
         return wrapper
+
+    # `builtins.open` is the high-level door and `os.open` is the only one under
+    # it. Measured against the sandbox as it stood: os.open with O_WRONLY|O_TRUNC,
+    # os.truncate, pathlib's write_text and os.symlink all went straight through
+    # and overwrote a file outside the temp directory, while the builtins.open
+    # control was blocked. pathlib is the reason a high-level guard alone can
+    # never be enough -- Path.write_text does not go through the name this module
+    # patched, and every one of those calls does reach os.open or os.truncate.
+    #
+    # Read-only opens stay permitted, because the guards under test read artifacts
+    # on purpose: only a flag carrying write intent is refused.
+    real_os_open = os.open
+    WRITE_FLAGS = (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+
+    def guarded_os_open(path, flags, *args, **kwargs):
+        if flags & WRITE_FLAGS:
+            target = os.path.realpath(str(path))
+            if not target.startswith(root):
+                raise SelfTestViolation(
+                    f"the self-test called os.open on {target} with write intent; "
+                    f"it may only write inside {work}, and os.open is the call "
+                    "every other write in Python goes through")
+        return real_os_open(path, flags, *args, **kwargs)
 
     def guard_proc(opname):
         def wrapper(*args, **kwargs):
@@ -2265,17 +2295,27 @@ def self_test_sandbox(work):
             "the self-test tried to start a subprocess; it must never invoke the "
             "Reference, because it has to stay runnable anywhere in under a second")
 
-    builtins.open, subprocess.run = guarded_open, guarded_run
-    for opname, count in PATH_OPS:
+    # AND `io.open`, which is the same function object and a DIFFERENT name.
+    # `io.open is builtins.open` is True, so patching builtins looks like enough;
+    # it is not, because pathlib's Path.open calls `io.open(...)` through the io
+    # module's attribute and never looks at builtins at all. Measured: with
+    # builtins.open and os.open both guarded, Path.write_text still wrote a file
+    # outside the sandbox. Rebinding a name does not rebind every name that
+    # happens to point at the same object.
+    builtins.open, io.open = guarded_open, guarded_open
+    subprocess.run = guarded_run
+    for opname, indices in PATH_OPS:
         saved[(os, opname)] = getattr(os, opname)
-        setattr(os, opname, guard_paths(saved[(os, opname)], opname, count))
+        setattr(os, opname, guard_paths(saved[(os, opname)], opname, indices))
+    saved[(os, "open")] = real_os_open
+    os.open = guarded_os_open
     for module, opname in PROC_OPS:
         saved[(module, opname)] = getattr(module, opname)
         setattr(module, opname, guard_proc(f"{module.__name__}.{opname}"))
     try:
         yield
     finally:
-        builtins.open, subprocess.run = real_open, real_run
+        builtins.open, io.open, subprocess.run = real_open, real_open, real_run
         for (module, opname), original in saved.items():
             setattr(module, opname, original)
 
@@ -2429,6 +2469,24 @@ def self_test():
     case("sandbox/allows-temp-replace",
          blocked(lambda: os.replace(os.path.join(work, "never-created"),
                                     os.path.join(work, "nor-this"))), False)
+    case("sandbox/blocks-os-open-write",
+         blocked(lambda: os.close(os.open(outside, os.O_WRONLY | os.O_CREAT))), True)
+    case("sandbox/blocks-truncate",
+         blocked(lambda: os.truncate(outside, 0)), True)
+    case("sandbox/blocks-pathlib-write",
+         blocked(lambda: pathlib.Path(outside).write_text("x")), True)
+    # THE SOURCE MUST BE INSIDE THE SANDBOX for this case to mean anything. With
+    # a source outside it too, checking either argument refuses the call and the
+    # case passes whichever index the guard looks at -- it was written that way
+    # first, and a mutant that checked the SOURCE instead of the destination
+    # survived it. A symlink is created at its second argument; that is the path
+    # that can land on an artifact.
+    case("sandbox/blocks-symlink-destination",
+         blocked(lambda: os.symlink(os.path.join(work, "f.lean"), outside)), True)
+    # ...and a READ must still reach the filesystem, or every guard under test
+    # that opens an artifact would be refused by its own sandbox.
+    case("sandbox/allows-os-open-read",
+         blocked(lambda: os.close(os.open(__file__, os.O_RDONLY))), False)
     case("sandbox/allows-temp-write",
          blocked(lambda: at("allowed.lean", "fine\n")), False)
     case("sandbox/allows-artifact-read",
