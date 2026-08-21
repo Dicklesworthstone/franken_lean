@@ -2148,6 +2148,21 @@ def main():
             "REFUSE: facade manifest probe-family bridge diverges "
             f"({json.dumps(probe_family_bridge_join, sort_keys=True)})"
         )
+    withdrawn_uncensused_zero_join = {
+        "summary_emission_withdrawn": manifest_summary.get("emission_withdrawn"),
+        "summary_uncensused_emitted": manifest_summary.get("uncensused_emitted"),
+        "pinned_withdrawn_uncensused_count": 0,
+    }
+    if (withdrawn_uncensused_zero_join["summary_emission_withdrawn"]
+            != withdrawn_uncensused_zero_join[
+                "pinned_withdrawn_uncensused_count"]
+            or withdrawn_uncensused_zero_join["summary_uncensused_emitted"]
+            != withdrawn_uncensused_zero_join[
+                "pinned_withdrawn_uncensused_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest withdrawn-uncensused count diverges "
+            f"({json.dumps(withdrawn_uncensused_zero_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3278,6 +3293,9 @@ def main():
             inductive_structural_count_join
         ),
         "manifest_probe_family_bridge_join": probe_family_bridge_join,
+        "manifest_withdrawn_uncensused_zero_join": (
+            withdrawn_uncensused_zero_join
+        ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
