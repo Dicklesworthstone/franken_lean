@@ -2215,6 +2215,42 @@ def self_test_sandbox(work):
     real_open, real_run = builtins.open, subprocess.run
     root = os.path.realpath(work) + os.sep
 
+    # DESTROYING A FILE IS NOT WRITING TO IT. The sandbox watched
+    # `builtins.open` for write modes, and neither `os.remove` nor `os.replace`
+    # goes anywhere near it -- so a case that deleted contracts/facade_module.lean
+    # or renamed something over it would have succeeded in silence, against the
+    # first rule in AGENTS.md. These are not exotic calls to reach for either:
+    # this very file publishes with `os.replace` at three sites and clears its
+    # verify files with `os.remove` at two, so they are the idioms a contributor
+    # writing a new case would copy.
+    #
+    # Listed as a table so adding one is a line, and every entry below has a case
+    # in the self-test that proves it blocks and a case that proves it does not
+    # over-block.
+    PATH_OPS = (("remove", 1), ("unlink", 1), ("rmdir", 1),
+                ("rename", 2), ("replace", 2))
+    PROC_OPS = ((subprocess, "Popen"), (os, "system"))
+    saved = {}
+
+    def guard_paths(real, opname, count):
+        def wrapper(*args, **kwargs):
+            for arg in args[:count]:
+                target = os.path.realpath(str(arg))
+                if not target.startswith(root):
+                    raise SelfTestViolation(
+                        f"the self-test called os.{opname} on {target}; it may "
+                        f"only touch paths inside {work}, and a file removed or "
+                        "renamed away is not recoverable by re-running anything")
+            return real(*args, **kwargs)
+        return wrapper
+
+    def guard_proc(opname):
+        def wrapper(*args, **kwargs):
+            raise SelfTestViolation(
+                f"the self-test called {opname}; it must never start a process, "
+                "because it has to stay runnable anywhere in under a second")
+        return wrapper
+
     def guarded_open(file, mode="r", *args, **kwargs):
         if any(ch in mode for ch in "wxa+"):
             target = os.path.realpath(str(file))
@@ -2230,10 +2266,18 @@ def self_test_sandbox(work):
             "Reference, because it has to stay runnable anywhere in under a second")
 
     builtins.open, subprocess.run = guarded_open, guarded_run
+    for opname, count in PATH_OPS:
+        saved[(os, opname)] = getattr(os, opname)
+        setattr(os, opname, guard_paths(saved[(os, opname)], opname, count))
+    for module, opname in PROC_OPS:
+        saved[(module, opname)] = getattr(module, opname)
+        setattr(module, opname, guard_proc(f"{module.__name__}.{opname}"))
     try:
         yield
     finally:
         builtins.open, subprocess.run = real_open, real_run
+        for (module, opname), original in saved.items():
+            setattr(module, opname, original)
 
 
 def self_test():
@@ -2258,11 +2302,18 @@ def self_test():
     failures, checked = [], []
 
     def blocked(thunk):
-        """The sandbox's own verdict, as an error string the way a guard reports."""
+        """The sandbox's own verdict, as an error string the way a guard reports.
+
+        An OSError means the call reached the filesystem, which is the sandbox
+        ALLOWING it -- that is how the not-over-blocking cases below can prove the
+        guard let them through without any of them destroying a file to do it.
+        """
         try:
             thunk()
         except SelfTestViolation as exc:
             return str(exc)
+        except OSError:
+            return None
         return None
 
     def case(name, got_error, want_refusal):
@@ -2359,6 +2410,25 @@ def self_test():
          blocked(lambda: builtins.open("contracts/facade_module.lean", "a")), True)
     case("sandbox/blocks-reference-call",
          blocked(lambda: subprocess.run(["true"])), True)
+    outside = os.path.join(os.path.dirname(work), "fln-l8f-not-a-real-file")
+    case("sandbox/blocks-delete-outside",
+         blocked(lambda: os.remove(outside)), True)
+    case("sandbox/blocks-replace-outside",
+         blocked(lambda: os.replace(os.path.join(work, "f.lean"), outside)), True)
+    case("sandbox/blocks-rename-outside",
+         blocked(lambda: os.rename(os.path.join(work, "f.lean"), outside)), True)
+    case("sandbox/blocks-popen",
+         blocked(lambda: subprocess.Popen(["true"])), True)
+    case("sandbox/blocks-os-system",
+         blocked(lambda: os.system("true")), True)
+    # ...and the same operations INSIDE the temp directory must still reach the
+    # filesystem. None of these destroys anything: each names a file that was
+    # never created, so the sandbox letting it through shows up as an OSError.
+    case("sandbox/allows-temp-delete",
+         blocked(lambda: os.remove(os.path.join(work, "never-created"))), False)
+    case("sandbox/allows-temp-replace",
+         blocked(lambda: os.replace(os.path.join(work, "never-created"),
+                                    os.path.join(work, "nor-this"))), False)
     case("sandbox/allows-temp-write",
          blocked(lambda: at("allowed.lean", "fine\n")), False)
     case("sandbox/allows-artifact-read",
