@@ -181,6 +181,10 @@ the toolchain would report a perfect facade:
     dependencies. Generated projections cannot lose their owning type outside
     the demanded subset.
 
+  * A MANIFEST-INIT-ROW-PROVENANCE JOIN requires every extracted Init-substrate
+    artifact row to carry a nonempty reason. The shared-substrate half of the
+    no-import proof cannot become an unexplained name exclusion.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2151,6 +2155,25 @@ def main():
             f"({json.dumps(manifest_negative_control_join, sort_keys=True)}, "
             f"collisions={sorted(forbidden_decoy_names)!r})"
         )
+    unexplained_init_artifact_rows = sorted(
+        row.get("name", "<missing>") for row in manifest_init_substrate
+        if not isinstance(row.get("reason"), str) or not row["reason"].strip()
+    )
+    manifest_init_row_provenance_join = {
+        "init_artifact_rows": len(manifest_init_substrate),
+        "reasoned_init_artifact_rows": len(manifest_init_substrate)
+        - len(unexplained_init_artifact_rows),
+        "unexplained_rows": len(unexplained_init_artifact_rows),
+    }
+    if (manifest_init_row_provenance_join["init_artifact_rows"] == 0
+            or manifest_init_row_provenance_join["reasoned_init_artifact_rows"]
+            != manifest_init_row_provenance_join["init_artifact_rows"]
+            or manifest_init_row_provenance_join["unexplained_rows"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest Init-row provenance join failed "
+            f"({json.dumps(manifest_init_row_provenance_join, sort_keys=True)}, "
+            f"unexplained={unexplained_init_artifact_rows[:8]!r})"
+        )
     unknown_printer_rows = []
     init_printer_rows = []
     manifest_printer_counts = Counter()
@@ -2393,6 +2416,7 @@ def main():
         "resistance_demand_join": resistance_demand_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "manifest_negative_control_join": manifest_negative_control_join,
+        "manifest_init_row_provenance_join": manifest_init_row_provenance_join,
         "manifest_printer_totality_join": manifest_printer_totality_join,
         "manifest_projection_closure_join": manifest_projection_closure_join,
         "checked": checked,
