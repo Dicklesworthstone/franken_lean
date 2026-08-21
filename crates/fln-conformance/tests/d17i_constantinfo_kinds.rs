@@ -3186,3 +3186,90 @@ fn stored_arities_match_the_telescopes_they_describe() {
          with fields, {recursors} recursors)"
     );
 }
+
+/// A constructor's result type: what it is headed by, and how many arguments it
+/// applies.
+///
+/// The arity cell counted the constructor's binders. It said nothing about what
+/// the type RESULTS in, and that is the half the kernel actually adjudicates:
+/// `crates/fln-kernel/tests/large_elimination_imax.rs` carries
+/// `constructor_with_foreign_result_type_is_rejected`, so a constructor whose
+/// result is headed by the wrong inductive is a rejection the kernel already
+/// knows how to produce. Nothing on the decode side checked that the artifact
+/// never hands it one.
+///
+/// Two relations, both derived from the decoded type rather than from a table:
+///
+///   the result's HEAD must be the constructor's own `induct`
+///   the result's ARGUMENT COUNT must be that inductive's
+///   `num_params + num_indices`
+///
+/// Measured over `Init/Prelude` at private level: 157 constructors, zero
+/// violations of either.
+///
+/// The second relation is why the first is not enough on its own. A result
+/// headed correctly but applied to the wrong number of arguments is a different
+/// defect — it would make the regenerated recursor's motive telescope disagree —
+/// and the head check alone cannot see it. Its non-vacuity comes from the
+/// indexed inductives: `Eq`, `HEq`, `Nat.le` and `Nat.le.below` carry indices at
+/// this pin, so the count is not merely `num_params` for everything.
+#[test]
+fn constructor_results_are_headed_by_their_own_inductive_at_the_right_arity() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    let indexed = inductives.values().filter(|v| v.num_indices > 0).count();
+    assert!(
+        indexed >= 4,
+        "the pin carries indexed inductives, without which the argument count below is just \
+         num_params: got {indexed}"
+    );
+
+    let mut checked = 0usize;
+    for info in &infos {
+        let ConstantInfo::Ctor(ctor) = info else {
+            continue;
+        };
+        let name = info.name().to_display_string();
+        let induct_name = ctor.induct.to_display_string();
+        let induct = inductives
+            .get(&induct_name)
+            .expect("constructor's inductive decodes");
+
+        // Strip the telescope, then walk the application spine of the result.
+        let mut current = &ctor.base.type_;
+        while let ExprNode::ForallE { body, .. } = current.node() {
+            current = body;
+        }
+        let mut arguments = 0usize;
+        while let ExprNode::App { f, .. } = current.node() {
+            arguments += 1;
+            current = f;
+        }
+        let ExprNode::Const { name: head, .. } = current.node() else {
+            panic!("{name}: result type is not headed by a constant");
+        };
+        assert_eq!(
+            head.to_display_string(),
+            induct_name,
+            "{name}: result is headed by a foreign inductive, which the kernel rejects"
+        );
+        assert_eq!(
+            arguments,
+            (induct.num_params + induct.num_indices) as usize,
+            "{name}: result applies the wrong number of arguments; the head can be right while \
+             this is wrong, and it would surface as a regenerated-recursor mismatch"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 150,
+        "the constructor census must be reached, got {checked}"
+    );
+}
