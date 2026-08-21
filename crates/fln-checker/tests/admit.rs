@@ -1797,6 +1797,23 @@ fn kr600_803_init_bool_refuses_a_forged_true_iota_rule() {
 }
 
 #[test]
+fn kr600_803_init_bool_fixture_pins_recursor_levels_motives_minors_and_rules() {
+    let entries = init_bool_entries();
+    let recursor = entries[3].declaration();
+    let metadata = recursor.recursor_metadata().expect("fixture recursor metadata");
+    assert_eq!(recursor.level_parameters().len(), 1);
+    assert_eq!(metadata.num_parameters(), 0);
+    assert_eq!(metadata.num_indices(), 0);
+    assert_eq!(metadata.num_motives(), 1);
+    assert_eq!(metadata.num_minors(), 2);
+    assert_eq!(metadata.rules().len(), 2);
+    assert_eq!(metadata.rules()[0].constructor(), &checker_qualified(&["Bool", "false"]));
+    assert_eq!(metadata.rules()[0].num_fields(), 0);
+    assert_eq!(metadata.rules()[1].constructor(), &checker_qualified(&["Bool", "true"]));
+    assert_eq!(metadata.rules()[1].num_fields(), 0);
+}
+
+#[test]
 fn kr600_803_init_punit_universes_constructor_and_iota_are_reconstructed() {
     let entries = init_punit_entries();
     let verdict = admit_inductive(&ConstantEnvironment::empty(), &entries, AdmissionBudget::unlimited(), EnvironmentBudget::unlimited());
