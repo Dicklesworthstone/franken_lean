@@ -992,6 +992,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateInitDataListToArrayResiduals",
+        1,
+        &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateInitDataListResiduals",
         4,
         &[
@@ -1550,6 +1556,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         ],
     );
     assert_human_named_residuals(&human.stdout, "decoded _private List.toArrayAux.match_N residuals", "decoded _private List.toArrayAux.match_N residual names", 1, &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"]);
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Init.Data.List.ToArrayImpl residuals",
+        "decoded _private Init.Data.List.ToArrayImpl residual names",
+        1,
+        &["_private.Init.Data.List.ToArrayImpl.0.List.toArrayAux.match_1"],
+    );
     assert_human_named_residuals(
         &human.stdout,
         "decoded _private Init.Data.List residuals",
