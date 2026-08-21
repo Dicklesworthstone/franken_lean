@@ -1642,6 +1642,18 @@ def main():
             "REFUSE: facade manifest bare-name probe pin diverges "
             f"({json.dumps(bare_names_probed_pin_join, sort_keys=True)})"
         )
+    class_provided_projections_pin_join = {
+        "summary_class_provided_projections": manifest_summary.get(
+            "class_provided_projections"
+        ),
+        "pinned_class_provided_projections": 5541,
+    }
+    if (class_provided_projections_pin_join["summary_class_provided_projections"]
+            != class_provided_projections_pin_join["pinned_class_provided_projections"]):
+        raise SystemExit(
+            "REFUSE: facade manifest class-projection pin diverges "
+            f"({json.dumps(class_provided_projections_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2719,6 +2731,7 @@ def main():
         "manifest_uncensused_emitted_pin_join": uncensused_emitted_pin_join,
         "manifest_uncensused_closure_pin_join": uncensused_closure_pin_join,
         "manifest_bare_names_probed_pin_join": bare_names_probed_pin_join,
+        "manifest_class_provided_projections_pin_join": class_provided_projections_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
