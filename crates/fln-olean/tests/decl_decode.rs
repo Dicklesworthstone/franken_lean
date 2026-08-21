@@ -11721,6 +11721,178 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The objects tile the file - stored sizes predict every next offset.
+///
+/// Every object stores its own extent: a constructor in `cs_sz`, an array as 24
+/// plus eight per capacity slot, a string as 32 plus its capacity in bytes. So
+/// an object's stored size PREDICTS where the next object begins, and that
+/// prediction can be checked against the actual offsets. Stored fields against
+/// observed layout - like `8cc7474c` and unlike the two before it, this is not
+/// one sum taken in two orders.
+///
+/// EVERY PREDICTION HOLDS. Sorting the walk by offset, each consecutive pair is
+/// exactly adjacent once the earlier object's end is rounded up to eight -
+/// 88,879 of 88,879 pairs in Prelude, and all of them in the fixtures. No gaps
+/// and no overlaps anywhere.
+///
+/// AND THE FILE CLOSES IT. The first object sits at offset 96, which is the
+/// 88-byte header plus the eight-byte root pointer, and
+/// `96 + sum of every extent and its padding` equals the FILE LENGTH exactly,
+/// in all four modules. So the reachable objects tile the file from the root
+/// pointer to end-of-file with nothing left over.
+///
+/// THAT IS A COMPLETENESS STATEMENT IN BYTES, which no earlier cell has made.
+/// `f4d108f7` showed nothing is unreferenced by counting in-degrees; this shows
+/// nothing is unreached by counting BYTES, and the two are independent - a
+/// region with an unreachable object would satisfy the in-degree partition and
+/// fail this one, since its bytes would appear as a gap.
+///
+/// NON-VACUITY: the extents are not uniform, so the prediction is doing work.
+/// Prelude has 80 DISTINCT extents ranging from 16 bytes to 17,656 - the last
+/// being the 2,204-element array of `c384f87e` - and even `Init.olean` has 20.
+/// If every object were the same size, "the next one starts where this one
+/// ends" would follow from the object count alone.
+///
+/// This also says the `mpz` limbs of `ddb61b49` are stored INSIDE their object
+/// rather than beside it: a separately-placed limb block would show up here as
+/// a gap, and there are none.
+///
+/// POPULATION SCOPE: all four modules, each asserted by name; every count is
+/// per module.
+#[test]
+fn the_objects_tile_the_file() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut rows: Vec<(String, usize, usize, usize, usize, usize, usize)> = Vec::new();
+    let mut spans: Vec<(String, usize, usize, usize, bool)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, _) = objects_of(bytes);
+        let mut sorted: Vec<Obj> = objects.clone();
+        sorted.sort_by_key(|object| object.off);
+
+        // The extent each object declares for itself.
+        let extent = |object: &Obj| -> usize {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                usize::from(object.cs_sz)
+            } else if object.tag == abi::TAG_ARRAY {
+                24 + 8 * usize::try_from(word_at(bytes, object.off + 16)).expect("capacity")
+            } else if object.tag == abi::TAG_STRING {
+                32 + usize::try_from(word_at(bytes, object.off + 16)).expect("capacity")
+            } else {
+                usize::from(object.cs_sz)
+            }
+        };
+
+        let extents: Vec<usize> = sorted.iter().map(extent).collect();
+        let mut exact = 0usize;
+        for (index, pair) in sorted.windows(2).enumerate() {
+            let end = pair[0].off + extents[index];
+            if end + (end.wrapping_neg() % 8) == pair[1].off {
+                exact += 1;
+            }
+        }
+        let distinct: BTreeSet<usize> = extents.iter().copied().collect();
+        rows.push((
+            module.clone(),
+            sorted.len(),
+            sorted.len() - 1,
+            exact,
+            distinct.len(),
+            *distinct.iter().next().expect("non-empty"),
+            *distinct.iter().next_back().expect("non-empty"),
+        ));
+
+        let occupied: usize = extents
+            .iter()
+            .map(|extent| extent + (extent.wrapping_neg() % 8))
+            .sum();
+        let first = sorted.first().expect("non-empty").off;
+        spans.push((
+            module.clone(),
+            first,
+            occupied,
+            bytes.len(),
+            first + occupied == bytes.len(),
+        ));
+    }
+
+    let keep = |all: Vec<(&str, usize, usize, usize, usize, usize, usize)>| {
+        all.into_iter()
+            .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b, c, d, e, f)| (m.to_owned(), a, b, c, d, e, f))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        rows,
+        keep(vec![
+            ("Init.olean", 158, 157, 157, 20, 24, 368),
+            ("Init.BinderNameHint.olean", 267, 266, 266, 24, 16, 136),
+            ("Init.SizeOfLemmas.olean", 795, 794, 794, 25, 16, 152),
+            ("Init/Prelude.olean", 88880, 88879, 88879, 80, 16, 17656),
+        ]),
+        "per module: objects, consecutive pairs, pairs where the earlier \
+         object's STORED extent lands exactly on the later one's offset after \
+         eight-byte rounding, then the distinct extents and their range. Every \
+         pair is exact - no gaps, no overlaps. The extents are far from \
+         uniform, 80 distinct values from 16 bytes to 17,656 in Prelude, so the \
+         prediction is doing work rather than following from the object count"
+    );
+    for (module, _, pairs, exact, ..) in &rows {
+        assert_eq!(
+            exact, pairs,
+            "{module}: every consecutive pair must be exactly adjacent"
+        );
+    }
+
+    assert_eq!(
+        spans
+            .iter()
+            .map(|(m, first, occupied, len, ok)| (m.as_str(), *first, *occupied, *len, *ok))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 96, 5688, 5784, true),
+            ("Init.BinderNameHint.olean", 96, 9696, 9792, true),
+            ("Init.SizeOfLemmas.olean", 96, 26984, 27080, true),
+            ("Init/Prelude.olean", 96, 3391288, 3391384, true),
+        ]
+        .into_iter()
+        .filter(|(m, ..)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "the first object's offset, the bytes its successors occupy including \
+         padding, the FILE LENGTH, and whether the first two sum to the third. \
+         96 is the 88-byte header plus the eight-byte root pointer, so the \
+         reachable objects tile the file from that pointer to end-of-file with \
+         nothing left over. That is a completeness statement in BYTES, \
+         independent of `f4d108f7`'s in-degree one: an unreachable object would \
+         satisfy that partition and leave a gap here"
+    );
+    for (module, first, occupied, len, _) in &spans {
+        assert_eq!(
+            first + occupied,
+            *len,
+            "{module}: the tiling must reach exactly end-of-file"
+        );
+    }
+}
+
 /// The string triple, checked against its own bytes - not a double count.
 ///
 /// A string object stores THREE numbers: `m_size` (bytes, terminator included),
