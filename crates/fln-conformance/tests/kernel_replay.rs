@@ -13799,6 +13799,31 @@ fn assert_string_terminator(key: &str, rest: &str, end: usize) -> Result<(), Str
     }
 }
 
+/// How many statements of a claim a line-by-line scan cannot see.
+///
+/// The document guard below decides per LINE whether a line states the
+/// determinism claim, and then whether that line names its scope. A claim broken
+/// across a line break is stated by neither half, so it is qualified by nobody
+/// and counted by nothing -- the scan silently redefines its own denominator,
+/// which is a failure this repository has met before under a different name.
+///
+/// Measured at this commit: zero sites in either document are hidden this way,
+/// so the population is empty and the synthetic member below is what keeps the
+/// rule honest. The first measurement I took said two were hidden; it compared
+/// LINES CONTAINING the phrase against OCCURRENCES of it, which is the same
+/// denominator error one artifact up. The green control for a line stating the
+/// claim twice is there because of it.
+fn claim_sites_hidden_by_a_line_break(text: &str, needle: &str) -> usize {
+    let per_line: usize = text.lines().map(|line| line.matches(needle).count()).sum();
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .matches(needle)
+        .count();
+    collapsed.saturating_sub(per_line)
+}
+
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
     let rows = text
         .lines()
@@ -16905,10 +16930,43 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     // Both spellings, because `on-demand` does not contain `on demand` and the mutant that
     // taught me the first lesson also slipped past on the hyphen.
     const CADENCE: [&str; 3] = ["shortfall", "on demand", "on-demand"];
+    // THE SCAN DECIDES PER LINE, SO A WRAPPED CLAIM IS STATED BY NEITHER HALF.
+    // Demonstrated on synthetic documents rather than on the real ones, because
+    // at this commit no site in either file is hidden: an empty population needs
+    // a planted member or the rule below is unfalsifiable.
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break("the matrix runs {1, 8,\n32} threads\n", "{1, 8, 32}"),
+        1,
+        "a claim split across a line break must be counted as hidden, or the rule below cannot \
+         fire"
+    );
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break("a {1, 8, 32} claim\n", "{1, 8, 32}"),
+        0,
+        "an ordinary statement must not be reported as hidden"
+    );
+    // AND A LINE STATING IT TWICE IS NOT A HIDDEN SITE. This control exists
+    // because my first measurement of the real documents compared lines
+    // CONTAINING the phrase against OCCURRENCES of it and reported two hidden
+    // sites that do not exist.
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break("{1, 8, 32} and {1, 8, 32}\n", "{1, 8, 32}"),
+        0,
+        "two statements on one line are both visible to a per-line scan; counting lines instead \
+         of occurrences is what makes them look hidden"
+    );
+
     let mut checked = 0usize;
     for doc in ["AGENTS.md", "README.md"] {
         let text = fs::read_to_string(repo.join(doc))
             .unwrap_or_else(|error| panic!("{doc} must be readable: {error}"));
+        assert_eq!(
+            claim_sites_hidden_by_a_line_break(&text, "{1, 8, 32}"),
+            0,
+            "{doc} states the {{1, 8, 32}} claim across a line break, where this scan decides per \
+             line: neither half states it, so no half is required to name its scope and the \
+             claim stands unqualified while this guard reports green"
+        );
         for (index, line) in text.lines().enumerate() {
             if line.contains("matrix") {
                 for stale in STALE {
