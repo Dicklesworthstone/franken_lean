@@ -3132,6 +3132,27 @@ def main():
             "REFUSE: facade manifest type-roundtrip count must exceed "
             f"structural-declaration count ({json.dumps(roundtrip_structural_inequality_join, sort_keys=True)})"
         )
+    field_set_inductive_inequality_join = {
+        "summary_field_sets_checked": manifest_summary.get("field_sets_checked"),
+        "summary_inductive_declarations": manifest_summary.get(
+            "inductive_declarations"
+        ),
+    }
+    if (not isinstance(field_set_inductive_inequality_join[
+            "summary_field_sets_checked"], int)
+            or isinstance(field_set_inductive_inequality_join[
+                "summary_field_sets_checked"], bool)
+            or not isinstance(field_set_inductive_inequality_join[
+                "summary_inductive_declarations"], int)
+            or isinstance(field_set_inductive_inequality_join[
+                "summary_inductive_declarations"], bool)
+            or field_set_inductive_inequality_join["summary_field_sets_checked"]
+            <= field_set_inductive_inequality_join[
+                "summary_inductive_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest field-set count must exceed inductive "
+            f"declaration count ({json.dumps(field_set_inductive_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5216,6 +5237,9 @@ def main():
         ),
         "manifest_roundtrip_structural_inequality_join": (
             roundtrip_structural_inequality_join
+        ),
+        "manifest_field_set_inductive_inequality_join": (
+            field_set_inductive_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
