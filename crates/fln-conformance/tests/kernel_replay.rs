@@ -17442,6 +17442,43 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
         );
         cursor = rest;
     }
+    // AND THE ALLOWANCE IS GLOBAL WHILE THE CLASSES ARE REGIONAL. The list says
+    // which tokens this file may state; the loop below says each must be stated
+    // SOMEWHERE. Neither says WHERE. So the oracle census -- which scores the
+    // corpus at exactly one pinned width and whose own row must say it measured
+    // nothing about schedules -- could state
+    // `schedule_independence=observed_once_not_an_invariant` and pass every
+    // check here: the token is permitted, it is present, and assertion 5 goes on
+    // checking each region's CODE, which would not have changed. A census
+    // claiming an observation its run cannot earn is the exact failure this
+    // guard exists to prevent, and the allowance was letting it through the
+    // middle.
+    //
+    // Measured today: `not_measured_in_this_run` twice in the oracle region and
+    // nowhere else; the observation and refutation classes once each, both in
+    // the matrix region. The partition is real and was held by nothing.
+    //
+    // Only the strengthening direction is refused. The matrix stating the
+    // oracle's weaker class would be a WEAKENING -- a run that declines to claim
+    // what it could -- and that is not this guard's business to forbid.
+    const STRONGER_THAN_A_SINGLE_WIDTH_EARNS: [&str; 2] = [
+        "observed_once_not_an_invariant",
+        "refuted_this_run_found_a_width_disagreement",
+    ];
+    for stronger in STRONGER_THAN_A_SINGLE_WIDTH_EARNS {
+        assert!(
+            !oracle_code.contains(&format!("schedule_independence={stronger}")),
+            "the oracle census states `{stronger}`, but it scores the corpus at ONE pinned \
+             width. A run that never varies the schedule cannot observe schedule independence \
+             or refute it, whichever of the two this is"
+        );
+    }
+    assert!(
+        oracle_code.contains("schedule_independence=not_measured_in_this_run"),
+        "the oracle census no longer states the one class its run earns, so the refusal above \
+         is guarding a region that has stopped making the claim at all"
+    );
+
     for permitted in PERMITTED_CLASSES {
         assert!(
             code.contains(&format!("schedule_independence={permitted}")),
