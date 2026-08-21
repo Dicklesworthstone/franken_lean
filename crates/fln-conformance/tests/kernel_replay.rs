@@ -8118,7 +8118,10 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
     };
 
     let mut tokens = vec!["accepted".to_string(), "internal_fault".to_string()];
-    for class in reject_class_variants_from_source() {
+    // BOUND RATHER THAN CONSUMED, so the assertion below can count against the
+    // population instead of against a literal that was true when it was typed.
+    let reject_classes = reject_class_variants_from_source();
+    for class in &reject_classes {
         tokens.push(format!("rejected:{class}"));
     }
     for reason in [
@@ -8212,9 +8215,19 @@ fn the_outcome_router_and_the_family_census_agree_on_direction() {
         accepted, 1,
         "exactly one token should route as an agreement"
     );
-    assert!(
-        rejected >= 17,
-        "every kernel rejection class should have routed as a rejection; {rejected} did"
+    // EVERY CLASS, NOT SEVENTEEN OF THEM. This read `rejected >= 17`, a count of
+    // the kernel's rejection classes written by hand beside the population it
+    // counts. There are seventeen today, so it was exact when typed and silently
+    // becomes a floor with slack the moment an eighteenth is added: the scan
+    // yields eighteen tokens, seventeen route as rejections, one does not, and
+    // `>= 17` still passes. Derived from the same list the tokens were built
+    // from, and equal rather than at-least, because every class token routes as
+    // a rejection or the router is wrong about one of them.
+    assert_eq!(
+        rejected as usize,
+        reject_classes.len(),
+        "every kernel rejection class should have routed as a rejection; {rejected} of {} did",
+        reject_classes.len()
     );
     assert!(
         no_answer >= 1 + StructuralUnit::ALL.len() as u32,
@@ -12112,11 +12125,17 @@ fn every_kernel_rejection_class_yields_a_legal_family_token() {
         "two entries of the array render to the same Debug string"
     );
     let declared = reject_class_variants_from_source();
+    // AND THE SAME LITERAL AGAIN, IN THE TEST THAT EXISTS TO CATCH THE ENUM
+    // GROWING. `all` above lists seventeen variants and this floor said
+    // seventeen: exact when typed, slack forever after. Derived from the array
+    // in this very scope, so adding a variant to the enum and to `all` raises
+    // the floor with it.
     assert!(
-        declared.len() >= 17,
-        "the RejectClass scan found only {} variant(s); a scan that parsed nothing would make \
-         every check below vacuous",
-        declared.len()
+        declared.len() >= all.len(),
+        "the RejectClass scan found only {} variant(s) for the {} this test lists; a scan that \
+         parsed nothing would make every check below vacuous",
+        declared.len(),
+        all.len()
     );
     assert_eq!(
         listed, declared,
