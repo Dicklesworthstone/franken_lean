@@ -86,6 +86,11 @@ pub enum DeclError {
     /// A chain was supplied for an artifact that is not a module-system
     /// module, which has no companions to compose.
     NotAModuleChain,
+    /// The three parts together exceed the caller's byte ceiling.
+    ChainTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 impl From<RegionError> for DeclError {
@@ -118,6 +123,10 @@ impl std::fmt::Display for DeclError {
                 "companion {} does not carry the exported part's identity stamp, so these \
                  regions are not one module's chain",
                 part.label()
+            ),
+            DeclError::ChainTooLarge { bytes, limit } => write!(
+                f,
+                "module-system chain is {bytes} bytes, over the {limit}-byte ceiling"
             ),
             DeclError::NotAModuleChain => write!(
                 f,
@@ -1201,6 +1210,42 @@ impl ChainConstants {
     }
 }
 
+/// Ceilings for composing one module-system chain.
+///
+/// Mirrors what `fln::OleanDecodeLimits` gives the product door: a byte ceiling
+/// charged against the three parts together before any of them is parsed, and
+/// the object budget the graph walk and declaration decoder run under. Two
+/// separate resources, because neither bounds the other — a region can be huge
+/// and hold few objects, or small and present a deeply shared graph.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainLimits {
+    /// Maximum combined size of the exported, server and private parts.
+    pub max_bytes: usize,
+    /// Object budget for each region's walk and for declaration decoding.
+    pub graph: WalkBudget,
+}
+
+impl ChainLimits {
+    /// Limits with an explicit byte ceiling and the default object budget.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            graph: WalkBudget::default(),
+        }
+    }
+}
+
+impl Default for ChainLimits {
+    /// The largest chain the pinned toolchain ships is
+    /// `Init.Data.BitVec.Lemmas` at 14,418,208 bytes across its three parts.
+    /// 64 MiB leaves more than four times that headroom while still refusing
+    /// an input that could only be hostile or corrupt. Callers holding
+    /// larger artifacts should state their own ceiling rather than raise this.
+    fn default() -> Self {
+        Self::new(64 * 1024 * 1024)
+    }
+}
+
 /// Decode a complete chain's constants with origin, straight from the three
 /// parts' bytes.
 ///
@@ -1235,8 +1280,28 @@ pub fn decode_chain_constants_from_parts(
     exported: &[u8],
     server: &[u8],
     private: &[u8],
-    budget: WalkBudget,
+    limits: ChainLimits,
 ) -> DResult<ChainConstants> {
+    // Charged BEFORE anything is parsed, so an oversized chain is refused
+    // rather than walked. The object budget below bounds the graph, not the
+    // input: a region can be enormous and still hold few objects, so a byte
+    // ceiling is the only thing that bounds the work this call will do at all.
+    let bytes = exported
+        .len()
+        .checked_add(server.len())
+        .and_then(|total| total.checked_add(private.len()))
+        .ok_or(DeclError::ChainTooLarge {
+            bytes: usize::MAX,
+            limit: limits.max_bytes,
+        })?;
+    if bytes > limits.max_bytes {
+        return Err(DeclError::ChainTooLarge {
+            bytes,
+            limit: limits.max_bytes,
+        });
+    }
+    let budget = limits.graph;
+
     let exported_view = OleanView::parse(exported)?;
     exported_view.shared_audit()?;
     exported_view.walk(budget)?;
@@ -1480,6 +1545,39 @@ mod tests {
         ),
     ];
 
+    /// The byte ceiling is charged before anything is parsed.
+    #[test]
+    fn a_chain_over_its_byte_ceiling_is_refused_before_parsing() {
+        let bytes = axiom_module(false);
+        let total = bytes.len() * 3;
+
+        // Positive control: the same input under a ceiling that admits it gets
+        // past the charge and fails later, on the module-system gate — proving
+        // the refusal below is the ceiling and not the fixture.
+        let admitted =
+            decode_chain_constants_from_parts(&bytes, &bytes, &bytes, ChainLimits::new(total))
+                .expect_err("a non-module artifact still has no chain");
+        assert_eq!(admitted, DeclError::NotAModuleChain, "{admitted:?}");
+
+        // One byte under the exact total must be refused, and refused as a
+        // size fault rather than anything downstream.
+        let error =
+            decode_chain_constants_from_parts(&bytes, &bytes, &bytes, ChainLimits::new(total - 1))
+                .expect_err("a chain over the ceiling must be refused");
+        assert_eq!(
+            error,
+            DeclError::ChainTooLarge {
+                bytes: total,
+                limit: total - 1,
+            },
+            "{error:?}"
+        );
+        assert!(
+            format!("{error}").contains("ceiling"),
+            "the rendered error must name the ceiling: {error}"
+        );
+    }
+
     /// A chain assembled from two DIFFERENT modules must be refused by identity,
     /// not decoded into a coherent-looking result for a module that exists
     /// nowhere.
@@ -1510,7 +1608,7 @@ mod tests {
         // Positive control first: the real chain must still decode, or the
         // refusal below would prove nothing about identity.
         let ok =
-            decode_chain_constants_from_parts(&exported, &server, &private, WalkBudget::default())
+            decode_chain_constants_from_parts(&exported, &server, &private, ChainLimits::default())
                 .expect("the module's own chain decodes");
         assert_eq!(
             ok.constants.len(),
@@ -1526,7 +1624,7 @@ mod tests {
             &exported,
             &server,
             &foreign_private,
-            WalkBudget::default(),
+            ChainLimits::default(),
         )
         .expect_err("a private companion from another module must be refused");
         assert!(
@@ -1540,7 +1638,7 @@ mod tests {
     fn a_non_module_artifact_is_not_accepted_as_a_chain() {
         let bytes = axiom_module(false);
         let error =
-            decode_chain_constants_from_parts(&bytes, &bytes, &bytes, WalkBudget::default())
+            decode_chain_constants_from_parts(&bytes, &bytes, &bytes, ChainLimits::default())
                 .expect_err("a non-module artifact has no companion chain");
         assert_eq!(error, DeclError::NotAModuleChain, "{error:?}");
     }
@@ -1583,7 +1681,7 @@ mod tests {
                 &exported,
                 &server,
                 &private,
-                WalkBudget::default(),
+                ChainLimits::default(),
             )
             .unwrap_or_else(|error| panic!("chain decode {module}: {error}"));
 
