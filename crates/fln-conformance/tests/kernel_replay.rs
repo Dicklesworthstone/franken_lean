@@ -6990,6 +6990,85 @@ fn a_fixture_tree_may_not_sit_where_another_fixtures_record_does() {
     );
 }
 
+/// A file named `.olean` is not an olean, and it is the only input that proves
+/// the filter is about the EXTENSION.
+///
+/// **The existing exactness decoys cannot kill the obvious wrong filter.**
+/// `the_inventory_vectors_are_parallel_and_the_extension_match_is_exact` plants
+/// `Ignored.OLEAN` and `NoExtension` and requires both to be skipped. Replace
+/// `path.extension() == Some("olean")` with `file_name().ends_with(".olean")` --
+/// the change anyone would make without thinking -- and that test still passes:
+/// `Ignored.OLEAN` differs in case, `NoExtension` has no dot, and both filters
+/// reject both. The mutant survives every assertion in this file.
+///
+/// **`.olean` is the discriminating input, measured.** `Path::extension` returns
+/// `None` for a name that begins with a dot and has no other, so the real filter
+/// skips it; the suffix test sees `.olean` ending in `.olean` and takes it. One
+/// file, opposite answers, and it was in no fixture.
+///
+/// **What the wrong filter would then do is worse than a miscount.** `.olean`
+/// strips to `.olean` -- there is no extension to remove -- so it projects to a
+/// module named `Fixture..olean`, whose middle segment has no characters. The
+/// walk refuses that, so the mutant does not quietly count one module too many:
+/// it makes the whole tree unwalkable, and the failure names an empty segment
+/// rather than the filter that admitted the file. This test kills it at the
+/// walk, where the cause is still visible.
+///
+/// **The decoy is asserted to be on disk**, because "a file that is not there
+/// was not collected" is a sentence about nothing.
+#[test]
+fn a_dotfile_named_like_an_extension_is_not_an_olean() {
+    // THE MECHANISM, LEXICALLY. The two filters agree on the old decoys and
+    // disagree here, which is the entire reason this fixture exists.
+    for (name, is_olean) in [(".olean", false), ("Real.olean", true)] {
+        assert_eq!(
+            Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("olean"),
+            is_olean,
+            "`{name}` must be judged by its EXTENSION"
+        );
+        assert!(
+            name.ends_with(".olean"),
+            "`{name}` must end with the suffix, or it does not distinguish the two filters"
+        );
+    }
+    for decoy in ["Ignored.OLEAN", "NoExtension"] {
+        assert!(
+            !decoy.ends_with(".olean"),
+            "`{decoy}` is rejected by the suffix filter too, which is why the older test cannot \
+             tell the two apart"
+        );
+    }
+
+    let library = write_inventory_fixture("t6r7-inventory-dotfile-v1", &["Real.olean", ".olean"]);
+    assert!(
+        library.join(".olean").is_file(),
+        "the decoy must be on disk; `a file that is not there was not collected` states nothing"
+    );
+
+    let OleanInventory { oleans, modules } = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| {
+            panic!(
+                "the tree must walk. A filter matching the `.olean` SUFFIX would have collected \
+                 the dotfile, projected it to a name with an empty segment, and failed here \
+                 instead: {reason}"
+            )
+        });
+
+    assert_eq!(
+        oleans.len(),
+        1,
+        "only `Real.olean` is an olean; a leading-dot name has no extension at all: {oleans:?}"
+    );
+    assert_eq!(
+        modules,
+        vec!["Fixture.Real".to_string()],
+        "the dotfile must contribute no module"
+    );
+}
+
 /// The walk and `module_names_below` are now two implementations of one meaning,
 /// and they must still agree.
 ///
