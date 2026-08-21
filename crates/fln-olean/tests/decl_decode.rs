@@ -10154,3 +10154,237 @@ fn the_six_inner_record_arrays() {
          base rate speaks to arrangement"
     );
 }
+
+/// The ten are not the same kind of object as the 111 - and here size DOES
+/// separate them.
+///
+/// `7e1ab465` called this "a parallel copy of the same structure" and noted the
+/// shapes match at every level. The shapes do. The contents at this level do
+/// not, and the phrase overstates what was measured - the skeleton is parallel,
+/// the things hanging on it are a different kind:
+///
+///              the 111                    the ten
+///   size       40                         32
+///   field 0    tag 2 arity 2, ALL         tag 1 arity 2, all
+///   field 1    a name, ALL                an ARRAY, all
+///   field 2    six expression shapes      tag 0 arity 2 once, tag 5 arity 1 nine
+///
+/// EVERY COMPARISON GROUP SITS AT A RATE OF ONE, so all four contrasts are
+/// decisive rather than suggestive. The 111 are `tag 2` at field 0, a name at
+/// field 1 and forty bytes without exception; the ten are none of those without
+/// exception. This is not the population-of-one case `1006bd18` found nor the
+/// uniform-property case `f2da5b0e` found - the properties vary across the
+/// union and agree perfectly within each side.
+///
+/// AND SIZE SEPARATES THEM, which is the complement to `8a1b98cb`. There, three
+/// record populations shared tag, arity AND size, and only the fields told them
+/// apart - so size was shown insufficient. Here the sizes differ, 32 against
+/// 40, and size alone would have sufficed. Neither result generalises: size is
+/// evidence when it differs and silence when it does not, which is all
+/// `2baabd20` ever licensed.
+///
+/// The field-0 names are `Decidable` eight times and `EStateM` twice, against
+/// `_uniq` for all 111. Those SPELLINGS are the fragile part, read with this
+/// file's own string walker, flagged as at `aec3efd1` and `3373af3b`. The
+/// structural contrast - a string link where the 111 have a numbered one -
+/// needs no byte of that decoding.
+#[test]
+fn the_ten_triples_are_not_the_same_kind() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut sizes: std::collections::BTreeMap<String, BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    let mut roots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut overlap = 0usize;
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape = |off: usize| at.get(&off).map(|o| (o.tag, o.other));
+        let described = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            if resolve(word_at(bytes, object.off + 16)).and_then(shape) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && shape(head) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        // The 111.
+        let mut known: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(array) = resolve(word_at(bytes, record + 8 + 8 * 2)) {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        known.insert(element);
+                    }
+                }
+            }
+        }
+
+        // The ten, through the `tag 4` wrappers.
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for &record in &records {
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && shape(target) == Some((0, 2))
+            {
+                seeds.insert(target);
+            }
+        }
+        let mut ten: BTreeSet<usize> = BTreeSet::new();
+        for &node in &seeds {
+            if let Some(tail) = resolve(word_at(bytes, node + 16))
+                && shape(tail) == Some((4, 1))
+                && let Some(inner) = resolve(word_at(bytes, tail + 8))
+                && let Some(array) = resolve(word_at(bytes, inner + 8 + 8 * 3))
+            {
+                for i in 0..word_at(bytes, array + 8) {
+                    if let Some(element) = resolve(word_at(bytes, array + 24 + 8 * i as usize))
+                        && shape(element) == Some((0, 3))
+                    {
+                        ten.insert(element);
+                    }
+                }
+            }
+        }
+        overlap += known.intersection(&ten).count();
+
+        for (label, group) in [("111", &known), ("ten", &ten)] {
+            for &triple in group {
+                *counts.entry(format!("{label}/population")).or_default() += 1;
+                sizes
+                    .entry(label.to_owned())
+                    .or_default()
+                    .insert(at.get(&triple).expect("resolved").cs_sz);
+                for slot in 0..3usize {
+                    let field = resolve(word_at(bytes, triple + 8 + 8 * slot))
+                        .expect("a triple field is a pointer");
+                    *counts
+                        .entry(format!("{label}/field {slot}/{}", described(field)))
+                        .or_default() += 1;
+                }
+                // Field 0's root component, via the production decoder.
+                let name = DeclDecoder::new(&view, WalkBudget::default())
+                    .decode_name(word_at(bytes, triple + 8))
+                    .unwrap_or_else(|e| panic!("{module}: field 0 must be a Name: {e}"))
+                    .to_display_string();
+                *roots
+                    .entry(format!(
+                        "{label}/{}",
+                        name.split('.').next().unwrap_or_default()
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert!(
+            counts.is_empty(),
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    let get = |key: &str| counts.get(key).copied().unwrap_or_default();
+
+    assert_eq!(
+        (get("111/population"), get("ten/population"), overlap),
+        (111, 10, 0),
+        "the two populations and their overlap"
+    );
+
+    // Four categorical contrasts, each against a comparison group at rate one.
+    assert_eq!(
+        (
+            get("111/field 0/tag 2 arity 2"),
+            get("ten/field 0/tag 1 arity 2"),
+        ),
+        (111, 10),
+        "field 0: the 111 are a numbered link WITHOUT EXCEPTION, the ten a \
+         string link without exception"
+    );
+    assert_eq!(
+        (
+            get("111/field 1/tag 1 arity 2") + get("111/field 1/tag 2 arity 2"),
+            get("ten/field 1/tag 246 arity 0"),
+        ),
+        (111, 10),
+        "field 1: a name in all 111, an ARRAY in all ten"
+    );
+    assert_eq!(
+        (
+            get("ten/field 2/tag 5 arity 1"),
+            get("ten/field 2/tag 0 arity 2"),
+        ),
+        (9, 1),
+        "field 2: two shapes here, against the six the 111 admit"
+    );
+
+    // Size, which separates here and did not at `8a1b98cb`.
+    assert_eq!(
+        (
+            sizes
+                .get("111")
+                .map(|s| s.iter().copied().collect::<Vec<_>>()),
+            sizes
+                .get("ten")
+                .map(|s| s.iter().copied().collect::<Vec<_>>()),
+        ),
+        (Some(vec![40]), Some(vec![32])),
+        "the sizes DIFFER, 40 against 32 - so size alone would have separated \
+         these, where at `8a1b98cb` three record populations shared tag, arity \
+         and size and only the fields told them apart. Size is evidence when it \
+         differs and silence when it does not"
+    );
+
+    // The fragile part, flagged.
+    assert_eq!(
+        roots.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("111/_uniq".to_owned(), 111),
+            ("ten/Decidable".to_owned(), 8),
+            ("ten/EStateM".to_owned(), 2),
+        ],
+        "field 0's root component. The SPELLINGS come from this file's own \
+         string walker and are the fragile part; the structural contrast above \
+         needs no byte of that decoding"
+    );
+}
