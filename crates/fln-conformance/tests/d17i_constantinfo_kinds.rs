@@ -12460,3 +12460,123 @@ fn the_mutual_groups_split_across_two_kinds_that_record_safety_differently() {
         "and no genuinely Unsafe definition carries the suffix: {unsafe_defs:?}"
     );
 }
+
+/// Reducibility and safety are not independent: four of the nine joint cells
+/// are empty.
+///
+/// Both fields are pinned one margin at a time and never together. The hints
+/// cell asserts floors — `abbrev > 500 && heights.len() > 300 && opaque > 10` —
+/// with the exact 1,171 / 511 / 38 living only in its doc comment; the safety
+/// triple was pinned one cell ago. A margin says nothing about a joint
+/// distribution: the same two margins are satisfied by every table that adds up,
+/// including the one where reducibility says nothing about safety at all.
+///
+/// The artifact's table, rows `hints` and columns `safety`:
+///
+///             Safe   Partial   Unsafe
+///   Abbrev    1171         0        0
+///   Regular    506         0        5
+///   Opaque       0        32        6
+///
+/// The four zeros are the claim. No `Abbrev` is anything but safe; no `Opaque`
+/// hint is safe; and every one of the 32 `Partial` definitions carries an
+/// `Opaque` hint, so the elaborator marks the whole `_unsafe_rec` population
+/// irreducible rather than merely non-safe. The two fields therefore cannot be
+/// decoded independently and checked apart: a decode that read the safety byte
+/// off a neighbouring field would have to produce one of the four empty cells
+/// to be caught, and each margin alone would still balance.
+///
+/// The `Unsafe` column is the one that splits — 5 `Regular` against 6 `Opaque`
+/// — which is what stops "unsafe implies irreducible" being read off this table.
+///
+/// Conservation first: the nine cells must reproduce BOTH margins before any
+/// cell is named, so a table that balances one way and not the other cannot
+/// pass.
+#[test]
+fn reducibility_and_safety_leave_four_joint_cells_empty() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut table: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Defn(v) = info {
+            let hint = match v.hints {
+                ReducibilityHints::Abbrev => "Abbrev",
+                ReducibilityHints::Regular(_) => "Regular",
+                ReducibilityHints::Opaque => "Opaque",
+            };
+            let safety = match v.safety {
+                DefinitionSafety::Safe => "Safe",
+                DefinitionSafety::Partial => "Partial",
+                DefinitionSafety::Unsafe => "Unsafe",
+            };
+            *table.entry((hint, safety)).or_default() += 1;
+        }
+    }
+
+    // Conservation first, both ways: the cells must reproduce each margin.
+    let margin = |keys: [(&str, &str); 3]| -> usize {
+        keys.iter()
+            .map(|k| table.get(k).copied().unwrap_or(0))
+            .sum()
+    };
+    let by_hint = [
+        margin([
+            ("Abbrev", "Safe"),
+            ("Abbrev", "Partial"),
+            ("Abbrev", "Unsafe"),
+        ]),
+        margin([
+            ("Regular", "Safe"),
+            ("Regular", "Partial"),
+            ("Regular", "Unsafe"),
+        ]),
+        margin([
+            ("Opaque", "Safe"),
+            ("Opaque", "Partial"),
+            ("Opaque", "Unsafe"),
+        ]),
+    ];
+    let by_safety = [
+        margin([("Abbrev", "Safe"), ("Regular", "Safe"), ("Opaque", "Safe")]),
+        margin([
+            ("Abbrev", "Partial"),
+            ("Regular", "Partial"),
+            ("Opaque", "Partial"),
+        ]),
+        margin([
+            ("Abbrev", "Unsafe"),
+            ("Regular", "Unsafe"),
+            ("Opaque", "Unsafe"),
+        ]),
+    ];
+    assert_eq!(
+        by_hint.iter().sum::<usize>(),
+        by_safety.iter().sum::<usize>(),
+        "the two margins must be built from the same population"
+    );
+    assert_eq!(
+        by_hint,
+        [1171, 511, 38],
+        "the hint margin, which the hints cell states in prose and asserts only as floors"
+    );
+    assert_eq!(
+        by_safety,
+        [1677, 32, 11],
+        "the safety margin, pinned one cell earlier"
+    );
+
+    // The joint table. Four cells are absent, and that is the whole claim.
+    assert_eq!(
+        table,
+        BTreeMap::from([
+            (("Abbrev", "Safe"), 1171),
+            (("Regular", "Safe"), 506),
+            (("Regular", "Unsafe"), 5),
+            (("Opaque", "Partial"), 32),
+            (("Opaque", "Unsafe"), 6),
+        ]),
+        "five of the nine joint cells are populated; the four empty ones are the fact the \
+         margins cannot express"
+    );
+}
