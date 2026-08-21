@@ -2371,6 +2371,23 @@ def main():
             kernel_special_why[_n] = f"owner refused: {inductive_refused[_own]}"
         elif _own not in decl:
             kernel_special_why[_n] = "owner is outside the closure"
+        elif _own in structural_refused:
+            # MEASURED, do not retry this. Every row in this bucket is a
+            # single-constructor STRUCTURE whose `structure` block the pin
+            # refused, so it fell back to `axiom` and took its constructor with
+            # it. Writing it as an `inductive` instead does recover the
+            # constructor, and it was tried: 37 rows qualified, and because a
+            # structure written as an inductive is NOT interchangeable for the
+            # rows whose types are written against it, 10 further structures
+            # stopped elaborating with "Application type mismatch" and carried 3
+            # DEMANDED rows into quarantine -- 442 -> 439. Confining the fallback
+            # to rows nothing depends on restores 442 and fires ZERO times,
+            # because all 37 are depended on. The bucket is therefore a property
+            # of the structural refusal, and it is the structural block that has
+            # to be repaired, not this.
+            kernel_special_why[_n] = (
+                "owner is a structure whose structural block the pin refused: "
+                + structural_refused[_own])
         else:
             kernel_special_why[_n] = "owner is in the closure and was not declared"
     rows = [{
@@ -2463,6 +2480,17 @@ def main():
             and n not in provided and n not in structural and n not in transparent},
         "kernel_special_why": {
             k: v for k, v in sorted(kernel_special_why.items())},
+        "kernel_special_structure_fallback_measured": {
+            "candidates": 37,
+            "ungated_demanded_coverage": "442 -> 439",
+            "ungated_structures_lost": 15,
+            "ungated_quarantine": "37 -> 54",
+            "gated_to_dependency_leaves_fires": 0,
+            "verdict": "a refused structure written as an inductive recovers its "
+                       "constructor and breaks every row whose type is written "
+                       "against it; gating to rows nothing depends on is safe and "
+                       "empty. The repair belongs to the structural block.",
+        },
         "kernel_special_denominator_note": "wave 62 read 49 for this class and this "
             "run reads more from the SAME defect: the constructors of an inductive "
             "must be in the closure before an `inductive` block can be written for "
