@@ -11720,6 +11720,271 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The size rule fails for the numeric-name shape too - and in a worse place.
+///
+/// `daaaabe2` measured that size 24 does not identify a cons cell: 99 objects
+/// wear `(1, 2, 24)` without being one, which is what BLOCKS a size rule in
+/// `list_ptrs`. The saving grace there was location - `1dd7c288` measured 0 of
+/// those 99 reachable from `constants`, so the declaration graph never meets
+/// them.
+///
+/// This asks the same question of the OTHER two-field shape, `(2, 2)`, which is
+/// the numeric name component's form. The answer is worse in exactly the way
+/// that matters.
+///
+/// SIZE DOES NOT SEPARATE IT EITHER. Of Prelude's 1,938 `(2, 2)` objects, 1,826
+/// carry a boxed scalar in slot 1 and 112 carry a POINTER. Splitting by size
+/// does not sort them: `(2, 2, 24)` is 64 pointer-holders, but `(2, 2, 32)` is
+/// 1,826 boxed AND 48 pointer-holders. A decoder that accepted `(2, 2, 32)` and
+/// read slot 1 as a number would read 48 pointers as numbers.
+///
+/// I MEASURED THIS WRONG FIRST, and the shape of the mistake is worth keeping.
+/// Comparing the string-holders against the boxed ones gave a clean split - all
+/// 64 at size 24, all 1,826 at size 32 - and it looked like a discriminator. It
+/// is not: 48 of the 112 pointer-holders are NOT string-holders, and they sit
+/// at size 32 with the boxed ones. Two subsets agreed and the complement
+/// disagreed, and only counting the complement showed it.
+///
+/// AND THEY ARE INSIDE THE DECLARATION GRAPH. All 48 are reachable from
+/// `constants`; 7 from `entries` as well. That is the opposite of the 99, which
+/// `constants` never reaches. So the `(1, 2)` collision is blocked-but-remote
+/// and this one is blocked-and-local: the objects a size test would misread are
+/// exactly the ones a declaration walk visits.
+///
+/// NOT A PRELUDE ARTEFACT: `Init.SizeOfLemmas.olean` contains one such object,
+/// also reachable from `constants`, in a fixture of 26 arrays and 795 objects.
+///
+/// A FOUR-SHAPE FAMILY - one hop, not a closure. Both fields of all 48 resolve
+/// into the same four-shape set - `(1, 1, 24)`, `(2, 2, 32)`, `(3, 2, 32)`,
+/// `(4, 1, 24)` - and the set is identical for slot 0 and slot 1. That is ONE
+/// HOP from the 48 and nothing more; whether the family is closed under further
+/// hops is not measured here and the word `closed` is deliberately not used.
+/// This cell pins the set
+/// structurally and does NOT name the type: `c4cbf83c` was reddened for reading
+/// a shape as an identity, and a fourth shape sharing `(2, 2, 32)` would break
+/// any name I put on it.
+///
+/// WHAT THIS DOES NOT DO: it does not unblock `list_ptrs` and does not propose
+/// a rule. It generalises the block - tag, arity and size together do not
+/// identify a constructor across TYPES, and only the field a walk arrived
+/// through does.
+///
+/// POPULATION SCOPE: the cross-tab covers all four modules with the fixtures
+/// participating; the reachability facts are named per module.
+#[test]
+fn the_size_rule_fails_for_the_numeric_name_shape_too() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut cross: Vec<(String, Vec<((u16, &'static str), usize)>)> = Vec::new();
+    let mut in_constants: Vec<(String, usize, usize)> = Vec::new();
+    let mut non_cons_in_constants: Vec<(String, usize, usize)> = Vec::new();
+    let mut families: Vec<(String, Vec<(u8, u8, u16)>)> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let profile = |off: usize| at.get(&off).map(|o| (o.tag, o.other, o.cs_sz));
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let constants = reachable_from(bytes, base, word_at(bytes, root + 24));
+
+        let mut tally: std::collections::BTreeMap<(u16, &'static str), usize> =
+            std::collections::BTreeMap::new();
+        let mut pointer_at_32: Vec<usize> = Vec::new();
+        for object in &objects {
+            if (object.tag, object.other) != (2, 2) {
+                continue;
+            }
+            let word = word_at(bytes, object.off + 16);
+            let kind = if word & 1 == 1 {
+                "boxed"
+            } else if resolve(word).is_some() {
+                "pointer"
+            } else {
+                "unresolved"
+            };
+            *tally.entry((object.cs_sz, kind)).or_default() += 1;
+            if object.cs_sz == 32 && kind == "pointer" {
+                pointer_at_32.push(object.off);
+            }
+        }
+        cross.push((module.clone(), tally.into_iter().collect()));
+
+        // Where the counterexamples live.
+        let reached = pointer_at_32
+            .iter()
+            .filter(|off| constants.contains(off))
+            .count();
+        in_constants.push((module.clone(), pointer_at_32.len(), reached));
+
+        // The same question for the shape that blocks `list_ptrs`.
+        let mut non_cons = 0usize;
+        let mut non_cons_reached = 0usize;
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let cons_shaped = (second & 1 == 1 && second >> 1 == 0)
+                || resolve(second)
+                    .and_then(|t| at.get(&t))
+                    .map(|o| (o.tag, o.other))
+                    == Some((1, 2));
+            if cons_shaped {
+                continue;
+            }
+            non_cons += 1;
+            if constants.contains(&object.off) {
+                non_cons_reached += 1;
+            }
+        }
+        non_cons_in_constants.push((module.clone(), non_cons, non_cons_reached));
+
+        // What the counterexamples' own fields resolve to.
+        if !pointer_at_32.is_empty() {
+            let mut both: BTreeSet<(u8, u8, u16)> = BTreeSet::new();
+            for &off in &pointer_at_32 {
+                for slot in 0..2 {
+                    if let Some(child) = resolve(word_at(bytes, off + 8 + 8 * slot))
+                        && let Some(shape) = profile(child)
+                    {
+                        both.insert(shape);
+                    }
+                }
+            }
+            families.push((module.clone(), both.into_iter().collect()));
+        }
+    }
+
+    let keep = |all: Vec<(&str, usize, usize)>| -> Vec<(String, usize, usize)> {
+        all.into_iter()
+            .filter(|(m, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b)| (m.to_owned(), a, b))
+            .collect()
+    };
+
+    // Size does not sort slot 1.
+    assert_eq!(
+        cross
+            .iter()
+            .map(|(m, t)| (m.as_str(), t.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", vec![((32, "boxed"), 1)]),
+            (
+                "Init.BinderNameHint.olean",
+                vec![((24, "pointer"), 1), ((32, "boxed"), 9)]
+            ),
+            (
+                "Init.SizeOfLemmas.olean",
+                vec![((32, "boxed"), 5), ((32, "pointer"), 1)]
+            ),
+            (
+                "Init/Prelude.olean",
+                vec![
+                    ((24, "pointer"), 64),
+                    ((32, "boxed"), 1826),
+                    ((32, "pointer"), 48)
+                ]
+            ),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "`(2, 2)` objects by size and by what slot 1 holds. Size 32 carries \
+         BOTH 1,826 boxed scalars and 48 pointers, so a size test cannot decide \
+         whether slot 1 is a number. Comparing only the string-holders against \
+         the boxed ones gives a clean 24-versus-32 split and is wrong - the \
+         complement is what shows it"
+    );
+
+    // And they are where a declaration walk goes.
+    assert_eq!(
+        in_constants,
+        keep(vec![
+            ("Init.olean", 0, 0),
+            ("Init.BinderNameHint.olean", 0, 0),
+            ("Init.SizeOfLemmas.olean", 1, 1),
+            ("Init/Prelude.olean", 48, 48),
+        ]),
+        "every pointer-holder at size 32 is reachable from `constants` - 48 of \
+         48 in Prelude and 1 of 1 in a C3 fixture, so this is not a Prelude \
+         artefact"
+    );
+    assert_eq!(
+        non_cons_in_constants,
+        keep(vec![
+            ("Init.olean", 0, 0),
+            ("Init.BinderNameHint.olean", 0, 0),
+            ("Init.SizeOfLemmas.olean", 0, 0),
+            ("Init/Prelude.olean", 99, 0),
+        ]),
+        "against the shape that blocks `list_ptrs`, re-measured here rather \
+         than quoted: 99 non-cons objects at `(1, 2, 24)` and `constants` \
+         reaches NONE of them. So the cons collision is blocked-but-remote and \
+         this one is blocked-and-LOCAL - the objects a size test would misread \
+         are exactly the ones a declaration walk visits"
+    );
+
+    if !prelude_loaded {
+        return;
+    }
+
+    // Structurally, without naming a type.
+    assert_eq!(
+        families
+            .iter()
+            .map(|(m, f)| (m.as_str(), f.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Init.SizeOfLemmas.olean", vec![(1, 1, 24), (4, 1, 24)]),
+            (
+                "Init/Prelude.olean",
+                vec![(1, 1, 24), (2, 2, 32), (3, 2, 32), (4, 1, 24)]
+            ),
+        ],
+        "both fields of every counterexample resolve into a small shape set: \
+         four in Prelude, and in the fixture a SUBSET of those four, because \
+         one object cannot exhibit all of them. Pinned per module rather than \
+         merged - the first version of this assertion collapsed both into one \
+         set and would have claimed the fixture shows four shapes when it shows \
+         two. Left unnamed as well: `c4cbf83c` was reddened for reading a shape \
+         as an identity, and one of these four is `(2, 2, 32)` itself, the very \
+         shape this cell has just shown to be ambiguous"
+    );
+    assert!(
+        families.iter().all(|(_, f)| f.iter().all(|shape| families
+            .last()
+            .expect("Prelude last")
+            .1
+            .contains(shape))),
+        "and the fixture's set is contained in Prelude's, so the two are one \
+         family seen at two sizes rather than two different families"
+    );
+}
+
 /// The interned empty array: one object per module, thousands of references.
 ///
 /// `4d5fba7a` found ONE empty array object behind 2,178 slots of the
