@@ -2294,6 +2294,17 @@ fn kr600_803_init_sum_branches_recursor_and_iota_are_reconstructed() {
 }
 
 #[test]
+fn kr600_803_init_sum_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = init_sum_entries();
+    let metadata = entries[3]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("Sum")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_init_sum_refuses_a_forged_inr_iota_rule() {
     let mut entries = init_sum_entries();
     let declaration = entries[3].declaration();
