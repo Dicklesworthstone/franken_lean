@@ -2282,6 +2282,21 @@ def main():
             "REFUSE: facade manifest verified-distinct count diverges "
             f"({json.dumps(verified_distinct_emission_join, sort_keys=True)})"
         )
+    verified_pin_presence_count_join = {
+        "summary_emission_verified": manifest_summary.get("emission_verified"),
+        "summary_pin_presence_checked": manifest_summary.get(
+            "pin_presence_checked"
+        ),
+        "pinned_verified_pin_count": 2005,
+    }
+    if (verified_pin_presence_count_join["summary_emission_verified"]
+            != verified_pin_presence_count_join["pinned_verified_pin_count"]
+            or verified_pin_presence_count_join["summary_pin_presence_checked"]
+            != verified_pin_presence_count_join["pinned_verified_pin_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest verified-pin count diverges "
+            f"({json.dumps(verified_pin_presence_count_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3424,6 +3439,9 @@ def main():
         "manifest_withdrawn_cycle_zero_join": withdrawn_cycle_zero_join,
         "manifest_verified_distinct_emission_join": (
             verified_distinct_emission_join
+        ),
+        "manifest_verified_pin_presence_count_join": (
+            verified_pin_presence_count_join
         ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
