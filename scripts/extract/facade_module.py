@@ -543,6 +543,64 @@ def probe_init_substrate(lean, env, work, names):
     return sorted(failed.items()), len(names)
 
 
+def probe_transparent_values(lean, env, work, rows):
+    """Does each emitted VALUE denote the Reference's own term?
+
+    A transparent row exists so the facade UNFOLDS to what the Reference unfolds
+    to. The emitter had only ever shown that the value STRING elaborates — and a
+    pretty-printed term that elaborates is not the same claim as a term that means
+    what it meant: implicits get re-inferred, coercions get re-inserted, and the
+    result can be a perfectly well-typed different term. That would make the facade
+    disagree with the pin precisely where transparency was supposed to make them
+    agree, and nothing would say so.
+
+    The question is asked where BOTH terms exist — in the pin's own environment,
+    not the facade's — as `theorem flnval_i : @X = (<emitted value>) := rfl`. The
+    pin's kernel decides. A deliberately wrong equation rides along, so a probe
+    that stopped noticing failures cannot pass as agreement.
+
+    `rows` is [(name, level_params, emitted_value_string)].
+    """
+    if not rows:
+        return {}, 0
+    lines = ["import Lean"]
+    line_map = {}
+    for i, (name, levels, value) in enumerate(rows):
+        # The declared universes must be APPLIED to the constant, or they go
+        # unused in the statement and the pin rejects the theorem for that alone —
+        # which reads as 30 value mismatches that are really the probe's own bug.
+        binder = (".{" + ", ".join(levels) + "}") if levels else ""
+        lines.append(
+            f"theorem flnval_{i}{binder} : @{name}{binder} = ({value}) := rfl")
+        line_map[len(lines)] = name
+    decoy_name, decoy_levels, _ = rows[0]
+    _, _, other_value = rows[-1]
+    binder = (".{" + ", ".join(decoy_levels) + "}") if decoy_levels else ""
+    lines.append(f"theorem flnval_decoy{binder} : @{decoy_name}{binder} = "
+                 f"({other_value}) := rfl")
+    line_map[len(lines)] = "@@DECOY@@"
+    src = os.path.join(work, "values.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    proc = subprocess.run([lean, "-DmaxErrors=100000", src], capture_output=True,
+                          text=True, env=env, timeout=1800)
+    out = proc.stdout + proc.stderr
+    base = os.path.basename(src)
+    failed = {}
+    for m in re.finditer(rf"{re.escape(base)}:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)",
+                         out):
+        n = line_map.get(int(m.group(1)))
+        if n is not None and n not in failed:
+            failed[n] = ((m.group(2) or "-") + ": " + m.group(3))[:200]
+    if "@@DECOY@@" not in failed:
+        raise SystemExit(
+            "REFUSE: the transparent-value check accepted a deliberately wrong "
+            f"equation for {decoy_name} — it cannot tell the Reference's term from "
+            "another one, so the values it just pronounced faithful mean nothing")
+    failed.pop("@@DECOY@@")
+    return failed, len(rows)
+
+
 def probe_companions(lean, env, work):
     """Ask the pin which companions a structure and a class actually generate.
 
@@ -1590,6 +1648,27 @@ def main():
             f"{type_mismatches[listed[0]]}. A projection that resolves with the "
             "wrong type is worse than one that is missing: every consumer type"
             "-checks against a lie")
+    # The transparent rows are checked against the pin's own terms, using the
+    # value strings this run actually emitted.
+    value_rows = []
+    for name in sorted(transparent):
+        d = decl.get(name) or {}
+        val = (d.get("valuex") if name in value_explicit_for and d.get("valuex")
+               else d.get("value"))
+        if val and name not in quarantine:
+            value_rows.append(
+                (name, d["levels"].split(",") if d["levels"] else [], val))
+    value_mismatches, values_checked = probe_transparent_values(
+        lean, env, work, value_rows)
+    if value_mismatches:
+        listed = sorted(value_mismatches)[:8]
+        raise SystemExit(
+            f"REFUSE: {len(value_mismatches)} transparent rows do not unfold to the "
+            f"Reference's term: {listed} — first reason: "
+            f"{value_mismatches[listed[0]]}. A transparent row exists to agree with "
+            "the pin on defeq; one that unfolds to something else is a silent "
+            "disagreement exactly where agreement was the point")
+
     decoy_reason = unresolved_claims.pop(DECOY_NAME, None)
     if decoy_reason is None:
         raise SystemExit(
@@ -1761,6 +1840,13 @@ def main():
             "becomes _private.privtest.0.Foo.bar. The price is the module count "
             "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
+        "transparent_values_checked": values_checked,
+        "transparent_value_mismatches": sorted(value_mismatches),
+        "transparent_value_note": "each emitted transparent VALUE was equated to the "
+            "Reference's own constant in the PIN's environment (theorem ... := rfl), "
+            "so the pin's kernel decides whether the string denotes the same term; "
+            "a deliberately wrong equation rides along and the run refuses if it "
+            "passes",
         "projection_types_checked": len(type_checked),
         "projection_type_mismatches": sorted(type_mismatches),
         "projection_type_note": "each projection a structural block GENERATES was "
@@ -1847,7 +1933,7 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
-          f"projtypes={len(type_checked)} "
+          f"projtypes={len(type_checked)} values={values_checked} "
           f"mod_probed={len(pin_module)} mod_drift={len(module_disagreements)} "
           f"safe_probed={len(pin_safety)} "
           f"safe_drift={len(safety_disagreements)} "
