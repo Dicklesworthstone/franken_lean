@@ -84,6 +84,9 @@ the toolchain would report a perfect facade:
   * A CURATED-MODULE NON-VACUITY JOIN requires every declared curated module to
     contribute at least one toolchain-api demand. A zero-demand module cannot
     inflate the reported real-mathlib slice without producing evidence rows.
+  * An EXACT-DEMAND SUMMARY JOIN makes the artifact's declared toolchain-api
+    distinct-symbol count equal the union rebuilt for this rig's controls. A
+    stale summary cannot misstate the compiled denominator.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -162,6 +165,7 @@ def load_demand(path, part):
     makes ~95% of real usage unqualified, measured on this same slice)."""
     by_module = defaultdict(set)
     modules = None
+    declared_toolchain_api_demand = None
     unscoped = []
     uncensused = []
     partition_classes = Counter()
@@ -175,6 +179,7 @@ def load_demand(path, part):
                 if modules is not None:
                     raise SystemExit(f"REFUSE: {path} has multiple summaries")
                 modules = row.get("curated_modules", [])
+                declared_toolchain_api_demand = row.get("toolchain_api_demanded")
                 continue
             if row.get("kind") != "symbol":
                 continue
@@ -202,6 +207,11 @@ def load_demand(path, part):
     if len(set(modules)) != len(modules):
         raise SystemExit(f"REFUSE: {path} repeats a curated module — the per-module "
                          "denominator would be ambiguous")
+    if (not isinstance(declared_toolchain_api_demand, int)
+            or isinstance(declared_toolchain_api_demand, bool)):
+        raise SystemExit(
+            f"REFUSE: {path} summary has no integer toolchain_api_demanded count"
+        )
     if uncensused:
         raise SystemExit(
             "REFUSE: exact-demand census-partition join found uncensused symbols "
@@ -230,10 +240,18 @@ def load_demand(path, part):
             "toolchain-api demand (" + ", ".join(modules_without_demand[:8])
             + ") — a reported module must contribute compile evidence"
         )
+    rebuilt_distinct = len({name for names in by_module.values() for name in names})
+    if declared_toolchain_api_demand != rebuilt_distinct:
+        raise SystemExit(
+            "REFUSE: exact-demand summary join disagrees with rebuilt distinct "
+            f"toolchain demand (declared={declared_toolchain_api_demand}, "
+            f"rebuilt={rebuilt_distinct})"
+        )
     module_join = {
         "curated_modules": len(modules),
         "modules_with_demand": len(by_module),
         "toolchain_use_edges": sum(len(names) for names in by_module.values()),
+        "toolchain_distinct_symbols": rebuilt_distinct,
     }
     partition_join = dict(sorted(partition_classes.items()))
     return modules, by_module, module_join, partition_join
