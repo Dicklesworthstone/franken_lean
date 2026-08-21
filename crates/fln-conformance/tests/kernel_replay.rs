@@ -8617,6 +8617,104 @@ fn truncate_after(row: &str, needle: &str) -> String {
     row[..start + needle.len()].to_string()
 }
 
+/// The census taxonomy is CLOSED, and the `context:` convention was prose.
+///
+/// **What the prefixes are for.** `check_family_token`'s own documentation says
+/// the two context families carry a `context:` prefix "so a reader can tell a
+/// kernel outcome token from a context-construction reason". That is the whole
+/// interpretability of the TRIAGE line the driver publishes: a family beginning
+/// `rejected:` is a D23 finding, `inconclusive:` is an exhaustion,
+/// `internal_fault` is a bug, and `context:` is a module our side could not
+/// build an environment for. Nothing enforced it. Rename either constant to
+/// something unprefixed and every test still passes -- the grammar rule only
+/// requires a non-answer NOT to start with `rejected:` -- while the census gains
+/// a family a reader cannot place.
+///
+/// **Closed, not merely prefixed.** The stronger property is that these four
+/// shapes are ALL of them. A new emitter adding a fifth would put an
+/// unclassifiable family into a published census, and the triage line would
+/// still look complete. So the population is assembled from every source a run
+/// can draw on -- the kernel's rejection classes from its own source, the
+/// resource causes through the production formatter, the two context constants,
+/// and the internal-fault token -- and each is required to land in one of the
+/// four.
+///
+/// **All four must actually occur.** A taxonomy check over a population missing
+/// a shape proves less than it appears to, so the shapes seen are counted.
+#[test]
+fn every_family_token_a_run_can_emit_belongs_to_the_closed_taxonomy() {
+    // The constants' VALUES, as literals: one side is what the scorer writes,
+    // the other is the name the census is read under.
+    assert_eq!(
+        FAMILY_NO_DECLARATION_ENVELOPE,
+        "context:subject_has_no_declaration_envelope"
+    );
+    assert_eq!(
+        FAMILY_UNFAITHFUL_IMPORT_CONTEXT,
+        "context:import_context_not_faithfully_representable"
+    );
+
+    let mut tokens = vec![
+        FAMILY_NO_DECLARATION_ENVELOPE.to_string(),
+        FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(),
+        "internal_fault".to_string(),
+    ];
+    for class in reject_class_variants_from_source() {
+        tokens.push(format!("rejected:{class}"));
+    }
+    for reason in [
+        ResourceReason::ExecutionSteps,
+        ResourceReason::Cancelled,
+        ResourceReason::Memory { limit_bytes: 8 },
+    ] {
+        tokens.push(
+            resource_usage_facts(&ResourceUsage {
+                reason,
+                allowed: 1,
+                observed: 2,
+            })
+            .0,
+        );
+    }
+    for unit in StructuralUnit::ALL {
+        tokens.push(
+            resource_usage_facts(&ResourceUsage {
+                reason: ResourceReason::StructuralBudget { unit },
+                allowed: 1,
+                observed: 2,
+            })
+            .0,
+        );
+    }
+
+    let mut shapes = BTreeSet::new();
+    for token in &tokens {
+        let shape = if token.starts_with("rejected:") {
+            "a D23 finding"
+        } else if token.starts_with("inconclusive:") {
+            "an exhaustion"
+        } else if token.starts_with("context:") {
+            "an environment our side could not build"
+        } else if token == "internal_fault" {
+            "a bug in us"
+        } else {
+            panic!(
+                "`{token}` belongs to none of the four family shapes, so a census carrying it \
+                 would publish a row a reader cannot place. Either give it a prefix that says \
+                 what kind of thing it is, or widen this taxonomy deliberately"
+            )
+        };
+        shapes.insert(shape);
+    }
+
+    assert_eq!(
+        shapes.len(),
+        4,
+        "the population must exercise all four shapes; a taxonomy checked against three of them \
+         says nothing about the fourth. Saw: {shapes:?}"
+    );
+}
+
 /// The floors carry the receipt's whole anti-vacuity argument, and their VALUES
 /// rested on nothing.
 ///
