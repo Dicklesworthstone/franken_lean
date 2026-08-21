@@ -19,7 +19,10 @@ TWO MEASUREMENT BOUNDS, declared because both were paid for:
      extern-backed — a tidy-looking, entirely wrong answer. Values are unquoted at
      the join, and an empty join REFUSES rather than reporting "no resistance".
 
-Output: NDJSON, schema fln-facade-resistance/1, sorted by (bucket, name).
+Output: NDJSON, schema fln-facade-resistance/1, sorted by (partition, bucket,
+name). Every demanded symbol is present: toolchain-API rows feed the stub emitter;
+library-code and user-facing-data rows make the slice partition total rather than
+silently disappearing from the artifact.
 """
 
 import argparse
@@ -109,7 +112,13 @@ def load_exact_demand(path):
                     raise SystemExit(
                         f"REFUSE: {path}:{lineno} symbol row carries no census_key "
                         "— regenerate the exact-demand artifact first")
-                exact[row["name"]] = '"' + row["census_key"].replace('"', '\\"') + '"'
+                key = '"' + row["census_key"].replace('"', '\\"') + '"'
+                prior = exact.get(row["name"])
+                if prior is not None and prior != key:
+                    raise SystemExit(
+                        f"REFUSE: {path}:{lineno} gives {row['name']} two structural "
+                        f"keys ({prior!r}, {key!r})")
+                exact[row["name"]] = key
     if not exact:
         raise SystemExit(f"REFUSE: no symbol rows in {path} — an empty exact demand "
                          "would silently shrink the union to the lexical scan")
@@ -124,6 +133,33 @@ def bucket_of(row):
     if row.get("effect") not in ("pure", "", "-", "none"):
         return "R-EFFECT"
     return "R-NONE"
+
+
+def load_partition():
+    """Load the mechanical three-way partition without accepting ambiguous rows."""
+    partition = {}
+    with open(PARTITION, encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, 1):
+            if not line.startswith("partition\t"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 3:
+                raise SystemExit(
+                    f"REFUSE: {PARTITION}:{lineno} is a truncated partition row")
+            key, cls = cols[1], cols[2]
+            if cls not in ("toolchain-api", "library-code", "user-facing-data"):
+                raise SystemExit(
+                    f"REFUSE: {PARTITION}:{lineno} has unknown partition {cls!r}")
+            prior = partition.get(key)
+            if prior is not None and prior != cls:
+                raise SystemExit(
+                    f"REFUSE: {PARTITION}:{lineno} classifies {key!r} as both "
+                    f"{prior!r} and {cls!r}")
+            partition[key] = cls
+    if not partition:
+        raise SystemExit("REFUSE: partition census loaded zero rows — a broken load "
+                         "would make an empty facade look complete")
+    return partition
 
 
 def main():
@@ -154,14 +190,15 @@ def main():
         keys[cell] = n
         provenance[n] = "both" if n in provenance else "exact"
 
-    toolchain = set()
-    with open(PARTITION, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if not line.startswith("partition\t"):
-                continue
-            cols = line.rstrip("\n").split("\t")
-            if len(cols) >= 3 and cols[1] in keys and cols[2] == "toolchain-api":
-                toolchain.add(cols[1])
+    partition = load_partition()
+    unclassified = sorted((keys[key] for key in keys if key not in partition))
+    if unclassified:
+        raise SystemExit(
+            "REFUSE: demanded symbols absent from the mechanical partition: "
+            f"{unclassified[:8]}{' …' if len(unclassified) > 8 else ''} — "
+            "an unclassified symbol blocks the facade surface rather than being guessed")
+    partition_counts = Counter(partition[key] for key in keys)
+    toolchain = {key for key in keys if partition[key] == "toolchain-api"}
 
     rows = {}
     declared = observed = 0
@@ -204,12 +241,23 @@ def main():
             f'"members":{counts[bucket]}}}'
         )
     for bucket, name, row in out:
+        key = next(key for key, candidate in keys.items() if candidate == name)
         lines.append(
             f'{{"schema":"{SCHEMA}","kind":"symbol","bucket":"{bucket}",'
-            f'"name":"{name}","provenance":"{provenance[name]}",'
+            f'"name":"{name}","census_key":{key},'
+            f'"partition":"toolchain-api","provenance":"{provenance[name]}",'
             f'"safety":"{row.get("safety")}",'
             f'"effect":"{row.get("effect")}",'
             f'"extern":{"true" if row.get("extern") not in ("", "-") else "false"}}}'
+        )
+    for key, name in sorted(keys.items(), key=lambda pair: (partition[pair[0]], pair[1])):
+        cls = partition[key]
+        if cls == "toolchain-api":
+            continue
+        lines.append(
+            f'{{"schema":"{SCHEMA}","kind":"classified-non-api",'
+            f'"name":"{name}","census_key":{key},"partition":"{cls}",'
+            f'"provenance":"{provenance[name]}"}}'
         )
     for name in orphans:
         lines.append(
@@ -219,7 +267,10 @@ def main():
     lines.append(
         f'{{"schema":"{SCHEMA}","kind":"summary","tactic_files":{files},'
         f'"demanded_names":{len(demanded)},"exact_demanded":{len(exact)},'
-        f'"union_demanded":{len(provenance)},"toolchain_api":{len(toolchain)},'
+        f'"union_demanded":{len(provenance)},"classified":{len(keys)},'
+        f'"unclassified":0,"toolchain_api":{len(toolchain)},'
+        f'"library_code":{partition_counts["library-code"]},'
+        f'"user_facing_data":{partition_counts["user-facing-data"]},'
         f'"joined":{len(rows)},"orphans":{len(orphans)},'
         f'"resisting":{sum(counts[b] for b in ("R-EXTERN", "R-UNSAFE", "R-EFFECT"))},'
         f'"unresisting":{counts["R-NONE"]}}}'
