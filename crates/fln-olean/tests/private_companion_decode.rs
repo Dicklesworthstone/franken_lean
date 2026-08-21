@@ -143,6 +143,11 @@ const ARRAY_MAP_M_PROOF_AUXILIARIES: [&str; 2] = [
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_1",
     "_private.Init.Data.Array.BasicAux.0.Array.mapM'._proof_2",
 ];
+/// The private match definition generated for `Array.of_push_eq_push`.
+const ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1: &str =
+    "_private.Init.Data.Array.BasicAux.0.Array.of_push_eq_push.match_1_1";
+/// The pin's private array stores this definition in the BasicAux module.
+const ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1_MODULE: &str = "Init/Data/Array/BasicAux";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -941,6 +946,35 @@ fn array_map_m_go_requires_the_companion_and_keeps_its_real_kind() {
     assert!(
         is_concrete_recovery(&recovered),
         "private companion decoded {ARRAY_MAP_M_GO} only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_of_push_eq_push_match_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_of_push_eq_push_match_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1.to_owned()),
+        "the private companion of {ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1_MODULE} must retain \
+         {ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_OF_PUSH_EQ_PUSH_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
