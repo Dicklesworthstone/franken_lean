@@ -415,6 +415,10 @@ const ARRAY_OF_FN_GO_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 const ARRAY_OF_FN_GO_MATCH_1: &str = "_private.Init.Data.Array.Basic.0.Array.ofFn.go.match_1";
 /// The pin's private array stores this match helper in the basic module.
 const ARRAY_OF_FN_GO_MATCH_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The first generated proof theorem for `Array.popWhile`.
+const ARRAY_POP_WHILE_PROOF_1: &str = "_private.Init.Data.Array.Basic.0.Array.popWhile._proof_1";
+/// The pin's private array stores this theorem in the basic module.
+const ARRAY_POP_WHILE_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The generated match definition for `Array.mem_def`.
 const ARRAY_MEM_DEF_MATCH_1_1: &str =
     "_private.Init.Data.Array.Basic.0.Array.mem_def.match_1_1";
@@ -2540,6 +2544,35 @@ fn array_of_fn_go_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_OF_FN_GO_MATCH_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_pop_while_proof_theorem_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_pop_while_proof_theorem_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_POP_WHILE_PROOF_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_POP_WHILE_PROOF_1.to_owned()),
+        "the private companion of {ARRAY_POP_WHILE_PROOF_1_MODULE} must retain \
+         {ARRAY_POP_WHILE_PROOF_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_POP_WHILE_PROOF_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_POP_WHILE_PROOF_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_POP_WHILE_PROOF_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
