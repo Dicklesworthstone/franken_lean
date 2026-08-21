@@ -81,6 +81,9 @@ the toolchain would report a perfect facade:
   * A TYPE-DEPENDENCY TARGET JOIN resolves every non-manifest type dependency
     against the empty facade (Init only), while manifest targets must be unique.
     The generated closure cannot hide an undeclared dependency behind the pin.
+  * A CURATED-MODULE NON-VACUITY JOIN requires every declared curated module to
+    contribute at least one toolchain-api demand. A zero-demand module cannot
+    inflate the reported real-mathlib slice without producing evidence rows.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -220,8 +223,16 @@ def load_demand(path, part):
     if not by_module:
         raise SystemExit("REFUSE: no toolchain-api demand joined — an empty demand "
                          "compiles vacuously and reads as full facade coverage")
+    modules_without_demand = sorted(set(modules).difference(by_module))
+    if modules_without_demand:
+        raise SystemExit(
+            "REFUSE: curated-module non-vacuity join found module(s) with no "
+            "toolchain-api demand (" + ", ".join(modules_without_demand[:8])
+            + ") — a reported module must contribute compile evidence"
+        )
     module_join = {
         "curated_modules": len(modules),
+        "modules_with_demand": len(by_module),
         "toolchain_use_edges": sum(len(names) for names in by_module.values()),
     }
     partition_join = dict(sorted(partition_classes.items()))
