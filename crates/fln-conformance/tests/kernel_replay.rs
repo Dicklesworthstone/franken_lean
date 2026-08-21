@@ -17307,6 +17307,23 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         "a qualifier in the sentence that states the claim must still count, or the bound \
          reddens every honest site"
     );
+    // AND THE TWO RULES OF THE ALLOWANCE TIER MUST BE READ TOGETHER. This input
+    // is the whole point of the assertion above: the site count is ZERO while a
+    // claim is plainly present, because it is wrapped. A tier that reads only
+    // the count sees an unblemished document.
+    let wrapped_and_unqualified = "the matrix runs {1, 8,\n32} threads per commit\n";
+    assert_eq!(
+        unscoped_claim_sites(wrapped_and_unqualified, &QUALIFIERS, &CADENCE),
+        0,
+        "a wrapped claim is stated by neither half, so the per-line count cannot see it -- this \
+         is the reading that makes the document look clean"
+    );
+    assert_eq!(
+        claim_sites_hidden_by_a_line_break(wrapped_and_unqualified),
+        1,
+        "and the hidden-site rule must see exactly what the count cannot, or nothing in the \
+         allowance tier distinguishes this document from one that never made the claim"
+    );
     // AND THE STRICT TIER MUST NOT BE WEAKER THAN THE LENIENT ONE. The scanned
     // documents are checked with no allowance at all, and they were still asked
     // only whether the LINE mentions a qualifier -- so the tier that forgives
@@ -17453,6 +17470,23 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
         // therefore dropped out of the count and met neither rule -- a gap
         // between the two paths, opened by the commit that derived this scope.
         let unqualified = unscoped_claim_sites(&text, &QUALIFIERS, &CADENCE);
+        // AND A WRAPPED CLAIM CONSUMES NO ALLOWANCE, WHICH IS HOW A LEDGER READS
+        // CLEAN. The count above decides per line, so a claim split across a
+        // line break is stated by neither half, counts zero, and this document
+        // passes with its allowance untouched -- indistinguishable from a
+        // document that never made the claim. The scanned tier has been checked
+        // for this since the day the rule existed; the tier that ALLOWS sites
+        // never was, so the hole sat in the half where a site is permitted
+        // rather than forbidden. Measured across all 23 documents in scope:
+        // zero hidden sites today, so this asserts a property that holds and
+        // guards one that could stop holding silently.
+        assert_eq!(
+            claim_sites_hidden_by_a_line_break(&text),
+            0,
+            "{name} states the {{1, 8, 32}} determinism claim across a line break, where this \
+             count decides per line: neither half states it, so the site consumes no allowance \
+             and the document reads exactly like one that never made the claim"
+        );
         let allowed = UNSCANNED_ALLOWANCE
             .iter()
             .find(|(doc, _)| *doc == name)
