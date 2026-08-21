@@ -4499,6 +4499,7 @@ impl CorpusMatrixReceipt {
     fn from_row(row: &str) -> Result<CorpusMatrixReceipt, String> {
         fn text(row: &str, key: &str) -> Result<String, String> {
             let needle = format!("\"{key}\":\"");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing string field `{key}`"))?
@@ -4511,6 +4512,7 @@ impl CorpusMatrixReceipt {
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
             let needle = format!("\"{key}\":");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing numeric field `{key}`"))?
@@ -4525,6 +4527,7 @@ impl CorpusMatrixReceipt {
         }
         fn array<'a>(row: &'a str, key: &str) -> Result<&'a str, String> {
             let needle = format!("\"{key}\":[");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing array field `{key}`"))?
@@ -11384,6 +11387,7 @@ impl WholeMathlibReceipt {
     fn from_row(row: &str) -> Result<WholeMathlibReceipt, String> {
         fn text(row: &str, key: &str) -> Result<String, String> {
             let needle = format!("\"{key}\":\"");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing string field `{key}`"))?
@@ -11396,6 +11400,7 @@ impl WholeMathlibReceipt {
         }
         fn number(row: &str, key: &str) -> Result<u64, String> {
             let needle = format!("\"{key}\":");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing numeric field `{key}`"))?
@@ -11410,6 +11415,7 @@ impl WholeMathlibReceipt {
         }
         fn strings(row: &str, key: &str) -> Result<Vec<String>, String> {
             let needle = format!("\"{key}\":[");
+            assert_field_once(row, key, &needle)?;
             let start = row
                 .find(&needle)
                 .ok_or_else(|| format!("missing array field `{key}`"))?
@@ -12691,6 +12697,34 @@ fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
         "the parsed row must equal what produced it"
     );
 
+    // A FIELD NAMED TWICE. This reader finds the FIRST match and a JSON reader
+    // takes the last, so before this commit the row below passed every floor
+    // here -- 700_000 decoded declarations -- while `jq` over the same file
+    // reported 1. Measured, both readings, on one row. The duplicate is refused
+    // rather than resolved: whichever value was meant, a row that says both is
+    // not evidence.
+    let doubled = row.replace("\"decoded\":", "\"decoded\":1,\"filler\":0,\"decoded\":");
+    assert_eq!(
+        doubled.matches("\"decoded\":").count(),
+        2,
+        "the planted row must really name the field twice: {doubled}"
+    );
+    // Matched rather than `expect_err`, which would need the receipt to be
+    // `Debug`; what matters if this ever parses is which value it took.
+    let doubled_reason = match WholeMathlibReceipt::from_row(&doubled) {
+        Err(reason) => reason,
+        Ok(read) => panic!(
+            "a row naming `decoded` twice was read anyway, as {}; a JSON reader would have taken \
+             the other value",
+            read.decoded
+        ),
+    };
+    assert!(
+        doubled_reason.contains("decoded") && doubled_reason.contains("more than once"),
+        "the refusal must name the duplicated field and say what is wrong with it: \
+         {doubled_reason}"
+    );
+
     // EACH CELL NAMES THE REFUSAL IT EXPECTS. Until now every one of these
     // asserted only `is_err()`, and `from_row` has SEVEN distinct refusal kinds
     // -- so a reader that rejected everything at the schema check would have
@@ -13437,6 +13471,26 @@ fn read_retained_rows(path: &Path) -> Result<Option<String>, String> {
 ///
 /// Returning `Result` is what lets the controls assert a LATER row is caught;
 /// an assertion inside cannot be caught.
+/// A field named twice makes a row mean two things at once.
+///
+/// These readers locate a field with `str::find`, which takes the FIRST match.
+/// A JSON reader takes the last. So a row carrying `"decoded":700000` and later
+/// `"decoded":1` passes every floor here while `jq` over the same file reports a
+/// number below all of them -- measured, both readings, on one row. The retained
+/// file is editable by hand, which is the only reason that matters.
+///
+/// Refusing the duplicate removes the disagreement rather than picking a winner:
+/// whichever value was meant, a row that says both is not evidence.
+fn assert_field_once(row: &str, key: &str, needle: &str) -> Result<(), String> {
+    if row.matches(needle).count() > 1 {
+        return Err(format!(
+            "field `{key}` appears more than once. This reader takes the first value and a JSON \
+             reader takes the last, so the row would mean different things to different readers"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_retained_receipts(text: &str, pin: &str, corpus_commit: &str) -> Result<usize, String> {
     let rows = text
         .lines()
