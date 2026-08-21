@@ -11720,6 +11720,298 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The interned empty array: one object per module, thousands of references.
+///
+/// `4d5fba7a` found ONE empty array object behind 2,178 slots of the
+/// `exportedAxiomsExt` payload and called it sharing. That was a fact about one
+/// extension. This asks the module-wide question, and the answer is stronger:
+/// EVERY module here contains EXACTLY ONE zero-length array object, and every
+/// reference to an empty array in the whole file resolves to it. So the payload
+/// slots are not sharing an array with each other, they are naming the module's
+/// single empty array - which the payload has no special claim on.
+///
+/// That makes the earlier finding a corollary rather than a separate fact, and
+/// this cell does not re-assert it: with exactly one such object, any set of
+/// empty-array references trivially points at the same one.
+///
+/// OBJECTS AGAINST OCCURRENCES, WITH A REAL COUNTEREXAMPLE. In Prelude 2,999
+/// slots name it, from 2,932 DISTINCT objects - the two differ because 62
+/// objects name it more than once. `Init.olean` is the sharp case: THREE slots,
+/// ONE holder. That holder is the `ModuleData` root itself, which stores the
+/// empty array as its `constNames`, its `constants` AND its
+/// `extraConstNames` - a module that declares nothing spends three of its five
+/// roots on one object. A walk counting occurrences would report three holders
+/// there and be wrong by a factor of three.
+///
+/// The multiplicity histogram is pinned per module and reconciled against both
+/// totals, so it cannot drift from either.
+///
+/// DISCRIMINATING POWER: Prelude holds 2,434 array objects and 2,999 references
+/// to an empty one. Without interning there could be up to 2,999 zero-length
+/// arrays; there is one. The count is not a consequence of arrays being scarce.
+///
+/// NOT UNIFORM, AND PINNED PER MODULE BECAUSE OF IT. The set of `ModuleData`
+/// roots that reaches the empty array is DIFFERENT IN ALL FOUR MODULES -
+/// `{constNames, constants, extraConstNames}`, `{entries}`,
+/// `{extraConstNames, entries}`, `{imports, entries}`. Every blanket sentence I
+/// could write about where it lives is false in at least one module. The number
+/// of distinct holder SHAPES varies too: 1, 2, 2 and 8.
+///
+/// POPULATION SCOPE: all four modules, fixtures participating, each pinned by
+/// name rather than pooled into a total that could hide a zero.
+#[test]
+fn the_interned_empty_array() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut counts: Vec<(String, usize, usize)> = Vec::new();
+    let mut references: Vec<(String, usize, usize)> = Vec::new();
+    let mut histograms: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+    let mut shapes_seen: Vec<(String, usize)> = Vec::new();
+    let mut root_sets: Vec<(String, Vec<&'static str>)> = Vec::new();
+    let mut dimensions: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut empty_root_slots: Vec<u64> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        // Every array object, and the zero-length ones among them.
+        let arrays: Vec<usize> = objects
+            .iter()
+            .filter(|o| o.tag == abi::TAG_ARRAY)
+            .map(|o| o.off)
+            .collect();
+        let empties: Vec<usize> = arrays
+            .iter()
+            .copied()
+            .filter(|&off| word_at(bytes, off + 8) == 0)
+            .collect();
+        counts.push((module.clone(), arrays.len(), empties.len()));
+        if empties.len() != 1 {
+            references.push((module.clone(), 0, 0));
+            histograms.push((module.clone(), Vec::new()));
+            shapes_seen.push((module.clone(), 0));
+            root_sets.push((module.clone(), Vec::new()));
+            continue;
+        }
+        let empty = empties[0];
+        dimensions.insert((word_at(bytes, empty + 8), word_at(bytes, empty + 16)));
+
+        // Slots against holders, per OBJECT.
+        let mut histogram: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        let mut shapes: BTreeSet<(u8, u8)> = BTreeSet::new();
+        let mut slots = 0usize;
+        let mut holders = 0usize;
+        for object in &objects {
+            let mut names_it = 0usize;
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                for slot in 0..usize::from(object.other) {
+                    if resolve(word_at(bytes, object.off + 8 + 8 * slot)) == Some(empty) {
+                        names_it += 1;
+                    }
+                }
+            } else if object.tag == abi::TAG_ARRAY {
+                for i in 0..word_at(bytes, object.off + 8) {
+                    if resolve(word_at(bytes, object.off + 24 + 8 * i as usize)) == Some(empty) {
+                        names_it += 1;
+                    }
+                }
+            }
+            if names_it == 0 {
+                continue;
+            }
+            slots += names_it;
+            holders += 1;
+            *histogram.entry(names_it).or_default() += 1;
+            shapes.insert((object.tag, object.other));
+        }
+        references.push((module.clone(), slots, holders));
+        shapes_seen.push((module.clone(), shapes.len()));
+
+        // The histogram must reconcile with BOTH totals, or it has drifted.
+        assert_eq!(
+            histogram.values().sum::<usize>(),
+            holders,
+            "{module}: the multiplicity histogram must account for every holder"
+        );
+        assert_eq!(
+            histogram.iter().map(|(k, v)| k * v).sum::<usize>(),
+            slots,
+            "{module}: and for every slot"
+        );
+        histograms.push((module.clone(), histogram.into_iter().collect()));
+
+        // Which roots reach it.
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let mut reached = Vec::new();
+        for (index, name) in [
+            "imports",
+            "constNames",
+            "constants",
+            "extraConstNames",
+            "entries",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if reachable_from(bytes, base, word_at(bytes, root + 8 + 8 * index)).contains(&empty) {
+                reached.push(name);
+            }
+        }
+        root_sets.push((module.clone(), reached));
+
+        // The declaration-free module spends three root slots on it.
+        if module == "Init.olean" {
+            for index in 0..5u64 {
+                if resolve(word_at(bytes, root + 8 + 8 * index as usize)) == Some(empty) {
+                    empty_root_slots.push(index);
+                }
+            }
+        }
+    }
+
+    let expect = |all: Vec<(&str, usize, usize)>| -> Vec<(String, usize, usize)> {
+        all.into_iter()
+            .filter(|(m, _, _)| prelude_loaded || *m != "Init/Prelude.olean")
+            .map(|(m, a, b)| (m.to_owned(), a, b))
+            .collect()
+    };
+
+    // Exactly one, in every module.
+    assert_eq!(
+        counts,
+        expect(vec![
+            ("Init.olean", 5, 1),
+            ("Init.BinderNameHint.olean", 24, 1),
+            ("Init.SizeOfLemmas.olean", 26, 1),
+            ("Init/Prelude.olean", 2434, 1),
+        ]),
+        "array objects, and zero-length array objects among them: EXACTLY ONE \
+         per module. Prelude holds 2,434 arrays and 2,999 references to an \
+         empty one, so a single zero-length object is not a consequence of \
+         arrays being scarce"
+    );
+
+    // Slots against holders.
+    assert_eq!(
+        references,
+        expect(vec![
+            ("Init.olean", 3, 1),
+            ("Init.BinderNameHint.olean", 3, 3),
+            ("Init.SizeOfLemmas.olean", 17, 17),
+            ("Init/Prelude.olean", 2999, 2932),
+        ]),
+        "slots naming it, against DISTINCT holder objects. `Init.olean` is the \
+         counterexample that makes the distinction real: three slots, ONE \
+         holder. Counting occurrences there would be wrong by a factor of three"
+    );
+
+    // The decomposition, per module.
+    assert_eq!(
+        histograms
+            .iter()
+            .map(|(m, h)| (m.as_str(), h.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", vec![(3, 1)]),
+            ("Init.BinderNameHint.olean", vec![(1, 3)]),
+            ("Init.SizeOfLemmas.olean", vec![(1, 17)]),
+            (
+                "Init/Prelude.olean",
+                vec![(1, 2870), (2, 58), (3, 3), (4, 1)]
+            ),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "how many slots each holder spends on it. Reconciled against both \
+         totals above inside the loop, so it cannot drift from either"
+    );
+
+    // A module that declares nothing spends three roots on one object.
+    assert_eq!(
+        empty_root_slots,
+        vec![1, 2, 3],
+        "`Init.olean` declares nothing, and its `constNames`, `constants` and \
+         `extraConstNames` are all the SAME empty array - which is why its one \
+         holder is the `ModuleData` root and why its slot count is three"
+    );
+
+    // Nothing uniform to say about where it lives.
+    assert_eq!(
+        root_sets
+            .iter()
+            .map(|(m, r)| (m.as_str(), r.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "Init.olean",
+                vec!["constNames", "constants", "extraConstNames"]
+            ),
+            ("Init.BinderNameHint.olean", vec!["entries"]),
+            (
+                "Init.SizeOfLemmas.olean",
+                vec!["extraConstNames", "entries"]
+            ),
+            ("Init/Prelude.olean", vec!["imports", "entries"]),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "the roots that reach it are DIFFERENT IN ALL FOUR MODULES, so every \
+         blanket sentence about where the empty array lives is false in at \
+         least one of them"
+    );
+    assert_eq!(
+        shapes_seen
+            .iter()
+            .map(|(m, n)| (m.as_str(), *n))
+            .collect::<Vec<_>>(),
+        [
+            ("Init.olean", 1),
+            ("Init.BinderNameHint.olean", 2),
+            ("Init.SizeOfLemmas.olean", 2),
+            ("Init/Prelude.olean", 8),
+        ]
+        .into_iter()
+        .filter(|(m, _)| prelude_loaded || *m != "Init/Prelude.olean")
+        .collect::<Vec<_>>(),
+        "and the distinct holder SHAPES vary as well - eight in Prelude, so the \
+         sharing spans many different structures rather than one extension"
+    );
+
+    // Length and capacity, the two fields that carry meaning here.
+    assert_eq!(
+        dimensions.into_iter().collect::<Vec<_>>(),
+        vec![(0, 0)],
+        "every module's empty array has length 0 AND capacity 0 - one shape, \
+         not four coincidences"
+    );
+}
+
 /// Where the sixteen dependents point - and the arrays they do NOT own.
 ///
 /// `bed63990` split the 26 singleton slots into ten whose element is the
