@@ -257,8 +257,22 @@ open Lean in
       | some val =>
         let fmt <- Meta.MetaM.run' (withOptions
           (fun o => o.setBool `pp.fullNames true) (Meta.ppExpr val))
+        -- The readable rendering of an alias VALUE leaves instance arguments to be
+        -- synthesized, and the facade cannot synthesize them: it holds the classes
+        -- opaquely. Measured on Lean.PrettyPrinter.Delaborator.OptionsPerPos, whose
+        -- transparent form was refused with "failed to synthesize instance of type
+        -- class" and which took Lean.PrettyPrinter.delab down with it. The explicit
+        -- rendering passes every instance by name, so nothing has to be synthesized.
+        let valOpts : Options -> Options := fun o0 =>
+          let o1 := o0.setBool `pp.fullNames true
+          let o2 := o1.setBool `pp.explicit true
+          let o3 := o2.setBool `pp.structureInstances false
+          let o4 := o3.setBool `pp.notation false
+          o4.setBool `pp.fieldNotation false
+        let fmtx <- Meta.MetaM.run' (withOptions valOpts (Meta.ppExpr val))
         let deps := ",".intercalate ((val.getUsedConstants.map toString).toList)
         IO.println s!"VALUE\t{n}\t{fmt}"
+        IO.println s!"VALUEX\t{n}\t{fmtx}"
         IO.println s!"VDEPS\t{n}\t{deps}"
       | none => IO.println s!"NOVALUE\t{n}"
     | none => IO.println s!"NOVALUE\t{n}"
@@ -289,13 +303,17 @@ def probe_values(lean, env, work, names):
     if proc.returncode != 0:
         raise SystemExit(f"REFUSE: the pinned binary refused the value probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
-    values, vdeps = {}, {}
+    values, valuesx, vdeps = {}, {}, {}
     current = None
     for line in proc.stdout.splitlines():
         if line.startswith("VALUE\t"):
             _, name, val = line.split("\t", 2)
             values[name] = val
             current = (values, name)
+        elif line.startswith("VALUEX\t"):
+            _, name, val = line.split("\t", 2)
+            valuesx[name] = val
+            current = (valuesx, name)
         elif line.startswith("VDEPS\t"):
             _, name, dep_csv = line.split("\t", 2)
             vdeps[name] = [d for d in dep_csv.split(",") if d]
@@ -305,7 +323,7 @@ def probe_values(lean, env, work, names):
         elif current is not None and line.strip():
             d, name = current
             d[name] = d[name] + " " + line.strip()
-    return values, vdeps
+    return values, valuesx, vdeps
 
 
 def probe(lean, env, work, names):
@@ -658,7 +676,8 @@ def structural_refusal(name, st, bs):
 
 
 def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
-           structural, structs, binders, deps, pbinders, transparent):
+           structural, structs, binders, deps, pbinders, transparent,
+           value_explicit_for):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -699,8 +718,10 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
             binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
             body.append(f"-- role={d['role']} bucket={d['bucket']} transparent "
                         f"module={d['module']}")
+            val = (d["valuex"] if name in value_explicit_for and d.get("valuex")
+                   else d["value"])
             body.append(f"@[reducible] noncomputable def {d['decl_name']}{binder} : "
-                        f"{ty} := {root_anchor(d['value'], deps.get(name, ()))}")
+                        f"{ty} := {root_anchor(val, deps.get(name, ()))}")
             line_map[len(body)] = ("transparent", name)
             emitted.append(name)
             continue
@@ -790,7 +811,7 @@ def main():
         return ("ReducibilityStatus.reducible"
                 in ((census.get(n) or {}).get("attrs") or ""))
 
-    values, vdeps, reducible = {}, {}, set()
+    values, valuesx, vdeps, reducible = {}, {}, {}, set()
     value_residue = set()
     for vround in range(args.transparency_rounds):
         cand = sorted(n for n in types
@@ -798,8 +819,9 @@ def main():
         if not cand:
             break
         reducible |= set(cand)
-        v, vd = probe_values(lean, env, work, cand)
+        v, vx, vd = probe_values(lean, env, work, cand)
         values.update(v)
+        valuesx.update(vx)
         vdeps.update(vd)
         extra = set()
         for n, ds in vd.items():
@@ -836,6 +858,7 @@ def main():
             "typex": typesx.get(name),
             "typem": typesm.get(name),
             "value": values.get(name),
+            "valuex": valuesx.get(name),
             "levels": levels.get(name, ""),
             "instance": insts.get(name, False),
             "role": "demanded" if name in demand else (
@@ -869,6 +892,7 @@ def main():
     structural_full = set(structural)
     ordered, cycle_residue = order(list(types), deps)
     explicit_for, maxexp_for, dropped_attrs, attr_reason = set(), set(), set(), {}
+    value_explicit_for = set()
     defer_count = {}
     text = line_map = emitted = None
     attempts = []
@@ -892,6 +916,7 @@ def main():
             # nothing ever looked again once the cause was repaired.
             transparent = set(transparent_full)
             transparent_refused = {}
+            value_explicit_for = set()
             structural = set(structural_full)
             structural_refused = {k: v for k, v in structural_refused.items()
                                   if not v.startswith("pin rejected")}
@@ -906,7 +931,8 @@ def main():
         for attempt in range(1, args.max_attempts + 1):
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
-                structural, structs, binders, deps, pbinders, transparent)
+                structural, structs, binders, deps, pbinders, transparent,
+            value_explicit_for)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -975,6 +1001,14 @@ def main():
                          if n in structural and is_victim(n, "s")}
             for name in blamed_transparent - victims_t:
                 if name in transparent:
+                    # The readable VALUE is tried first because it is auditable;
+                    # a row the pin refuses there gets the explicit rendering,
+                    # which needs no instance synthesis, before it is demoted to
+                    # an opaque axiom.
+                    if name not in value_explicit_for and decl[name].get("valuex"):
+                        value_explicit_for.add(name)
+                        progressed = True
+                        continue
                     transparent.discard(name)
                     transparent_refused[name] = ("pin rejected the transparent form "
                                                  "-- " + blame_msg.get(name, "-"))
@@ -1110,6 +1144,7 @@ def main():
         raise SystemExit("REFUSE: no facade candidate survived")
     (_, text, line_map, emitted, attr_count, provided, quarantine, explicit_for,
      maxexp_for, dropped_attrs, structural, transparent) = best
+
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(text)
 
@@ -1177,6 +1212,7 @@ def main():
         },
         "init_provided": len(init_provided),
         "transparent_declarations": len(transparent),
+        "transparent_explicit_value": len(value_explicit_for),
         "transparency_note": "these are the pin's REDUCIBLE definitions — "
             "abbreviations. The facade emits them with their values because "
             "declaring them opaquely invents distinctions the Reference does not "
