@@ -1747,6 +1747,18 @@ def main():
             "REFUSE: facade manifest value-residue pin diverges "
             f"({json.dumps(value_residue_pin_join, sort_keys=True)})"
         )
+    transparent_declarations_pin_join = {
+        "summary_transparent_declarations": manifest_summary.get(
+            "transparent_declarations"
+        ),
+        "pinned_transparent_declarations": 747,
+    }
+    if (transparent_declarations_pin_join["summary_transparent_declarations"]
+            != transparent_declarations_pin_join["pinned_transparent_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest transparent-declaration pin diverges "
+            f"({json.dumps(transparent_declarations_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -2834,6 +2846,7 @@ def main():
         "manifest_structural_refused_pin_join": structural_refused_pin_join,
         "manifest_structural_declarations_pin_join": structural_declarations_pin_join,
         "manifest_value_residue_pin_join": value_residue_pin_join,
+        "manifest_transparent_declarations_pin_join": transparent_declarations_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
