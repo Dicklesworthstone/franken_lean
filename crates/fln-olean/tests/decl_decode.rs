@@ -2599,3 +2599,166 @@ fn the_pointer_tailed_third_shape_heads_are_uniform_within_each_group() {
          only in a TAIL that it would mean `List.nil`"
     );
 }
+
+/// The records the 71 heads point at - and there are 69 of them, not 71.
+///
+/// BOTH THINGS THIS WAVE OFFERED ARE ALREADY HARD ASSERTIONS, which is why this
+/// cell is about neither. The constructor-tag count map for the 71 heads is
+/// pinned by `9d365d6a` as `[("tag 0 arity 5", 71)]`, and that `constants`
+/// reaches none of the 99 is pinned by `1dd7c288` as `(0, 99, 0)` and again for
+/// the 17 by `a7a7a9e0`. Re-pinning either would add a green and no fact. What
+/// nothing has read is the records those heads point AT.
+///
+/// A CORRECTION FIRST. `9d365d6a` described them as "a regular record laid out
+/// the same way 71 times". Seventy-one is the number of REFERENCES. The number
+/// of distinct objects is 69: two records are each pointed at twice. Nothing in
+/// that cell was wrong - it counted heads, and there are 71 heads - but the
+/// sentence invited the reading that there are 71 records, and there are not.
+/// Compaction shares structurally identical subterms, so counting references as
+/// objects is a mistake this format makes easy and this file has now made once.
+///
+/// Over the 69 distinct records: 345 fields, every one a pointer, not a single
+/// scalar. That is the fourth population in this investigation to come out
+/// uniform in pointer-ness - the 71's tails all pointers, the 17's fields all
+/// scalars, the 82's heads split cleanly by group, and now these. Four
+/// independent uniformities is not what a walker reading misaligned words
+/// produces.
+///
+/// Four of the five slots hold a single shape apiece across all 69. The fifth
+/// holds three shapes. A slot that varies where its neighbours do not is the
+/// signature of a field whose type has several constructors, and that is as far
+/// as this cell goes: it pins the tags and arities and names no type, no
+/// extension and no schema.
+#[test]
+fn the_head_records_are_shared_and_uniformly_shaped() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut distinct: BTreeSet<(usize, usize)> = BTreeSet::new(); // (module index, offset)
+    let mut fields = 0usize;
+    let mut pointer_fields = 0usize;
+    let mut per_slot: Vec<std::collections::BTreeMap<String, usize>> =
+        vec![std::collections::BTreeMap::new(); 5];
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut here: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            // The 71: a third-shape object whose tail is a `tag 0` arity-2
+            // constructor. Its head is the record this cell reads.
+            let Some(tail) = resolve(word_at(bytes, object.off + 16)) else {
+                continue;
+            };
+            if at.get(&tail).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(head) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&head).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            references += 1;
+            here.insert(head);
+        }
+
+        for head in here {
+            distinct.insert((index, head));
+            for slot in 0..5usize {
+                fields += 1;
+                let word = word_at(bytes, head + 8 + 8 * slot);
+                match resolve(word) {
+                    Some(off) => {
+                        pointer_fields += 1;
+                        let child = at.get(&off).expect("filtered above");
+                        *per_slot[slot]
+                            .entry(format!("tag {} arity {}", child.tag, child.other))
+                            .or_default() += 1;
+                    }
+                    None => {
+                        *per_slot[slot]
+                            .entry("boxed or unresolvable".to_owned())
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // The sharing, which is the fact `9d365d6a`'s wording obscured.
+    assert_eq!(
+        (references, distinct.len()),
+        (71, 69),
+        "seventy-one heads point at sixty-nine distinct records: two are shared. \
+         Counting references as objects is the mistake a compacted format makes \
+         easy"
+    );
+    assert_eq!(
+        fields,
+        distinct.len() * 5,
+        "five fields per distinct record, counted once each"
+    );
+    assert_eq!(
+        (fields, pointer_fields),
+        (345, 345),
+        "every field of every record is a pointer - the fourth population here \
+         to come out uniform, and not what a walker reading misaligned words \
+         produces"
+    );
+
+    // Four slots of one shape each; the fifth varies.
+    let shapes: Vec<Vec<(String, usize)>> = per_slot
+        .into_iter()
+        .map(|slot| slot.into_iter().collect())
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            vec![("tag 2 arity 2".to_owned(), 69)],
+            vec![("tag 2 arity 2".to_owned(), 69)],
+            vec![("tag 246 arity 0".to_owned(), 69)],
+            vec![("tag 7 arity 3".to_owned(), 69)],
+            vec![
+                ("tag 0 arity 2".to_owned(), 57),
+                ("tag 1 arity 2".to_owned(), 8),
+                ("tag 5 arity 1".to_owned(), 4),
+            ],
+        ],
+        "per-slot constructor tags and arities. Slot 2 carries the ARRAY tag; \
+         slot 4 is the only one that varies, which is what a field whose type \
+         has several constructors looks like. No type is named here"
+    );
+}
