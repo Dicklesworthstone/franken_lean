@@ -196,6 +196,40 @@ fn the_recovered_auxiliary_decodes_to_a_real_constant_info() {
 }
 
 #[test]
+fn timy_match_1_requires_the_private_companion_for_a_non_axiom_decode() {
+    let lib = lib_or_skip!("timy_match_1_requires_the_private_companion_for_a_non_axiom_decode");
+    let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
+
+    // The constNames cell pins the original corpus witness. This decoder-level
+    // cell supplies its RED side: the exported declaration array must still
+    // omit that exact `match_1`, or companion recovery is not being tested.
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("exported constants decode");
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != TIMY_WITNESS),
+        "exported decoder unexpectedly recovered {TIMY_WITNESS}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == TIMY_WITNESS)
+        .unwrap_or_else(|| panic!("private decoder lost {TIMY_WITNESS}"));
+    assert!(
+        !matches!(recovered, ConstantInfo::Axiom(_)),
+        "private companion recovery weakened {TIMY_WITNESS} to an axiom"
+    );
+}
+
+#[test]
 fn private_part_is_a_superset_across_the_modules_the_bead_names() {
     let lib = lib_or_skip!("private_part_is_a_superset_across_the_modules_the_bead_names");
 
