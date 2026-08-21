@@ -799,6 +799,19 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateLeanSyntaxResiduals",
+        6,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "arrayMapMProofResiduals",
         2,
         &[
@@ -1094,6 +1107,20 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     assert_human_named_residuals(
         &human.stdout, "core-observables Lean.Syntax match_N residuals", "core-observables Lean.Syntax match_N residual names", 2,
         &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1", "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private Lean.Syntax residuals",
+        "decoded _private Lean.Syntax residual names",
+        6,
+        &[
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",
+            "_private.Init.Prelude.0.Lean.Syntax.insertIdx.loop._unary",
+        ],
     );
     assert_human_named_residuals(
         &human.stdout, "decoded _private Array.mapM'._proof_N residuals", "decoded _private Array.mapM'._proof_N residual names", 2,
