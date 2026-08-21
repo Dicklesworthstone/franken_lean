@@ -6070,17 +6070,21 @@ fn server_module_view(lib: &Path, module: &str) -> ModuleDataView {
 /// then never examined, so what the middle of the chain contains has been an
 /// open question on a bead whose entire repair was part SELECTION.
 ///
-/// Measured over three modules, and the answer is uniform: the server part adds
-/// no declarations at all.
+/// Measured over three modules — a sample, and the doc line below that read
+/// "the same four blocks in every module" was widened from it and is FALSE at
+/// 600. See `the_server_parts_documentation_vocabulary_is_six_names_and_often_empty`,
+/// which measures the whole corpus. What this cell establishes for its three
+/// modules still stands: the server part adds no declarations at all.
 ///
 ///   `constNames` at server equals the exported array as a SEQUENCE, not merely
 ///     in length — 2,204 / 379 / 791, the same names in the same order
 ///   `extraConstNames` likewise, and the import array is identical at all three
 ///   the extension names NEST, exported ⊆ server ⊆ private, strictly at each
 ///     step — 56 < 60 < 62 for `Init/Prelude`
-///   what the server adds is the same FOUR blocks in every module, and all four
-///     are documentation extensions: `declRangeExt`, `docStringExt`,
-///     `inheritDocStringExt`, `moduleDocExt`
+///   what the server adds HERE is four documentation extensions — corpus-wide it
+///     is a six-name vocabulary of which a module uses between none and five,
+///     and 77 modules add nothing; two of these four are also stored under
+///     `_private.Lean.DocString.Extension.0.…` rather than as spelled
 ///
 /// So reading the server part instead of the private one would have recovered
 /// ZERO of the declarations this bead is about. The private part is the only
@@ -12917,5 +12921,140 @@ fn no_header_field_names_which_part_of_the_chain_it_is() {
         addresses.len(),
         parts,
         "base_addr separates every part from every other, including same-role ones"
+    );
+}
+
+/// Everything the server part ever adds, over all 600 modules rather than three.
+const SERVER_DOCUMENTATION_EXTENSIONS: &[&str] = &[
+    "Lean.declRangeExt",
+    "Lean.docStringExt",
+    "Lean.versoDocStringExt",
+    "_private.Lean.DocString.Extension.0.Lean.inheritDocStringExt",
+    "_private.Lean.DocString.Extension.0.Lean.moduleDocExt",
+    "_private.Lean.DocString.Extension.0.Lean.versoModuleDocExt",
+];
+
+/// What the server part adds is a VOCABULARY, not a fixed block list — and for
+/// 77 modules it adds nothing at all.
+///
+/// `the_server_part_adds_documentation_extensions_and_no_declarations` reads
+/// three named modules and its doc comment generalises to "the same FOUR blocks
+/// in every module". Run over all 600 and both halves of that sentence fail:
+/// the sets are not the same, and four is not the number. The three sampled
+/// modules are large ones that happen to carry a rich set; nothing in the cell
+/// samples anything else, so the claim was never tested where it breaks.
+///
+/// Measured over all 600 `Init` chains:
+///
+///   the server-added set has size 0, 1, 2, 3, 4 or 5 — 77 / 116 / 209 / 167 /
+///     28 / 3 modules respectively, and 21 distinct sets occur
+///   the union of everything it ever adds is SIX names, not four
+///   two of the four names the older comment lists do not occur as spelled:
+///     `inheritDocStringExt` and `moduleDocExt` are stored under
+///     `_private.Lean.DocString.Extension.0.…`, and the two `verso` extensions
+///     are absent from that list entirely
+///
+/// WHAT SURVIVES THE WIDENING, stated because most of the older cell is right.
+/// The server carries the exported constant array unchanged as a SEQUENCE in all
+/// 600, not just the three. The extension tables nest, exported ⊆ server ⊆
+/// private, in all 600. What does not survive is STRICTNESS: the older cell
+/// asserts each step adds something, which holds for 516 of 600 — the 77 modules
+/// with an empty server contribution are the bulk of the shortfall.
+///
+/// The declaration claim needs the same care. "The private part is the only one
+/// that adds declarations" is true — the server adds none anywhere. But the
+/// older cell enforces it as `private > exported` per module, and only 400 of
+/// the 600 private parts are longer. For the other 200 the private part adds no
+/// declarations either, so the assertion would fail on a third of the corpus
+/// while the claim it defends stays true.
+///
+/// Conservation first: the six size classes must account for all 600 modules
+/// before the vocabulary is named, so a module that failed to open cannot shrink
+/// the population into agreement.
+#[test]
+fn the_server_parts_documentation_vocabulary_is_six_names_and_often_empty() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let vocabulary: BTreeSet<String> = SERVER_DOCUMENTATION_EXTENSIONS
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let names = |view: &ModuleDataView| -> BTreeSet<String> {
+        view.extensions
+            .iter()
+            .map(|block| block.name.clone())
+            .collect()
+    };
+
+    let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut distinct_sets: BTreeSet<BTreeSet<String>> = BTreeSet::new();
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    let mut sequence_preserved = 0usize;
+    let mut nests = 0usize;
+    let mut strictly_nests = 0usize;
+    let mut private_grew = 0usize;
+    for module in &modules {
+        let exported = module_view(&lib, module, Level::Exported);
+        let server = server_module_view(&lib, module);
+        let private = module_view(&lib, module, Level::Private);
+
+        if server.const_names == exported.const_names {
+            sequence_preserved += 1;
+        }
+        if private.const_names.len() > exported.const_names.len() {
+            private_grew += 1;
+        }
+
+        let (exported_names, server_names, private_names) =
+            (names(&exported), names(&server), names(&private));
+        if exported_names.is_subset(&server_names) && server_names.is_subset(&private_names) {
+            nests += 1;
+        }
+        if exported_names.len() < server_names.len() && server_names.len() < private_names.len() {
+            strictly_nests += 1;
+        }
+
+        let added: BTreeSet<String> = server_names.difference(&exported_names).cloned().collect();
+        *sizes.entry(added.len()).or_default() += 1;
+        union.extend(added.iter().cloned());
+        distinct_sets.insert(added);
+    }
+
+    // Conservation first: every module landed in exactly one size class.
+    assert_eq!(
+        sizes.values().sum::<usize>(),
+        modules.len(),
+        "the size classes must account for every module"
+    );
+    assert_eq!(
+        sizes,
+        BTreeMap::from([(0, 77), (1, 116), (2, 209), (3, 167), (4, 28), (5, 3)]),
+        "what the server adds varies by module; it is not one fixed block list"
+    );
+    assert_eq!(
+        distinct_sets.len(),
+        21,
+        "twenty-one distinct server contributions occur across the corpus"
+    );
+
+    // The vocabulary is closed, and it is six names.
+    assert_eq!(
+        union, vocabulary,
+        "the union of every server contribution is exactly this six-name vocabulary"
+    );
+
+    // What the three-module cell claims, re-measured at 600.
+    assert_eq!(
+        (sequence_preserved, nests),
+        (600, 600),
+        "the constant sequence and the non-strict nesting do hold everywhere"
+    );
+    assert_eq!(
+        (strictly_nests, private_grew),
+        (516, 400),
+        "strictness and per-module private growth do NOT; these are the two the older cell \
+         would enforce corpus-wide"
     );
 }
