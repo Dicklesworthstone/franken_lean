@@ -5230,15 +5230,30 @@ fn write_inventory_fixture_with(
     // It also poisons the shape record beside the tree: the manifest would store
     // the entry twice, so a later run that tidied the list to one copy would be
     // refused as a shape change that never happened.
+    //
+    // KEYED ON THE PATH, NOT ON THE STRING, AND IT USED TO BE THE STRING. Two
+    // spellings of one path are two different `&str`s: `A.olean` and `A.olean/`
+    // differ by a trailing separator, `A/B.olean` and `A//B.olean` by a repeated
+    // one. `Path` drops both when it splits into components, so `base.join`
+    // returns the SAME file for either -- measured, not assumed -- and a set of
+    // strings sees two entries where the filesystem sees one. The guard let
+    // through exactly the case it exists to catch, because it compared a
+    // rendering instead of the thing rendered.
     {
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeMap<Vec<std::ffi::OsString>, &str> = BTreeMap::new();
         for relative in relative_files {
-            assert!(
-                seen.insert(*relative),
-                "fixture `{versioned_name}` lists `{relative}` more than once. The second write \
-                 truncates the first, so the tree holds one file where the list names two and \
-                 every count taken from the list is one too many"
-            );
+            let key = Path::new(relative)
+                .components()
+                .map(|component| component.as_os_str().to_owned())
+                .collect::<Vec<_>>();
+            if let Some(previous) = seen.insert(key, *relative) {
+                panic!(
+                    "fixture `{versioned_name}` lists `{previous}` and `{relative}`, which name \
+                     the same file. The second write truncates the first, so the tree holds one \
+                     file where the list names two and every count taken from the list is one \
+                     too many"
+                );
+            }
         }
     }
 
@@ -6158,6 +6173,113 @@ fn a_fixture_list_that_repeats_an_entry_is_refused() {
         "the list was refused and a tree exists anyway; the check must run BEFORE the writes, or \
          the half-built tree is left for the next run to union into"
     );
+}
+
+/// Two SPELLINGS of one path are one entry, and the duplicate guard used to
+/// disagree.
+///
+/// **The guard compared strings; the filesystem compares paths.** `A.olean` and
+/// `A.olean/` are different `&str`s and the same file: `Path` drops a trailing
+/// separator when it splits into components, and drops a repeated one too, so
+/// `A/B.olean` and `A//B.olean` are also one path. A set of strings sees two
+/// entries where `base.join` sees one, both writes land on the same file, and
+/// the tree comes out one smaller than the list -- which is precisely the
+/// failure the duplicate guard was added to stop, walking through it because the
+/// guard compared a rendering instead of the thing rendered.
+///
+/// **That is the third time in this file, and the shape is worth naming.** The
+/// empty-component rule inspected the PATH's components while the name is made
+/// of segments. The containment check compared a lexical prefix while the
+/// question was about where a write lands. Here a set of strings stood in for a
+/// set of paths. Each time the check was one representation away from its
+/// subject, and each time it passed every test written for it.
+///
+/// **The mechanism is asserted, not described.** If `Path` ever stopped
+/// collapsing these spellings, the guard would be solving a problem that no
+/// longer exists and this test would say so instead of quietly passing.
+///
+/// **Both spellings must appear in the refusal.** Naming only the second leaves
+/// the reader scanning the list for whichever other line means the same thing,
+/// which is the whole work.
+#[test]
+fn two_spellings_of_one_path_are_one_fixture_entry() {
+    // THE MECHANISM, LEXICALLY. Different strings, same file.
+    let base = Path::new("/fixtures/tree");
+    assert_ne!(
+        "Same.olean", "Same.olean/",
+        "the two spellings must differ as text, or there is nothing for a string set to miss"
+    );
+    assert_eq!(
+        base.join("Same.olean"),
+        base.join("Same.olean/"),
+        "a trailing separator must not change which file is written, or this guard is about \
+         nothing"
+    );
+    assert_eq!(
+        base.join("A/B.olean"),
+        base.join("A//B.olean"),
+        "a repeated separator must not change which file is written either"
+    );
+
+    // GREEN CONTROL FIRST: two entries that differ AS PATHS must still build.
+    let ok = write_inventory_fixture(
+        "t6r7-selftest-spelling-ok-v1",
+        &["Dir/One.olean", "Dir/Two.olean"],
+    );
+    for entry in ["Dir/One.olean", "Dir/Two.olean"] {
+        assert!(
+            ok.join(entry).is_file(),
+            "`{entry}` names its own file and must still be written"
+        );
+    }
+
+    let refuse = |name: &str, entries: &[&str]| -> String {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| write_inventory_fixture(name, entries));
+        std::panic::set_hook(previous);
+        let payload = outcome
+            .err()
+            .unwrap_or_else(|| panic!("`{entries:?}` name one file and must be refused"));
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let trailing = refuse(
+        "t6r7-selftest-spelling-trailing-v1",
+        &["Same.olean", "Same.olean/"],
+    );
+    let repeated = refuse(
+        "t6r7-selftest-spelling-repeated-v1",
+        &["A/B.olean", "A//B.olean"],
+    );
+
+    // BOTH SPELLINGS, delimited so the shorter one is not merely a substring of
+    // the longer: `Same.olean` occurs inside `Same.olean/`, and a bare
+    // `contains` would be satisfied by the longer alone.
+    assert!(
+        trailing.contains("`Same.olean`") && trailing.contains("`Same.olean/`"),
+        "the refusal must name BOTH spellings; naming one leaves the reader scanning the list for \
+         the other: {trailing}"
+    );
+    assert!(
+        repeated.contains("`A/B.olean`") && repeated.contains("`A//B.olean`"),
+        "the refusal must name both spellings of the repeated separator: {repeated}"
+    );
+
+    for name in [
+        "t6r7-selftest-spelling-trailing-v1",
+        "t6r7-selftest-spelling-repeated-v1",
+    ] {
+        assert!(
+            !Path::new(env!("CARGO_TARGET_TMPDIR")).join(name).exists(),
+            "`{name}` was refused and a tree exists anyway; the check must run before the writes"
+        );
+    }
 }
 
 /// An entry that is a file and another entry's parent directory is refused, the
