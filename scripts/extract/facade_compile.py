@@ -2238,6 +2238,28 @@ def main():
             "REFUSE: facade manifest demanded count must exceed emitted "
             f"demand count ({json.dumps(demanded_emission_inequality_join, sort_keys=True)})"
         )
+    emitted_demand_init_substrate_inequality_join = {
+        "summary_demanded_emitted": manifest_summary.get("demanded_emitted"),
+        "summary_demanded_init_substrate": manifest_summary.get(
+            "demanded_init_substrate"
+        ),
+    }
+    if (not isinstance(emitted_demand_init_substrate_inequality_join[
+            "summary_demanded_emitted"], int)
+            or isinstance(emitted_demand_init_substrate_inequality_join[
+                "summary_demanded_emitted"], bool)
+            or not isinstance(emitted_demand_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"], int)
+            or isinstance(emitted_demand_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"], bool)
+            or emitted_demand_init_substrate_inequality_join[
+                "summary_demanded_emitted"]
+            <= emitted_demand_init_substrate_inequality_join[
+                "summary_demanded_init_substrate"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emitted-demand count must exceed demanded "
+            f"Init-substrate count ({json.dumps(emitted_demand_init_substrate_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -4205,6 +4227,9 @@ def main():
         ),
         "manifest_demanded_emission_inequality_join": (
             demanded_emission_inequality_join
+        ),
+        "manifest_emitted_demand_init_substrate_inequality_join": (
+            emitted_demand_init_substrate_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
