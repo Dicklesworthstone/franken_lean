@@ -1607,6 +1607,55 @@ fn private_eq_n_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 }
 
 #[test]
+fn match_n_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
+    let lib =
+        lib_or_skip!("match_n_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
+
+    // The original timy witness pins one exact `match_1`; this separate family
+    // cell prevents another private-only match_N from being silently weakened
+    // to an axiom while that one witness still happens to decode.
+    let (relative, name) = init_chain_modules(&lib)
+        .into_iter()
+        .find_map(|relative| {
+            let chain = chain_bytes(&lib, &relative);
+            let (exported, private) = exported_and_private_names(&chain);
+            private
+                .iter()
+                .find(|name| !exported.contains(*name) && family::match_n(name))
+                .map(|name| (relative, name.clone()))
+        })
+        .expect("the pinned Init private companions contain a private-only match_N witness");
+    let chain = chain_bytes(&lib, &relative);
+
+    let exported_view = OleanView::parse(&chain.exported)
+        .unwrap_or_else(|error| panic!("match_N {name}: parse exported {relative}: {error}"));
+    let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("match_N {name}: decode exported {relative}: {error}"));
+    assert!(
+        exported_constants
+            .iter()
+            .all(|info| info.name().to_display_string() != name),
+        "match_N {name}: exported decoder unexpectedly has the private auxiliary"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .unwrap_or_else(|error| panic!("match_N {name}: parse private {relative}: {error}"));
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .unwrap_or_else(|error| panic!("match_N {name}: decode private {relative}: {error}"))
+        .into_iter()
+        .find(|info| info.name().to_display_string() == name)
+        .unwrap_or_else(|| panic!("match_N {name}: private decoder lost it in {relative}"));
+    assert!(
+        is_concrete_recovery(&recovered),
+        "match_N {name}: companion recovery decoded only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
 fn verified_chain_decode_returns_the_private_superset_on_the_real_pin() {
     let lib = lib_or_skip!("verified_chain_decode_returns_the_private_superset_on_the_real_pin");
     let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
