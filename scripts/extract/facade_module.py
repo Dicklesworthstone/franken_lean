@@ -3041,11 +3041,18 @@ def self_test():
     case("acceptance/unvalidated", pin_acceptance_error(text, {"0" * 64}), True)
 
     # work_scratch_report: the probes wrote where this run put them
-    # A file inside a SUBDIRECTORY is disk held just the same. Sized so the
-    # nested file dominates: a report that does not descend sees almost none of it.
+    # A file inside a SUBDIRECTORY is disk held just the same. ONE BLOCK, NOT TWO
+    # HUNDRED KILOBYTES: proving the report descends does not need a large file,
+    # and this suite is meant to be runnable anywhere. Measured while writing
+    # this, 187 self-test directories held 10.10 MiB while 4.4 MiB remained free
+    # on the same filesystem, at roughly 57 KB a run -- and then it reached zero
+    # and the wave that was fixing it could not write its own edit. A checker that
+    # outgrows the disk it checks should be the smallest thing that still answers
+    # the question, and the claim below is relative rather than a threshold.
     _nest = os.path.join(work, "nested-scratch")
     os.makedirs(_nest, exist_ok=True)
-    builtins.open(os.path.join(_nest, "buried.lean"), "w").write("z" * 200000)
+    _buried = os.path.join(_nest, "buried.lean")
+    builtins.open(_buried, "w").write("z" * 64)
     _, _nfiles, _nbytes = work_scratch_report(_nest)
     _sparse = os.path.join(work, "sparse.lean")
     with builtins.open(_sparse, "wb") as _fh:
@@ -3062,7 +3069,8 @@ def self_test():
          None if disk_bytes(at("held.lean", text)) >= len(text.encode("utf-8"))
          else "understated a real file", False)
     case("work/counts-a-nested-file",
-         None if _nbytes >= 200000 else f"reported only {_nbytes} bytes", False)
+         None if _nbytes >= disk_bytes(_buried) > 0
+         else f"reported {_nbytes} for a file holding {disk_bytes(_buried)}", False)
     case("work/counts-files-not-directories",
          None if _nfiles == 1 else f"counted {_nfiles} entries, not 1 file", False)
     _hollow = os.path.join(work, "hollow-scratch")
@@ -3391,6 +3399,42 @@ def self_test():
     case("divergence/reporter-silent-when-nothing-happened",
          _report_divergence_says(work), False)
 
+    # LIFTED ABOVE THE VERDICT. This block computed a case and then ran it
+    # after the failure check and the OK line had already been printed, so
+    # the case registered too late to affect anything -- the count did not
+    # even move. The same ordering fault 47342ab8 repaired for the summary,
+    # reintroduced by putting a check inside a disclosure.
+    _mine = sum(disk_bytes(os.path.join(_r, _f))
+                for _r, _, _fs in os.walk(work) for _f in _fs)
+    _peers = _siblings = 0
+    _parent = os.path.dirname(work) or "."
+    try:
+        for _entry in os.listdir(_parent):
+            if _entry.startswith("fln-l8f-selftest-"):
+                _peers += 1
+                _siblings += sum(
+                    disk_bytes(os.path.join(_r, _f))
+                    for _r, _, _fs in os.walk(os.path.join(_parent, _entry))
+                    for _f in _fs)
+    except OSError:
+        pass
+    try:
+        _free = (lambda v: v.f_bavail * v.f_frsize)(os.statvfs(_parent))
+    except OSError:
+        _free = -1
+    # COMPOSED, THEN CHECKED, THEN PRINTED. A disclosure nobody asserts can stop
+    # disclosing without anyone noticing: a mutant that dropped the accumulation
+    # from this line survived the whole suite, because printing is not checking.
+    _line = (f"facade-module: self-test scratch kept at {work} ({_mine} bytes); "
+             f"{_peers} such directories now hold {_siblings} bytes against "
+             f"{_free} free. Nothing was deleted -- a run has no business "
+             "removing files a reader may be halfway through -- but a checker "
+             "that outgrows the disk it checks has to say so")
+    case("work/disclosure-states-the-accumulation",
+         None if all(str(v) in _line for v in (_mine, _peers, _siblings, _free))
+         else "the scratch disclosure omits one of its own numbers", False)
+    print(_line, file=sys.stderr)
+
     # A PLANTED FAILURE, BECAUSE THE HARNESS HAS NEVER BEEN CHECKED EITHER. Every
     # case above routes its verdict through `case`, and `case` had nothing
     # watching it: gutting its comparison makes all 65 cases pass and the command
@@ -3433,8 +3477,9 @@ def self_test():
     print(f"facade-module: SELF-TEST OK — {len(checked)} cases across {_guards} guards "
           f"and its own sandbox: "
           + " ".join(checked), file=sys.stderr)
-    print(f"facade-module: self-test scratch kept at {work}; nothing was deleted "
-          "and no artifact was read or written", file=sys.stderr)
+    # WHAT THE ACCUMULATION COSTS, not only what this run left. The per-run line
+    # was honest and useless: one directory at a time never looks like a problem,
+    # and the total was visible only to somebody who went looking with a glob.
 
 
 def main():
