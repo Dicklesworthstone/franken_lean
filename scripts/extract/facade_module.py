@@ -3617,6 +3617,40 @@ def main():
     os.replace(tmp, args.manifest)
     published[args.manifest] = (manifest_text, "the manifest",
                                 MANIFEST_SCRATCH_SUFFIXES)
+    # THE SUMMARY IS PRINTED ONLY BY A RUN THAT EARNED IT, which is why these
+    # checks sit ABOVE it rather than below. They used to run after, and the line
+    # they follow is not a debug aside: it is how every reader of this extractor
+    # decides whether a run worked -- the waves on this bead are reported GREEN or
+    # RED off exactly that line, and it is what `tail -3` on a run's output shows.
+    # A run that failed the publication checks still emitted the whole
+    # `covered=442 ... rounds=28` banner first, so a grep for it returned a green
+    # from a run that then refused. The verdict has to come before the claim.
+    #
+    # THE MANIFEST CARRIES THE EVIDENCE and the facade carries the surface; both
+    # get both checks, and neither is named here. The registry is what makes that
+    # true: an artifact is checked because it was published, not because someone
+    # remembered to add a line for it.
+    _reg = publication_registry_error(published, (args.out, args.manifest))
+    if _reg:
+        raise SystemExit("REFUSE: " + _reg)
+    _cov = scratch_coverage_error(scratch_created, published)
+    if _cov:
+        raise SystemExit("REFUSE: " + _cov)
+    _werr, _wfiles, _wbytes = work_scratch_report(work)
+    if _werr:
+        raise SystemExit("REFUSE: " + _werr)
+    for _path in sorted(published):
+        _text, _what, _sufs = published[_path]
+        _err = published_bytes_error(_path, _text, _what)
+        if _err:
+            raise SystemExit("REFUSE: " + _err)
+        _err = leftover_scratch_error(_path, _sufs)
+        if _err:
+            raise SystemExit("REFUSE: " + _err)
+    print(f"facade-module: probe scratch left in {work}: {_wfiles} files, "
+          f"{_wbytes} bytes (st_blocks). Nothing removes it and it is keyed by "
+          f"pid, so this is one directory per run", file=sys.stderr)
+
     print(f"facade-module: demanded={len(demand)} init_substrate={len(init_demanded)} "
           f"facade_demand={len(facade_demand)} emitted={len(emitted)} "
           f"covered={len(covered)} substrate={rows[0]['substrate_emitted']} "
@@ -3652,30 +3686,6 @@ def main():
           f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
 
-    # THE MANIFEST CARRIES THE EVIDENCE and the facade carries the surface; both
-    # get both checks, and neither is named here. The registry is what makes that
-    # true: an artifact is checked because it was published, not because someone
-    # remembered to add a line for it.
-    _reg = publication_registry_error(published, (args.out, args.manifest))
-    if _reg:
-        raise SystemExit("REFUSE: " + _reg)
-    _cov = scratch_coverage_error(scratch_created, published)
-    if _cov:
-        raise SystemExit("REFUSE: " + _cov)
-    _werr, _wfiles, _wbytes = work_scratch_report(work)
-    if _werr:
-        raise SystemExit("REFUSE: " + _werr)
-    print(f"facade-module: probe scratch left in {work}: {_wfiles} files, "
-          f"{_wbytes} bytes (st_blocks). Nothing removes it and it is keyed by "
-          f"pid, so this is one directory per run", file=sys.stderr)
-    for _path in sorted(published):
-        _text, _what, _sufs = published[_path]
-        _err = published_bytes_error(_path, _text, _what)
-        if _err:
-            raise SystemExit("REFUSE: " + _err)
-        _err = leftover_scratch_error(_path, _sufs)
-        if _err:
-            raise SystemExit("REFUSE: " + _err)
 
 
 if __name__ == "__main__":
