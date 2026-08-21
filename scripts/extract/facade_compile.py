@@ -1697,6 +1697,33 @@ def main():
             "REFUSE: facade manifest kernel-special-as-axiom pin diverges "
             f"({json.dumps(kernel_special_as_axiom_pin_join, sort_keys=True)})"
         )
+    kernel_special_axiom_inequality_join = {
+        "summary_kernel_special_population": manifest_summary.get(
+            "kernel_special_population"
+        ),
+        "kernel_special_as_axiom_count": (
+            len(manifest_summary.get("kernel_special_as_axiom"))
+            if isinstance(manifest_summary.get("kernel_special_as_axiom"), list)
+            else None
+        ),
+    }
+    if (not isinstance(
+            kernel_special_axiom_inequality_join[
+                "summary_kernel_special_population"], int)
+            or isinstance(
+                kernel_special_axiom_inequality_join[
+                    "summary_kernel_special_population"], bool)
+            or not isinstance(
+                kernel_special_axiom_inequality_join[
+                    "kernel_special_as_axiom_count"], int)
+            or kernel_special_axiom_inequality_join[
+                "summary_kernel_special_population"]
+            <= kernel_special_axiom_inequality_join[
+                "kernel_special_as_axiom_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest kernel-special population must exceed "
+            f"the as-axiom count ({json.dumps(kernel_special_axiom_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -3593,6 +3620,9 @@ def main():
         "manifest_inductive_refused_pin_join": inductive_refused_pin_join,
         "manifest_kernel_special_population_pin_join": kernel_special_population_pin_join,
         "manifest_kernel_special_as_axiom_pin_join": kernel_special_as_axiom_pin_join,
+        "manifest_kernel_special_axiom_inequality_join": (
+            kernel_special_axiom_inequality_join
+        ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
         "manifest_structural_refused_pin_join": structural_refused_pin_join,
