@@ -10922,6 +10922,47 @@ fn the_platform_gated_identities_declare_where_they_do_not_run() {
     ];
     const SOURCE: &str = include_str!("kernel_replay.rs");
 
+    // THE LIST IS HAND-WRITTEN AND THE CENSUS BELOW PRINTS ITS LENGTH. Every
+    // check in this guard runs FROM the list: each named identity must exist and
+    // must still be gated. Nothing ran the other way, so a fourth
+    // `#[cfg(unix)]` test added anywhere in this file would be checked by
+    // nothing, and the row printed at the end would go on claiming three
+    // identities ran on this platform while four did. A census that publishes a
+    // count is the one place a hand-written scope cannot be allowed to rot.
+    //
+    // The marker below is written with escaped newlines, so this scanning code
+    // does not match itself -- the same escape asymmetry that keeps the
+    // assertion inside the loop from finding its own text. Measured after
+    // writing: still three.
+    let marker = "#[cfg(unix)]\n#[test]\nfn ";
+    let mut scanned = Vec::new();
+    let mut rest = SOURCE;
+    while let Some(at) = rest.find(marker) {
+        let tail = &rest[at + marker.len()..];
+        let end = tail
+            .find("()")
+            .expect("a gated test declaration must name a function");
+        scanned.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    scanned.sort_unstable();
+    let mut declared = GATED.to_vec();
+    declared.sort_unstable();
+    assert_eq!(
+        scanned, declared,
+        "the platform-gated identities in this file are not the ones this row declares. A test \
+         gated but unlisted is checked by nothing here and is missing from the count printed \
+         below; a listed identity that is no longer gated is caught by the loop after this one"
+    );
+    // AND BOTH BEING EMPTY IS THE ONE WAY THE EQUALITY ABOVE PASSES WITHOUT
+    // SAYING ANYTHING. If this file ever gates nothing, the honest move is to
+    // delete this guard and its census row rather than let it print zero.
+    assert!(
+        !scanned.is_empty(),
+        "no platform-gated identity was found, so this guard and the row it prints describe a \
+         population that no longer exists"
+    );
+
     for name in GATED {
         assert!(
             SOURCE.contains(&format!("fn {name}()")),
