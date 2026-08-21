@@ -423,6 +423,67 @@ fn every_named_auxiliary_family_decodes_across_the_whole_init_corpus() {
 }
 
 #[test]
+fn every_named_private_auxiliary_family_reaches_the_constant_info_decoder() {
+    let lib = lib_or_skip!("every_named_private_auxiliary_family_reaches_the_constant_info_decoder");
+
+    // The corpus census above proves that the private `constNames` arrays name
+    // each family. That is necessary but insufficient: a future decoder could
+    // retain the names while failing to construct the corresponding
+    // ConstantInfo. Find one *private-only* representative per family, then
+    // pass each through DeclDecoder with its real companion address spaces.
+    let families: [(&str, fn(&str) -> bool); 4] = [
+        ("match_N", family::match_n),
+        ("_proof_N", family::proof_n),
+        ("eq_N", family::eq_n),
+        (".loop", family::loop_),
+    ];
+    let mut representatives: [Option<(String, String)>; 4] = [None, None, None, None];
+
+    for relative in init_chain_modules(&lib) {
+        let chain = chain_bytes(&lib, &relative);
+        let (exported, private) = exported_and_private_names(&chain);
+        for (slot, (_, belongs_to_family)) in representatives.iter_mut().zip(families) {
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(name) = private
+                .iter()
+                .find(|name| !exported.contains(*name) && belongs_to_family(name))
+            {
+                *slot = Some((relative.clone(), name.clone()));
+            }
+        }
+        if representatives.iter().all(Option::is_some) {
+            break;
+        }
+    }
+
+    for ((family, _), representative) in families.into_iter().zip(representatives) {
+        let (relative, name) = representative.unwrap_or_else(|| {
+            panic!(
+                "the pinned Init private companions contain no private-only {family} representative"
+            )
+        });
+        let chain = chain_bytes(&lib, &relative);
+        let private_view = OleanView::parse_with_dependencies(
+            &chain.private,
+            &[&chain.exported, &chain.server],
+        )
+        .unwrap_or_else(|error| panic!("{family} {name}: parse private {relative}: {error}"));
+        let constants = DeclDecoder::new(&private_view, WalkBudget::default())
+            .decode_module_constants()
+            .unwrap_or_else(|error| panic!("{family} {name}: decode private {relative}: {error}"));
+
+        assert!(
+            constants
+                .iter()
+                .any(|info| info.name().to_display_string() == name),
+            "{family} {name} in {relative} remained only a constName instead of decoding to ConstantInfo"
+        );
+    }
+}
+
+#[test]
 fn a_companion_part_read_without_its_dependencies_is_a_typed_refusal() {
     let lib = lib_or_skip!("a_companion_part_read_without_its_dependencies_is_a_typed_refusal");
     let chain = chain_bytes(&lib, "Init/Data/List/ToArrayImpl");
