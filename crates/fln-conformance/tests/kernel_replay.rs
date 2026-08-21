@@ -4837,6 +4837,103 @@ fn the_inventory_walk_refuses_a_non_injective_projection() {
     );
 }
 
+/// Add a symlink to a fixture tree, idempotently and without removing anything.
+///
+/// `symlink` fails with `AlreadyExists` on a second run, and these fixtures are
+/// never swept, so the link is created only when nothing is there. Existence is
+/// tested with `symlink_metadata`, which does NOT follow links -- `Path::exists`
+/// follows, so a dangling link would read as absent and the creation would then
+/// fail on the next run.
+#[cfg(unix)]
+fn link_fixture_entry(link: &Path, target: &Path) {
+    if fs::symlink_metadata(link).is_ok() {
+        return;
+    }
+    std::os::unix::fs::symlink(target, link).unwrap_or_else(|error| {
+        panic!(
+            "create fixture symlink {} -> {}: {error}",
+            link.display(),
+            target.display()
+        )
+    });
+}
+
+/// A symlinked FILE is refused, so the inventory cannot include something that
+/// is not in the pinned tree.
+///
+/// **Why this is an identity law and not a hygiene rule.** The corpus's whole
+/// job is to say which declarations are in it. A symlink resolves to bytes that
+/// live somewhere else -- another checkout, another revision, a scratch
+/// directory, anything -- so following one would let the walk report a module
+/// that is not part of the corpus it claims to describe, and every count and
+/// digest derived from that walk would then describe a tree that does not exist
+/// as checked out. `preflight_mathlib_corpus` already refuses a symlinked ROOT;
+/// this is the same law one level down, where a single entry can smuggle in a
+/// file the root check never sees.
+///
+/// **It had never executed.** The refusal has exactly one site, inside
+/// `collect_present_oleans`, and nothing anywhere reached it -- so "the corpus
+/// refuses symlinks" was a sentence in a `format!` string rather than a
+/// behaviour anyone had observed.
+///
+/// Unix only, and stated rather than hidden: the law is real on every platform,
+/// but this control cannot construct its input where `std::os::unix` does not
+/// exist, so on such a host the behaviour is unverified rather than verified.
+#[cfg(unix)]
+#[test]
+fn the_inventory_walk_refuses_a_symlinked_file_entry() {
+    let library = write_inventory_fixture("t6r7-inventory-symlink-file-v1", &["Real.olean"]);
+    // Sorted before `Real.olean`, so the walk meets the link first and the
+    // refusal cannot be an accident of iteration order.
+    link_fixture_entry(&library.join("Alias.olean"), &library.join("Real.olean"));
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(OleanInventory { oleans, modules }) => panic!(
+            "the walk FOLLOWED a symlinked olean: {} entr(y/ies) became {modules:?}. A link \
+             resolves to bytes outside the tree being inventoried, so the corpus would then \
+             contain a module that is not in it.",
+            oleans.len()
+        ),
+    };
+    assert!(
+        reason.contains("symlink"),
+        "the refusal must name the symlink rather than fail for something incidental: {reason}"
+    );
+}
+
+/// A symlinked DIRECTORY is refused too, which is the case that matters more.
+///
+/// A linked file smuggles in one module; a linked directory smuggles in an
+/// entire subtree, and could point at a second corpus at a different revision.
+/// The check is the same one, but a guard shown to reject only the smaller case
+/// has not been shown to reject the larger one -- `is_symlink()` is tested
+/// before `is_dir()`, and an implementation that reordered them would keep
+/// passing the file control while silently walking a linked subtree.
+#[cfg(unix)]
+#[test]
+fn the_inventory_walk_refuses_a_symlinked_directory_entry() {
+    let library = write_inventory_fixture(
+        "t6r7-inventory-symlink-dir-v1",
+        &["Real.olean", "Sub/Inner.olean"],
+    );
+    // `Aliased` sorts before both `Real.olean` and `Sub`.
+    link_fixture_entry(&library.join("Aliased"), &library.join("Sub"));
+
+    let reason = match walk_olean_inventory(&library, Some("Fixture")) {
+        Err(reason) => reason,
+        Ok(OleanInventory { oleans, modules }) => panic!(
+            "the walk RECURSED THROUGH a symlinked directory: {} olean(s) became {modules:?}. \
+             A linked subtree can carry an entire second corpus at another revision.",
+            oleans.len()
+        ),
+    };
+    assert!(
+        reason.contains("symlink"),
+        "the refusal must name the symlink rather than fail for something incidental: {reason}"
+    );
+}
+
 /// A real inventory flows into a real receipt, and the real guard refuses it.
 ///
 /// **The join that did not exist.** The producer test drives `from_run` with a
