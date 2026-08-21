@@ -213,6 +213,10 @@ the toolchain would report a perfect facade:
     dropped instance-attribute counts to their declaration rows. The summary
     cannot erase an unregistered attribute or invent a successful registration.
 
+  * A MANIFEST-PRIVATE-NAME JOIN binds the private declaration count and its
+    owning-module distribution to `_private.*` declaration rows. Private names
+    cannot disappear from the generated surface behind a summary-only claim.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1421,6 +1425,31 @@ def main():
             "REFUSE: facade manifest instance-attribute join disagrees with its "
             f"declaration rows ({json.dumps(instance_attribute_join, sort_keys=True)})"
         )
+    private_module_counts = Counter(
+        row.get("module") for row in manifest_rows
+        if isinstance(row.get("name"), str) and row["name"].startswith("_private.")
+    )
+    private_name_join = {
+        "private_rows": sum(private_module_counts.values()),
+        "private_modules": dict(sorted(private_module_counts.items())),
+        "summary_private_rows": manifest_summary.get("private_name_rows"),
+        "summary_private_modules": manifest_summary.get("private_name_modules"),
+    }
+    if (not isinstance(private_name_join["summary_private_rows"], int)
+            or isinstance(private_name_join["summary_private_rows"], bool)
+            or private_name_join["summary_private_rows"] < 0
+            or not all(isinstance(module, str) and module
+                       and isinstance(count, int) and not isinstance(count, bool)
+                       and count > 0
+                       for module, count in private_module_counts.items())
+            or private_name_join["private_rows"]
+            != private_name_join["summary_private_rows"]
+            or private_name_join["private_modules"]
+            != private_name_join["summary_private_modules"]):
+        raise SystemExit(
+            "REFUSE: facade manifest private-name join disagrees with its "
+            f"declaration rows ({json.dumps(private_name_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1600,6 +1629,7 @@ def main():
         "manifest_substrate_emission_join": substrate_emission_join,
         "manifest_init_substrate_join": init_substrate_join,
         "manifest_instance_attribute_join": instance_attribute_join,
+        "manifest_private_name_join": private_name_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
