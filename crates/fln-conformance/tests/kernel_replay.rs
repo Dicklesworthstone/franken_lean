@@ -13893,15 +13893,14 @@ fn stale_claim_split_across_lines(text: &str, stale: &[&str]) -> Option<usize> {
 /// The window is taken on char boundaries. A byte window panics on the em dash
 /// in `AGENTS.md` -- measured, not feared -- and a panicking guard is an
 /// invariant failure, not a diagnostic.
-fn thread_matrix_claim_count(segment: &str) -> usize {
+fn thread_matrix_claim_sites(segment: &str) -> Vec<usize> {
     /// How far from the numerals the noun may sit and still be about them.
     const NEAR: usize = 40;
-    let stripped = segment
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let mut sites = stripped.matches("{1,8,32}").count();
+    let stripped = whitespace_free(segment).to_ascii_lowercase();
+    let mut sites: Vec<usize> = stripped
+        .match_indices("{1,8,32}")
+        .map(|(at, _)| at)
+        .collect();
     for prose in ["1,8and32", "1,8,and32", "1,8or32"] {
         for (at, hit) in stripped.match_indices(prose) {
             let mut low = at.saturating_sub(NEAR);
@@ -13913,11 +13912,47 @@ fn thread_matrix_claim_count(segment: &str) -> usize {
                 high += 1;
             }
             if stripped[low..high].contains("thread") {
-                sites += 1;
+                sites.push(at);
             }
         }
     }
     sites
+}
+
+/// The one place a segment is collapsed, so every rule below indexes the same
+/// string. Positions from one of them are meaningless against another otherwise,
+/// and this guard has already shipped two scans that recognised different claims.
+fn whitespace_free(segment: &str) -> String {
+    segment.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn thread_matrix_claim_count(segment: &str) -> usize {
+    thread_matrix_claim_sites(segment).len()
+}
+
+/// Whether a qualifying word sits near the claim rather than merely on its line.
+///
+/// A CLAIM LINE HERE IS A PARAGRAPH. `AGENTS.md:316` is 3359 characters with
+/// whitespace removed, so "does this line mention the corpus" asks almost
+/// nothing: a word 3000 characters away, in a different sentence, about a
+/// different subject, satisfied the rule. R4 wants the scope stated WHERE THE
+/// CLAIM IS MADE, and a line is not a place.
+///
+/// Measured at every real site before choosing the bound -- the qualifier is
+/// within 70 collapsed characters at all five qualified sites, the cadence
+/// within 318, on lines up to 3359. 600 clears the widest real distance by
+/// nearly twice and still refuses a different sentence of the same paragraph.
+/// Case is preserved: lowercasing here would widen which words count, and this
+/// cell is not the place to do that.
+fn qualifier_is_near_the_claim(line: &str, words: &[&str], within: usize) -> bool {
+    let dense = whitespace_free(line);
+    let sites = thread_matrix_claim_sites(line);
+    words.iter().any(|word| {
+        let needle = whitespace_free(word);
+        dense
+            .match_indices(&needle)
+            .any(|(at, _)| sites.iter().any(|&site| site.abs_diff(at) <= within))
+    })
 }
 
 fn states_thread_matrix_claim(line: &str) -> bool {
@@ -13925,11 +13960,13 @@ fn states_thread_matrix_claim(line: &str) -> bool {
 }
 
 fn unscoped_claim_sites(text: &str, qualifiers: &[&str], cadence: &[&str]) -> usize {
+    /// A qualifier belongs to the sentence stating the claim, not to the paragraph.
+    const NEARBY: usize = 600;
     text.lines()
         .filter(|line| states_thread_matrix_claim(line))
         .filter(|line| {
-            !qualifiers.iter().any(|word| line.contains(word))
-                || !cadence.iter().any(|word| line.contains(word))
+            !qualifier_is_near_the_claim(line, qualifiers, NEARBY)
+                || !qualifier_is_near_the_claim(line, cadence, NEARBY)
         })
         .count()
 }
@@ -17175,6 +17212,35 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
     assert!(
         states_thread_matrix_claim("at 1, 8, and 32 threads"),
         "an Oxford comma is a spelling, not a different claim"
+    );
+    // AND SO MUST THE QUALIFIER BE NEAR THE CLAIM. A claim line in these
+    // documents is a whole paragraph -- AGENTS.md:316 is 3359 collapsed
+    // characters -- so asking whether the LINE mentions the corpus asks almost
+    // nothing. Measured against the rule this replaces: old counts this site
+    // qualified, new counts it unscoped.
+    let distant = format!(
+        "the matrix runs {{1, 8, 32}} per commit.{} It is a corpus observation, an on-demand \
+         shortfall.",
+        " padding".repeat(120)
+    );
+    assert_eq!(
+        unscoped_claim_sites(&distant, &QUALIFIERS, &CADENCE),
+        1,
+        "a qualifier 1000 characters away in a different sentence does not state the scope of \
+         this claim; R4 asks for it where the claim is made"
+    );
+    // AND THE SAME SENTENCE MUST STILL PASS. The control against my own bound:
+    // every real qualified site sits within 70 collapsed characters of its
+    // claim, and a rule that reddens those invents sites instead of missing them.
+    assert_eq!(
+        unscoped_claim_sites(
+            "the matrix runs {1, 8, 32} over the corpus, an on-demand shortfall",
+            &QUALIFIERS,
+            &CADENCE
+        ),
+        0,
+        "a qualifier in the sentence that states the claim must still count, or the bound \
+         reddens every honest site"
     );
     // AND THE NOUN MUST BE NEAR THE NUMERALS. This decoy is invisible to every
     // per-line scan and visible only to the whole-document one, so the guard
