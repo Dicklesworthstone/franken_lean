@@ -3503,6 +3503,65 @@ mod tests {
         );
     }
 
+    /// A `Name` link whose constructor is neither `str` nor `num` is refused.
+    ///
+    /// Nothing shadows it: within `decode_name` the constructor check runs
+    /// BEFORE the size bind added at 81b0234c, so a wrong tag reaches it first
+    /// rather than being reported as a size disagreement. The plant leaves the
+    /// arity and size alone, and the cell re-reads the header to prove it.
+    #[test]
+    fn a_name_link_with_neither_str_nor_num_constructor_is_refused() {
+        let mut bytes = axiom_module(false);
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let name_off = view
+            .deref(
+                view.read_u64(arrays.const_names.0 + 24)
+                    .expect("first constName"),
+            )
+            .expect("Name object");
+
+        let (tag, other, cs_sz) = view.obj_header(name_off).expect("Name header");
+        assert!(
+            tag == 1 || tag == 2,
+            "a Name link is str or num, not tag {tag}"
+        );
+        assert_eq!(other, 2, "prefix and component");
+        assert_eq!(cs_sz, 32, "plus the stored hash");
+
+        // Claim a third constructor the type does not have, leaving the arity
+        // and size — and therefore the size bind — untouched.
+        let header = view.read_u64(name_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (3_u64 << 56);
+        bytes[name_off as usize..name_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(name_off).expect("header after plant"),
+            (3, 2, 32),
+            "only the tag moved, so the size bind cannot fire"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a Name link with an unknown constructor must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Name ctor",
+                    ..
+                }
+            ),
+            "expected the constructor refusal rather than the size bind: {error:?}"
+        );
+    }
+
     /// A `Name` link whose stored size contradicts its layout is refused
     /// before its hash is compared.
     ///
