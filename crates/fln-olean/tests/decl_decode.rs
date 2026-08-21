@@ -2762,3 +2762,183 @@ fn the_head_records_are_shared_and_uniformly_shaped() {
          has several constructors looks like. No type is named here"
     );
 }
+
+/// The two shared head records - and they are not special.
+///
+/// The other option this wave offered is EMPTY BY AN ALREADY-PINNED FACT, which
+/// is worth saying rather than silently not doing. Reading "the tag-4 head
+/// records the same way" cannot be done: `9d365d6a` pins that not one of the 11
+/// has a pointer head, so there are no tag-4 head records to read. An
+/// instruction can be unsatisfiable because an earlier measurement already
+/// closed it, and that is not the same as declining it.
+///
+/// `2475a62f` found 71 references to 69 distinct records. This reads the
+/// difference. The refcounts are 67 records referenced once and two referenced
+/// twice, and the four referring parents are four distinct objects, so the
+/// sharing is at the RECORD level and not an artefact of a parent being counted
+/// twice.
+///
+/// THE RESULT IS NEGATIVE AND THAT IS WHY IT IS WORTH A CELL. The obvious guess
+/// is that a record shared by two parents is a distinguished one - a default, a
+/// sentinel, an empty case. It is not. Both shared records carry exactly the
+/// per-slot shapes `2475a62f` pins for the population: the same single shape in
+/// each of slots 0 through 3, and a slot 4 drawn from the same three-element
+/// set the other 67 draw from. Nothing about their shape marks them out.
+///
+/// So the sharing is what compaction does to structurally identical subterms,
+/// and not a signal about the data. Recording that stops the next reader
+/// spending a wave looking for the distinction, which is the only thing a
+/// negative result can buy and the reason to pin it rather than mention it.
+///
+/// The addresses are pinned with a guard at the address, the pattern
+/// `d7518917` established: a constant nothing re-derives rots quietly, so the
+/// cell goes to each one and re-establishes that the object there is the
+/// five-field shape with exactly two referring parents.
+#[test]
+fn the_two_shared_head_records_are_not_structurally_special() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut references = 0usize;
+    let mut refcounts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut parents_of: std::collections::BTreeMap<usize, BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    let mut shared: Vec<usize> = Vec::new();
+    let mut shared_slots: Vec<Vec<String>> = Vec::new();
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        let mut here: std::collections::BTreeMap<usize, BTreeSet<usize>> =
+            std::collections::BTreeMap::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let Some(tail) = resolve(word_at(bytes, object.off + 16)) else {
+                continue;
+            };
+            if at.get(&tail).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(head) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&head).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            references += 1;
+            here.entry(head).or_default().insert(object.off);
+        }
+
+        for (record, parents) in here {
+            *refcounts.entry(parents.len()).or_default() += 1;
+            if parents.len() > 1 {
+                shared.push(record);
+                shared_slots.push(
+                    (0..5usize)
+                        .map(
+                            |slot| match resolve(word_at(bytes, record + 8 + 8 * slot)) {
+                                Some(off) => {
+                                    let child = at.get(&off).expect("filtered above");
+                                    format!("tag {} arity {}", child.tag, child.other)
+                                }
+                                None => "boxed or unresolvable".to_owned(),
+                            },
+                        )
+                        .collect(),
+                );
+                // The guard, at the address about to be pinned.
+                assert_eq!(
+                    at.get(&record).map(|r| (r.tag, r.other)),
+                    Some((0, 5)),
+                    "a pinned shared record must still be the five-field shape"
+                );
+            }
+            parents_of.insert(record, parents);
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(references, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // The arithmetic `2475a62f` left as a difference.
+    assert_eq!(
+        refcounts.into_iter().collect::<Vec<_>>(),
+        vec![(1, 67), (2, 2)],
+        "sixty-seven records referenced once and two referenced twice - which \
+         is the 71 references over 69 objects `2475a62f` pins"
+    );
+    assert_eq!(references, 71, "and the reference count is unchanged");
+
+    let sharing_parents: usize = shared
+        .iter()
+        .map(|record| parents_of.get(record).map_or(0, BTreeSet::len))
+        .sum();
+    assert_eq!(
+        (shared.len(), sharing_parents),
+        (2, 4),
+        "two shared records between four DISTINCT parents: the sharing is at \
+         the record level, not a parent counted twice"
+    );
+
+    shared.sort_unstable();
+    assert_eq!(
+        shared,
+        vec![0x2aa2e0, 0x2b9490],
+        "the shared records, locatable rather than only counted"
+    );
+
+    // The negative result: nothing about their shape marks them out.
+    let single = "tag 2 arity 2".to_owned();
+    for slots in &shared_slots {
+        assert_eq!(
+            &slots[..4],
+            &[
+                single.clone(),
+                single.clone(),
+                "tag 246 arity 0".to_owned(),
+                "tag 7 arity 3".to_owned(),
+            ],
+            "a shared record's first four slots carry exactly the shapes \
+             `2475a62f` pins for all 69"
+        );
+        assert!(
+            ["tag 0 arity 2", "tag 1 arity 2", "tag 5 arity 1"].contains(&slots[4].as_str()),
+            "and its slot 4 is drawn from the same three shapes the other 67 \
+             draw from, so sharing is not a structural distinction: {}",
+            slots[4]
+        );
+    }
+    assert_eq!(
+        shared_slots.len(),
+        2,
+        "both shared records must have been examined, or the claim that \
+         neither is special is made about nothing"
+    );
+}
