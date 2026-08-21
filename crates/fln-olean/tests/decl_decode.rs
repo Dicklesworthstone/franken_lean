@@ -2103,3 +2103,183 @@ fn the_tag_zero_third_shape_tails_are_well_formed_constructors() {
          one per tail - are records of a regular type, not debris"
     );
 }
+
+/// The 11 `tag 4 arity 2` tails are `Expr.const` nodes with EMPTY level lists.
+///
+/// This is the last third of `2ea2447b`'s histogram. The other two were settled
+/// differently: the 17 boxed tails by an argument (`List` has one nullary
+/// constructor and it is boxed zero, so a boxed 1..6 cannot be a list), the 71
+/// `tag 0` tails by well-formedness (142 fields, none unresolvable, which is
+/// not what a misreading walker produces). These 11 are settled by SHAPE, and
+/// the shape is specific enough to name.
+///
+/// Thirty-two bytes at arity 2 is `8 + 8 * 2` plus an eight-byte scalar area -
+/// one trailing word. That is an `Expr` node's `Data` field, and tag 4 with two
+/// pointers and a `Data` word is `Expr.const declName us`. The cell does not
+/// stop at the arithmetic: it checks the two fields are what that constructor
+/// declares. Slot 0 is a `Name` link in all 11 and `decode_name` accepts it -
+/// the production decoder, not a shape guess. Slot 1 is boxed nil in all 11.
+///
+/// SLOT 1 IS THE POINT, and it is a small irony worth stating. `Expr.const`'s
+/// second field is `List Level` - these objects DO carry a list, walked by the
+/// same `list_ptrs`. Every one of the 11 carries the EMPTY list, so they
+/// contribute no cons cells at all, which is why they turn up as tails and
+/// never as cells.
+///
+/// The names are `obj` (5) and `tobj` (6), all single-component. That the
+/// prefix is the anonymous name is structural - a boxed zero in the link's
+/// first slot - and is measured independently of any string decoding. The
+/// spellings themselves come from reading the string payload, which is the
+/// least robust thing in this cell; a red there names what they really are and
+/// is a finding rather than a fault. `obj` and `tobj` are how Lean's compiler
+/// IR spells its object types, which is consistent with these living in an
+/// extension payload, but this cell does not establish which extension and
+/// does not claim to.
+#[test]
+fn the_tag_four_third_shape_tails_are_expr_const_nodes() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut third_tails = 0usize;
+    let mut tail_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut tag_four = 0usize;
+    let mut in_entries = 0usize;
+    let mut widths: BTreeSet<i64> = BTreeSet::new();
+    let mut sizes: BTreeSet<u16> = BTreeSet::new();
+    let mut single_component = 0usize;
+    let mut empty_level_lists = 0usize;
+    let mut names: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for (module, bytes) in &modules {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root in range");
+        let entries = reachable_from(bytes, base, word_at(bytes, root + 40));
+
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let second = word_at(bytes, object.off + 16);
+            let tail_off = (second & 1 == 0)
+                .then(|| usize::try_from(second.wrapping_sub(base)).ok())
+                .flatten();
+            let tail = tail_off.and_then(|off| at.get(&off).map(|o| (*o, off)));
+            if (second & 1 == 1 && second >> 1 == 0)
+                || tail.is_some_and(|(t, _)| (t.tag, t.other) == (1, 2))
+            {
+                continue;
+            }
+            third_tails += 1;
+            let Some((tail, tail_off)) = tail else {
+                *tail_shapes
+                    .entry("boxed or unresolvable".to_owned())
+                    .or_default() += 1;
+                continue;
+            };
+            *tail_shapes
+                .entry(format!("tag {} arity {}", tail.tag, tail.other))
+                .or_default() += 1;
+            if (tail.tag, tail.other) != (4, 2) {
+                continue;
+            }
+
+            tag_four += 1;
+            if entries.contains(&tail_off) {
+                in_entries += 1;
+            }
+            widths.insert(i64::from(tail.cs_sz) - (8 + 8 * i64::from(tail.other)));
+            sizes.insert(tail.cs_sz);
+
+            // Slot 0: `declName`. Decoded by the production decoder.
+            let name_word = word_at(bytes, tail_off + 8);
+            let decoded = DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(name_word)
+                .unwrap_or_else(|e| panic!("{module}: an Expr.const declName must decode: {e}"));
+            *names.entry(decoded.to_display_string()).or_default() += 1;
+            // Single-component: the link's own prefix slot is the anonymous
+            // name, which is a boxed zero. Structural, not string-derived.
+            if let Some(link) = usize::try_from(name_word.wrapping_sub(base))
+                .ok()
+                .filter(|off| at.contains_key(off))
+            {
+                let prefix = word_at(bytes, link + 8);
+                if prefix & 1 == 1 && prefix >> 1 == 0 {
+                    single_component += 1;
+                }
+            }
+
+            // Slot 1: `us : List Level`.
+            let levels = word_at(bytes, tail_off + 16);
+            if levels & 1 == 1 && levels >> 1 == 0 {
+                empty_level_lists += 1;
+            }
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(third_tails, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    // Kept: the remainder two-way, and the histogram this refines.
+    assert_eq!(third_tails, 99, "the same 99 the remainder cell pins");
+    assert_eq!(
+        tail_shapes.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("boxed or unresolvable".to_owned(), 17),
+            ("tag 0 arity 2".to_owned(), 71),
+            ("tag 4 arity 2".to_owned(), 11),
+        ],
+        "the tail histogram `2ea2447b` pins, grouped by shape"
+    );
+    assert_eq!(tag_four, 11, "the population this cell characterises");
+
+    // The shape, derivation before literal.
+    assert_eq!(
+        widths.iter().copied().collect::<Vec<_>>(),
+        vec![8_i64],
+        "two pointer fields and ONE trailing word - an `Expr` node's `Data`"
+    );
+    assert_eq!(
+        sizes.iter().copied().collect::<Vec<_>>(),
+        vec![32_u16],
+        "which is the size that follows: 8 + 8 * 2 + 8"
+    );
+    assert_eq!(in_entries, 11, "all reached through `entries`");
+
+    // The two fields `Expr.const` declares.
+    assert_eq!(
+        single_component, 11,
+        "every `declName` is a single component: its link's prefix slot is the \
+         boxed anonymous name"
+    );
+    assert_eq!(
+        empty_level_lists, 11,
+        "every `us` is the EMPTY level list. `Expr.const`'s second field is a \
+         `List Level` walked by this same `list_ptrs`, and all 11 carry boxed \
+         nil - which is why these appear as tails and never as cells"
+    );
+    assert_eq!(
+        names.into_iter().collect::<Vec<_>>(),
+        vec![("obj".to_owned(), 5), ("tobj".to_owned(), 6)],
+        "the declNames, decoded by the production decoder"
+    );
+}
