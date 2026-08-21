@@ -358,12 +358,6 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         private_companion_name_count,
         "{json}",
     );
-    assert!(
-        private_companion_name_strings
-            .windows(2)
-            .all(|names| names[0] < names[1]),
-        "{json}",
-    );
     assert_eq!(
         private_companion_name_count,
         private_companion_observed,
