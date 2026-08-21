@@ -2727,6 +2727,23 @@ fn is_private_loop_proof_residual(display: &str) -> bool {
     false
 }
 
+fn is_private_standalone_proof_n_residual(display: &str) -> bool {
+    if !display.starts_with("_private.") {
+        return false;
+    }
+
+    let mut has_proof_n = false;
+    for component in display.split('.') {
+        if component == "loop" {
+            return false;
+        }
+        has_proof_n |= component.strip_prefix("_proof_").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    }
+    has_proof_n
+}
+
 fn is_private_loop_match_one_residual(display: &str) -> bool {
     if !display.starts_with("_private.") {
         return false;
@@ -2823,6 +2840,14 @@ fn render_check_olean_success(
     };
     private_loop_proof_residuals
         .observe_matching(&checked.decoded.constants, is_private_loop_proof_residual);
+    let mut private_standalone_proof_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_standalone_proof_n_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_standalone_proof_n_residual,
+    );
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -2879,6 +2904,13 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_loop_proof_residuals)
     };
+    let private_standalone_proof_n_observed = private_standalone_proof_n_residuals.observed;
+    let private_standalone_proof_n_omitted = private_standalone_proof_n_residuals.omitted();
+    let private_standalone_proof_n_names = if json {
+        render_named_residuals_json(&mut private_standalone_proof_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_standalone_proof_n_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -2908,6 +2940,7 @@ fn render_check_olean_success(
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
@@ -2938,6 +2971,9 @@ fn render_check_olean_success(
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
+            private_standalone_proof_n_observed,
+            private_standalone_proof_n_names,
+            private_standalone_proof_n_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -2976,6 +3012,9 @@ fn render_check_olean_success(
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
+                "decoded standalone _private _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded standalone _private _proof_N residual names: {}\n",
+                "decoded standalone _private _proof_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -3011,6 +3050,9 @@ fn render_check_olean_success(
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
+            private_standalone_proof_n_observed,
+            private_standalone_proof_n_names,
+            private_standalone_proof_n_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3398,6 +3440,16 @@ fn render_check_olean_set_success(
         private_loop_proof_residuals
             .observe_matching(&module.decoded.constants, is_private_loop_proof_residual);
     }
+    let mut private_standalone_proof_n_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_standalone_proof_n_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_standalone_proof_n_residual,
+        );
+    }
     let mut private_loop_match_one_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3458,6 +3510,13 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_loop_proof_residuals)
     };
+    let private_standalone_proof_n_observed = private_standalone_proof_n_residuals.observed;
+    let private_standalone_proof_n_omitted = private_standalone_proof_n_residuals.omitted();
+    let private_standalone_proof_n_names = if json {
+        render_named_residuals_json(&mut private_standalone_proof_n_residuals)
+    } else {
+        render_named_residuals_human(&mut private_standalone_proof_n_residuals)
+    };
     let private_loop_match_one_observed = private_loop_match_one_residuals.observed;
     let private_loop_match_one_omitted = private_loop_match_one_residuals.omitted();
     let private_loop_match_one_names = if json {
@@ -3493,6 +3552,7 @@ fn render_check_olean_set_success(
                 "\"privateEqNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopProofResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateStandaloneProofNResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateLoopMatchOneResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
@@ -3525,6 +3585,9 @@ fn render_check_olean_set_success(
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
+            private_standalone_proof_n_observed,
+            private_standalone_proof_n_names,
+            private_standalone_proof_n_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
@@ -3565,6 +3628,9 @@ fn render_check_olean_set_success(
                 "decoded _private .loop._proof_* residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop._proof_* residual names: {}\n",
                 "decoded _private .loop._proof_* residual names omitted: {}\n",
+                "decoded standalone _private _proof_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded standalone _private _proof_N residual names: {}\n",
+                "decoded standalone _private _proof_N residual names omitted: {}\n",
                 "decoded _private .loop.match_1 residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private .loop.match_1 residual names: {}\n",
                 "decoded _private .loop.match_1 residual names omitted: {}\n",
@@ -3602,6 +3668,9 @@ fn render_check_olean_set_success(
             private_loop_proof_observed,
             private_loop_proof_names,
             private_loop_proof_omitted,
+            private_standalone_proof_n_observed,
+            private_standalone_proof_n_names,
+            private_standalone_proof_n_omitted,
             private_loop_match_one_observed,
             private_loop_match_one_names,
             private_loop_match_one_omitted,
