@@ -6630,6 +6630,14 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
 ///
 /// **Every claim here is asserted lexically**, so nothing rests on my having
 /// read `Path`'s documentation correctly.
+///
+/// **A second spelling exists for the cheap version of this rule.** `Spelled/`
+/// is refused by the round-trip test AND by "reject a name ending in a
+/// separator", so it cannot distinguish them. `Spelled/.` is the input that can:
+/// it ends in a dot, the cheap rule takes it, `Path` still collapses it to one
+/// component, and its record still lands inside the tree. Measured across both
+/// rules and all the old inputs before the cell was written -- the discriminating
+/// input has to be shown to be discriminating, or it is just a third example.
 #[test]
 fn a_fixture_name_must_be_spelled_as_one_component_not_merely_parse_as_one() {
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -6688,6 +6696,47 @@ fn a_fixture_name_must_be_spelled_as_one_component_not_merely_parse_as_one() {
         !tmp.join("Spelled").exists(),
         "the name was refused and its tree exists anyway; the check must run before anything is \
          created"
+    );
+
+    // THE SPELLING THAT A TRAILING-SLASH TEST WOULD LET THROUGH. `Spelled/` is
+    // refused by the rule above AND by the cheap version of it -- reject a name
+    // that ends in a separator -- so it cannot tell the two apart. `Spelled/.`
+    // ends in a dot: the cheap rule accepts it, the round-trip rule refuses it,
+    // and the harm is identical. Measured, all three columns, before this cell
+    // was written.
+    assert!(
+        !"Spelled/.".ends_with('/'),
+        "the discriminating name must NOT end in a separator, or the cheap rule refuses it too and \
+         this cell proves nothing"
+    );
+    assert!(
+        tmp.join("Spelled/..manifest")
+            .starts_with(tmp.join("Spelled/.")),
+        "this spelling must put the record inside the tree as well; a discriminating input that \
+         did no harm would be a rule for its own sake"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| write_inventory_fixture("Spelled/.", &["Any.olean"]));
+    std::panic::set_hook(previous);
+    let payload = outcome.err().unwrap_or_else(|| {
+        panic!("`Spelled/.` parses as one component and is not spelled as one; it must be refused")
+    });
+    let dotted = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        dotted.contains("not spelled as one"),
+        "the dot spelling must be refused by the SAME branch as the slash spelling, not by the \
+         one about a name having no components: {dotted}"
+    );
+    assert!(
+        !tmp.join("Spelled").exists(),
+        "`Spelled/.` names the same directory as `Spelled`, and it was refused, so nothing may \
+         have been created there"
     );
 }
 
