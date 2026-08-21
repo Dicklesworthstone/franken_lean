@@ -338,6 +338,13 @@ fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expecte
 fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOutput) {
     assert_eq!(report.exit_code, 0, "{}", report.stderr);
     assert!(report.stderr.is_empty());
+    assert_eq!(
+        include_str!("../src/lib.rs")
+            .match_indices(r#"\"decodedPrivateAuxiliaryNames\":{}"#)
+            .count(),
+        2,
+        "both check-olean JSON render paths emit decodedPrivateAuxiliaryNames",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
