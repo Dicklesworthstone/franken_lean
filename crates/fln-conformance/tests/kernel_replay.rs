@@ -2874,6 +2874,31 @@ struct CorpusCounts {
     unscorable: u64,
     oracle_skipped: u64,
     subject_no_answer: u64,
+    /// Rejection triage (bead `franken_lean-t6r7`), keyed by the kernel's OWN
+    /// outcome token — `rejected:BlockMismatch`, `inconclusive:Steps` — and not
+    /// by a family name parsed back out of a rendered message. The token is the
+    /// structured `UnitOutcome::outcome` field the verdict stream is built from,
+    /// so the census cannot disagree with the verdict it is counting, and a new
+    /// rejection class names itself here without anyone extending a match arm.
+    ///
+    /// Two maps rather than one because the two populations answer different
+    /// questions: `restrictive_families` triages rows the Reference ACCEPTED and
+    /// we did not, which is the D23 direction this lane exists to bound;
+    /// `no_answer_families` triages rows we could not answer for at all, which
+    /// are unscorable and say nothing about kernel completeness. Folding them
+    /// together would let an exhaustion budget read as a kernel divergence.
+    restrictive_families: BTreeMap<String, u64>,
+    no_answer_families: BTreeMap<String, u64>,
+}
+
+/// Render a family census in the receipt's canonical form: `token=count`,
+/// ascending by token (the `BTreeMap` order), so two runs that saw the same
+/// families produce byte-identical rows.
+fn family_census_rows(census: &BTreeMap<String, u64>) -> Vec<String> {
+    census
+        .iter()
+        .map(|(family, count)| format!("{family}={count}"))
+        .collect()
 }
 
 impl CorpusCounts {
@@ -2893,6 +2918,12 @@ impl CorpusCounts {
         self.unscorable += other.unscorable;
         self.oracle_skipped += other.oracle_skipped;
         self.subject_no_answer += other.subject_no_answer;
+        for (family, count) in &other.restrictive_families {
+            *self.restrictive_families.entry(family.clone()).or_default() += count;
+        }
+        for (family, count) in &other.no_answer_families {
+            *self.no_answer_families.entry(family.clone()).or_default() += count;
+        }
     }
 
     fn assert_conservation(&self, scope: &str) {
@@ -2908,6 +2939,22 @@ impl CorpusCounts {
                 + self.restrictive_with_carve_out
                 + self.restrictive_without_carve_out,
             "{scope}: compared rows must conserve the D23 direction buckets"
+        );
+        // THE TRIAGE IS TOTAL, OR IT IS NOT A TRIAGE. `franken_lean-t6r7` asks
+        // that every rejection land in a NAMED family; a census that counted
+        // fewer rows than the buckets it describes would publish a partial
+        // triage wearing the shape of a complete one, and the shortfall would
+        // be invisible in the summary because both numbers are printed
+        // separately and neither is derived from the other.
+        assert_eq!(
+            self.restrictive_families.values().sum::<u64>(),
+            self.restrictive_with_carve_out + self.restrictive_without_carve_out,
+            "{scope}: every restrictive row must be triaged to exactly one family"
+        );
+        assert_eq!(
+            self.no_answer_families.values().sum::<u64>(),
+            self.subject_no_answer,
+            "{scope}: every subject non-answer must be triaged to exactly one family"
         );
     }
 }
@@ -3153,6 +3200,12 @@ fn score_accepted_reference_module(
                 for name in applicable_members {
                     let rendered = name.to_display_string();
                     counts.compared += 1;
+                    // Triage from the structured outcome token, never from the
+                    // rendered `ours` message (bead `franken_lean-t6r7`).
+                    *counts
+                        .restrictive_families
+                        .entry(outcome.outcome.clone())
+                        .or_default() += 1;
                     if let Some(row) = corpus_carve_out(&rendered) {
                         assert!(
                             !row.justification.trim().is_empty(),
@@ -3178,6 +3231,10 @@ fn score_accepted_reference_module(
                 let affected = applicable_members.len() as u64;
                 counts.unscorable += affected;
                 counts.subject_no_answer += affected;
+                *counts
+                    .no_answer_families
+                    .entry(outcome.outcome.clone())
+                    .or_default() += affected;
                 eprintln!(
                     "kernel_reference_corpus finding: module={} declaration={} \
                      direction=unscorable affected={} detail={}",
@@ -3221,6 +3278,15 @@ fn score_accepted_reference_module(
     if !subject_omitted.is_empty() {
         counts.unscorable += subject_omitted.len() as u64;
         counts.subject_no_answer += subject_omitted.len() as u64;
+        // A row our side never produced an admission envelope for is a
+        // non-answer with a NAMED cause, not an untyped remainder. The family
+        // token is the same typed reason the finding below prints, under a
+        // `context:` prefix so a reader can tell a kernel outcome token
+        // (`rejected:`, `inconclusive:`) from a context-construction reason.
+        *counts
+            .no_answer_families
+            .entry("context:subject_has_no_declaration_envelope".to_string())
+            .or_default() += subject_omitted.len() as u64;
         eprintln!(
             "kernel_reference_corpus finding: module={} direction=unscorable \
              reason=subject_has_no_declaration_envelope affected={} first={:?}",
@@ -4537,6 +4603,703 @@ fn whole_mathlib_corpus_resurrection_sweep() {
     );
 }
 
+/// The coverage floors the whole-Mathlib lane refuses to publish below, named
+/// once so the producer and the receipt reader cannot drift apart. The receipt
+/// guard re-derives its anti-vacuity floors from these same constants: a row
+/// recording fewer modules than the driver asserts before it compares anything
+/// could not have come from a run of this lane.
+const WHOLE_MATHLIB_MODULE_FLOOR: u64 = 10_000;
+const WHOLE_MATHLIB_DECODED_FLOOR: u64 = 700_000;
+
+const WHOLE_MATHLIB_RECEIPT_SCHEMA: &str = "fln.whole-mathlib-differential-receipt/1";
+
+/// The retained receipt for one whole-Mathlib differential run (bead
+/// `franken_lean-t6r7`, mirroring `franken_lean-p6x1`'s corpus-matrix receipt).
+///
+/// **Why a receipt at all.** The lane is hours-class and on demand, so what it
+/// observed exists only in a terminal unless something writes it down. A month
+/// later "the whole-Mathlib differential was clean" would rest on a memory, and
+/// a memory cannot be distinguished from a run that never happened. The row
+/// binds the three things that decide whether the observation is about *this*
+/// world: the Reference pin, the corpus revision (`corpus_commit` from
+/// `SUITE.lock` plus `corpus_fixture_hash`, the inventory's own hash over every
+/// module and its bytes), and the host it ran on.
+///
+/// **Why the file is keyed by pin.** The receipt lives at
+/// `evidence/whole_mathlib_differential/<pin>.jsonl`, so the path itself carries
+/// the binding: when `SUITE.lock` advances the Reference, the file for the new
+/// epoch does not exist and any future retention guard fails without anyone
+/// having to remember a date or read a clock.
+///
+/// **What the row is NOT.** It is one bounded observation at one pin, corpus
+/// revision, host and build — class `bounded_model`, never an invariant, and
+/// never a G1 or PG-1 claim. Whole-corpus acceptance is not claimed anywhere
+/// today and a green row here does not begin to claim it: `unscorable` is
+/// carried in the row precisely so that a run which compared a fraction of the
+/// corpus cannot be quoted as a run over the corpus.
+///
+/// **The triage is part of the format.** `restrictive_families` and
+/// `no_answer_families` carry the per-family census, and [`Self::validate`]
+/// refuses a row whose families do not sum to the buckets they describe. A
+/// partial triage therefore cannot be filed as a complete one — which is the
+/// whole content of "triage every rejection to a named family".
+#[derive(Clone, PartialEq, Eq)]
+struct WholeMathlibReceipt {
+    bead: String,
+    pin: String,
+    corpus_commit: String,
+    observed_unix_s: u64,
+    corpus_fixture_hash: String,
+    modules: u64,
+    decoded: u64,
+    compared: u64,
+    agree: u64,
+    unsoundly_permissive: u64,
+    restrictive_with_carve_out: u64,
+    restrictive_without_carve_out: u64,
+    unscorable: u64,
+    oracle_skipped: u64,
+    subject_no_answer: u64,
+    restrictive_families: Vec<String>,
+    no_answer_families: Vec<String>,
+    wall_ms: u64,
+    profile: String,
+    target: String,
+    available_parallelism: u64,
+    lane_source_digest_at_run: String,
+    class: String,
+}
+
+/// The class token a run earns, derived from what it actually observed rather
+/// than chosen by whoever files the row.
+fn whole_mathlib_class(counts: &CorpusCounts) -> &'static str {
+    if counts.unsoundly_permissive != 0 {
+        // Accepting what the Reference rejects is release-blocking. It must not
+        // sit quietly in an evidence file wearing the clean class.
+        "refuted_this_run_accepted_what_the_reference_rejected"
+    } else if counts.restrictive_without_carve_out != 0 {
+        "refuted_this_run_found_a_restrictive_divergence"
+    } else {
+        "observed_once_not_an_invariant"
+    }
+}
+
+impl WholeMathlibReceipt {
+    /// The canonical one-line form. Field order is fixed and is part of the
+    /// format: a receipt that does not re-serialize to the bytes it was read
+    /// from is refused rather than repaired, so there is exactly one spelling
+    /// of a given observation.
+    fn to_row(&self) -> String {
+        let strings = |values: &[String]| {
+            values
+                .iter()
+                .map(|value| json_string(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"schema\":{},\"bead\":{},\"pin\":{},\"corpus_commit\":{},\
+             \"observed_unix_s\":{},\"corpus_fixture_hash\":{},\"modules\":{},\
+             \"decoded\":{},\"compared\":{},\"agree\":{},\"unsoundly_permissive\":{},\
+             \"restrictive_with_carve_out\":{},\"restrictive_without_carve_out\":{},\
+             \"unscorable\":{},\"oracle_skipped\":{},\"subject_no_answer\":{},\
+             \"restrictive_families\":[{}],\"no_answer_families\":[{}],\"wall_ms\":{},\
+             \"profile\":{},\"target\":{},\"available_parallelism\":{},\
+             \"lane_source_digest_at_run\":{},\"class\":{}}}",
+            json_string(WHOLE_MATHLIB_RECEIPT_SCHEMA),
+            json_string(&self.bead),
+            json_string(&self.pin),
+            json_string(&self.corpus_commit),
+            self.observed_unix_s,
+            json_string(&self.corpus_fixture_hash),
+            self.modules,
+            self.decoded,
+            self.compared,
+            self.agree,
+            self.unsoundly_permissive,
+            self.restrictive_with_carve_out,
+            self.restrictive_without_carve_out,
+            self.unscorable,
+            self.oracle_skipped,
+            self.subject_no_answer,
+            strings(&self.restrictive_families),
+            strings(&self.no_answer_families),
+            self.wall_ms,
+            json_string(&self.profile),
+            json_string(&self.target),
+            self.available_parallelism,
+            json_string(&self.lane_source_digest_at_run),
+            json_string(&self.class),
+        )
+    }
+
+    /// Read a row, then prove the read was faithful by re-serializing it.
+    ///
+    /// Extraction is by key and so tolerant of order; the round-trip is what
+    /// makes the format strict. A parser that silently accepted a row it could
+    /// not reproduce would let a guard check a value nobody wrote.
+    fn from_row(row: &str) -> Result<WholeMathlibReceipt, String> {
+        fn text(row: &str, key: &str) -> Result<String, String> {
+            let needle = format!("\"{key}\":\"");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing string field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find('"')
+                .ok_or_else(|| format!("unterminated string field `{key}`"))?;
+            Ok(rest[..end].to_string())
+        }
+        fn number(row: &str, key: &str) -> Result<u64, String> {
+            let needle = format!("\"{key}\":");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing numeric field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end]
+                .parse()
+                .map_err(|_| format!("field `{key}` is not a u64"))
+        }
+        fn strings(row: &str, key: &str) -> Result<Vec<String>, String> {
+            let needle = format!("\"{key}\":[");
+            let start = row
+                .find(&needle)
+                .ok_or_else(|| format!("missing array field `{key}`"))?
+                + needle.len();
+            let rest = &row[start..];
+            let end = rest
+                .find(']')
+                .ok_or_else(|| format!("unterminated array field `{key}`"))?;
+            Ok(rest[..end]
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(|item| item.trim_matches('"').to_string())
+                .collect())
+        }
+        let schema = text(row, "schema")?;
+        if schema != WHOLE_MATHLIB_RECEIPT_SCHEMA {
+            return Err(format!(
+                "receipt schema is `{schema}`, expected `{WHOLE_MATHLIB_RECEIPT_SCHEMA}`"
+            ));
+        }
+        let receipt = WholeMathlibReceipt {
+            bead: text(row, "bead")?,
+            pin: text(row, "pin")?,
+            corpus_commit: text(row, "corpus_commit")?,
+            observed_unix_s: number(row, "observed_unix_s")?,
+            corpus_fixture_hash: text(row, "corpus_fixture_hash")?,
+            modules: number(row, "modules")?,
+            decoded: number(row, "decoded")?,
+            compared: number(row, "compared")?,
+            agree: number(row, "agree")?,
+            unsoundly_permissive: number(row, "unsoundly_permissive")?,
+            restrictive_with_carve_out: number(row, "restrictive_with_carve_out")?,
+            restrictive_without_carve_out: number(row, "restrictive_without_carve_out")?,
+            unscorable: number(row, "unscorable")?,
+            oracle_skipped: number(row, "oracle_skipped")?,
+            subject_no_answer: number(row, "subject_no_answer")?,
+            restrictive_families: strings(row, "restrictive_families")?,
+            no_answer_families: strings(row, "no_answer_families")?,
+            wall_ms: number(row, "wall_ms")?,
+            profile: text(row, "profile")?,
+            target: text(row, "target")?,
+            available_parallelism: number(row, "available_parallelism")?,
+            lane_source_digest_at_run: text(row, "lane_source_digest_at_run")?,
+            class: text(row, "class")?,
+        };
+        if receipt.to_row() != row {
+            return Err(format!(
+                "receipt is not in canonical form; it was read as\n  {}\nbut the file holds\n  {row}",
+                receipt.to_row()
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Sum a `token=count` family census back to the number of rows it triages.
+    fn family_total(rows: &[String], field: &str) -> Result<u64, String> {
+        let mut total = 0u64;
+        let mut seen = BTreeSet::new();
+        for entry in rows {
+            let (family, count) = entry
+                .rsplit_once('=')
+                .ok_or_else(|| format!("`{field}` entry `{entry}` is not `family=count`"))?;
+            if family.is_empty() {
+                return Err(format!("`{field}` entry `{entry}` names no family"));
+            }
+            if !seen.insert(family.to_string()) {
+                return Err(format!(
+                    "`{field}` names family `{family}` twice; the census would double-count it"
+                ));
+            }
+            let parsed = count
+                .parse::<u64>()
+                .map_err(|_| format!("`{field}` entry `{entry}` has a non-u64 count"))?;
+            if parsed == 0 {
+                return Err(format!(
+                    "`{field}` entry `{entry}` counts zero rows; an empty family is not a triage"
+                ));
+            }
+            total += parsed;
+        }
+        Ok(total)
+    }
+
+    /// Everything the row must say to be evidence for a sentence that cites it.
+    ///
+    /// **Why a function and not assertions at one call site.** It has two
+    /// callers: the mutant test below, which runs it over forged rows, and any
+    /// future retention guard, which will run it over a committed file. A second
+    /// copy of these rules written for the test could drift from the one that
+    /// gates, and the mutants would then prove a check that no longer runs.
+    ///
+    /// **What it is for.** The failure mode this is built against is the
+    /// empty-referent row: `modules: 0, decoded: 0, compared: 0` satisfies
+    /// "zero divergences" perfectly and would stand as the retained evidence for
+    /// a whole-corpus observation. Size and conservation are checked BEFORE
+    /// content for exactly that reason. The floors are `>=`: a larger corpus is
+    /// not a failure, a smaller one is.
+    fn validate(&self, pin: &str, corpus_commit: &str) -> Result<(), String> {
+        if self.pin != pin {
+            return Err(format!(
+                "row records pin {} but the file is the {pin} epoch's. The path IS the \
+                 binding; a row filed under the wrong epoch would make the guard check an \
+                 observation of another Reference",
+                self.pin
+            ));
+        }
+        if self.corpus_commit != corpus_commit {
+            return Err(format!(
+                "row records corpus commit {} but SUITE.lock pins {corpus_commit}. A complete \
+                 run over a DIFFERENT Mathlib revision is evidence about another corpus",
+                self.corpus_commit
+            ));
+        }
+
+        // ANTI-VACUITY, before any content check. `all()` over an empty
+        // population is vacuously true, and so is "no divergences" over no
+        // comparisons.
+        if self.modules < WHOLE_MATHLIB_MODULE_FLOOR {
+            return Err(format!(
+                "row records {} module(s), below the {WHOLE_MATHLIB_MODULE_FLOOR} the driver \
+                 asserts before it compares anything. Zero divergences over a corpus this \
+                 small is not the observation the row appears to carry",
+                self.modules
+            ));
+        }
+        if self.decoded < WHOLE_MATHLIB_DECODED_FLOOR {
+            return Err(format!(
+                "row records {} decoded declaration(s), below the {WHOLE_MATHLIB_DECODED_FLOOR} \
+                 floor",
+                self.decoded
+            ));
+        }
+        if self.compared == 0 {
+            return Err(
+                "row records zero declarations compared. `restrictive_without_carve_out: 0` \
+                 over zero comparisons is not agreement; it is the absence of a measurement \
+                 wearing the shape of one"
+                    .to_string(),
+            );
+        }
+        if self.observed_unix_s == 0 {
+            return Err(
+                "row records observed_unix_s: 0. A receipt with no observation instant cannot \
+                 date the evidence it carries. The producer sets this from the clock at the \
+                 end of the run, so zero means the row was constructed rather than observed"
+                    .to_string(),
+            );
+        }
+        if self.wall_ms == 0 {
+            return Err(
+                "row records wall_ms: 0. The whole Mathlib closure does not decode, replay and \
+                 score in under a millisecond, and this number is the priced input to the \
+                 cadence decision that keeps the lane on demand"
+                    .to_string(),
+            );
+        }
+
+        // CONSERVATION. The producer asserts these live; the row re-states them
+        // so a hand-edited file cannot quietly contradict the run it claims.
+        if self.decoded != self.compared + self.unscorable {
+            return Err(format!(
+                "row does not conserve its own population: decoded {} != compared {} + \
+                 unscorable {}",
+                self.decoded, self.compared, self.unscorable
+            ));
+        }
+        let buckets = self.agree
+            + self.unsoundly_permissive
+            + self.restrictive_with_carve_out
+            + self.restrictive_without_carve_out;
+        if self.compared != buckets {
+            return Err(format!(
+                "row does not conserve the D23 direction buckets: compared {} != {buckets}",
+                self.compared
+            ));
+        }
+
+        // THE TRIAGE IS TOTAL. A row may not claim a family census that covers
+        // fewer rows than the buckets it describes.
+        let restrictive = Self::family_total(&self.restrictive_families, "restrictive_families")?;
+        if restrictive != self.restrictive_with_carve_out + self.restrictive_without_carve_out {
+            return Err(format!(
+                "restrictive_families triages {restrictive} row(s) but the row records {} \
+                 restrictive comparison(s); a partial triage must not be filed as a complete one",
+                self.restrictive_with_carve_out + self.restrictive_without_carve_out
+            ));
+        }
+        let no_answer = Self::family_total(&self.no_answer_families, "no_answer_families")?;
+        if no_answer != self.subject_no_answer {
+            return Err(format!(
+                "no_answer_families triages {no_answer} row(s) but the row records {} subject \
+                 non-answer(s)",
+                self.subject_no_answer
+            ));
+        }
+
+        // PROVENANCE. Empty strings are not weak provenance, they are none.
+        if self.corpus_fixture_hash.is_empty() {
+            return Err(
+                "row carries an empty corpus_fixture_hash, so it names no corpus revision"
+                    .to_string(),
+            );
+        }
+        if self.lane_source_digest_at_run.is_empty() {
+            return Err(
+                "row carries an empty lane_source_digest_at_run, so it names no producing source"
+                    .to_string(),
+            );
+        }
+
+        // CONTENT. The class must match what the counts actually say: a
+        // refutation wearing the clean token is the one failure this format
+        // exists to make impossible.
+        let expected = match (
+            self.unsoundly_permissive,
+            self.restrictive_without_carve_out,
+        ) {
+            (0, 0) => "observed_once_not_an_invariant",
+            (0, _) => "refuted_this_run_found_a_restrictive_divergence",
+            _ => "refuted_this_run_accepted_what_the_reference_rejected",
+        };
+        if self.class != expected {
+            return Err(format!(
+                "row claims class {} but its own counts earn {expected} \
+                 (unsoundly_permissive={}, restrictive_without_carve_out={})",
+                self.class, self.unsoundly_permissive, self.restrictive_without_carve_out
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Where the retained whole-Mathlib receipts for a given Reference pin live.
+///
+/// **No retention guard exists yet, deliberately.** The corpus this lane needs
+/// is host state that is NOT provisioned on this machine today, so no run can
+/// have produced a row, so a guard demanding a committed receipt would be a
+/// standing red for the absence of an input rather than for a defect. The
+/// binding this path expresses becomes enforceable the first time the lane runs
+/// against a provisioned corpus and its row is committed.
+fn whole_mathlib_receipt_path(pin: &str) -> PathBuf {
+    fln_conformance::checked_manifest_dir!()
+        .join("evidence/whole_mathlib_differential")
+        .join(format!("{pin}.jsonl"))
+}
+
+/// A receipt describing a clean whole-Mathlib run, used as the GREEN CONTROL for
+/// the mutants below. Every mutant is this row with exactly one cell changed, so
+/// a mutant that dies names the cell that killed it.
+///
+/// It is hand-built rather than read from a committed file because no committed
+/// file can exist yet: the corpus is host state and is not provisioned here. A
+/// fixture is not the production path, and this test says only that the FORMAT
+/// refuses what it must — not that any real run was ever scored.
+fn sample_whole_mathlib_receipt() -> WholeMathlibReceipt {
+    WholeMathlibReceipt {
+        bead: "franken_lean-t6r7".to_string(),
+        pin: suite_lock_reference_pin(),
+        corpus_commit: suite_lock_corpus_commit(),
+        observed_unix_s: 1_786_000_000,
+        corpus_fixture_hash: "0123456789abcdef".to_string(),
+        modules: WHOLE_MATHLIB_MODULE_FLOOR,
+        decoded: WHOLE_MATHLIB_DECODED_FLOOR,
+        compared: 600_000,
+        agree: 600_000,
+        unsoundly_permissive: 0,
+        restrictive_with_carve_out: 0,
+        restrictive_without_carve_out: 0,
+        unscorable: WHOLE_MATHLIB_DECODED_FLOOR - 600_000,
+        oracle_skipped: 60_000,
+        subject_no_answer: 40_000,
+        restrictive_families: Vec::new(),
+        no_answer_families: vec![
+            "context:import_context_not_faithfully_representable=39000".to_string(),
+            "inconclusive:Steps=1000".to_string(),
+        ],
+        wall_ms: 11_000_000,
+        profile: "dev".to_string(),
+        target: "x86_64-linux".to_string(),
+        lane_source_digest_at_run: "fedcba9876543210".to_string(),
+        available_parallelism: 16,
+        class: "observed_once_not_an_invariant".to_string(),
+    }
+}
+
+/// The format is strict: a row must re-serialize to the bytes it was read from,
+/// and a reader that cannot reproduce a row must refuse it rather than repair it.
+#[test]
+fn the_whole_mathlib_receipt_round_trips_through_its_own_serializer() {
+    let sample = sample_whole_mathlib_receipt();
+    let row = sample.to_row();
+    let parsed = WholeMathlibReceipt::from_row(&row).expect("the sample row must parse");
+    assert_eq!(parsed.to_row(), row, "canonical round trip");
+    assert!(
+        parsed == sample,
+        "the parsed row must equal what produced it"
+    );
+
+    let mutations: Vec<(&str, String)> = vec![
+        ("schema moved", row.replace("receipt/1", "receipt/2")),
+        ("truncated", row[..row.len() / 2].to_string()),
+        ("field dropped", row.replace(",\"wall_ms\":11000000", "")),
+        (
+            "whitespace introduced",
+            row.replace("\"modules\":", "\"modules\": "),
+        ),
+        (
+            "count reworded but not re-serialized",
+            row.replace("\"compared\":600000", "\"compared\":0600000"),
+        ),
+    ];
+    for (name, damaged) in mutations {
+        assert!(
+            WholeMathlibReceipt::from_row(&damaged).is_err(),
+            "a receipt with `{name}` was accepted; the reader must refuse what it cannot \
+             reproduce byte for byte"
+        );
+    }
+}
+
+/// The guard's content rules, run over forged rows.
+///
+/// The failure this is built against is the empty-referent row: zero
+/// divergences over zero comparisons satisfies every naive "was it clean?"
+/// check and would stand as the retained evidence for a whole-corpus
+/// observation. Each mutant below changes ONE cell of the green control, so a
+/// mutant that dies names the cell responsible; the control itself must pass, or
+/// every mutant below would die for the wrong reason.
+#[test]
+fn a_whole_mathlib_receipt_that_measured_nothing_is_refused() {
+    let pin = suite_lock_reference_pin();
+    let corpus = suite_lock_corpus_commit();
+    let sample = sample_whole_mathlib_receipt();
+    if let Err(reason) = sample.validate(&pin, &corpus) {
+        panic!("the green control must satisfy its own guard, but: {reason}");
+    }
+
+    let mutants: Vec<(&str, WholeMathlibReceipt, &str)> = vec![
+        (
+            "compared nothing",
+            WholeMathlibReceipt {
+                compared: 0,
+                agree: 0,
+                unscorable: WHOLE_MATHLIB_DECODED_FLOOR,
+                ..sample_whole_mathlib_receipt()
+            },
+            "zero declarations compared",
+        ),
+        (
+            "empty corpus",
+            WholeMathlibReceipt {
+                modules: 0,
+                ..sample_whole_mathlib_receipt()
+            },
+            "below the",
+        ),
+        (
+            "decoded below the floor",
+            WholeMathlibReceipt {
+                decoded: 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "below the",
+        ),
+        (
+            "another Reference epoch",
+            WholeMathlibReceipt {
+                pin: "v0.0.0".to_string(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "epoch",
+        ),
+        (
+            "another corpus revision",
+            WholeMathlibReceipt {
+                corpus_commit: "0".repeat(40),
+                ..sample_whole_mathlib_receipt()
+            },
+            "another corpus",
+        ),
+        (
+            "no observation instant",
+            WholeMathlibReceipt {
+                observed_unix_s: 0,
+                ..sample_whole_mathlib_receipt()
+            },
+            "observed_unix_s",
+        ),
+        (
+            "no elapsed time",
+            WholeMathlibReceipt {
+                wall_ms: 0,
+                ..sample_whole_mathlib_receipt()
+            },
+            "wall_ms",
+        ),
+        (
+            "population does not conserve",
+            WholeMathlibReceipt {
+                unscorable: 0,
+                ..sample_whole_mathlib_receipt()
+            },
+            "conserve its own population",
+        ),
+        (
+            "direction buckets do not conserve",
+            WholeMathlibReceipt {
+                agree: 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "D23 direction buckets",
+        ),
+        (
+            "restrictive rows left untriaged",
+            WholeMathlibReceipt {
+                agree: 599_990,
+                restrictive_without_carve_out: 10,
+                class: "refuted_this_run_found_a_restrictive_divergence".to_string(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "partial triage",
+        ),
+        (
+            "non-answers left untriaged",
+            WholeMathlibReceipt {
+                no_answer_families: Vec::new(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "no_answer_families triages",
+        ),
+        (
+            "a family counted twice",
+            WholeMathlibReceipt {
+                no_answer_families: vec![
+                    "inconclusive:Steps=20000".to_string(),
+                    "inconclusive:Steps=20000".to_string(),
+                ],
+                ..sample_whole_mathlib_receipt()
+            },
+            "twice",
+        ),
+        (
+            "a family that triages nobody",
+            WholeMathlibReceipt {
+                no_answer_families: vec![
+                    "context:import_context_not_faithfully_representable=40000".to_string(),
+                    "inconclusive:Steps=0".to_string(),
+                ],
+                ..sample_whole_mathlib_receipt()
+            },
+            "counts zero rows",
+        ),
+        (
+            "a family entry that is not family=count",
+            WholeMathlibReceipt {
+                no_answer_families: vec!["inconclusive:Steps".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "is not `family=count`",
+        ),
+        (
+            "no corpus provenance",
+            WholeMathlibReceipt {
+                corpus_fixture_hash: String::new(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "corpus_fixture_hash",
+        ),
+        (
+            "no source provenance",
+            WholeMathlibReceipt {
+                lane_source_digest_at_run: String::new(),
+                ..sample_whole_mathlib_receipt()
+            },
+            "lane_source_digest_at_run",
+        ),
+        (
+            "a restrictive divergence wearing the clean class",
+            WholeMathlibReceipt {
+                agree: 599_990,
+                restrictive_without_carve_out: 10,
+                restrictive_families: vec!["rejected:BlockMismatch=10".to_string()],
+                ..sample_whole_mathlib_receipt()
+            },
+            "earns refuted_this_run_found_a_restrictive_divergence",
+        ),
+        (
+            "an unsound acceptance wearing the clean class",
+            WholeMathlibReceipt {
+                agree: 599_999,
+                unsoundly_permissive: 1,
+                ..sample_whole_mathlib_receipt()
+            },
+            "earns refuted_this_run_accepted_what_the_reference_rejected",
+        ),
+    ];
+
+    for (name, mutant, expected) in mutants {
+        let verdict = mutant.validate(&pin, &corpus);
+        let reason = match verdict {
+            Ok(()) => panic!(
+                "the receipt guard ACCEPTED a row that `{name}`. Every rule here exists \
+                 because a row of that shape would otherwise stand as retained evidence"
+            ),
+            Err(reason) => reason,
+        };
+        assert!(
+            reason.contains(expected),
+            "`{name}` was refused for the wrong reason: expected a message naming \
+             `{expected}`, got `{reason}`"
+        );
+    }
+}
+
+/// The receipt path is keyed by the Reference pin, so advancing `SUITE.lock`
+/// retires every retained observation by construction rather than by anyone
+/// remembering to.
+#[test]
+fn the_whole_mathlib_receipt_path_is_keyed_by_the_reference_pin() {
+    let pin = suite_lock_reference_pin();
+    let path = whole_mathlib_receipt_path(&pin);
+    assert!(
+        path.ends_with(format!("{pin}.jsonl")),
+        "the receipt file must be named for the pin it observes: {}",
+        path.display()
+    );
+    assert_ne!(
+        whole_mathlib_receipt_path("v0.0.0"),
+        path,
+        "two Reference epochs must not share a receipt file"
+    );
+}
+
 /// The full pinned Mathlib kernel differential over the exact closed graph
 /// established by `whole_mathlib_corpus_resurrection_sweep`. It reuses the
 /// Reference-library corpus scorer and reconstructed-context executor; only
@@ -4564,6 +5327,7 @@ fn whole_mathlib_kernel_differential() {
         "whole-Mathlib differential seed floor: {} < 8000",
         mathlib_modules.len()
     );
+    let corpus_commit = suite_lock_corpus_commit();
     let mathlib_oracle_applicable = mathlib_modules
         .iter()
         .map(|name| {
@@ -4586,13 +5350,18 @@ fn whole_mathlib_kernel_differential() {
         inventory,
         order,
         CorpusDifferentialScope {
-            module_floor: 10_000,
-            decoded_floor: 700_000,
+            module_floor: WHOLE_MATHLIB_MODULE_FLOOR,
+            decoded_floor: WHOLE_MATHLIB_DECODED_FLOOR,
             compared_floor: mathlib_oracle_applicable,
             oracle_total_timeout: WHOLE_MATHLIB_ORACLE_TOTAL_TIMEOUT,
             oracle_process_timeout: WHOLE_MATHLIB_ORACLE_PROCESS_TIMEOUT,
             oracle_modules_per_process: WHOLE_MATHLIB_ORACLE_MODULES_PER_PROCESS,
             label: "pinned-whole-mathlib",
+            receipt: Some(CorpusReceiptSpec {
+                bead: "franken_lean-t6r7",
+                corpus_commit,
+                receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+            }),
         },
     );
 }
@@ -4626,6 +5395,7 @@ fn pinned_present_olean_kernel_differential() {
             oracle_process_timeout: DEFAULT_LEANCHECKER_TIMEOUT,
             oracle_modules_per_process: usize::MAX,
             label: "pinned-reference-library",
+            receipt: None,
         },
     );
 }
@@ -4638,6 +5408,22 @@ struct CorpusDifferentialScope {
     oracle_process_timeout: Duration,
     oracle_modules_per_process: usize,
     label: &'static str,
+    /// `Some` only for lanes that retain a pin-keyed receipt. The pinned
+    /// present-olean lane does not: its corpus IS the Reference library, so
+    /// `SUITE.lock`'s corpus commit would name a revision it never read, and a
+    /// receipt whose provenance field is about another input is worse than none.
+    receipt: Option<CorpusReceiptSpec>,
+}
+
+/// What a receipt-retaining lane must name about itself before it may file a row.
+struct CorpusReceiptSpec {
+    bead: &'static str,
+    corpus_commit: String,
+    /// Environment variable naming the file the row is appended to. The row is
+    /// ALWAYS printed; it is written into the tree only when an operator names a
+    /// path, because a test that edits a tracked file on its own is a
+    /// governed-input mutation and could void another lane's run.
+    receipt_path_var: &'static str,
 }
 
 fn run_accepted_corpus_kernel_differential(
@@ -4655,7 +5441,9 @@ fn run_accepted_corpus_kernel_differential(
         oracle_process_timeout,
         oracle_modules_per_process,
         label: corpus_label,
+        receipt: receipt_spec,
     } = scope;
+    let started = Instant::now();
     assert!(
         inventory.modules.len() as u64 >= module_floor,
         "{corpus_label} module coverage floor: {} < {module_floor}",
@@ -4837,13 +5625,23 @@ fn run_accepted_corpus_kernel_differential(
                 .filter(|row| !reference_replay_skips(&infos[**row]))
                 .count() as u64;
             let oracle_skipped = module.oracle_skipped + dynamic_oracle_skips;
-            let counts = CorpusCounts {
+            let mut counts = CorpusCounts {
                 decoded: module.decoded,
                 unscorable: module.decoded,
                 oracle_skipped,
                 subject_no_answer: module.decoded - oracle_skipped,
                 ..CorpusCounts::default()
             };
+            // The whole module is unscorable because we could not faithfully
+            // rebuild its import context. That is the single largest
+            // non-answer family in every corpus run to date, so it is named
+            // here rather than left as an untriaged remainder.
+            if counts.subject_no_answer != 0 {
+                counts.no_answer_families.insert(
+                    "context:import_context_not_faithfully_representable".to_string(),
+                    counts.subject_no_answer,
+                );
+            }
             counts.assert_conservation(&module.name);
             eprintln!(
                 "kernel_reference_corpus finding: module={} direction=unscorable \
@@ -4922,6 +5720,26 @@ fn run_accepted_corpus_kernel_differential(
         inventory.missing_imports.len(),
         inventory.fixture_hash
     );
+    // THE TRIAGE, PUBLISHED WITH THE COUNTS IT EXPLAINS (bead `franken_lean-t6r7`).
+    // Printed for EVERY receipt-retaining and non-retaining lane alike, because
+    // the pinned present-olean lane files no receipt and its rejection families
+    // would otherwise exist only as thousands of individual `finding:` lines
+    // nobody aggregates. An empty census prints as `none`, so a run that
+    // triaged nothing is visibly distinct from a run whose census was dropped.
+    let render = |census: &BTreeMap<String, u64>| {
+        if census.is_empty() {
+            "none".to_string()
+        } else {
+            family_census_rows(census).join(",")
+        }
+    };
+    println!(
+        "kernel_reference_corpus TRIAGE: corpus={corpus_label} \
+         restrictive_families={} no_answer_families={} \
+         means=restrictive_rows_are_D23_findings_no_answer_rows_are_unscorable_and_say_nothing_about_kernel_completeness",
+        render(&total.restrictive_families),
+        render(&total.no_answer_families),
+    );
     // The claim class that belongs to the numbers above, printed with them so it
     // cannot be dropped when they are quoted (bead `fln-8zsq`). PG-5 asks for a
     // measured invariant across {1, 8, 32}; what this run supports is weaker,
@@ -4942,6 +5760,70 @@ fn run_accepted_corpus_kernel_differential(
          means=these_counts_are_NOT_evidence_of_deterministic_corpus_checking \
          bead=fln-8zsq,fln-corpus-thread-matrix-93te"
     );
+    // THE RETAINED EVIDENCE (bead `franken_lean-t6r7`), emitted BEFORE the
+    // terminal assertions on purpose. A run that found a divergence is exactly
+    // the run whose row must survive; filing it after the asserts would retain
+    // only the clean observations and quietly discard every refutation.
+    if let Some(spec) = receipt_spec {
+        let receipt = WholeMathlibReceipt {
+            bead: spec.bead.to_string(),
+            pin: suite_lock_reference_pin(),
+            corpus_commit: spec.corpus_commit.clone(),
+            observed_unix_s: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0),
+            corpus_fixture_hash: inventory.fixture_hash.clone(),
+            modules: inventory.modules.len() as u64,
+            decoded: total.decoded,
+            compared: total.compared,
+            agree: total.agree,
+            unsoundly_permissive: total.unsoundly_permissive,
+            restrictive_with_carve_out: total.restrictive_with_carve_out,
+            restrictive_without_carve_out: total.restrictive_without_carve_out,
+            unscorable: total.unscorable,
+            oracle_skipped: total.oracle_skipped,
+            subject_no_answer: total.subject_no_answer,
+            restrictive_families: family_census_rows(&total.restrictive_families),
+            no_answer_families: family_census_rows(&total.no_answer_families),
+            wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            profile: if cfg!(debug_assertions) {
+                "dev"
+            } else {
+                "release"
+            }
+            .to_string(),
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            available_parallelism: std::thread::available_parallelism()
+                .map(|n| n.get() as u64)
+                .unwrap_or(0),
+            // The lane digests its OWN source, so the provenance cannot be
+            // forgotten by an operator or mistyped by one.
+            lane_source_digest_at_run: hash(
+                Domain::Fixture,
+                include_str!("kernel_replay.rs").as_bytes(),
+            )
+            .to_hex(),
+            class: whole_mathlib_class(&total).to_string(),
+        };
+        let row = receipt.to_row();
+        eprintln!("kernel_reference_corpus RECEIPT: {row}");
+        eprintln!(
+            "kernel_reference_corpus RECEIPT-DESTINATION: pin_keyed_path={}              written_only_when={} is_set",
+            whole_mathlib_receipt_path(&suite_lock_reference_pin()).display(),
+            spec.receipt_path_var
+        );
+        if let Ok(path) = std::env::var(spec.receipt_path_var) {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|error| panic!("open receipt {path}: {error}"));
+            writeln!(file, "{row}")
+                .unwrap_or_else(|error| panic!("append receipt {path}: {error}"));
+        }
+    }
+
     assert!(
         total.compared >= compared_floor,
         "kernel differential coverage silently stopped: {} < {} scoreable declarations",
