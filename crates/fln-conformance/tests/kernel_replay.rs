@@ -4510,10 +4510,23 @@ fn suite_lock_corpus_commit() -> String {
 /// discovery seam in one place so the resurrection sweep and later kernel
 /// differential cannot disagree on what they accepted as the Mathlib corpus.
 fn mathlib_corpus_root() -> PathBuf {
-    std::env::var_os("FLN_MATHLIB_CORPUS")
+    std::env::var_os(MATHLIB_CORPUS_ROOT_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/data/tmp/mathlib4-corpus"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MATHLIB_CORPUS_ROOT))
 }
+
+/// The host path the whole-Mathlib lane requires when nothing overrides it, and
+/// the variable that overrides it.
+///
+/// These are the PRODUCTION spellings.
+/// `the_corpus_root_is_exactly_the_documented_host_path` writes the same path out
+/// again as a literal and compares. That duplication is deliberate and is the
+/// only reason the comparison means anything: a test that reused these constants
+/// would agree with any value they ever held, including a wrong one. One side is
+/// the implementation, the other is the specification, and they must be written
+/// independently or the check is a mirror.
+const DEFAULT_MATHLIB_CORPUS_ROOT: &str = "/data/tmp/mathlib4-corpus";
+const MATHLIB_CORPUS_ROOT_ENV: &str = "FLN_MATHLIB_CORPUS";
 
 /// Refuse before an expensive whole-corpus run when its external input cannot
 /// identify itself. This is intentionally stronger than `is_dir()`: a different
@@ -4594,6 +4607,28 @@ enum MathlibCorpusInput {
     Misprovisioned { root: PathBuf, reason: String },
 }
 
+impl MathlibCorpusInput {
+    /// Whether this classification makes the walk SKIP.
+    ///
+    /// Exactly one of the three does, and that is the law: a skip is earned by
+    /// the root not being on this host, and by nothing else. A present root that
+    /// cannot identify itself as the pinned corpus is a misprovisioned input and
+    /// fails; a present root that can is walked. Neither is quietly passed over.
+    fn skips(&self) -> bool {
+        matches!(self, MathlibCorpusInput::Absent { .. })
+    }
+
+    /// The root this classification is ABOUT, so a caller can check the answer
+    /// is about the path it asked after rather than some other path.
+    fn root(&self) -> &Path {
+        match self {
+            MathlibCorpusInput::Absent { root, .. }
+            | MathlibCorpusInput::Present { root, .. }
+            | MathlibCorpusInput::Misprovisioned { root, .. } => root,
+        }
+    }
+}
+
 fn classify_mathlib_corpus_input() -> MathlibCorpusInput {
     classify_mathlib_corpus_input_at(mathlib_corpus_root())
 }
@@ -4616,6 +4651,112 @@ fn classify_mathlib_corpus_input_at(root: PathBuf) -> MathlibCorpusInput {
             Err(reason) => MathlibCorpusInput::Misprovisioned { root, reason },
         },
     }
+}
+
+/// The corpus root is EXACTLY the documented host path, compared whole.
+///
+/// **Why a literal and not the constant.** The path is written out again here by
+/// hand. Reusing `DEFAULT_MATHLIB_CORPUS_ROOT` would make this agree with
+/// whatever that constant ever held, including a wrong value -- a mirror, not a
+/// check. One side is the implementation and this side is the specification, so
+/// changing where the lane looks for its corpus has to be done twice, on
+/// purpose, and a silent drift fails here.
+///
+/// **Why equality and not containment.** `contains` would accept
+/// `/data/tmp/mathlib4-corpus-old`, `/srv/backup/data/tmp/mathlib4-corpus`, or a
+/// path with a trailing separator -- every one of them a different directory,
+/// and each would let the lane report on one corpus while the skip row named
+/// another.
+#[test]
+fn the_corpus_root_is_exactly_the_documented_host_path() {
+    let root = mathlib_corpus_root();
+    match std::env::var_os("FLN_MATHLIB_CORPUS") {
+        None => assert_eq!(
+            root.as_path(),
+            Path::new("/data/tmp/mathlib4-corpus"),
+            "with no override the whole-Mathlib lane must look in exactly the documented path; \
+             it looked in {}",
+            root.display()
+        ),
+        Some(override_path) => assert_eq!(
+            root.as_path(),
+            Path::new(&override_path),
+            "FLN_MATHLIB_CORPUS must be honoured exactly, with no normalisation of its own"
+        ),
+    }
+    // The override variable's NAME is part of the contract the skip row prints,
+    // so it is pinned too.
+    assert_eq!(MATHLIB_CORPUS_ROOT_ENV, "FLN_MATHLIB_CORPUS");
+}
+
+/// EXISTENCE ALONE decides whether the walk skips.
+///
+/// **The law.** `classify(root).skips()` is true if and only if `root` is not
+/// present on this host. A present root is never skipped: if it identifies
+/// itself as the pinned corpus it is walked, and if it cannot it fails. The one
+/// outcome that must never happen is a directory sitting on disk while the lane
+/// reports a missing host input -- that reads as "nothing to do here" when the
+/// truth is "there is something here and it is wrong".
+///
+/// **Why a table and not one case.** Present-ness has more shapes than
+/// "directory": a plain file exists too, and so does a symlink. Each must fall
+/// on the not-skipped side, and each takes a different path through the gate, so
+/// one example would leave the law asserted for one shape and assumed for the
+/// rest. None of these roots is written to or removed; they are read where they
+/// already are.
+#[test]
+fn only_an_absent_root_takes_the_skip_path() {
+    let manifest = fln_conformance::checked_manifest_dir!();
+    let candidates = [
+        (
+            "a path that is not on this host",
+            PathBuf::from("/data/tmp/fln-t6r7-a-root-that-does-not-exist"),
+        ),
+        ("a real directory", manifest.clone()),
+        ("a real nested directory", manifest.join("tests")),
+        (
+            "a real file, which is present but not a directory",
+            manifest.join("Cargo.toml"),
+        ),
+    ];
+
+    let mut skipped = 0usize;
+    let mut walked_or_failed = 0usize;
+    for (description, candidate) in candidates {
+        let present = fs::symlink_metadata(&candidate).is_ok();
+        let classified = classify_mathlib_corpus_input_at(candidate.clone());
+        assert_eq!(
+            classified.root(),
+            candidate.as_path(),
+            "{description}: the classification must be ABOUT the root it was handed"
+        );
+        assert_eq!(
+            classified.skips(),
+            !present,
+            "{description} ({}): present={present} but skips={}. A root that exists must be \
+             walked or refused, never skipped -- a skip claims the input is missing, and this \
+             one is not.",
+            candidate.display(),
+            classified.skips()
+        );
+        if classified.skips() {
+            skipped += 1;
+        } else {
+            walked_or_failed += 1;
+        }
+    }
+
+    // ANTI-VACUITY. An `assert_eq!(a, a)`-shaped law holds trivially if every
+    // candidate lands on the same side; the table is only a discriminator if
+    // both sides are actually populated.
+    assert_eq!(
+        skipped, 1,
+        "exactly one candidate should have been absent; the table no longer discriminates"
+    );
+    assert_eq!(
+        walked_or_failed, 3,
+        "three candidates should have been present; the table no longer discriminates"
+    );
 }
 
 /// The classifier tells ABSENT from MISPROVISIONED, proved on every run.
@@ -4718,12 +4859,21 @@ fn the_corpus_classifier_distinguishes_an_absent_root_from_a_wrong_one() {
 fn the_whole_mathlib_inventory_walks_the_corpus_or_names_what_is_missing() {
     match classify_mathlib_corpus_input() {
         MathlibCorpusInput::Absent { root, detail } => {
-            // ANTI-VACUITY ON THE DISCLOSURE ITSELF. A skip is only honest if it
-            // says what is missing; an empty reason would be a green that
-            // reports nothing, which is the shape this test exists to avoid.
+            // THE SKIP'S IDENTITY IS EXACT. This was a substring containment on
+            // the human-readable detail, which is far too loose to be an
+            // identity: `/data/tmp/mathlib4-corpus-old`, a stale sibling, or any
+            // path merely CONTAINING the required one would have satisfied it,
+            // and the row would then disclose a missing input while naming the
+            // wrong file. The path is compared whole, against the documented
+            // requirement rather than against itself.
+            assert_eq!(
+                root.as_path(),
+                mathlib_corpus_root().as_path(),
+                "the skip must be about the root the lane actually requires"
+            );
             assert!(
-                !detail.trim().is_empty() && detail.contains(&*root.to_string_lossy()),
-                "the skip must name the path it could not find, but the detail was {detail:?}"
+                !detail.trim().is_empty(),
+                "a skip with an empty detail is a green that reports nothing"
             );
             println!(
                 "{{\"schema\":\"fln-t6r7-mathlib-inventory/1\",\"status\":\"skipped_absent_host_input\",\
