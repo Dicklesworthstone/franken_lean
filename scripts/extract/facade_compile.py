@@ -200,6 +200,10 @@ the toolchain would report a perfect facade:
     declaration totals to rows marked `structure` and `class`. A claimed
     structural surface cannot omit a category or count it twice.
 
+  * A MANIFEST-SUBSTRATE-EMISSION JOIN binds the summary's native substrate
+    emission count to rows that are both emitted and marked `substrate`. A
+    correct aggregate emission total may not hide a misclassified substrate.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1334,6 +1338,22 @@ def main():
             "REFUSE: facade manifest structural join disagrees with its "
             f"declaration rows ({json.dumps(structural_join, sort_keys=True)})"
         )
+    substrate_emission_join = {
+        "emitted_substrate_rows": sum(
+            row.get("emitted") is True and row.get("role") == "substrate"
+            for row in manifest_rows
+        ),
+        "summary_substrate_emitted": manifest_summary.get("substrate_emitted"),
+    }
+    if (not isinstance(substrate_emission_join["summary_substrate_emitted"], int)
+            or isinstance(substrate_emission_join["summary_substrate_emitted"], bool)
+            or substrate_emission_join["summary_substrate_emitted"] < 0
+            or substrate_emission_join["emitted_substrate_rows"]
+            != substrate_emission_join["summary_substrate_emitted"]):
+        raise SystemExit(
+            "REFUSE: facade manifest substrate-emission join disagrees with its "
+            f"declaration rows ({json.dumps(substrate_emission_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1510,6 +1530,7 @@ def main():
         "manifest_emitted_name_join": emitted_name_join,
         "manifest_transparency_join": transparency_join,
         "manifest_structural_join": structural_join,
+        "manifest_substrate_emission_join": substrate_emission_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
