@@ -115,6 +115,59 @@ fn json_bool_field(object: &str, field: &str) -> bool {
     }
 }
 
+fn json_object_key_set(object: &str) -> BTreeSet<String> {
+    assert!(object.starts_with('{') && object.ends_with('}'));
+
+    let bytes = object.as_bytes();
+    let mut keys = BTreeSet::new();
+    let mut object_depth = 0_usize;
+    let mut array_depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut key_start = None;
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                if let Some(start) = key_start.take() {
+                    keys.insert(object[start..index].to_owned());
+                }
+            }
+            continue;
+        }
+
+        match byte {
+            b'{' => object_depth = object_depth.saturating_add(1),
+            b'}' => object_depth = object_depth.saturating_sub(1),
+            b'[' => array_depth = array_depth.saturating_add(1),
+            b']' => array_depth = array_depth.saturating_sub(1),
+            b'"' => {
+                let previous = bytes[..index]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|byte| !byte.is_ascii_whitespace());
+                if object_depth == 1
+                    && array_depth == 0
+                    && matches!(previous, Some(b'{') | Some(b','))
+                {
+                    key_start = Some(index + 1);
+                }
+                in_string = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!in_string && key_start.is_none(), "JSON object keys are closed");
+    keys
+}
+
 fn json_name_set(object: &str) -> BTreeSet<String> {
     object
         .split("\"name\":\"")
@@ -155,6 +208,14 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     assert!(!json_bool_field(json, "g1Satisfied"), "{json}");
     assert!(json_bool_field(json, "companionPartsLoaded"), "{json}");
     let private_companion_residuals = json_object_field(json, "privateCompanionResiduals");
+    assert_eq!(
+        json_object_key_set(private_companion_residuals),
+        ["missing", "names", "observed", "omitted"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "{json}",
+    );
     let private_companion_omitted = json_usize_field(private_companion_residuals, "omitted");
     assert_eq!(private_companion_omitted, 0, "{json}");
     let private_companion_missing = json_usize_field(private_companion_residuals, "missing");
