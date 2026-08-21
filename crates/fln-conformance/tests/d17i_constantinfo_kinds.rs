@@ -9560,3 +9560,124 @@ fn a_recursors_motive_count_is_its_block_size_plus_its_nesting() {
          mutual inductive block would be needed to test the other half of the formula"
     );
 }
+
+/// The only indexed inductives at the pin, with how many indices each carries.
+const INDEXED_INDUCTIVES: &[(&str, u32)] =
+    &[("Eq", 1), ("HEq", 2), ("Nat.le", 1), ("Nat.le.below", 2)];
+/// Prop-valued inductives that carry no indices — the converse witnesses.
+const UNINDEXED_PROPS: &[&str] = &[
+    "And",
+    "ByteArray.IsValidUTF8",
+    "False",
+    "Nonempty",
+    "Or",
+    "True",
+];
+
+/// Carrying indices implies being a Prop, and only FOUR inductives carry any —
+/// which is how thinly the index term of every arity formula here is tested.
+///
+/// Four cells compute a telescope from `num_params + num_motives + num_minors +
+/// num_indices + 1` and check it against a binder count. Each is a five-term
+/// formula, and nothing says how much of it the pin actually exercises. It
+/// exercises the index term four times:
+///
+///   exactly 4 of the 127 inductives have `num_indices > 0` — `Eq` and
+///     `Nat.le` with one, `HEq` and `Nat.le.below` with two
+///   all four are Prop-valued, and NO non-Prop inductive carries an index
+///   the converse fails: six Props carry none, and they are named
+///
+/// So `num_indices` is zero for 123 of 127 declarations, and every arity
+/// formula in this file is being checked against a term that vanishes almost
+/// everywhere. That is not a defect in those cells — the formula is right — but
+/// it is the difference between a five-term identity verified and one verified
+/// at four points, and it was nowhere recorded.
+///
+/// Both widths occur, which is what stops the index term from being tested only
+/// at one: two inductives carry a single index and two carry a pair. A formula
+/// with the term dropped would agree with the artifact on 123 inductives and
+/// disagree on four, two of them by one and two by two.
+#[test]
+fn only_props_carry_indices_and_only_four_inductives_carry_any() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut indexed: Vec<(String, u32)> = Vec::new();
+    let mut unindexed_props: Vec<String> = Vec::new();
+    let mut indexed_non_props: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for info in &infos {
+        let ConstantInfo::Induct(induct) = info else {
+            continue;
+        };
+        total += 1;
+        let name = info.name().to_display_string();
+        let prop = inductive_result_is_prop(induct);
+        if induct.num_indices > 0 {
+            indexed.push((name.clone(), induct.num_indices));
+            if !prop {
+                indexed_non_props.push(name);
+            }
+        } else if prop {
+            unindexed_props.push(name);
+        }
+    }
+    assert_eq!(total, 127, "the inductive census must be reached");
+
+    assert!(
+        indexed_non_props.is_empty(),
+        "a non-Prop inductive must carry no index: {indexed_non_props:?}"
+    );
+    assert_eq!(
+        indexed
+            .iter()
+            .map(|(name, width)| (name.as_str(), *width))
+            .collect::<Vec<(&str, u32)>>(),
+        INDEXED_INDUCTIVES.to_vec(),
+        "the indexed inductives and their widths"
+    );
+    assert_eq!(
+        unindexed_props
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<&str>>(),
+        UNINDEXED_PROPS.to_vec(),
+        "the Props that carry no index, so the implication is one-way"
+    );
+
+    // How thinly the index term of the arity formulas is exercised.
+    let widths: BTreeSet<u32> = indexed.iter().map(|(_, width)| *width).collect();
+    assert_eq!(
+        (indexed.len(), total - indexed.len(), widths.len()),
+        (4, 123, 2),
+        "four indexed against 123 unindexed, at two distinct widths"
+    );
+    assert_eq!(
+        widths,
+        BTreeSet::from([1, 2]),
+        "a formula that dropped the index term would disagree by one on two inductives and by \
+         two on the other two"
+    );
+
+    // And their recursors carry the same widths, which is where the term is
+    // actually consumed.
+    let mut recursors = 0usize;
+    for info in &infos {
+        if let ConstantInfo::Rec(rec) = info {
+            if rec.num_indices > 0 {
+                recursors += 1;
+                let head = rec.all.first().expect("a block head").to_display_string();
+                assert!(
+                    INDEXED_INDUCTIVES
+                        .iter()
+                        .any(|(name, width)| *name == head && *width == rec.num_indices),
+                    "{head}: a recursor's index count must match its inductive's"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        recursors, 4,
+        "exactly four recursors consume a nonzero index term"
+    );
+}
