@@ -3167,6 +3167,80 @@ mod tests {
         .bytes
     }
 
+    /// A `List` cell whose constructor is not `cons` is refused.
+    ///
+    /// Nothing shadows it: the list decoder has no size bind at all, so none of
+    /// the object-size rules added in waves 47-57 can fire ahead of it, and the
+    /// constructor check is the first thing it does with the header.
+    ///
+    /// It needs a NON-EMPTY list. `List.nil` is fieldless and scalar-boxed, so
+    /// a fixture whose `levelParams` and `all` are empty contains no cons cell
+    /// and this rule is unreachable from it — the same trap as `Level::zero`
+    /// and `ReducibilityHints::Abbrev`. `param_level_module` declares one
+    /// universe parameter, so its `ConstantVal.levelParams` is a real cons.
+    #[test]
+    fn a_list_cell_that_is_not_cons_is_refused() {
+        let mut bytes = param_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified universe-polymorphic fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+
+        // ConstantVal slot 1 is levelParams. It must be a POINTER here, not the
+        // scalar box an empty list would be.
+        let stored = view.read_u64(base_off + 16).expect("levelParams slot");
+        assert_eq!(
+            stored & 1,
+            0,
+            "the fixture declares a universe, so the list is a cons cell"
+        );
+        let cons_off = view.deref(stored).expect("cons cell");
+        let (tag, other, cs_sz) = view.obj_header(cons_off).expect("cons header");
+        assert_eq!(tag, 1, "List.cons");
+        assert_eq!(other, 2, "head and tail");
+
+        // Claim a constructor the type does not have, leaving arity and size.
+        let header = view.read_u64(cons_off).expect("header word");
+        let planted = (header & !0xff00_0000_0000_0000) | (2_u64 << 56);
+        bytes[cons_off as usize..cons_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(cons_off).expect("header after plant"),
+            (2, other, cs_sz),
+            "only the tag moved"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a list cell that is not cons must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "List cons",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `Level.param` claiming an arity other than one is refused.
     ///
     /// The source comment on this rule records why it matters: both the eager
