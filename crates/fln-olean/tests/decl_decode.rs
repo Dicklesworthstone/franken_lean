@@ -3405,3 +3405,185 @@ fn the_head_record_slot_four_links_back_into_the_third_shape() {
          being third-shape with a `tag 0` tail means"
     );
 }
+
+/// The links are PAIRS. They never compose, and my last commit said otherwise.
+///
+/// NEITHER OPTION THIS WAVE OFFERED EXISTS. "Slot 5+" is arithmetically
+/// impossible: the head records are `tag 0` ARITY 5, pinned by `2475a62f` and
+/// re-asserted in every cell since, so their slots are 0 through 4 and
+/// `8ca067f9` read the last one. And the 11 tag-4 objects have no head records
+/// - `9d365d6a` pins that not one of them has a pointer head - which is the
+/// fourth wave to offer it.
+///
+/// So this takes the increment `8ca067f9` named: the shape of the structure
+/// those links form. It also CORRECTS that commit. It said the 99 "form a
+/// LINKED STRUCTURE - a chain or a tree - rather than a scattered population".
+/// The first half is right and the parenthesis is wrong.
+///
+/// Measured over the 71 nodes: 8 edges, every target in the node set, no node
+/// with more than one incoming edge, no cycles, and the longest path from any
+/// root is ONE EDGE. The structure is 8 disjoint pairs and 55 isolated nodes.
+/// Links exist; they never compose.
+///
+/// THE ERROR WAS REASONING FROM AN EDGE'S EXISTENCE TO A SHAPE. Eight edges
+/// among 71 nodes is equally consistent with one chain of nine, a tree, or
+/// eight unrelated pairs, and "chain or a tree" picked two of those and left
+/// out the one that is true. Nothing was measured between finding the edges and
+/// describing what they build - the distance between those two steps is exactly
+/// one graph traversal, and I wrote the sentence instead of taking it.
+///
+/// The pairs are still the substantive part: 16 of the 71 are not independent.
+/// That is a smaller claim than the one it replaces and it is the one the bytes
+/// support.
+#[test]
+fn the_third_shape_links_are_pairs_and_never_chains() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut nodes = 0usize;
+    let mut edges = 0usize;
+    let mut targets_outside = 0usize;
+    let mut in_degrees: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    let mut longest = 0usize;
+    let mut cycles = 0usize;
+    let mut isolated = 0usize;
+
+    for (module, bytes) in &modules {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_third_shape = |off: usize| -> bool {
+            if at.get(&off).map(|o| (o.tag, o.other, o.cs_sz)) != Some((1, 2, 24)) {
+                return false;
+            }
+            let second = word_at(bytes, off + 16);
+            if second & 1 == 1 {
+                return second >> 1 != 0;
+            }
+            !resolve(second).is_some_and(|t| at.get(&t).map(|o| (o.tag, o.other)) == Some((1, 2)))
+        };
+
+        // Nodes: third-shape objects with a `tag 0` tail and a five-field head.
+        let mut here: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if !is_third_shape(object.off) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let head = resolve(word_at(bytes, object.off + 8));
+            if head.and_then(|h| at.get(&h)).map(|h| (h.tag, h.other)) == Some((0, 5)) {
+                here.insert(object.off);
+            }
+        }
+
+        // Edges: node -> its head record's slot 4, when that is itself a node.
+        let mut successor: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for &node in &here {
+            let head = resolve(word_at(bytes, node + 8)).expect("nodes have head records");
+            if let Some(target) = resolve(word_at(bytes, head + 8 + 8 * 4))
+                && is_third_shape(target)
+            {
+                if here.contains(&target) {
+                    successor.insert(node, target);
+                } else {
+                    targets_outside += 1;
+                }
+            }
+        }
+
+        let mut incoming: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for target in successor.values() {
+            *incoming.entry(*target).or_default() += 1;
+        }
+        for &node in &here {
+            *in_degrees
+                .entry(incoming.get(&node).copied().unwrap_or(0))
+                .or_default() += 1;
+            if !successor.contains_key(&node) && !incoming.contains_key(&node) {
+                isolated += 1;
+            }
+            // Walk forward from every node; a root is one with no incoming.
+            if incoming.get(&node).is_none() {
+                let mut walked: BTreeSet<usize> = BTreeSet::new();
+                let mut cursor = node;
+                let mut length = 0usize;
+                while let Some(&next) = successor.get(&cursor) {
+                    if !walked.insert(cursor) {
+                        cycles += 1;
+                        break;
+                    }
+                    cursor = next;
+                    length += 1;
+                }
+                longest = longest.max(length);
+            }
+        }
+
+        nodes += here.len();
+        edges += successor.len();
+    }
+
+    if !prelude_loaded {
+        assert_eq!(nodes, 0, "the third shape is not in the C3 fixtures");
+        return;
+    }
+
+    assert_eq!(nodes, 71, "the tag-0-tailed third-shape objects");
+    assert_eq!(edges, 8, "the links `8ca067f9` found");
+    assert!(
+        edges > 0,
+        "with no edges every claim below is vacuously true about a graph with \
+         no structure to describe"
+    );
+    assert_eq!(
+        targets_outside, 0,
+        "every link target is itself one of the 71"
+    );
+
+    // The shape, which is the correction.
+    assert_eq!(
+        in_degrees.into_iter().collect::<Vec<_>>(),
+        vec![(0, 63), (1, 8)],
+        "no node is pointed at twice: the links do not converge"
+    );
+    assert_eq!(cycles, 0, "and they do not close");
+    assert_eq!(
+        longest, 1,
+        "the longest path from any root is ONE EDGE. Eight edges among 71 nodes \
+         is equally consistent with a chain of nine or a tree; it is neither. \
+         `8ca067f9` said \"a chain or a tree\" without traversing, and this is \
+         the traversal"
+    );
+    assert_eq!(
+        isolated, 55,
+        "so the structure is 8 disjoint pairs and 55 isolated nodes: 16 of the \
+         71 are not independent, and the other 55 are"
+    );
+}
