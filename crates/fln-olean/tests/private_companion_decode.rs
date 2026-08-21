@@ -172,6 +172,11 @@ const STRING_REMOVE_LEADING_SPACES_EXPORTED_UNSAFE_RECS: [&str; 2] = [
 const INSERT_IDX_LOOP_UNARY: &str = "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._unary";
 /// The module that actually declares it.
 const INSERT_IDX_LOOP_UNARY_MODULE: &str = "Init/Data/Array/Basic";
+/// The first generated proof theorem for `Array.insertIdx.loop`.
+const INSERT_IDX_LOOP_PROOF_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.insertIdx.loop._proof_1";
+/// The pin's private array stores this theorem in the basic module.
+const INSERT_IDX_LOOP_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The exported shell name for `Array.zipWithMAux`'s unary compiler helper.
 const ARRAY_ZIP_WITH_M_AUX_UNARY: &str = "Array.zipWithMAux._unary";
 /// The exact private proof generated for the unary wrapper of `Nat.gcd`.
@@ -1175,6 +1180,34 @@ fn array_basic_insert_idx_loop_unary_requires_the_companion_and_keeps_its_real_k
     assert!(
         is_concrete_recovery(&recovered),
         "private companion decoded {INSERT_IDX_LOOP_UNARY} only as {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_insert_idx_loop_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, INSERT_IDX_LOOP_PROOF_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&INSERT_IDX_LOOP_PROOF_1.to_owned()),
+        "the private companion of {INSERT_IDX_LOOP_PROOF_1_MODULE} must retain \
+         {INSERT_IDX_LOOP_PROOF_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == INSERT_IDX_LOOP_PROOF_1)
+        .unwrap_or_else(|| panic!("private decoder lost {INSERT_IDX_LOOP_PROOF_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {INSERT_IDX_LOOP_PROOF_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
