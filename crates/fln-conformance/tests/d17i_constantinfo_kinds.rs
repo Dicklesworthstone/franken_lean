@@ -5382,9 +5382,10 @@ fn header_names(lib: &Path, module: &str, level: Level) -> (Vec<String>, Vec<Str
 /// module header, and the distinction only becomes visible once the arrays are
 /// compared as sets. Corroboration beyond what this cell walks: over all 600
 /// `Init` modules at private level there are 29,050 extra names, 514 of them
-/// overlapping across 141 modules, and every single one is a `.splitter`. That
-/// sweep is provenance for the shape law, not something asserted here — this
-/// cell checks the four modules it names.
+/// overlapping across 141 modules, and every single one is a `.splitter`. This
+/// cell checks the four modules it names; that sweep is now ASSERTED, in
+/// `the_splitter_overlap_law_holds_over_every_init_module`, rather than left as
+/// provenance nothing would fail on.
 ///
 /// One more array law falls out and is worth having: `extraConstNames` carries
 /// no duplicate of its own, at either level, in any module walked.
@@ -13413,5 +13414,133 @@ fn multi_declaration_survives_the_export_boundary_whole_or_not_at_all() {
             .sum::<usize>(),
         131 - 115,
         "they contribute the entire difference between the two excesses"
+    );
+}
+
+/// The `.splitter` shape law, asserted over 600 modules instead of described in
+/// a comment.
+///
+/// `extra_const_names_overlap_declared_names_exactly_at_the_splitters` checks
+/// four modules and then records, in prose, a sweep over all 600 — "29,050 extra
+/// names, 514 of them overlapping across 141 modules, and every single one is a
+/// `.splitter`" — explicitly flagged as "provenance for the shape law, not
+/// something asserted here". A measured corpus fact that no assertion covers is
+/// the shape that rots: it reads as established, nothing fails when it stops
+/// being true, and the next reader cannot tell whether it was ever re-run.
+///
+/// It is re-run here, and it holds. Over all 600 `Init` chains:
+///
+///   private level   29,050 extra names, 514 overlapping `constNames` across
+///                   141 modules, and the overlap is the `.splitter` subset
+///                   exactly — no overlapping name lacks the tail, and no
+///                   `.splitter` in the extra array goes undeclared
+///   exported level  21,978 extra names and ZERO overlap in any module, which
+///                   the four-module cell could only say about four
+///   both levels     no module repeats a name inside `extraConstNames`
+///
+/// THE EMPTY SIDE IS A CLAIM, not an absence of one. Exported disjointness over
+/// 600 is what makes the private overlap a property of the LEVEL rather than of
+/// the modules that happen to have splitters; with only four modules checked,
+/// "exported is disjoint" and "these four modules have no splitters" were the
+/// same observation.
+///
+/// The walk also re-derives 51,506 and 65,404 from the `constNames` arrays while
+/// reading the extra ones. Those totals are pinned by two other cells, and
+/// recomputing them alongside a different array in the same pass is a
+/// cross-check that costs nothing: an offset slip that moved the extra array
+/// would almost certainly move these too.
+///
+/// Conservation first: each module's extra array must split into overlapping and
+/// non-overlapping parts that sum to its length, before the overlap is
+/// characterised.
+#[test]
+fn the_splitter_overlap_law_holds_over_every_init_module() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut extra_private = 0usize;
+    let mut extra_exported = 0usize;
+    let mut declared_private = 0usize;
+    let mut declared_exported = 0usize;
+    let mut overlapping = 0usize;
+    let mut overlapping_modules = 0usize;
+    let mut exported_overlap = 0usize;
+    for module in &modules {
+        for level in [Level::Exported, Level::Private] {
+            let label = match level {
+                Level::Exported => "exported",
+                Level::Private => "private",
+            };
+            let (declared_names, extra) = header_names(&lib, module, level);
+            let declared: BTreeSet<&String> = declared_names.iter().collect();
+            let extra_set: BTreeSet<&String> = extra.iter().collect();
+
+            assert_eq!(
+                extra_set.len(),
+                extra.len(),
+                "{module} [{label}]: extraConstNames repeats a name"
+            );
+
+            let shared: BTreeSet<&&String> = extra_set.intersection(&declared).collect();
+            let splitters: BTreeSet<&&String> = extra_set
+                .iter()
+                .filter(|name| name.ends_with(".splitter"))
+                .collect();
+
+            // Conservation first: the two parts are counted independently and
+            // must exhaust the array. Subtracting one from the length would be
+            // arithmetic on itself and could not fail.
+            let undeclared = extra.iter().filter(|name| !declared.contains(name)).count();
+            assert_eq!(
+                shared.len() + undeclared,
+                extra.len(),
+                "{module} [{label}]: the declared and undeclared extra names must exhaust the \
+                 array"
+            );
+
+            match level {
+                Level::Exported => {
+                    exported_overlap += shared.len();
+                    extra_exported += extra.len();
+                    declared_exported += declared_names.len();
+                }
+                Level::Private => {
+                    // The law, in both directions at once.
+                    assert_eq!(
+                        shared, splitters,
+                        "{module}: the overlap must be exactly the `.splitter` subset"
+                    );
+                    if !shared.is_empty() {
+                        overlapping_modules += 1;
+                    }
+                    overlapping += shared.len();
+                    extra_private += extra.len();
+                    declared_private += declared_names.len();
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        (extra_exported, extra_private),
+        (21_978, 29_050),
+        "the extra-name census at both levels"
+    );
+    assert_eq!(
+        (overlapping, overlapping_modules),
+        (514, 141),
+        "the overlapping population the older cell describes but does not assert"
+    );
+    assert_eq!(
+        exported_overlap, 0,
+        "no exported module overlaps at all, which four modules could not establish"
+    );
+
+    // Cross-check: the same walk re-derives the two pinned name censuses.
+    assert_eq!(
+        (declared_exported, declared_private),
+        (51_506, 65_404),
+        "the constNames totals, recomputed here beside a different array"
     );
 }
