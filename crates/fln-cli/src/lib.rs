@@ -2616,30 +2616,23 @@ fn decoded_private_auxiliaries(constants: &[fln::ConstantInfo]) -> usize {
         .count()
 }
 
-/// A bounded, deterministic presentation of decoded private loop auxiliaries.
+/// A bounded, deterministic presentation of decoded residual names.
 /// `observed` counts every matching declaration while `names` keeps the
 /// lexicographically earliest names for a stable, bounded report.
-struct DecodedPrivateLoopAuxiliaries {
+struct DecodedNamedResiduals {
     observed: usize,
     names: Vec<fln::Name>,
 }
 
-impl DecodedPrivateLoopAuxiliaries {
-    fn observe(&mut self, constants: &[fln::ConstantInfo]) {
+impl DecodedNamedResiduals {
+    fn observe_matching(
+        &mut self,
+        constants: &[fln::ConstantInfo],
+        matches_residual: fn(&str) -> bool,
+    ) {
         for constant in constants {
             let name = constant.name();
-            let display = name.to_display_string();
-            if !is_private_loop_auxiliary(&display) {
-                continue;
-            }
-            self.observe_name(name);
-        }
-    }
-
-    fn observe_core_observables_residuals(&mut self, constants: &[fln::ConstantInfo]) {
-        for constant in constants {
-            let name = constant.name();
-            if is_core_observables_loop_residual(&name.to_display_string()) {
+            if matches_residual(&name.to_display_string()) {
                 self.observe_name(name);
             }
         }
@@ -2682,12 +2675,22 @@ fn is_core_observables_loop_residual(display: &str) -> bool {
         .any(|prefix| display.starts_with(prefix))
 }
 
-fn render_private_loop_auxiliary_names_json(
-    auxiliaries: &mut DecodedPrivateLoopAuxiliaries,
-) -> String {
+fn is_private_eq_def_or_match_residual(display: &str) -> bool {
+    display.starts_with("_private.")
+        && display.split('.').any(|component| {
+            component == "eq_def"
+                || component
+                    .strip_prefix("match_")
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+}
+
+fn render_named_residuals_json(residuals: &mut DecodedNamedResiduals) -> String {
     format!(
         "[{}]",
-        auxiliaries
+        residuals
             .sorted_names()
             .iter()
             .map(|name| {
@@ -2702,10 +2705,8 @@ fn render_private_loop_auxiliary_names_json(
     )
 }
 
-fn render_private_loop_auxiliary_names_human(
-    auxiliaries: &mut DecodedPrivateLoopAuxiliaries,
-) -> String {
-    let names = auxiliaries
+fn render_named_residuals_human(residuals: &mut DecodedNamedResiduals) -> String {
+    let names = residuals
         .sorted_names()
         .iter()
         .map(|name| bounded_olean_name(name).0)
@@ -2725,29 +2726,44 @@ fn render_check_olean_success(
     let constants = checked.declarations.len();
     let extensions = checked.decoded.module.extensions.len();
     let private_auxiliaries = decoded_private_auxiliaries(&checked.decoded.constants);
-    let mut private_loop_auxiliaries = DecodedPrivateLoopAuxiliaries {
+    let mut private_loop_auxiliaries = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
-    private_loop_auxiliaries.observe(&checked.decoded.constants);
-    let mut core_observables_loop_residuals = DecodedPrivateLoopAuxiliaries {
+    private_loop_auxiliaries
+        .observe_matching(&checked.decoded.constants, is_private_loop_auxiliary);
+    let mut core_observables_loop_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
-    core_observables_loop_residuals.observe_core_observables_residuals(&checked.decoded.constants);
+    core_observables_loop_residuals
+        .observe_matching(&checked.decoded.constants, is_core_observables_loop_residual);
+    let mut private_equation_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_equation_residuals
+        .observe_matching(&checked.decoded.constants, is_private_eq_def_or_match_residual);
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
-        render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
+        render_named_residuals_json(&mut private_loop_auxiliaries)
     } else {
-        render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+        render_named_residuals_human(&mut private_loop_auxiliaries)
     };
     let core_observables_loop_observed = core_observables_loop_residuals.observed;
     let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
     let core_observables_loop_names = if json {
-        render_private_loop_auxiliary_names_json(&mut core_observables_loop_residuals)
+        render_named_residuals_json(&mut core_observables_loop_residuals)
     } else {
-        render_private_loop_auxiliary_names_human(&mut core_observables_loop_residuals)
+        render_named_residuals_human(&mut core_observables_loop_residuals)
+    };
+    let private_equation_observed = private_equation_residuals.observed;
+    let private_equation_omitted = private_equation_residuals.omitted();
+    let private_equation_names = if json {
+        render_named_residuals_json(&mut private_equation_residuals)
+    } else {
+        render_named_residuals_human(&mut private_equation_residuals)
     };
     let stdout = if json {
         format!(
@@ -2758,6 +2774,7 @@ fn render_check_olean_success(
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"module\":{{\"isModulePart\":{},\"imports\":0,",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
@@ -2774,6 +2791,9 @@ fn render_check_olean_success(
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
+            private_equation_observed,
+            private_equation_names,
+            private_equation_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             checked.decoded.module.is_module,
@@ -2794,6 +2814,9 @@ fn render_check_olean_success(
                 "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables .loop residual names: {}\n",
                 "core-observables .loop residual names omitted: {}\n",
+                "decoded _private eq_def/match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private eq_def/match_N residual names: {}\n",
+                "decoded _private eq_def/match_N residual names omitted: {}\n",
                 "dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -2811,6 +2834,9 @@ fn render_check_olean_success(
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
+            private_equation_observed,
+            private_equation_names,
+            private_equation_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
@@ -3142,34 +3168,50 @@ fn render_check_olean_set_success(
         .iter()
         .map(|module| decoded_private_auxiliaries(&module.decoded.constants))
         .sum();
-    let mut private_loop_auxiliaries = DecodedPrivateLoopAuxiliaries {
+    let mut private_loop_auxiliaries = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
     for module in &checked.modules {
-        private_loop_auxiliaries.observe(&module.decoded.constants);
+        private_loop_auxiliaries
+            .observe_matching(&module.decoded.constants, is_private_loop_auxiliary);
     }
-    let mut core_observables_loop_residuals = DecodedPrivateLoopAuxiliaries {
+    let mut core_observables_loop_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
     };
     for module in &checked.modules {
         core_observables_loop_residuals
-            .observe_core_observables_residuals(&module.decoded.constants);
+            .observe_matching(&module.decoded.constants, is_core_observables_loop_residual);
+    }
+    let mut private_equation_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_equation_residuals
+            .observe_matching(&module.decoded.constants, is_private_eq_def_or_match_residual);
     }
     let private_loop_observed = private_loop_auxiliaries.observed;
     let private_loop_omitted = private_loop_auxiliaries.omitted();
     let private_loop_names = if json {
-        render_private_loop_auxiliary_names_json(&mut private_loop_auxiliaries)
+        render_named_residuals_json(&mut private_loop_auxiliaries)
     } else {
-        render_private_loop_auxiliary_names_human(&mut private_loop_auxiliaries)
+        render_named_residuals_human(&mut private_loop_auxiliaries)
     };
     let core_observables_loop_observed = core_observables_loop_residuals.observed;
     let core_observables_loop_omitted = core_observables_loop_residuals.omitted();
     let core_observables_loop_names = if json {
-        render_private_loop_auxiliary_names_json(&mut core_observables_loop_residuals)
+        render_named_residuals_json(&mut core_observables_loop_residuals)
     } else {
-        render_private_loop_auxiliary_names_human(&mut core_observables_loop_residuals)
+        render_named_residuals_human(&mut core_observables_loop_residuals)
+    };
+    let private_equation_observed = private_equation_residuals.observed;
+    let private_equation_omitted = private_equation_residuals.omitted();
+    let private_equation_names = if json {
+        render_named_residuals_json(&mut private_equation_residuals)
+    } else {
+        render_named_residuals_human(&mut private_equation_residuals)
     };
     let companion_modules = checked
         .modules
@@ -3186,6 +3228,7 @@ fn render_check_olean_set_success(
                 "\"decodedPrivateAuxiliaries\":{},",
                 "\"decodedPrivateLoopAuxiliaries\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"coreObservablesLoopResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateEqDefMatchResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},",
                 "\"extensionBlocksObserved\":{},\"extensionsInterpreted\":false,",
                 "\"companionPartsLoaded\":{},\"companionModulesLoaded\":{},",
@@ -3204,6 +3247,9 @@ fn render_check_olean_set_success(
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
+            private_equation_observed,
+            private_equation_names,
+            private_equation_omitted,
             json_string(&checked.base_logical_root.to_string()),
             json_string(&checked.result_logical_root.to_string()),
             extensions,
@@ -3226,6 +3272,9 @@ fn render_check_olean_set_success(
                 "core-observables .loop residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "core-observables .loop residual names: {}\n",
                 "core-observables .loop residual names omitted: {}\n",
+                "decoded _private eq_def/match_N residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private eq_def/match_N residual names: {}\n",
+                "decoded _private eq_def/match_N residual names omitted: {}\n",
                 "module and declaration dependency order: derived\n",
                 "base logical root: {}\n",
                 "result logical root: {}\n",
@@ -3245,6 +3294,9 @@ fn render_check_olean_set_success(
             core_observables_loop_observed,
             core_observables_loop_names,
             core_observables_loop_omitted,
+            private_equation_observed,
+            private_equation_names,
+            private_equation_omitted,
             checked.base_logical_root,
             checked.result_logical_root,
             extensions,
