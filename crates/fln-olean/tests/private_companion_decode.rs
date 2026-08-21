@@ -373,6 +373,11 @@ const OPTION_ATTACH_EQ_SOME_MATCH_1_1: &str =
     "_private.Init.Data.Option.Attach.0.Option.attach_eq_some.match_1_1";
 /// The pin's private option companion stores this definition in Attach.
 const OPTION_ATTACH_EQ_SOME_MATCH_1_1_MODULE: &str = "Init/Data/Option/Attach";
+/// The private match implementation for `Option.unattach_eq_some_iff`.
+const OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1: &str =
+    "_private.Init.Data.Option.Attach.0.Option.unattach_eq_some_iff.match_1_1";
+/// The pin's private option companion stores this definition in Attach.
+const OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1_MODULE: &str = "Init/Data/Option/Attach";
 /// The private stored definition implementing `List.hasDecEq`.
 const LIST_HAS_DEC_EQ: &str = "List.hasDecEq";
 /// The census places the implementation in Prelude's private companion.
@@ -2626,6 +2631,38 @@ fn option_attach_eq_some_match_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {OPTION_ATTACH_EQ_SOME_MATCH_1_1} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_unattach_eq_some_match_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "option_unattach_eq_some_match_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1.to_owned()),
+        "the private companion of {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1_MODULE} must retain \\
+         {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1)
+        .unwrap_or_else(|| {
+            panic!("private decoder lost {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1}")
+        });
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {OPTION_UNATTACH_EQ_SOME_IFF_MATCH_1_1} as {} instead of Defn",
         recovered.kind_name()
     );
 }
