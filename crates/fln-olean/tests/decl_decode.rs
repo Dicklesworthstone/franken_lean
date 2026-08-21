@@ -4147,3 +4147,178 @@ fn the_distinct_triples_weigh_differently_from_their_references() {
     );
     assert_eq!(expressions.len(), 49, "reaching 49 distinct expressions");
 }
+
+/// The two other slot-4 shapes, opened - and they interlock.
+///
+/// `8ca067f9` pinned slot 4 as three shapes with counts and opened only one of
+/// them, the eight that are themselves third-shape. These are the other two:
+/// `(0, 2)` fifty-seven times and `(5, 1)` four times.
+///
+/// The `(5, 1)` objects are a single field wrapping a numbered name link, and
+/// all four go to the production `decode_name` rather than being matched by
+/// shape.
+///
+/// THE `(0, 2)` OBJECTS INTERLOCK WITH THEM. Their first field is uniformly a
+/// four-field record; their second admits three shapes - and two of those three
+/// are `(0, 2)` and `(5, 1)`, the same two shapes slot 4 itself admits. So an
+/// object of one kind can hold an object of the other, and 44 of the 56 hold
+/// another of their own kind.
+///
+/// That is a spine: not the pairing `3575962c` measured among the third-shape
+/// objects themselves, but a second and separate chaining one level down.
+/// `3575962c` is why this cell does NOT say how long the spine is or what shape
+/// it forms - eight edges there were consistent with a chain, a tree or eight
+/// pairs, and only a traversal could tell them apart. Counting what each field
+/// admits is not traversing, and the wave that traverses this one can say what
+/// it builds.
+///
+/// Deduplicated as well as counted by reference, because that distinction has
+/// now changed a total three times and a ranking once: 57 references reach 56
+/// objects, and the four `(5, 1)` are four.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_slot_four_other_shapes_interlock() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut pair_references = 0usize;
+    let mut wrapper_references = 0usize;
+    let mut pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut wrappers: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut first_fields: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut second_fields: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut wrapped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut names_decoded = 0usize;
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let view = OleanView::parse(bytes).unwrap_or_else(|e| panic!("{module}: parse: {e}"));
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut records: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            if let Some(head) = resolve(word_at(bytes, object.off + 8))
+                && at.get(&head).map(|h| (h.tag, h.other)) == Some((0, 5))
+            {
+                records.insert(head);
+            }
+        }
+
+        for record in records {
+            let Some(off) = resolve(word_at(bytes, record + 8 + 8 * 4)) else {
+                continue;
+            };
+            match at.get(&off).map(|o| (o.tag, o.other)) {
+                Some((0, 2)) => {
+                    pair_references += 1;
+                    pairs.insert((index, off));
+                }
+                Some((5, 1)) => {
+                    wrapper_references += 1;
+                    wrappers.insert((index, off));
+                }
+                _ => {}
+            }
+        }
+
+        // Deduplicated before reading, the `c0a4f175` discipline.
+        for (_, off) in pairs.iter().filter(|(i, _)| *i == index) {
+            let first = resolve(word_at(bytes, off + 8)).expect("field 0 is a pointer");
+            *first_fields.entry(shape_of(first)).or_default() += 1;
+            let second = resolve(word_at(bytes, off + 16)).expect("field 1 is a pointer");
+            *second_fields.entry(shape_of(second)).or_default() += 1;
+        }
+        for (_, off) in wrappers.iter().filter(|(i, _)| *i == index) {
+            let field = word_at(bytes, off + 8);
+            let inner = resolve(field).expect("the wrapped field is a pointer");
+            *wrapped.entry(shape_of(inner)).or_default() += 1;
+            DeclDecoder::new(&view, WalkBudget::default())
+                .decode_name(field)
+                .unwrap_or_else(|e| panic!("{module}: a wrapped name must decode: {e}"));
+            names_decoded += 1;
+        }
+    }
+
+    if !prelude_loaded {
+        assert_eq!(
+            pair_references + wrapper_references,
+            0,
+            "not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        (pair_references, pairs.len()),
+        (57, 56),
+        "the two-field shape: 57 references reaching 56 objects"
+    );
+    assert_eq!(
+        (wrapper_references, wrappers.len()),
+        (4, 4),
+        "and the one-field shape, shared by nothing"
+    );
+
+    // The one-field shape wraps a name, established by the decoder.
+    assert_eq!(
+        wrapped.into_iter().collect::<Vec<_>>(),
+        vec![("tag 2 arity 2".to_owned(), 4)],
+        "each wraps a numbered name link"
+    );
+    assert_eq!(names_decoded, 4, "and `decode_name` accepts every one");
+
+    // The two-field shape, and the interlock.
+    assert_eq!(
+        first_fields.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 4".to_owned(), 56)],
+        "field 0 is uniformly a four-field record"
+    );
+    assert_eq!(
+        second_fields.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 44),
+            ("tag 4 arity 1".to_owned(), 6),
+            ("tag 5 arity 1".to_owned(), 6),
+        ],
+        "field 1 admits three shapes, and TWO of them are the two shapes slot 4 \
+         itself admits - so an object of one kind can hold one of the other, and \
+         44 of the 56 hold another of their own kind. That is a spine; how long \
+         it is and what it forms needs a traversal, which `3575962c` is the \
+         reason not to guess"
+    );
+}
