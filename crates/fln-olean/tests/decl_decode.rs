@@ -11736,7 +11736,23 @@ fn the_other_references_to_that_name() {
 ///   constants    one - a three-field record at 32 bytes
 ///   entries      three - an array, a two-field object, and the node itself
 ///
-/// AND THE LINK ITSELF IS REACHABLE FROM BOTH `constants` AND `entries`.
+/// AND THE LINK ITSELF IS REACHABLE FROM ALL THREE, while the NODE that holds
+/// it is reachable from `entries` ALONE. That pair is the whole finding: the
+/// name crosses the root boundary, the object carrying it does not.
+///
+/// The first version of this cell pinned the link at two roots, `constants` and
+/// `entries`. w190 caught it. The walk is right and the pin was wrong, and it
+/// was wrong in a way that needed no measurement to expose: a holder sits under
+/// `constNames` twenty lines above, and being a holder MEANS naming the link,
+/// so `constNames` reaches the link in one more hop. The two assertions
+/// contradicted each other in the same cell. What I wrote down was the two
+/// roots `1dd7c288`'s argument is ABOUT, not the set the walk computes - and
+/// the word `BOTH` sealed it, since a two-element word reads as complete no
+/// matter what the code found.
+///
+/// So the `node_roots` pin below is not decoration. The conflation that
+/// produced the bad number was between the LINK and the NODE, and those two now
+/// have separate, differing assertions instead of one sentence covering both.
 ///
 /// THAT IS A DEPARTURE FROM `1dd7c288`, AND THE SCOPE OF ITS FINDING IS WHAT
 /// MOVES. That cell pinned the third shape as reachable from `entries` and
@@ -11781,6 +11797,7 @@ fn the_four_outside_holders() {
     let mut holders: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut by_root: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut link_roots: BTreeSet<&'static str> = BTreeSet::new();
+    let mut node_roots: BTreeSet<&'static str> = BTreeSet::new();
     let mut third_shape_in_constants = 0usize;
     let mut third_shape_total = 0usize;
     let mut modules_seen: BTreeSet<String> = BTreeSet::new();
@@ -11922,6 +11939,9 @@ fn the_four_outside_holders() {
             if set.contains(&link) {
                 link_roots.insert(name);
             }
+            if set.contains(&node) {
+                node_roots.insert(name);
+            }
         }
 
         // Every holder, and which root reaches it.
@@ -11978,8 +11998,20 @@ fn the_four_outside_holders() {
     );
     assert_eq!(
         link_roots.into_iter().collect::<Vec<_>>(),
-        vec!["constants", "entries"],
-        "and the link itself is reachable from BOTH `constants` and `entries`"
+        vec!["constNames", "constants", "entries"],
+        "and the link itself is reachable from ALL THREE - which follows from \
+         the `by_root` pin above without any walk at all, since one holder is \
+         under `constNames` and a holder is by definition an object that names \
+         the link. The first version pinned two here and contradicted its own \
+         neighbour; w190 caught it"
+    );
+    assert_eq!(
+        node_roots.into_iter().collect::<Vec<_>>(),
+        vec!["entries"],
+        "while the NODE that holds the link is reachable from `entries` ALONE. \
+         This is the assertion the bad pin was standing in front of: the name \
+         escapes `entries` and the object does not, and one sentence covering \
+         both is what let a two-element set look right"
     );
 
     // What that does and does not do to `1dd7c288`.
