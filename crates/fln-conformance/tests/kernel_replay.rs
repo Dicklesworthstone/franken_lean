@@ -4837,6 +4837,129 @@ fn the_inventory_walk_refuses_a_non_injective_projection() {
     );
 }
 
+/// A real inventory flows into a real receipt, and the real guard refuses it.
+///
+/// **The join that did not exist.** The producer test drives `from_run` with a
+/// hand-built `CorpusCounts` and hand-picked module counts; the walk tests drive
+/// `walk_olean_inventory` over a real tree and stop at its output. Nothing
+/// connected the two, so "the row carries what the walk observed" was an
+/// assumption sitting in the exact gap between two passing tests. Here the
+/// numbers come out of the filesystem, go through the production producer, and
+/// are compared against what was on disk.
+///
+/// **Why the guard must REFUSE the result, and why that is the point.** Three
+/// empty files are not Mathlib. A receipt built from them is exactly the
+/// empty-referent row `validate` exists to catch, so this is the anti-vacuity
+/// floor tested against a REAL small tree rather than against a number somebody
+/// typed. If the floor were ever weakened, a fixture would start qualifying as a
+/// whole-corpus observation and this test says so.
+///
+/// **What it does not claim.** Nothing about Mathlib, the corpus, the kernel or
+/// the oracle. No declaration is decoded and none is checked.
+#[test]
+fn a_fixture_inventory_flows_into_a_receipt_the_guard_refuses() {
+    let library = write_inventory_fixture(
+        "t6r7-receipt-identity-v1",
+        &[
+            "Alpha.olean",
+            "Nested/Beta.olean",
+            "Nested/Gamma.olean",
+            "Alpha.olean.server",
+            "ignored.txt",
+        ],
+    );
+
+    // DETERMINISM, on real directory entries. `read_dir` yields in whatever
+    // order the filesystem likes; the walk sorts. Two walks of one unchanged
+    // tree must agree, or every count derived from one of them is a coin toss.
+    let first = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the fixture tree must be walkable: {reason}"));
+    let second = walk_olean_inventory(&library, Some("Fixture"))
+        .unwrap_or_else(|reason| panic!("the fixture tree must be walkable twice: {reason}"));
+    assert_eq!(
+        first.modules, second.modules,
+        "two walks of an unchanged tree disagreed; the projection is not order-deterministic and \
+         any count taken from it is arbitrary"
+    );
+    assert_eq!(first.oleans, second.oleans);
+
+    // The population is DERIVED from the tree, not chosen. This is the shape the
+    // driver produces for modules whose import context it cannot rebuild:
+    // everything decoded, nothing compared, every row a subject non-answer under
+    // one named family.
+    let observed = first.modules.len() as u64;
+    assert_eq!(observed, 3, "the fixture tree holds exactly three oleans");
+    let mut counts = CorpusCounts {
+        decoded: observed,
+        unscorable: observed,
+        subject_no_answer: observed,
+        ..CorpusCounts::default()
+    };
+    counts
+        .no_answer_families
+        .insert(FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(), observed);
+    // The live law, over a population that came off a disk rather than out of a
+    // literal.
+    counts.assert_conservation("fixture inventory");
+
+    let spec = CorpusReceiptSpec {
+        bead: "franken_lean-t6r7",
+        corpus_commit: suite_lock_corpus_commit(),
+        seed_modules: observed,
+        receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+    };
+    let receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &counts,
+        closure_modules: observed,
+        corpus_fixture_hash: "fixture-tree-which-is-not-a-corpus",
+        observed_unix_s: 1_786_222_333,
+        wall_ms: 7,
+    });
+
+    // THE IDENTITY: the row says what the walk saw.
+    assert_eq!(
+        receipt.seed_modules, observed,
+        "the row's seed count must be the number of modules the walk actually found"
+    );
+    assert_eq!(receipt.closure_modules, observed);
+    assert_eq!(receipt.decoded, observed);
+    assert_eq!(receipt.unscorable, observed);
+    assert_eq!(receipt.subject_no_answer, observed);
+    assert_eq!(receipt.compared, 0);
+    assert_eq!(
+        receipt.no_answer_families,
+        vec![format!("{FAMILY_UNFAITHFUL_IMPORT_CONTEXT}={observed}")],
+        "the triage must carry the family the counts were built from, at the count they were \
+         built with"
+    );
+    assert!(
+        receipt.restrictive_families.is_empty(),
+        "nothing was compared, so nothing can be a restrictive divergence"
+    );
+
+    // THE REFUSAL, and specifically for being too small.
+    let reason = match receipt.validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit()) {
+        Err(reason) => reason,
+        Ok(()) => panic!(
+            "a three-file fixture tree was accepted as a whole-Mathlib observation. The floors are \
+             the only thing standing between an empty referent and a row that reads like corpus \
+             coverage."
+        ),
+    };
+    assert!(
+        reason.contains("closure module(s)") && reason.contains("below the"),
+        "the refusal must be about the corpus being too small, not something incidental: {reason}"
+    );
+
+    // Serialization does not depend on magnitude: a refused row must still be
+    // readable, or a refutation could not be retained and inspected.
+    let row = receipt.to_row();
+    let parsed = WholeMathlibReceipt::from_row(&row)
+        .expect("even a row the guard refuses must survive its own reader");
+    assert!(parsed == receipt, "a produced row must round trip");
+}
+
 /// The corpus root is EXACTLY the documented host path, compared whole.
 ///
 /// **Why a literal and not the constant.** The path is written out again here by
