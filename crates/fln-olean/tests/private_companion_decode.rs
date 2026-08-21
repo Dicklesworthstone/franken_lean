@@ -301,6 +301,11 @@ const ARRAY_FIND_SOME_REV_M_FIND_F: &str =
     "_private.Init.Data.Array.Basic.0.Array.findSomeRevM?.find._f";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_FIND_SOME_REV_M_FIND_F_MODULE: &str = "Init/Data/Array/Basic";
+/// The private recursion helper generated for `Array.firstM`.
+const ARRAY_FIRST_M_GO: &str =
+    "_private.Init.Data.Array.Basic.0.Array.firstM.go";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_FIRST_M_GO_MODULE: &str = "Init/Data/Array/Basic";
 /// The splitter definition generated for `Option.isSome.match_1`.
 const OPTION_IS_SOME_MATCH_1_SPLITTER: &str =
     "_private.Init.Data.AC.0.Option.isSome.match_1.splitter";
@@ -1712,6 +1717,33 @@ fn array_find_some_rev_m_find_f_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Defn(_)),
         "private companion decoded {ARRAY_FIND_SOME_REV_M_FIND_F} as {} instead of Defn",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_first_m_go_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("array_first_m_go_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_FIRST_M_GO_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_FIRST_M_GO.to_owned()),
+        "the private companion of {ARRAY_FIRST_M_GO_MODULE} must retain {ARRAY_FIRST_M_GO}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_FIRST_M_GO)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_FIRST_M_GO}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {ARRAY_FIRST_M_GO} as {} instead of Defn",
         recovered.kind_name()
     );
 }
