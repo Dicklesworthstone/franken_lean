@@ -2597,6 +2597,31 @@ fn kr600_803_witness_fixture_pins_recursor_mutual_family_and_k() {
 }
 
 #[test]
+fn kr600_803_witness_fixture_pins_constructor_index_parameters_and_fields() {
+    let entries = dependent_field_inductive_entries();
+    let constructor = entries[1].declaration();
+    let metadata = constructor
+        .constructor_metadata()
+        .expect("fixture constructor metadata");
+    assert_eq!(metadata.inductive(), &checker_name("Witness"));
+    assert_eq!(metadata.index(), 0);
+    assert_eq!(metadata.num_parameters(), 0);
+    assert_eq!(metadata.num_fields(), 2);
+    assert!(constructor.level_parameters().is_empty());
+}
+
+#[test]
+fn kr600_803_witness_fixture_pins_iota_rule_constructor_and_fields() {
+    let entries = dependent_field_inductive_entries();
+    let metadata = entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.rules()[0].constructor(), entries[1].name());
+    assert_eq!(metadata.rules()[0].num_fields(), 2);
+}
+
+#[test]
 fn kr600_803_direct_self_recursion_is_reconstructed_independently() {
     let entries = nat_entries();
     let verdict = admit_inductive(
