@@ -9298,3 +9298,160 @@ fn the_reference_graph_cycles_are_exactly_the_unsafe_recursion_and_the_recursors
         "eleven non-safe definitions are well-founded, so the converse fails"
     );
 }
+
+/// The nested block's recursor family, and the edge each one's rules carry.
+const NESTED_RECURSOR_CHAIN: &[(&str, &str)] = &[
+    ("Lean.Syntax.rec", "Lean.Syntax.rec_1"),
+    ("Lean.Syntax.rec_1", "Lean.Syntax.rec_2"),
+    ("Lean.Syntax.rec_2", "Lean.Syntax.rec"),
+];
+
+/// A recursor's self-reference is at ITS OWN universe parameters, in order —
+/// and two of the nine cyclic recursors do not self-reference at all.
+///
+/// The cycle cell establishes that exactly the recursors of recursive blocks
+/// sit on a cycle, nine of them. It does not distinguish HOW. Seven reference
+/// themselves directly in an iota rule; the other two reach a cycle only
+/// through their siblings, and they are `Lean.Syntax.rec` and
+/// `Lean.Syntax.rec_1`. The nested block's three recursors form a directed
+/// three-cycle — `rec` to `rec_1` to `rec_2` and back — with `rec_2` also
+/// naming itself. That is the only mutual recursion among recursors in the
+/// module, and it is invisible to a cell that only counts cycle participants.
+///
+/// The levels are the substantive half. Iota reduction replaces a recursor
+/// application by its rule's right-hand side, so a self-reference inside that
+/// right-hand side is the recursive call. If it carried different universe
+/// arguments the reduct would be ill-typed at the instantiation it came from.
+/// Measured: every self-reference carries exactly the recursor's own level
+/// parameters, as `Param`s, in the declared ORDER — no exception across every
+/// occurrence, and `Lean.ParserDescr.rec` alone has seven.
+///
+/// The level-arity cell checks that a `Const` reference carries the right
+/// NUMBER of levels. This checks which ones, for the references where being
+/// wrong would break reduction rather than resolution.
+///
+/// Order is distinguishable from set here, which is what makes "in order" worth
+/// asserting: `List.rec` declares `[u_1, u]`, not alphabetically sorted, and two
+/// of the seven declare none at all, so the claim is exercised at zero, one and
+/// two parameters.
+#[test]
+fn a_recursors_self_reference_carries_its_own_universe_parameters_in_order() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut recursors: BTreeMap<String, &RecursorVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Rec(v) = info {
+            recursors.insert(info.name().to_display_string(), v);
+        }
+    }
+    assert_eq!(recursors.len(), 129, "the recursor census must be reached");
+
+    let mut self_referencing: BTreeSet<&String> = BTreeSet::new();
+    let mut occurrences = 0usize;
+    let mut widths: BTreeSet<usize> = BTreeSet::new();
+    let mut departures: Vec<(String, Vec<String>)> = Vec::new();
+    let mut chain: Vec<(String, String)> = Vec::new();
+    for (name, rec) in &recursors {
+        let own: Vec<String> = rec
+            .base
+            .level_params
+            .iter()
+            .map(Name::to_display_string)
+            .collect();
+        let mut named_siblings: BTreeSet<String> = BTreeSet::new();
+        for rule in &rec.rules {
+            let mut stack: Vec<&Expr> = vec![&rule.rhs];
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current.allocation_identity()) {
+                    continue;
+                }
+                if let ExprNode::Const {
+                    name: target,
+                    levels,
+                } = current.node()
+                {
+                    let target = target.to_display_string();
+                    if target == **name {
+                        occurrences += 1;
+                        self_referencing.insert(name);
+                        widths.insert(own.len());
+                        let carried: Vec<String> = levels
+                            .iter()
+                            .map(|level| match level.view() {
+                                LevelView::Param(parameter) => parameter.to_display_string(),
+                                _ => "<not a parameter>".to_owned(),
+                            })
+                            .collect();
+                        if carried != own {
+                            departures.push((name.to_string(), carried));
+                        }
+                    } else if recursors.contains_key(&target) {
+                        named_siblings.insert(target);
+                    }
+                }
+                match current.node() {
+                    ExprNode::App { f, a } => {
+                        stack.push(f);
+                        stack.push(a);
+                    }
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        stack.push(binder_type);
+                        stack.push(body);
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        stack.push(type_);
+                        stack.push(value);
+                        stack.push(body);
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+                    _ => {}
+                }
+            }
+        }
+        for sibling in named_siblings {
+            chain.push((name.to_string(), sibling));
+        }
+    }
+
+    assert!(
+        departures.is_empty(),
+        "a recursor's self-reference must carry its own parameters in order: {departures:?}"
+    );
+    assert_eq!(
+        self_referencing.len(),
+        7,
+        "seven recursors name themselves; the other cyclic ones do not"
+    );
+    assert!(
+        occurrences > 10 && widths.len() == 3,
+        "the claim must span several occurrences and parameter widths, got {occurrences} \
+         occurrences over widths {widths:?}"
+    );
+
+    // The mutual chain, which is why nine recursors are cyclic and only seven
+    // name themselves.
+    chain.sort();
+    let expected: Vec<(String, String)> = NESTED_RECURSOR_CHAIN
+        .iter()
+        .map(|(from, to)| ((*from).to_owned(), (*to).to_owned()))
+        .collect();
+    assert_eq!(
+        chain, expected,
+        "the only recursor-to-recursor references form the nested block's three-cycle"
+    );
+    for (from, _) in NESTED_RECURSOR_CHAIN {
+        assert!(
+            recursors.contains_key(*from),
+            "{from} must be a decoded recursor"
+        );
+    }
+}
