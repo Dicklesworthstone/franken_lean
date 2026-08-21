@@ -6601,6 +6601,13 @@ fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
 /// resolve to directories that already exist -- the temporary directory and
 /// `target/` -- so their absence proves nothing. Said rather than quietly
 /// omitted.
+///
+/// **A fourth name exists because the non-ordinary branch had one decoy, and it
+/// was a `..`.** A rule built around that reading -- the danger is a parent
+/// directory -- refuses every name here and cannot be told apart from the real
+/// one, which asks for an ordinary component and gets a ROOT. `/` is that input:
+/// it round-trips through its own component, so the spelling half does not save
+/// it either, and the tree it would name is the filesystem root.
 #[test]
 fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -6668,6 +6675,52 @@ fn the_fixture_name_is_validated_and_it_decides_where_everything_lands() {
         !tmp.join("nested").exists(),
         "`nested/name` was refused and a tree appeared anyway; the name check must run before \
          anything is created"
+    );
+
+    // THE NON-ORDINARY BRANCH HAS ONE DECOY AND IT IS A `..`. A rule written
+    // around that -- "the danger is a parent directory" -- refuses `..`, and
+    // refuses the other three for their own reasons, so nothing here tells it
+    // apart from the real rule. `/` is the input that does: its single component
+    // is a ROOT, not a parent.
+    assert!(
+        matches!(
+            Path::new("..").components().next(),
+            Some(std::path::Component::ParentDir)
+        ),
+        "the existing decoy must be a parent-directory component, or the gap described here is \
+         not the gap that exists"
+    );
+    assert!(
+        matches!(
+            Path::new("/").components().next(),
+            Some(std::path::Component::RootDir)
+        ),
+        "`/` must be a ROOT component; that is what a rule aimed at `..` does not cover"
+    );
+    // AND THE SPELLING HALF DOES NOT SAVE IT: `/` is exactly its own component,
+    // so a name that round-trips can still be catastrophic.
+    assert_eq!(
+        Path::new("/").components().next().map(|c| c.as_os_str()),
+        Some(std::ffi::OsStr::new("/")),
+        "`/` round-trips through its own component, so only the ORDINARY-name rule refuses it"
+    );
+    assert_eq!(
+        tmp.join("/"),
+        Path::new("/"),
+        "an absolute name discards the temporary directory: the fixture tree would be the \
+         filesystem root, and the walk would enumerate it"
+    );
+
+    let rooted = refuse("/");
+    assert!(
+        rooted.contains("climb out") && !rooted.contains("names nothing at all"),
+        "`/` must be refused as a name that is not ordinary, not as one with no components: \
+         {rooted}"
+    );
+    assert!(
+        !Path::new("/.manifest").exists(),
+        "the refusal must precede the shape record's write; a record for the name `/` would be \
+         `/.manifest`, at the filesystem root"
     );
 }
 
