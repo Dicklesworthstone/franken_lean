@@ -3748,6 +3748,9 @@ def main():
     demanded_emitted_init_provided_inequality_join = {"summary_demanded_emitted": manifest_summary.get("demanded_emitted"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"], bool) or not isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], int) or isinstance(demanded_emitted_init_provided_inequality_join["summary_init_provided"], bool) or demanded_emitted_init_provided_inequality_join["summary_demanded_emitted"] <= demanded_emitted_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest emitted-demand count must exceed Init-provided count " + json.dumps(demanded_emitted_init_provided_inequality_join, sort_keys=True))
+    demanded_emitted_structural_class_inequality_join = {"summary_demanded_emitted": manifest_summary.get("demanded_emitted"), "summary_structural_class": manifest_summary.get("structural_class")}
+    if (not isinstance(demanded_emitted_structural_class_inequality_join["summary_demanded_emitted"], int) or isinstance(demanded_emitted_structural_class_inequality_join["summary_demanded_emitted"], bool) or not isinstance(demanded_emitted_structural_class_inequality_join["summary_structural_class"], int) or isinstance(demanded_emitted_structural_class_inequality_join["summary_structural_class"], bool) or demanded_emitted_structural_class_inequality_join["summary_demanded_emitted"] <= demanded_emitted_structural_class_inequality_join["summary_structural_class"]):
+        raise SystemExit("REFUSE: facade manifest emitted-demand count must exceed structural-class count " + json.dumps(demanded_emitted_structural_class_inequality_join, sort_keys=True))
     transparent_declarations_init_provided_inequality_join = {"summary_transparent_declarations": manifest_summary.get("transparent_declarations"), "summary_init_provided": manifest_summary.get("init_provided")}
     if (not isinstance(transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"], int) or isinstance(transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"], bool) or not isinstance(transparent_declarations_init_provided_inequality_join["summary_init_provided"], int) or isinstance(transparent_declarations_init_provided_inequality_join["summary_init_provided"], bool) or transparent_declarations_init_provided_inequality_join["summary_transparent_declarations"] <= transparent_declarations_init_provided_inequality_join["summary_init_provided"]):
         raise SystemExit("REFUSE: facade manifest transparent-declaration count must exceed Init-provided count " + json.dumps(transparent_declarations_init_provided_inequality_join, sort_keys=True))
@@ -6087,6 +6090,9 @@ def main():
         ),
         "manifest_demanded_emitted_init_provided_inequality_join": (
             demanded_emitted_init_provided_inequality_join
+        ),
+        "manifest_demanded_emitted_structural_class_inequality_join": (
+            demanded_emitted_structural_class_inequality_join
         ),
         "manifest_transparent_declarations_init_provided_inequality_join": (
             transparent_declarations_init_provided_inequality_join
