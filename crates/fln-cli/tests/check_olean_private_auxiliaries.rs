@@ -756,6 +756,12 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     );
     assert_json_named_residuals(
         &json.stdout,
+        "privateCliPrivateReportFResiduals",
+        1,
+        &["_private.CliPrivateReport.0._f"],
+    );
+    assert_json_named_residuals(
+        &json.stdout,
         "privateSunfoldResiduals",
         1,
         &["_private.CliPrivateReport.0._sunfold"],
@@ -1299,6 +1305,13 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
             "_private.Init.Data.String.Extra.0.String.findLeadingSpacesSize.findNextLine._unsafe_rec", "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
             "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
         ],
+    );
+    assert_human_named_residuals(
+        &human.stdout,
+        "decoded _private CliPrivateReport _f residuals",
+        "decoded _private CliPrivateReport _f residual names",
+        1,
+        &["_private.CliPrivateReport.0._f"],
     );
     assert_human_named_residuals(
         &human.stdout,
