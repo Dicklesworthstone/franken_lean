@@ -4896,6 +4896,125 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// When a run is BOTH unsound and restrictive, the row must say UNSOUND.
+///
+/// **The one input combination nobody had evaluated.** `whole_mathlib_class`
+/// takes two counts, so it has four cases. The guard's mutants cover
+/// `(0, restrictive)` and `(unsound, 0)`, and the producer covers `(0, 0)`.
+/// `(unsound, restrictive)` -- both nonzero -- had never been evaluated anywhere,
+/// and it is the only one where the function has to CHOOSE.
+///
+/// **What the choice decides.** D23 is the asymmetry this entire bead rests on:
+/// restrictive divergences are repairable findings, while accepting what the
+/// Reference rejects is release-blocking and has no carve-out. A run exhibiting
+/// both is release-blocking. If the precedence were inverted -- or if it were an
+/// accident of which `if` came first, which is what an untested branch order is
+/// -- such a run would be filed as `refuted_this_run_found_a_restrictive_divergence`,
+/// and the single most serious result this lane can produce would be recorded as
+/// the ordinary kind. Nothing downstream re-derives it: the class token is what
+/// the retention guard reads and what a reader quotes.
+///
+/// **The protection is asserted through `validate`, not just the classifier.**
+/// Getting the token right in the producer means nothing if the guard would
+/// ACCEPT a row that downgraded it, since rows can be hand-written into the
+/// retained file. So the same both-nonzero population is offered to the guard
+/// three ways: with the unsound token it must pass, and with either the
+/// restrictive or the clean token it must be refused.
+#[test]
+fn an_unsound_run_that_is_also_restrictive_is_filed_as_unsound() {
+    let clean = whole_mathlib_class(0, 0);
+    let restrictive = whole_mathlib_class(0, 7);
+    let unsound = whole_mathlib_class(3, 0);
+
+    // ANTI-VACUITY: three distinct tokens, or the precedence assertions below
+    // are satisfiable by a function that returns the same string always.
+    assert_eq!(
+        [clean, restrictive, unsound]
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3,
+        "the three class tokens must differ, or nothing below discriminates"
+    );
+
+    // THE CASE THAT WAS NEVER EVALUATED.
+    assert_eq!(
+        whole_mathlib_class(3, 7),
+        unsound,
+        "a run that is BOTH unsound and restrictive must be classified by its most severe \
+         finding. D23 gives restrictive divergences a repair path and gives an unsound acceptance \
+         none, so filing this run as merely restrictive would record the one release-blocking \
+         outcome this lane can produce as the ordinary kind"
+    );
+
+    // A legal population exhibiting both directions at once.
+    let mut counts = CorpusCounts {
+        decoded: 700_011,
+        compared: 600_011,
+        agree: 600_000,
+        unsoundly_permissive: 1,
+        restrictive_without_carve_out: 10,
+        unscorable: 100_000,
+        oracle_skipped: 60_000,
+        subject_no_answer: 40_000,
+        ..CorpusCounts::default()
+    };
+    counts
+        .restrictive_families
+        .insert("rejected:BlockMismatch".to_string(), 10);
+    counts
+        .no_answer_families
+        .insert(FAMILY_UNFAITHFUL_IMPORT_CONTEXT.to_string(), 40_000);
+    counts.assert_conservation("unsound and restrictive");
+
+    let spec = CorpusReceiptSpec {
+        bead: "franken_lean-t6r7",
+        corpus_commit: suite_lock_corpus_commit(),
+        seed_modules: 8_009,
+        receipt_path_var: "FLN_WHOLE_MATHLIB_RECEIPT",
+    };
+    let receipt = WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+        spec: &spec,
+        counts: &counts,
+        closure_modules: 10_007,
+        corpus_fixture_hash: "both-directions-at-once",
+        observed_unix_s: 1_786_555_666,
+        wall_ms: 13,
+    });
+    assert_eq!(
+        receipt.class, unsound,
+        "the producer must file the more severe class"
+    );
+    if let Err(reason) = receipt.validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit())
+    {
+        panic!("the correctly classified row was refused: {reason}");
+    }
+
+    // THE DOWNGRADE MUST BE REFUSED. Rows can be written by hand into the
+    // retained file, so the producer choosing correctly is not sufficient.
+    for downgraded in [restrictive, clean] {
+        let forged = WholeMathlibReceipt {
+            class: downgraded.to_string(),
+            ..WholeMathlibReceipt::from_run(&WholeMathlibRunFacts {
+                spec: &spec,
+                counts: &counts,
+                closure_modules: 10_007,
+                corpus_fixture_hash: "both-directions-at-once",
+                observed_unix_s: 1_786_555_666,
+                wall_ms: 13,
+            })
+        };
+        let reason = forged
+            .validate(&suite_lock_reference_pin(), &suite_lock_corpus_commit())
+            .expect_err("a downgraded class must be refused");
+        assert!(
+            reason.contains(unsound),
+            "the refusal must name the class the counts actually earn, so the row can be \
+             corrected rather than merely rejected: {reason}"
+        );
+    }
+}
+
 /// The ROUTER and the CENSUS agree about what a token means.
 ///
 /// **A prose join between two functions, made checkable.** `check_family_token`'s
