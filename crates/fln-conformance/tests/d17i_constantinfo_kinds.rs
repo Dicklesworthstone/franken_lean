@@ -13149,3 +13149,121 @@ fn no_module_declares_a_name_twice_at_either_level() {
          not a per-module law"
     );
 }
+
+/// The two name censuses reconcile, and the 131 that separate them have a shape.
+///
+/// Two cells count private-level names over the same 600 modules and get
+/// different answers, correctly. The cross-module census counts DISTINCT names
+/// and reports 65,273; the uniqueness cell sums each module's array and reports
+/// 65,404. Neither is wrong and nothing connects them. The difference is 131,
+/// and until it is derived from the same walk it is a coincidence between two
+/// numbers rather than a fact about the artifact.
+///
+/// It is the multi-declaration excess. The census cell names 92 names declared
+/// by more than one module and breaks them down by equation-compiler tail —
+/// `eq_1` ×36, `congr_simp` ×24 and so on — but a tail family says nothing about
+/// HOW MANY modules a name spans, so the excess cannot be recovered from it. The
+/// multiplicity distribution is what closes the gap:
+///
+///   2 modules  69 names        5 modules  1 name
+///   3 modules  13 names        6 modules  1 name
+///   4 modules   7 names        7 modules  1 name  (`InvImage.eq_1`)
+///
+/// Ninety-two names, and 69 + 26 + 21 + 4 + 5 + 6 = 131 surplus occurrences.
+///
+/// WHY THIS IS NOT ARITHMETIC ON TWO PINNED NUMBERS. Every quantity here comes
+/// from one walk: the occurrence total, the distinct total, and the histogram
+/// are three margins of the same table, and the cell asserts all three plus the
+/// identity between them. Subtracting 65,273 from 65,404 in a comment would
+/// prove nothing — either census could drift and the difference would still be
+/// whatever it is. Recomputing both from the multiplicity classes is what makes
+/// a drift in either one fail here.
+///
+/// The tail is the anti-vacuity. A decode that collapsed duplicate names into a
+/// map — the exact failure the uniqueness cell guards against at module scope —
+/// would report every multiplicity as 1 and the excess as 0.
+///
+/// Conservation first, both margins: the classes must reproduce the occurrence
+/// total and the distinct total before the excess is named.
+#[test]
+fn the_distinct_and_total_name_censuses_differ_by_the_multi_declaration_excess() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total = 0usize;
+    for module in &modules {
+        let private = module_view(&lib, module, Level::Private);
+        total += private.const_names.len();
+        for name in private.const_names {
+            *occurrences.entry(name).or_default() += 1;
+        }
+    }
+
+    let mut classes: BTreeMap<usize, usize> = BTreeMap::new();
+    for count in occurrences.values() {
+        *classes.entry(*count).or_default() += 1;
+    }
+
+    // Conservation first, both margins.
+    assert_eq!(
+        classes.iter().map(|(m, n)| m * n).sum::<usize>(),
+        total,
+        "the multiplicity classes must reproduce the occurrence total"
+    );
+    assert_eq!(
+        classes.values().sum::<usize>(),
+        occurrences.len(),
+        "and the distinct total"
+    );
+
+    assert_eq!(
+        (total, occurrences.len()),
+        (65_404, 65_273),
+        "the two censuses this cell reconciles, recomputed here rather than quoted"
+    );
+    assert_eq!(
+        classes,
+        BTreeMap::from([
+            (1, 65_181),
+            (2, 69),
+            (3, 13),
+            (4, 7),
+            (5, 1),
+            (6, 1),
+            (7, 1)
+        ]),
+        "how many modules a name spans; the census cell's tail families cannot express this"
+    );
+
+    // The excess, derived two ways.
+    let multi: usize = classes
+        .iter()
+        .filter(|(m, _)| **m > 1)
+        .map(|(_, n)| n)
+        .sum();
+    let excess: usize = classes.iter().map(|(m, n)| (m - 1) * n).sum();
+    assert_eq!(
+        (multi, excess),
+        (92, 131),
+        "92 multiply-declared names contributing 131 surplus occurrences"
+    );
+    assert_eq!(
+        excess,
+        total - occurrences.len(),
+        "and that surplus is exactly what separates the two censuses"
+    );
+
+    // The deepest one, tying this distribution to the census cell's example.
+    let deepest: Vec<&String> = occurrences
+        .iter()
+        .filter(|(_, count)| **count == 7)
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        deepest,
+        vec!["InvImage.eq_1"],
+        "the seven-module name is the one the census cell names"
+    );
+}
