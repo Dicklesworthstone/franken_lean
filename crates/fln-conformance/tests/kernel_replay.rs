@@ -9261,6 +9261,40 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
          refusal, which also begins `empty module`: {reason}"
     );
 
+    // A NAME WHOSE LAST SEGMENT HAS NO CHARACTERS. Of the four probes the cells
+    // below prove discriminating, this was the one never checked against a
+    // message the projection actually writes: it identified exactly one entry of
+    // a list and was exercised against no output. The emitter's own comment
+    // names the input -- `x..olean` has extension `olean` and stem `x.`, so the
+    // JOIN mints an empty segment out of components that are each non-empty.
+    let reason = module_name_from_path(root, &root.join("A/x..olean"))
+        .expect_err("a name whose last segment is empty must be refused");
+    assert!(
+        reason.contains("empty segment"),
+        "`empty segment` is the probe the cells below prove unique, and this is the only \
+         refusal that produces it: {reason}"
+    );
+    // AND THE OBVIOUS DECOY DIES AT A DIFFERENT RULE, which is why the input
+    // above is spelled the way it is. `A/..olean` looks like the same defect and
+    // is refused as a NON-NORMAL COMPONENT, several rules earlier -- a plant
+    // built from it would pass while proving nothing about this refusal. Checked
+    // rather than assumed, because that is the way this file has been wrong
+    // before.
+    let sibling = module_name_from_path(root, &root.join("A/..olean"))
+        .expect_err("a `..` component must be refused");
+    assert!(
+        sibling.contains("non-normal") && !sibling.contains("empty segment"),
+        "the `..` input no longer dies at the non-normal rule, so the cell above may be \
+         resting on it rather than on the join: {sibling}"
+    );
+    // AND THE GREEN CONTROL: an ordinary path still projects, so the refusals
+    // above are about the names they name and not about the walk being broken.
+    assert_eq!(
+        module_name_from_path(root, &root.join("A/B.olean")).as_deref(),
+        Ok("A.B"),
+        "an ordinary path must still project, or every refusal above is vacuous"
+    );
+
     // ANTI-VACUITY on the choice of expectations: each must appear in exactly
     // one of the five messages this function can produce, or a cell could pass
     // on a sibling's refusal. The list is the messages themselves, so it cannot
