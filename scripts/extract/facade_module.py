@@ -592,6 +592,19 @@ def writable_binder(name):
     return writable_component(name)
 
 
+def needs_rename(name):
+    """A binder name that no amount of ESCAPING can make usable.
+
+    `end` and `private` are Lean keywords, and «end» is the same NAME — escaping
+    is all they need. Renaming them was a real defect: it emitted
+    `structure Lean.Lsp.Range where start : Position; flnp1 : Position`, which has
+    different field names from the Reference's and therefore no
+    `Lean.Lsp.Range.end` projection at all. Only an inaccessible name (a dagger)
+    or one carrying whitespace is genuinely unwritable.
+    """
+    return (not name) or ("\u271d" in name) or any(ch.isspace() for ch in name)
+
+
 def binder_text(b, deps):
     """Render one constructor binder so the pin reads it as a binder.
 
@@ -637,7 +650,7 @@ def structural_block(name, d, st, bs, deps, pks):
         # declaration in the file down with it.
         if i < st["num_params"]:
             b = dict(b, kind=pks.get(i, "default"))
-        if b["kind"] != "inst" and not writable_binder(b["user"]):
+        if b["kind"] != "inst" and needs_rename(b["user"]):
             b = dict(b, user=f"flnp{i}")
         (params if i < st["num_params"] else fields).append(b)
     if not fields:
@@ -646,8 +659,10 @@ def structural_block(name, d, st, bs, deps, pks):
         (" " + " ".join(binder_text(b, deps) for b in params)) if params else "") + " where"
     lines = [head]
     for b in fields:
-        fname = renderable_name(b["user"])
-        if fname is None:
+        # A field name is a SINGLE component: escaping the whole string is right,
+        # while splitting it on dots would turn one field into a dotted path.
+        fname = safe_ident(b["user"])
+        if not fname:
             return None
         lines.append(f"  {fname} : {root_anchor(b['type'], deps)}")
     return lines
@@ -667,7 +682,7 @@ def structural_refusal(name, st, bs):
         # refused — but only when nothing else names it. If a later binder or
         # field type mentions it, the rename would silently change what that type
         # means, so the structure keeps the axiom form instead.
-        if b["kind"] != "inst" and not writable_binder(b["user"]):
+        if b["kind"] != "inst" and needs_rename(b["user"]):
             later = [o["type"] for j, o in sorted(bs.items()) if j > i]
             if any(re.search(r"(?<![\w.])" + re.escape(b["user"]) + r"(?![\w.])", t)
                    for t in later):
@@ -686,7 +701,12 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
     provided = {}
     for c in structural:
         st = structs[c]
-        provided[st["ctor"]] = c
+        # The block always generates a PUBLIC `<C>.mk`. Where the Reference's
+        # constructor is private (`_private.Lean.Environment.0.…mk`), that private
+        # name is NOT what gets generated, and claiming it is a claim the module
+        # cannot show — measured as 7 of the 13 withdrawn rows.
+        ctor = st["ctor"]
+        provided[f"{c}.mk" if ctor.split(".")[0] == "_private" else ctor] = c
         for i, b in sorted(binders.get(c, {}).items()):
             if i >= st["num_params"]:
                 provided[f"{c}.{b['user']}"] = c
@@ -852,6 +872,13 @@ def main():
         dn = renderable_name(name)
         if dn is None:
             quarantine[name] = "name has a component the facade cannot declare"
+        elif name.split(".")[0] == "_private":
+            # Declaring it would elaborate but nothing could ever refer to it: the
+            # Reference hides this constant behind a private name, and a facade
+            # declaration under that spelling is unresolvable.
+            quarantine[name] = ("the Reference declares this under a PRIVATE name; "
+                                "no facade declaration reproduces a nameable "
+                                "equivalent")
         decl[name] = {
             "decl_name": dn or name,
             "type": types[name],
@@ -1150,7 +1177,12 @@ def main():
 
     # A projection the structural block generates IS in the facade; counting only
     # the lines this emitter wrote would understate coverage by every field.
-    emitted = emitted + [p for p in sorted(provided) if p in decl]
+    # A quarantined name is NOT emitted, however it got here. Folding `provided`
+    # in without subtracting the quarantine put 14 rows in both states at once —
+    # all of them `_private.…` companions of structural structures, quarantined as
+    # undeclarable and simultaneously claimed as generated.
+    emitted = sorted((set(emitted) | {p for p in provided if p in decl})
+                     - set(quarantine))
 
     # THE MANIFEST MUST NOT CLAIM AN EMISSION IT CANNOT SHOW. Until now `emitted`
     # was BOOKKEEPING — "this name is not in the quarantine dict" — and every
@@ -1216,6 +1248,7 @@ def main():
         # version of this check) let a withdrawn constructor be re-added by the
         # very next line, leaving a row both emitted and withdrawn.
         emitted = [n for n in emitted if n not in unresolved_claims]
+    emitted_set = set(emitted)
     emission_verified = len(claimed) - len(unresolved_claims)
     emission_withdrawn = len(unresolved_claims)
 
@@ -1311,6 +1344,7 @@ def main():
         "maxexplicit_printer": len(maxexp_for),
         "quarantined": len(quarantine),
         "emission_verified": emission_verified,
+        "declarations_emitted_distinct": len(emitted_set),
         "emission_withdrawn": emission_withdrawn,
         "emission_verification": "every name the manifest calls emitted was "
             "resolved by the pin in the generated module itself",
@@ -1337,7 +1371,7 @@ def main():
             "provided_by": provided.get(name),
             "structural_refused_reason": structural_refused.get(name),
             "transparent_refused_reason": transparent_refused.get(name),
-            "emitted": name not in quarantine,
+            "emitted": name in emitted_set,
             "quarantine_reason": quarantine.get(name),
             "emission_withdrawn": bool(decl[name].get("emission_withdrawn")),
             "demanded_outcome": demanded_outcomes.get(name),
@@ -1361,6 +1395,13 @@ def main():
         rows.append({"schema": SCHEMA, "kind": "init-substrate", "name": name,
                      "reason": "defined under Init; implicitly imported by every "
                                "non-prelude module, so both sides share it"})
+    row_emitted = sum(1 for r in rows if r.get("kind") == "decl" and r.get("emitted"))
+    if row_emitted != len(emitted_set):
+        raise SystemExit(
+            f"REFUSE: the summary would claim {len(emitted_set)} emitted "
+            f"declarations while {row_emitted} rows carry the flag — one word, two "
+            "definitions, and every downstream count picks whichever it read first")
+
     tmp = args.manifest + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         for row in rows:
