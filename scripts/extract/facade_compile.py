@@ -126,6 +126,10 @@ the toolchain would report a perfect facade:
     recognized generated form. Name/type availability cannot stand in for an
     unclassified declaration-emission shape.
 
+  * A TRANSPARENCY-REFUSAL JOIN requires transparent abbreviations and rejected
+    transparent candidates to agree with their form and refusal metadata. The
+    rig must not conflate a value-preserving abbreviation with an opaque axiom.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -455,6 +459,7 @@ def join_demanded_rows(names, manifest_rows):
     safety_mismatches = []
     instance_mismatches = []
     form_mismatches = []
+    transparency_mismatches = []
     roles = Counter()
     emission_join = Counter()
     provider_join = Counter()
@@ -466,6 +471,7 @@ def join_demanded_rows(names, manifest_rows):
     safety_join = Counter()
     instance_join = Counter()
     form_join = Counter()
+    transparency_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -516,6 +522,20 @@ def join_demanded_rows(names, manifest_rows):
                 form_mismatches.append(f"{name}(form={form!r})")
                 continue
             form_join[form] += 1
+            transparency_reason = row.get("transparent_refused_reason")
+            if form == "transparent-abbrev" and transparency_reason is None:
+                transparency_join["transparent"] += 1
+            elif (form == "axiom" and isinstance(transparency_reason, str)
+                  and transparency_reason.strip()):
+                transparency_join["transparent_refused"] += 1
+            elif transparency_reason is None:
+                transparency_join["opaque"] += 1
+            else:
+                transparency_mismatches.append(
+                    f"{name}(form={form!r}, transparent_refused_reason="
+                    f"{transparency_reason!r})"
+                )
+                continue
             printer = row.get("printer")
             level_params = row.get("level_params")
             if (printer not in ("pp.fullNames", "pp.explicit", "pp.maxexplicit")
@@ -595,7 +615,8 @@ def join_demanded_rows(names, manifest_rows):
             or provider_mismatches or provider_dependency_mismatches
             or signature_provenance_mismatches or type_dependency_shape_mismatches
             or level_parameter_mismatches or effect_mismatches or bucket_mismatches
-            or safety_mismatches or instance_mismatches or form_mismatches):
+            or safety_mismatches or instance_mismatches or form_mismatches
+            or transparency_mismatches):
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -633,6 +654,10 @@ def join_demanded_rows(names, manifest_rows):
             details.append("instance=" + ", ".join(instance_mismatches[:8]))
         if form_mismatches:
             details.append("form=" + ", ".join(form_mismatches[:8]))
+        if transparency_mismatches:
+            details.append("transparency=" + ", ".join(
+                transparency_mismatches[:8]
+            ))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
@@ -642,7 +667,8 @@ def join_demanded_rows(names, manifest_rows):
             dict(sorted(printer_join.items())), dict(sorted(type_dependency_join.items())),
             dict(sorted(level_parameter_join.items())), dict(sorted(effect_join.items())),
             dict(sorted(bucket_join.items())), dict(sorted(safety_join.items())),
-            dict(sorted(instance_join.items())), dict(sorted(form_join.items())))
+            dict(sorted(instance_join.items())), dict(sorted(form_join.items())),
+            dict(sorted(transparency_join.items())))
 
 
 def choose_quarantine_control(dispositions):
@@ -942,7 +968,8 @@ def main():
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
      demand_buckets, demand_safeties,
-     demand_instances, demand_forms) = join_demanded_rows(
+     demand_instances, demand_forms,
+     demand_transparency) = join_demanded_rows(
          demand_names, manifest_rows
      )
     type_ascription_join = join_type_ascriptions(demand_dispositions, sigs)
@@ -1086,6 +1113,7 @@ def main():
         "demanded_safety_join": demand_safeties,
         "demanded_instance_join": demand_instances,
         "demanded_form_join": demand_forms,
+        "demanded_transparency_join": demand_transparency,
         "type_dependency_target_join": type_dependency_target_join,
         "demanded_type_ascription_join": type_ascription_join,
         "disposition_matrix_control": {
