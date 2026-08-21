@@ -11721,6 +11721,242 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// Which multi-size shapes the arrival context separates - the whole census.
+///
+/// `5efac560` measured one shape and concluded that discrimination is
+/// "shape-specific". That was two data points wearing the language of a general
+/// claim, so this asks the same question of EVERY shape that has more than one
+/// stored size.
+///
+/// Of 36 constructor shapes pooled across the four modules, FOURTEEN store more
+/// than one size - 46,334 objects between them. Asking whether the arrival
+/// context determines the stored size:
+///
+///   SEPARABLE (no mixed context)   6:  (0,5) (0,6) (0,7) (3,1) (4,1) (4,2)
+///   NOT separable                  8:  (0,1) (0,2) (0,3) (0,4)
+///                                      (1,1) (1,2) (2,2) (7,3)
+///
+/// SO THE CLAIM SURVIVES AND MY FRAMING OF IT DID NOT. Separation is indeed
+/// shape-specific, but `5efac560` presented `(4, 1)` as the positive case and
+/// left the impression that separation is rare. Six of fourteen separate. The
+/// finding worth keeping is the other half: EIGHT DO NOT, and `(1, 2)` - the
+/// shape that blocks `list_ptrs` - is the worst of them, with SIX mixed
+/// contexts out of 40. Its nearest rivals have two.
+///
+/// THE ARRAY CONTEXT IS AN OFFENDER FIVE TIMES AND THE SOLE OFFENDER ONCE, and
+/// measuring that mattered because the tempting story is wrong. An array
+/// arrival cannot fix a size - arrays are homogeneous in type, not in layout -
+/// so "arrays spoil it" looks like it would explain the eight. It does not:
+/// ignoring array arrivals entirely moves the separable count from 6 to SEVEN,
+/// not to fourteen. One shape flips. The other seven fail on constructor
+/// contexts alone.
+///
+/// The per-shape table is pinned in full rather than as summary counts, so a
+/// shape moving between the two groups cannot leave the totals looking right -
+/// the decomposition rule from `a-count-grep-cannot-find-a-decomposition`.
+///
+/// POPULATION SCOPE: all four modules pooled, constructor objects only; array
+/// and string objects have no arity to vary and are excluded by construction,
+/// which is why the shape count is 36 rather than the walk's full inventory.
+#[test]
+fn the_context_separability_census() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+    if !prelude_loaded {
+        return;
+    }
+
+    const ARRAY_CONTEXT: (u8, u8, usize) = (abi::TAG_ARRAY, 0, usize::MAX);
+
+    let mut sizes: std::collections::BTreeMap<(u8, u8), std::collections::BTreeMap<u16, usize>> =
+        std::collections::BTreeMap::new();
+    let mut contexts: std::collections::BTreeMap<
+        (u8, u8),
+        std::collections::BTreeMap<(u8, u8, usize), BTreeSet<u16>>,
+    > = std::collections::BTreeMap::new();
+
+    for (_, bytes) in &modules {
+        let bytes = bytes.as_slice();
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+
+        for object in &objects {
+            if object.tag <= abi::TAG_MAX_CTOR_TAG {
+                *sizes
+                    .entry((object.tag, object.other))
+                    .or_default()
+                    .entry(object.cs_sz)
+                    .or_default() += 1;
+            }
+        }
+        for parent in &objects {
+            let slots: Vec<((u8, u8, usize), u64)> = if parent.tag <= abi::TAG_MAX_CTOR_TAG {
+                (0..usize::from(parent.other))
+                    .map(|slot| {
+                        (
+                            (parent.tag, parent.other, slot),
+                            word_at(bytes, parent.off + 8 + 8 * slot),
+                        )
+                    })
+                    .collect()
+            } else if parent.tag == abi::TAG_ARRAY {
+                (0..word_at(bytes, parent.off + 8))
+                    .map(|i| {
+                        (
+                            ARRAY_CONTEXT,
+                            word_at(bytes, parent.off + 24 + 8 * i as usize),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for (key, word) in slots {
+                let Some(child) = resolve(word).and_then(|off| at.get(&off)) else {
+                    continue;
+                };
+                if child.tag > abi::TAG_MAX_CTOR_TAG {
+                    continue;
+                }
+                contexts
+                    .entry((child.tag, child.other))
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .insert(child.cs_sz);
+            }
+        }
+    }
+
+    let multi: Vec<(u8, u8)> = sizes
+        .iter()
+        .filter(|(_, by_size)| by_size.len() > 1)
+        .map(|(shape, _)| *shape)
+        .collect();
+    let objects_in_multi: usize = multi
+        .iter()
+        .map(|shape| sizes[shape].values().sum::<usize>())
+        .sum();
+    assert_eq!(
+        (sizes.len(), multi.len(), objects_in_multi),
+        (36, 14, 46334),
+        "constructor shapes, those storing more than one size, and the objects \
+         they hold between them"
+    );
+
+    // The whole table, so a shape cannot move group unnoticed.
+    let table: Vec<(u8, u8, usize, Vec<(u16, usize)>, usize, usize)> = multi
+        .iter()
+        .map(|shape| {
+            let by_size = &sizes[shape];
+            let ctx = &contexts[shape];
+            (
+                shape.0,
+                shape.1,
+                by_size.values().sum::<usize>(),
+                by_size.iter().map(|(k, v)| (*k, *v)).collect(),
+                ctx.len(),
+                ctx.values().filter(|seen| seen.len() > 1).count(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        table,
+        vec![
+            (0, 1, 1350, vec![(16, 958), (24, 392)], 19, 2),
+            (0, 2, 6506, vec![(24, 6350), (32, 156)], 8, 2),
+            (0, 3, 5553, vec![(32, 2730), (40, 2823)], 12, 2),
+            (0, 4, 4747, vec![(40, 1218), (48, 3529)], 8, 1),
+            (0, 5, 784, vec![(48, 461), (56, 323)], 8, 0),
+            (0, 6, 161, vec![(56, 34), (64, 127)], 2, 0),
+            (0, 7, 152, vec![(64, 23), (72, 129)], 2, 0),
+            (1, 1, 1912, vec![(16, 1863), (24, 49)], 24, 2),
+            (1, 2, 7591, vec![(24, 2564), (32, 5027)], 40, 6),
+            (2, 2, 1955, vec![(24, 65), (32, 1890)], 19, 1),
+            (3, 1, 52, vec![(16, 5), (24, 47)], 9, 0),
+            (4, 1, 122, vec![(16, 106), (24, 16)], 11, 0),
+            (4, 2, 2537, vec![(24, 231), (32, 2306)], 20, 0),
+            (7, 3, 12912, vec![(40, 38), (48, 12874)], 13, 1),
+        ],
+        "tag, arity, objects, sizes, arrival contexts, and contexts reaching \
+         BOTH sizes - pinned per shape rather than as group totals, so a shape \
+         changing group cannot leave the counts looking right"
+    );
+
+    let separable = table.iter().filter(|row| row.5 == 0).count();
+    assert_eq!(
+        (separable, table.len() - separable),
+        (6, 8),
+        "SIX of the fourteen are separated by their arrival context and EIGHT \
+         are not. `5efac560` measured one of the six and framed it as the \
+         positive case; separation is not rare. The finding is the other half - \
+         eight are not separable, and `(1, 2)`, the shape that blocks \
+         `list_ptrs`, is the worst with six mixed contexts against its nearest \
+         rivals' two"
+    );
+
+    // The tempting story about arrays, measured instead of assumed.
+    let array_offender = multi
+        .iter()
+        .filter(|shape| {
+            contexts[*shape]
+                .get(&ARRAY_CONTEXT)
+                .is_some_and(|seen| seen.len() > 1)
+        })
+        .count();
+    let array_sole = multi
+        .iter()
+        .filter(|shape| {
+            let mixed: Vec<&(u8, u8, usize)> = contexts[*shape]
+                .iter()
+                .filter(|(_, seen)| seen.len() > 1)
+                .map(|(key, _)| key)
+                .collect();
+            mixed == vec![&ARRAY_CONTEXT]
+        })
+        .count();
+    let separable_without_arrays = multi
+        .iter()
+        .filter(|shape| {
+            contexts[*shape]
+                .iter()
+                .filter(|(key, _)| **key != ARRAY_CONTEXT)
+                .all(|(_, seen)| seen.len() == 1)
+        })
+        .count();
+    assert_eq!(
+        (array_offender, array_sole, separable_without_arrays),
+        (5, 1, 7),
+        "an array arrival cannot fix a size - arrays are homogeneous in type, \
+         not in layout - so `arrays spoil it` looks like it should explain the \
+         eight. It does not: the array context is an offender for five shapes \
+         but the SOLE offender for one, and ignoring array arrivals moves the \
+         separable count from 6 to SEVEN rather than to fourteen. Seven shapes \
+         fail on constructor contexts alone"
+    );
+}
+
 /// The `(4, 1)` layouts ARE separated by context - the positive case.
 ///
 /// `ed5d41d5` pinned `(4, 1)` at 122 objects across two stored sizes and used
@@ -11728,8 +11964,15 @@ fn the_other_references_to_that_name() {
 /// one type. It left the obvious question unasked - if shape does not separate
 /// them, does anything?
 ///
-/// It does, and this is the first place in this bead where a discriminator
-/// works. TWO of them do, independently:
+/// It does, and this is the first place in this bead where I MEASURED a
+/// discriminator working. TWO do, independently.
+///
+/// It is not, however, an unusual shape:
+/// `the_context_separability_census` asks this of all fourteen multi-size
+/// shapes and finds SIX separable. This cell's framing invites the reading that
+/// separation is rare and `(4, 1)` special; it is neither. What is unusual is
+/// the other direction - eight shapes are NOT separable, and `(1, 2)` is the
+/// worst of them.
 ///
 ///   by the CHILD: size 16 always holds `(0, 4, 40)` or `(0, 1, 24)` in slot 0;
 ///   size 24 always holds `(1, 2, 32)`. The two sets are disjoint.
