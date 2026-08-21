@@ -217,6 +217,10 @@ the toolchain would report a perfect facade:
     owning-module distribution to `_private.*` declaration rows. Private names
     cannot disappear from the generated surface behind a summary-only claim.
 
+  * A MANIFEST-PRINTER JOIN binds explicit and maximal-explicit printer counts
+    to the declaration rows that record those rendering modes. Type-signature
+    provenance cannot be overstated by a stale printer summary.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1450,6 +1454,24 @@ def main():
             "REFUSE: facade manifest private-name join disagrees with its "
             f"declaration rows ({json.dumps(private_name_join, sort_keys=True)})"
         )
+    printer_counts = Counter(row.get("printer") for row in manifest_rows)
+    printer_join = {
+        "explicit_rows": printer_counts["pp.explicit"],
+        "maxexplicit_rows": printer_counts["pp.maxexplicit"],
+        "summary_explicit_printer": manifest_summary.get("explicit_printer"),
+        "summary_maxexplicit_printer": manifest_summary.get("maxexplicit_printer"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (printer_join["summary_explicit_printer"],
+                          printer_join["summary_maxexplicit_printer"]))
+            or printer_join["maxexplicit_rows"]
+            != printer_join["summary_maxexplicit_printer"]
+            or printer_join["explicit_rows"] + printer_join["maxexplicit_rows"]
+            != printer_join["summary_explicit_printer"]):
+        raise SystemExit(
+            "REFUSE: facade manifest printer join disagrees with its declaration "
+            f"rows ({json.dumps(printer_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1630,6 +1652,7 @@ def main():
         "manifest_init_substrate_join": init_substrate_join,
         "manifest_instance_attribute_join": instance_attribute_join,
         "manifest_private_name_join": private_name_join,
+        "manifest_printer_join": printer_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
