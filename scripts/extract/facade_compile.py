@@ -3271,6 +3271,27 @@ def main():
             "REFUSE: facade manifest emission-verification count must exceed "
             f"kernel-special population ({json.dumps(emission_kernel_special_inequality_join, sort_keys=True)})"
         )
+    emission_projection_inequality_join = {
+        "summary_emission_verified": manifest_summary.get("emission_verified"),
+        "summary_projection_types_checked": manifest_summary.get(
+            "projection_types_checked"
+        ),
+    }
+    if (not isinstance(emission_projection_inequality_join[
+            "summary_emission_verified"], int)
+            or isinstance(emission_projection_inequality_join[
+                "summary_emission_verified"], bool)
+            or not isinstance(emission_projection_inequality_join[
+                "summary_projection_types_checked"], int)
+            or isinstance(emission_projection_inequality_join[
+                "summary_projection_types_checked"], bool)
+            or emission_projection_inequality_join["summary_emission_verified"]
+            <= emission_projection_inequality_join[
+                "summary_projection_types_checked"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emission-verification count must exceed "
+            f"projection-type count ({json.dumps(emission_projection_inequality_join, sort_keys=True)})"
+        )
     closure_rounds_pin_join = {
         "summary_closure_rounds": manifest_summary.get("closure_rounds"),
         "pinned_closure_rounds": 28,
@@ -5373,6 +5394,9 @@ def main():
         ),
         "manifest_emission_kernel_special_inequality_join": (
             emission_kernel_special_inequality_join
+        ),
+        "manifest_emission_projection_inequality_join": (
+            emission_projection_inequality_join
         ),
         "manifest_closure_rounds_pin_join": closure_rounds_pin_join,
         "manifest_cycle_residue_pin_join": cycle_residue_pin_join,
