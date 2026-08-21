@@ -402,6 +402,28 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         [1, 1],
         "both check-olean JSON render paths emit the logical-root pair",
     );
+    assert_eq!(
+        [
+            cli_source_lines
+                .iter()
+                .filter(|line| {
+                    line.trim()
+                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
+                })
+                .count(),
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},","##
+                        && lines[1].trim()
+                            == r##""\"checker\":{{\"admissions\":{},\"finalSchema\":{},","##
+                })
+                .count(),
+        ],
+        [3, 1],
+        "the third logical-root pair is the source-run checker template",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
