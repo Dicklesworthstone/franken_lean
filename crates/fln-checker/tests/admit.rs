@@ -2638,6 +2638,21 @@ fn kr600_803_witness_fixture_pins_iota_rule_constructor_and_fields() {
 }
 
 #[test]
+fn kr600_803_witness_fixture_pins_iota_rhs_closure() {
+    let entries = dependent_field_inductive_entries();
+    let rule = &entries[2]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata")
+        .rules()[0];
+    let facts = match inspect(rule.rhs(), TermBudget::unlimited()) {
+        TermOutcome::Complete(facts) => facts,
+        other => panic!("fixture iota inspection must complete: {other:?}"),
+    };
+    assert_eq!(facts.external_bound_span, 0);
+}
+
+#[test]
 fn kr600_803_direct_self_recursion_is_reconstructed_independently() {
     let entries = nat_entries();
     let verdict = admit_inductive(
