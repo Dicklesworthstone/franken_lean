@@ -8798,6 +8798,10 @@ fn every_non_answer_outcome_yields_a_legal_family_token() {
 /// **What each refusal protects.** A path outside the root would yield a module
 /// name for a file the corpus does not contain. A `..` component would yield a
 /// name that reads as ordinary while pointing above the tree being inventoried.
+/// That one gets two paths as well: one whose `..` is its first component, which
+/// any check refuses, and one that begins with an ordinary name and climbs
+/// afterwards, which only a check over EVERY component refuses -- the second
+/// would otherwise be named `A.up.Thing`.
 /// A root with nothing below it would yield the empty name, which would collide
 /// with any other empty name and take the injectivity rule down with it. All
 /// three produce a plausible-looking module name rather than an error, which is
@@ -8870,6 +8874,54 @@ fn the_module_projection_refuses_a_path_it_cannot_honestly_name() {
         reason.contains("non-normal"),
         "`non-normal` is the only word separating this from the empty-component \
          refusal, which shares `module path component in`: {reason}"
+    );
+
+    // A NON-NORMAL COMPONENT THAT IS NOT THE FIRST ONE. The relative path above
+    // begins with `..`, so a check written as "is the first component ordinary"
+    // -- looking at where the path starts rather than at what it contains --
+    // refuses it exactly as a check over every component does. The path below
+    // starts with an ordinary name and climbs afterwards.
+    //
+    // What the first-component version would mint is the point, and it was
+    // measured: it keeps the Normal components and drops the rest, naming the
+    // module `A.up.Thing` -- a name claiming `up` sits under `A`, for a file that
+    // actually resolves to `/corpus/up`. Plausible, wrong, and attached to the
+    // wrong library.
+    const DEEP: &str = "/corpus/lib/A/../../up/Thing.olean";
+    let deep_relative = Path::new(DEEP)
+        .strip_prefix(root)
+        .expect("the path is lexically below the root; that is why the component check matters");
+    assert!(
+        matches!(
+            deep_relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        ),
+        "the relative path must START with an ordinary component, or a first-component check \
+         refuses it too and this cell distinguishes nothing"
+    );
+    assert!(
+        deep_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_))),
+        "and it must still climb somewhere, or there is nothing to refuse"
+    );
+    let shallow_relative = Path::new("/corpus/lib/../up/Thing.olean")
+        .strip_prefix(root)
+        .expect("the decoy is lexically below the root too");
+    assert!(
+        !matches!(
+            shallow_relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        ),
+        "the decoy above must begin with the offending component; that is why it cannot tell a \
+         first-component check from a whole-path one"
+    );
+    let deep = module_name_from_path(root, Path::new(DEEP))
+        .expect_err("a `..` anywhere in the relative path cannot be projected");
+    assert!(
+        deep.contains("non-normal"),
+        "climbing from the middle must be refused by the same rule as climbing from the start: \
+         {deep}"
     );
 
     // NOTHING BELOW THE ROOT AT ALL: the relative path is empty, so there are no
