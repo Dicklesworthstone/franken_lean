@@ -41,11 +41,11 @@ use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{
-    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, InductiveVal, RecursorRule, RecursorVal,
-    TheoremVal,
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
+    InductiveVal, OpaqueVal, RecursorRule, RecursorVal, ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::Environment;
-use fln_kernel::verdict::{Budget, Verdict};
+use fln_kernel::verdict::{Budget, RejectClass, Verdict};
 use fln_kernel::{Declaration, InductiveBlock, check, check_def_eq};
 
 fn n(s: &str) -> Name {
@@ -1065,5 +1065,228 @@ fn a_theorem_major_premise_reduces_its_recursor() {
          unfolds theorems as the pin's `has_value()` does. Neither proof \
          irrelevance nor K conversion can close this: W.sup has a field so `k` \
          is false, and both sides here are at the DATA type A. Got {verdict:?}"
+    );
+}
+
+/// Shared setup for the delta-gate cells: the admitted `W` block plus
+/// `A : Sort 1`, `a : A` and `f : A → W A`, all at `u := 1` so the recursor's
+/// motive lands in `Sort 1` and its result is DATA rather than a proof.
+fn w_delta_env() -> Environment {
+    let block = w_block(&n("u"), &n("u_1"));
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Inductive(block.clone()),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the W block must admit before anything reduces against it: {verdict:?}"
+    );
+    let mut env = Environment::new();
+    for t in &block.types {
+        env = env
+            .add_decl(ConstantInfo::Induct(t.clone()))
+            .expect("accepted inductive adds");
+    }
+    for c in &block.ctors {
+        env = env
+            .add_decl(ConstantInfo::Ctor(c.clone()))
+            .expect("accepted constructor adds");
+    }
+    for r in &block.recursors {
+        env = env
+            .add_decl(ConstantInfo::Rec(r.clone()))
+            .expect("accepted recursor adds");
+    }
+    for (name, type_) in [
+        ("A", sort(Level::one())),
+        ("a", w_carrier()),
+        ("f", forall("_x", w_carrier(), w_of_a())),
+    ] {
+        let decl = Declaration::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            is_unsafe: false,
+        });
+        let verdict = check(&env, &decl, Budget::DEFAULT);
+        assert!(
+            matches!(
+                verdict,
+                fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+            ),
+            "setup axiom {name} must admit: {verdict:?}"
+        );
+        let Declaration::Axiom(v) = decl else {
+            unreachable!("just constructed an axiom")
+        };
+        env = env
+            .add_decl(ConstantInfo::Axiom(v))
+            .expect("accepted axiom adds");
+    }
+    env
+}
+
+fn w_carrier() -> Expr {
+    Expr::const_(n("A"), vec![])
+}
+
+fn w_of_a() -> Expr {
+    Expr::app(Expr::const_(n("W"), vec![Level::one()]), w_carrier())
+}
+
+/// `W.sup.{1} A f` — the constructor application every major below carries.
+/// Identical in all three cells, so the ConstantInfo KIND is the only variable.
+fn w_sup_proof() -> Expr {
+    Expr::app(
+        Expr::app(
+            Expr::const_(nn("W", "sup"), vec![Level::one()]),
+            w_carrier(),
+        ),
+        Expr::const_(n("f"), vec![]),
+    )
+}
+
+/// `W.rec.{1,1} A (fun _ => A) (fun f ih => a) <major>`, which reduces to `a`
+/// exactly when the major reduces to a `W.sup` application.
+fn w_rec_applied(major: Expr) -> Expr {
+    let motive = lam("t", w_of_a(), w_carrier());
+    let minor = lam(
+        "f",
+        forall("_x", w_carrier(), w_of_a()),
+        lam(
+            "ih",
+            forall("_x", w_carrier(), w_carrier()),
+            Expr::const_(n("a"), vec![]),
+        ),
+    );
+    Expr::app(
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(nn("W", "rec"), vec![Level::one(), Level::one()]),
+                    w_carrier(),
+                ),
+                motive,
+            ),
+            minor,
+        ),
+        major,
+    )
+}
+
+/// The delta gate must admit theorems and REFUSE opaques, and this is the cell
+/// that keeps the second half true.
+///
+/// `e7cdcbbc` widened `unfold_definition` from `Defn` to `Defn | Thm` so a
+/// theorem major would reduce. The pin's gate is `constant_info::has_value()`,
+/// `is_theorem() || is_definition() || (allow_opaque && is_opaque())`, and
+/// `is_delta` takes the DEFAULT `allow_opaque = false` — so widening to
+/// theorems is faithful and widening to opaques would not be. Nothing about the
+/// theorem repair makes the opaque arm fail loudly if someone later reaches for
+/// `Defn | Thm | Opaque`, or threads `allow_opaque = true` through: opaques
+/// would simply start reducing, and every existing test would stay green.
+///
+/// The two cells move exactly ONE variable. Same carrier, same axioms, same
+/// `W.sup.{1} A f` value, same recursor application — only the ConstantInfo
+/// kind of the major differs. A definition major reduces; an opaque major must
+/// not, and must be refused as `NotDefEq` rather than by some unrelated
+/// rejection that would make this pass for the wrong reason.
+#[test]
+fn an_opaque_major_premise_is_not_unfolded_while_a_definition_major_is() {
+    let env = w_delta_env();
+
+    // POSITIVE CONTROL. Without it, the negative cell below is satisfied by any
+    // environment where the recursor cannot fire for some unrelated reason —
+    // a broken carrier, a mistyped minor — and would prove nothing about the
+    // gate at all.
+    let definition_major = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: n("wdef"),
+            level_params: vec![],
+            type_: w_of_a(),
+        },
+        value: w_sup_proof(),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![n("wdef")],
+    });
+    let verdict = check(&env, &definition_major, Budget::DEFAULT);
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the definition carrying the proof must admit: {verdict:?}"
+    );
+    let Declaration::Defn(defn) = definition_major else {
+        unreachable!("just constructed a definition")
+    };
+    let definition_env = env
+        .add_decl(ConstantInfo::Defn(defn))
+        .expect("accepted definition adds");
+    let verdict = check_def_eq(
+        &definition_env,
+        &[],
+        &w_rec_applied(Expr::const_(n("wdef"), vec![])),
+        &Expr::const_(n("a"), vec![]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "a DEFINITION major must still reduce, or the opaque cell below is \
+         vacuous: {verdict:?}"
+    );
+
+    // THE CELL. Same value, same type, declared opaque instead.
+    let opaque_major = Declaration::Opaque(OpaqueVal {
+        base: ConstantVal {
+            name: n("wopq"),
+            level_params: vec![],
+            type_: w_of_a(),
+        },
+        value: w_sup_proof(),
+        is_unsafe: false,
+        all: vec![n("wopq")],
+    });
+    let verdict = check(&env, &opaque_major, Budget::DEFAULT);
+    assert!(
+        matches!(
+            verdict,
+            fln_core::outcome::Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "the opaque carrying the proof must admit: {verdict:?}"
+    );
+    let Declaration::Opaque(opq) = opaque_major else {
+        unreachable!("just constructed an opaque")
+    };
+    let opaque_env = env
+        .add_decl(ConstantInfo::Opaque(opq))
+        .expect("accepted opaque adds");
+    let verdict = check_def_eq(
+        &opaque_env,
+        &[],
+        &w_rec_applied(Expr::const_(n("wopq"), vec![])),
+        &Expr::const_(n("a"), vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        match &verdict {
+            fln_core::outcome::Outcome::Complete(Verdict::Rejected { class, .. }) => Some(*class),
+            _ => None,
+        },
+        Some(RejectClass::NotDefEq),
+        "an OPAQUE major must stay stuck: the pin's is_delta passes \
+         allow_opaque = false, so `Defn | Thm` is the whole gate. If this cell \
+         ever goes green by reducing, the delta gate has been widened past the \
+         pin. Got {verdict:?}"
     );
 }
