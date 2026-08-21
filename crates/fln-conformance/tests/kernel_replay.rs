@@ -17133,7 +17133,15 @@ fn the_thread_matrix_claim_is_scoped_wherever_it_appears() {
                     );
                 }
             }
-            if !line.contains("{1, 8, 32}") {
+            // THE SAME MATCHER THE DERIVED SCOPE USES. This loop tested the
+            // literal `{1, 8, 32}` while the scope beside it stripped
+            // whitespace, so the two paths recognised different claims: a
+            // scanned document could have spelled it `{1,8,32}` and stated it
+            // without a scope, exactly as the plan's PG-5 gate row does, and
+            // this loop would have walked past it. Measured at this commit,
+            // neither scanned document uses a variant -- so nothing was hidden
+            // here yet, and the swap changes no count today.
+            if !states_thread_matrix_claim(line) {
                 continue;
             }
             checked += 1;
