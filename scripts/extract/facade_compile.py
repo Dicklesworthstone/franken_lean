@@ -187,6 +187,10 @@ the toolchain would report a perfect facade:
     `emitted=true`. The summary may not claim pin-verified emission for rows
     that are absent from its own row set.
 
+  * A MANIFEST-EMITTED-NAME JOIN requires every emitted row to name a distinct
+    declaration and binds the manifest's distinct-emission count to that set.
+    Duplicate rows may not impersonate distinct coverage.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1264,6 +1268,27 @@ def main():
             f"(rows={emitted_row_join['emitted_declaration_rows']}, "
             f"summary={emission_verification['declarations_emitted']})"
         )
+    emitted_names = {
+        row.get("name") for row in manifest_rows if row.get("emitted") is True
+    }
+    emitted_name_join = {
+        "emitted_distinct_names": len(emitted_names),
+        "summary_emitted_distinct": manifest_summary.get(
+            "declarations_emitted_distinct"
+        ),
+    }
+    if (not isinstance(emitted_name_join["summary_emitted_distinct"], int)
+            or isinstance(emitted_name_join["summary_emitted_distinct"], bool)
+            or emitted_name_join["summary_emitted_distinct"] < 0
+            or emitted_name_join["emitted_distinct_names"]
+            != emitted_row_join["emitted_declaration_rows"]
+            or emitted_name_join["summary_emitted_distinct"]
+            != emitted_name_join["emitted_distinct_names"]):
+        raise SystemExit(
+            "REFUSE: facade manifest emitted-name join failed "
+            f"({json.dumps(emitted_name_join, sort_keys=True)}, "
+            f"rows={emitted_row_join['emitted_declaration_rows']})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1437,6 +1462,7 @@ def main():
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
         "manifest_emitted_row_join": emitted_row_join,
+        "manifest_emitted_name_join": emitted_name_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
