@@ -2506,6 +2506,115 @@ mod tests {
         .bytes
     }
 
+    /// A `DataValue.ofBool` claiming a pointer field is refused.
+    ///
+    /// `ofBool` carries a single scalar byte and NO pointers, so the decoder
+    /// reads that byte at a fixed `off + 8`. A claimed pointer field would put
+    /// a whole word where the byte is, and the value read as the flag would be
+    /// the low byte of a pointer — a plausible 0 or 1 either way, so the fault
+    /// would not announce itself.
+    ///
+    /// SHADOWING CHECKED. `decode_data_value` has no size bind and its scalar
+    /// guard passes (the value is a heap object, asserted below). The plant
+    /// leaves the enclosing pair, its list cell and the `Expr.mdata` object
+    /// untouched, so the KVMap pair rule (27f2ce93), the list rules and the
+    /// Expr rules cannot fire; all three headers are re-asserted afterwards.
+    #[test]
+    fn a_data_value_of_bool_claiming_a_pointer_field_is_refused() {
+        let mut bytes = mdata_expr_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified mdata fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let mdata_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("mdata expression");
+        let mdata_header = view.obj_header(mdata_off).expect("mdata header");
+
+        let cell_off = view
+            .deref(view.read_u64(mdata_off + 8).expect("kvmap slot"))
+            .expect("cons cell");
+        let cell_header = view.obj_header(cell_off).expect("cons header");
+        let pair_off = view
+            .deref(view.read_u64(cell_off + 8).expect("head pointer"))
+            .expect("pair object");
+        let pair_header = view.obj_header(pair_off).expect("pair header");
+        assert_eq!(pair_header.1, 2, "key and value");
+
+        // The pair's second field is the DataValue.
+        let value_ptr = view.read_u64(pair_off + 16).expect("value pointer");
+        assert_eq!(
+            value_ptr & 1,
+            0,
+            "ofBool has a scalar field, so it is still a heap object"
+        );
+        let value_off = view.deref(value_ptr).expect("DataValue object");
+        let (tag, other, cs_sz) = view.obj_header(value_off).expect("DataValue header");
+        assert_eq!(tag, 1, "DataValue.ofBool");
+        assert_eq!(other, 0, "which carries no pointer fields");
+        assert_eq!(
+            view.read_bytes_at(value_off + 8, 1).expect("flag byte")[0],
+            1,
+            "the fixture's flag is true, read from the byte the rule protects"
+        );
+
+        // Claim one pointer field where the constructor has none.
+        let header = view.read_u64(value_off).expect("header word");
+        let planted = (header & !0x00ff_0000_0000_0000) | (1_u64 << 48);
+        bytes[value_off as usize..value_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        assert_eq!(
+            view.obj_header(value_off).expect("value after plant"),
+            (1, 1, cs_sz),
+            "only the arity moved"
+        );
+        assert_eq!(
+            view.obj_header(pair_off).expect("pair after plant"),
+            pair_header,
+            "the pair is untouched, so the KVMap rule cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(cell_off).expect("cell after plant"),
+            cell_header,
+            "the list cell is untouched, so the list rules cannot fire"
+        );
+        assert_eq!(
+            view.obj_header(mdata_off).expect("mdata after plant"),
+            mdata_header,
+            "and the enclosing expression is untouched"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("an ofBool claiming a pointer field must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "DataValue.ofBool arity",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     /// A `KVMap` entry that is not a two-field pair is refused.
     ///
     /// This completes `KVMap`'s own rule, as the last three waves completed
