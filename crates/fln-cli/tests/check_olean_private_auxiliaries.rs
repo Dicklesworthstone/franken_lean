@@ -486,6 +486,30 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         [1, 1],
         "both check-olean JSON render paths keep extension status beside companion loading",
     );
+    assert_eq!(
+        [
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,","##
+                        && lines[1].trim()
+                            == r##""\"scope\":\"decoded-declarations\",\"artifactBytes\":{},","##
+                })
+                .count(),
+            cli_source_lines
+                .windows(2)
+                .filter(|lines| {
+                    lines[0].trim()
+                        == r##""{{\"schema\":{},\"outcome\":\"complete\",\"authority\":true,","##
+                        && lines[1].trim()
+                            == r##""\"scope\":\"closed-module-set-declarations\",\"artifactBytes\":{},","##
+                })
+                .count(),
+        ],
+        [1, 1],
+        "both check-olean JSON render paths keep the complete authority header beside scope",
+    );
 
     let json = &report.stdout;
     let g1_satisfied = json_bool_field(json, "g1Satisfied");
