@@ -208,6 +208,9 @@ open Lean in
         o4.setBool `pp.fieldNotation false
       let fmtm <- Meta.MetaM.run' (withOptions maxOpts (Meta.ppExpr info.type))
       let inst <- Meta.isInstance n
+      match (Meta.instanceExtension.getState env).instanceNames.find? n with
+      | some ie => IO.println s!"PRIO\t{n}\t{ie.priority}"
+      | none => pure ()
       let redStatus <- getReducibilityStatus n
       let red := match redStatus with
         | ReducibilityStatus.reducible => "reducible"
@@ -384,6 +387,7 @@ def probe(lean, env, work, names):
     safety_status = {}
     module_of = {}
     res_head = {}
+    priorities = {}
     structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     struct_fields = {}
     current = None
@@ -407,6 +411,10 @@ def probe(lean, env, work, names):
         elif line.startswith("SAFE\t"):
             _, name, status = line.split("\t", 2)
             safety_status[name] = status.strip()
+            current = None
+        elif line.startswith("PRIO\t"):
+            _, name, prio = line.split("\t", 2)
+            priorities[name] = int(prio.strip())
             current = None
         elif line.startswith("RESHEAD\t"):
             _, name, head = line.split("\t", 2)
@@ -450,7 +458,7 @@ def probe(lean, env, work, names):
     return (types, typesx, typesm, levels, insts, deps, missing,
             structs, {k: v for k, v in binders.items()},
             {k: v for k, v in pbinders.items()}, reducibility, safety_status,
-            module_of, struct_fields, res_head)
+            module_of, struct_fields, res_head, priorities)
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
@@ -840,6 +848,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     pin_module = {}
     pin_fields = {}
     pin_res_head = {}
+    pin_priority = {}
     known, missing, init_provided = set(), [], set()
     # Names this function INVENTED (a structure's field projection, derived as
     # `C.field`). A derived name the pin does not have is not a missing type: it
@@ -858,7 +867,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
         (t, tx, tm, lv, ins, dp, ms, st, bd, pb,
-         rd, sfy, mod, flds, rh) = probe(lean, env, work, frontier)
+         rd, sfy, mod, flds, rh, prio) = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); typesm.update(tm); levels.update(lv)
         insts.update(ins); deps.update(dp)
         structs.update(st); binders.update(bd); pbinders.update(pb)
@@ -867,6 +876,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         pin_module.update(mod)
         pin_fields.update(flds)
         pin_res_head.update(rh)
+        pin_priority.update(prio)
         for m in ms:
             if m in derived:
                 absent_projections.add(m)
@@ -898,7 +908,8 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
         frontier = nxt
     return (types, typesx, typesm, levels, insts, deps, missing, init_provided,
             rounds, structs, binders, absent_projections, pbinders,
-            pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head)
+            pin_reducibility, pin_safety, pin_module, pin_fields, pin_res_head,
+            pin_priority)
 
 
 def order(names, deps):
@@ -1097,9 +1108,27 @@ def structural_refusal(name, st, bs):
     return None
 
 
+DEFAULT_INSTANCE_PRIORITY = 1000
+
+
+def instance_prio(name, priorities):
+    """Render the priority suffix for an `attribute [instance ...]`.
+
+    An instance's PRIORITY decides which of several candidates resolution picks.
+    Registering every row at Lean's default silently re-ranks the Reference's
+    instances, and nothing downstream would show it: resolution simply succeeds
+    with a different instance. The pin's own number is used, and the suffix is
+    omitted where it already is the default so the artifact stays readable.
+    """
+    prio = priorities.get(name)
+    if prio is None or prio == DEFAULT_INSTANCE_PRIORITY:
+        return ""
+    return f" {prio}"
+
+
 def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
            structural, structs, binders, deps, pbinders, transparent,
-           value_explicit_for, companions):
+           value_explicit_for, companions, priorities):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -1166,14 +1195,16 @@ def render(tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_att
             continue
         if name in structural:
             continue
-        body.append(f"attribute [instance] {d['decl_name']}")
+        body.append(f"attribute [instance{instance_prio(name, priorities)}] "
+                    f"{d['decl_name']}")
         line_map[len(body)] = ("attr", name)
         attrs += 1
     # A parent projection of an `extends` class is an instance in the pin; the
     # structural block generates the projection but not its registration.
     for proj, owner in sorted(provided.items()):
         if proj in decl and decl[proj]["instance"] and proj not in dropped_attrs:
-            body.append(f"attribute [instance] {decl[proj]['decl_name']}")
+            body.append(f"attribute [instance{instance_prio(proj, priorities)}] "
+                        f"{decl[proj]['decl_name']}")
             line_map[len(body)] = ("attr", proj)
             attrs += 1
     for name in sorted(quarantine):
@@ -1219,7 +1250,7 @@ def main():
     (types, typesx, typesm, levels, insts, deps, missing, init_provided,
      rounds, structs, binders, absent_projections, pbinders,
      pin_reducibility, pin_safety, pin_module,
-     pin_fields, pin_res_head) = close_over_types(
+     pin_fields, pin_res_head, pin_priority) = close_over_types(
         lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
@@ -1337,7 +1368,7 @@ def main():
         if not extra:
             break
         (t2, tx2, tm2, lv2, in2, dp2, ms2, ip2, r2, st2, bd2, ap2,
-         pb2, rd2, sfy2, mod2, flds2, rh2) = close_over_types(
+         pb2, rd2, sfy2, mod2, flds2, rh2, prio2) = close_over_types(
             lean, env, work, extra, census)
         value_residue |= set(ms2)
         types.update(t2); typesx.update(tx2); typesm.update(tm2)
@@ -1348,6 +1379,7 @@ def main():
         pin_module.update(mod2)
         pin_fields.update(flds2)
         pin_res_head.update(rh2)
+        pin_priority.update(prio2)
         init_provided |= ip2; absent_projections |= ap2
         rounds += r2
 
@@ -1479,7 +1511,7 @@ def main():
             text, line_map, emitted, attr_count, provided = render(
                 tag, ordered, decl, explicit_for, maxexp_for, quarantine, dropped_attrs,
                 structural, structs, binders, deps, pbinders, transparent,
-            value_explicit_for, companions)
+            value_explicit_for, companions, pin_priority)
             candidate = args.out + ".candidate.lean"
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -2082,6 +2114,16 @@ def main():
             "becomes _private.privtest.0.Foo.bar. The price is the module count "
             "above, not a redesign of the surface.",
         "emission_verified": emission_verified,
+        "instance_priorities_probed": len(pin_priority),
+        "instance_priorities_nondefault": sorted(
+            ({"name": n, "priority": v} for n, v in pin_priority.items()
+             if v != DEFAULT_INSTANCE_PRIORITY),
+            key=lambda r: r["name"]),
+        "instance_priority_note": "instance priorities are taken from the pin's own "
+            "instance extension and reproduced in the emitted attribute. Registering "
+            "every row at Lean's default would silently re-rank the Reference's "
+            "instances, and nothing downstream would show it: resolution just "
+            "succeeds with a different instance.",
         "pin_presence_checked": presence_checked,
         "facade_only_names": expected_permissive,
         "facade_only_unexplained": unexplained_facade_only,
@@ -2203,6 +2245,9 @@ def main():
           f"structural={len(structural)} projections={len(provided)} "
           f"maxexp={len(maxexp_for)} transparent={len(transparent)} "
           f"verified={emission_verified} withdrawn={emission_withdrawn} "
+          f"prio={len(pin_priority)}"
+          f"/{sum(1 for v in pin_priority.values() if v != DEFAULT_INSTANCE_PRIORITY)}"
+          f"nondefault "
           f"presence={presence_checked}/{len(expected_permissive)}permissive "
           f"fieldsets={field_sets_checked} "
           f"projtypes={len(type_checked)} roundtrip={roundtrip_checked} "
