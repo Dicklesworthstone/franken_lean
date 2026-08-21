@@ -1572,6 +1572,51 @@ def unreproduced_family_error(decl, provided, line_map, unreproduced,
     return None
 
 
+# The scratch files this extractor writes NEXT TO its output. Named once so the
+# leak check below cannot drift from the places that create them: a guard whose
+# scope is hand-listed goes quietly out of date the first time a fourth file is
+# added beside it.
+CANDIDATE_SUFFIX = ".candidate.lean"
+VERIFY_SUFFIX = ".verify.lean"
+VERIFY2_SUFFIX = ".verify2.lean"
+SCRATCH_SUFFIXES = (CANDIDATE_SUFFIX, VERIFY_SUFFIX, VERIFY2_SUFFIX)
+
+
+def leftover_scratch_error(out):
+    """A finished run must leave none of its scratch files beside the artifact.
+
+    The candidate is not a copy of the facade, it is a MOVE: the success path
+    ends in `os.replace(candidate, args.out)`, and the verify files are removed
+    once the pin has answered. So a candidate still sitting there when the run
+    finishes means some path returned success without going through the replace,
+    and what it leaves behind is a stale, plausible-looking `.lean` next to the
+    published one -- same shape, same neighbourhood, one repair round out of date.
+
+    That path is not hypothetical. The success branch grew a `continue` when the
+    generated-constructor check landed, which demotes a block and retries WITHOUT
+    replacing; it sits one line above the replace, and a later edit that breaks
+    out there instead of continuing would leak silently. Nothing else in this run
+    would notice, because the artifact it publishes is still correct.
+
+    Returns an error string, or None.
+    """
+    leaked = []
+    for suffix in SCRATCH_SUFFIXES:
+        path = out + suffix
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        leaked.append(f"{path} ({size} bytes)")
+    if leaked:
+        return (f"the run finished but left {len(leaked)} scratch file(s) beside "
+                f"the artifact: {leaked}. The candidate is MOVED onto the output "
+                "on success, so anything still here means a path returned without "
+                "going through that move, and a stale facade is now sitting next "
+                "to the published one")
+    return None
+
+
 def kept_candidate(path):
     """Say what is ACTUALLY at the candidate path, at the moment of saying it.
 
@@ -2244,7 +2289,7 @@ def main():
             value_explicit_for, companions, pin_priority, inductive_decls,
             pin_inductives, types, ind_companions, ctor_companions,
             pin_ind_params, pin_ctor_bodies, pin_ind_result)
-            candidate = args.out + ".candidate.lean"
+            candidate = args.out + CANDIDATE_SUFFIX
             with open(candidate, "w", encoding="utf-8") as fh:
                 fh.write(text)
             proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
@@ -2608,7 +2653,7 @@ def main():
             f"noncomputable def flnty_decoy : {TYPE_DECOY_TYPE} := "
             f"@{decl[first]['decl_name']}")
         verify_map[len(verify_lines)] = ("TYPEDECOY", first)
-    verify_path = args.out + ".verify.lean"
+    verify_path = args.out + VERIFY_SUFFIX
     with open(verify_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(verify_lines) + "\n")
     proc = subprocess.run([lean, "-DmaxErrors=4000", "-Dlinter.unusedVariables=false",
@@ -2677,7 +2722,7 @@ def main():
                 f"noncomputable def flntyr_decoy : {TYPE_DECOY_TYPE} := "
                 f"@{decl[retry[0]]['decl_name']}")
             rmap[len(rlines)] = ("TYPEDECOY", retry[0])
-            rpath = args.out + ".verify2.lean"
+            rpath = args.out + VERIFY2_SUFFIX
             with open(rpath, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(rlines) + "\n")
             rproc = subprocess.run(
@@ -3330,6 +3375,10 @@ def main():
           f"private_rows={sum(private_owners.values())}"
           f"/{len(private_owners)}mods "
           f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
+
+    _leak = leftover_scratch_error(args.out)
+    if _leak:
+        raise SystemExit("REFUSE: " + _leak)
 
 
 if __name__ == "__main__":
