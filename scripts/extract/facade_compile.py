@@ -2265,6 +2265,23 @@ def main():
             "REFUSE: facade manifest withdrawn-cycle count diverges "
             f"({json.dumps(withdrawn_cycle_zero_join, sort_keys=True)})"
         )
+    verified_distinct_emission_join = {
+        "summary_emission_verified": manifest_summary.get("emission_verified"),
+        "summary_declarations_emitted_distinct": manifest_summary.get(
+            "declarations_emitted_distinct"
+        ),
+        "pinned_verified_distinct_count": 2005,
+    }
+    if (verified_distinct_emission_join["summary_emission_verified"]
+            != verified_distinct_emission_join["pinned_verified_distinct_count"]
+            or verified_distinct_emission_join[
+                "summary_declarations_emitted_distinct"]
+            != verified_distinct_emission_join[
+                "pinned_verified_distinct_count"]):
+        raise SystemExit(
+            "REFUSE: facade manifest verified-distinct count diverges "
+            f"({json.dumps(verified_distinct_emission_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3405,6 +3422,9 @@ def main():
         "manifest_emitted_value_zero_join": emitted_value_zero_join,
         "manifest_closure_withdrawn_zero_join": closure_withdrawn_zero_join,
         "manifest_withdrawn_cycle_zero_join": withdrawn_cycle_zero_join,
+        "manifest_verified_distinct_emission_join": (
+            verified_distinct_emission_join
+        ),
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
