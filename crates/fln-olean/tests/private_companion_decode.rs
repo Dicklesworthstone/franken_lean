@@ -171,6 +171,11 @@ const LIST_SIZE_TO_ARRAY_AUX_MODULE: &str = "Init/Data/Array/BasicAux";
 const LIST_TO_ARRAY_AUX_EQ_1: &str = "_private.Init.Data.Array.BasicAux.0.List.toArrayAux.eq_1";
 /// The pin's private array stores this theorem in the BasicAux module.
 const LIST_TO_ARRAY_AUX_EQ_1_MODULE: &str = "Init/Data/Array/BasicAux";
+/// The generated argument pusher for `PSigma.casesOn`.
+const PSIGMA_CASES_ON_ARG_PUSHER: &str =
+    "_private.Init.Data.Array.Basic.0.PSigma.casesOn._arg_pusher";
+/// The pin's private array stores this theorem in the Basic module.
+const PSIGMA_CASES_ON_ARG_PUSHER_MODULE: &str = "Init/Data/Array/Basic";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1151,6 +1156,34 @@ fn list_to_array_aux_equation_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {LIST_TO_ARRAY_AUX_EQ_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn psigma_cases_on_arg_pusher_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("psigma_cases_on_arg_pusher_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, PSIGMA_CASES_ON_ARG_PUSHER_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&PSIGMA_CASES_ON_ARG_PUSHER.to_owned()),
+        "the private companion of {PSIGMA_CASES_ON_ARG_PUSHER_MODULE} must retain \\
+         {PSIGMA_CASES_ON_ARG_PUSHER}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == PSIGMA_CASES_ON_ARG_PUSHER)
+        .unwrap_or_else(|| panic!("private decoder lost {PSIGMA_CASES_ON_ARG_PUSHER}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {PSIGMA_CASES_ON_ARG_PUSHER} as {} instead of Thm",
         recovered.kind_name()
     );
 }
