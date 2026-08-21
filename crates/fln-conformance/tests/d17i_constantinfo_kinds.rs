@@ -5135,3 +5135,181 @@ fn every_stored_expression_is_closed_and_carries_no_elaboration_nodes() {
          narrowing it, got {tight}"
     );
 }
+
+/// Every level a stored expression carries, through both carriers: a `Sort`'s
+/// level and a `Const`'s level arguments.
+fn stored_levels(root: &Expr) -> Vec<&fln_core::level::Level> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = vec![root];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.allocation_identity()) {
+            continue;
+        }
+        match current.node() {
+            ExprNode::Sort { level } => out.push(level),
+            ExprNode::Const { levels, .. } => out.extend(levels.iter()),
+            ExprNode::App { f, a } => {
+                stack.push(f);
+                stack.push(a);
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(binder_type);
+                stack.push(body);
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(type_);
+                stack.push(value);
+                stack.push(body);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => stack.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    out
+}
+
+/// The form a normalizing level constructor would have collapsed, or `None`.
+fn collapsible_form(level: &fln_core::level::Level) -> Option<&'static str> {
+    match level.view() {
+        LevelView::IMax(u, v) => match v.view() {
+            LevelView::Zero => Some("imax _ 0 collapses to 0"),
+            LevelView::Succ(_) => Some("imax u (succ v) collapses to max u (succ v)"),
+            _ => (u == v).then_some("imax u u collapses to u"),
+        },
+        LevelView::Max(a, b) => {
+            if matches!(a.view(), LevelView::Zero) || matches!(b.view(), LevelView::Zero) {
+                Some("max with 0 collapses to the other side")
+            } else {
+                (a == b).then_some("max u u collapses to u")
+            }
+        }
+        _ => None,
+    }
+}
+
+/// No stored level is in a form a normalizing constructor would have collapsed
+/// — the artifact-side half of this bead's own root cause.
+///
+/// The level cell above reads level parameters as NAMES and settles KR-140 and
+/// KR-971. It says nothing about level STRUCTURE, and structure is where d17i
+/// actually lives: the 228 rows were traced to `infer` minting a `Pi` sort with
+/// a dumb `imax` where the pin uses a normalizing constructor, so `imax _ 0`
+/// survived instead of collapsing to `0` and large elimination was refused.
+/// That was settled in the kernel. What was never asserted is the artifact fact
+/// that makes it a divergence at all: the pin does not STORE levels in those
+/// forms, so a path that produces one is producing something no `.olean` at the
+/// pin contains.
+///
+/// Measured over `Init/Prelude` at private level, every level reachable from
+/// every stored expression through both carriers — 35,225 level nodes: 19,096
+/// `Param`, 9,878 `Succ`, 4,323 `Zero`, 1,542 `Max`, 282 `IMax`, and ZERO
+/// `MVar`. Five collapsible forms, all absent:
+///
+///   `imax _ 0`, `imax u (succ v)`, `imax u u`
+///   `max` with a `0` on either side, `max u u`
+///
+/// What is asserted is the artifact fact, not a claim about upstream source:
+/// these forms do not occur. The normalizing constructor is the explanation for
+/// why, and the explanation is not what the cell checks.
+///
+/// The `MVar` count is the universe-level counterpart of the expression-level
+/// law in the cell above, and it is a separate carrier: an expression free of
+/// `FVar` and `MVar` can still carry a level metavariable inside a `Sort`,
+/// because levels are not `ExprNode`s.
+///
+/// Counts are floors rather than equalities. A level is reached once per
+/// distinct expression node carrying it, so the totals move with how the
+/// decoder shares subterms; the absence of a form does not.
+#[test]
+fn no_stored_level_is_in_a_form_its_smart_constructor_would_have_collapsed() {
+    const CAP: usize = 1_000_000;
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut collapsible: Vec<(String, &'static str)> = Vec::new();
+    let mut metavariables: Vec<String> = Vec::new();
+    let mut nodes = 0usize;
+
+    for info in &infos {
+        let name = info.name().to_display_string();
+        for expr in declaration_expressions(info) {
+            let mut stack: Vec<&fln_core::level::Level> = stored_levels(expr);
+            while let Some(level) = stack.pop() {
+                nodes += 1;
+                assert!(
+                    nodes < CAP,
+                    "{name}: level walk exceeded {CAP} nodes; raise the cap rather than trusting \
+                     a truncated answer"
+                );
+                if let Some(form) = collapsible_form(level) {
+                    collapsible.push((name.clone(), form));
+                }
+                let shape = match level.view() {
+                    LevelView::Zero => "Zero",
+                    LevelView::Succ(inner) => {
+                        stack.push(inner);
+                        "Succ"
+                    }
+                    LevelView::Max(a, b) => {
+                        stack.push(a);
+                        stack.push(b);
+                        "Max"
+                    }
+                    LevelView::IMax(a, b) => {
+                        stack.push(a);
+                        stack.push(b);
+                        "IMax"
+                    }
+                    LevelView::Param(_) => "Param",
+                    LevelView::MVar(_) => {
+                        metavariables.push(name.clone());
+                        "MVar"
+                    }
+                };
+                *shapes.entry(shape).or_default() += 1;
+            }
+        }
+    }
+
+    assert!(
+        collapsible.is_empty(),
+        "these stored levels are in a form a normalizing constructor collapses: {:?}",
+        &collapsible[..collapsible.len().min(8)]
+    );
+    assert!(
+        metavariables.is_empty(),
+        "a level metavariable is an elaboration-time node and no stored declaration may carry \
+         one; these do: {:?}",
+        &metavariables[..metavariables.len().min(8)]
+    );
+
+    // Anti-vacuity. Absence is only worth asserting over a population where the
+    // constructors that could produce these forms are heavily used: a walk
+    // finding no `IMax` at all would report the same empty violation list.
+    let count = |shape: &str| shapes.get(shape).copied().unwrap_or_default();
+    assert!(
+        count("IMax") > 250 && count("Max") > 1_500,
+        "both collapsible constructors must be well populated, got {shapes:?}"
+    );
+    assert!(
+        count("Param") > 19_000 && count("Succ") > 9_000 && count("Zero") > 4_000,
+        "the level population must be reached, got {shapes:?}"
+    );
+    assert_eq!(
+        shapes.keys().copied().collect::<Vec<&str>>(),
+        vec!["IMax", "Max", "Param", "Succ", "Zero"],
+        "exactly five level shapes occur at the pin, and `MVar` is not one of them"
+    );
+}
