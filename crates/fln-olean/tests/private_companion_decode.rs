@@ -272,6 +272,10 @@ const UINT16_AND_LE_LEFT_SIMP_1_1: &str =
     "_private.Init.Data.UInt.Bitwise.0.UInt16.and_le_left._simp_1_1";
 /// The pin's private unsigned-integer companion stores this theorem in Bitwise.
 const UINT16_AND_LE_LEFT_SIMP_1_1_MODULE: &str = "Init/Data/UInt/Bitwise";
+/// The private proof theorem for `Float.ofBits`.
+const FLOAT_OF_BITS_PROOF_1: &str = "_private.Init.Data.Float.0.Float.ofBits._proof_1";
+/// The pin's private floating-point companion stores this theorem in its module.
+const FLOAT_OF_BITS_PROOF_1_MODULE: &str = "Init/Data/Float";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1901,6 +1905,33 @@ fn uint16_and_le_left_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {UINT16_AND_LE_LEFT_SIMP_1_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn float_of_bits_proof_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("float_of_bits_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, FLOAT_OF_BITS_PROOF_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&FLOAT_OF_BITS_PROOF_1.to_owned()),
+        "the private companion of {FLOAT_OF_BITS_PROOF_1_MODULE} must retain {FLOAT_OF_BITS_PROOF_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == FLOAT_OF_BITS_PROOF_1)
+        .unwrap_or_else(|| panic!("private decoder lost {FLOAT_OF_BITS_PROOF_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {FLOAT_OF_BITS_PROOF_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
