@@ -1091,10 +1091,89 @@ pub fn decode_chain_constants(
     private: &OleanView<'_>,
     budget: WalkBudget,
 ) -> DResult<Vec<ConstantInfo>> {
+    Ok(decode_chain_constants_with_origin(exported, private, budget)?.constants)
+}
+
+/// Which part of a module-system chain a decoded declaration came from.
+///
+/// This is a fact recovered from the chain, NOT a guess from the name. The two
+/// are routinely different: `_private.` is Lean's mangling for a
+/// private-SCOPED declaration, and such a declaration is frequently exported.
+/// At the pin, 2,336 of the 51,506 declarations in Init's exported parts carry
+/// a `_private.` prefix, eight of them with a `.loop.` component (all in
+/// `Init.Data.AC`). Any consumer deciding provenance by prefix therefore
+/// classifies those 2,336 wrongly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstantOrigin {
+    /// Declared by the exported `.olean` part, and so also by the private one.
+    Exported,
+    /// Recovered only from the `.olean.private` companion — the population
+    /// `franken_lean-timy` is about.
+    PrivateOnly,
+}
+
+/// A complete chain's authoritative constants, with each declaration's part of
+/// origin.
+#[derive(Debug, Clone)]
+pub struct ChainConstants {
+    /// The private part's array — authoritative, and a superset of the
+    /// exported one (proven by [`verify_private_superset`]).
+    pub constants: Vec<ConstantInfo>,
+    /// `origins[i]` is the origin of `constants[i]`.
+    pub origins: Vec<ConstantOrigin>,
+}
+
+impl ChainConstants {
+    /// The declarations recovered only from the private companion, in
+    /// `constants` order.
+    pub fn private_only(&self) -> impl Iterator<Item = &ConstantInfo> {
+        self.constants
+            .iter()
+            .zip(&self.origins)
+            .filter(|(_, origin)| **origin == ConstantOrigin::PrivateOnly)
+            .map(|(info, _)| info)
+    }
+}
+
+/// Decode a complete chain and record which part each declaration came from.
+///
+/// [`decode_chain_constants`] answers "what does this chain declare". This also
+/// answers "which of those did the exported part NOT declare" — the question
+/// `franken_lean-timy` turns on, and the one a caller cannot answer from the
+/// returned names alone. Before this, a consumer wanting to distinguish
+/// companion-recovered declarations from exported ones had only the `_private.`
+/// name prefix to go on, which is a scoping convention rather than a statement
+/// about which part carries the declaration; see [`ConstantOrigin`] for how far
+/// apart the two are at the pin.
+pub fn decode_chain_constants_with_origin(
+    exported: &OleanView<'_>,
+    private: &OleanView<'_>,
+    budget: WalkBudget,
+) -> DResult<ChainConstants> {
     let exported_constants = DeclDecoder::new(exported, budget).decode_module_constants()?;
     let private_constants = DeclDecoder::new(private, budget).decode_module_constants()?;
     verify_private_superset(&exported_constants, &private_constants)?;
-    Ok(private_constants)
+
+    let exported_names: HashSet<&Name> =
+        exported_constants.iter().map(ConstantInfo::name).collect();
+    let mut origins = Vec::new();
+    origins
+        .try_reserve_exact(private_constants.len())
+        .map_err(|_| DeclError::Budget {
+            visited: private_constants.len() as u64,
+        })?;
+    for info in &private_constants {
+        origins.push(if exported_names.contains(info.name()) {
+            ConstantOrigin::Exported
+        } else {
+            ConstantOrigin::PrivateOnly
+        });
+    }
+
+    Ok(ChainConstants {
+        constants: private_constants,
+        origins,
+    })
 }
 
 /// Prove that `private` names every declaration `exported` names.

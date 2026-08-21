@@ -33,7 +33,10 @@ use fln_core::expr::Expr;
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
-use fln_olean::decl::{DeclDecoder, DeclError, decode_chain_constants};
+use fln_olean::decl::{
+    ConstantOrigin, DeclDecoder, DeclError, decode_chain_constants,
+    decode_chain_constants_with_origin,
+};
 use fln_olean::region::{OleanView, WalkBudget};
 use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
 
@@ -425,7 +428,9 @@ mod family {
         let parts = components(name);
         parts.len() >= 5
             && parts.last() == Some(&"_f")
-            && parts.windows(3).any(|window| window == ["Array", "shrink", "loop"])
+            && parts
+                .windows(3)
+                .any(|window| window == ["Array", "shrink", "loop"])
     }
 }
 
@@ -675,9 +680,8 @@ fn private_auxiliary_recovery_never_weakens_a_private_only_constant_to_an_axiom(
 
 #[test]
 fn unary_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
-    let lib = lib_or_skip!(
-        "unary_private_auxiliary_requires_the_companion_and_keeps_its_real_kind"
-    );
+    let lib =
+        lib_or_skip!("unary_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
 
     // Keep `_unary` as an independently named regression cell. The generic
     // family loop above proves breadth; this cell makes a failure's RED side
@@ -725,9 +729,8 @@ fn unary_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 
 #[test]
 fn unsafe_rec_private_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
-    let lib = lib_or_skip!(
-        "unsafe_rec_private_auxiliary_requires_the_companion_and_keeps_its_real_kind"
-    );
+    let lib =
+        lib_or_skip!("unsafe_rec_private_auxiliary_requires_the_companion_and_keeps_its_real_kind");
 
     // `_unsafe_rec` is its own compiler-emitted recursion shape. Select a real
     // private-only witness from the pin so the RED side cannot be satisfied by
@@ -745,9 +748,8 @@ fn unsafe_rec_private_auxiliary_requires_the_companion_and_keeps_its_real_kind()
         .expect("the pinned Init private companions contain a private-only _unsafe_rec witness");
     let chain = chain_bytes(&lib, &relative);
 
-    let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
-        panic!("_unsafe_rec {name}: parse exported {relative}: {error}")
-    });
+    let exported_view = OleanView::parse(&chain.exported)
+        .unwrap_or_else(|error| panic!("_unsafe_rec {name}: parse exported {relative}: {error}"));
     let exported_constants = DeclDecoder::new(&exported_view, WalkBudget::default())
         .decode_module_constants()
         .unwrap_or_else(|error| panic!("_unsafe_rec {name}: decode exported {relative}: {error}"));
@@ -824,9 +826,7 @@ fn private_f_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
 
 #[test]
 fn loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
-    let lib = lib_or_skip!(
-        "loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind"
-    );
+    let lib = lib_or_skip!("loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind");
 
     // `.loop._proof_1` combines the recursion and proof-helper shapes; testing
     // it separately prevents either broad predicate from masking a missing
@@ -866,14 +866,10 @@ fn loop_proof_1_auxiliary_requires_the_companion_and_keeps_its_real_kind() {
             });
     let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
         .decode_module_constants()
-        .unwrap_or_else(|error| {
-            panic!(".loop._proof_1 {name}: decode private {relative}: {error}")
-        })
+        .unwrap_or_else(|error| panic!(".loop._proof_1 {name}: decode private {relative}: {error}"))
         .into_iter()
         .find(|info| info.name().to_display_string() == name)
-        .unwrap_or_else(|| {
-            panic!(".loop._proof_1 {name}: private decoder lost it in {relative}")
-        });
+        .unwrap_or_else(|| panic!(".loop._proof_1 {name}: private decoder lost it in {relative}"));
     assert!(
         !matches!(recovered, ConstantInfo::Axiom(_)),
         ".loop._proof_1 {name}: companion recovery weakened the declaration to an axiom"
@@ -897,9 +893,7 @@ fn array_shrink_loop_f_requires_the_companion_and_keeps_its_real_kind() {
                 .find(|name| !exported.contains(*name) && family::array_shrink_loop_f(name))
                 .map(|name| (relative, name.clone()))
         })
-        .expect(
-            "the pinned Init private companions contain an Array.shrink.loop._f witness",
-        );
+        .expect("the pinned Init private companions contain an Array.shrink.loop._f witness");
     let chain = chain_bytes(&lib, &relative);
 
     let exported_view = OleanView::parse(&chain.exported).unwrap_or_else(|error| {
@@ -1163,6 +1157,110 @@ fn decoded_extra_const_names_are_code_generator_names_not_declarations() {
         "the admissible auxiliary still comes from `constants`, not from \
          extraConstNames — that distinction is the whole of franken_lean-timy"
     );
+}
+
+#[test]
+fn chain_decode_reports_origin_as_a_fact_not_as_a_name_prefix() {
+    let lib = lib_or_skip!("chain_decode_reports_origin_as_a_fact_not_as_a_name_prefix");
+
+    // (module, exported, private, private-only) — measured at the pin.
+    let expected = [
+        ("Init/Data/List/ToArrayImpl", 5_usize, 6_usize, 1_usize),
+        ("Init/Data/Array/BasicAux", 8, 37, 29),
+        ("Init/Control/MonadAttach", 29, 30, 1),
+        ("Init/Prelude", 2204, 2314, 110),
+    ];
+
+    for (relative, exported_count, private_count, private_only_count) in expected {
+        let chain = chain_bytes(&lib, relative);
+        let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+        let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+            .expect("server part parses against the exported region");
+        let private_view =
+            OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+                .expect("private part parses against the exported and server regions");
+
+        let chained = decode_chain_constants_with_origin(
+            &exported_view,
+            &private_view,
+            WalkBudget::default(),
+        )
+        .expect("the pin's chains are supersets");
+
+        assert_eq!(
+            chained.constants.len(),
+            private_count,
+            "{relative}: constant count"
+        );
+        assert_eq!(
+            chained.origins.len(),
+            private_count,
+            "{relative}: one origin per constant"
+        );
+        assert_eq!(
+            chained.private_only().count(),
+            private_only_count,
+            "{relative}: private-only count"
+        );
+        assert_eq!(
+            chained
+                .origins
+                .iter()
+                .filter(|origin| **origin == ConstantOrigin::Exported)
+                .count(),
+            exported_count,
+            "{relative}: exported-origin count must equal the exported array length"
+        );
+    }
+}
+
+#[test]
+fn the_private_name_prefix_is_not_a_provenance_signal() {
+    let lib = lib_or_skip!("the_private_name_prefix_is_not_a_provenance_signal");
+
+    // THE DEFECT THIS API EXISTS FOR. `_private.` is Lean's mangling for a
+    // private-SCOPED declaration; it says nothing about which part of the chain
+    // carries it. Init/Data/AC exports declarations that are BOTH `_private.`-
+    // prefixed and `.loop.`-bearing, so any consumer deciding provenance by
+    // prefix classifies them as companion-recovered when they are exported.
+    let chain = chain_bytes(&lib, "Init/Data/AC");
+    let exported_view = OleanView::parse(&chain.exported).expect("exported part parses");
+    let _server_view = OleanView::parse_with_dependencies(&chain.server, &[&chain.exported])
+        .expect("server part parses against the exported region");
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against the exported and server regions");
+
+    let chained =
+        decode_chain_constants_with_origin(&exported_view, &private_view, WalkBudget::default())
+            .expect("the pin's chain is a superset");
+
+    let prefix_and_loop: Vec<String> = chained
+        .constants
+        .iter()
+        .zip(&chained.origins)
+        .filter(|(info, origin)| {
+            **origin == ConstantOrigin::Exported && {
+                let rendered = info.name().to_display_string();
+                rendered.starts_with("_private.") && rendered.contains(".loop.")
+            }
+        })
+        .map(|(info, _)| info.name().to_display_string())
+        .collect();
+
+    assert!(
+        !prefix_and_loop.is_empty(),
+        "Init.Data.AC must still export `_private.*.loop.*` declarations; without \
+         them this test no longer witnesses the prefix/provenance gap"
+    );
+    for name in &prefix_and_loop {
+        assert!(
+            !chained
+                .private_only()
+                .any(|info| info.name().to_display_string() == *name),
+            "{name} is reported both exported and private-only"
+        );
+    }
 }
 
 #[test]
