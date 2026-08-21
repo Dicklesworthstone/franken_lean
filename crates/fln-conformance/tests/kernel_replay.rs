@@ -8344,7 +8344,20 @@ fn each_conservation_law_catches_its_own_violation() {
     // THE BASE MUST BE LEGAL, or every probe below fires for the wrong law.
     legal().assert_conservation("legal base");
 
-    let cases: [(&str, fn(&mut CorpusCounts), &str); 6] = [
+    // EACH SUM LAW IS BROKEN IN ONLY ONE DIRECTION BELOW, so a one-sided
+    // comparison survives. Measured, per law, against the legal base and both
+    // directions: `decoded = 11` is refused by `<=` as well as by `==`, so `<=`
+    // stands in for the law; `agree = 5` is refused by `>=`; `oracle_skipped = 2`
+    // is refused by `<=`. The three MIRROR cases at the end of this list are the
+    // inputs that kill each of those, and the legal base is accepted by all
+    // three variants, so they are not merely "everything refuses".
+    //
+    // The direction matters for what the law means. A rule that only catches
+    // over-counting lets the census credit work it never did: `decoded` below
+    // `compared + unscorable` says rows were scored without being decoded, and
+    // buckets below `compared` says a compared row landed in no direction at
+    // all.
+    let cases: [(&str, fn(&mut CorpusCounts), &str); 9] = [
         (
             // The token loop runs BEFORE the sum checks, so this must keep the
             // family SUM correct: otherwise the restrictive-triage law would
@@ -8387,6 +8400,24 @@ fn each_conservation_law_catches_its_own_violation() {
             },
             "every subject non-answer",
         ),
+        (
+            // MIRROR of the decoded law: fewer decoded than were scored.
+            "decoded falls BELOW compared plus unscorable",
+            |counts| counts.decoded = 9,
+            "decoded must equal compared + unscorable",
+        ),
+        (
+            // MIRROR of the direction law: a compared row in no bucket at all.
+            "the direction buckets fall BELOW compared",
+            |counts| counts.agree = 3,
+            "D23 direction buckets",
+        ),
+        (
+            // MIRROR of the unscorable split: the parts exceed the whole.
+            "the unscorable parts EXCEED unscorable",
+            |counts| counts.oracle_skipped = 4,
+            "unscorable rows must split",
+        ),
     ];
 
     let mut seen: Vec<String> = Vec::new();
@@ -8402,9 +8433,12 @@ fn each_conservation_law_catches_its_own_violation() {
         seen.push(message);
     }
 
-    // NO TWO CELLS MAY HAVE TRIPPED THE SAME LAW. Five distinct violations must
-    // produce five distinct complaints, or one law is standing in for another
-    // and the cell that appears to cover it covers nothing.
+    // NO TWO CELLS MAY HAVE TRIPPED THE SAME LAW. Distinct violations must
+    // produce distinct complaints, or one law is standing in for another and the
+    // cell that appears to cover it covers nothing. The mirrors pass this
+    // because each complaint is an `assert_eq!` panic carrying its two values:
+    // `left: 9` and `left: 11` are different messages about the same law, which
+    // is exactly what a mirror is.
     for (index, message) in seen.iter().enumerate() {
         for (other, other_message) in seen.iter().enumerate() {
             assert!(
