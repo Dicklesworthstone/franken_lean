@@ -410,6 +410,38 @@ impl<'a> DeclDecoder<'a> {
                 continue;
             }
             let (tag, other, cs_sz) = self.view.obj_header(off)?;
+            let child_count: u64 = match tag {
+                1 => 1,     // succ
+                2 | 3 => 2, // max / imax
+                4 | 5 => 0, // param / mvar (Name decoded eagerly below)
+                _ => {
+                    return Err(DeclError::Shape {
+                        offset: off,
+                        what: "Level ctor",
+                    });
+                }
+            };
+            if (tag == 1 && other != 1) || ((tag == 2 || tag == 3) && other != 2) {
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Level arity",
+                });
+            }
+            if (tag == 4 || tag == 5) && other != 1 {
+                // param/mvar carry exactly one slot: the eager Name decode below
+                // and the stored Level.Data word are both indexed by `other`, so
+                // any other arity reads past the object (found by review).
+                return Err(DeclError::Shape {
+                    offset: off,
+                    what: "Level param/mvar arity",
+                });
+            }
+            // Checked AFTER the arity rules above, so a wrong `other` reports
+            // itself as an arity fault rather than as a size fault. The two are
+            // independent, but arity is the more specific diagnosis and
+            // `decode_expr` already ordered them this way; they disagreed until
+            // this was moved.
+            //
             // Every `Level` constructor is its pointer fields followed by ONE
             // stored `Level.Data` word, so the object is 8 + 8*other + 8 bytes,
             // already a multiple of 8.
@@ -435,32 +467,6 @@ impl<'a> DeclDecoder<'a> {
                 return Err(DeclError::Shape {
                     offset: off,
                     what: "Level object size disagrees with its pointer-fields-plus-data layout",
-                });
-            }
-            let child_count: u64 = match tag {
-                1 => 1,     // succ
-                2 | 3 => 2, // max / imax
-                4 | 5 => 0, // param / mvar (Name decoded eagerly below)
-                _ => {
-                    return Err(DeclError::Shape {
-                        offset: off,
-                        what: "Level ctor",
-                    });
-                }
-            };
-            if (tag == 1 && other != 1) || ((tag == 2 || tag == 3) && other != 2) {
-                return Err(DeclError::Shape {
-                    offset: off,
-                    what: "Level arity",
-                });
-            }
-            if (tag == 4 || tag == 5) && other != 1 {
-                // param/mvar carry exactly one slot: the eager Name decode below
-                // and the stored Level.Data word are both indexed by `other`, so
-                // any other arity reads past the object (found by review).
-                return Err(DeclError::Shape {
-                    offset: off,
-                    what: "Level param/mvar arity",
                 });
             }
             let mut pending = false;
@@ -2660,6 +2666,78 @@ mod tests {
         .bytes
     }
 
+    /// A `Level.succ` claiming an arity its constructor does not have is
+    /// refused, and refused as an ARITY fault.
+    ///
+    /// This cell is the reason the size check moved below the arity rules in
+    /// the same commit. Before that, planting `other = 2` on a succ left the
+    /// stored size at 24 where the size law expects 32, so the SIZE rule fired
+    /// and this rule was unreachable by any single-field mutant — the arity
+    /// refusal existed but nothing could demonstrate it. The mutant now moves
+    /// `other` alone and lands on the rule it targets.
+    #[test]
+    fn a_level_succ_claiming_the_wrong_arity_is_refused() {
+        let mut bytes = succ_level_module();
+        let view = OleanView::parse(&bytes).expect("header");
+
+        DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the unmodified succ fixture decodes");
+
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("AxiomVal pointer"))
+            .expect("AxiomVal object");
+        let base_off = view
+            .deref(view.read_u64(val_off + 8).expect("ConstantVal pointer"))
+            .expect("ConstantVal object");
+        let sort_off = view
+            .deref(view.read_u64(base_off + 24).expect("type pointer"))
+            .expect("Sort expression");
+        let level_off = view
+            .deref(view.read_u64(sort_off + 8).expect("level pointer"))
+            .expect("Level object");
+
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("Level header");
+        assert_eq!(tag, 1, "Level.succ");
+        assert_eq!(other, 1, "one level child");
+        assert_eq!(cs_sz, 24, "and the size that arity implies");
+
+        // Claim two slots, leaving the size at 24. Under the old ordering this
+        // reached the size rule; it must now reach the arity rule.
+        let header = view.read_u64(level_off).expect("header word");
+        let planted = (header & !0x00ff_0000_0000_0000) | (2_u64 << 48);
+        bytes[level_off as usize..level_off as usize + 8].copy_from_slice(&planted.to_le_bytes());
+
+        let view = OleanView::parse(&bytes).expect("planted region");
+        let (tag, other, cs_sz) = view.obj_header(level_off).expect("planted header");
+        assert_eq!(
+            (tag, other, cs_sz),
+            (1, 2, 24),
+            "the plant landed as intended"
+        );
+
+        let error = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect_err("a succ level with the wrong arity must be refused");
+        assert!(
+            matches!(
+                error,
+                DeclError::Shape {
+                    what: "Level arity",
+                    ..
+                }
+            ),
+            "expected the arity refusal, not the size law: {error:?}"
+        );
+    }
+
     /// One universe-polymorphic axiom, so the region contains a `Level.param`
     /// object — tag 4, the arity-sensitive constructor.
     fn param_level_module() -> Vec<u8> {
@@ -2699,11 +2777,11 @@ mod tests {
     /// unchecked it would surface as a `Level.Data` cross-check divergence or a
     /// nonsense universe name rather than as a shape error.
     ///
-    /// The mutant has to move the size WITH the arity. `other` and `cs_sz` are
-    /// bound to each other by the Level size law (7498bf87), so raising the
-    /// arity alone trips that check first and never reaches this one — the two
-    /// rules are independent and this cell proves it by satisfying the first
-    /// deliberately.
+    /// The mutant moves the size WITH the arity. That was REQUIRED when this
+    /// cell was written, because the size law then ran ahead of the arity
+    /// rules; since the ordering cleanup it is merely harmless, and it is kept
+    /// because a mutant that satisfies every neighbouring rule proves the kill
+    /// belongs to this one alone.
     #[test]
     fn a_level_param_claiming_the_wrong_arity_is_refused() {
         let mut bytes = param_level_module();
