@@ -155,8 +155,15 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         0,
         "{json}",
     );
+    let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
+    let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
+    assert_eq!(
+        decoded_private_auxiliaries,
+        private_companion_observed,
+        "{json}",
+    );
     assert!(
-        json_usize_field(private_companion_residuals, "observed") > 0,
+        decoded_private_auxiliaries > 0,
         "{json}",
     );
 }
@@ -688,7 +695,6 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         OsString::from("--json"),
         exported.clone().into_os_string(),
     ]);
-    assert!(json.stdout.contains("\"decodedPrivateAuxiliaries\":29"));
     let private_companion_names = &[
         "_private.CliPrivateReport.0._f",
         "_private.CliPrivateReport.0._proof_2",
