@@ -2887,7 +2887,7 @@ fn list_rule_rhs(
         list_universe,
         true,
     );
-    let mut result = builder.bvar(1);
+    let mut result = builder.bvar(2);
     if selected_cons {
         let head = builder.bvar(1);
         result = builder.apply(result, head);

@@ -1136,7 +1136,7 @@ fn init_list_entries() -> Vec<ConstantEntry> {
                             primary_name("tail"),
                             list_expr(bv(5)),
                             Expr::app(
-                                Expr::app(Expr::app(bv(1), bv(1)), bv(0)),
+                                Expr::app(Expr::app(bv(2), bv(1)), bv(0)),
                                 recursive_call,
                             ),
                             BinderInfo::Default,
