@@ -4886,6 +4886,145 @@ fn link_fixture_entry(link: &Path, target: &Path) {
     });
 }
 
+/// The PUBLISHED disagreement count is the sum of the three D23 buckets, and
+/// every one of them is in it.
+///
+/// **This is the number that gets quoted, and nothing checked it.**
+/// `CorpusCounts::disagreements` has exactly two call sites and BOTH are inside
+/// `println!`: the per-module `kernel_reference_corpus module=... disagreements=`
+/// row and the `SUMMARY` line. No assertion anywhere reads it. The terminal
+/// assertions at the end of the driver check `unsoundly_permissive` and
+/// `restrictive_without_carve_out` DIRECTLY, so a term dropped from this sum
+/// changes what the lane REPORTS while leaving everything the lane ENFORCES
+/// intact.
+///
+/// That is the worst shape a reporting bug can have here. Every figure in this
+/// bead's history -- the original 265, the 93, the 1,482 -- came off these two
+/// lines. A `disagreements()` missing `restrictive_without_carve_out` would have
+/// published "0 disagreements" for a run that found hundreds, and the run would
+/// still have failed its assertions for the right reason with the wrong headline
+/// in the log.
+///
+/// **Each term is checked by sensitivity, not by re-adding them up.** Re-deriving
+/// the same sum in the test would restate the implementation and agree with any
+/// version of it. Instead each bucket is zeroed in turn and the published number
+/// must fall by exactly that bucket's amount, which proves the term is present
+/// with coefficient one. The three buckets carry DISTINCT values so a drop cannot
+/// be mistaken for a different drop.
+///
+/// **The probes are deliberately not legal populations.** Zeroing one bucket
+/// breaks `compared == agree + buckets`, so `assert_conservation` is run on the
+/// baseline only; the variants exist to interrogate the arithmetic, not to model
+/// a run.
+#[test]
+fn the_published_disagreement_count_includes_every_d23_bucket() {
+    let library = write_inventory_fixture(
+        "t6r7-disagreement-v1",
+        &["One.olean", "Two.olean", "Three.olean"],
+    );
+    let seen = walk_olean_inventory(&library, Some("D"))
+        .unwrap_or_else(|reason| panic!("walk the fixture: {reason}"))
+        .modules
+        .len() as u64;
+    assert_eq!(seen, 3);
+
+    // Distinct per bucket, so dropping any one is distinguishable from dropping
+    // another rather than merely from dropping nothing.
+    let (permissive, with_carve_out, without_carve_out) = (1_u64, 2_u64, seen);
+    let baseline = || {
+        let mut counts = CorpusCounts {
+            decoded: 20,
+            compared: 16,
+            agree: 10,
+            unsoundly_permissive: permissive,
+            restrictive_with_carve_out: with_carve_out,
+            restrictive_without_carve_out: without_carve_out,
+            unscorable: 4,
+            oracle_skipped: 1,
+            subject_no_answer: 3,
+            ..CorpusCounts::default()
+        };
+        counts
+            .restrictive_families
+            .insert("rejected:BlockMismatch".to_string(), 2);
+        counts
+            .restrictive_families
+            .insert("rejected:TypeMismatch".to_string(), 3);
+        counts
+            .no_answer_families
+            .insert("inconclusive:Steps".to_string(), 3);
+        counts
+    };
+    let counts = baseline();
+    counts.assert_conservation("published disagreements");
+
+    let published = counts.disagreements();
+    assert_eq!(
+        published,
+        permissive + with_carve_out + without_carve_out,
+        "the published count must be the sum of the three D23 buckets"
+    );
+    // The identity the SUMMARY line implicitly claims when it prints `compared`,
+    // the buckets and this number side by side.
+    assert_eq!(
+        counts.compared,
+        counts.agree + published,
+        "every compared declaration either agreed or disagreed; the row cannot print a `compared` \
+         that its own parts do not reconstruct"
+    );
+
+    // SENSITIVITY, one bucket at a time.
+    for (name, dropped, mutate) in [
+        (
+            "unsoundly_permissive",
+            permissive,
+            (|c: &mut CorpusCounts| c.unsoundly_permissive = 0) as fn(&mut CorpusCounts),
+        ),
+        ("restrictive_with_carve_out", with_carve_out, |c| {
+            c.restrictive_with_carve_out = 0
+        }),
+        ("restrictive_without_carve_out", without_carve_out, |c| {
+            c.restrictive_without_carve_out = 0
+        }),
+    ] {
+        let mut probe = baseline();
+        mutate(&mut probe);
+        assert_eq!(
+            probe.disagreements(),
+            published - dropped,
+            "zeroing `{name}` changed the published disagreement count by something other than \
+             {dropped}, so that bucket is not in the sum with coefficient one. A term missing \
+             here under-reports divergences in the one number this lane publishes, while every \
+             assertion the lane enforces keeps passing"
+        );
+    }
+
+    // And nothing that is NOT a disagreement may leak into it.
+    for (name, mutate) in [
+        (
+            "agree",
+            (|c: &mut CorpusCounts| c.agree += 97) as fn(&mut CorpusCounts),
+        ),
+        ("unscorable", |c: &mut CorpusCounts| c.unscorable += 97),
+        ("oracle_skipped", |c: &mut CorpusCounts| {
+            c.oracle_skipped += 97
+        }),
+        ("subject_no_answer", |c: &mut CorpusCounts| {
+            c.subject_no_answer += 97
+        }),
+    ] {
+        let mut probe = baseline();
+        mutate(&mut probe);
+        assert_eq!(
+            probe.disagreements(),
+            published,
+            "`{name}` moved the published disagreement count. A non-answer or an agreement \
+             counted as a divergence would report the kernel as differing from the Reference \
+             where it did not"
+        );
+    }
+}
+
 /// Per-module counts ACCUMULATE into a corpus total, families included.
 ///
 /// **The one production function on this path with no coverage at all.**
