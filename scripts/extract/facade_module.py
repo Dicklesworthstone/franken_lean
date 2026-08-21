@@ -1793,27 +1793,40 @@ def work_scratch_report(work):
     Returns (error_or_None, files, bytes).
     """
     try:
-        entries = sorted(os.listdir(work))
+        # WALKED, NOT LISTED. os.listdir does not descend, so a subdirectory
+        # contributed one inode and its contents contributed nothing: measured, a
+        # directory holding 204800 bytes reported 8192, understating by 25x, and
+        # counted the subdirectory itself as a "file". The number exists to make
+        # disk cost visible while disk is the constraint, and a disclosure that
+        # is wrong by a factor of twenty-five is worse than none -- it is the
+        # well-formed wrong answer this file refuses everywhere else.
+        os.listdir(work)
     except OSError as exc:
         return (f"the probe work directory {work} is not there at the end of the "
                 f"run ({exc.__class__.__name__}). Every pin-side check in this run "
                 "writes its Lean source there, so its absence means those files "
                 "went somewhere this run cannot account for", 0, 0)
-    if not entries:
+    total = files = 0
+    for root, _dirs, names in os.walk(work):
+        for name in names:
+            try:
+                st = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            # st_blocks, not st_size: apparent size is wrong in both directions on
+            # this filesystem, and the point of the number is the disk it holds
+            total += st.st_blocks * 512
+            files += 1
+    # EMPTY MEANS NO FILES ANYWHERE, decided by the same walk that does the
+    # counting. Deciding it from a bare listdir while counting with a walk was an
+    # inconsistency my own case caught: a directory holding nothing but empty
+    # subdirectories looked populated and then reported zero files.
+    if not files:
         return (f"the probe work directory {work} is empty. Every pin-side check "
                 "in this run writes Lean source into it, so an empty directory "
                 "means they wrote somewhere else, and a probe whose source is not "
                 "where this run put it answers about some other file", 0, 0)
-    total = 0
-    for name in entries:
-        try:
-            st = os.stat(os.path.join(work, name))
-        except OSError:
-            continue
-        # st_blocks, not st_size: apparent size is wrong in both directions on
-        # this filesystem, and the point of the number is the disk it holds
-        total += st.st_blocks * 512
-    return None, len(entries), total
+    return None, files, total
 
 
 @checked_by_self_test
@@ -3011,6 +3024,20 @@ def self_test():
     case("acceptance/unvalidated", pin_acceptance_error(text, {"0" * 64}), True)
 
     # work_scratch_report: the probes wrote where this run put them
+    # A file inside a SUBDIRECTORY is disk held just the same. Sized so the
+    # nested file dominates: a report that does not descend sees almost none of it.
+    _nest = os.path.join(work, "nested-scratch")
+    os.makedirs(_nest, exist_ok=True)
+    builtins.open(os.path.join(_nest, "buried.lean"), "w").write("z" * 200000)
+    _, _nfiles, _nbytes = work_scratch_report(_nest)
+    case("work/counts-a-nested-file",
+         None if _nbytes >= 200000 else f"reported only {_nbytes} bytes", False)
+    case("work/counts-files-not-directories",
+         None if _nfiles == 1 else f"counted {_nfiles} entries, not 1 file", False)
+    _hollow = os.path.join(work, "hollow-scratch")
+    os.makedirs(os.path.join(_hollow, "empty-inside"), exist_ok=True)
+    case("work/a-directory-of-empty-directories-is-still-empty",
+         work_scratch_report(_hollow)[0], True)
     case("work/populated", work_scratch_report(work)[0], False)
     case("work/absent", work_scratch_report(os.path.join(work, "nope"))[0], True)
     empty = os.path.join(work, "empty")
