@@ -2796,6 +2796,17 @@ fn is_private_cli_private_report_f_residual(display: &str) -> bool {
     display.starts_with("_private.CliPrivateReport.") && display.ends_with("._f")
 }
 
+fn is_private_cli_private_report_implementation_aux_residual(display: &str) -> bool {
+    let Some(suffix) = display.strip_prefix("_private.CliPrivateReport.0.") else {
+        return false;
+    };
+
+    matches!(suffix, "_f" | "_sunfold" | "_unsafe_rec")
+        || suffix.strip_prefix("_proof_").is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 fn is_private_sunfold_residual(display: &str) -> bool {
     display.starts_with("_private.")
         && display.split('.').any(|component| component == "_sunfold")
@@ -3293,6 +3304,14 @@ fn render_check_olean_success(
         &checked.decoded.constants,
         is_private_cli_private_report_f_residual,
     );
+    let mut private_cli_private_report_implementation_aux_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    private_cli_private_report_implementation_aux_residuals.observe_matching(
+        &checked.decoded.constants,
+        is_private_cli_private_report_implementation_aux_residual,
+    );
     let mut private_sunfold_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -3707,6 +3726,15 @@ fn render_check_olean_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_f_residuals)
     };
+    let private_cli_private_report_implementation_aux_observed =
+        private_cli_private_report_implementation_aux_residuals.observed;
+    let private_cli_private_report_implementation_aux_omitted =
+        private_cli_private_report_implementation_aux_residuals.omitted();
+    let private_cli_private_report_implementation_aux_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_implementation_aux_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_implementation_aux_residuals)
+    };
     let private_sunfold_observed = private_sunfold_residuals.observed;
     let private_sunfold_omitted = private_sunfold_residuals.omitted();
     let private_sunfold_names = if json {
@@ -4060,6 +4088,7 @@ fn render_check_olean_success(
                 "\"privateSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportImplementationAuxResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -4160,6 +4189,9 @@ fn render_check_olean_success(
             private_cli_private_report_f_observed,
             private_cli_private_report_f_names,
             private_cli_private_report_f_omitted,
+            private_cli_private_report_implementation_aux_observed,
+            private_cli_private_report_implementation_aux_names,
+            private_cli_private_report_implementation_aux_omitted,
             private_sunfold_observed,
             private_sunfold_names,
             private_sunfold_omitted,
@@ -4354,6 +4386,9 @@ fn render_check_olean_success(
                 "decoded _private CliPrivateReport _f residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _f residual names: {}\n",
                 "decoded _private CliPrivateReport _f residual names omitted: {}\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residual names: {}\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residual names omitted: {}\n",
                 "decoded _private _sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _sunfold residual names: {}\n",
                 "decoded _private _sunfold residual names omitted: {}\n",
@@ -4545,6 +4580,9 @@ fn render_check_olean_success(
             private_cli_private_report_f_observed,
             private_cli_private_report_f_names,
             private_cli_private_report_f_omitted,
+            private_cli_private_report_implementation_aux_observed,
+            private_cli_private_report_implementation_aux_names,
+            private_cli_private_report_implementation_aux_omitted,
             private_sunfold_observed,
             private_sunfold_names,
             private_sunfold_omitted,
@@ -5145,6 +5183,16 @@ fn render_check_olean_set_success(
             is_private_cli_private_report_f_residual,
         );
     }
+    let mut private_cli_private_report_implementation_aux_residuals = DecodedNamedResiduals {
+        observed: 0,
+        names: Vec::new(),
+    };
+    for module in &checked.modules {
+        private_cli_private_report_implementation_aux_residuals.observe_matching(
+            &module.decoded.constants,
+            is_private_cli_private_report_implementation_aux_residual,
+        );
+    }
     let mut private_sunfold_residuals = DecodedNamedResiduals {
         observed: 0,
         names: Vec::new(),
@@ -5652,6 +5700,15 @@ fn render_check_olean_set_success(
     } else {
         render_named_residuals_human(&mut private_cli_private_report_f_residuals)
     };
+    let private_cli_private_report_implementation_aux_observed =
+        private_cli_private_report_implementation_aux_residuals.observed;
+    let private_cli_private_report_implementation_aux_omitted =
+        private_cli_private_report_implementation_aux_residuals.omitted();
+    let private_cli_private_report_implementation_aux_names = if json {
+        render_named_residuals_json(&mut private_cli_private_report_implementation_aux_residuals)
+    } else {
+        render_named_residuals_human(&mut private_cli_private_report_implementation_aux_residuals)
+    };
     let private_sunfold_observed = private_sunfold_residuals.observed;
     let private_sunfold_omitted = private_sunfold_residuals.omitted();
     let private_sunfold_names = if json {
@@ -6011,6 +6068,7 @@ fn render_check_olean_set_success(
                 "\"privateSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportSunfoldFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateCliPrivateReportFResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
+                "\"privateCliPrivateReportImplementationAuxResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateSunfoldResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
                 "\"privateInitUnsafeRecResiduals\":{{\"observed\":{},\"names\":{},\"omitted\":{}}},",
@@ -6113,6 +6171,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_f_observed,
             private_cli_private_report_f_names,
             private_cli_private_report_f_omitted,
+            private_cli_private_report_implementation_aux_observed,
+            private_cli_private_report_implementation_aux_names,
+            private_cli_private_report_implementation_aux_omitted,
             private_sunfold_observed,
             private_sunfold_names,
             private_sunfold_omitted,
@@ -6309,6 +6370,9 @@ fn render_check_olean_set_success(
                 "decoded _private CliPrivateReport _f residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private CliPrivateReport _f residual names: {}\n",
                 "decoded _private CliPrivateReport _f residual names omitted: {}\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residual names: {}\n",
+                "decoded _private CliPrivateReport direct implementation auxiliary residual names omitted: {}\n",
                 "decoded _private _sunfold residuals: {} (decoded companion names; reporting only; not a G1 claim)\n",
                 "decoded _private _sunfold residual names: {}\n",
                 "decoded _private _sunfold residual names omitted: {}\n",
@@ -6502,6 +6566,9 @@ fn render_check_olean_set_success(
             private_cli_private_report_f_observed,
             private_cli_private_report_f_names,
             private_cli_private_report_f_omitted,
+            private_cli_private_report_implementation_aux_observed,
+            private_cli_private_report_implementation_aux_names,
+            private_cli_private_report_implementation_aux_omitted,
             private_sunfold_observed,
             private_sunfold_names,
             private_sunfold_omitted,
