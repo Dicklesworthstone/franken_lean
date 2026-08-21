@@ -4521,3 +4521,195 @@ fn the_pair_spine_is_a_converging_dag() {
          as the in-degree histogram, reached without it"
     );
 }
+
+/// The 46 interior spine nodes: same shape, disjoint contents.
+///
+/// `b327b20c` found them by closing the spine on field 1 - 56 seeds becoming
+/// 102 nodes - and characterised none of them. They had been invisible to every
+/// earlier cell because every earlier cell reached objects by asking what a
+/// field ADMITS, and these are reached only by following edges.
+///
+/// They are `(0, 2)` by construction, so their shape is not news. What is news
+/// is that they are not simply more of the same:
+///
+///   FIELD 0 IS DISJOINT. The 56 seeds carry 54 distinct four-field records
+///   between them; the 46 interior nodes carry 46, one each; and the two sets
+///   share NOT ONE object. Whatever these records hold, the interior of the
+///   spine holds different ones from its entry points, and no amount of sharing
+///   connects them.
+///
+///   FIELD 1 DIFFERS CATEGORICALLY. The seeds admit three shapes; the interior
+///   admits two. The `(4, 1)` shape occurs six times among the seeds and ZERO
+///   times among the 46. That is a categorical absence rather than a
+///   difference of proportion, which is why it is asserted as a count of zero
+///   and not as a distribution.
+///
+/// The interior also terminates differently - 28 of its 46 end in the
+/// one-field shape against 6 of 56 - but that is a difference of proportion
+/// over small numbers, so it is pinned as the two histograms and NOT described
+/// as a tendency. Two counts side by side let a reader draw that conclusion;
+/// a sentence asserting it would be me drawing it for them from 46 samples.
+///
+/// No size is asserted. No schema, type or extension is named.
+#[test]
+fn the_forty_six_interior_spine_nodes_are_disjoint() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut seed_count = 0usize;
+    let mut interior_count = 0usize;
+    let mut seed_records: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut interior_records: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut shared_records = 0usize;
+    let mut seed_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut interior_shapes: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut seed_next: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut interior_next: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for (index, (module, bytes)) in modules.iter().enumerate() {
+        let _ = module;
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let is_pair = |off: usize| at.get(&off).map(|o| (o.tag, o.other)) == Some((0, 2));
+        let shape_of = |off: usize| -> String {
+            let object = at.get(&off).expect("a walked object");
+            format!("tag {} arity {}", object.tag, object.other)
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for object in &objects {
+            if (object.tag, object.other, object.cs_sz) != (1, 2, 24) {
+                continue;
+            }
+            let tail = resolve(word_at(bytes, object.off + 16));
+            if tail.and_then(|t| at.get(&t)).map(|t| (t.tag, t.other)) != Some((0, 2)) {
+                continue;
+            }
+            let Some(record) = resolve(word_at(bytes, object.off + 8)) else {
+                continue;
+            };
+            if at.get(&record).map(|h| (h.tag, h.other)) != Some((0, 5)) {
+                continue;
+            }
+            if let Some(target) = resolve(word_at(bytes, record + 8 + 8 * 4))
+                && is_pair(target)
+            {
+                seeds.insert(target);
+            }
+        }
+
+        let mut all = seeds.clone();
+        let mut frontier: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(node) = frontier.pop() {
+            if let Some(target) = resolve(word_at(bytes, node + 16))
+                && is_pair(target)
+                && all.insert(target)
+            {
+                frontier.push(target);
+            }
+        }
+
+        for node in &all {
+            let seed = seeds.contains(node);
+            let record = resolve(word_at(bytes, node + 8)).expect("field 0 is a pointer");
+            let next = resolve(word_at(bytes, node + 16));
+            let next_shape = next.map_or("boxed or unresolvable".to_owned(), &shape_of);
+            if seed {
+                seed_count += 1;
+                seed_records.insert((index, record));
+                *seed_shapes.entry(shape_of(record)).or_default() += 1;
+                *seed_next.entry(next_shape).or_default() += 1;
+            } else {
+                interior_count += 1;
+                interior_records.insert((index, record));
+                *interior_shapes.entry(shape_of(record)).or_default() += 1;
+                *interior_next.entry(next_shape).or_default() += 1;
+            }
+        }
+        shared_records += seed_records
+            .iter()
+            .filter(|entry| interior_records.contains(entry))
+            .count();
+    }
+
+    if !prelude_loaded {
+        assert_eq!(
+            interior_count, 0,
+            "the third shape is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    assert_eq!(
+        (seed_count, interior_count),
+        (56, 46),
+        "the seeds and the nodes only the traversal found"
+    );
+
+    // Same shape - not the news.
+    assert_eq!(
+        seed_shapes.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 4".to_owned(), 56)],
+        "every seed's field 0 is a four-field record"
+    );
+    assert_eq!(
+        interior_shapes.into_iter().collect::<Vec<_>>(),
+        vec![("tag 0 arity 4".to_owned(), 46)],
+        "and so is every interior node's"
+    );
+
+    // Disjoint contents - the news.
+    assert_eq!(
+        (seed_records.len(), interior_records.len(), shared_records),
+        (54, 46, 0),
+        "the seeds carry 54 distinct records, the interior 46, and the two sets \
+         share NOT ONE. The interior of the spine holds different records from \
+         its entry points"
+    );
+
+    // Categorical absence, asserted as a zero rather than as a proportion.
+    assert_eq!(
+        seed_next.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 44),
+            ("tag 4 arity 1".to_owned(), 6),
+            ("tag 5 arity 1".to_owned(), 6),
+        ],
+        "the seeds' field 1 admits three shapes"
+    );
+    assert_eq!(
+        interior_next.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("tag 0 arity 2".to_owned(), 18),
+            ("tag 5 arity 1".to_owned(), 28),
+        ],
+        "the interior admits two: the `tag 4 arity 1` shape occurs six times \
+         among the seeds and ZERO times here, which is a categorical absence \
+         rather than a difference of proportion"
+    );
+}
