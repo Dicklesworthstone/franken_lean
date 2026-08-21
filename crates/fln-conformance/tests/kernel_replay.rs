@@ -5112,6 +5112,21 @@ fn walk_olean_inventory(
 /// run's leftovers join the population and the counts below stop meaning what
 /// they say.
 fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> PathBuf {
+    write_inventory_fixture_with(versioned_name, relative_files, |path| fs::write(path, b""))
+}
+
+/// The same writer with its per-entry WRITE as a parameter, so the order of
+/// "record the shape" against "build the tree" can be observed.
+///
+/// Nothing about a successful build distinguishes the two orders: the tree and
+/// the record are both there either way. The difference only shows when the
+/// build dies partway, and a caller can produce that on demand by handing over a
+/// write that fails. Production passes `fs::write` one line above.
+fn write_inventory_fixture_with(
+    versioned_name: &str,
+    relative_files: &[&str],
+    mut write_entry: impl FnMut(&Path) -> std::io::Result<()>,
+) -> PathBuf {
     // `relative_files` IS A PROMISE THE PARAMETER'S NAME MAKES AND NOTHING KEPT.
     // `Path::join` obeys the caller, not the name: an entry beginning with `/`
     // DISCARDS the base entirely and lands wherever it says -- outside
@@ -5297,6 +5312,25 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
         );
     }
 
+    // RECORDED BEFORE ANYTHING IS BUILT, AND IT USED TO BE RECORDED AFTER. A
+    // build that dies partway -- the disk filling mid-run, which happened twice
+    // while this file was being written -- left a PARTIAL tree and no record at
+    // all. The next run then saw no shape to compare against, built whatever its
+    // list said, and unioned into the leftovers: exactly the hazard this record
+    // exists to stop, surviving in the one window where it matters most.
+    //
+    // Written first, the record always describes the shape that was ATTEMPTED. A
+    // retry with the same list matches and completes the tree; a retry with a
+    // different list is refused. Both are what the reader wants; neither was
+    // true before.
+    static MANIFEST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = MANIFEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = manifest.with_extension(format!("manifest-{}-{seq}", std::process::id()));
+    fs::write(&staging, recorded.as_bytes())
+        .unwrap_or_else(|error| panic!("write {}: {error}", staging.display()));
+    fs::rename(&staging, &manifest)
+        .unwrap_or_else(|error| panic!("record fixture shape {}: {error}", manifest.display()));
+
     fs::create_dir_all(&base)
         .unwrap_or_else(|error| panic!("create fixture tree {}: {error}", base.display()));
     for relative in relative_files {
@@ -5306,17 +5340,9 @@ fn write_inventory_fixture(versioned_name: &str, relative_files: &[&str]) -> Pat
             .unwrap_or_else(|| panic!("fixture entry {relative} has no parent directory"));
         fs::create_dir_all(parent)
             .unwrap_or_else(|error| panic!("create fixture dir {}: {error}", parent.display()));
-        fs::write(&path, b"")
+        write_entry(&path)
             .unwrap_or_else(|error| panic!("create fixture file {}: {error}", path.display()));
     }
-
-    static MANIFEST_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let seq = MANIFEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let staging = manifest.with_extension(format!("manifest-{}-{seq}", std::process::id()));
-    fs::write(&staging, recorded.as_bytes())
-        .unwrap_or_else(|error| panic!("write {}: {error}", staging.display()));
-    fs::rename(&staging, &manifest)
-        .unwrap_or_else(|error| panic!("record fixture shape {}: {error}", manifest.display()));
     base
 }
 
@@ -6165,6 +6191,138 @@ fn an_entry_that_is_also_another_entrys_directory_is_refused_in_either_order() {
             !Path::new(env!("CARGO_TARGET_TMPDIR")).join(name).exists(),
             "`{name}` was refused and a tree exists anyway; the check must run BEFORE the writes, \
              or the conflicting file is already on disk when the refusal arrives"
+        );
+    }
+}
+
+/// The shape is recorded BEFORE the tree is built, so a build that dies partway
+/// still leaves something to compare against.
+///
+/// **The record used to be written last, and that is the one window where it
+/// matters.** A completed build is indistinguishable under either order: the
+/// tree and the record are both there. The difference appears only when the
+/// build dies mid-way -- the disk filling under it, which happened twice while
+/// this file was being written -- and the old order then left a PARTIAL tree and
+/// no record at all. The next run had nothing to compare against, built whatever
+/// its list said, and unioned into the leftovers: exactly the hazard the record
+/// exists to stop, surviving precisely where it was needed.
+///
+/// **Observed by making the per-entry write a parameter.** No allocation
+/// counter, no timing, no crashed process: the test hands over a writer that
+/// succeeds once and then fails, which is what a disk filling looks like from
+/// inside this function. If the record were still written last, it would not be
+/// on disk when the panic escapes and the assertion below fails.
+///
+/// **The tree really is partial, and that is asserted too.** A writer that
+/// failed on the FIRST entry would leave an empty tree, which is a different and
+/// far less interesting situation -- nothing to union into. The first entry must
+/// have landed and the second must not.
+///
+/// **And the retry completes it.** With the shape recorded, building the same
+/// list again is allowed by both the name registry and the shape check, and the
+/// tree finishes. That is the behaviour the ordering buys, so it is checked
+/// rather than described.
+#[test]
+fn the_shape_is_recorded_before_the_tree_is_built() {
+    const NAME: &str = "t6r7-selftest-record-first-v1";
+    const ENTRIES: [&str; 2] = ["First.olean", "Second.olean"];
+
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let manifest = tmp.join(format!("{NAME}.manifest"));
+    let base = tmp.join(NAME);
+
+    // A writer that succeeds once and then fails, held in an atomic so the
+    // closure stays unwind-safe across `catch_unwind`.
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| {
+        write_inventory_fixture_with(NAME, &ENTRIES, |path| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                fs::write(path, b"")
+            } else {
+                Err(std::io::Error::other("simulated ENOSPC"))
+            }
+        })
+    });
+    std::panic::set_hook(previous);
+
+    let payload = outcome
+        .err()
+        .unwrap_or_else(|| panic!("the injected writer must fail the second entry"));
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("Second.olean") && message.contains("simulated ENOSPC"),
+        "the failure must name the entry that could not be written and why: {message}"
+    );
+
+    // THE TREE IS PARTIAL. Without this the assertion below would hold for a
+    // build that never started, which is not the situation this is about.
+    assert!(
+        base.join("First.olean").is_file(),
+        "the first entry must have landed, or there is no partial tree to protect"
+    );
+    assert!(
+        !base.join("Second.olean").exists(),
+        "the second entry must NOT have landed, or the writer was not injected. This fixture is \
+         never retried, precisely so this stays true on every run"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the writer must have been REACHED for both entries; a build that stopped before the \
+         second would leave the same partial tree for a different reason"
+    );
+
+    // THE RECORD SURVIVED THE FAILURE. Under the old order it would not exist at
+    // all, and the next run would union into the partial tree above without
+    // anything noticing.
+    let recorded = fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manifest.display()));
+    assert_eq!(
+        recorded, "First.olean\nSecond.olean",
+        "the shape must be recorded before the build, and must describe what was ATTEMPTED"
+    );
+
+    // THE RETRY IS A SEPARATE FIXTURE, AND THAT IS NOT TIDiness. Nothing sweeps
+    // these trees, so a retry here would leave `Second.olean` on disk and the
+    // partial-tree assertion above would fail on the NEXT run -- with the tree
+    // it was asserting the absence of created by its own previous pass. The two
+    // properties cannot share a fixture: one needs the second entry never to
+    // have been written, the other needs it eventually written.
+    let resume_name = "t6r7-selftest-record-resume-v1";
+    let resume_attempts = std::sync::atomic::AtomicUsize::new(0);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let failed = std::panic::catch_unwind(|| {
+        write_inventory_fixture_with(resume_name, &ENTRIES, |path| {
+            if resume_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                fs::write(path, b"")
+            } else {
+                Err(std::io::Error::other("simulated ENOSPC"))
+            }
+        })
+    });
+    std::panic::set_hook(previous);
+    assert!(
+        failed.is_err(),
+        "the resume fixture must fail before it is resumed"
+    );
+
+    // AND THE RETRY COMPLETES THE TREE. Same name, same list: allowed by the
+    // registry, matched by the record the failed build left behind, finished by
+    // the ordinary writer. That is the behaviour the ordering buys.
+    let resumed = write_inventory_fixture(resume_name, &ENTRIES);
+    assert_eq!(resumed, tmp.join(resume_name));
+    for entry in ENTRIES {
+        assert!(
+            resumed.join(entry).is_file(),
+            "`{entry}` must exist after the retry; a recorded shape is what lets a failed build be \
+             resumed instead of refused"
         );
     }
 }
