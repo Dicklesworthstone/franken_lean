@@ -498,6 +498,11 @@ const OPTION_PMAP_EQ_SOME_IFF_SIMP_1_4: &str =
     "_private.Init.Data.Option.Lemmas.0.Option.pmap_eq_some_iff._simp_1_4";
 /// The pin's private option companion stores this theorem in Lemmas.
 const OPTION_PMAP_EQ_SOME_IFF_SIMP_1_4_MODULE: &str = "Init/Data/Option/Lemmas";
+/// The second private simplifier theorem for `Option.pmap_eq_some_iff`.
+const OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5: &str =
+    "_private.Init.Data.Option.Lemmas.0.Option.pmap_eq_some_iff._simp_1_5";
+/// The pin's private option companion stores this theorem in Lemmas.
+const OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5_MODULE: &str = "Init/Data/Option/Lemmas";
 /// The private stored definition implementing `List.hasDecEq`.
 const LIST_HAS_DEC_EQ: &str = "List.hasDecEq";
 /// The census places the implementation in Prelude's private companion.
@@ -3494,6 +3499,36 @@ fn option_pmap_eq_some_simp_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {OPTION_PMAP_EQ_SOME_IFF_SIMP_1_4} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!(
+        "option_pmap_eq_some_second_simp_is_decoded_from_its_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5.to_owned()),
+        "the private companion of {OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5_MODULE} must retain \\
+         {OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5)
+        .unwrap_or_else(|| panic!("private decoder lost {OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {OPTION_PMAP_EQ_SOME_IFF_SIMP_1_5} as {} instead of Thm",
         recovered.kind_name()
     );
 }
