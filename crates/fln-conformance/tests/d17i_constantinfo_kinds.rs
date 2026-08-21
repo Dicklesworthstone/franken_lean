@@ -1640,6 +1640,10 @@ fn decoded_block_relations_agree_with_each_other() {
             );
         }
     }
+    // Decode order is not a pin law: these are collected by walking the
+    // module's constant array, and the artifact is free to order it any way.
+    // Compare as a set, keeping the equality so a new member still fails.
+    exceptions.sort();
     assert_eq!(
         exceptions, NESTED_AUXILIARY_RECURSORS,
         "the set of recursors whose rules differ from their block's constructors must be \
@@ -1753,17 +1757,22 @@ fn numeric_block_observables_agree_and_the_k_population_is_exact() {
             );
         }
     }
+    // Sorted for the same reason as above; a batch run caught this one
+    // reporting the same three names in a different order.
+    numeric_exceptions.sort();
     assert_eq!(
         numeric_exceptions, NESTED_NUMERIC_EXCEPTIONS,
         "the recursors whose numeric observables count an expanded block must be exactly the \
          named nested ones"
     );
 
-    let k_set: Vec<String> = recursors
+    let mut k_set: Vec<String> = recursors
         .iter()
         .filter(|(_, rec)| rec.k)
         .map(|(name, _)| name.clone())
         .collect();
+    // Sorted: membership is the claim, not the array's order.
+    k_set.sort();
     assert_eq!(
         k_set, K_RECURSORS,
         "K conversion is available for exactly these recursors at the pin"
@@ -1908,13 +1917,17 @@ fn the_four_quotient_constants_carry_four_distinct_kinds() {
     let lib = lib_or_skip!();
     let infos = decode_prelude_private(&lib);
 
-    let found: Vec<(String, QuotKind)> = infos
+    let mut found: Vec<(String, QuotKind)> = infos
         .iter()
         .filter_map(|info| match info {
             ConstantInfo::Quot(v) => Some((info.name().to_display_string(), v.kind)),
             _ => None,
         })
         .collect();
+    // Sorted by name: the pin's constant array does not list these
+    // alphabetically, so an order-sensitive comparison would fail on a
+    // correct decode.
+    found.sort_by(|a, b| a.0.cmp(&b.0));
     let expected: Vec<(String, QuotKind)> = QUOTIENT_CONSTANTS
         .iter()
         .map(|(name, kind)| ((*name).to_string(), *kind))
