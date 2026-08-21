@@ -1833,7 +1833,7 @@ fn init_sum_entries() -> Vec<ConstantEntry> {
             "motive", BinderInfo::Implicit, motive(), primary_pi(
                 "inl", BinderInfo::Default, inl_minor(), primary_pi(
                     "inr", BinderInfo::Default, inr_minor(), primary_pi(
-                        "t", BinderInfo::Default, sum_expr(bv(5), bv(4)), Expr::app(bv(3), bv(0)),
+                        "t", BinderInfo::Default, sum_expr(bv(4), bv(3)), Expr::app(bv(3), bv(0)),
                     ),
                 ),
             ),
@@ -1940,7 +1940,7 @@ fn init_prod_entries() -> Vec<ConstantEntry> {
         "β", BinderInfo::Implicit, right_type(), primary_pi(
             "motive", BinderInfo::Implicit, motive(), primary_pi(
                 "mk", BinderInfo::Default, minor(), primary_pi(
-                    "t", BinderInfo::Default, prod_expr(bv(4), bv(3)), Expr::app(bv(2), bv(0)),
+                    "t", BinderInfo::Default, prod_expr(bv(3), bv(2)), Expr::app(bv(2), bv(0)),
                 ),
             ),
         ),

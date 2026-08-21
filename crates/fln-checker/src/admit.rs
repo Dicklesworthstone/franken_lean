@@ -2467,8 +2467,8 @@ fn sum_recursor_type(
     let motive_type = sum_motive_type(&mut builder, sum, left_universe, right_universe, motive_universe);
     let inl_minor = sum_minor_type(&mut builder, sum, inl, left_universe, right_universe, true, 0);
     let inr_minor = sum_minor_type(&mut builder, sum, inr, left_universe, right_universe, false, 1);
-    let left = builder.bvar(5);
-    let right = builder.bvar(4);
+    let left = builder.bvar(4);
+    let right = builder.bvar(3);
     let major_type = sum_application(&mut builder, sum, left_universe, right_universe, left, right);
     let motive = builder.bvar(3);
     let major = builder.bvar(0);
@@ -2583,8 +2583,8 @@ fn prod_recursor_type(prod: &WireName, constructor: &WireName, motive_universe: 
     let right_type = builder.sort_successor_parameter(right_universe);
     let motive_type = prod_motive_type(&mut builder, prod, left_universe, right_universe, motive_universe);
     let minor = prod_minor_type(&mut builder, prod, constructor, left_universe, right_universe);
-    let left = builder.bvar(4);
-    let right = builder.bvar(3);
+    let left = builder.bvar(3);
+    let right = builder.bvar(2);
     let major_type = prod_application(&mut builder, prod, left_universe, right_universe, left, right);
     let motive = builder.bvar(2);
     let major = builder.bvar(0);
