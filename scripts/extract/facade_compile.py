@@ -1951,6 +1951,16 @@ def main():
             "REFUSE: facade manifest private-field exposure pin diverges "
             f"({json.dumps(private_fields_exposed_pin_join, sort_keys=True)})"
         )
+    structural_class_pin_join = {
+        "summary_structural_class": manifest_summary.get("structural_class"),
+        "pinned_structural_class": 14,
+    }
+    if (structural_class_pin_join["summary_structural_class"]
+            != structural_class_pin_join["pinned_structural_class"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural-class pin diverges "
+            f"({json.dumps(structural_class_pin_join, sort_keys=True)})"
+        )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
         name for name, count in manifest_name_counts.items() if count != 1
@@ -3060,6 +3070,7 @@ def main():
             transparent_explicit_value_pin_join
         ),
         "manifest_private_fields_exposed_pin_join": private_fields_exposed_pin_join,
+        "manifest_structural_class_pin_join": structural_class_pin_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
