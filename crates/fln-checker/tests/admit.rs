@@ -2957,6 +2957,17 @@ fn kr600_803_init_empty_fixture_pins_recursor_levels_motives_minors_and_rules() 
 }
 
 #[test]
+fn kr600_803_init_empty_fixture_pins_recursor_mutual_family_and_k() {
+    let entries = init_empty_entries();
+    let metadata = entries[1]
+        .declaration()
+        .recursor_metadata()
+        .expect("fixture recursor metadata");
+    assert_eq!(metadata.mutual(), &[checker_name("Empty")]);
+    assert!(!metadata.k());
+}
+
+#[test]
 fn kr600_803_init_empty_fixture_pins_eliminator_bvar_closure() {
     let entries = init_empty_entries();
     let facts = match inspect(entries[1].declaration().type_(), TermBudget::unlimited()) {
