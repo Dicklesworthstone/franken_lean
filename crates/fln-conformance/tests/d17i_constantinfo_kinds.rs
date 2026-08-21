@@ -13995,3 +13995,104 @@ fn the_import_array_is_identical_in_all_three_parts_of_every_chain() {
         "the non-exported edge count, which another cell pins independently"
     );
 }
+
+/// A shared extension block never shrinks — and between exported and server it
+/// never MOVES at all.
+///
+/// `the_axioms_extension_counts_exported_declarations_at_both_levels` checks
+/// that the private part does not shrink a block it shares with the exported
+/// one, over the five `AXIOM_WITNESS_ROWS` modules, and never looks at the
+/// server step. Widening both is a header read.
+///
+/// The corpus answer is stronger than "never shrinks", and the two steps behave
+/// differently:
+///
+///   exported → server   9,848 shared blocks, ALL EQUAL. Not one grows. The
+///                       server part adds blocks and leaves every block it
+///                       inherits byte-for-byte alone
+///   server → private    11,010 shared blocks: 9,837 equal and 1,173 grown,
+///                       none shrunk
+///   both steps          no block present at one level is missing at the next
+///
+/// So "the private part adds and never removes" is two facts, not one. The
+/// server step is an equality and the private step is a growth, and only the
+/// latter needs the weaker no-shrink phrasing. A cell that checked only
+/// exported against private would see the sum of both and could not tell which
+/// step moved anything.
+///
+/// The comparison counts cross-check against a figure this file pins elsewhere.
+/// The server step compares 9,848 blocks and the private step 11,010; the
+/// difference of 1,162 is what the server contributes, and the vocabulary cell's
+/// size classes give the same number independently — 116 + 2×209 + 3×167 +
+/// 4×28 + 5×3. Two cells reading the same array a different way agree.
+///
+/// Anti-vacuity: the 1,173 grown blocks are why "equal or grown" is not a
+/// disguised equality, and the exported-to-server equality is a claim precisely
+/// because the other step shows growth is possible.
+///
+/// Conservation first: every shared block must be classified, and the
+/// missing-block count must be zero, before either step is characterised — a
+/// block that vanished would otherwise leave the classes summing short without
+/// any class recording it.
+#[test]
+fn a_shared_extension_block_is_frozen_by_the_server_and_grown_by_the_private_part() {
+    let lib = lib_or_skip!();
+    let modules = init_modules(&lib);
+    assert_eq!(modules.len(), 600, "the Init module census must be reached");
+
+    let sizes = |view: &ModuleDataView| -> BTreeMap<String, u64> {
+        view.extensions
+            .iter()
+            .map(|block| (block.name.clone(), block.entries))
+            .collect()
+    };
+
+    let mut server_step: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut private_step: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut missing = 0usize;
+    for module in &modules {
+        let exported = sizes(&module_view(&lib, module, Level::Exported));
+        let server = sizes(&server_module_view(&lib, module));
+        let private = sizes(&module_view(&lib, module, Level::Private));
+
+        for (step, before, after) in [
+            (&mut server_step, &exported, &server),
+            (&mut private_step, &server, &private),
+        ] {
+            for (name, was) in before {
+                match after.get(name) {
+                    None => missing += 1,
+                    Some(now) if now < was => *step.entry("shrink").or_default() += 1,
+                    Some(now) if now == was => *step.entry("equal").or_default() += 1,
+                    Some(_) => *step.entry("grow").or_default() += 1,
+                }
+            }
+        }
+    }
+
+    // Conservation first: nothing vanished, so the classes are total.
+    assert_eq!(
+        missing, 0,
+        "a block present at one level must still be present at the next"
+    );
+
+    assert_eq!(
+        server_step,
+        BTreeMap::from([("equal", 9_848)]),
+        "the server part leaves every inherited block exactly as it found it"
+    );
+    assert_eq!(
+        private_step,
+        BTreeMap::from([("equal", 9_837), ("grow", 1_173)]),
+        "the private part grows blocks and never shrinks one"
+    );
+
+    // Cross-check: the gap between the two comparison counts is what the server
+    // contributes, which the vocabulary cell's size classes fix independently.
+    let compared = |step: &BTreeMap<&str, usize>| -> usize { step.values().sum() };
+    assert_eq!(
+        compared(&private_step) - compared(&server_step),
+        116 + 2 * 209 + 3 * 167 + 4 * 28 + 5 * 3,
+        "the server-added blocks, counted here as a difference and there as a distribution"
+    );
+}
