@@ -176,6 +176,11 @@ the toolchain would report a perfect facade:
     none. Rows outside the explicit-printer subset cannot lose rendering
     provenance.
 
+  * A MANIFEST-PROJECTION-CLOSURE JOIN requires every class-projection row to
+    name a structural provider and include that provider in its type
+    dependencies. Generated projections cannot lose their owning type outside
+    the demanded subset.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2177,6 +2182,42 @@ def main():
             f"({json.dumps(manifest_printer_totality_join, sort_keys=True)}, "
             f"unknown={unknown_printer_rows[:8]!r}, init={init_printer_rows[:8]!r})"
         )
+    projection_rows = [
+        row for row in manifest_rows if row.get("form") == "class-projection"
+    ]
+    providerless_projections = sorted(
+        row["name"] for row in projection_rows if not row.get("provided_by")
+    )
+    projection_provider_dependency_mismatches = sorted(
+        row["name"] for row in projection_rows
+        if row.get("provided_by") not in row.get("type_deps", [])
+    )
+    manifest_row_by_name = {row["name"]: row for row in manifest_rows}
+    projection_owner_forms = Counter(
+        manifest_row_by_name[row["provided_by"]].get("form") for row in projection_rows
+        if row.get("provided_by") in manifest_row_by_name
+    )
+    manifest_projection_closure_join = {
+        "projection_rows": len(projection_rows),
+        "structure_owners": projection_owner_forms["structure"],
+        "class_owners": projection_owner_forms["class"],
+        "providerless_rows": len(providerless_projections),
+        "provider_dependency_mismatches": len(
+            projection_provider_dependency_mismatches
+        ),
+    }
+    if (manifest_projection_closure_join["projection_rows"] == 0
+            or manifest_projection_closure_join["structure_owners"]
+            + manifest_projection_closure_join["class_owners"]
+            != manifest_projection_closure_join["projection_rows"]
+            or manifest_projection_closure_join["providerless_rows"] != 0
+            or manifest_projection_closure_join["provider_dependency_mismatches"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest projection-closure join failed "
+            f"({json.dumps(manifest_projection_closure_join, sort_keys=True)}, "
+            f"providerless={providerless_projections[:8]!r}, "
+            f"mismatches={projection_provider_dependency_mismatches[:8]!r})"
+        )
     (demand_dispositions, demand_roles, demand_emission, demand_providers,
      demand_printers, demand_type_dependencies,
      demand_level_parameters, demand_effects,
@@ -2353,6 +2394,7 @@ def main():
         "manifest_demanded_outcome_join": manifest_outcome_join,
         "manifest_negative_control_join": manifest_negative_control_join,
         "manifest_printer_totality_join": manifest_printer_totality_join,
+        "manifest_projection_closure_join": manifest_projection_closure_join,
         "checked": checked,
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
