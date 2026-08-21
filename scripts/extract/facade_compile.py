@@ -196,6 +196,10 @@ the toolchain would report a perfect facade:
     A summary cannot claim a transparent compatibility surface that its own
     manifest does not enumerate.
 
+  * A MANIFEST-STRUCTURAL JOIN binds the generator's structural and class
+    declaration totals to rows marked `structure` and `class`. A claimed
+    structural surface cannot omit a category or count it twice.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1311,6 +1315,25 @@ def main():
             "REFUSE: facade manifest transparency join disagrees with its "
             f"declaration rows ({json.dumps(transparency_join, sort_keys=True)})"
         )
+    structural_join = {
+        "structure_rows": sum(row.get("form") == "structure" for row in manifest_rows),
+        "class_rows": sum(row.get("form") == "class" for row in manifest_rows),
+        "summary_structural_declarations": manifest_summary.get(
+            "structural_declarations"
+        ),
+        "summary_structural_class": manifest_summary.get("structural_class"),
+    }
+    if (any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for count in (structural_join["summary_structural_declarations"],
+                          structural_join["summary_structural_class"]))
+            or structural_join["class_rows"]
+            != structural_join["summary_structural_class"]
+            or structural_join["structure_rows"] + structural_join["class_rows"]
+            != structural_join["summary_structural_declarations"]):
+        raise SystemExit(
+            "REFUSE: facade manifest structural join disagrees with its "
+            f"declaration rows ({json.dumps(structural_join, sort_keys=True)})"
+        )
     generator_attempts = manifest_summary.get("attempts")
     terminal_attempt = (
         generator_attempts[-1]
@@ -1486,6 +1509,7 @@ def main():
         "manifest_emitted_row_join": emitted_row_join,
         "manifest_emitted_name_join": emitted_name_join,
         "manifest_transparency_join": transparency_join,
+        "manifest_structural_join": structural_join,
         "manifest_generator_residue_join": generator_residue,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
