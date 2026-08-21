@@ -8341,3 +8341,120 @@ fn the_ctor_eliminator_family_is_paired_and_decided_by_ctor_index_and_arity() {
         "the family must span real arities, got {arities:?}"
     );
 }
+
+/// Base names whose `match_N` auxiliaries are NOT numbered contiguously from 1,
+/// with the indices that actually exist.
+const GAPPED_MATCH_FAMILIES: &[(&str, &[u32])] = &[
+    ("List.hasDecEq", &[1, 3, 5]),
+    ("String.decEq", &[1, 3]),
+    ("instDecidableEqRaw", &[1, 3]),
+];
+
+/// The two auxiliary numbering families do NOT behave the same way, and one of
+/// them has gaps — which is the failure mode this bead exists to catch.
+///
+/// `match_N` and `_proof_N` are the equation-compiler auxiliaries `franken_lean-timy`
+/// and this bead are about recovering. Nothing here reads their NUMBERING, and
+/// the numbering is exactly what an enumerator would rely on.
+///
+/// Measured over `Init/Prelude` at private level:
+///
+///   `_proof_N` covers 25 base names and every one is contiguous from 1
+///   `match_N` covers 72 base names and THREE are not — `List.hasDecEq` has
+///     1, 3, 5; `String.decEq` has 1, 3; `instDecidableEqRaw` has 1, 3
+///
+/// The consequence is concrete and is the reason this is worth pinning. Code
+/// that recovers a declaration's match auxiliaries by walking `match_1`,
+/// `match_2`, … until one is absent STOPS AT THE FIRST GAP: it finds one of
+/// three for `List.hasDecEq` and one of two for the other two, and reports
+/// success. That is a decode gap which looks like a complete answer, which is
+/// the same shape as the part-selection defect this bead started from.
+///
+/// The two families differing is what makes the check worth having as a pair.
+/// A single observation of `_proof_N` being contiguous would invite the
+/// generalisation to all auxiliaries, and that generalisation is false.
+///
+/// The three gapped bases are all decidable-equality functions. I do not claim
+/// that is the reason — three cases with a shared shape is a coincidence I
+/// cannot distinguish from a rule, and the artifact does not record why an
+/// index is skipped.
+#[test]
+fn proof_auxiliaries_are_numbered_contiguously_and_match_auxiliaries_are_not() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut matches: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut proofs: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        let Some((base, tail)) = name.rsplit_once('.') else {
+            continue;
+        };
+        for (prefix, family) in [("match_", &mut matches), ("_proof_", &mut proofs)] {
+            if let Some(digits) = tail.strip_prefix(prefix) {
+                if let Ok(index) = digits.parse::<u32>() {
+                    family.entry(base.to_owned()).or_default().insert(index);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (matches.len(), proofs.len()),
+        (72, 25),
+        "both auxiliary families must be reached"
+    );
+
+    let gapped = |family: &BTreeMap<String, BTreeSet<u32>>| -> Vec<(String, Vec<u32>)> {
+        family
+            .iter()
+            .filter(|(_, indices)| {
+                let highest = indices.iter().copied().max().unwrap_or_default();
+                indices.len() as u32 != highest
+            })
+            .map(|(base, indices)| (base.clone(), indices.iter().copied().collect()))
+            .collect()
+    };
+
+    assert!(
+        gapped(&proofs).is_empty(),
+        "every _proof_N family is numbered contiguously from 1: {:?}",
+        gapped(&proofs)
+    );
+
+    let expected: Vec<(String, Vec<u32>)> = GAPPED_MATCH_FAMILIES
+        .iter()
+        .map(|(base, indices)| ((*base).to_owned(), indices.to_vec()))
+        .collect();
+    assert_eq!(
+        gapped(&matches),
+        expected,
+        "these match_N families skip an index, so walking from 1 until absent stops early"
+    );
+
+    // The consequence, asserted rather than described: a walk from 1 recovers
+    // strictly fewer auxiliaries than exist, for each gapped base.
+    for (base, indices) in &expected {
+        let contiguous = indices
+            .iter()
+            .enumerate()
+            .take_while(|(position, index)| **index as usize == position + 1)
+            .count();
+        assert!(
+            contiguous < indices.len(),
+            "{base}: a walk from 1 must recover fewer than all {} auxiliaries",
+            indices.len()
+        );
+    }
+
+    // Non-vacuity: the contiguous majority must be real, or "three are gapped"
+    // is a statement about a tiny population.
+    assert_eq!(
+        matches.len() - expected.len(),
+        69,
+        "the contiguous match families must dominate"
+    );
+    assert!(
+        matches.values().any(|indices| indices.len() > 2),
+        "some family must have more than two members, or contiguity is trivial"
+    );
+}
