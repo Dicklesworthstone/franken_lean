@@ -199,6 +199,19 @@ open Lean in
             if let some cinfo := env.find? ctor then
               let cdeps := ",".intercalate ((cinfo.type.getUsedConstants.map toString).toList)
               IO.println s!"STRUCT\t{n}\t{iv.numParams}\t{isClass env n}\t{ctor}"
+              -- The PARAMETER binder kinds come from the structure's OWN type, not
+              -- from the constructor: Lean makes constructor parameters implicit,
+              -- so emitting `class C {m : X}` from the ctor telescope makes `C m`
+              -- "Function expected at C" (measured: 76 rows, 45 of them demanded).
+              Meta.MetaM.run' <| Meta.forallTelescopeReducing info.type fun ps _ => do
+                for i in [0:ps.size] do
+                  let pd <- ps[i]!.fvarId!.getDecl
+                  let pk := match pd.binderInfo with
+                    | BinderInfo.default => "default"
+                    | BinderInfo.implicit => "implicit"
+                    | BinderInfo.strictImplicit => "strict"
+                    | BinderInfo.instImplicit => "inst"
+                  IO.println s!"PBINDER\t{n}\t{i}\t{pk}"
               IO.println s!"DEPSC\t{n}\t{cdeps}"
               Meta.MetaM.run' <| Meta.forallTelescopeReducing cinfo.type fun xs _ => do
                 for i in [0:xs.size] do
@@ -231,7 +244,7 @@ def probe(lean, env, work, names):
         raise SystemExit(f"REFUSE: the pinned binary refused the probe:\n"
                          f"{(proc.stdout + proc.stderr)[:1200]}")
     types, typesx, levels, insts, deps, missing = {}, {}, {}, {}, {}, []
-    structs, binders = {}, defaultdict(dict)
+    structs, binders, pbinders = {}, defaultdict(dict), defaultdict(dict)
     current = None
     for line in proc.stdout.splitlines():
         if line.startswith("TYPE\t"):
@@ -255,6 +268,10 @@ def probe(lean, env, work, names):
             structs[name] = {"num_params": int(nparams),
                              "is_class": is_class == "true", "ctor": ctor}
             current = None
+        elif line.startswith("PBINDER\t"):
+            _, name, idx, kind = line.split("\t", 3)
+            pbinders[name][int(idx)] = kind
+            current = None
         elif line.startswith("BINDER\t"):
             _, name, idx, kind, user, bty = line.split("\t", 5)
             binders[name][int(idx)] = {"kind": kind, "user": user, "type": bty}
@@ -266,10 +283,34 @@ def probe(lean, env, work, names):
             d, name = current
             d[name] = d[name] + " " + line.strip()
     return (types, typesx, levels, insts, deps, missing,
-            structs, {k: v for k, v in binders.items()})
+            structs, {k: v for k, v in binders.items()},
+            {k: v for k, v in pbinders.items()})
 
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
+TOKEN = re.compile(r"(?<![\w.\u00ab\u00bb])([A-Za-z_][\w'!?]*(?:\.[A-Za-z_][\w'!?]*)*)(?![\w.])")
+
+
+def root_anchor(ty, deps):
+    """Prefix every constant occurrence in a printed type with `_root_.`.
+
+    WHY, and it is a property of a ONE-MODULE facade rather than of any row. A
+    declaration named `Lean.Syntax.reprint` resolves names in its own type with
+    `Lean.Syntax` and `Lean` open, so the printed `Option String` finds
+    `Lean.Option` — a structure — and the pin says "Function expected at Option".
+    The Reference never hits this: there, `Lean.Syntax.reprint` is elaborated in a
+    module that has not yet imported `Lean.Option`, and module order does the
+    disambiguation for free. A facade that declares the whole closure at once has
+    no module order to lean on, so every reference is anchored explicitly.
+
+    Only tokens that EXACTLY equal a constant the pin listed for this type are
+    rewritten; binder names, universe names and notation are left alone.
+    """
+    if not deps:
+        return ty
+    names = set(deps)
+    return TOKEN.sub(
+        lambda m: ("_root_." + m.group(1)) if m.group(1) in names else m.group(1), ty)
 
 
 def renderable_name(name):
@@ -299,8 +340,15 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
     itself declared, unless `Init` provides it — `import Init` is implicit in every
     non-prelude Lean file, so those constants are the shared substrate."""
     types, typesx, levels, insts, deps = {}, {}, {}, {}, {}
-    structs, binders = {}, {}
+    structs, binders, pbinders = {}, {}, {}
     known, missing, init_provided = set(), [], set()
+    # Names this function INVENTED (a structure's field projection, derived as
+    # `C.field`). A derived name the pin does not have is not a missing type: it
+    # is a PRIVATE field, whose projection the Reference does not export under
+    # that name. Refusing on it would block the facade over the pin's own access
+    # control; it is recorded as a divergence instead, because the facade's
+    # structural block DOES expose it.
+    derived, absent_projections = set(), set()
     frontier = set(demand)
     rounds = 0
     while frontier:
@@ -310,11 +358,15 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 f"REFUSE: type closure did not converge in {max_rounds} rounds "
                 f"({len(frontier)} names still unresolved) — an unconverged "
                 "closure emits a facade that silently depends on the Reference")
-        t, tx, lv, ins, dp, ms, st, bd = probe(lean, env, work, frontier)
+        t, tx, lv, ins, dp, ms, st, bd, pb = probe(lean, env, work, frontier)
         types.update(t); typesx.update(tx); levels.update(lv)
         insts.update(ins); deps.update(dp)
-        structs.update(st); binders.update(bd)
-        missing.extend(ms)
+        structs.update(st); binders.update(bd); pbinders.update(pb)
+        for m in ms:
+            if m in derived:
+                absent_projections.add(m)
+            else:
+                missing.append(m)
         known |= set(frontier)
         nxt = set()
         for name in frontier:
@@ -323,10 +375,12 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 for i, b in sorted(binders.get(name, {}).items()):
                     if i >= st["num_params"]:
                         proj = f"{name}.{b['user']}"
-                        if proj not in known:
+                        if proj not in known and proj not in absent_projections:
                             nxt.add(proj)
-                if st["ctor"] not in known:
+                            derived.add(proj)
+                if st["ctor"] not in known and st["ctor"] not in absent_projections:
                     nxt.add(st["ctor"])
+                    derived.add(st["ctor"])
             for dep in deps.get(name, ()):
                 if dep in known or dep in nxt:
                     continue
@@ -338,7 +392,7 @@ def close_over_types(lean, env, work, demand, census, max_rounds=24):
                 nxt.add(dep)
         frontier = nxt
     return (types, typesx, levels, insts, deps, missing, init_provided, rounds,
-            structs, binders)
+            structs, binders, absent_projections, pbinders)
 
 
 def order(names, deps):
@@ -387,12 +441,12 @@ HEADER = [
 ]
 
 
-def binder_text(b):
+def binder_text(b, deps):
     """Render one constructor binder. An INACCESSIBLE name (`inst✝`) cannot be
     written back as source, and a field type that mentions one cannot either — the
     caller refuses structural emission for that structure rather than emitting a
     line the pin will reject."""
-    name, ty, kind = b["user"], b["type"], b["kind"]
+    name, ty, kind = b["user"], root_anchor(b["type"], deps), b["kind"]
     if kind == "inst":
         return f"[{ty}]" if "✝" in name else f"[{name} : {ty}]"
     open_, close = {"default": ("(", ")"), "implicit": ("{", "}"),
@@ -400,7 +454,7 @@ def binder_text(b):
     return f"{open_}{name} : {ty}{close}"
 
 
-def structural_block(name, d, st, bs):
+def structural_block(name, d, st, bs, deps, pks):
     """A `class`/`structure` declaration rebuilt from the pin's own constructor
     telescope. This is the ONE thing an axiom facade cannot do: class-hood and
     field projections are structural facts, so an opaque `axiom Lean.MonadEnv`
@@ -410,17 +464,20 @@ def structural_block(name, d, st, bs):
     binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
     params, fields = [], []
     for i, b in sorted(bs.items()):
-        (params if i < st["num_params"] else fields).append(b)
+        if i < st["num_params"]:
+            params.append(dict(b, kind=pks.get(i, "default")))
+        else:
+            fields.append(b)
     if not fields:
         return None
     head = f"{keyword} {d['decl_name']}{binder}" + (
-        (" " + " ".join(binder_text(b) for b in params)) if params else "") + " where"
+        (" " + " ".join(binder_text(b, deps) for b in params)) if params else "") + " where"
     lines = [head]
     for b in fields:
         fname = renderable_name(b["user"])
         if fname is None:
             return None
-        lines.append(f"  {fname} : {b['type']}")
+        lines.append(f"  {fname} : {root_anchor(b['type'], deps)}")
     return lines
 
 
@@ -440,7 +497,7 @@ def structural_refusal(name, st, bs):
 
 
 def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
-           structural, structs, binders):
+           structural, structs, binders, deps, pbinders):
     body = [line.replace("{tag}", tag) for line in HEADER]
     line_map = {}
     emitted = []
@@ -458,7 +515,8 @@ def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
             continue
         if name in structural:
             block = structural_block(name, decl[name], structs[name],
-                                     binders.get(name, {}))
+                                     binders.get(name, {}), deps.get(name, ()),
+                                     pbinders.get(name, {}))
             d = decl[name]
             body.append(f"-- role={d['role']} bucket={d['bucket']} "
                         f"structural={'class' if structs[name]['is_class'] else 'structure'} "
@@ -472,6 +530,7 @@ def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
         ty = d["typex"] if name in explicit_for else d["type"]
         if ty is None:
             continue
+        ty = root_anchor(ty, deps.get(name, ()))
         body.append(f"-- role={d['role']} bucket={d['bucket']} effect={d['effect']} "
                     f"module={d['module']}" + (" pp=explicit" if name in explicit_for else ""))
         binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
@@ -531,7 +590,8 @@ def main():
         raise SystemExit("REFUSE: every demanded symbol is Init-provided — there "
                          "would be no facade left to emit")
     (types, typesx, levels, insts, deps, missing, init_provided, rounds,
-     structs, binders) = close_over_types(lean, env, work, facade_demand, census)
+     structs, binders, absent_projections, pbinders) = close_over_types(
+        lean, env, work, facade_demand, census)
     if missing:
         raise SystemExit(
             "REFUSE: the pinned environment has no type for "
@@ -579,7 +639,7 @@ def main():
     for attempt in range(1, args.max_attempts + 1):
         text, line_map, emitted, attr_count, provided = render(
             tag, ordered, decl, explicit_for, quarantine, dropped_attrs,
-            structural, structs, binders)
+            structural, structs, binders, deps, pbinders)
         candidate = args.out + ".candidate.lean"
         with open(candidate, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -683,6 +743,13 @@ def main():
         "uncensused_emitted": sum(1 for n in emitted if decl[n]["role"] == "uncensused-closure"),
         "init_provided": len(init_provided),
         "structural_declarations": len(structural),
+        "private_fields_exposed": sum(
+            1 for c in structural
+            for i, b in binders.get(c, {}).items()
+            if i >= structs[c]["num_params"] and f"{c}.{b['user']}" in absent_projections),
+        "private_fields_note": "the Reference does not export a projection for these "
+            "fields; the facade's structural block does, which is a PERMISSIVE "
+            "divergence — a probe can resolve a name the Reference would refuse",
         "structural_class": sum(1 for n in structural if structs[n]["is_class"]),
         "structural_refused": len(structural_refused),
         "class_provided_projections": len(provided),
