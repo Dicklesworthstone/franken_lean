@@ -1,0 +1,561 @@
+#!/usr/bin/env -S python3 -I -S
+"""The STANDALONE Mirror facade module (bead `fln-l8f`, G0-8 acceptance b; plan
+§4.3, risk R1, OQ-3).
+
+WHY A SECOND EMITTER BESIDE scripts/extract/facade_stubs.py. That one answers
+"does the pin re-accept the type it printed for each demanded symbol" — it emits
+`axiom Lean_Meta_inferType : ...` inside `namespace FlnFacade` and it opens with
+`import Lean`, so the REAL toolchain is linked while the stubs are checked. That is
+a real check of the printed types and it is NOT a facade: no mathlib file can be
+compiled against it, because every name it declares is mangled and every type it
+mentions is served by the very toolchain the facade is supposed to replace.
+
+This emitter produces the other artifact: declarations at their TRUE qualified
+names, in one module that has NO `import Lean`, closed under type-level
+dependencies so it stands alone against `Init` only. That is the object acceptance
+(b) needs — the thing a curated mathlib metaprogram file's toolchain demand can be
+checked against with no Reference `Lean.*` in scope at all.
+
+WHAT IT IS NOT, stated here so the artifact is never read as more than it is:
+
+  * An axiom carries a TYPE and no VALUE, so the facade is opaque where the
+    Reference is transparent. `Lean.Meta.MetaM` as an axiom does not unfold to its
+    reader/state stack, so anything that needs that defeq fails against this
+    facade. Those failures are the spike's measurement, not its defect: they are
+    exactly the rows a native mirror must implement rather than declare.
+  * Constants defined under `Init` are NOT declared: every Lean file that is not
+    `prelude` imports `Init` implicitly, so they are the substrate both sides
+    share. Everything else in the closure is declared, and closure members outside
+    the demanded toolchain-api surface are labelled `substrate` in the manifest
+    rather than being silently counted as facade coverage.
+  * Universe parameters are emitted from `levelParams`; a polymorphic constant
+    whose binders are dropped elaborates as a different declaration.
+
+Outputs: the Lean module, and a manifest NDJSON (fln-facade-module/1) carrying one
+row per declaration with its role, partition, census facts and printed signature.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+RESISTANCE = os.path.join(REPO, "contracts", "facade_resistance.ndjson")
+ENV_SHARDS = [
+    os.path.join(REPO, "contracts", "builtin_environment.tsv"),
+    os.path.join(REPO, "contracts", "builtin_environment.001.tsv"),
+    os.path.join(REPO, "contracts", "builtin_environment.002.tsv"),
+]
+SCHEMA = "fln-facade-module/1"
+COLS = [
+    "key", "display", "kind", "module", "levels", "arity", "telescope",
+    "sig_root", "res_root", "res_head", "safety", "attrs", "extern",
+    "impl_by", "effect",
+]
+
+
+def unquote(v):
+    return v[1:-1] if len(v) >= 2 and v[0] == '"' and v[-1] == '"' else v
+
+
+def dotted(structural):
+    """Decode the census's structural Name encoding into a dotted name.
+
+    `a/s\"Lean\"/s\"Meta\"/s\"Basic\"` -> `Lean.Meta.Basic`. Numeric components
+    (`/n3`) are kept as numerals; collapsing them into strings is the f6br defect
+    this project has already paid for once.
+    """
+    parts = []
+    for comp in structural.split("/")[1:]:
+        if comp.startswith('s\\"') and comp.endswith('\\"'):
+            parts.append(comp[3:-2])
+        elif comp.startswith('s"') and comp.endswith('"'):
+            parts.append(comp[2:-1])
+        elif comp.startswith("n"):
+            parts.append(comp[1:])
+        else:
+            return None
+    return ".".join(parts) if parts else None
+
+
+def pinned_lean():
+    with open(os.path.join(REPO, "SUITE.lock"), encoding="utf-8") as fh:
+        lock = fh.read()
+    tag = None
+    for line in lock.splitlines():
+        if line.startswith("reference "):
+            for field in line.split():
+                if field.startswith("tag="):
+                    tag = field[4:]
+    if not tag:
+        raise SystemExit("REFUSE: SUITE.lock has no Reference tag")
+    path = os.path.join(
+        os.path.expanduser("~"), ".elan", "toolchains",
+        f"leanprover--lean4---{tag}", "bin", "lean",
+    )
+    if not os.path.isfile(path):
+        raise SystemExit(f"SKIP: pinned Reference not installed at {path}")
+    return path, tag
+
+
+def load_census():
+    """display-name -> census facts, with the shard-completeness refusal.
+
+    Reading one shard of three once manufactured phantom orphans for the
+    resistance census; the same trap here would silently declare a closure member
+    `Init`-provided (it has no row, so no module) and drop it from the facade.
+    """
+    facts = {}
+    declared = observed = 0
+    for shard in ENV_SHARDS:
+        if not os.path.isfile(shard):
+            raise SystemExit(f"REFUSE: census shard absent: {shard}")
+        with open(shard, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("constant_count\t"):
+                    declared = max(declared, int(line.split("\t")[1]))
+                if not line.startswith("observed\t"):
+                    continue
+                observed += 1
+                cols = line.rstrip("\n").split("\t")[1:]
+                row = {k: unquote(v) for k, v in zip(COLS, cols)}
+                facts[row["display"]] = row
+    if observed != declared:
+        raise SystemExit(
+            f"REFUSE: {observed} observed census rows against a declared "
+            f"constant_count of {declared} — a partial census would misreport "
+            "closure members as Init-provided and drop them from the facade")
+    return facts
+
+
+def demanded_symbols():
+    """Toolchain-API symbol rows of the resistance census.
+
+    Tolerates both the pre- and post-totality shapes of fln-facade-resistance/1:
+    when a row carries no `partition` field every symbol row is toolchain-api by
+    construction (that artifact contained nothing else), and when it does, only
+    the toolchain-api rows define the facade surface.
+    """
+    rows = []
+    with open(RESISTANCE, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"REFUSE: {RESISTANCE}:{lineno} is not JSON ({exc})") from exc
+            if row.get("kind") != "symbol":
+                continue
+            if row.get("partition", "toolchain-api") != "toolchain-api":
+                continue
+            rows.append(row)
+    if not rows:
+        raise SystemExit(
+            "REFUSE: no toolchain-api symbol rows in the resistance census — an "
+            "empty facade would compile every probe vacuously")
+    return {r["name"]: r for r in rows}
+
+
+PROBE = r'''import Lean
+open Lean in
+#eval show CoreM Unit from do
+  let txt <- IO.FS.readFile "@NAMES@"
+  let names := ((txt.splitOn "\n").filter (fun s => s != "")).map String.toName
+  let env <- getEnv
+  for n in names do
+    match env.find? n with
+    | some info =>
+      let fmt <- Meta.MetaM.run' (withOptions
+        (fun o => o.setBool `pp.fullNames true) (Meta.ppExpr info.type))
+      let fmtx <- Meta.MetaM.run' (withOptions
+        (fun o => (o.setBool `pp.fullNames true).setBool `pp.explicit true)
+        (Meta.ppExpr info.type))
+      let inst <- Meta.isInstance n
+      let lvls := ",".intercalate (info.levelParams.map toString)
+      let deps := ",".intercalate ((info.type.getUsedConstants.map toString).toList)
+      IO.println s!"TYPE\t{n}\t{lvls}\t{inst}\t{fmt}"
+      IO.println s!"TYPEX\t{n}\t{fmtx}"
+      IO.println s!"DEPS\t{n}\t{deps}"
+    | none => IO.println s!"MISSING\t{n}"
+'''
+
+
+def probe(lean, env, work, names):
+    """Ask the pin for the printed type, universes, instance flag and type-level
+    dependencies of each name. Multi-line pp output is rejoined here: the printer
+    wraps at its own width, and a probe that pins a width is responsible for an
+    option name the pin can move."""
+    names_path = os.path.join(work, "names.txt")
+    with open(names_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(sorted(names)) + "\n")
+    src = os.path.join(work, "probe.lean")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(PROBE.replace("@NAMES@", names_path))
+    proc = subprocess.run([lean, src], capture_output=True, text=True, env=env, timeout=1800)
+    if proc.returncode != 0:
+        raise SystemExit(f"REFUSE: the pinned binary refused the probe:\n"
+                         f"{(proc.stdout + proc.stderr)[:1200]}")
+    types, typesx, levels, insts, deps, missing = {}, {}, {}, {}, {}, []
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("TYPE\t"):
+            _, name, lvls, inst, ty = line.split("\t", 4)
+            types[name], levels[name], insts[name] = ty, lvls, inst == "true"
+            current = (types, name)
+        elif line.startswith("TYPEX\t"):
+            _, name, ty = line.split("\t", 2)
+            typesx[name] = ty
+            current = (typesx, name)
+        elif line.startswith("DEPS\t"):
+            _, name, dep_csv = line.split("\t", 2)
+            deps[name] = [d for d in dep_csv.split(",") if d]
+            current = None
+        elif line.startswith("MISSING\t"):
+            missing.append(line.split("\t", 1)[1])
+            current = None
+        elif current is not None and line.strip():
+            d, name = current
+            d[name] = d[name] + " " + line.strip()
+    return types, typesx, levels, insts, deps, missing
+
+
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_'!?]*$")
+
+
+def renderable_name(name):
+    """A declaration name the facade can actually declare.
+
+    A numeric component (`Foo.1`, hygiene residue) is not a declarable name; such
+    a closure member is quarantined with its reason rather than emitted as a
+    line the pin will reject.
+    """
+    comps = name.split(".")
+    if not comps or any(c == "" for c in comps):
+        return None
+    out = []
+    for c in comps:
+        if IDENT.match(c):
+            out.append(c)
+        elif c.isdigit():
+            return None
+        else:
+            out.append("«" + c + "»")
+    return ".".join(out)
+
+
+def close_over_types(lean, env, work, demand, census, max_rounds=8):
+    """Fixpoint: a facade that mentions a type it does not declare is not
+    standalone. Round after round, every constant appearing in a declared type is
+    itself declared, unless `Init` provides it — `import Init` is implicit in every
+    non-prelude Lean file, so those constants are the shared substrate."""
+    types, typesx, levels, insts, deps = {}, {}, {}, {}, {}
+    known, missing, init_provided = set(), [], set()
+    frontier = set(demand)
+    rounds = 0
+    while frontier:
+        rounds += 1
+        if rounds > max_rounds:
+            raise SystemExit(
+                f"REFUSE: type closure did not converge in {max_rounds} rounds "
+                f"({len(frontier)} names still unresolved) — an unconverged "
+                "closure emits a facade that silently depends on the Reference")
+        t, tx, lv, ins, dp, ms = probe(lean, env, work, frontier)
+        types.update(t); typesx.update(tx); levels.update(lv)
+        insts.update(ins); deps.update(dp)
+        missing.extend(ms)
+        known |= set(frontier)
+        nxt = set()
+        for name in frontier:
+            for dep in deps.get(name, ()):
+                if dep in known or dep in nxt:
+                    continue
+                row = census.get(dep)
+                mod = dotted(row["module"]) if row and row.get("module") else None
+                if mod is not None and (mod == "Init" or mod.startswith("Init.")):
+                    init_provided.add(dep)
+                    continue
+                nxt.add(dep)
+        frontier = nxt
+    return types, typesx, levels, insts, deps, missing, init_provided, rounds
+
+
+def order(names, deps):
+    """Wave-based Kahn with a declared tie-break (name), so the emitted order is
+    deterministic. A cycle is disclosed as residue and appended in name order —
+    never silently linearized into a false ordering claim."""
+    pending = set(names)
+    edges = {n: {d for d in deps.get(n, ()) if d in pending and d != n} for n in pending}
+    ordered, residue = [], []
+    while pending:
+        wave = sorted(n for n in pending if not (edges[n] - set(ordered)))
+        if not wave:
+            residue = sorted(pending)
+            ordered.extend(residue)
+            break
+        ordered.extend(wave)
+        pending -= set(wave)
+    return ordered, residue
+
+
+HEADER = [
+    "-- GENERATED by scripts/extract/facade_module.py from the pinned Reference",
+    "-- ({tag}) — the STANDALONE Mirror facade for the demanded toolchain surface",
+    "-- (bead fln-l8f, G0-8 acceptance b). DO NOT EDIT.",
+    "--",
+    "-- There is deliberately NO `import Lean` here. A facade that imports the",
+    "-- Reference is checked against the very toolchain it stands in for, and every",
+    "-- name it appears to serve is really served by the import. This module names",
+    "-- its declarations exactly as the Reference does and closes over its own",
+    "-- type-level dependencies, so a probe compiled against it alone is compiled",
+    "-- against no Reference `Lean.*` at all.",
+    "--",
+    "-- `Init` is the shared substrate: every non-prelude Lean file imports it",
+    "-- implicitly, so Init-defined constants are not redeclared here. Closure",
+    "-- members outside the demanded toolchain-api surface are marked role=substrate",
+    "-- in contracts/facade_module.ndjson and are not counted as facade coverage.",
+    "--",
+    "-- Each declaration is an `axiom`: a TYPE with no VALUE. The facade is",
+    "-- therefore opaque exactly where the Reference is transparent, and anything",
+    "-- that needs a definitional unfolding fails against it. Those failures are",
+    "-- this spike's measurement of what a native mirror must implement rather",
+    "-- than declare — see contracts/facade_compile.ndjson.",
+    "set_option autoImplicit false",
+    "set_option maxRecDepth 8000",
+    "",
+]
+
+
+def render(tag, ordered, decl, explicit_for, quarantine, dropped_attrs):
+    body = [line.replace("{tag}", tag) for line in HEADER]
+    line_map = {}
+    emitted = []
+    for name in ordered:
+        if name in quarantine:
+            continue
+        d = decl[name]
+        ty = d["typex"] if name in explicit_for else d["type"]
+        if ty is None:
+            continue
+        body.append(f"-- role={d['role']} bucket={d['bucket']} effect={d['effect']} "
+                    f"module={d['module']}" + (" pp=explicit" if name in explicit_for else ""))
+        binder = "" if not d["levels"] else ".{" + d["levels"].replace(",", ", ") + "}"
+        body.append(f"axiom {d['decl_name']}{binder} : {ty}")
+        line_map[len(body)] = ("axiom", name)
+        emitted.append(name)
+    body.append("")
+    attrs = 0
+    for name in ordered:
+        d = decl[name]
+        if name in quarantine or not d["instance"] or name in dropped_attrs:
+            continue
+        body.append(f"attribute [instance] {d['decl_name']}")
+        line_map[len(body)] = ("attr", name)
+        attrs += 1
+    for name in sorted(quarantine):
+        body.append(f"-- QUARANTINED {name}: {quarantine[name]}")
+    return "\n".join(body) + "\n", line_map, emitted, attrs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="the generated Lean facade module")
+    ap.add_argument("--manifest", required=True, help="fln-facade-module/1 NDJSON")
+    ap.add_argument("--max-attempts", type=int, default=6)
+    args = ap.parse_args()
+
+    lean, tag = pinned_lean()
+    census = load_census()
+    demand = demanded_symbols()
+    work = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"fln-l8f-facade-{os.getpid()}")
+    os.makedirs(work, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in ("LEAN_PATH", "LEAN_SYSROOT")}
+    env["LC_ALL"] = "C"
+
+    # The Init test applies to the DEMAND too, not only to the closure. A
+    # demanded symbol whose census module sits under Init is served by the shared
+    # prelude: `axiom Array.push` is not a facade row, it is a redeclaration error
+    # (measured: 163 of 560 demanded rows are Init-defined).
+    init_demanded = set()
+    for name in list(demand):
+        row = census.get(name)
+        mod = dotted(row["module"]) if row and row.get("module") else None
+        if mod is not None and (mod == "Init" or mod.startswith("Init.")):
+            init_demanded.add(name)
+    facade_demand = set(demand) - init_demanded
+    if not facade_demand:
+        raise SystemExit("REFUSE: every demanded symbol is Init-provided — there "
+                         "would be no facade left to emit")
+    types, typesx, levels, insts, deps, missing, init_provided, rounds = close_over_types(
+        lean, env, work, facade_demand, census)
+    if missing:
+        raise SystemExit(
+            "REFUSE: the pinned environment has no type for "
+            f"{sorted(set(missing))[:8]} — no partial facade is emitted")
+
+    decl, quarantine = {}, {}
+    for name in sorted(types):
+        row = census.get(name)
+        module = dotted(row["module"]) if row and row.get("module") else None
+        dn = renderable_name(name)
+        if dn is None:
+            quarantine[name] = "name has a component the facade cannot declare"
+        decl[name] = {
+            "decl_name": dn or name,
+            "type": types[name],
+            "typex": typesx.get(name),
+            "levels": levels.get(name, ""),
+            "instance": insts.get(name, False),
+            "role": "demanded" if name in demand else (
+                "substrate" if row is not None else "uncensused-closure"),
+            "bucket": demand[name]["bucket"] if name in demand else "-",
+            "effect": (row or {}).get("effect", "-"),
+            "safety": (row or {}).get("safety", "-"),
+            "module": module or "-",
+            "census": row is not None,
+        }
+
+    ordered, cycle_residue = order(list(types), deps)
+    explicit_for, dropped_attrs, attr_reason = set(), set(), {}
+    text = line_map = emitted = None
+    attempts = []
+    for attempt in range(1, args.max_attempts + 1):
+        text, line_map, emitted, attr_count = render(
+            tag, ordered, decl, explicit_for, quarantine, dropped_attrs)
+        candidate = args.out + ".candidate.lean"
+        with open(candidate, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        proc = subprocess.run([lean, "-DmaxErrors=4000", candidate],
+                              capture_output=True, text=True, env=env, timeout=1800)
+        out = proc.stdout + proc.stderr
+        errors = len(re.findall(r"\.candidate\.lean:\d+:\d+: error", out))
+        attempts.append({"attempt": attempt, "emitted": len(emitted),
+                         "attributes": attr_count, "errors": errors,
+                         "quarantined": len(quarantine)})
+        if proc.returncode == 0:
+            os.replace(candidate, args.out)
+            break
+        blamed_axioms, blamed_attrs, blame_msg = set(), set(), {}
+        for m in re.finditer(r"\.candidate\.lean:(\d+):\d+: error(?:\(([^)]*)\))?: (.*)", out):
+            hit = line_map.get(int(m.group(1)))
+            if hit is None:
+                continue
+            (blamed_attrs if hit[0] == "attr" else blamed_axioms).add(hit[1])
+            blame_msg[hit[1]] = ((m.group(2) or "-") + ": " + m.group(3))[:220]
+        for m in re.finditer(r"\.candidate\.lean:(\d+):", out):
+            hit = line_map.get(int(m.group(1)))
+            if hit is not None:
+                (blamed_attrs if hit[0] == "attr" else blamed_axioms).add(hit[1])
+        if not blamed_axioms and not blamed_attrs:
+            raise SystemExit(
+                f"REFUSE: elaboration failed but no error line maps to a "
+                f"declaration (candidate kept at {candidate}):\n{out[:1500]}")
+        progressed = False
+        # An instance registration the facade cannot reproduce is a FINDING: the
+        # class itself is an opaque axiom here, so `attribute [instance]` has no
+        # class to attach to. Drop it and record it; never silently keep a green.
+        for name in blamed_attrs - dropped_attrs:
+            dropped_attrs.add(name)
+            attr_reason[name] = blame_msg.get(name, "-")
+            progressed = True
+        # A type that does not round-trip readably gets the explicit printer once;
+        # if it still fails it is quarantined with its reason, and the anti-vacuity
+        # floor below stops a facade from quarantining its way to green.
+        for name in blamed_axioms:
+            # `X has already been declared` is not a broken stub: it is the
+            # implicitly imported Init substrate ALREADY serving that symbol. The
+            # facade must not redeclare it, and counting it as a failed stub would
+            # understate coverage by exactly the size of the prelude.
+            if "already been declared" in blame_msg.get(name, ""):
+                if name not in quarantine:
+                    quarantine[name] = "provided by the implicitly imported Init substrate"
+                    decl[name]["role"] = "init-substrate"
+                    progressed = True
+                continue
+            if name not in explicit_for and decl[name]["typex"]:
+                explicit_for.add(name)
+                progressed = True
+            elif name not in quarantine:
+                quarantine[name] = "printed type is not re-acceptable by the pin"
+                progressed = True
+        if not progressed:
+            raise SystemExit(
+                f"REFUSE: no repair left for {sorted(blamed_axioms | blamed_attrs)[:8]} "
+                f"(candidate kept at {candidate})")
+    else:
+        raise SystemExit(
+            f"REFUSE: the facade did not converge in {args.max_attempts} attempts")
+
+    covered = [n for n in emitted if decl[n]["role"] == "demanded"]
+    if len(covered) < 0.5 * len(facade_demand):
+        raise SystemExit(
+            f"REFUSE: only {len(covered)} of {len(facade_demand)} demanded symbols survive "
+            "in the facade — a facade that quarantines its way to a green is not a "
+            "facade, and this artifact will not land")
+
+    rows = [{
+        "schema": SCHEMA, "kind": "summary", "pin": tag,
+        "claim_class": "bounded_model",
+        "demanded": len(demand), "demanded_emitted": len(covered),
+        "demanded_init_substrate": len(init_demanded),
+        "facade_demand": len(facade_demand),
+        "closure_rounds": rounds, "declarations_emitted": len(emitted),
+        "substrate_emitted": sum(1 for n in emitted if decl[n]["role"] == "substrate"),
+        "uncensused_emitted": sum(1 for n in emitted if decl[n]["role"] == "uncensused-closure"),
+        "init_provided": len(init_provided),
+        "instance_attrs_kept": sum(1 for n in emitted
+                                   if decl[n]["instance"] and n not in dropped_attrs),
+        "instance_attrs_dropped": len(dropped_attrs),
+        "explicit_printer": len(explicit_for),
+        "quarantined": len(quarantine),
+        "cycle_residue": len(cycle_residue),
+        "attempts": attempts,
+        "imports_reference": False,
+        "bound": "an axiom facade declares types and no values: it is opaque where "
+                 "the Reference is transparent, and elaboration against it proves "
+                 "name/type availability, never semantic parity",
+    }]
+    for name in ordered:
+        d = decl[name]
+        rows.append({
+            "schema": SCHEMA, "kind": "decl", "name": name, "role": d["role"],
+            "bucket": d["bucket"], "effect": d["effect"], "safety": d["safety"],
+            "module": d["module"], "level_params": d["levels"].split(",") if d["levels"] else [],
+            "instance": d["instance"],
+            "instance_registered": bool(d["instance"]) and name not in dropped_attrs,
+            "instance_drop_reason": attr_reason.get(name),
+            "emitted": name not in quarantine,
+            "quarantine_reason": quarantine.get(name),
+            "printer": "pp.explicit" if name in explicit_for else "pp.fullNames",
+            "signature": (d["typex"] if name in explicit_for else d["type"]),
+            "type_deps": sorted(deps.get(name, ())),
+        })
+    for name in sorted(init_demanded):
+        rows.append({"schema": SCHEMA, "kind": "decl", "name": name,
+                     "role": "init-substrate", "emitted": False,
+                     "bucket": demand[name]["bucket"],
+                     "module": (dotted(census[name]["module"])
+                                if name in census and census[name].get("module") else "-"),
+                     "quarantine_reason": "demanded, and defined under Init: the "
+                     "shared prelude already provides it, so the facade must not "
+                     "redeclare it"})
+    for name in sorted(init_provided):
+        rows.append({"schema": SCHEMA, "kind": "init-substrate", "name": name,
+                     "reason": "defined under Init; implicitly imported by every "
+                               "non-prelude module, so both sides share it"})
+    tmp = args.manifest + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    os.replace(tmp, args.manifest)
+    print(f"facade-module: demanded={len(demand)} init_substrate={len(init_demanded)} "
+          f"facade_demand={len(facade_demand)} emitted={len(emitted)} "
+          f"covered={len(covered)} substrate={rows[0]['substrate_emitted']} "
+          f"init={len(init_provided)} attrs_kept={rows[0]['instance_attrs_kept']} "
+          f"attrs_dropped={len(dropped_attrs)} quarantined={len(quarantine)} "
+          f"rounds={rounds} attempts={len(attempts)}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
