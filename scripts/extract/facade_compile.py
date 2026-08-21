@@ -162,6 +162,10 @@ the toolchain would report a perfect facade:
     terminal generator attempt with zero errors. The facade cannot advertise a
     clean emitted surface while its recorded generation remains unresolved.
 
+  * A MANIFEST-ATTEMPT-FINALIZATION JOIN requires the terminal zero-error
+    attempt's quarantine count to equal the manifest's published quarantine
+    count. A clean final attempt cannot be paired with a stale outcome summary.
+
   * A MANIFEST-INPUT-DIGEST JOIN recomputes every extraction-input hash named by
     the facade manifest. Pin-derived provenance cannot be a self-reported list
     detached from the actual census and resistance inputs.
@@ -2079,6 +2083,24 @@ def main():
             "REFUSE: facade manifest generator-residue join failed "
             f"({json.dumps(generator_residue, sort_keys=True)})"
         )
+    attempt_finalization_join = {
+        "attempts": len(generator_attempts),
+        "terminal_quarantined": (
+            terminal_attempt.get("quarantined")
+            if isinstance(terminal_attempt, dict) else None
+        ),
+        "summary_quarantined": manifest_summary.get("quarantined"),
+    }
+    if (attempt_finalization_join["attempts"] == 0
+            or any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+                   for count in (attempt_finalization_join["terminal_quarantined"],
+                                 attempt_finalization_join["summary_quarantined"]))
+            or attempt_finalization_join["terminal_quarantined"]
+            != attempt_finalization_join["summary_quarantined"]):
+        raise SystemExit(
+            "REFUSE: facade manifest attempt-finalization join disagrees with its "
+            f"summary ({json.dumps(attempt_finalization_join, sort_keys=True)})"
+        )
     manifest_input_digest_join = join_manifest_input_digests(manifest_summary)
     resistance_demand_join = join_resistance_demand(manifest_summary, module_join)
     manifest_outcome_join = join_manifest_demanded_outcomes(
@@ -2256,6 +2278,7 @@ def main():
         "manifest_printer_join": printer_join,
         "manifest_structural_refusal_join": structural_refusal_join,
         "manifest_generator_residue_join": generator_residue,
+        "manifest_attempt_finalization_join": attempt_finalization_join,
         "manifest_input_digest_join": manifest_input_digest_join,
         "resistance_demand_join": resistance_demand_join,
         "manifest_demanded_outcome_join": manifest_outcome_join,
