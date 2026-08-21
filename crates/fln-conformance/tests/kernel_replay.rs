@@ -17132,6 +17132,28 @@ fn corpus_census_keeps_disclosing_its_claim_class() {
         .find("fn corpus_census_keeps_disclosing_its_claim_class")
         .expect("the guard must be able to locate its own definition");
     let census = &SOURCE[..guard];
+    // THE SPLIT IS DEMONSTRATED, NOT ASSUMED. The size floor below proves the
+    // region is BIG; it says nothing about whether the region still contains
+    // this guard, which is the one property the split exists for. A split that
+    // silently kept the guard's own body would let every assertion here be
+    // satisfied by its own assertion text -- the self-match this file's comment
+    // three lines down says has already bitten it four times, and the size floor
+    // passes at full file size most comfortably of all.
+    //
+    // The marker below lives inside this function, so it sits AFTER the split
+    // point and must not appear in the region before it. Confirmed absent from
+    // the rest of the file before it was chosen.
+    const SELF_EXCLUSION_DECOY: &str = "corpus-census-self-exclusion-decoy-9d3f";
+    assert!(
+        SOURCE.contains(SELF_EXCLUSION_DECOY),
+        "the decoy must exist in the file, or its absence from the search region below proves \
+         nothing at all -- a typo here would make the next assertion pass forever"
+    );
+    assert!(
+        !census.contains(SELF_EXCLUSION_DECOY),
+        "the search region still contains this guard's own body, so every check below can be \
+         satisfied by the text of the checks themselves"
+    );
     assert!(
         census.len() > 100_000,
         "search region collapsed to {} bytes, so the self-exclusion split is wrong and \
