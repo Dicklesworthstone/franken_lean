@@ -401,6 +401,17 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         "both check-olean JSON render paths keep K2 unchecked in concat-item strings",
     );
     assert_eq!(
+        cli_source_lines
+            .iter()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with('"') && line.contains(r#"\"companionPartsLoaded\":"#)
+            })
+            .count(),
+        2,
+        "both check-olean JSON render paths emit companion-parts loading in concat-item strings",
+    );
+    assert_eq!(
         [
             cli_source_lines
                 .windows(2)
