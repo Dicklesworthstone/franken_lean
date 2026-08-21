@@ -5208,6 +5208,29 @@ fn write_inventory_fixture_with(
         panic!("fixture name `{versioned_name}` {fault}");
     }
 
+    // THE RECORD'S SUFFIX IS RESERVED, BECAUSE A TREE AND A RECORD SHARE ONE
+    // DIRECTORY. The shape record for `X` is `<tmp>/X.manifest`, which is
+    // exactly where a fixture NAMED `X.manifest` would put its tree. Both names
+    // pass every rule above -- each is one ordinary component, spelled as one --
+    // and the two objects then fight over one path.
+    //
+    // Which failure you get depends on build order, which is the tell that this
+    // is a naming problem and not a filesystem one. Build `X` first and the
+    // record is a file, so the other fixture's `create_dir_all` dies with a raw
+    // `Not a directory`. Build `X.manifest` first and the record path is a
+    // directory, so `X`'s record read fails and is refused as unreadable -- true,
+    // and pointing at the wrong cause.
+    //
+    // A STRING SUFFIX IS THE RIGHT SUBJECT HERE, unlike everywhere else in this
+    // function. The record path is FORMATTED from the name, so what collides is
+    // the spelling, not a path component.
+    assert!(
+        !versioned_name.ends_with(".manifest"),
+        "fixture name `{versioned_name}` ends with the suffix the shape record uses, so this \
+         fixture's TREE would sit exactly where another fixture's record does. Which of the two \
+         fails, and how, would depend on which was built first"
+    );
+
     // `relative_files` IS A PROMISE THE PARAMETER'S NAME MAKES AND NOTHING KEPT.
     // `Path::join` obeys the caller, not the name: an entry beginning with `/`
     // DISCARDS the base entirely and lands wherever it says -- outside
@@ -6879,6 +6902,91 @@ fn a_shape_record_that_cannot_be_read_is_not_an_absent_one() {
     assert!(
         fresh.join("Any.olean").is_file(),
         "a fixture with no record yet is an ordinary first build and must proceed"
+    );
+}
+
+/// A fixture's TREE must not be another fixture's shape RECORD.
+///
+/// **One directory holds both kinds of object.** The record for `X` is
+/// `<tmp>/X.manifest`; a fixture named `X.manifest` would put its tree at that
+/// same path. Both names satisfy every naming rule -- one ordinary component,
+/// spelled as one -- so nothing stopped them, and the two objects then fight
+/// over one path.
+///
+/// **The collision is computed here, not asserted from memory.** The test builds
+/// an ordinary fixture, reads back where its record actually went, and requires
+/// the reserved name to be exactly that path's file name. If the record's naming
+/// scheme ever changes, this test stops agreeing with itself instead of
+/// continuing to guard a path nothing uses.
+///
+/// **Order decides which failure you see, which is the tell.** Build `X` first
+/// and the record is a file, so the other fixture's `create_dir_all` dies with a
+/// raw `Not a directory`. Build `X.manifest` first and the record path is a
+/// directory, so `X`'s record read fails and is refused as unreadable -- true,
+/// and pointing at the wrong cause. A naming problem should not be diagnosed by
+/// whichever test happened to run first.
+///
+/// **The green control is the one a `contains` implementation fails.** A name
+/// that merely mentions the word must still build; only the suffix is reserved.
+#[test]
+fn a_fixture_tree_may_not_sit_where_another_fixtures_record_does() {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+
+    // WHERE THE RECORD ACTUALLY GOES, read off a real build rather than assumed.
+    const OWNER: &str = "t6r7-selftest-reserved-v1";
+    write_inventory_fixture(OWNER, &["Any.olean"]);
+    let record = tmp.join(format!("{OWNER}.manifest"));
+    assert!(
+        record.is_file(),
+        "the owning fixture's record must exist for this collision to be real: {}",
+        record.display()
+    );
+    let reserved = record
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("the record path has no usable file name"))
+        .to_string();
+
+    // GREEN CONTROL FIRST: mentioning the word is not the same as ending with
+    // it. A rule written with `contains` would refuse this.
+    let ok = write_inventory_fixture("t6r7-manifest-ish-v1", &["Any.olean"]);
+    assert!(
+        ok.join("Any.olean").is_file(),
+        "a name that merely mentions the record's word must still build"
+    );
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| write_inventory_fixture(&reserved, &["Any.olean"]));
+    std::panic::set_hook(previous);
+
+    let payload = outcome.err().unwrap_or_else(|| {
+        panic!("`{reserved}` would put its tree on top of `{OWNER}`'s record and must be refused")
+    });
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        message.contains("shape record uses"),
+        "the refusal must be about the reserved suffix, not about the name's shape: {message}"
+    );
+    assert!(
+        message.contains(&reserved),
+        "the refusal must name the fixture it is about: {message}"
+    );
+
+    // AND THE OWNER'S RECORD IS UNTOUCHED. A refusal that arrived after
+    // `create_dir_all` would have replaced a working fixture's record with a
+    // directory.
+    assert!(
+        record.is_file(),
+        "the owning fixture's record is no longer a file; the refusal came too late"
+    );
+    assert!(
+        !tmp.join(&reserved).is_dir(),
+        "a tree was created at the record's path"
     );
 }
 
