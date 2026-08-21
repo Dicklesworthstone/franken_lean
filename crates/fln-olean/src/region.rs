@@ -997,6 +997,70 @@ impl<'a> OleanView<'a> {
 
     /// The `constNames`/`constants` array views of the root `ModuleData`,
     /// as (file offset, length) pairs for the declaration decoder.
+    /// Decode the CONTENTS of `ModuleData.extraConstNames`.
+    ///
+    /// [`Self::module_data`] reports this array only as a count
+    /// ([`ModuleDataView::extra_const_names`]), so until now the one field of
+    /// `ModuleData` that names declarations was the one field whose names the
+    /// decoder threw away. The writer has always accepted them
+    /// (`ModuleWriteInput::extra_const_names`), so the codec could emit a
+    /// population it could not read back.
+    ///
+    /// WHAT THESE NAMES ARE, because it decides what may be built on them. The
+    /// pin documents `extraConstNames` as "auxiliary declarations that are NOT
+    /// in the mapping `constants`" — the code generator's own names, populated
+    /// by `getIRExtraConstNames`. They are NAMES ONLY: no `ConstantInfo` is
+    /// stored for any of them anywhere in the artifact. Across the 2,431 pinned
+    /// modules that carry a complete companion chain, 342,908 distinct names
+    /// appear here and in no module's `constants`, and every one carries a
+    /// code-generator marker component (`_boxed`, `_redArg`, `_closed_N`,
+    /// `_lam_N`, `_at_`/`spec_N`, `_hyg`, `_boxed_const_N`).
+    ///
+    /// So this decodes a real population the reader was dropping, and it is
+    /// NOT a source of kernel dependencies: no `UnknownConstant` can be
+    /// explained or repaired by it, because a name with no `ConstantInfo`
+    /// cannot be admitted. Callers that need admissible declarations want
+    /// `constNames`/`constants` instead — see `franken_lean-timy`.
+    pub fn extra_const_names(&self, budget: WalkBudget) -> RResult<Vec<Name>> {
+        let mut budget = DecodeBudget::new(budget);
+        budget.visit()?;
+        let root = self.root_ptr()?;
+        if root & 1 == 1 {
+            return Err(RegionError::RootShape {
+                reason: "root is a scalar",
+            });
+        }
+        let off = self.deref(root)?;
+        let n_ptr_fields = format::MODULE_DATA_FIELDS
+            .iter()
+            .filter(|f| f.lean_type != "Bool")
+            .count() as u8;
+        let (tag, other, _) = self.obj_header(off)?;
+        if tag != 0 || other != n_ptr_fields {
+            return Err(RegionError::RootShape {
+                reason: "root is not a ModuleData constructor",
+            });
+        }
+        // extraConstNames is pointer field 3: imports, constNames, constants,
+        // extraConstNames, entries.
+        let (array_off, len) = self.decode_array_view(
+            self.read_u64(off + 8 + 8 * 3)?,
+            "extraConstNames not an array",
+            &mut budget,
+        )?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(usize::try_from(len).unwrap_or(usize::MAX))
+            .map_err(|_| RegionError::DecodeShape {
+                offset: array_off,
+                reason: "extraConstNames length exceeds addressable storage",
+            })?;
+        for index in 0..len {
+            names.push(self.read_name(self.read_u64(array_off + 24 + 8 * index)?, &mut budget)?);
+        }
+        Ok(names)
+    }
+
     pub(crate) fn module_arrays(&self) -> RResult<ModuleArrays> {
         let n_ptr_fields = format::MODULE_DATA_FIELDS
             .iter()
