@@ -2384,6 +2384,22 @@ fn kr600_803_init_option_fixture_pins_recursor_levels_motives_minors_and_rules()
 }
 
 #[test]
+fn kr600_803_init_option_fixture_pins_constructor_indices_parameters_and_fields() {
+    let entries = init_option_entries();
+    for (entry, expected_index, expected_fields) in [(&entries[1], 0, 0), (&entries[2], 1, 1)] {
+        let metadata = entry
+            .declaration()
+            .constructor_metadata()
+            .expect("fixture constructor metadata");
+        assert_eq!(metadata.inductive(), &checker_name("Option"));
+        assert_eq!(metadata.index(), expected_index);
+        assert_eq!(metadata.num_parameters(), 1);
+        assert_eq!(metadata.num_fields(), expected_fields);
+        assert_eq!(entry.declaration().level_parameters().len(), 1);
+    }
+}
+
+#[test]
 fn kr600_803_init_list_recursive_parameter_and_iota_rules_are_reconstructed() {
     let entries = init_list_entries();
     let verdict = admit_inductive(
