@@ -234,6 +234,10 @@ the toolchain would report a perfect facade:
     remain intentionally formless. A form classification cannot disappear
     outside the demanded subset.
 
+  * A MANIFEST-DECLARATION-NAME JOIN requires every declaration name to be
+    nonempty and unique before the signature map is built. A duplicate cannot
+    overwrite another manifest row merely because neither is emitted.
+
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
 """
@@ -1260,6 +1264,10 @@ def main():
                 continue
             if row.get("kind") != "decl":
                 continue
+            if not isinstance(row.get("name"), str) or not row["name"]:
+                raise SystemExit(
+                    "REFUSE: facade manifest declaration has no usable name"
+                )
             manifest_rows.append(row)
             if row.get("signature"):
                 sigs[row["name"]] = {"signature": row["signature"],
@@ -1291,6 +1299,24 @@ def main():
         raise SystemExit(
             "REFUSE: facade manifest schema-row join disagrees with the pinned "
             f"summary ({json.dumps(manifest_schema_join, sort_keys=True)})"
+        )
+    manifest_name_counts = Counter(row["name"] for row in manifest_rows)
+    duplicate_manifest_names = sorted(
+        name for name, count in manifest_name_counts.items() if count != 1
+    )
+    manifest_name_join = {
+        "declaration_rows": len(manifest_rows),
+        "distinct_declaration_names": len(manifest_name_counts),
+        "duplicate_names": len(duplicate_manifest_names),
+    }
+    if (manifest_name_join["declaration_rows"] == 0
+            or manifest_name_join["distinct_declaration_names"]
+            != manifest_name_join["declaration_rows"]
+            or manifest_name_join["duplicate_names"] != 0):
+        raise SystemExit(
+            "REFUSE: facade manifest declaration-name join failed "
+            f"({json.dumps(manifest_name_join, sort_keys=True)}, "
+            f"duplicates={duplicate_manifest_names[:8]!r})"
         )
     malformed_forms = sorted(
         row["name"] for row in manifest_rows
@@ -1717,6 +1743,7 @@ def main():
         "census_partition_join": partition_join,
         "manifest_pin_join": {"schema": manifest_summary["schema"], "reference_pin": tag},
         "manifest_schema_row_join": manifest_schema_join,
+        "manifest_declaration_name_join": manifest_name_join,
         "manifest_form_totality_join": manifest_form_join,
         "manifest_totality_join": totality,
         "manifest_emission_verification_join": emission_verification,
