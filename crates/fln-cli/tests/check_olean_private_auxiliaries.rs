@@ -548,7 +548,8 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
         decoded_private_loop_observed <= decoded_private_auxiliaries,
         "{json}",
     );
-    assert!(
+    assert_eq!(
+        decoded_private_auxiliaries > 0,
         decoded_private_loop_observed > 0,
         "{json}",
     );
