@@ -16102,3 +16102,94 @@ fn every_part_in_the_library_carries_the_same_magic_version_and_flags() {
         "the Init parts include the aggregator's chain, which the census omits"
     );
 }
+/// The path-to-module projection is injective, and WHY it is.
+///
+/// Sixteen sites in this file turn a filesystem path into a module name by
+/// stripping `.olean` and replacing `/` with `.`, then hand that name to
+/// `module_view`, which rebuilds a path from it. Every library-wide cell I have
+/// written keys a `BTreeMap` by the result. If two paths ever projected to one
+/// name, one of the two would silently overwrite the other in every one of those
+/// maps — the non-injective-projection defect this repository has hit before,
+/// and it would show up as counts that are quietly one too low rather than as a
+/// failure.
+///
+/// It is injective: 2,433 exported paths give 2,433 distinct names.
+///
+/// THE COUNT IS NOT THE INTERESTING PART — the mechanism is. The projection is
+/// injective because no relative path in the library contains a literal dot, so
+/// every dot in a projected name came from a separator and can be turned back
+/// into one. The cell asserts THAT, not just the tally: a future module file
+/// named `Foo.Bar.olean` would fail here immediately, even in a library where it
+/// happened to collide with nothing, because it breaks the reason rather than
+/// the result. A cell that only counted 2,433 twice would pass it and wait for
+/// an actual collision to appear.
+///
+/// The round trip is asserted directly too, since that is what `module_view`
+/// performs: replacing every `.` with `/` and appending `.olean` must return the
+/// exact path the name came from, for all 2,433.
+///
+/// Anti-vacuity: paths run from one component to nine, so the projection is
+/// exercised on real nesting rather than on a flat directory where `/` never
+/// appears and the replacement is a no-op.
+///
+/// Conservation first: the projected names must number exactly as many as the
+/// paths before injectivity is claimed — that equality IS injectivity, so it is
+/// stated before the mechanism that explains it.
+#[test]
+fn the_path_to_module_projection_is_injective_because_paths_hold_no_dot() {
+    let lib = lib_or_skip!();
+    let all = chain_census(&lib, &lib);
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut depths: BTreeMap<usize, usize> = BTreeMap::new();
+    for path in &all.exported {
+        let relative = path
+            .strip_suffix(".olean")
+            .expect("an exported part ends in .olean");
+
+        // The mechanism: a dot in the projection can only come from a separator.
+        assert!(
+            !relative.contains('.'),
+            "{relative}: a literal dot in a path makes the projection ambiguous"
+        );
+
+        let module = relative.replace('/', ".");
+        assert_eq!(
+            format!("{}.olean", module.replace('.', "/")),
+            *path,
+            "{module}: the round trip must return the path module_view will rebuild"
+        );
+        names.insert(module);
+        *depths.entry(relative.split('/').count()).or_default() += 1;
+    }
+
+    // Conservation first: as many names as paths is exactly injectivity.
+    assert_eq!(
+        names.len(),
+        all.exported.len(),
+        "two paths projected to one module name, so every name-keyed map loses an entry"
+    );
+    assert_eq!(names.len(), 2_433, "the library census");
+
+    // Anti-vacuity: real nesting, so the replacement is not a no-op.
+    assert_eq!(
+        depths.values().sum::<usize>(),
+        all.exported.len(),
+        "every path must be counted at exactly one depth"
+    );
+    assert_eq!(
+        (
+            *depths.keys().next().expect("nonempty"),
+            *depths.keys().next_back().expect("nonempty")
+        ),
+        (1, 9),
+        "paths span one to NINE components; the deepest is not eight, which is what I \
+         assumed before measuring"
+    );
+    // The eight single-component paths are the eight top-level namespaces the
+    // layering cell names, reached here from the filesystem instead.
+    assert_eq!(
+        depths[&1], 8,
+        "one olean sits at the root of each namespace"
+    );
+}
