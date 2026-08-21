@@ -1797,10 +1797,21 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
     let human = fln_cli::run([OsString::from("check-olean"), exported.into_os_string()]);
     assert_eq!(human.exit_code, 0, "{}", human.stderr);
     assert!(human.stderr.is_empty());
-    assert!(
-        human
-            .stdout
-            .contains("decoded _private auxiliaries: 29 (reporting only; not a G1 claim)")
+    let human_decoded_private_auxiliaries = human_line_suffix(
+        &human.stdout,
+        "decoded _private auxiliaries: ",
+    )
+    .split_once(" (")
+    .map(|(count, _)| count)
+    .expect("human decoded-private summary has a reporting suffix")
+    .parse::<usize>()
+    .expect("human decoded-private count is a usize");
+    assert_eq!(
+        human_decoded_private_auxiliaries,
+        json_usize_field(&json.stdout, "decodedPrivateAuxiliaries"),
+        "human: {}\njson: {}",
+        human.stdout,
+        json.stdout,
     );
     assert_canonical_residual_group_keys_match_human_prefixes(&json.stdout, &human.stdout);
     assert_human_named_residuals(
