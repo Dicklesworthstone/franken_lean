@@ -3465,7 +3465,7 @@ fn render_check_olean_success(
             array_map_m_proof_omitted,
             array_map_m_go_observed,
             array_map_m_go_names,
-           array_map_m_go_omitted,
+            array_map_m_go_omitted,
             private_go_observed,
             private_go_names,
             private_go_omitted,
