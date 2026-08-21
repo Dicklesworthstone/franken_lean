@@ -342,3 +342,132 @@ fn the_only_declarations_still_postulated_are_the_pins_real_axioms() {
         );
     }
 }
+
+/// One bounded step beyond `Init`, chosen because this bead already names a
+/// declaration inside it.
+///
+/// d17i's exhaustive pass listed four definitions that appeared in BOTH the
+/// UnknownConstant and the DefinitionTypeMismatch families, and
+/// `Std.DHashMap.Internal.AssocList.contains` was one of them. Init is the
+/// module set every earlier increment measured; carrying the same two-part
+/// reading into a named `Std` prefix is what shows the companion repair is a
+/// property of the module system rather than of `Init`.
+const STD_PREFIX: &str = "Std/Data/DHashMap";
+/// A declaration this bead names, and the module that holds it at the pin.
+const STD_NAMED_ROW: (&str, &str) = (
+    "Std.DHashMap.Internal.AssocList.contains",
+    "Std/Data/DHashMap/Internal/AssocList/Basic",
+);
+
+/// Every module under `root` that carries a complete three-part chain, as
+/// library-relative module paths.
+fn complete_chains_under(lib: &Path, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => panic!("read {}: {error}", directory.display()),
+        };
+        for entry in entries {
+            let path = entry.expect("library entry").path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "olean")
+                && path.with_extension("olean.server").exists()
+                && path.with_extension("olean.private").exists()
+            {
+                let stem = path.with_extension("");
+                let relative = stem.strip_prefix(lib).expect("module is under the library");
+                out.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn the_named_std_prefix_carries_no_postulates_and_restores_a_row_this_bead_names() {
+    let lib = lib_or_skip!();
+    let root = lib.join(STD_PREFIX);
+    if !root.is_dir() {
+        // A typed skip that NAMES the missing input, so an absent prefix can
+        // never be read as a measured zero.
+        eprintln!(
+            "SKIP: missing input {} under {} — this lane measures a named Std prefix and \
+             does not provision one",
+            STD_PREFIX,
+            lib.display()
+        );
+        return;
+    }
+
+    let modules = complete_chains_under(&lib, &root);
+    // Floors, not golden equalities: more modules at the same Reference epoch is
+    // extra coverage, while enumerating fewer than the measured pin must fail.
+    assert!(
+        modules.len() >= 20,
+        "{STD_PREFIX}: expected at least the 20 complete chains measured at the pin, got {}",
+        modules.len()
+    );
+
+    let mut exported_axioms = 0usize;
+    let mut exported_total = 0usize;
+    let mut private_total = 0usize;
+    let mut residual: Vec<String> = Vec::new();
+    let mut lost: Vec<String> = Vec::new();
+    for module in &modules {
+        let (exported, private) = exported_and_private(&lib, module);
+        exported_total += exported.len();
+        private_total += private.len();
+        for (name, kind) in &exported {
+            if !private.contains_key(name) {
+                lost.push(format!("{module}::{name}"));
+            }
+            if *kind == "Axiom" {
+                exported_axioms += 1;
+                if private.get(name).copied() == Some("Axiom") {
+                    residual.push(format!("{module}::{name}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        lost.is_empty(),
+        "{STD_PREFIX}: the private parts dropped names the exported parts had: {lost:?}"
+    );
+    // Anti-vacuity for the emptiness claim below. Without this floor the
+    // assertion is satisfied by a prefix that never postulated anything, which
+    // says nothing at all about the repair.
+    assert!(
+        exported_axioms >= 3_500,
+        "{STD_PREFIX}: expected the exported parts to postulate at least the 3,561 measured at \
+         the pin, got {exported_axioms} — a low count makes the empty residual below vacuous"
+    );
+    assert!(
+        private_total > exported_total,
+        "{STD_PREFIX}: the private parts are supposed to ADD declarations \
+         (exported {exported_total}, private {private_total})"
+    );
+    // Unlike Init, this prefix has NO real axioms of its own: every one of its
+    // postulates is a body the exported part withheld. So the residual is not
+    // "the pin's genuine axioms" here — it is empty.
+    assert!(
+        residual.is_empty(),
+        "{STD_PREFIX}: declarations still postulated after the private part was read: {residual:?}"
+    );
+
+    let (declaration, module) = STD_NAMED_ROW;
+    let (exported, private) = exported_and_private(&lib, module);
+    assert_eq!(exported.get(declaration).copied(), Some("Axiom"));
+    assert_eq!(
+        private.get(declaration).copied(),
+        Some("Defn"),
+        "{declaration} is one of the four definitions d17i found in BOTH the UnknownConstant and \
+         DefinitionTypeMismatch families; the private part must restore its body"
+    );
+}
