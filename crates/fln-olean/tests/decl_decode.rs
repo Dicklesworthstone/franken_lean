@@ -11720,6 +11720,333 @@ fn the_other_references_to_that_name() {
     );
 }
 
+/// The compiler structure inside `entries` that shares the declaration names.
+///
+/// `c384f87e` showed `constNames[i]` and the `ConstantVal` under `constants[i]`
+/// are the same name object. The two remaining unread holders are the
+/// `entries`-rooted ones that are not the node: a two-field pair and a
+/// one-element array. This walks them.
+///
+/// THE PAIR IS ELEMENT 43 OF AN EXTENSION PAYLOAD, and 43 is the same index
+/// again. The path is `entries[19]`, whose payload array is element-for-element
+/// aligned with `constNames` - 2,204 of 2,204, pointer identity, none
+/// unresolved. So THREE roots share one name object at that index: the name
+/// array, the declaration record, and this extension's entry. The pair's second
+/// field is the one-element array, and its single element is that object again.
+///
+/// LENGTH DOES NOT IMPLY ALIGNMENT, and that is what keeps this honest.
+/// Selecting extension payloads by "as many elements as `constNames`" finds six
+/// across these modules and only four are aligned:
+/// `Init.BinderNameHint.olean` has THREE length-matches and ONE aligned. The
+/// tidy version of this finding - an extension sized like the module is indexed
+/// like the module - is false, and the two counterexamples are pinned rather
+/// than filtered out. The count varies too, two in `Init.SizeOfLemmas.olean`
+/// against one in Prelude, so there is no such thing as `the` aligned
+/// extension.
+///
+/// WHICH EXTENSION, pinned structurally rather than by rendering. Its name is
+/// SEVEN components, one NUMERIC - the `_private` mangling shape - ending in an
+/// 18-byte string, `exportedAxiomsExt` and its terminator. All read off the
+/// wire, so none of it depends on how the production decoder renders a numeric
+/// component. `c2f98113` put its one rendering-dependent assertion last and
+/// flagged it; this cell needs none.
+///
+/// PER-NODE, NOT PER-RECORD: the payload's second fields are 2,178 EMPTY arrays
+/// and 26 singletons, counted over array objects. The 26 split ten whose single
+/// element is the entry's own name and sixteen whose is not, and the ten are
+/// pinned AS INDICES rather than as a count, because
+/// `a-count-grep-cannot-find-a-decomposition`.
+///
+/// A ONE-WAY IMPLICATION ACROSS TWO ROOTS, WITH THE CONVERSE MEASURED FALSE.
+/// All ten self-referential entries are declarations whose `ConstantInfo`
+/// carries constructor tag 0, against a base rate of 256 in 2,204 - so the
+/// agreement is not what an arbitrary ten indices would give. The converse does
+/// NOT hold: 239 of those 256 have an EMPTY array here, and seven of the
+/// sixteen non-self-referential entries are tag 0 as well. Pinned in one
+/// direction with a floor, per `fln-shrinking-allowance-guard-direction`;
+/// equality would be a wall that a correct decoder fails against.
+///
+/// ANTI-VACUITY: an empty payload satisfies "every index agrees" while checking
+/// nothing, so alignment requires a non-empty array, and the pooled aligned
+/// population is asserted above 100.
+///
+/// POPULATION SCOPE: the per-module counts cover all four modules with the
+/// fixtures participating; the index-43, histogram and tag facts are
+/// `Init/Prelude.olean` alone, asserted rather than left implicit.
+#[test]
+fn the_extension_that_shares_the_declaration_names() {
+    let mut modules: Vec<(String, Vec<u8>)> = [
+        "Init.olean",
+        "Init.BinderNameHint.olean",
+        "Init.SizeOfLemmas.olean",
+    ]
+    .into_iter()
+    .map(|module| (module.to_owned(), fixture(module)))
+    .collect();
+    let mut prelude_loaded = false;
+    if let Some(lib) = reference_lib() {
+        let prelude = lib.join("Init/Prelude.olean");
+        if let Ok(bytes) = std::fs::read(&prelude) {
+            modules.push(("Init/Prelude.olean".to_owned(), bytes));
+            prelude_loaded = true;
+        }
+    }
+
+    let mut length_matches: Vec<(String, usize)> = Vec::new();
+    let mut aligned_at: Vec<(String, Vec<u64>)> = Vec::new();
+    let mut pooled_aligned = 0usize;
+    let mut lengths_histogram: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+    let mut self_indices: Vec<u64> = Vec::new();
+    let mut other_indices: Vec<u64> = Vec::new();
+    let mut self_tags: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+    let mut other_tag_zero = 0usize;
+    let mut tag_zero_total = 0usize;
+    let mut tag_zero_empty = 0usize;
+    let mut name_components = 0usize;
+    let mut numeric_components = 0usize;
+    let mut last_component_bytes = 0u64;
+
+    for (module, bytes) in &modules {
+        let (objects, base) = objects_of(bytes);
+        let at: std::collections::BTreeMap<usize, Obj> =
+            objects.iter().map(|o| (o.off, *o)).collect();
+        let resolve = |word: u64| -> Option<usize> {
+            (word & 1 == 0)
+                .then(|| usize::try_from(word.wrapping_sub(base)).ok())
+                .flatten()
+                .filter(|off| at.contains_key(off))
+        };
+        let arity = |off: usize| at.get(&off).map(|o| o.other).unwrap_or(0);
+        let tag = |off: usize| at.get(&off).map(|o| o.tag);
+
+        let root = usize::try_from(word_at(bytes, 88).wrapping_sub(base)).expect("root");
+        let names_array = resolve(word_at(bytes, root + 16)).expect("constNames array");
+        let consts_array = resolve(word_at(bytes, root + 24)).expect("constants array");
+        let entries_array = resolve(word_at(bytes, root + 40)).expect("entries array");
+        let names_len = word_at(bytes, names_array + 8);
+
+        let mut matches = 0usize;
+        let mut aligned: Vec<u64> = Vec::new();
+        for e in 0..word_at(bytes, entries_array + 8) {
+            let Some(entry) = resolve(word_at(bytes, entries_array + 24 + 8 * e as usize)) else {
+                continue;
+            };
+            if arity(entry) < 2 {
+                continue;
+            }
+            let Some(payload) = resolve(word_at(bytes, entry + 16)) else {
+                continue;
+            };
+            if tag(payload) != Some(abi::TAG_ARRAY) || word_at(bytes, payload + 8) != names_len {
+                continue;
+            }
+            matches += 1;
+
+            let mut agree = 0u64;
+            let mut counted = 0u64;
+            for i in 0..names_len {
+                let slot = 24 + 8 * i as usize;
+                // Counted, never skipped - a skipped index would shrink the
+                // denominator and make this walk a sampler.
+                counted += 1;
+                let named = resolve(word_at(bytes, names_array + slot));
+                let Some(element) =
+                    resolve(word_at(bytes, payload + slot)).filter(|&o| arity(o) >= 1)
+                else {
+                    continue;
+                };
+                if named.is_some() && resolve(word_at(bytes, element + 8)) == named {
+                    agree += 1;
+                }
+            }
+            // A zero-length payload would satisfy `agree == counted` while
+            // checking nothing at all.
+            if counted == 0 || agree != counted {
+                continue;
+            }
+            aligned.push(e);
+            pooled_aligned += usize::try_from(counted).expect("in range");
+
+            if module != "Init/Prelude.olean" {
+                continue;
+            }
+
+            // The extension's own name, read off the wire.
+            let mut component = resolve(word_at(bytes, entry + 8)).expect("extension name");
+            last_component_bytes = resolve(word_at(bytes, component + 16))
+                .map(|string| word_at(bytes, string + 8))
+                .expect("its last component is a string");
+            loop {
+                name_components += 1;
+                if tag(component) == Some(2) {
+                    numeric_components += 1;
+                }
+                match resolve(word_at(bytes, component + 8)) {
+                    Some(next) => component = next,
+                    None => break,
+                }
+            }
+
+            // The second fields, per array OBJECT, and who they name.
+            for i in 0..names_len {
+                let slot = 24 + 8 * i as usize;
+                let Some(element) = resolve(word_at(bytes, payload + slot)) else {
+                    continue;
+                };
+                let Some(list) = resolve(word_at(bytes, element + 16)) else {
+                    continue;
+                };
+                if tag(list) != Some(abi::TAG_ARRAY) {
+                    continue;
+                }
+                let len = word_at(bytes, list + 8);
+                *lengths_histogram.entry(len).or_default() += 1;
+
+                // The declaration record's variant at the same index.
+                let variant = resolve(word_at(bytes, consts_array + slot)).and_then(tag);
+                if variant == Some(0) {
+                    tag_zero_total += 1;
+                    if len == 0 {
+                        tag_zero_empty += 1;
+                    }
+                }
+                if len == 0 {
+                    continue;
+                }
+                let named = resolve(word_at(bytes, element + 8));
+                if named.is_some() && resolve(word_at(bytes, list + 24)) == named {
+                    self_indices.push(i);
+                    *self_tags.entry(variant.unwrap_or(u8::MAX)).or_default() += 1;
+                } else {
+                    other_indices.push(i);
+                    if variant == Some(0) {
+                        other_tag_zero += 1;
+                    }
+                }
+            }
+        }
+        length_matches.push((module.clone(), matches));
+        aligned_at.push((module.clone(), aligned));
+    }
+
+    // Selected by length.
+    assert_eq!(
+        length_matches
+            .iter()
+            .map(|(m, n)| (m.as_str(), *n))
+            .collect::<Vec<_>>(),
+        if prelude_loaded {
+            vec![
+                ("Init.olean", 0),
+                ("Init.BinderNameHint.olean", 3),
+                ("Init.SizeOfLemmas.olean", 2),
+                ("Init/Prelude.olean", 1),
+            ]
+        } else {
+            vec![
+                ("Init.olean", 0),
+                ("Init.BinderNameHint.olean", 3),
+                ("Init.SizeOfLemmas.olean", 2),
+            ]
+        },
+        "extension payloads with exactly as many elements as `constNames`"
+    );
+
+    // And how many of those are actually aligned. THIS IS THE POINT.
+    assert_eq!(
+        aligned_at
+            .iter()
+            .map(|(m, a)| (m.as_str(), a.clone()))
+            .collect::<Vec<_>>(),
+        if prelude_loaded {
+            vec![
+                ("Init.olean", vec![]),
+                ("Init.BinderNameHint.olean", vec![1_u64]),
+                ("Init.SizeOfLemmas.olean", vec![1_u64, 2]),
+                ("Init/Prelude.olean", vec![19_u64]),
+            ]
+        } else {
+            vec![
+                ("Init.olean", vec![]),
+                ("Init.BinderNameHint.olean", vec![1_u64]),
+                ("Init.SizeOfLemmas.olean", vec![1_u64, 2]),
+            ]
+        },
+        "LENGTH DOES NOT IMPLY ALIGNMENT: six payloads are sized like their \
+         module and only four are indexed like it. `Init.BinderNameHint.olean` \
+         has three length-matches and one aligned, so the two misses stay in \
+         the pin rather than being filtered out of it. The count varies as \
+         well - two in `Init.SizeOfLemmas.olean`, one in Prelude - so there is \
+         no such thing as `the` aligned extension"
+    );
+    assert!(
+        pooled_aligned >= 100,
+        "anti-vacuity: the aligned indices must stay a real population, got \
+         {pooled_aligned}"
+    );
+
+    if !prelude_loaded {
+        assert!(
+            self_indices.is_empty(),
+            "the extension is not in the C3 fixtures"
+        );
+        return;
+    }
+
+    // Which extension, structurally rather than by rendering.
+    assert_eq!(
+        (name_components, numeric_components, last_component_bytes),
+        (7, 1, 18),
+        "the extension's name is seven components with one NUMERIC among them - \
+         the `_private` mangling shape - ending in an 18-byte string, \
+         `exportedAxiomsExt` and its terminator. Read off the wire, so it does \
+         not depend on how a numeric component is rendered"
+    );
+
+    // Per array OBJECT.
+    assert_eq!(
+        lengths_histogram.into_iter().collect::<Vec<_>>(),
+        vec![(0, 2178), (1, 26)],
+        "the payload's second fields are 2,178 empty arrays and 26 singletons, \
+         counted over array objects rather than over the names inside them"
+    );
+
+    // The decomposition, bound per member and not as a total.
+    assert_eq!(
+        self_indices,
+        vec![43, 504, 633, 885, 969, 1127, 1152, 1359, 1531, 1537],
+        "the ten entries whose single element is the entry's own name, pinned \
+         as INDICES so that moving one member across the split cannot leave a \
+         total looking right. Element 43 is among them - the same 43 at which \
+         that name sits in `constNames` and in `constants`, so three roots \
+         share one name object and the third holds it twice"
+    );
+    assert_eq!(
+        (self_indices.len(), other_indices.len()),
+        (10, 16),
+        "ten of the 26 singletons, sixteen not"
+    );
+
+    // One direction, with the converse measured false.
+    assert_eq!(
+        self_tags.into_iter().collect::<Vec<_>>(),
+        vec![(0, 10)],
+        "every one of the ten is a declaration whose `ConstantInfo` carries \
+         constructor tag 0, which is 256 of 2,204 overall - so ten out of ten \
+         is not what an arbitrary ten indices would give"
+    );
+    assert_eq!(
+        (tag_zero_total, tag_zero_empty, other_tag_zero),
+        (256, 239, 7),
+        "and the CONVERSE DOES NOT HOLD: 239 of those 256 have an empty array \
+         here, and seven of the sixteen non-self-referential entries are tag 0 \
+         too. So this is an implication in one direction only. Pinning it as an \
+         equivalence would be a wall a correct decoder fails against, per \
+         `fln-shrinking-allowance-guard-direction`"
+    );
+}
+
 /// What the `constants`-rooted holder IS: this module's declaration 43.
 ///
 /// `83016935` split the link from the node - the link reaches three roots, the
