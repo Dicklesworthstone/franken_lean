@@ -1498,6 +1498,12 @@ impl StructuralTermBuilder {
         self.expression(ExprNode::Sort { level })
     }
 
+    fn sort_successor_parameter(&mut self, parameter: &WireName) -> ExprId {
+        let parameter = self.level(LevelNode::Parameter(parameter.clone()));
+        let level = self.level(LevelNode::Succ(parameter));
+        self.expression(ExprNode::Sort { level })
+    }
+
     fn constant(&mut self, name: &WireName, parameters: &[WireName]) -> ExprId {
         let levels = parameters
             .iter()
@@ -2267,6 +2273,129 @@ fn nonrecursive_rule_rhs(
     let motive_sort = builder.sort_parameter(level_parameter);
     let motive_type = builder.forall("t", BinderStyle::Default, inductive_type, motive_sort);
     let root = builder.lambda("motive", BinderStyle::Default, motive_type, result);
+    builder.finish(root)
+}
+
+fn option_application(
+    builder: &mut StructuralTermBuilder,
+    option: &WireName,
+    universe: &WireName,
+    parameter: ExprId,
+) -> ExprId {
+    let option = builder.constant(option, std::slice::from_ref(universe));
+    builder.apply(option, parameter)
+}
+
+fn option_inductive_type(universe: &WireName) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(universe);
+    let result = builder.sort_successor_parameter(universe);
+    let root = builder.forall("α", BinderStyle::Default, parameter_type, result);
+    builder.finish(root)
+}
+
+fn option_constructor_type(
+    option: &WireName,
+    constructor: &WireName,
+    universe: &WireName,
+    has_field: bool,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(universe);
+    let parameter = builder.bvar(0);
+    let mut result = option_application(&mut builder, option, universe, parameter);
+    if has_field {
+        let field_type = builder.bvar(0);
+        let parameter = builder.bvar(1);
+        result = option_application(&mut builder, option, universe, parameter);
+        result = builder.forall("value", BinderStyle::Default, field_type, result);
+    }
+    let root = builder.forall_name(constructor, BinderStyle::Default, parameter_type, result);
+    builder.finish(root)
+}
+
+fn option_minor_type(
+    builder: &mut StructuralTermBuilder,
+    option: &WireName,
+    constructor: &WireName,
+    universe: &WireName,
+    has_field: bool,
+) -> ExprId {
+    let constructor = builder.constant(constructor, std::slice::from_ref(universe));
+    let parameter = builder.bvar(if has_field { 3 } else { 1 });
+    let constructor = builder.apply(constructor, parameter);
+    let constructor = if has_field {
+        let value = builder.bvar(0);
+        builder.apply(constructor, value)
+    } else {
+        constructor
+    };
+    let motive = builder.bvar(if has_field { 2 } else { 0 });
+    let mut result = builder.apply(motive, constructor);
+    if has_field {
+        let parameter = builder.bvar(2);
+        result = builder.forall("value", BinderStyle::Default, parameter, result);
+    }
+    let _ = option;
+    result
+}
+
+fn option_recursor_type(
+    option: &WireName,
+    none: &WireName,
+    some: &WireName,
+    motive_universe: &WireName,
+    option_universe: &WireName,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(option_universe);
+    let parameter = builder.bvar(0);
+    let inductive = option_application(&mut builder, option, option_universe, parameter);
+    let motive_sort = builder.sort_parameter(motive_universe);
+    let motive_type = builder.forall("t", BinderStyle::Default, inductive, motive_sort);
+
+    let none_minor = option_minor_type(&mut builder, option, none, option_universe, false);
+    let some_minor = option_minor_type(&mut builder, option, some, option_universe, true);
+    let parameter = builder.bvar(3);
+    let major_type = option_application(&mut builder, option, option_universe, parameter);
+    let major = builder.bvar(0);
+    let motive = builder.bvar(3);
+    let mut result = builder.apply(motive, major);
+    result = builder.forall("t", BinderStyle::Default, major_type, result);
+    result = builder.forall("some", BinderStyle::Default, some_minor, result);
+    result = builder.forall("none", BinderStyle::Default, none_minor, result);
+    result = builder.forall("motive", BinderStyle::Implicit, motive_type, result);
+    let root = builder.forall("α", BinderStyle::Implicit, parameter_type, result);
+    builder.finish(root)
+}
+
+fn option_rule_rhs(
+    option: &WireName,
+    none: &WireName,
+    some: &WireName,
+    motive_universe: &WireName,
+    option_universe: &WireName,
+    selected_some: bool,
+) -> Option<WireExpr> {
+    let mut builder = StructuralTermBuilder::new();
+    let parameter_type = builder.sort_successor_parameter(option_universe);
+    let parameter = builder.bvar(0);
+    let inductive = option_application(&mut builder, option, option_universe, parameter);
+    let motive_sort = builder.sort_parameter(motive_universe);
+    let motive_type = builder.forall("t", BinderStyle::Default, inductive, motive_sort);
+    let none_minor = option_minor_type(&mut builder, option, none, option_universe, false);
+    let some_minor = option_minor_type(&mut builder, option, some, option_universe, true);
+    let mut result = builder.bvar(1);
+    if selected_some {
+        let value = builder.bvar(0);
+        result = builder.apply(result, value);
+        let parameter = builder.bvar(2);
+        result = builder.lambda("value", BinderStyle::Default, parameter, result);
+    }
+    result = builder.lambda("some", BinderStyle::Default, some_minor, result);
+    result = builder.lambda("none", BinderStyle::Default, none_minor, result);
+    result = builder.lambda("motive", BinderStyle::Default, motive_type, result);
+    let root = builder.lambda("α", BinderStyle::Default, parameter_type, result);
     builder.finish(root)
 }
 
