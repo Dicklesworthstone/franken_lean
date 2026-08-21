@@ -180,6 +180,12 @@ const ARRAY_ZIP_WITH_M_AUX_UNARY: &str = "Array.zipWithMAux._unary";
 /// companion owns the declaration rather than the exported interface.
 const NAT_GCD_UNARY_PROOF_1: &str =
     "_private.Init.Data.Nat.Gcd.0.Nat.gcd._unary._proof_1";
+/// A generated theorem whose privacy prefix names `Array.Basic`, while the
+/// pin's private array stores it in the module that generated the simp lemma.
+const ARRAY_OF_FN_GO_CONGR_SIMP: &str =
+    "_private.Init.Data.Array.Basic.0.Array.ofFn.go.congr_simp";
+/// The actual storage module from the pin's private constant array.
+const ARRAY_OF_FN_GO_CONGR_SIMP_MODULE: &str = "Init/Data/Array/Lemmas";
 /// A private-mangled unary equation helper deliberately exported by the pinned
 /// array-sort lemmas module.
 const SUBARRAY_MERGE_SORT_UNARY_EQ_DEF: &str =
@@ -893,6 +899,36 @@ fn nat_gcd_unary_proof_requires_the_companion_and_remains_a_theorem() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {NAT_GCD_UNARY_PROOF_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module() {
+    let lib = lib_or_skip!(
+        "array_of_fn_go_congr_simp_is_decoded_from_its_actual_private_storage_module"
+    );
+    let chain = chain_bytes(&lib, ARRAY_OF_FN_GO_CONGR_SIMP_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_OF_FN_GO_CONGR_SIMP.to_owned()),
+        "the private companion of {ARRAY_OF_FN_GO_CONGR_SIMP_MODULE} must retain \
+         {ARRAY_OF_FN_GO_CONGR_SIMP}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_OF_FN_GO_CONGR_SIMP)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_OF_FN_GO_CONGR_SIMP}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_OF_FN_GO_CONGR_SIMP} as {} instead of Thm",
         recovered.kind_name()
     );
 }
