@@ -122,6 +122,34 @@ fn assert_json_named_residuals(json: &str, field: &str, observed: usize, expecte
     );
 }
 
+fn assert_json_private_companion_partition_is_disjoint(json: &str, fields: &[&str]) {
+    let private_companions = json_name_set(json_object_field(json, "privateCompanionResiduals"));
+    let groups = fields
+        .iter()
+        .map(|field| (field, json_name_set(json_object_field(json, field))))
+        .collect::<Vec<_>>();
+
+    let mut covered = BTreeSet::new();
+    for (field, names) in &groups {
+        assert!(
+            names.is_subset(&private_companions),
+            "{field} includes a name outside privateCompanionResiduals: {json}",
+        );
+        covered.extend(names.iter().cloned());
+    }
+
+    for (index, (left_field, left_names)) in groups.iter().enumerate() {
+        for (right_field, right_names) in groups.iter().skip(index + 1) {
+            assert!(
+                left_names.is_disjoint(right_names),
+                "{left_field} overlaps {right_field}: {json}",
+            );
+        }
+    }
+
+    assert_eq!(covered, private_companions, "{json}");
+}
+
 fn human_line_suffix<'a>(stdout: &'a str, prefix: &str) -> &'a str {
     stdout
         .lines()
@@ -620,6 +648,14 @@ fn check_olean_reports_private_auxiliaries_from_the_authoritative_companion_part
         "privateCompanionResiduals",
         29,
         private_companion_names,
+    );
+    assert_json_private_companion_partition_is_disjoint(
+        &json.stdout,
+        &[
+            "privateCliPrivateReportResiduals",
+            "privateInitDataResiduals",
+            "privateInitPreludeResiduals",
+        ],
     );
     assert_json_named_residuals(
         &json.stdout,
