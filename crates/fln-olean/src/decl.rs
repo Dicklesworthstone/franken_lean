@@ -2540,7 +2540,12 @@ mod tests {
                         nfields: 5,
                         rhs: Expr::sort(Level::zero()),
                     }],
-                    k: false,
+                    // DIFFERENT on purpose, for the same reason the counts
+                    // above are: `k` and `isUnsafe` are two adjacent scalar
+                    // BYTES read by index, so equal values would make a swap
+                    // between them invisible. See
+                    // `the_recursor_flags_come_from_their_own_scalar_bytes`.
+                    k: true,
                     is_unsafe: false,
                 })],
                 extra_const_names: &[],
@@ -2556,6 +2561,82 @@ mod tests {
         )
         .expect("module encodes")
         .bytes
+    }
+
+    /// Each recursor flag is read from its OWN scalar byte.
+    ///
+    /// `k` and `isUnsafe` are two adjacent bytes in the payload's scalar area,
+    /// read by index. Both are `Bool`, both are one byte, and neither position
+    /// is distinguishable from the other by shape — so reading them the wrong
+    /// way round produces a valid `RecursorVal` that says the opposite of what
+    /// was written on both counts at once. `k` decides whether the recursor
+    /// gets K-like reduction and `isUnsafe` whether the kernel may trust it,
+    /// so a swap is not cosmetic.
+    ///
+    /// A PIN, not a mutant, for the same reason as the telescope counts: a
+    /// swap leaves every byte canonical, so no refusal fires. The one thing
+    /// that CAN be made wrong here — a byte outside `{0, 1}` — already has its
+    /// mutant in `axiom_is_unsafe_byte_two_is_not_decoded_as_true`, and
+    /// planting it here would exercise the same `decode_bool` rule again
+    /// rather than anything new.
+    ///
+    /// It only means something because the fixture sets the two flags
+    /// DIFFERENTLY; with both `false`, as this fixture had them until now,
+    /// a swap would decode identically.
+    #[test]
+    fn the_recursor_flags_come_from_their_own_scalar_bytes() {
+        let bytes = recursor_module();
+        let view = OleanView::parse(&bytes).expect("header");
+        let constants = DeclDecoder::new(&view, WalkBudget::default())
+            .decode_module_constants()
+            .expect("the recursor fixture decodes");
+
+        let ConstantInfo::Rec(recursor) = constants
+            .iter()
+            .find(|info| matches!(info, ConstantInfo::Rec(_)))
+            .expect("the fixture declares a recursor")
+        else {
+            unreachable!("filtered above")
+        };
+
+        assert!(recursor.k, "k is scalar byte 0");
+        assert!(!recursor.is_unsafe, "isUnsafe is scalar byte 1");
+
+        // The guard that stops the two assertions above from going quiet: if a
+        // later edit made the flags equal, a swap would satisfy both and this
+        // cell would assert nothing about which byte is which.
+        assert_ne!(
+            recursor.k, recursor.is_unsafe,
+            "the fixture's two flags must stay different, or reading them the \
+             wrong way round would decode identically and this cell would \
+             prove nothing"
+        );
+
+        // And the bytes really are where the decoder indexes them: the scalar
+        // area begins after the payload's pointer fields.
+        let arrays = view.module_arrays().expect("constant array");
+        let info_off = view
+            .deref(
+                view.read_u64(arrays.constants.0 + 24)
+                    .expect("ConstantInfo"),
+            )
+            .expect("ConstantInfo object");
+        let val_off = view
+            .deref(view.read_u64(info_off + 8).expect("RecursorVal pointer"))
+            .expect("RecursorVal object");
+        let (_, other, _) = view.obj_header(val_off).expect("RecursorVal header");
+        let scalar_base = val_off + 8 + 8 * u64::from(other);
+        assert_eq!(
+            view.read_bytes_at(scalar_base, 1).expect("k byte")[0],
+            1,
+            "k is true in the byte the decoder reads it from"
+        );
+        assert_eq!(
+            view.read_bytes_at(scalar_base + 1, 1)
+                .expect("isUnsafe byte")[0],
+            0,
+            "and isUnsafe is false in the next one"
+        );
     }
 
     /// Each telescope count is read from its OWN slot.
