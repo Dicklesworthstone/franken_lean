@@ -57,6 +57,9 @@ the toolchain would report a perfect facade:
   * A CENSUS-PARTITION JOIN requires every exact-demand symbol to resolve to a
     known partition row before the toolchain-api filter is applied. An
     uncensused symbol must refuse the run, never silently leave its denominator.
+  * A DEMANDED-EMISSION JOIN makes the manifest's `emitted` bit agree with its
+    demanded disposition: emitted rows must say true; Init and quarantined rows
+    must say false. The row's stated provenance cannot contradict its outcome.
 
 Output: NDJSON, schema fln-facade-compile/1 — one row per (module, symbol), one
 per module, and a summary that carries the reading above with it.
@@ -331,7 +334,9 @@ def join_demanded_rows(names, manifest_rows):
     unclassified = []
     signatureless = []
     role_mismatches = []
+    emission_mismatches = []
     roles = Counter()
+    emission_join = Counter()
     for name in sorted(names):
         row = rows_by_name[name][0]
         outcome = row.get("demanded_outcome")
@@ -350,9 +355,16 @@ def join_demanded_rows(names, manifest_rows):
                 f"{name}(outcome={outcome}, role={row.get('role')!r})"
             )
             continue
+        expected_emitted = outcome == "emitted"
+        if row.get("emitted") is not expected_emitted:
+            emission_mismatches.append(
+                f"{name}(outcome={outcome}, emitted={row.get('emitted')!r})"
+            )
+            continue
         dispositions[name] = outcome
         roles[expected_role] += 1
-    if unclassified or signatureless or role_mismatches:
+        emission_join["emitted" if expected_emitted else "not_emitted"] += 1
+    if unclassified or signatureless or role_mismatches or emission_mismatches:
         details = []
         if unclassified:
             details.append("unclassified=" + ", ".join(unclassified[:8]))
@@ -360,11 +372,13 @@ def join_demanded_rows(names, manifest_rows):
             details.append("signatureless=" + ", ".join(signatureless[:8]))
         if role_mismatches:
             details.append("role-mismatch=" + ", ".join(role_mismatches[:8]))
+        if emission_mismatches:
+            details.append("emission-mismatch=" + ", ".join(emission_mismatches[:8]))
         raise SystemExit(
             "REFUSE: demanded-row join cannot support a typed disposition ("
             + "; ".join(details) + ")"
         )
-    return dispositions, dict(sorted(roles.items()))
+    return dispositions, dict(sorted(roles.items())), dict(sorted(emission_join.items()))
 
 
 def choose_quarantine_control(dispositions):
@@ -524,7 +538,9 @@ def main():
                          "run would silently degrade to a name-only check")
 
     demand_names = {name for names in by_module.values() for name in names}
-    demand_dispositions, demand_roles = join_demanded_rows(demand_names, manifest_rows)
+    demand_dispositions, demand_roles, demand_emission = join_demanded_rows(
+        demand_names, manifest_rows
+    )
 
     # Mutation control for the source guard above. It is deliberately in-memory:
     # no Reference-importing file is ever handed to the pinned compiler.
@@ -630,6 +646,7 @@ def main():
         "distinct_symbols": len(control_names),
         "demanded_dispositions": disposition_matrix,
         "demanded_role_join": demand_roles,
+        "demanded_emission_join": demand_emission,
         "disposition_matrix_control": {
             "emitted": disposition_matrix.get("emitted", 0),
             "init_substrate": disposition_matrix.get("init-substrate", 0),
