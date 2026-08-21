@@ -1809,13 +1809,7 @@ def work_scratch_report(work):
     total = files = 0
     for root, _dirs, names in os.walk(work):
         for name in names:
-            try:
-                st = os.stat(os.path.join(root, name))
-            except OSError:
-                continue
-            # st_blocks, not st_size: apparent size is wrong in both directions on
-            # this filesystem, and the point of the number is the disk it holds
-            total += st.st_blocks * 512
+            total += disk_bytes(os.path.join(root, name))
             files += 1
     # EMPTY MEANS NO FILES ANYWHERE, decided by the same walk that does the
     # counting. Deciding it from a bare listdir while counting with a walk was an
@@ -1921,6 +1915,32 @@ def publication_registry_error(published, declared):
                 "ships, or something is being written where a reader will not "
                 "think to look for it")
     return None
+
+
+@checked_by_self_test
+def disk_bytes(path):
+    """What a file actually holds on disk, in one place.
+
+    Four sites asked this question and two answered it differently:
+    work_scratch_report used st_blocks while kept_candidate,
+    leftover_scratch_error and the pre-flight's own floor used os.path.getsize,
+    which is the APPARENT size. They are not the same number and the gap runs both
+    ways -- measured here, a leaked candidate reporting 50,000,000 apparent bytes
+    occupies 0 on disk, and small files are padded up to a block so getsize
+    understates them.
+
+    The floor is the site that makes this decision-changing rather than cosmetic:
+    computed from apparent size, a sparse artifact would demand hundreds of times
+    the space it needs and refuse a run that would have finished. A pre-flight
+    that turns into a wall is worse than none, because the wall is invisible until
+    somebody has room and still cannot start.
+
+    Returns 0 for anything that cannot be stat'd, so a missing file claims nothing.
+    """
+    try:
+        return os.stat(path).st_blocks * 512
+    except OSError:
+        return 0
 
 
 @checked_by_self_test
@@ -2153,11 +2173,9 @@ def leftover_scratch_error(out, suffixes=SCRATCH_SUFFIXES):
     leaked = []
     for suffix in suffixes:
         path = out + suffix
-        try:
-            size = os.path.getsize(path)
-        except OSError:
+        if not os.path.exists(path):
             continue
-        leaked.append(f"{path} ({size} bytes)")
+        leaked.append(f"{path} ({disk_bytes(path)} bytes on disk)")
     if leaked:
         return (f"the run finished but left {len(leaked)} scratch file(s) beside "
                 f"the artifact: {leaked}. The candidate is MOVED onto the output "
@@ -2184,11 +2202,10 @@ def kept_candidate(path):
     Returns the phrase to interpolate, not a verdict: this reports on a run that
     is already failing and must never replace its cause with one of its own.
     """
-    try:
-        size = os.path.getsize(path)
-    except OSError:
+    if not os.path.exists(path):
         return (f"no candidate was kept -- {path} does not exist, so the facade "
                 "that failed is not on disk to inspect")
+    size = disk_bytes(path)
     if size == 0:
         return f"candidate at {path} is EMPTY (0 bytes), nothing to inspect"
     return f"candidate kept at {path}, {size} bytes"
@@ -3030,6 +3047,20 @@ def self_test():
     os.makedirs(_nest, exist_ok=True)
     builtins.open(os.path.join(_nest, "buried.lean"), "w").write("z" * 200000)
     _, _nfiles, _nbytes = work_scratch_report(_nest)
+    _sparse = os.path.join(work, "sparse.lean")
+    with builtins.open(_sparse, "wb") as _fh:
+        _fh.truncate(50_000_000)
+    case("disk/sparse-file-is-not-its-apparent-size",
+         None if disk_bytes(_sparse) < 1_000_000
+         else f"claimed {disk_bytes(_sparse)} bytes for a sparse file", False)
+    case("disk/apparent-size-would-have-said-fifty-million",
+         None if os.path.getsize(_sparse) == 50_000_000 else "premise changed", False)
+    case("disk/a-missing-file-holds-nothing",
+         None if disk_bytes(os.path.join(work, "absent")) == 0
+         else "claimed disk for a file that is not there", False)
+    case("disk/a-real-file-holds-at-least-its-bytes",
+         None if disk_bytes(at("held.lean", text)) >= len(text.encode("utf-8"))
+         else "understated a real file", False)
     case("work/counts-a-nested-file",
          None if _nbytes >= 200000 else f"reported only {_nbytes} bytes", False)
     case("work/counts-files-not-directories",
@@ -3426,10 +3457,7 @@ def main():
     os.makedirs(work, exist_ok=True)
 
     def _prior(path):
-        try:
-            return os.path.getsize(path)
-        except OSError:
-            return 0
+        return disk_bytes(path)
 
     _space = insufficient_space_error((
         (os.path.dirname(args.out) or ".", publication_floor(_prior(args.out)),
