@@ -10483,3 +10483,169 @@ fn every_projection_uses_the_primitive_node_whatever_its_kind() {
         "the index match must be exercised beyond the first field, got {indices:?}"
     );
 }
+
+/// A projection's TYPE takes the structure at the parameter boundary, and the
+/// binder is always called `self`.
+///
+/// The two cells above read what a projection IS and what its value CONTAINS.
+/// Its type is unread, and the type is where the projection's interface lives:
+/// it abstracts the inductive's parameters and then takes the structure.
+///
+/// Measured over all 145 fields of every single-constructor inductive:
+///
+///   for all 142 that project, the binder at index `num_params` is headed by
+///     the projection's own inductive — the structure argument sits exactly at
+///     the parameter boundary, no earlier and no later
+///   that binder is named `self` in every one of the 142. It is a generated
+///     name, and the binder-name cell elsewhere covers recursors only
+///   the remaining 3 fields do not project and were named earlier
+///
+/// A NATURAL RULE THAT IS FALSE, recorded so it is not retried: the telescope is
+/// NOT `num_params + 1`. Only 67 of the 142 stop after the structure argument.
+/// The other 75 carry more binders — 11 with one, 50 with two, 7 with three, 6
+/// with four, 1 with five — because a field whose type is itself a function
+/// contributes its own binders to the projection's telescope. `BEq.beq` reaches
+/// four. I measured the exact-length version first and it failed on 75 of 142,
+/// which is why the law is stated as a position rather than a length.
+///
+/// The position is not trivially zero: `num_params` ranges from 0 to 6 across
+/// these structures, so the boundary the binder sits at genuinely moves.
+#[test]
+fn a_projection_takes_its_structure_at_the_parameter_boundary() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let declared = kinds(&infos);
+    let mut types: BTreeMap<String, &Expr> = BTreeMap::new();
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    let mut constructors: BTreeMap<String, (&ConstructorVal, Vec<String>)> = BTreeMap::new();
+    for info in &infos {
+        let name = info.name().to_display_string();
+        types.insert(name.clone(), &info.constant_val().type_);
+        match info {
+            ConstantInfo::Induct(v) => drop(inductives.insert(name, v)),
+            ConstantInfo::Ctor(v) => {
+                let mut binders = Vec::new();
+                let mut current = &info.constant_val().type_;
+                while let ExprNode::ForallE {
+                    binder_name, body, ..
+                } = current.node()
+                {
+                    binders.push(binder_name.to_display_string());
+                    current = body;
+                }
+                drop(constructors.insert(name, (v, binders)));
+            }
+            _ => {}
+        }
+    }
+
+    // `(binder name, the head constant of its type)` for each leading binder.
+    let telescope = |root: &Expr| -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        let mut current = root;
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            ..
+        } = current.node()
+        {
+            let mut head = binder_type;
+            while let ExprNode::App { f, .. } = head.node() {
+                head = f;
+            }
+            let named = match head.node() {
+                ExprNode::Const { name, .. } => Some(name.to_display_string()),
+                _ => None,
+            };
+            out.push((binder_name.to_display_string(), named));
+            current = body;
+        }
+        out
+    };
+
+    let mut projecting = 0usize;
+    let mut absent = 0usize;
+    let mut fields = 0usize;
+    let mut departures: Vec<(String, Option<String>)> = Vec::new();
+    let mut beyond: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut boundaries: BTreeSet<u32> = BTreeSet::new();
+    let mut binder_names: BTreeSet<String> = BTreeSet::new();
+    for (name, induct) in &inductives {
+        if induct.ctors.len() != 1 {
+            continue;
+        }
+        let ctor_name = induct.ctors[0].to_display_string();
+        let Some((ctor, binders)) = constructors.get(&ctor_name) else {
+            continue;
+        };
+        let start = ctor.num_params as usize;
+        for field in &binders[start..start + ctor.num_fields as usize] {
+            fields += 1;
+            let plain = format!("{name}.{field}");
+            let suffix = format!(".{plain}");
+            let Some(declaration) = declared
+                .keys()
+                .find(|candidate| **candidate == plain || candidate.ends_with(&suffix))
+            else {
+                absent += 1;
+                continue;
+            };
+
+            let binders = telescope(types[declaration]);
+            match binders.get(start) {
+                Some((binder, Some(head))) if *head == **name => {
+                    projecting += 1;
+                    binder_names.insert(binder.clone());
+                    boundaries.insert(ctor.num_params);
+                    *beyond.entry(binders.len() - start - 1).or_default() += 1;
+                }
+                Some((_, head)) => departures.push((declaration.clone(), head.clone())),
+                None => departures.push((declaration.clone(), None)),
+            }
+        }
+    }
+
+    // Conservation first.
+    assert_eq!(
+        projecting + absent + departures.len(),
+        fields,
+        "every field must project, be absent, or be a departure"
+    );
+    assert!(
+        departures.is_empty(),
+        "the binder at index num_params must be the structure itself: {departures:?}"
+    );
+    assert_eq!(
+        (fields, projecting, absent),
+        (145, 142, 3),
+        "the field population and how many take their structure at the boundary"
+    );
+    assert_eq!(
+        binder_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<&str>>(),
+        vec!["self"],
+        "the structure argument carries one generated binder name"
+    );
+
+    // The length rule that does not hold, pinned as its own distribution.
+    assert_eq!(
+        beyond.values().sum::<usize>(),
+        projecting,
+        "the trailing-binder table must account for every projection"
+    );
+    assert_eq!(
+        beyond.get(&0).copied().unwrap_or_default(),
+        67,
+        "only 67 projections stop after the structure argument, so the telescope is not \
+         num_params + 1"
+    );
+    assert!(
+        beyond.len() >= 5 && boundaries.len() >= 4,
+        "the trailing widths and the parameter boundary must both vary, got {beyond:?} and \
+         {boundaries:?}"
+    );
+}
