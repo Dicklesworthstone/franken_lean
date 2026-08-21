@@ -90,6 +90,11 @@ fn json_usize_field(object: &str, field: &str) -> usize {
         .bytes()
         .take_while(|byte| byte.is_ascii_digit())
         .count();
+    assert!(digits > 0, "JSON integer field starts with a number: {object}");
+    assert!(
+        matches!(value.as_bytes().get(digits), Some(b',') | Some(b'}')),
+        "JSON integer field is terminated: {object}",
+    );
     value[..digits]
         .parse()
         .expect("JSON integer field is a decimal usize")
@@ -150,11 +155,8 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     assert!(!json_bool_field(json, "g1Satisfied"), "{json}");
     assert!(json_bool_field(json, "companionPartsLoaded"), "{json}");
     let private_companion_residuals = json_object_field(json, "privateCompanionResiduals");
-    assert_eq!(
-        json_usize_field(private_companion_residuals, "omitted"),
-        0,
-        "{json}",
-    );
+    let private_companion_omitted = json_usize_field(private_companion_residuals, "omitted");
+    assert_eq!(private_companion_omitted, 0, "{json}");
     let private_companion_missing = json_usize_field(private_companion_residuals, "missing");
     assert_eq!(private_companion_missing, 0, "{json}");
     let private_companion_observed = json_usize_field(private_companion_residuals, "observed");
