@@ -194,6 +194,11 @@ const INSERT_IDX_LOOP_PROOF_3: &str =
 const INSERT_IDX_LOOP_PROOF_3_MODULE: &str = "Init/Data/Array/Basic";
 /// The exported shell name for `Array.zipWithMAux`'s unary compiler helper.
 const ARRAY_ZIP_WITH_M_AUX_UNARY: &str = "Array.zipWithMAux._unary";
+/// The generated proof theorem for `Array.zipWithMAux._unary`.
+const ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1: &str =
+    "_private.Init.Data.Array.Basic.0.Array.zipWithMAux._unary._proof_1";
+/// The pin's private array stores this theorem in the basic module.
+const ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1_MODULE: &str = "Init/Data/Array/Basic";
 /// The exact private proof generated for the unary wrapper of `Nat.gcd`.
 ///
 /// The pin census records this theorem under `Init.Data.Nat.Gcd`; its private
@@ -1350,6 +1355,35 @@ fn array_zip_with_m_aux_unary_requires_the_companion_and_keeps_its_real_kind() {
     assert!(
         is_concrete_recovery(&recovered),
         "chain decode of {ARRAY_ZIP_WITH_M_AUX_UNARY} produced only {} instead of a concrete declaration",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn array_zip_with_m_aux_unary_proof_is_decoded_from_its_private_storage_module() {
+    let lib =
+        lib_or_skip!("array_zip_with_m_aux_unary_proof_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1.to_owned()),
+        "the private companion of {ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1_MODULE} must retain \
+         {ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1)
+        .unwrap_or_else(|| panic!("private decoder lost {ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Thm(_)),
+        "private companion decoded {ARRAY_ZIP_WITH_M_AUX_UNARY_PROOF_1} as {} instead of Thm",
         recovered.kind_name()
     );
 }
