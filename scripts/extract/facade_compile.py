@@ -2000,8 +2000,28 @@ def main():
             or uncensused_zero_join["summary_uncensused_closure"]
             != uncensused_zero_join["pinned_uncensused_count"]):
         raise SystemExit(
-            "REFUSE: facade manifest uncensused-count equality diverges "
+           "REFUSE: facade manifest uncensused-count equality diverges "
             f"({json.dumps(uncensused_zero_join, sort_keys=True)})"
+        )
+    probe_shape_count_join = {
+        "summary_result_head_probed": manifest_summary.get("result_head_probed"),
+        "summary_reducibility_probed": manifest_summary.get(
+            "reducibility_probed"
+        ),
+        "summary_implemented_by_probed": manifest_summary.get(
+            "implemented_by_probed"
+        ),
+        "pinned_probe_shape_count": 2042,
+    }
+    if (any(count != probe_shape_count_join["pinned_probe_shape_count"]
+            for count in (
+                probe_shape_count_join["summary_result_head_probed"],
+                probe_shape_count_join["summary_reducibility_probed"],
+                probe_shape_count_join["summary_implemented_by_probed"],
+            ))):
+        raise SystemExit(
+            "REFUSE: facade manifest probe-shape count equality diverges "
+            f"({json.dumps(probe_shape_count_join, sort_keys=True)})"
         )
     manifest_name_counts = Counter(row["name"] for row in manifest_rows)
     duplicate_manifest_names = sorted(
@@ -3118,6 +3138,7 @@ def main():
             emission_verification_count_join
         ),
         "manifest_uncensused_zero_join": uncensused_zero_join,
+        "manifest_probe_shape_count_join": probe_shape_count_join,
         "manifest_declaration_name_join": manifest_name_join,
         "manifest_signature_totality_join": manifest_signature_join,
         "manifest_role_partition_join": manifest_role_join,
