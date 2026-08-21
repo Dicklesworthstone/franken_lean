@@ -36,8 +36,8 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::level::LevelView;
 use fln_core::name::Name;
 use fln_env::constants::{
-    ConstantInfo, ConstructorVal, DefinitionSafety, InductiveVal, QuotKind, RecursorVal,
-    ReducibilityHints,
+    ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, InductiveVal, QuotKind,
+    RecursorVal, ReducibilityHints,
 };
 use fln_olean::decl::DeclDecoder;
 use fln_olean::region::{ModuleDataView, OleanView, WalkBudget};
@@ -3562,5 +3562,113 @@ fn inductive_and_recursor_block_lists_agree() {
     assert!(
         recursors > 100 && constructors > 120,
         "both populations must be reached ({recursors} recursors, {constructors} constructors)"
+    );
+}
+
+/// The level-parameter relation between a block's three declarations — which is
+/// the observable the 228 rows disagreed on.
+///
+/// d17i's `BlockMismatch` family was exactly this: the kernel regenerated a
+/// recursor whose level-parameter list was one SHORTER than the decoded one,
+/// reported as `generated [u,v,w]` against `decoded [u_1,u,v,w]`. The repair at
+/// `50f65ba4` restored the missing motive universe. Nothing has ever checked the
+/// decoded side of that comparison — what the artifact actually carries.
+///
+/// Measured over `Init/Prelude` at private level:
+///
+///   157 constructors, every one sharing its inductive's level parameters exactly
+///   124 recursors carrying one EXTRA parameter, PREPENDED, over their inductive
+///     5 recursors carrying exactly their inductive's, with nothing added
+///
+/// No recursor takes any other shape: the extra is always a single name and
+/// always first, never appended or interleaved.
+///
+/// THE FIVE WITHOUT AN EXTRA ARE ALL PROP-BASED — they eliminate only into
+/// `Prop`, so there is no motive universe to carry. But the converse fails, and
+/// that is the part worth pinning: five OTHER Prop-based recursors DO carry the
+/// extra parameter. Prop-ness alone does not decide whether a block gets a
+/// motive universe; being a SUBSINGLETON does, which is precisely the
+/// distinction `elim_only_at_universe_zero` was making structurally when it cost
+/// 228 rows. The artifact says both populations exist, so a rule keyed on
+/// Prop-ness alone is refutable here rather than only in the lane.
+#[test]
+fn recursor_level_parameters_extend_their_inductives_by_at_most_a_motive_universe() {
+    let lib = lib_or_skip!();
+    let infos = decode_prelude_private(&lib);
+
+    let mut inductives: BTreeMap<String, &InductiveVal> = BTreeMap::new();
+    for info in &infos {
+        if let ConstantInfo::Induct(v) = info {
+            inductives.insert(info.name().to_display_string(), v);
+        }
+    }
+    let params = |v: &ConstantVal| -> Vec<String> {
+        v.level_params.iter().map(Name::to_display_string).collect()
+    };
+
+    let mut constructors = 0usize;
+    let mut extended = 0usize;
+    let mut unextended = 0usize;
+    let mut prop_extended = 0usize;
+    let mut prop_unextended = 0usize;
+    for info in &infos {
+        let name = info.name().to_display_string();
+        match info {
+            ConstantInfo::Ctor(v) => {
+                constructors += 1;
+                let induct = inductives
+                    .get(&v.induct.to_display_string())
+                    .expect("constructor's inductive decodes");
+                assert_eq!(
+                    params(&v.base),
+                    params(&induct.base),
+                    "{name}: a constructor shares its inductive's universe parameters"
+                );
+            }
+            ConstantInfo::Rec(v) => {
+                let head = inductives
+                    .get(&v.all[0].to_display_string())
+                    .expect("recursor's head inductive decodes");
+                let mine = params(&v.base);
+                let theirs = params(&head.base);
+                let is_prop = inductive_result_is_prop(head);
+                if mine == theirs {
+                    unextended += 1;
+                    if is_prop {
+                        prop_unextended += 1;
+                    }
+                } else {
+                    assert_eq!(
+                        mine.len(),
+                        theirs.len() + 1,
+                        "{name}: a recursor may add at most one universe over its inductive"
+                    );
+                    assert_eq!(
+                        &mine[1..],
+                        theirs.as_slice(),
+                        "{name}: the motive universe is PREPENDED — `decoded [u_1,u,v,w]` is the \
+                         shape the 228 rows reported against a regeneration that dropped it"
+                    );
+                    extended += 1;
+                    if is_prop {
+                        prop_extended += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        constructors > 120 && extended > 100 && unextended > 0,
+        "both recursor populations must be present ({extended} extended, {unextended} not)"
+    );
+    // The refutation of "Prop implies no motive universe". Both Prop populations
+    // must be non-empty, or that wrong rule is indistinguishable from the right
+    // one over this artifact — and it is the wrong rule that cost 228 rows.
+    assert!(
+        prop_unextended > 0 && prop_extended > 0,
+        "Prop-ness alone must NOT determine the motive universe: {prop_extended} Prop-based \
+         recursors carry the extra parameter and {prop_unextended} do not"
     );
 }
