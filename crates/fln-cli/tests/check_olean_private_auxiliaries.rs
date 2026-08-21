@@ -386,9 +386,8 @@ fn assert_json_private_companion_residual_report(report: &fln_cli::MultiplexerOu
     );
     let decoded_private_auxiliary_name_count = json_array_len(decoded_private_auxiliary_names);
     let decoded_private_auxiliaries = json_usize_field(json, "decodedPrivateAuxiliaries");
-    assert!(decoded_private_auxiliaries > 0, "{json}");
     assert!(
-        decoded_private_auxiliaries == 0 || !g1_satisfied,
+        decoded_private_auxiliaries > 0 && !g1_satisfied,
         "{json}",
     );
     assert_eq!(
