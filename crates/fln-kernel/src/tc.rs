@@ -2774,7 +2774,24 @@ impl<'a> TypeChecker<'a> {
                 (defn.value.clone(), defn.base.level_params.clone())
             }
             Some(ConstantInfo::Thm(thm)) => (thm.value.clone(), thm.base.level_params.clone()),
-            _ => return Ok(None),
+            // `is_delta` calls `has_value()` with `allow_opaque` at its DEFAULT
+            // false, so an opaque is deliberately not delta. This arm is spelled
+            // out rather than swept into a catch-all so the refusal is enforced
+            // by the compiler and not only by a test: folding `Opaque` into the
+            // arm above makes THIS arm unreachable, which is an error under
+            // `-D warnings`. Widening the gate to opaques should cost an
+            // argument, not a one-token edit that every suite stays green for.
+            Some(ConstantInfo::Opaque(_)) => return Ok(None),
+            // Exhaustive on purpose, for the same reason: a NEW `ConstantInfo`
+            // kind must not silently inherit "not unfoldable" from a wildcard —
+            // whether it is delta is a decision the pin has an answer to, and
+            // this match is where that answer belongs.
+            Some(ConstantInfo::Axiom(_))
+            | Some(ConstantInfo::Quot(_))
+            | Some(ConstantInfo::Induct(_))
+            | Some(ConstantInfo::Ctor(_))
+            | Some(ConstantInfo::Rec(_))
+            | None => return Ok(None),
         };
         let levels = levels.clone();
         let mut unfolded = self.instantiate_lparams(&value, &params, &levels, depth + 1)?;
