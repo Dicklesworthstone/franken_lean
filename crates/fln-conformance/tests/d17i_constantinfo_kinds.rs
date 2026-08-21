@@ -11605,3 +11605,109 @@ fn a_mutual_group_has_as_many_members_as_its_list_is_long() {
         "the four pairs are the only place this equation is tested above one"
     );
 }
+
+/// The kind censuses of the two parts balance, kind by kind.
+///
+/// Three quantities are already counted in separate cells: the kind census at
+/// each level, what the private part ADDS by kind, and the Axiom-to-something
+/// transitions. Nothing ties them together, and the tie is a conservation law —
+/// for every kind,
+///
+///   exported + added + transitions in − transitions out == private
+///
+/// It holds for all eight kinds in `Init/Prelude` with no departure. The
+/// arithmetic is not implied by the existing pins: a transition miscounted
+/// between two kinds leaves the exported census, the added census and the total
+/// untouched, and moves only the private figure of the two kinds involved.
+///
+/// The interesting rows are the ones that move. `Axiom` goes 256 to 10 because
+/// 246 of them are supplied privately and nothing becomes an axiom. `Thm` goes
+/// 0 to 153 — THE EXPORTED PART DECLARES NO THEOREM AT ALL, so every theorem in
+/// the module is either an exported axiom that gained a proof or a private-only
+/// addition. `Opaque` likewise starts at zero.
+///
+/// The four structural kinds — `Induct`, `Ctor`, `Rec`, `Quot` — are unchanged
+/// at both levels, which is the same fact the private-only cell states from the
+/// other side, and here it falls out of the balance rather than being asserted
+/// separately.
+#[test]
+fn the_kind_censuses_of_the_two_parts_balance() {
+    let lib = lib_or_skip!();
+    let (exported, _) = decode_at(&lib, "Init.Prelude", Level::Exported);
+    let (private, _) = decode_at(&lib, "Init.Prelude", Level::Private);
+
+    let census = |infos: &[ConstantInfo]| -> BTreeMap<&'static str, usize> {
+        let mut out = BTreeMap::new();
+        for info in infos {
+            *out.entry(kind_of(info)).or_default() += 1;
+        }
+        out
+    };
+    let before = census(&exported);
+    let after = census(&private);
+
+    let known: BTreeMap<String, &'static str> = exported
+        .iter()
+        .map(|info| (info.name().to_display_string(), kind_of(info)))
+        .collect();
+    let mut added: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut into: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut out_of: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for info in &private {
+        let kind = kind_of(info);
+        match known.get(&info.name().to_display_string()) {
+            None => *added.entry(kind).or_default() += 1,
+            Some(was) if *was != kind => {
+                *into.entry(kind).or_default() += 1;
+                *out_of.entry(*was).or_default() += 1;
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Conservation first, kind by kind.
+    let count = |table: &BTreeMap<&'static str, usize>, kind: &str| {
+        table.get(kind).copied().unwrap_or_default()
+    };
+    let kinds: BTreeSet<&'static str> = before.keys().chain(after.keys()).copied().collect();
+    let mut departures: Vec<(&str, usize, usize)> = Vec::new();
+    for kind in &kinds {
+        let balanced =
+            count(&before, kind) + count(&added, kind) + count(&into, kind) - count(&out_of, kind);
+        if balanced != count(&after, kind) {
+            departures.push((kind, balanced, count(&after, kind)));
+        }
+    }
+    assert!(
+        departures.is_empty(),
+        "each kind must balance (kind, computed, actual): {departures:?}"
+    );
+    assert_eq!(
+        exported.len() + added.values().sum::<usize>(),
+        private.len(),
+        "and the totals must balance too, since nothing is ever lost"
+    );
+
+    // The rows that move, and the ones that cannot.
+    assert_eq!(
+        (
+            count(&before, "Axiom"),
+            count(&after, "Axiom"),
+            count(&before, "Thm"),
+            count(&after, "Thm")
+        ),
+        (256, 10, 0, 153),
+        "the exported part declares no theorem, and 246 of its axioms gain a proof"
+    );
+    for structural in ["Induct", "Ctor", "Rec", "Quot"] {
+        assert_eq!(
+            count(&before, structural),
+            count(&after, structural),
+            "{structural} must be untouched between the levels"
+        );
+        assert!(
+            count(&before, structural) > 0,
+            "{structural} must be populated, or its invariance says nothing"
+        );
+    }
+}
