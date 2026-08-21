@@ -1071,6 +1071,10 @@ const ARRAY_TAKE_WHILE_GO_UNSAFE_REC: &str =
     "_private.Init.Data.Array.Basic.0.Array.takeWhile.go._unsafe_rec";
 /// The pin's private array stores this helper in the basic module.
 const ARRAY_TAKE_WHILE_GO_UNSAFE_REC_MODULE: &str = "Init/Data/Array/Basic";
+/// The private recursion helper generated for `Array.filterM`.
+const ARRAY_FILTER_M_GO: &str = "_private.Init.Data.Array.Basic.0.Array.filterM.go";
+/// The pin's private array stores this helper in the basic module.
+const ARRAY_FILTER_M_GO_MODULE: &str = "Init/Data/Array/Basic";
 /// The private recursion helper generated for `Array.zipWithAll`.
 const ARRAY_ZIP_WITH_ALL_GO: &str = "_private.Init.Data.Array.Basic.0.Array.zipWithAll.go";
 /// The pin's private array stores this helper in the basic module.
@@ -2129,6 +2133,9 @@ fn array_unzip_basic_second_match_is_decoded_from_its_private_storage_module() {
 
 #[test]
 fn array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_take_while_go_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_TAKE_WHILE_GO_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_TAKE_WHILE_GO_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_TAKE_WHILE_GO_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
+
+#[test]
+fn array_filter_m_go_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_filter_m_go_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FILTER_M_GO_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FILTER_M_GO.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FILTER_M_GO).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
 
 #[test]
 fn array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module() { let lib = lib_or_skip!("array_find_some_rev_m_find_unsafe_rec_is_decoded_from_its_private_storage_module"); let chain = chain_bytes(&lib, ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC_MODULE); let (_, n) = exported_and_private_names(&chain); assert!(n.contains(&ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC.to_owned())); let v = OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server]).unwrap(); let r = DeclDecoder::new(&v, WalkBudget::default()).decode_module_constants().unwrap().into_iter().find(|i| i.name().to_display_string() == ARRAY_FIND_SOME_REV_M_FIND_UNSAFE_REC).unwrap(); assert!(matches!(r, ConstantInfo::Defn(_))); }
