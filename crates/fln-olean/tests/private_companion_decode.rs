@@ -180,6 +180,10 @@ const PSIGMA_CASES_ON_ARG_PUSHER_MODULE: &str = "Init/Data/Array/Basic";
 const GET_ELEM_MATCH_1_EQ_1: &str = "_private.Init.Data.Array.Basic.0.GetElem?.match_1.eq_1";
 /// The pin's private array stores this theorem in the Basic module.
 const GET_ELEM_MATCH_1_EQ_1_MODULE: &str = "Init/Data/Array/Basic";
+/// The private implementation backing `mapMonoMImp`.
+const MAP_MONO_M_IMP: &str = "_private.Init.Data.Array.BasicAux.0.mapMonoMImp";
+/// The pin's private array stores this definition in the BasicAux module.
+const MAP_MONO_M_IMP_MODULE: &str = "Init/Data/Array/BasicAux";
 /// A private equation-compiler match helper used by Prelude's name equality.
 const NAME_BEQ_MATCH_1: &str = "_private.Init.Prelude.0.Lean.Name.beq.match_1";
 /// The direct Syntax match helpers required by the public partial functions.
@@ -1216,6 +1220,33 @@ fn get_elem_match_equation_is_decoded_from_its_private_storage_module() {
     assert!(
         matches!(recovered, ConstantInfo::Thm(_)),
         "private companion decoded {GET_ELEM_MATCH_1_EQ_1} as {} instead of Thm",
+        recovered.kind_name()
+    );
+}
+
+#[test]
+fn map_mono_m_imp_is_decoded_from_its_private_storage_module() {
+    let lib = lib_or_skip!("map_mono_m_imp_is_decoded_from_its_private_storage_module");
+    let chain = chain_bytes(&lib, MAP_MONO_M_IMP_MODULE);
+    let (_, private_names) = exported_and_private_names(&chain);
+
+    assert!(
+        private_names.contains(&MAP_MONO_M_IMP.to_owned()),
+        "the private companion of {MAP_MONO_M_IMP_MODULE} must retain {MAP_MONO_M_IMP}"
+    );
+
+    let private_view =
+        OleanView::parse_with_dependencies(&chain.private, &[&chain.exported, &chain.server])
+            .expect("private part parses against its companion address spaces");
+    let recovered = DeclDecoder::new(&private_view, WalkBudget::default())
+        .decode_module_constants()
+        .expect("private constants decode")
+        .into_iter()
+        .find(|info| info.name().to_display_string() == MAP_MONO_M_IMP)
+        .unwrap_or_else(|| panic!("private decoder lost {MAP_MONO_M_IMP}"));
+    assert!(
+        matches!(recovered, ConstantInfo::Defn(_)),
+        "private companion decoded {MAP_MONO_M_IMP} as {} instead of Defn",
         recovered.kind_name()
     );
 }
